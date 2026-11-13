@@ -12,7 +12,7 @@ blocked · **2** usage or environment error (also: unknown command, unknown flag
 **GitHub rate limits.** Retrying is opt-in per caller. These wait out a GitHub rate limit and run again: `comment` (every kind), `summary`,
 `checkpoint` and the triage publication of `review-complete` and of `triage claude-ruling` / `triage second-review` (the triage and summary
 comments), `review-complete`'s label edits (awaiting-review, recheck), `followups create` and `labels ensure`. The whole operation re-reads before it
-writes, so a write that landed before the limit answer is found, not repeated. Only a secondary or primary rate limit is retried (a plain 403, a
+writes, so a write that landed before the limit answer is found, not repeated. Only a secondary or primary rate limit is retried, judged from gh's stderr and the `message` of its error JSON, never from other stdout text (a plain 403, a
 timeout, a 5xx or a network error is not). The wait is `Retry-After` when gh shows it; else 60 s, then the rest of the cap, for a
 secondary limit; for a primary limit, until the earliest reset among the exhausted resources, and only when that fits the cap (else it
 fails at once and names the reset time). The total wait of one command is capped at 100 s (one budget for all its retried operations); `PIPELINE_GH_RETRY_MS` can only shorten it, and `0`

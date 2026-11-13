@@ -16,7 +16,51 @@ const MAX_ATTEMPTS = 8; // a belt for the case where every wait is 0
 const SECONDARY = /secondary rate limit|abuse detection|submitted too quickly/i;
 const PRIMARY = /API rate limit (already )?exceeded|HTTP 429/i;
 
-const textOf = (r) => `${r?.stderr ?? ''}\n${r?.stdout ?? ''}`;
+// gh's own words about a failure: its stderr, plus the `message` of the error JSON that gh api prints to stdout. The rest of
+// stdout is NOT gh's: a paginated read prints the pages it already fetched (repository content) before a later page fails, and
+// that text may itself say 'secondary rate limit' (#267). So only the LAST top-level JSON value of stdout is read, and only when
+// it is an object with a string `message`; anything else (arrays, raw --jq text, a stream that does not parse) adds nothing.
+function lastTopLevelValue(text) {
+  let depth = 0;
+  let start = -1;
+  let last = null;
+  let inString = false;
+  let escaped = false;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (inString) {
+      if (escaped) escaped = false;
+      else if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+    } else if (ch === '"') {
+      if (depth === 0) return null; // raw text between values: not a JSON stream
+      inString = true;
+    } else if (ch === '[' || ch === '{') {
+      if (depth === 0) start = i;
+      depth += 1;
+    } else if (ch === ']' || ch === '}') {
+      depth -= 1;
+      if (depth < 0) return null;
+      if (depth === 0) last = text.slice(start, i + 1);
+    } else if (depth === 0 && !/\s/.test(ch)) {
+      return null;
+    }
+  }
+  return depth === 0 && !inString ? last : null;
+}
+
+function errorMessage(stdout) {
+  if (typeof stdout !== 'string' || stdout === '') return '';
+  try {
+    const raw = lastTopLevelValue(stdout);
+    const v = raw === null ? null : JSON.parse(raw);
+    return v && typeof v === 'object' && !Array.isArray(v) && typeof v.message === 'string' ? v.message : '';
+  } catch {
+    return '';
+  }
+}
+
+const textOf = (r) => `${r?.stderr ?? ''}\n${errorMessage(r?.stdout)}`;
 
 // `r` is a gh result or a GhError (both carry code, stderr, stdout, timedOut, overBuffer).
 export function isRateLimited(r) {

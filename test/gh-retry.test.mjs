@@ -25,6 +25,25 @@ test('isRateLimited: the messages GitHub uses, and only those', () => {
   assert.equal(isRateLimited({ code: 0, stderr: SECONDARY }), false);
 });
 
+test('isRateLimited reads stderr and the error JSON message only, never repository text in stdout (#267)', () => {
+  const page = JSON.stringify([{ body: 'the PR hit a secondary rate limit; later: API rate limit exceeded (HTTP 429)' }]);
+  const paged = (stderr, tail = '') => Object.assign(new GhError({ code: 1, stderr, args: ['api', 'x', '--paginate'] }), { stdout: page + tail });
+  assert.equal(isRateLimited(paged('gh: Bad gateway (HTTP 502)')), false, 'a 502 after pages that mention a rate limit is not one');
+  assert.equal(isRateLimited(paged('gh: Bad gateway (HTTP 502)', JSON.stringify({ message: 'Server Error' }))), false);
+  assert.equal(isRateLimited(paged('gh: Post "https://api.github.com/graphql": EOF')), false, 'a dropped connection neither');
+  assert.equal(isRateLimited(paged('')), false);
+  assert.equal(isRateLimited(paged('gh: You have exceeded a secondary rate limit. (HTTP 403)')), true, 'a real limit on stderr still retries');
+  assert.equal(isRateLimited(paged('gh: HTTP 403', JSON.stringify({ message: 'You have exceeded a secondary rate limit.' }))), true, 'the error JSON message counts');
+  assert.equal(isRateLimited(paged('gh: HTTP 403', JSON.stringify({ message: 'API rate limit exceeded for user ID 1.' }))), true);
+  // raw --jq text is not an error body
+  assert.equal(isRateLimited(limited('gh: Bad gateway (HTTP 502)', { stdout: 'secondary rate limit\nAPI rate limit exceeded\n' })), false);
+  let calls = 0;
+  const h = harness();
+  assert.throws(() => retrying(() => { calls += 1; throw paged('gh: Bad gateway (HTTP 502)'); }, h.opts), GhError);
+  assert.equal(calls, 1, 'no retry');
+  assert.deepEqual(h.waits, []);
+});
+
 test('retryAfterMs reads Retry-After seconds when gh printed headers', () => {
   assert.equal(retryAfterMs(limited(`${SECONDARY}\nRetry-After: 7`)), 7000);
   assert.equal(retryAfterMs(limited(SECONDARY)), null);
