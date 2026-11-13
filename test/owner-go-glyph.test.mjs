@@ -129,3 +129,29 @@ test('#190.3b the length caps apply after the strip (the nudges)', () => {
   assert.equal(queuedNudge(hook(home, `${grant}.`, [], QUEUED)), null, 'control: one over the cap');
   assert.equal(queuedNudge(hook(home, `> ${grant}`, [], QUEUED)), QUEUED_NUDGE, 'glyph plus a 300-character body: 302 raw, at the cap once stripped');
 });
+
+test('#190.3b the length caps apply after the strip (the recorders: recordRoundGrant, recordRuling and the stored prompt reference)', () => {
+  const home = tmp();
+  // extra round: cap 300
+  const grant = `extra round${' '.repeat(300 - 'extra round'.length - '#58'.length)}#58`;
+  assert.equal(grant.length, 300);
+  const ask = () => [said(roundRequest(58, 4, HEAD, REPO))];
+  assert.ok(recordRoundGrant(hook(home, grant, ask()), { home, now }), 'control: at the cap');
+  assert.equal(recordRoundGrant(hook(home, `${grant}.`, ask()), { home, now }), null, 'control: one over the cap is not recorded');
+  const g = recordRoundGrant(hook(home, `> ${grant}`, ask()), { home, now });
+  assert.deepEqual([g?.pr, g?.k], [58, 4], 'glyph plus a 300-character body: 302 raw, at the cap once stripped, so recorded');
+  assert.equal(g.prompt, `> ${grant}`, 'stored verbatim');
+  assert.equal(recordRoundGrant(hook(home, `❯ ${grant}.`, ask()), { home, now }), null, 'over the cap after the strip: refused as before');
+  // ruling: cap 1000
+  const rask = [said(rulingRequest(58, ['R4-B1'], REPO, ITEMS))];
+  const ruling = `R4-B1:${' '.repeat(1000 - 'R4-B1: reject'.length + 1)}reject`;
+  assert.equal(ruling.length, 1000);
+  assert.ok(recordRuling(hook(home, ruling, rask), { home, now }), 'control: at the cap');
+  const r = recordRuling(hook(home, `$ ${ruling}`, rask), { home, now });
+  assert.deepEqual(r?.ids, ['R4-B1'], 'glyph plus a 1000-character body is recorded');
+  assert.equal(r.prompt, `$ ${ruling}`, 'stored verbatim, and the prompt reference to find it again is kept (not dropped for the raw length)');
+  const over = `R4-B1:${' '.repeat(1000 - 'R4-B1: reject'.length + 2)}reject`;
+  assert.equal(over.length, 1001);
+  assert.equal(recordRuling(hook(home, over, rask), { home, now }), null, 'control: 1001 characters');
+  assert.equal(recordRuling(hook(home, `› ${over}`, rask), { home, now }), null, 'over the cap after the strip');
+});

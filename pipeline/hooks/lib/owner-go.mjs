@@ -712,7 +712,7 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
 const promptRefs = (input) => ({
   prompt_id: typeof input?.prompt_id === 'string' && input.prompt_id !== '' ? input.prompt_id : null,
   transcript_path: typeof input?.transcript_path === 'string' && input.transcript_path !== '' ? input.transcript_path : null,
-  prompt: typeof input?.prompt === 'string' && input.prompt.length <= RULING_PROMPT_MAX ? input.prompt : null,
+  prompt: typeof input?.prompt === 'string' && answerBody(input.prompt).length <= RULING_PROMPT_MAX ? input.prompt : null, // (the cap is on the words after a pasted glyph, #190.3b)
 });
 
 // Appends one record to <home>/.claude/pipeline-state/owner-go/<session>.jsonl; the record, or null when it cannot be written safely.
@@ -742,7 +742,7 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
-    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || answerBody(input.prompt).length > RULING_PROMPT_MAX) return null; // (#190.3b: the cap applies after the glyph strip, as the nudges' does)
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's words)
     if (queuedAnswer(input)) return null; // (#191 B1)
     const reply = lastReply(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true });
@@ -1169,7 +1169,7 @@ export function recordRoundGrant(input, { home = accountHome(), now = Date.now }
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
-    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > ROUND_GRANT_PROMPT_MAX) return null;
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || answerBody(input.prompt).length > ROUND_GRANT_PROMPT_MAX) return null; // (#190.3b: after the glyph strip)
     const g = parseRoundGrant(input.prompt);
     if (!g) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
@@ -1193,7 +1193,7 @@ const FULL_HEAD = /^[0-9a-f]{40}$/;
 function isRoundRecord(r) {
   return r?.kind === 'extra-round' && typeof r.session === 'string' && typeof r.ts === 'string' && typeof r.prompt_sha256 === 'string'
     && repoKey(r.repo) === r.repo && Number.isInteger(r.pr) && Number.isInteger(r.k) && /^[0-9a-f]{12,40}$/.test(String(r.head))
-    && typeof r.prompt === 'string' && r.prompt.trim() !== '' && r.prompt.length <= ROUND_GRANT_PROMPT_MAX
+    && typeof r.prompt === 'string' && r.prompt.trim() !== '' && answerBody(r.prompt).length <= ROUND_GRANT_PROMPT_MAX
     && createHash('sha256').update(r.prompt).digest('hex') === r.prompt_sha256;
 }
 
