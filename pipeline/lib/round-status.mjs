@@ -104,7 +104,8 @@ export function predictNextRound({ root, config, state, head }) {
   // The last reviewed head is on HEAD's first-parent chain exactly when the oldest listed commit's first parent is the anchor (the walk resolutionReviewBase's history rule makes,
   // history-not-first-parent). After a rewritten history the list holds the default branch's commits too, so nothing below may be read as "the PR's own commits".
   const anchorOnChain = chain.length > 0 && chain.at(-1).split(' ')[1] === anchor;
-  const rewritten = chain.length > 0 && !anchorOnChain;
+  // (an empty list with HEAD elsewhere than the anchor is a HEAD reset to behind the reviewed head: rewritten too)
+  const rewritten = headFull !== anchor && !anchorOnChain;
   for (const line of chain) {
     const parents = line.split(' ');
     if (parents.length > 2) {
@@ -167,7 +168,9 @@ export function predictNextRound({ root, config, state, head }) {
     rewritten
       ? `Prediction: the last reviewed head is not in HEAD's first-parent history (rewritten history); ${plural(chain.length, 'commit')} since it.`
       : `Prediction: ${plural(merges, 'merge commit')} and ${plural(ownCommits, 'own commit')} since the last reviewed head.`,
-    `Prediction: the next round would be ${words}${nextRound.resolutionIneligible ? `; the conflict resolution could not be reviewed alone (${nextRound.resolutionIneligible})` : ''}.`,
+    contentRestored
+      ? 'Prediction: the next round has nothing new to review: the content is what the last reviewed round saw.'
+      : `Prediction: the next round would be ${words}${nextRound.resolutionIneligible ? `; the conflict resolution could not be reviewed alone (${nextRound.resolutionIneligible})` : ''}.`,
     ...(nextRound.alternative ? [`Prediction: No-round alternative: ${nextRound.alternative}.`] : []),
   ];
   return { nextRound, lines: lines.map((l) => asciiLine(l, 500)) };

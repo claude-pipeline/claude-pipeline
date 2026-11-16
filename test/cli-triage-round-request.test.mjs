@@ -503,6 +503,8 @@ test('round-request nextRound: after the hinted revert the confirming run gives 
   assert.equal(back.json.nextRound.sinceReviewed.ownCommits, 2);
   assert.equal(back.json.nextRound.alternative, undefined);
   assert.doesNotMatch(back.json.summary, /No-round alternative/);
+  assert.match(back.json.summary, /^Prediction: the next round has nothing new to review: the content is what the last reviewed round saw\.$/m);
+  assert.doesNotMatch(back.json.summary, /counted round/);
 });
 
 // Failure caught: with 10 or more own commits the alternative's summary line went past the 400-character cap and was cut mid-word.
@@ -519,6 +521,19 @@ test('round-request nextRound: the alternative summary line keeps its full endin
   const line = r.json.summary.split('\n').find((l) => l.startsWith('Prediction: No-round alternative'));
   assert.match(line, /revert the 12 own commits/);
   assert.ok(line.endsWith('whole-PR when the reviewer escalates).'), line.slice(-80));
+});
+
+// Failure caught: a HEAD reset to behind the reviewed head, with nothing committed after it, was described like an untouched branch ("0 merge commits and 0 own commits").
+test('round-request nextRound: a HEAD reset to behind the reviewed head is rewritten history even with nothing committed after it', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  w.repo.git(['reset', '--hard', 'HEAD~1']);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.nextRound.sinceReviewed, { rewritten: true, commits: 0 });
+  assert.match(r.json.summary, /^Prediction: the last reviewed head is not in HEAD's first-parent history \(rewritten history\); 0 commits since it\.$/m);
+  assert.doesNotMatch(r.json.summary, /own commit/);
 });
 
 // Failure caught: a prediction that throws must never cost the owner the closing line.
