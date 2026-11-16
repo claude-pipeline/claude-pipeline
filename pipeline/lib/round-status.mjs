@@ -1,7 +1,7 @@
 // The review's status as the owner reads it: how many rounds ran, what they cost, which items are open and how serious, why the review is not clean. One gatherer
 // feeds both the extra-round ask (`triage round-request`) and the park comment (`comment --kind needs-human`), so the two cannot drift. Display only: nothing here decides
 // anything. Untrusted text (titles, categories) goes through asciiLine inside round-ask.mjs.
-import { diffFiles, git, mergeBase, resolutionReviewBase, revParse } from './git.mjs';
+import { diffFiles, git, isAncestor, mergeBase, resolutionReviewBase, revParse } from './git.mjs';
 import { trustedBase } from './risk.mjs';
 import { diffStats } from './diff.mjs';
 import { costFrom, notCleanReasons, openItems, roundsFrom, statusLines } from './round-ask.mjs';
@@ -87,7 +87,7 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
 // What the next review round would be, so the owner sees what the extra round buys BEFORE asking for it (display only: it decides nothing, `codex-review` decides the real
 // round). It uses the same classification admitRound makes (review-round.mjs#classifyReview: the review base and kind, the resolution-only proof) without the cap, without
 // writing a review artifact and without touching a grant; git writes at most the trial merge's objects. A judge-to-Fable escalation and a PR that targets another branch than the
-// default are not modelled, so the free kinds (base-only, resolution) are worded as conditional (the real round may be a counted whole-PR one then).
+// default are not modelled, so the free kinds (base-only, resolution) are worded as conditional (the real round is a counted one then: whole-PR for the escalation).
 // -> { nextRound: { prediction: true, previousClean, sinceReviewed: {merges, ownCommits}, kind, resolutionIneligible?, alternative? }, lines: ['Prediction: ...'] }. Throws on a git failure:
 // the caller turns that into a warning.
 export function predictNextRound({ root, config, state, head }) {
@@ -99,9 +99,13 @@ export function predictNextRound({ root, config, state, head }) {
   const previousClean = roundOutcome({ ...state, currentContentHash: last.contentHashAtToHead }).clean;
   let merges = 0;
   let ownCommits = 0;
+  const mergedIn = []; // the second parent of every merge on the first-parent chain
   for (const line of git(['rev-list', '--first-parent', '--parents', headFull, `^${anchor}`], o).split('\n').filter(Boolean)) {
-    if (line.split(' ').length > 2) merges += 1;
-    else ownCommits += 1;
+    const parents = line.split(' ');
+    if (parents.length > 2) {
+      merges += 1;
+      mergedIn.push(parents[2]);
+    } else ownCommits += 1;
   }
   const baseRef = reviewBaseRef(root, config);
   const forkPoint = mergeBase(baseRef, headFull, o);
@@ -116,16 +120,18 @@ export function predictNextRound({ root, config, state, head }) {
   if (resolutionIneligible !== undefined) nextRound.resolutionIneligible = asciiLine(resolutionIneligible, 160);
   if (previousClean && ownCommits > 0) {
     const revert = `revert the ${plural(ownCommits, 'own commit')} since the last reviewed head (newest first)`;
-    // A free recording after the revert is promised only when this classification proves it: a clean trial merge (kind 'synthetic'). A conflicting merge keeps the
-    // PR whole-PR (the reverted commits stay in the history, so the resolution-only proof refuses too), and a merge of another branch is not the default branch's.
+    // A free recording after the revert is promised only when it is proven: a clean trial merge (kind 'synthetic') AND every merge in the range brought in only the
+    // default branch's commits (its second parent is on the default-branch ref, the check resolutionReviewBase's history rule makes). A conflicting merge keeps the PR whole-PR
+    // (the reverted commits stay in the history, so the resolution-only proof refuses too), and a merge of a topic branch leaves its changes in the range after the revert.
+    const onlyDefaultBranch = mergedIn.every((p) => isAncestor(p, baseRef, o));
     nextRound.alternative = merges === 0
       ? `${revert}; that restores the reviewed content and needs no round`
-      : review.kind === 'synthetic'
+      : review.kind === 'synthetic' && onlyDefaultBranch
         ? `${revert}; the default branch merges cleanly, so a free base-only recording would then follow`
         : `${revert}; that does not make the next round free here: the merge since the last reviewed head is not a clean merge of the default branch, so a counted round would still follow`;
   }
-  // The free kinds are conditional: a judge-to-Fable escalation and a PR that does not target the default branch are not modelled above, and either makes the real round counted whole-PR.
-  const unlessCounted = ' (unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted whole-PR round)';
+  // The free kinds are conditional: a judge-to-Fable escalation and a PR that does not target the default branch are not modelled above, and either makes the real round counted (whole-PR for the escalation, the range since the last reviewed head for another base branch).
+  const unlessCounted = ' (unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates)';
   const words = {
     'base-only': `base-only: only the default branch was merged in, free, no Codex, not counted${unlessCounted}`,
     resolution: `resolution-only: a real review of the conflict resolution, not counted, no owner grant${unlessCounted}`,

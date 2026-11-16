@@ -334,7 +334,7 @@ test('round-request nextRound: a main merge with a provable conflict resolution 
   const free = ask(w);
   assertExit(free, 0, free.stderr + free.stdout);
   assert.deepEqual([free.json.nextRound.kind, free.json.nextRound.sinceReviewed, free.json.nextRound.resolutionIneligible], ['resolution', { merges: 1, ownCommits: 0 }, undefined]);
-  assert.match(free.json.summary, /^Prediction: the next round would be resolution-only: a real review of the conflict resolution, not counted, no owner grant \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted whole-PR round\)\.$/m);
+  assert.match(free.json.summary, /^Prediction: the next round would be resolution-only: a real review of the conflict resolution, not counted, no owner grant \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)\.$/m);
 
   w.repo.write('src/c.js', 'export const c = 1;\n');
   w.repo.commit('own commit after the merge');
@@ -375,6 +375,31 @@ test('round-request nextRound: after a clean merge of the default branch the alt
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 1, ownCommits: 1 }, 'synthetic']);
   assert.match(r.json.nextRound.alternative, /the default branch merges cleanly, so a free base-only recording would then follow$/);
+});
+
+// Failure caught: a clean synthetic base was taken as proof of a free recording, but a merged TOPIC branch keeps its changes in the range after the revert, so the round is counted.
+test('round-request nextRound: after a clean merge of a topic branch (not the default branch) the alternative does not promise a free recording', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  w.repo.commit('own commit');
+  w.repo.checkout('main');
+  w.repo.write('src/m.js', 'export const m = 1;\n');
+  w.repo.commit('main adds a file');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']); // a clean merge of the default branch first: the base is synthetic
+  w.repo.git(['branch', 'topic', 'HEAD~1']);
+  w.repo.checkout('topic');
+  w.repo.write('src/t.js', 'export const t = 1;\n');
+  w.repo.commit('topic work');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge topic into feat/x', 'topic']);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 2, ownCommits: 1 }, 'synthetic'], 'the trial merge is clean: only the merged-in parent tells it apart');
+  assert.match(r.json.nextRound.alternative, /that does not make the next round free here: .* a counted round would still follow$/);
+  assert.doesNotMatch(r.json.nextRound.alternative, /free base-only recording/);
 });
 
 // Failure caught: a prediction that throws must never cost the owner the closing line.
