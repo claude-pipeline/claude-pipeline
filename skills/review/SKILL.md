@@ -61,7 +61,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). The ol
 
 ## 3. Review complete, ready, hand-off
 
-Full text: `reference/ready-and-handoff.md`: read it before step 1 (the verdicts, `update-branch`, queue mode, the conflict-merge rule, the freeze after a clean review and the merge holds are only there).
+Full text: `reference/ready-and-handoff.md`: read it before step 1 (the verdicts, `update-branch`, queue mode (never merge the default branch in unless the PR is CONFLICTING), the conflict-merge rule, the freeze after a clean review and the merge holds are only there).
 
 1. `P review-complete --pr N` (HEAD pushed). Exit 1 ⇒ read `reason` and go back to the round it names.
 2. Only after exit 0: if the head changed since 1.5 ran (any review fix), re-run 1.5 (`P risk`, `P hardstops`, `P integrity`) on it first; high risk (1.5's `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured); then `gh pr ready N`, then CI via `P job start ci -- node ~/.claude/pipeline/bin/pipeline.mjs ci-wait --pr N` (never `gh pr checks --watch`); verdicts, `update-branch`, queue mode and merge holds are in the reference.
