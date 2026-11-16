@@ -9,7 +9,7 @@ import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFile
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { MAX_AGE_MS, accountHome, appendRecord, approvalGap, ownerGoDir, readRecords, settleEnabled } from '../pipeline/hooks/lib/owner-go.mjs';
+import { MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, ownerGoDir, ownerGrantedRounds, ownerRuled, readApprovals, readRecords, settleEnabled } from '../pipeline/hooks/lib/owner-go.mjs';
 import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickProvenance, issueAsk, mergeAsk, readAsk, recordClick, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { OWNER_GO_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
 import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
@@ -583,4 +583,71 @@ test('click-race.mjs refuses (exit code 2, never 0) to run on the account home',
   const r = spawnSync(process.execPath, [child, 'settle', libDir, accountHome(), join(tmpdir(), 'never-opened-barrier'), '0'], { encoding: 'utf8' });
   assert.equal(r.status, 2, r.stdout + r.stderr);
   assert.equal(r.stdout.includes('ready'), false);
+});
+
+// ---- Task 4: readers settle; read-only paths never do -------------------------------------------------------------------------------------
+
+// A world whose click has been captured at the hook and whose result entry has since landed: everything is ready for a reader to settle it.
+const flushedWorld = async (t, opts = {}) => { const w = pw(t, opts); assert.ok((await w.hook()).pending); w.flush(); return w; };
+const withSwitch = (value, fn) => {
+  const before = process.env.PIPELINE_CLICK_SETTLE;
+  if (value === undefined) delete process.env.PIPELINE_CLICK_SETTLE; else process.env.PIPELINE_CLICK_SETTLE = value;
+  try { return fn(); } finally { if (before === undefined) delete process.env.PIPELINE_CLICK_SETTLE; else process.env.PIPELINE_CLICK_SETTLE = before; }
+};
+
+test('every consumer verifies a pending click by itself (settle: true): approvalGap, approvedPr (only its session), readApprovals, ownerRuled, ownerGrantedRounds', async (t) => {
+  const merge = await flushedWorld(t);
+  assert.equal(merge.gap({ settle: true }), 'ok');
+  assert.equal(merge.records().length, 1);
+  const guarded = await flushedWorld(t);
+  const ask = { repo: REPO, pr: 58, head: HEAD, home: guarded.home, now: guarded.now, settle: true };
+  assert.equal(approvedPr({ ...ask, session: 'some-other-session' }), false, 'the guard reads one session: another session\'s read settles nothing of this one');
+  assert.deepEqual(allSettled(guarded.home), []);
+  assert.equal(approvedPr({ ...ask, session: guarded.session }), true);
+  assert.equal(allSettled(guarded.home).length, 1);
+  const approvals = await flushedWorld(t);
+  const list = readApprovals({ home: approvals.home, now: approvals.now, settle: true });
+  assert.equal(list[0]?.via, 'ask');
+  assert.equal(list[0].ask.askId, approvals.askId);
+  const ruling = await flushedWorld(t, { kind: 'ruling', answer: 'Accept all' });
+  const q = { repo: REPO, pr: 58, quote: 'R1-B1: accept, R2-S3: accept', decision: 'ACCEPT', contentOf: () => 'c0ffee000000', home: ruling.home, now: ruling.now, settle: true };
+  assert.equal(ownerRuled({ ...q, id: 'R1-B1' }), true);
+  const round = await flushedWorld(t, { kind: 'round', answer: 'Yes, one more round' });
+  const granted = ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home: round.home, now: round.now, settle: true });
+  assert.equal(granted.length, 1, JSON.stringify(granted));
+  assert.equal(granted[0].via, 'ask');
+});
+
+test('settle: false and the environment switch leave the pending alone; settle: true overrides the switch', async (t) => {
+  const w = await flushedWorld(t);
+  assert.equal(w.gap({ settle: false }), 'none');
+  assert.equal(withSwitch(undefined, () => w.gap({ settle: false })), 'none');
+  assert.equal(withSwitch('off', () => w.gap({ settle: undefined })), 'none', 'the test switch');
+  assert.deepEqual(allSettled(w.home), []);
+  assert.equal(existsSync(w.spentFile), false);
+  assert.equal(w.records().length, 0);
+  assert.equal(withSwitch('off', () => w.gap({ settle: true })), 'ok', 'an explicit settle: true wins');
+  assert.equal(allSettled(w.home).length, 1);
+  const d = await flushedWorld(t);
+  assert.equal(withSwitch(undefined, () => d.gap({ settle: undefined })), 'ok', 'by default a reader settles');
+});
+
+test('a settle that cannot run never breaks readRecords: the typed records still count and the fault is a problem', async (t) => {
+  const w = await flushedWorld(t);
+  const typed = { v: 1, ts: new Date(w.answeredAt + 2000).toISOString(), session: w.session, prompt: 'merge', prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }] };
+  assert.ok(appendRecord(w.home, w.session, typed));
+  rmSync(asksDir(w.home), { recursive: true });
+  writeFileSync(asksDir(w.home), 'not a folder');
+  const problems = [];
+  const records = readRecords({ home: w.home, now: w.now, settle: true, problems });
+  assert.deepEqual(records.map((r) => r.prompt), ['merge']);
+  assert.ok(problems.some((p) => /asks folder cannot be read/.test(p)), JSON.stringify(problems));
+});
+
+test('a typed word after a pending click: both stand', async (t) => {
+  const w = await flushedWorld(t);
+  const typed = { v: 1, ts: new Date(w.answeredAt + 5000).toISOString(), session: w.session, prompt: 'merge', prs: [58], requests: [{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }] };
+  assert.ok(appendRecord(w.home, w.session, typed));
+  const records = readRecords({ home: w.home, now: w.now, settle: true });
+  assert.deepEqual(records.map((r) => r.via ?? 'typed').sort(), ['ask', 'typed']);
 });
