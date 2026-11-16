@@ -109,7 +109,7 @@ test('the same name cannot start twice while running; after it finishes it resta
 // R17-F1: clearOldJobDir deletes the old run's files one at a time (rmSync, in the filesystem's order). A reader holding run A must never find a half-deleted directory whose
 // meta.json still names A, so meta.json goes first. The delete leaves the same files whatever its order, so the order is what is observed: what is in the directory the moment
 // rmSync is called on it (fs.rmSync is wrapped for the call, and the ESM bindings are synced).
-test('startJob unlinks the old run\'s meta.json before the recursive delete starts: a half-deleted directory never names run A', async (t) => {
+test('startJob moves the old run\'s meta.json aside before the recursive delete starts: a half-deleted directory never names run A', async (t) => {
   const cwd = scratch(t);
   start('half', node("console.log('first-run')"), { cwd });
   assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
@@ -127,6 +127,31 @@ test('startJob unlinks the old run\'s meta.json before the recursive delete star
   syncBuiltinESMExports();
   assert.deepEqual(seen, [{ meta: false, exit: true }], 'the old directory was cleared once, meta.json first');
   assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+});
+
+// R1-F1: an interrupted clear (killed between the rename and the delete, or the delete failed) leaves the tombstone and the old run's other files; the next start of the SAME job heals it.
+test('a leftover job directory holding only the tombstone (meta.cleared.json) and old files is cleared by the next start of that job', async (t) => {
+  const cwd = scratch(t);
+  start('healed', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('healed', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'healed');
+  fs.renameSync(join(dir, 'meta.json'), join(dir, 'meta.cleared.json'));
+  assert.equal(existsSync(join(dir, 'meta.json')), false);
+  assert.equal(readJob('healed', { cwd }).state, 'missing', 'a reader sees no job in the half-cleared directory');
+  start('healed', node("console.log('second-run')"), { cwd });
+  const r = await waitJob('healed', { cwd, timeoutMs: 20_000, ...FAST });
+  assert.equal(r.state, 'done');
+  assert.match(r.tail, /second-run/);
+  assert.doesNotMatch(r.tail, /first-run/);
+  assert.equal(existsSync(join(dir, 'meta.cleared.json')), false, 'the tombstone is gone');
+  // A tombstone naming another job is not ours: the directory is refused, not deleted.
+  start('other', node("console.log('x')"), { cwd });
+  await waitJob('other', { cwd, timeoutMs: 20_000, ...FAST });
+  const odir = jobDirOf(cwd, 'other');
+  fs.renameSync(join(odir, 'meta.json'), join(odir, 'meta.cleared.json'));
+  const meta = readJson(join(odir, 'meta.cleared.json'));
+  writeFileSync(join(odir, 'meta.cleared.json'), JSON.stringify({ ...meta, name: 'not-other' }));
+  assert.throws(() => start('other', node("console.log('y')"), { cwd }), /refusing to replace/);
 });
 
 test('a policy refusal throws and starts nothing', async (t) => {
