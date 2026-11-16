@@ -158,7 +158,7 @@ function clearOldJobDir(jobDir, name) {
   for (const entry of readdirSync(jobDir)) {
     if (entry !== META_TOMBSTONE) rmSync(path.join(jobDir, entry), { recursive: true, force: true, maxRetries: 3 });
   }
-  rmSync(path.join(jobDir, META_TOMBSTONE), { force: true });
+  rmSync(path.join(jobDir, META_TOMBSTONE), { recursive: true, force: true, maxRetries: 3 }); // recursive: Node ignores maxRetries without it
   rmSync(jobDir, { recursive: true, force: true, maxRetries: 3 }); // a fresh log, never a mix of two runs
 }
 
