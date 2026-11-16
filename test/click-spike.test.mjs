@@ -43,7 +43,7 @@ test('judge accepts every committed fixture of every allowlisted build for the c
   }
 });
 
-test('judge: the human stamp is the whole permissionDecision (a hook auto-submit with source user_temporary is not human)', () => {
+test('judge: the human stamp is the whole permissionDecision (an answer stamped source user_temporary with another reasonCode is not human)', () => {
   const human = CASES.find((c) => c.name === 'genuine-click');
   const fixture = load('2.1.323', 'genuine-click');
   assert.equal(judge(human, fixture).ok, true);
