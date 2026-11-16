@@ -4,7 +4,7 @@
 import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
-import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
+import { Fail, guarded, requireConfig, resolveRepo, untrustedAnchorRefusal } from '../lib/cmd-common.mjs';
 import { GhError } from '../lib/proc.mjs';
 import { GitError, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantedRounds, ownerPastRoundHistory, ownerPastRoundRecords, verifyOwnerGrant } from '../hooks/lib/owner-go.mjs';
@@ -406,13 +406,8 @@ async function discardRound(rest, ctx) {
 }
 
 // The sentence when the default branch could not be anchored on the remote (risk.mjs#trustedDefaultBranch), else null: the content hash is then measured from the working tree's
-// default_branch, which a PR can edit. A command that records from, or vouches with, that hash refuses (untrustedAnchorRefusal); an informational one only warns (#456).
+// default_branch, which a PR can edit. A command that records from, or vouches with, that hash refuses (cmd-common.mjs#untrustedAnchorRefusal); an informational one only warns (#456).
 const untrustedAnchor = (root, config) => trustedDefaultBranch(root, config).untrusted;
-// The refusal of a command that would record from a hash measured under an untrusted anchor: exit 3 (the remote could not say). `then` finishes the sentence (what was not done).
-const untrustedAnchorRefusal = (untrusted, then) => new Fail(EXIT.UNAVAILABLE, {
-  ok: false, unavailable: true, reason: 'untrusted-anchor', error: 'untrusted-anchor',
-  message: `${untrusted}; the content hash is measured from that branch, so ${then}`,
-});
 
 // ---- outcome --------------------------------------------------------------------------------
 
@@ -538,8 +533,9 @@ async function markImplemented(rest, ctx) {
     // So this fails CLOSED (exit 3, nothing marked) whenever the base ref used is origin/<branch> and it was not refreshed in this call:
     // the fetch failed or timed out, or there is no origin remote but a leftover refs/remotes/origin/<branch>. Only a repo whose base
     // resolves to the local <branch> (no origin/<branch> ref at all) has nothing to refresh and carries on.
-    const untrusted = untrustedAnchor(root, config); // the same fail-closed rule: a hash measured from a value the PR can edit must not clear a blocking finding (#456)
-    if (untrusted !== null) throw untrustedAnchorRefusal(untrusted, 'the fix cannot be proven to differ from what the round reviewed: nothing was marked');
+    // the same fail-closed rule: a hash measured from a value the PR can edit must not clear a blocking finding (#456)
+    const noAnchor = untrustedAnchorRefusal(root, config, 'the fix cannot be proven to differ from what the round reviewed: nothing was marked');
+    if (noAnchor !== null) throw noAnchor;
     const refresh = refreshBaseRef(root, config);
     if (refresh.usesRemoteRef && !refresh.refreshed) {
       throw new Fail(EXIT.UNAVAILABLE, {
@@ -673,8 +669,9 @@ async function fableRefresh(rest, ctx) {
     const last = state.rounds.at(-1);
     const o = { cwd: root };
     const head = headSha(o);
-    const untrusted = untrustedAnchor(root, config); // the round records a content hash: refuse before it is measured from a value the PR can edit (#456)
-    if (untrusted !== null) throw untrustedAnchorRefusal(untrusted, 'a refresh round cannot be recorded for the current content: nothing was recorded');
+    // the round records a content hash: refuse before it is measured from a value the PR can edit (#456)
+    const noAnchor = untrustedAnchorRefusal(root, config, 'a refresh round cannot be recorded for the current content: nothing was recorded');
+    if (noAnchor !== null) throw noAnchor;
     // As in state outcome: a stale origin/<trusted default branch> only makes the content look moved, and the refusal below says what to do then.
     refreshBaseRef(root, config);
     const hash = currentContentHash(root, config);

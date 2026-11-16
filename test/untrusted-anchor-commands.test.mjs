@@ -84,3 +84,18 @@ test('state outcome: an untrusted anchor still answers (exit 0) but carries the 
   assert.equal(r.json.warnings.length, 1);
   assert.match(r.json.warnings[0], UNANCHORED);
 });
+
+// triage defer-fixes records a deferral after comparing the content hash with the reviewed one: it fails closed like mark-implemented.
+test('triage defer-fixes: an untrusted anchor fails closed (exit 3, untrusted-anchor, nothing deferred) and changes no state', (t) => {
+  const w = roundWorld(t); // max 1: round 2 is the automatic extra round, its fix is then taken out as the skill does
+  const { h2 } = w.atCap();
+  w.revert(h2);
+  w.repo.git(['remote', 'add', 'origin', NO_ORIGIN]);
+  const before = w.stateText();
+  const r = w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', 'R2-S1', '--fix-head', h2, '--reason', 'minor, file it']);
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.deepEqual([r.json.ok, r.json.unavailable, r.json.reason, r.json.error], [false, true, 'untrusted-anchor', 'untrusted-anchor']);
+  assert.match(r.json.message, UNANCHORED);
+  assert.match(r.json.message, /nothing was deferred$/);
+  assert.equal(w.stateText(), before, 'the state is untouched');
+});
