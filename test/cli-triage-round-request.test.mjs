@@ -374,7 +374,7 @@ test('round-request nextRound: after a clean merge of the default branch the alt
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 1, ownCommits: 1 }, 'synthetic']);
-  assert.match(r.json.nextRound.alternative, /the default branch merges cleanly, so a free base-only recording would then follow$/);
+  assert.match(r.json.nextRound.alternative, /the default branch merges cleanly, so a free base-only recording would then follow \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)$/);
 });
 
 // Failure caught: a clean synthetic base was taken as proof of a free recording, but a merged TOPIC branch keeps its changes in the range after the revert, so the round is counted.
@@ -400,6 +400,46 @@ test('round-request nextRound: after a clean merge of a topic branch (not the de
   assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 2, ownCommits: 1 }, 'synthetic'], 'the trial merge is clean: only the merged-in parent tells it apart');
   assert.match(r.json.nextRound.alternative, /that does not make the next round free here: .* a counted round would still follow$/);
   assert.doesNotMatch(r.json.nextRound.alternative, /free base-only recording/);
+});
+
+// Failure caught: the free-recording promise held for an octopus merge (only the second parent was checked) and for a merge of the default branch that carries its own edits.
+// Both leave something in the range that reverting the own commit does not remove.
+function atCapWithOwnCommit(t) {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  w.repo.commit('own commit');
+  w.repo.checkout('main');
+  w.repo.write('src/m.js', 'export const m = 1;\n');
+  w.repo.commit('main adds a file');
+  w.repo.checkout('feat/x');
+  return w;
+}
+const notFree = (r) => {
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.nextRound.kind, 'synthetic', 'the trial merge is clean: only the merge commits tell these apart');
+  assert.match(r.json.nextRound.alternative, /that does not make the next round free here: .* a counted round would still follow$/);
+};
+
+test('round-request nextRound: an octopus merge of main and a topic branch does not get the free-recording promise', (t) => {
+  const w = atCapWithOwnCommit(t);
+  w.repo.git(['branch', 'topic', 'HEAD~1']);
+  w.repo.checkout('topic');
+  w.repo.write('src/t.js', 'export const t = 1;\n');
+  w.repo.commit('topic work');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-m', 'Octopus', 'main', 'topic']);
+  notFree(ask(w));
+});
+
+test('round-request nextRound: a merge of the default branch that carries its own edits does not get the free-recording promise', (t) => {
+  const w = atCapWithOwnCommit(t);
+  w.repo.git(['merge', '--no-ff', '--no-commit', 'main']);
+  w.repo.write('src/extra.js', 'export const extra = 1;\n'); // an edit made inside the merge commit
+  w.repo.git(['add', '-A']);
+  w.repo.git(['commit', '-q', '--no-edit']);
+  notFree(ask(w));
 });
 
 // Failure caught: a prediction that throws must never cost the owner the closing line.
