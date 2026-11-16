@@ -1,8 +1,8 @@
 // #261 (click-to-approve, PR A, T1): the owner's click on a choice dialog as a recorded "merge" / "extra round" / ruling. The transcripts under test/fixtures/click/<build>/ are trimmed copies
 // (prompt, AskUserQuestion tool_use, its tool_result; cwd and repo names neutral, every metadata field as that Claude Code build wrote it), one folder per build in CLICK_BUILDS, recorded by
 // scripts/click-spike.mjs (2.1.322: the 2026-11-11 spikes by hand): genuine-click (a keystroke click), pretooluse-hook-answer, permissionrequest-hook-answer, model-prefilled-answers,
-// preview-annotations, multiselect-click, and from 2.1.323 on pretooluse-ask-prefill (a hook that answers "ask" with prefilled answers: the recording shows a result stamped user_temporary
-// but with reasonCode hook:PreToolUse; whether Claude Code submitted it itself or the recording script pressed a key is not settled by that recording). The fixture-driven cases run for EVERY build in CLICK_BUILDS, so a new build gets the whole matrix by adding its folder. A test rewrites the dialog text
+// preview-annotations, multiselect-click, and from 2.1.323 on pretooluse-ask-prefill and pretooluse-fill-no-decision (a hook that prefills the answers: on 2.1.323 the dialog stayed open about 60 s
+// until the recording script cancelled it, so Claude Code waits for a person and the recording is a cancelled dialog: an error result, no answer, no permissionDecision). The fixture-driven cases run for EVERY build in CLICK_BUILDS, so a new build gets the whole matrix by adding its folder. A test rewrites the dialog text
 // and answer inside a copy to bind a real closing block (and moves the result's time 30 s after the tool_use when the recording was answered sooner than MIN_ANSWER_MS, so the 2 s floor is
 // never what a case proves); it never touches a metadata field unless the case IS that field.
 import { test } from 'node:test';
@@ -29,9 +29,9 @@ const BUILD_DIR = (build) => new URL(`${build}/`, FIX);
 const loadFixture = (name, build = OLDEST) => readFileSync(new URL(`${name}.jsonl`, BUILD_DIR(build)), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 const buildNo = (b) => b.split('.').map(Number);
 const buildAtLeast = (b, min) => { const [x, y] = [buildNo(b), buildNo(min)]; for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return true; };
-// The fixture set every build in CLICK_BUILDS must have; pretooluse-ask-prefill exists from 2.1.323 on (2.1.322 has no such Claude Code behaviour to record).
+// The fixture set every build in CLICK_BUILDS must have; the two prefilled-dialog recordings exist from 2.1.323 on (2.1.322 has no such Claude Code behaviour to record).
 const REQUIRED = ['genuine-click', 'pretooluse-hook-answer', 'permissionrequest-hook-answer', 'model-prefilled-answers', 'preview-annotations', 'multiselect-click'];
-const requiredFor = (build) => (buildAtLeast(build, '2.1.323') ? [...REQUIRED, 'pretooluse-ask-prefill'] : REQUIRED);
+const requiredFor = (build) => (buildAtLeast(build, '2.1.323') ? [...REQUIRED, 'pretooluse-ask-prefill', 'pretooluse-fill-no-decision'] : REQUIRED);
 const OK = () => ({ ok: true, hookLayersSha256: null });
 const noSleep = async () => {};
 
@@ -182,7 +182,7 @@ test('every build in CLICK_BUILDS: a genuine click and a multiselect click are r
   }
 });
 
-test('a genuine 2.1.323 click (the recording, answered after 30 s) is recorded and proven', async (t) => {
+test('a genuine 2.1.323 click (the recording, answered after 29 s) is recorded and proven', async (t) => {
   const w = world(t, { build: '2.1.323' });
   const r = await w.click();
   assert.equal(r.recorded?.via, 'ask', JSON.stringify(r));
@@ -261,22 +261,29 @@ test('an answer a hook gave (PreToolUse updatedInput, PermissionRequest) is refu
   }
 });
 
-// 2.1.323: the recording of a PreToolUse hook that answers "ask" with `updatedInput.answers` has a result about 1.5 s after the tool_use, stamped decision accept / source user_temporary /
-// grantScope once, but reasonCode "hook:PreToolUse" (a person's click: "unknown"), annotations {} and no `answers` in the tool_use input. (An auto-submit by Claude Code or a stray key
-// press of the old recording script: the recording cannot tell; the whole-permissionDecision check refuses it either way.)
-test('a hook-prefilled "ask" answer recorded with reasonCode hook:PreToolUse is refused not-a-human-answer, whatever the answer time (every build that has the case)', async (t) => {
+// 2.1.323: a dialog that came with prefilled answers from a hook (PreToolUse "ask" with updatedInput.answers, or updatedInput alone) stayed open about 60 s until the recording script cancelled it:
+// Claude Code waits for a person. The recordings are therefore cancelled dialogs (an error result "User rejected tool use", no answer, no permissionDecision). The older recording of the same case (answered
+// 1.5 s after the tool_use, reasonCode hook:PreToolUse) was the old script's own stray key presses; the whole-permissionDecision check stays as defence in depth (the 'hook reasonCode' case below).
+test('a prefilled dialog that stayed open and was cancelled has no answer and is refused, even with an answer written into it and the error flag dropped (every build that has the case)', async (t) => {
   const builds = [...new Set(['2.1.323', ...CLICK_BUILDS.filter((b) => buildAtLeast(b, '2.1.323'))])]; // 2.1.323 always: it is the build that recorded the case
   for (const build of builds) {
-    const w = world(t, { fixture: 'pretooluse-ask-prefill', build, mutate: ({ use, result }) => { result.timestamp = new Date(Date.parse(use.timestamp) + 40000).toISOString(); } });
-    assert.equal(w.result.permissionDecision.reasonCode, 'hook:PreToolUse', 'the fixture is the recorded hook-prefilled answer (hook:PreToolUse stamp)');
-    assert.deepEqual(Object.keys(w.use.message.content[0].input), ['questions']);
-    const ev = clickEvidence(w.file, w.toolUseId, { home: w.home });
-    assert.deepEqual([ev.ok, ev.reason], [false, 'not-a-human-answer'], `${build} clickEvidence`);
-    assert.deepEqual(await w.click(), { refused: 'not-a-human-answer' }, build);
-    assert.equal(w.records().length, 0);
-    // the recording's own, shorter time refuses the same way (the stamp is checked before the floor)
-    const fast = world(t, { fixture: 'pretooluse-ask-prefill', build, mutate: ({ use, result }) => { result.timestamp = new Date(Date.parse(use.timestamp) + 1487).toISOString(); } });
-    assert.equal(clickEvidence(fast.file, fast.toolUseId, { home: fast.home }).reason, 'not-a-human-answer');
+    for (const fixture of ['pretooluse-ask-prefill', 'pretooluse-fill-no-decision', 'model-prefilled-answers']) {
+      const raw = loadFixture(fixture, build);
+      assert.ok(Date.parse(raw[2].timestamp) - Date.parse(raw[1].timestamp) >= 30000, `${build} ${fixture}: the dialog stayed open at least 30 s`);
+      assert.equal(raw[2].toolUseResult, 'User rejected tool use');
+      assert.equal(raw[2].message.content[0].is_error, true);
+      assert.ok(!('permissionDecision' in raw[2]), `${build} ${fixture}: a cancelled dialog carries no stamp`);
+      if (fixture === 'model-prefilled-answers') continue; // its input carries `answers`: refused for the tool-use shape, tested below
+      const w = world(t, { fixture, build });
+      assert.deepEqual(Object.keys(w.use.message.content[0].input), ['questions']);
+      assert.deepEqual([clickEvidence(w.file, w.toolUseId, { home: w.home }).ok, clickEvidence(w.file, w.toolUseId, { home: w.home }).reason], [false, 'tool-result-shape'], `${build} ${fixture}: the error result`);
+      assert.deepEqual(await w.click(), { refused: 'tool-result-shape' }, `${build} ${fixture}`);
+      assert.equal(w.records().length, 0);
+      // even with the error flag gone, there is no human stamp
+      const bare = world(t, { fixture, build, mutate: ({ result }) => { delete result.message.content[0].is_error; } });
+      assert.deepEqual(await bare.click(), { refused: 'not-a-human-answer' }, `${build} ${fixture} without the error flag`);
+      assert.equal(bare.records().length, 0);
+    }
   }
 });
 
@@ -316,9 +323,12 @@ test('the model pre-filling `answers` in the tool input is refused (an input key
   }
 });
 
-test('2.1.323 model-prefilled-answers: the recording itself carries the exact human stamp, so only the tool-use shape check refuses it (answer >= 2 s)', async (t) => {
-  const w = world(t, { fixture: 'model-prefilled-answers', build: '2.1.323', mutate: ({ use, result }) => { use.message.content[0].input.answers = { x: 'Merge' }; result.timestamp = new Date(Date.parse(use.timestamp) + 2058).toISOString(); } });
-  assert.deepEqual(w.result.permissionDecision, HUMAN_DECISION);
+test('2.1.323 model-prefilled-answers: the recording is a dialog the model prefilled that stayed open until cancelled; the tool-use shape check refuses it first (answer >= 2 s)', async (t) => {
+  const raw = loadFixture('model-prefilled-answers', '2.1.323');
+  assert.ok(Object.keys(raw[1].message.content[0].input).includes('answers'), 'the recorded tool_use input carries answers');
+  assert.equal(raw[2].permissionDecision, undefined, 'a cancelled dialog: no stamp');
+  // the world rewrites the tool_use input to the issued dialog; put the model's `answers` key back
+  const w = world(t, { fixture: 'model-prefilled-answers', build: '2.1.323', mutate: ({ use, result, dialog }) => { use.message.content[0].input = { questions: [dialog], answers: { [dialog.question]: 'Merge' } }; result.timestamp = new Date(Date.parse(use.timestamp) + 2058).toISOString(); } });
   assert.ok(Date.parse(w.result.timestamp) - Date.parse(w.use.timestamp) >= MIN_ANSWER_MS);
   assert.deepEqual(clickEvidence(w.file, w.toolUseId, { home: w.home }), { ok: false, reason: 'tool-use-shape' });
 });

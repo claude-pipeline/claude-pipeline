@@ -9,8 +9,8 @@
 // when any case no longer shows it: then DO NOT add the build to CLICK_BUILDS (clicks stay refused on it; typing still works).
 // Exit codes: 0 = the WHOLE matrix ran and every case passed (the only run that may justify adding a build); 1 = a case failed;
 // 2 = usage, or started inside Claude Code; 3 = a partial run (--only) whose cases passed: it is NOT a verdict and never recommends adding the build.
-// The keys the script sends are logged with their time: the pre-dialog handlers (folder trust, auto-mode tip) stop as soon as the AskUserQuestion tool_use
-// is in the transcript, and a case fails if a key was sent into a dialog that should get none, or the result was recorded before the script's own Enter.
+// The keys the script sends are logged with their time: the pre-dialog handlers (folder trust, auto-mode tip) re-check for the AskUserQuestion call before EVERY key and stop as soon as it
+// is known (sendKeys), and a case fails if any dismiss key went in at or after the tool_use, a key was sent into a dialog that should get none, or the result was recorded before the script's own Enter.
 // Costs a few Haiku calls. macOS or Linux (util-linux `script`); needs a logged-in `claude`.
 // Run it from your OWN terminal, not inside a Claude Code session: Claude Code will not start nested, and the script does not unset CLAUDECODE or CLAUDE_CODE_* for
 // the child (only the owner may unset CLAUDECODE); started inside a session it prints that and exits 2.
@@ -34,6 +34,12 @@ const QUESTION = 'Spike ask-0123456789ab: merge #1?';
 export const PREFILL_LABEL = 'Prefilled by spike';
 const SIMPLE = `Call the AskUserQuestion tool exactly once, with one question: question "${QUESTION}", header "Merge", multiSelect false, options [{label:"Not yet",description:"stop"},{label:"Merge",description:"merge it"},{label:"${PREFILL_LABEL}",description:"only a hook or the model picks this"}]. Then reply with only the answer you received.`;
 const PREFILLED = `Call the AskUserQuestion tool exactly once. Its input must have TWO keys: "questions" = [{"question":"${QUESTION}","header":"Merge","multiSelect":false,"options":[{"label":"Not yet","description":"stop"},{"label":"Merge","description":"merge it"},{"label":"${PREFILL_LABEL}","description":"only a hook or the model picks this"}]}] and "answers" = {"${QUESTION}":"${PREFILL_LABEL}"}. Include the answers key exactly. Then reply with only the answer you received.`;
+// How long the script holds a dialog open before it cancels it with its own exit key (a case with a hook that fills the answers in, or with keys, gets this long to be answered).
+export const HOLD_MS = 30_000;
+// A "waits" case (the dialog came with prefilled answers) counts as "Claude Code waited for a person" only if it stayed open at least this long after the tool_use before the script's exit key
+// cancelled it. The script's own minimum is HOLD_MS (the hold starts only after the hook has seen the call, so the tool_use is never later than the hold's start) and the recordings show 33-60 s;
+// 25 s leaves 5 s for timestamp jitter, and is far above anything a stray key press produces (the old recordings were answered 1.4-2 s after the tool_use).
+export const WAITS_MIN_MS = 25_000;
 // The hook cases' answer: the older recordings (2.1.322, 2.1.323) were made when the hook prefilled "Merge", so those fixtures keep passing.
 const HOOK_ANSWER = new RegExp(`^(?:Merge|${PREFILL_LABEL})$`);
 const PREVIEW = 'Call the AskUserQuestion tool exactly once with exactly this input JSON (copy it byte for byte, including the \\n newlines): {"questions":[{"question":"Merge #1818 into main?\\n\\nRulings: R1 F2 ACCEPT (fixed) · R2 F1 FOLLOW-UP #1830 · R2 F3 REJECT (Codex high: not reachable)\\nAreas: pipeline/hooks, pipeline/lib/finalgate.mjs, skills/review, docs\\nHold: none\\nHead 3f2a9c81d0e4 · items 9b1c2d3e4f50a6b7 · repo acme/app\\nask-0123456789ab","header":"Merge","multiSelect":false,"options":[{"label":"Not yet","description":"Leave #1818 open; nothing merges."},{"label":"Merge","description":"Merge #1818 at head 3f2a9c81d0e4 with the items above.","preview":"Rulings\\nR1 F2 ACCEPT (fixed)\\nR2 F1 FOLLOW-UP #1830\\nR2 F3 REJECT (Codex high: not reachable)\\nHead 3f2a9c81d0e4 · items 9b1c2d3e4f50a6b7"}]}]}. Then reply with only the answer you received.';
@@ -41,19 +47,22 @@ const MULTI = 'Call the AskUserQuestion tool exactly once with exactly this inpu
 
 // expect: what the recorder must see. human = permissionDecision exactly HUMAN_DECISION and annotations exactly {}; hook = source hook and no annotations;
 // annotated = a human answer whose annotations are NOT empty; prefilled = the tool_use input carries an `answers` key (the recorder refuses that input);
-// not-human = the dialog was ANSWERED (a result with an answer, not an error, not ended by the script's own exit key) and the permissionDecision is not exactly HUMAN_DECISION; a dialog that was never answered is inconclusive (judge returns inconclusive: true, ok false). since: the first build the case applies to (the committed fixtures of an older build lack it).
+// waits = a dialog that came with prefilled answers (from a hook) is NOT submitted by Claude Code: it waits for a person. Passes when the dialog stayed open at least WAITS_MIN_MS after the tool_use
+// and was then cancelled by the script's own exit key (an error result, no answer; no case or dismiss key went in), or when it was answered with a stamp that is not exactly HUMAN_DECISION.
+// It fails when it was answered with the exact human stamp or when any non-exit key went into the dialog; a dialog cancelled sooner than WAITS_MIN_MS, or answered after an exit key, is
+// inconclusive (judge returns inconclusive: true, ok false), so a cancel never counts as a hook answer.
+// since: the first build the case applies to (the committed fixtures of an older build lack it).
 export const CASES = [
   { name: 'genuine-click', mode: 'none', prompt: SIMPLE, keys: [DOWN, ENTER], expect: 'human', answer: 'Merge' },
   { name: 'pretooluse-hook-answer', mode: 'answer', prompt: SIMPLE, keys: [], expect: 'hook', answer: HOOK_ANSWER },
   { name: 'permissionrequest-hook-answer', mode: 'permreq', prompt: SIMPLE, keys: [], expect: 'hook', answer: HOOK_ANSWER },
   { name: 'model-prefilled-answers', mode: 'none', prompt: PREFILLED, keys: [], expect: 'prefilled' },
-  // 2.1.323: the committed recording of a PreToolUse hook answering "ask" with prefilled answers shows a result stamped source user_temporary with annotations {} and
-  // reasonCode 'hook:PreToolUse' (not 'unknown') about 1.5 s after the tool_use. That recording was made by the older script, which could press keys into the dialog, so it
-  // cannot tell a Claude Code auto-submit from a stray key press; a re-record with the key log (judge checks it) does.
-  { name: 'pretooluse-ask-prefill', mode: 'askfill', prompt: SIMPLE, keys: [], expect: 'not-human', since: '2.1.323' },
-  // A PreToolUse hook that returns ONLY updatedInput (answers prefilled), no permissionDecision. Not recorded yet (since: the first build after 2.1.323, or a 2.1.323 re-record);
-  // expected not-human. If a recording shows the human stamp here, the dialog-hook check (not the stamp) is what stops it.
-  { name: 'pretooluse-fill-no-decision', mode: 'fill', prompt: SIMPLE, keys: [], expect: 'not-human', since: '2.1.324' },
+  // 2.1.323: a PreToolUse hook answering "ask" with prefilled answers. The owner's re-record (their own terminal, 2026-11-15; no key log, the recording script's case keys are empty) shows the dialog staying open about 60 s until the
+  // script's exit key cancelled it (an error result, no answer): Claude Code waits for a person. (The earlier recording, answered about 1.5 s after the tool_use with reasonCode hook:PreToolUse,
+  // was made by a script that could press keys into the dialog: those were its own stray key presses, not an auto-submit.)
+  { name: 'pretooluse-ask-prefill', mode: 'askfill', prompt: SIMPLE, keys: [], expect: 'waits', since: '2.1.323' },
+  // A PreToolUse hook that returns ONLY updatedInput (answers prefilled), no permissionDecision. The same 2.1.323 re-record: the dialog stayed open about 60 s until cancelled.
+  { name: 'pretooluse-fill-no-decision', mode: 'fill', prompt: SIMPLE, keys: [], expect: 'waits', since: '2.1.323' },
   { name: 'preview-annotations', mode: 'none', prompt: PREVIEW, keys: [DOWN, ENTER], expect: 'annotated', answer: 'Merge' },
   // Number keys tick options, → goes to the Submit tab, whose first choice submits. Which options end up ticked is not reliable on 2.1.323 (the same keys
   // ticked different sets across runs), so any list of two or more labels joined by ", " is accepted: the tests rewrite the answer anyway.
@@ -135,8 +144,8 @@ export function trim(entries, cwd) {
 const canonicalInput = (input) => input !== null && typeof input === 'object' && !Array.isArray(input) && Object.keys(input).every((k) => k === 'questions' || k === 'metadata');
 
 // sent: the keys this script sent into the session, [{ key, at (ms), phase: 'dismiss' | 'case' | 'exit' }], when the run was a real one (a committed fixture has none: skipped).
-// A case that gets no keys fails if any dismiss/case key went in at or after the tool_use (it could have answered the dialog); a case that does press keys fails if the result
-// was recorded before the script's own Enter. 'exit' keys (ESC, /exit) are cleanup after the answer; one sent before the result is reported as endedByScriptKey.
+// A dismiss key at or after the tool_use fails EVERY case (the trust/tip handlers must have stopped: a key there could have answered the dialog); a case that gets no keys fails if any
+// dismiss/case key went in after the tool_use; a case that does press keys fails if the result was recorded before the script's own Enter. 'exit' keys (ESC, /exit) are cleanup after the answer; one sent before the result is reported as endedByScriptKey.
 export function judge(c, [, use, result], { sent } = {}) {
   const input = blocks(use).find((b) => b?.type === 'tool_use').input;
   const pd = result.permissionDecision;
@@ -153,7 +162,9 @@ export function judge(c, [, use, result], { sent } = {}) {
   if (Array.isArray(sent)) {
     const into = sent.filter((k) => k.phase !== 'exit' && k.at >= useAt);
     const enter = sent.find((k) => k.phase === 'case' && k.key === ENTER);
-    if (c.keys.length === 0 && into.length > 0) keyProblem = `${into.length} key(s) sent after the tool_use (first ${into[0].at - useAt} ms after it, phase ${into[0].phase}) into a dialog that should get none`;
+    const dismissInto = into.filter((k) => k.phase === 'dismiss');
+    if (dismissInto.length > 0) keyProblem = `${dismissInto.length} dismiss key(s) sent at or after the tool_use (first ${dismissInto[0].at - useAt} ms after it): the trust/tip handler pressed into the dialog`;
+    else if (c.keys.length === 0 && into.length > 0) keyProblem = `${into.length} key(s) sent after the tool_use (first ${into[0].at - useAt} ms after it, phase ${into[0].phase}) into a dialog that should get none`;
     else if (c.keys.length > 0 && !enter) keyProblem = 'the script never pressed Enter';
     else if (c.keys.length > 0 && !(resultAt >= enter.at)) keyProblem = `the result was recorded ${enter.at - resultAt} ms before the script's own Enter`;
   }
@@ -162,21 +173,31 @@ export function judge(c, [, use, result], { sent } = {}) {
     annotations: isObj(res) && Object.hasOwn(res, 'annotations') ? Object.keys(res.annotations ?? {}).length : 'absent',
     answer: answer ?? null,
     inputKeys: Object.keys(input ?? {}).join(','),
+    ...(Number.isFinite(resultAt - useAt) ? { openMs: resultAt - useAt } : {}),
     ...(keyProblem ? { keyProblem } : {}),
     ...(Array.isArray(sent) && sent.some((k) => k.phase === 'exit' && k.at <= resultAt) ? { endedByScriptKey: true } : {}),
   };
   const clean = canonicalInput(input) && keyProblem === null;
-  // A not-human verdict needs an answered dialog: a result that is an error, carries no answer, or was recorded after the script's own ESC / /exit says nothing about who (or what) answered.
-  // The script cancelling a dialog that stayed open (a hook that filled nothing in) must never read as "not human": it is inconclusive and fails a run.
+  // A "waits" verdict (a dialog that came with prefilled answers): either it was ANSWERED with a stamp that is not the human one (a result with an answer, not an error, not ended by the script's own
+  // exit key), or it stayed open at least WAITS_MIN_MS after the tool_use and was then cancelled (an error result, no answer). A cancel never counts as a hook answer: a dialog cancelled sooner
+  // than that, or an error that carries an answer, or an answer recorded after the script's exit key, says nothing about who answered and is inconclusive (it fails a run).
   const errored = blocks(result).some((b) => b?.type === 'tool_result' && b.tool_use_id === use.message.content.find((x) => x?.type === 'tool_use')?.id && b.is_error === true);
-  const inconclusive = c.expect === 'not-human' && (errored || answer === undefined || seen.endedByScriptKey === true);
-  if (inconclusive) seen.inconclusive = errored ? 'the result is an error (the dialog was cancelled, not answered)' : answer === undefined ? 'the result carries no answer' : 'the script sent an exit key before the result was recorded';
+  const cancelled = errored && answer === undefined;
+  const heldMs = resultAt - useAt;
+  let inconclusive = null;
+  if (c.expect === 'waits') {
+    if (cancelled) { if (!(heldMs >= WAITS_MIN_MS)) inconclusive = `the dialog was cancelled ${heldMs} ms after the tool_use, sooner than the ${WAITS_MIN_MS} ms a waiting dialog must stay open`; }
+    else if (errored) inconclusive = 'the result is an error that carries an answer';
+    else if (answer === undefined) inconclusive = 'the result carries no answer';
+    else if (seen.endedByScriptKey === true) inconclusive = 'the script sent an exit key before the result was recorded';
+  }
+  if (inconclusive) seen.inconclusive = inconclusive;
   const ok = {
     human: clean && human && emptyNotes && wanted(answer),
     hook: clean && !human && isObj(pd) && pd.source === 'hook' && !(isObj(res) && Object.hasOwn(res, 'annotations')) && wanted(answer),
     annotated: clean && human && isObj(res?.annotations) && Object.keys(res.annotations).length > 0 && wanted(answer),
     prefilled: Object.hasOwn(input ?? {}, 'answers'),
-    'not-human': clean && !human && !inconclusive,
+    waits: clean && !human && !inconclusive,
   }[c.expect];
   return { ok, seen, ...(inconclusive ? { inconclusive: true } : {}) };
 }
@@ -190,6 +211,19 @@ export function headlessVerdict(r) {
   if (r.code !== 0) return { ok: false, text: `claude -p exited with code ${r.code}: nothing was verified` };
   if (r.called || r.fixture) return { ok: false, text: `AskUserQuestion was called headless${r.fixture ? ` (entrypoint ${JSON.stringify(r.fixture[2]?.entrypoint)})` : ''}: the case expects it not to be offered` };
   return { ok: true, text: 'claude -p exited 0 and AskUserQuestion was not called (not offered headless)' };
+}
+
+// Types a list of keys one by one, `gapMs` apart. A 'dismiss' key (trust screen, auto-mode tip) is sent only while `asked()` is still false, checked immediately before EACH key: the
+// AskUserQuestion call can be made while the list is being typed (the old code checked once, so DOWN+ENTER could land in the dialog and answer it as "Merge"). Returns how many keys were sent.
+export async function sendKeys(list, { phase, asked, send, sleep: wait, gapMs = 700 }) {
+  let n = 0;
+  for (const k of list) {
+    await wait(gapMs);
+    if (phase === 'dismiss' && asked()) break;
+    send(k, phase);
+    n++;
+  }
+  return n;
 }
 
 async function runCase(c, { claude, scratch }) {
@@ -236,7 +270,7 @@ async function runCase(c, { claude, scratch }) {
   let seen = 0;
   const fresh = () => screen().slice(seen);
   const consume = () => { seen = screen().length; };
-  const keys = async (list, ph) => { for (const k of list) { await sleep(700); send(k, ph); } await sleep(1500); consume(); };
+  const keys = async (list, ph) => { await sendKeys(list, { phase: ph, asked: () => Boolean(transcript()), send, sleep }); await sleep(1500); consume(); };
   const answered = () => (transcript() ? trim(readJsonl(transcript()), cwd) : null);
   const deadline = Date.now() + 150_000;
   // Wait for the dialog (or, for the hook cases, the answer). Screens that can come first are dismissed: the folder-trust question (the scratch folder
@@ -256,7 +290,7 @@ async function runCase(c, { claude, scratch }) {
     else if (!asked && /Teachautomode/.test(t)) await keys([DOWN, ENTER], 'dismiss');
     else await sleep(500);
   }
-  const waitUntil = Date.now() + (c.keys.length > 0 || c.mode !== 'none' ? 30_000 : 4_000);
+  const waitUntil = Date.now() + (c.keys.length > 0 || c.mode !== 'none' ? HOLD_MS : 4_000);
   while (Date.now() < waitUntil && !answered()) await sleep(500);
   phase = 'exit';
   if (!answered()) { send(ESC); await sleep(3000); } // the declined case (and any dialog the keys missed)

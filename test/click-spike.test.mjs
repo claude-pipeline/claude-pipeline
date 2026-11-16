@@ -8,7 +8,7 @@ import { existsSync, mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { CASES, DOWN, ENTER, HOOK, PARTIAL_EXIT, PREFILL_LABEL, headlessVerdict, judge, selectCases, trim, verdict } from '../scripts/click-spike.mjs';
+import { CASES, DOWN, ENTER, HOLD_MS, HOOK, PARTIAL_EXIT, PREFILL_LABEL, WAITS_MIN_MS, headlessVerdict, judge, selectCases, sendKeys, trim, verdict } from '../scripts/click-spike.mjs';
 import { CLICK_BUILDS, HUMAN_DECISION } from '../pipeline/hooks/lib/owner-go-click.mjs';
 
 const FIX = new URL('./fixtures/click/', import.meta.url);
@@ -28,7 +28,7 @@ test('importing the script does not run main() (this file is not a script run)',
 test('judge accepts every committed fixture of every allowlisted build for the case the script defines', () => {
   for (const build of CLICK_BUILDS) {
     const cases = recorded(build);
-    assert.ok(cases.length >= 6, `${build}: the script defines the six core cases (and pretooluse-ask-prefill from 2.1.323)`);
+    assert.ok(cases.length >= 6, `${build}: the script defines the six core cases (and the two prefilled-dialog cases from 2.1.323)`);
     for (const c of cases) {
       const j = judge(c, load(build, c.name));
       assert.equal(j.ok, true, `${build}/${c.name}: expected ${c.expect}, saw ${JSON.stringify(j.seen)}`);
@@ -36,8 +36,11 @@ test('judge accepts every committed fixture of every allowlisted build for the c
   }
   // a case newer than the build may still have a fixture (an owner re-record of an older build): it is judged when present
   for (const build of CLICK_BUILDS) for (const c of CASES.filter((x) => !x.headless && !recorded(build).includes(x) && fixtureExists(build, x.name))) assert.equal(judge(c, load(build, c.name)).ok, true, `${build}/${c.name}`);
-  assert.ok(recorded('2.1.323').some((c) => c.name === 'pretooluse-ask-prefill'));
-  assert.ok(!recorded('2.1.322').some((c) => c.name === 'pretooluse-ask-prefill'));
+  for (const name of ['pretooluse-ask-prefill', 'pretooluse-fill-no-decision']) {
+    assert.ok(recorded('2.1.323').some((c) => c.name === name), name);
+    assert.ok(!recorded('2.1.322').some((c) => c.name === name), name);
+    assert.ok(fixtureExists('2.1.323', name), `2.1.323/${name} is committed`);
+  }
 });
 
 test('judge: the human stamp is the whole permissionDecision (a hook auto-submit with source user_temporary is not human)', () => {
@@ -48,8 +51,8 @@ test('judge: the human stamp is the whole permissionDecision (a hook auto-submit
   const forged = structuredClone(fixture);
   forged[2].permissionDecision = { ...HUMAN_DECISION, reasonCode: 'hook:PreToolUse' };
   assert.equal(judge(human, forged).ok, false);
-  assert.equal(judge(CASES.find((c) => c.name === 'pretooluse-ask-prefill'), forged).ok, true, 'and the case that expects it passes on it');
-  assert.equal(judge(CASES.find((c) => c.name === 'pretooluse-ask-prefill'), fixture).ok, false, 'a real click is not what that case expects');
+  assert.equal(judge(CASES.find((c) => c.name === 'pretooluse-ask-prefill'), forged).ok, true, 'and a "waits" case passes on an answer that is not exactly the human stamp');
+  assert.equal(judge(CASES.find((c) => c.name === 'pretooluse-ask-prefill'), fixture).ok, false, 'a real click is not what a "waits" case expects');
 });
 
 test('trim keeps the prompt, the AskUserQuestion tool_use and its result; neutral cwd; drops usage; null without a result', () => {
@@ -78,7 +81,7 @@ test('R1-B1: judge refuses a noncanonical tool_use input for every case that doe
   const prefilledFixture = load('2.1.323', 'model-prefilled-answers');
   assert.equal(judge(byName('genuine-click'), prefilledFixture).ok, false, 'the 2.1.323 model-prefilled recording carries the exact human stamp; as a genuine click it must fail');
   assert.equal(judge(byName('model-prefilled-answers'), prefilledFixture).ok, true, 'and it is exactly what the prefilled case expects');
-  for (const [name, fixture] of [['genuine-click', 'genuine-click'], ['preview-annotations', 'preview-annotations'], ['multiselect-click', 'multiselect-click'], ['pretooluse-hook-answer', 'pretooluse-hook-answer'], ['pretooluse-ask-prefill', 'pretooluse-ask-prefill']]) {
+  for (const [name, fixture] of [['genuine-click', 'genuine-click'], ['preview-annotations', 'preview-annotations'], ['multiselect-click', 'multiselect-click'], ['pretooluse-hook-answer', 'pretooluse-hook-answer'], ['pretooluse-ask-prefill', 'pretooluse-ask-prefill'], ['pretooluse-fill-no-decision', 'pretooluse-fill-no-decision']]) {
     const c = byName(name);
     assert.equal(judge(c, load('2.1.323', fixture)).ok, true, name);
     for (const extra of ['answers', 'surprise']) {
@@ -160,12 +163,15 @@ test('R1-F1/F3: the scratch hook prefills the non-navigable label; mode fill ret
   assert.equal(run('none', 'PreToolUse'), null);
 });
 
-test('R1-F3: the matrix has the PreToolUse updatedInput-only case, expected not-human', () => {
+test('R1-F3: the matrix has the PreToolUse updatedInput-only case, expected waits, recorded on 2.1.323', () => {
   const c = byName('pretooluse-fill-no-decision');
   assert.ok(c);
   assert.equal(c.mode, 'fill');
-  assert.equal(c.expect, 'not-human');
+  assert.equal(c.expect, 'waits');
+  assert.equal(c.since, '2.1.323');
   assert.deepEqual(c.keys, []);
+  assert.equal(byName('pretooluse-ask-prefill').expect, 'waits');
+  assert.ok(CASES.every((x) => x.expect !== 'not-human'), 'the old not-human expectation is gone');
 });
 
 test('R1-F2: a partial run (--only) is not a verdict: distinct exit code, no CLICK_BUILDS recommendation', () => {
@@ -189,36 +195,98 @@ test('R1-F2: --only names are checked against the matrix', () => {
   assert.deepEqual(selectCases(new Set(['genuine-click', 'typo'])).unknown, ['typo']);
 });
 
-test('R2-B1: a not-human case needs a real answered result; a dialog the script cancelled (ESC, error result, no answer) is inconclusive, never not-human', () => {
-  const notHuman = ['pretooluse-ask-prefill', 'pretooluse-fill-no-decision'].map(byName);
-  const answered = load('2.1.323', 'pretooluse-ask-prefill');
-  // the committed 2.1.322 recording of the model-prefilled case: the dialog stayed open and the result is the rejection error with no permissionDecision and no answers
-  const cancelled = load('2.1.322', 'model-prefilled-answers');
-  // the same rejection with the canonical tool_use input a script-cancelled dialog really has (the committed 2.1.322 input carries prefilled answers, which fails for another reason)
-  const scriptCancelled = [answered[0], answered[1], cancelled[2]];
-  scriptCancelled[2].message.content[0].tool_use_id = answered[1].message.content.find((b) => b.type === 'tool_use').id;
-  for (const c of notHuman) {
-    assert.equal(judge(c, cancelled).inconclusive, true, `${c.name}: the committed 2.1.322 rejection is inconclusive as a not-human recording`);
-    const j = judge(c, scriptCancelled);
-    assert.equal(j.ok, false, `${c.name}: an error result with no answer is not a not-human verdict`);
-    assert.equal(j.inconclusive, true, `${c.name}: and it is reported as inconclusive`);
+test('R2-B1/R2-F1: a "waits" case passes on a dialog held open and then cancelled by the script, or answered with a non-human stamp; a quick cancel is inconclusive, a human stamp or a key into it fails', () => {
+  const waits = ['pretooluse-ask-prefill', 'pretooluse-fill-no-decision'].map(byName);
+  assert.ok(WAITS_MIN_MS > 0 && WAITS_MIN_MS < HOLD_MS, 'N sits below the script\'s own hold (30 s) and far above a stray key press (1-2 s)');
+  for (const c of waits) {
+    const held = load('2.1.323', c.name);
+    const useAt = Date.parse(held[1].timestamp);
+    const resultAt = Date.parse(held[2].timestamp);
+    assert.ok(resultAt - useAt >= 55000 && resultAt - useAt < 65000, `${c.name}: the owner's recording held the dialog open about 60 s`);
+    assert.equal(held[2].toolUseResult, 'User rejected tool use');
+    assert.equal(held[2].message.content[0].is_error, true);
+    assert.equal('permissionDecision' in held[2], false, 'a cancelled dialog carries no permissionDecision');
+    // the recording as committed (no key log): held open >= N, an error with no answer
+    const j = judge(c, held);
+    assert.equal(j.ok, true, `${c.name}: ${JSON.stringify(j.seen)}`);
     assert.equal(j.seen.answer, null);
-    // the same shape produced by the script's own ESC: the result is recorded after an exit key
-    const esc = judge(c, answered, { sent: [{ key: '\x1b', at: Date.parse(answered[2].timestamp) - 1000, phase: 'exit' }] });
-    assert.equal(esc.ok, false, `${c.name}: ESC from the script before the result`);
-    assert.equal(esc.seen.endedByScriptKey, true);
+    assert.ok(j.seen.openMs >= WAITS_MIN_MS);
+    // the same with a real key log: the script's ESC (exit phase) cancelled it, nothing else was typed
+    assert.equal(judge(c, held, { sent: [{ key: DOWN, at: useAt - 4000, phase: 'dismiss' }, { key: '\x1b', at: resultAt - 20, phase: 'exit' }] }).ok, true);
+    // a key into the dialog (case or dismiss) fails it, however long it stayed open
+    for (const phase of ['case', 'dismiss']) {
+      const stray = judge(c, held, { sent: [{ key: ENTER, at: useAt + 30000, phase }, { key: '\x1b', at: resultAt - 20, phase: 'exit' }] });
+      assert.equal(stray.ok, false, `${c.name}: a ${phase} key sent into the dialog`);
+      assert.match(stray.seen.keyProblem, /key/);
+    }
+    // a cancel sooner than N is inconclusive, never a pass; exactly N passes
+    const quick = structuredClone(held);
+    quick[2].timestamp = new Date(useAt + WAITS_MIN_MS - 1).toISOString();
+    const q = judge(c, quick);
+    assert.deepEqual([q.ok, q.inconclusive], [false, true], `${c.name}: cancelled after N - 1 ms`);
+    assert.match(q.seen.inconclusive, /sooner/);
+    quick[2].timestamp = new Date(useAt + WAITS_MIN_MS).toISOString();
+    assert.equal(judge(c, quick).ok, true, `${c.name}: exactly N`);
+    const instant = structuredClone(held);
+    instant[2].timestamp = new Date(useAt + 1400).toISOString();
+    assert.equal(judge(c, instant).ok, false, 'a dialog cancelled 1.4 s after the tool_use');
+    // an error result that carries an answer, or a result with neither an error nor an answer, is no verdict
+    const errAnswer = load('2.1.323', 'pretooluse-hook-answer');
+    errAnswer[2].message.content.find((b) => b.type === 'tool_result').is_error = true;
+    assert.deepEqual([judge(c, errAnswer).ok, judge(c, errAnswer).inconclusive], [false, true], 'an error that carries an answer');
+    const noAnswer = structuredClone(held);
+    delete noAnswer[2].message.content[0].is_error;
+    assert.deepEqual([judge(c, noAnswer).ok, judge(c, noAnswer).inconclusive], [false, true], 'no error and no answer');
+    // a non-human answer passes (the old not-human verdict), unless the script's exit key came before the result
+    const hookAnswered = load('2.1.323', 'pretooluse-hook-answer');
+    assert.equal(judge(c, hookAnswered).ok, true, 'answered with source hook');
+    assert.equal(judge(c, hookAnswered, { sent: [{ key: '\x1b', at: Date.parse(hookAnswered[2].timestamp) + 100, phase: 'exit' }] }).ok, true, 'exit keys after the answer are cleanup');
+    const early = judge(c, hookAnswered, { sent: [{ key: '\x1b', at: Date.parse(hookAnswered[2].timestamp) - 10, phase: 'exit' }] });
+    assert.deepEqual([early.ok, early.inconclusive], [false, true], 'an answer recorded after the script\'s ESC');
+    // the exact human stamp fails (not inconclusive: it IS a verdict)
+    const human = judge(c, load('2.1.323', 'genuine-click'));
+    assert.equal(human.ok, false);
+    assert.equal(human.inconclusive, undefined);
   }
-  // an answered result with an exit key sent before it was recorded was also ended by the script, so it does not count either
-  const early = judge(byName('pretooluse-ask-prefill'), answered, { sent: [{ key: '\x1b', at: Date.parse(answered[2].timestamp) - 10, phase: 'exit' }] });
-  assert.equal(early.ok, false);
-  assert.equal(early.inconclusive, true);
-  // the committed answered recording still passes, with and without exit keys sent after the result
-  assert.equal(judge(byName('pretooluse-ask-prefill'), answered).ok, true);
-  assert.equal(judge(byName('pretooluse-ask-prefill'), answered, { sent: [{ key: '\x1b', at: Date.parse(answered[2].timestamp) + 100, phase: 'exit' }] }).ok, true);
-  // an answered result with an is_error tool_result does not count (answers present but the tool_result was an error)
-  const errored = structuredClone(answered);
-  errored[2].message.content.find((b) => b.type === 'tool_result').is_error = true;
-  assert.equal(judge(byName('pretooluse-ask-prefill'), errored).ok, false);
-  // other expectations are unchanged: the 2.1.322 prefilled case is judged on the tool_use input, not on an answer
-  assert.equal(judge(byName('model-prefilled-answers'), cancelled).ok, true);
+  // other expectations: the 2.1.323 model-prefilled case is judged on the tool_use input (a cancelled dialog there is fine)
+  assert.equal(judge(byName('model-prefilled-answers'), load('2.1.323', 'model-prefilled-answers')).ok, true);
+});
+
+test('R2-F1: a dismiss key sent at or after the tool_use fails EVERY case (the trust/tip handler pressed into the dialog)', () => {
+  for (const [name, fixture] of [['genuine-click', 'genuine-click'], ['preview-annotations', 'preview-annotations'], ['multiselect-click', 'multiselect-click'], ['pretooluse-hook-answer', 'pretooluse-hook-answer'], ['pretooluse-ask-prefill', 'pretooluse-ask-prefill']]) {
+    const c = byName(name);
+    const fx = load('2.1.323', fixture);
+    const useAt = Date.parse(fx[1].timestamp);
+    const resultAt = Date.parse(fx[2].timestamp);
+    const caseKeys = c.keys.length === 0 ? [] : [...c.keys.slice(0, -1).map((key, k) => ({ key, at: resultAt - 700 * (c.keys.length - k), phase: 'case' })), { key: ENTER, at: resultAt - 50, phase: 'case' }];
+    const fine = [{ key: DOWN, at: useAt - 3000, phase: 'dismiss' }, { key: ENTER, at: useAt - 2300, phase: 'dismiss' }, ...caseKeys];
+    if (c.keys.length === 0 || resultAt - useAt > 3000) assert.equal(judge(c, fx, { sent: fine }).ok, true, `${name}: dismiss keys before the tool_use are fine`);
+    for (const offset of [0, 700, 1400]) {
+      const j = judge(c, fx, { sent: [...fine, { key: DOWN, at: useAt + offset, phase: 'dismiss' }] });
+      assert.equal(j.ok, false, `${name}: a dismiss key ${offset} ms after the tool_use`);
+      assert.match(j.seen.keyProblem, /dismiss/);
+    }
+  }
+  // the failed 2026-11-15 preview-annotations run: answered 1.386 s after the tool_use, with DOWN (+0.7 s) and ENTER (+1.4 s) from the dismiss handler
+  const preview = load('2.1.323', 'preview-annotations');
+  const useAt = Date.parse(preview[1].timestamp);
+  const raced = judge(byName('preview-annotations'), preview, { sent: [{ key: DOWN, at: useAt + 700, phase: 'dismiss' }, { key: ENTER, at: useAt + 1400, phase: 'dismiss' }] });
+  assert.equal(raced.ok, false);
+  assert.match(raced.seen.keyProblem, /2 dismiss key\(s\)/);
+});
+
+test('R2-F1: sendKeys re-checks "asked" before EVERY dismiss key and stops once the AskUserQuestion call is known; case and exit keys are not stopped', async () => {
+  const run = async (phase, { askedAtStart = false, askedAfterSleeps = Infinity } = {}) => {
+    const out = [];
+    let sleeps = 0;
+    const asked = () => askedAtStart || sleeps >= askedAfterSleeps;
+    const n = await sendKeys([DOWN, ENTER], { phase, asked, send: (k, ph) => out.push([k, ph]), sleep: async () => { sleeps++; }, gapMs: 700 });
+    return { n, out };
+  };
+  assert.deepEqual(await run('dismiss'), { n: 2, out: [[DOWN, 'dismiss'], [ENTER, 'dismiss']] }, 'not asked: both keys go');
+  assert.deepEqual(await run('dismiss', { askedAtStart: true }), { n: 0, out: [] }, 'asked before the first key: nothing is sent');
+  assert.deepEqual(await run('dismiss', { askedAfterSleeps: 1 }), { n: 0, out: [] }, 'the call is made during the first 700 ms pause: DOWN is not sent');
+  assert.deepEqual(await run('dismiss', { askedAfterSleeps: 2 }), { n: 1, out: [[DOWN, 'dismiss']] }, 'the call is made during the pause before the second key: ENTER is not sent');
+  assert.deepEqual(await run('case', { askedAtStart: true }), { n: 2, out: [[DOWN, 'case'], [ENTER, 'case']] }, 'the case keys are meant for the dialog');
+  assert.equal((await run('exit', { askedAtStart: true })).n, 2);
 });
