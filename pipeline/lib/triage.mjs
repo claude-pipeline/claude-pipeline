@@ -1308,7 +1308,7 @@ export const isPostMaxFinal = (item) => isObject(item?.final?.postMax) && item.f
 // `ordinal`: the counted ordinal of the round these items belong to (fix-verify.mjs#countedOrdinal; an uncounted round gets the counted rounds before it); `max`: review.max_rounds.
 // Only a round past max + 1 is touched: the first round past the limit (the automatic extra round, or the owner's first grant when there was none) keeps its ACCEPTs; later owner-granted rounds are
 // affected. Only an ACCEPT the judge or arbiter made on a SUGGESTION / WORTH_CONSIDERING item that itemSeverity rates LOW (a low-severity category, a location that resolves to one file of the reviewed
-// diff, no accepted BLOCKING / security item in that file, no sensitive path under the working-tree or the trusted config), not yet implemented; never a bug, security item or BLOCKING one, a test
+// diff, no accepted (or still unsettled / waiting for a human) BLOCKING / security item in that file, no sensitive path under the working-tree or the trusted config), not yet implemented; never a bug, security item or BLOCKING one, a test
 // result, a cached copy, Claude's, the owner's or a forced final. `severity` = { state, round, config, files, baseConfig } as itemSeverity takes them (`round`: the number of the round `items` belong
 // to, whose items in `state` are replaced by `items` so this round's own accepts count); none given, an unreadable diff or config (null) or a config error (itemSeverity throws) keeps the ACCEPT.
 export function applyPostMaxDefault(items, { policy, ordinal, max, severity } = {}) {
@@ -1316,7 +1316,11 @@ export function applyPostMaxDefault(items, { policy, ordinal, max, severity } = 
   let view = null;
   if (isObject(severity) && isObject(severity.state)) {
     const ids = new Set(items.map((i) => i?.id));
-    view = { ...severity.state, rounds: (severity.state.rounds ?? []).map((r) => (r?.n === severity.round ? { ...r, items: [...(r.items ?? []).filter((i) => !ids.has(i?.id)), ...items] } : r)) };
+    // An unsettled BLOCKING / security item (no final yet: the arbiter is still owed it; or a final that waits for a human) may still end up accepted, so it counts as accepted for the same-file test.
+    // Only items already in the state at this point: a BLOCKING accepted in a LATER round on the same file is not caught (a suggestion already turned into a FOLLOW-UP is not revisited).
+    const holds = (i) => isObject(i) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)) && (!isObject(i.final) || i.final.needsHuman === true);
+    const asAccepted = (i) => (holds(i) ? { ...i, final: { decision: 'ACCEPT', by: 'pending', needsHuman: false } } : i);
+    view = { ...severity.state, rounds: (severity.state.rounds ?? []).map((r) => ({ ...r, items: (r?.n === severity.round ? [...(r.items ?? []).filter((i) => !ids.has(i?.id)), ...items] : (r?.items ?? [])).map(asAccepted) })) };
   }
   const lowSeverity = (item) => {
     if (view === null || !isObject(severity.config) || !isObject(severity.baseConfig)) return false;

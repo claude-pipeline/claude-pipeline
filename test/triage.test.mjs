@@ -1719,6 +1719,27 @@ test('applyPostMaxDefault: the repo severity predicate decides: a file with an a
   assert.equal(stays([lowAccept({ file: 'src/a.js' })], { severity: { files: [...PM_FILES, ...PM_FILES] } }), true, 'ambiguous');
 });
 
+// R2-F1: on a judge-lane round the item that decides the file may still be unsettled (arbiter owed) or waiting for a human when the suggestion beside it is rated.
+test('applyPostMaxDefault: a PENDING or human-owed BLOCKING / security item in the same file keeps the low suggestion an ACCEPT (it may still be accepted)', () => {
+  const low = lowAccept({ file: 'src/a.js' });
+  const elsewhere = lowAccept({ file: 'src/b.js' });
+  const waiting = [
+    ['pending BLOCKING', item({ bucket: 'BLOCKING', category: 'logic', final: null, file: 'src/a.js' })],
+    ['pending security', item({ bucket: 'SUGGESTION', category: 'security', final: null, file: 'src/a.js' })],
+    ['needs-human BLOCKING (dismissed)', item({ bucket: 'BLOCKING', category: 'logic', final: { ...settled('REJECT', 'judge'), needsHuman: true }, file: 'src/a.js' })],
+    ['needs-human security (dismissed)', item({ bucket: 'WORTH_CONSIDERING', category: 'auth', final: { ...settled('REJECT', 'judge'), needsHuman: true }, file: 'src/a.js' })],
+  ];
+  for (const [what, other] of waiting) {
+    const [a1, , b1] = pm([low, other, elsewhere]);
+    assert.equal(a1.final.decision, 'ACCEPT', what);
+    assert.equal(b1.final.decision, 'FOLLOW-UP', `${what}: a file with nothing unsettled beside it is still coerced`);
+  }
+  // a settled dismissal (no human owed) and a pending non-BLOCKING, non-security item do not hold the file back
+  const dismissed = item({ bucket: 'BLOCKING', category: 'logic', final: settled('REJECT', 'arbiter'), file: 'src/a.js' });
+  const pendingLow = item({ bucket: 'SUGGESTION', category: 'docs', final: null, file: 'src/a.js' });
+  assert.equal(pm([low, dismissed, pendingLow])[0].final.decision, 'FOLLOW-UP');
+});
+
 test('applyPostMaxDefault: no severity context, an unreadable diff, or an unreadable config keeps the ACCEPT (fail closed)', () => {
   const a = lowAccept();
   assert.equal(pm([a], { severity: null })[0].final.decision, 'ACCEPT', 'no context given');
