@@ -21,7 +21,7 @@ import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { askSummary, processReviewSummary, roundsFrom } from '../lib/round-ask.mjs';
-import { postMaxApply, fixRoundFiles, fixRoundScope } from '../lib/fix-verify.mjs';
+import { postMaxApply, fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -972,7 +972,7 @@ async function roundRequest(rest, ctx) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
     // The trip-wire (#374 PR B): a prompt before another round, never a refusal of the owner's own words. Tripped without --after-process-review: no line, no ask file.
-    const { wire, processReview } = tripWireOf({ state, config, root, head, k, shown });
+    const { wire, processReview } = tripWireOf({ state, config, root, head, k, shown, gh });
     if (wire.tripped && values['after-process-review'] !== true) {
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, warnings } };
     }
@@ -984,7 +984,7 @@ async function roundRequest(rest, ctx) {
 
 // The round trip-wire (lib/triage.mjs#roundTripWire) with the SMALLER of each setting in the working-tree and the fork-point config (a PR must not loosen its own wire; an unreadable
 // fork-point config leaves the working-tree one). A wire that cannot be computed is not tripped: it is a prompt, and a broken one must never be what blocks the owner's own ask.
-function tripWireOf({ state, config, root, head, k, shown }) {
+function tripWireOf({ state, config, root, head, k, shown, gh }) {
   try {
     const fork = state.rounds.findLast((r) => typeof r.forkPoint === 'string');
     const read = fork === undefined ? { ok: false } : baseConfigAt(fork.forkPoint, root);
@@ -995,7 +995,10 @@ function tripWireOf({ state, config, root, head, k, shown }) {
     let fixScope = null;
     try {
       const last = state.rounds.findLast(countsTowardCap);
-      if (last !== undefined) fixScope = fixRoundScope({ files: fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config) }, { cwd: root }).files, configs });
+      if (last !== undefined) {
+        const ineligible = mergeInIneligible({ pr: state.pr, gh, root, config });
+        fixScope = fixRoundScope({ files: fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, { cwd: root }).files, configs });
+      }
     } catch { /* not measured: the line is left out */ }
     return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k }) };
   } catch {

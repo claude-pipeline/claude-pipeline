@@ -8,7 +8,7 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { GhError } from '../lib/proc.mjs';
 import { GitError, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
-import { fixRoundFiles, fixRoundScope } from '../lib/fix-verify.mjs';
+import { fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantedRounds, ownerPastRoundHistory, ownerPastRoundRecords, verifyOwnerGrant } from '../hooks/lib/owner-go.mjs';
 import { pastRoundsNeedingApproval } from '../lib/owner-grants.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -444,7 +444,13 @@ async function fixScope(rest, ctx) {
       warnings.push(`the ${label} config could not be read (${read.reason}): its limits and test globs are taken as the defaults`);
     }
   }
-  const { files, baseKind, baseNote } = fixRoundFiles({ from: round.toHead, head, baseRef: reviewBaseRef(root, config) }, o);
+  // Best effort, as `state outcome` and mark-implemented do: after update-branch + a plain pull origin/<default branch> is stale, and a stale base counts what main brought in as fix lines.
+  const refresh = refreshBaseRef(root, config);
+  if (refresh.usesRemoteRef && !refresh.refreshed) {
+    warnings.push(`origin/${hashBranch(root, config)} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}: the cached ref is used, so what the default branch brought in since it was last fetched may be counted as fix lines`);
+  }
+  const ineligible = mergeInIneligible({ pr: state.pr, gh: createGitHub({ cwd: root, env: ctx.env }), root, config });
+  const { files, baseKind, baseNote } = fixRoundFiles({ from: round.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, o);
   if (baseNote !== undefined) warnings.push(baseNote);
   const scope = fixRoundScope({ files, configs });
   const advisory = scope.newExports > 2 ? [`${scope.newExports} new exports: check that each is needed by an accepted item (advisory, does not flag by itself)`] : [];
