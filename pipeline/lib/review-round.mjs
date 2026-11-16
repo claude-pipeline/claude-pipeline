@@ -14,18 +14,19 @@
 //
 // Reviewer-specific facts go in `roundFields` (spread into the stored round after the range fields: today `codexModel` and
 // `promptSha256`; a substitute passes `firstReviewer` / `substitute` and no codexModel). The module never reads them back.
+import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { assignIds, buildReviewPrompt, largeBinaryNote, renderFindingsMarkdown } from './codex.mjs';
 import { Fail } from './cmd-common.mjs';
 import {
-  GitError, NETWORK_TIMEOUT_MS, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, showFile,
+  GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, showFile,
 } from './git.mjs';
 import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
-import { isSensitivePath, prBaseBranch, rateBranch, trustedBase } from './risk.mjs';
-import { DEFAULTS, EFFORTS, EFFORT_LANES } from './config.mjs';
+import { isSensitivePath, prBaseBranch, rateBranch, threatModelsFor, trustedBase } from './risk.mjs';
+import { DEFAULTS, EFFORTS, EFFORT_LANES, baseConfigAt } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
@@ -207,11 +208,11 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
 
   // What the reviewer is shown (and what the fix commits are measured against) is exactly this range. Round 1 starts at the merge
   // base; a later round starts where the previous one ended, with the base branch's commits merged in since then taken out.
-  // Only commits that came from the protected default branch are left out: the base side is origin/<default_branch> (never a
+  // Only commits that came from the protected default branch are left out: the base side is origin/<trusted default branch> (GitHub's default; never a
   // branch the PR author chose), and a PR that targets any other branch leaves nothing out. "Targets the default branch" is the trusted one
   // (rated.defaultBranch: origin/HEAD), not config.default_branch: a PR that names its own base branch there would otherwise have that branch's commits left out (#398). An UNTRUSTED anchor
   // (rated.untrusted: an origin remote that answered neither origin/HEAD nor ls-remote, so the default branch is the working tree's, which the PR can edit) leaves nothing out either (S1).
-  // A failed or stale fetch only leaves an older origin/<default_branch>, which can only make the range bigger.
+  // A failed or stale fetch only leaves an older origin/<trusted default branch>, which can only make the range bigger.
   // The conflict case ('whole-pr' above): when the merge of the default branch conflicted and the resolution only chose lines the
   // two sides had, the range is the resolution alone and the round is free of the cap (resolutionReviewBase has every rule).
   const baseBranchRef = reviewBaseRef(root, config, prBase);
@@ -282,10 +283,21 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // (round.confirmFixed) so review-complete can see they were asked. A base-only round asks nothing, so it consumes none.
   const confirmed = new Set((state?.rounds ?? []).flatMap((r) => (Array.isArray(r.confirmFixed) ? r.confirmFixed : [])));
   const confirmItems = baseOnly ? [] : priorItems.filter((i) => i.implementedVia === 'other-files' && !confirmed.has(i.id));
+  // The trusted default-branch config this round is rated under (F7): pinned on the round (trustedConfigSha; null = unavailable) and the source of the threat models in the prompt.
+  const trustedConfigSha = rated.baseConfig?.ok === true && typeof rated.trustedFork === 'string' ? rated.trustedFork : null;
+  // Shown to Codex (and the substitute) only on a Fable round: a threat-model finding they downgrade to a SUGGESTION is routed to a filed issue or a human only by
+  // the Fable review path, so a judge-lane or light-lane round would let it be dismissed with neither.
+  let threatModels = [];
+  if (trustedConfigSha !== null && !baseOnly && fable) {
+    const trustedRead = baseConfigAt(trustedConfigSha, root);
+    try {
+      if (trustedRead.ok) threatModels = threatModelsFor(diffFiles(review.base, head, o), trustedRead.config);
+    } catch { /* unreadable range: no model */ }
+  }
 
   return {
     ...c, state, view, slug, level, rated, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView,
-    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, hashAtHead: currentContentHash(root, config),
+    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, hashAtHead: currentContentHash(root, config),
   };
 }
 
@@ -293,7 +305,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
 export const roundPrompt = (adm) => buildReviewPrompt({
   pr: adm.pr, title: adm.view.title, body: adm.view.body, base: adm.review.base, head: adm.head, risk: adm.level, round: adm.round,
   lightLane: adm.lightLane, priorRulings: adm.priorRulings, rulesRef: adm.forkPoint, largeBinaries: adm.largeBinaries, baseKind: adm.review.kind,
-  sensitivePaths: adm.lane.sensitivePaths,
+  sensitivePaths: adm.lane.sensitivePaths, threatModels: adm.threatModels,
   ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => ({ id: i.id, title: i.title, file: i.file, detail: i.detail })) } : {}),
   ...(adm.resolutionOnly ? { resolution: { from: adm.base, forkPoint: adm.forkPoint, ...adm.resolutionView } } : {}),
 });
@@ -362,8 +374,12 @@ export function strictestRouteConfig(config, trusted) {
   const higher = (a, b) => (EFFORTS.indexOf(b) > EFFORTS.indexOf(a) ? b : a);
   const anchored = trusted?.ok !== true && trusted?.anchoredConfig ? knobs(trusted.anchoredConfig) : null;
   const effort = Object.fromEntries(EFFORT_LANES.map((lane) => [lane, higher(higher(wt.effort[lane], other.effort[lane]), anchored ? anchored.effort[lane] : other.effort[lane])]));
+  // Where each choice came from (#445), for the notes that say why a lane or the model is not what the working tree's pipeline.yml says: the SAME selection as above, not a second guess.
+  // A tie goes to the working tree (nothing to explain). -> codexModelFrom: 'fork-point' | 'anchored-fork-point' | 'built-in'; effortFrom[lane]: 'working-tree' | 'fork-point' | 'anchored-fork-point' | 'built-in'.
+  const otherName = trusted?.ok === true ? 'fork-point' : 'built-in';
+  const effortFrom = Object.fromEntries(EFFORT_LANES.map((lane) => [lane, wt.effort[lane] === effort[lane] ? 'working-tree' : anchored && anchored.effort[lane] === effort[lane] ? 'anchored-fork-point' : otherName]));
   return {
-    modeOffFrom, effort, codexModel: (anchored ?? other).codexModel,
+    modeOffFrom, effort, effortFrom, codexModel: (anchored ?? other).codexModel, codexModelFrom: anchored ? 'anchored-fork-point' : otherName,
     smallFixLines: Math.min(wt.smallFixLines, other.smallFixLines), codexRoundBudget: Math.max(wt.codexRoundBudget, other.codexRoundBudget),
     soft: Math.max(wt.soft, other.soft), hard: Math.max(wt.hard, other.hard), mode: wt.mode === 'off' || other.mode === 'off' ? 'off' : wt.mode,
     minWaitMinutes: Math.max(wt.minWaitMinutes, other.minWaitMinutes), maxPacketMb: Math.min(wt.maxPacketMb, other.maxPacketMb),
@@ -412,7 +428,24 @@ export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
     mode: route.mode, protectedKinds: kinds, small, governor, budget,
     normal: baseEffort({ effort, firstOrWholePr: round === 1 || adm.wholePr === true, level: adm.level }), smallFix: effort.small_fix,
   });
-  return { ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom };
+  // #445: when the working tree's own lanes alone would have given another effort, say which source raised it (the lanes are the higher of the working tree's and the fork point's / built-in).
+  // The SAME decision is made with the working tree's lanes, so a small fix-check or a governor-lowered round is compared on its own lane. None for a round a substitute takes.
+  let effortNote;
+  if (decision.route === 'codex') {
+    const own = config.review.effort;
+    const alone = decideRoute({
+      mode: route.mode, protectedKinds: kinds, small, governor, budget,
+      normal: baseEffort({ effort: own, firstOrWholePr: round === 1 || adm.wholePr === true, level: adm.level }), smallFix: own.small_fix,
+    });
+    if (alone.effort !== decision.effort) {
+      const lane = decision.lowered ? 'small_fix' : (round === 1 || adm.wholePr === true) && effort[adm.level] !== undefined ? adm.level : (round === 1 || adm.wholePr === true) ? 'high' : 'followup';
+      effortNote = { workingTree: alone.effort, configured: decision.effort, lane, from: route.effortFrom[lane] };
+    }
+  }
+  return {
+    ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom,
+    ...(effortNote === undefined ? {} : { effortNote }), codexModel: route.codexModel, codexModelFrom: route.codexModelFrom,
+  };
 }
 
 // A base-merge-only round has nothing to ask about: zero findings, and the round says why.
@@ -497,7 +530,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
     // maxRisk is read from the state as it was BEFORE this round overwrites state.risk (a legacy state without maxRisk starts it from what it recorded).
     const next = addRound({ ...base0, ...(fresh ? { maxRisk: maxRiskOf(fresh) } : {}), risk: adm.level, lightLane: reviewer === 'fable' ? false : adm.lightLane, reviewer, currentContentHash: adm.hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: adm.hashAtHead, items: ruled, risk: adm.level,
-      reviewBase: adm.review.base, reviewBaseKind: adm.review.kind, forkPoint: adm.forkPoint, ...roundFields, ...(adm.baseOnly ? { baseOnly: true } : {}),
+      reviewBase: adm.review.base, reviewBaseKind: adm.review.kind, forkPoint: adm.forkPoint, trustedConfigSha: adm.trustedConfigSha, ...roundFields, ...(adm.baseOnly ? { baseOnly: true } : {}),
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => i.id) } : {}),
       ...(adm.wholePr ? { wholePr: true } : {}),
@@ -514,4 +547,29 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
     return ruled;
   }));
   return { items, state: saved, grantUsed };
+}
+
+// #445: the review runs the model of the pipeline.yml at the default branch's fork point, never the working tree's. When the working tree names another one, say so (the round still runs; nothing blocks).
+// `configPath` is the working-tree file: a key it omits reads "unset (built-in default <m>)". `defaultBranch`: the trusted default branch the caller resolved (required).
+// -> the note text, or undefined when the working tree agrees with the model that runs.
+export function modelNoteFor({ config, configPath, trustedModel, codexModelFrom, defaultBranch }) {
+  const wt = config.review.codex_model;
+  if (wt === trustedModel) return undefined;
+  let shown = wt;
+  if (wt === DEFAULTS.review.codex_model) {
+    let omitted = false;
+    try { omitted = !/^\s*codex_model\s*:/m.test(readFileSync(configPath, 'utf8')); } catch { /* unreadable: show the value */ }
+    if (omitted) shown = `unset (built-in default ${wt})`;
+  }
+  const dflt = defaultBranch; // the TRUSTED default branch (risk.mjs#hashBranch), required: never the working-tree value a PR can edit (anchor-default-branch.test.mjs pins every config read)
+  const source = codexModelFrom === 'built-in' ? `the built-in default (the pipeline.yml at ${dflt}'s fork point could not be used)`
+    : codexModelFrom === 'anchored-fork-point' ? `the value at ${dflt}'s genuine fork point (the working tree moved default_branch)`
+      : `the value at ${dflt}'s fork point`;
+  return `review.codex_model ${shown} in the working tree is not used: this round runs ${trustedModel}, ${source}; the edit applies once it is on ${dflt} and this branch includes it`;
+}
+
+// #445: why an effort lane is not the one the working tree's pipeline.yml gives. -> the clause codex-review's effort-mismatch message appends.
+export function effortNoteText(note, defaultBranch) {
+  const from = note.from === 'built-in' ? 'the built-in lane' : note.from === 'anchored-fork-point' ? `the lane at ${defaultBranch}'s genuine fork point` : `the lane in the pipeline.yml at ${defaultBranch}'s fork point`;
+  return `the working tree's pipeline.yml alone gives ${note.workingTree}, but each review.effort lane is the higher of the working tree's and ${from} (here ${note.configured}), so a lower lane applies only once it is on ${defaultBranch}`;
 }

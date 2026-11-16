@@ -143,6 +143,17 @@ export function isSensitivePath(file, config) {
   return pathsOf(file).some((p) => matches(p, highRisk) || matches(p, always));
 }
 
+// review.threat_models: the models whose `paths` match any old OR new path of a changed file (diffFiles entries), in config order, each once.
+// Pure and total: no config, no models or a malformed entry (validateConfig refuses those) means no model, which is today's behaviour. A bad
+// `files` is a TypeError (a forgotten await must not quietly mean "no threat model").
+export function threatModelsFor(files, config) {
+  if (!Array.isArray(files)) throw new TypeError('threatModelsFor: files must be an array');
+  const list = config?.review?.threat_models;
+  if (!Array.isArray(list)) return [];
+  return list.filter((m) => m && typeof m.name === 'string' && Array.isArray(m.paths) && m.paths.every((g) => typeof g === 'string')
+    && files.some((f) => pathsOf(f).some((p) => matches(p, m.paths))));
+}
+
 // Which reviewer follows Codex. `fable`: one Fable pass per round that rules on every Codex item AND reviews the diff itself
 // (agents/arbiter.md), for a medium or high PR or one touching a sensitive path (risk.high_risk_paths or
 // review.arbiter_always_paths, matched like high_risk_paths). `judge`: the Sonnet judge, for everything else.
@@ -176,15 +187,22 @@ export function reviewLane({ level, files, config, sizeOnly = false }) {
 // -> { branch, remote, anchor: 'origin-head'|'ls-remote'|'config', untrusted: string | null }
 export function trustedDefaultBranch(root, config) {
   const o = { cwd: root };
+  const configured = config?.default_branch ?? DEFAULTS.default_branch; // a partial or null config is tolerated (Fable F7)
   const fromHead = remoteDefaultBranch(o);
   if (fromHead !== null) return { branch: fromHead, remote: fromHead, anchor: 'origin-head', untrusted: null };
-  if (!hasOriginRemote(o)) return { branch: config.default_branch, remote: null, anchor: 'config', untrusted: null };
+  if (!hasOriginRemote(o)) return { branch: configured, remote: null, anchor: 'config', untrusted: null };
   const asked = lsRemoteDefaultBranch(o);
   if (asked !== null) return { branch: asked, remote: asked, anchor: 'ls-remote', untrusted: null };
   return {
-    branch: config.default_branch, remote: null, anchor: 'config',
-    untrusted: `the default branch could not be anchored on the remote (no refs/remotes/origin/HEAD, and \`git ls-remote --symref origin HEAD\` named none), so the working-tree config's default_branch ${JSON.stringify(config.default_branch)} is the only source and a PR can edit it (fix: \`git remote set-head origin -a\`)`,
+    branch: configured, remote: null, anchor: 'config',
+    untrusted: `the default branch could not be anchored on the remote (no refs/remotes/origin/HEAD, and \`git ls-remote --symref origin HEAD\` named none), so the working-tree config's default_branch ${JSON.stringify(configured)} is the only source and a PR can edit it (fix: \`git remote set-head origin -a\`)`,
   };
+}
+
+// The ONE branch every content-hash and behind-base site measures from (#448): trustedDefaultBranch's answer, never the working-tree config's default_branch a PR can edit (that value is
+// only the fallback of a clone with no origin remote). `config` may be partial or null. -> string
+export function hashBranch(root, config) {
+  return trustedDefaultBranch(root, config).branch;
 }
 
 // The branch a PR is read as targeting, for the commands that fetch / measure a range from it: GitHub's answer (the PR's baseRefName) wins; without one, the TRUSTED default branch
@@ -234,7 +252,7 @@ export function trustedBase({ root, head, config, trustedFork: given }) {
 // records the Fable round review-complete will ask for.
 // `base` (optional) is the ref the diff starts from; it defaults to the trusted fork point (codex-review passes its own, stack-aware, fork point).
 // Throws what the scan throws (the callers decide how to fail closed). -> {
-//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
+//   level, reasons, changedLines, fileCount, drivers, sizeOnly, reviewer, laneReasons, laneNotes, sensitivePaths, sizeOnlyJudge, note, hits, files, lightLane,
 //   trustedFork, baseConfig: { ok, reason? }, stacked, defaultBranch, anchor, untrusted }
 // `defaultBranch` is the trusted one and `anchor` where it came from ('origin-head' | 'ls-remote' | 'config', trustedDefaultBranch), for a caller that decides "is the PR's base the default branch" (admitRound's base rule, #398); `untrusted` (a sentence, or null) says the anchor came from the working tree although an origin remote exists:
 // such a default branch is the PR's to choose and must not narrow a reviewed range (S1).
@@ -280,9 +298,11 @@ export async function rateBranch({ root, head, config, prBase, base }) {
   if (stacked && sizeCandidate) reasons.push(`stacked PR: base is ${prBase} (no size-only judge)`);
   if (!trusted.ok) laneReasons.push(`trusted base config unreadable: ${trusted.reason}`);
   else if (mismatch !== null) laneReasons.push(`trusted base config unreadable: ${mismatch}`);
+  // Informational, never a reason for Fable (codex-review stores laneReasons as the Fable reasons): its own field (#367).
+  const laneNotes = [];
   if (remoteDefault !== null) {
     const source = anchor === 'ls-remote' ? 'the remote (git ls-remote --symref origin HEAD; origin/HEAD is not set)' : 'origin/HEAD';
-    laneReasons.push(`${source} names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows ${anchor === 'ls-remote' ? 'the remote' : 'origin/HEAD'} (fix a stale one with \`git remote set-head origin -a\`)`);
+    laneNotes.push(`${source} names default branch ${JSON.stringify(remoteDefault)}, pipeline.yml names ${JSON.stringify(config.default_branch)}: the rating follows ${anchor === 'ls-remote' ? 'the remote' : 'origin/HEAD'}. The pipeline supports only GitHub's default branch as its main: set default_branch: ${remoteDefault} in pipeline.yml, or make ${JSON.stringify(config.default_branch)} the default branch on GitHub (fix a stale origin/HEAD with \`git remote set-head origin -a\`)`);
   }
   // The collector's own identity (hardstops.mjs makeSink: rule, file, line; the detail when there is no line), and the stricter status
   // (blocking > ownerMerge > report-only) when both configs report the same hit.
@@ -312,7 +332,7 @@ export async function rateBranch({ root, head, config, prBase, base }) {
       hardStop: rated.some((r) => r.risk.drivers.hardStop), advisory: rated.some((r) => r.risk.drivers.advisory),
       path: rated.some((r) => r.risk.drivers.path), size: rated.some((r) => r.risk.drivers.size),
     },
-    sizeOnly, reviewer, laneReasons, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
+    sizeOnly, reviewer, laneReasons, laneNotes, sensitivePaths, ...(sizeOnlyJudge ? { sizeOnlyJudge: true, note: SIZE_ONLY_NOTE } : {}),
     hits, files, lightLane: rated.every((r) => r.lightLane), trustedFork, baseConfig: trustedOk ? { ok: true, same: sameConfig } : { ok: false, reason: trusted.ok ? mismatch : trusted.reason }, stacked, defaultBranch, anchor, untrusted,
   };
 }
