@@ -1740,6 +1740,27 @@ test('applyPostMaxDefault: a PENDING or human-owed BLOCKING / security item in t
   assert.equal(pm([low, dismissed, pendingLow])[0].final.decision, 'FOLLOW-UP');
 });
 
+// R3-F1: a judge-final dismissal that `triage settle` can still overturn (disputed, testable, no test result yet) may still end up accepted, so it holds the file too.
+test('applyPostMaxDefault: a judge-final REJECT that a settle test can still overturn holds the file; once the test result is in, the final decides', () => {
+  const low = lowAccept({ file: 'src/a.js' });
+  const judge = { decision: 'REJECT', confidence: 'high', reason: 'fine', disputedBug: true, settleTest: { possible: true, plan: 'assert x' } };
+  const testable = (over = {}) => item({ bucket: 'WORTH_CONSIDERING', category: 'auth', file: 'src/a.js', judge, final: settled('REJECT', 'judge'), ...over });
+  assert.equal(pm([low, testable()])[0].final.decision, 'ACCEPT', 'settle-testable judge REJECT on a security item');
+  assert.equal(pm([low, testable({ bucket: 'BLOCKING', category: 'logic' })])[0].final.decision, 'ACCEPT', 'settle-testable judge REJECT on a BLOCKING item');
+  // not testable, not disputed, or the arbiter / owner decided: nothing left for a test to overturn
+  for (const [what, over] of [
+    ['untestable', { judge: { ...judge, settleTest: { possible: false, plan: '' } } }],
+    ['not a disputed bug', { judge: { ...judge, disputedBug: false } }],
+    ['arbiter final', { final: settled('REJECT', 'arbiter') }],
+  ]) assert.equal(pm([low, testable(over)])[0].final.decision, 'FOLLOW-UP', what);
+  assert.equal(pm([low, testable({ final: settled('ACCEPT', 'judge') })])[0].final.decision, 'ACCEPT', 'an accepted security item holds the file on its own');
+  // the test result is recorded: bug-confirmed accepts the item (the file keeps its ACCEPT); bug-disproved on a non-security item settles the dismissal
+  assert.equal(pm([low, applyTestResult(testable(), 'bug-confirmed', 'fails')])[0].final.decision, 'ACCEPT', 'bug-confirmed');
+  assert.equal(pm([low, applyTestResult(testable({ bucket: 'BLOCKING', category: 'logic' }), 'bug-disproved', 'passes')])[0].final.decision, 'FOLLOW-UP', 'bug-disproved converts');
+  // a disproved security item still goes to a human (needsHuman), which holds the file by the existing rule
+  assert.equal(pm([low, applyTestResult(testable(), 'bug-disproved', 'passes')])[0].final.decision, 'ACCEPT', 'bug-disproved security item is human-owed');
+});
+
 test('applyPostMaxDefault: no severity context, an unreadable diff, or an unreadable config keeps the ACCEPT (fail closed)', () => {
   const a = lowAccept();
   assert.equal(pm([a], { severity: null })[0].final.decision, 'ACCEPT', 'no context given');

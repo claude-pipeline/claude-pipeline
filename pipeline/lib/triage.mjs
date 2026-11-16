@@ -1316,9 +1316,11 @@ export function applyPostMaxDefault(items, { policy, ordinal, max, severity } = 
   let view = null;
   if (isObject(severity) && isObject(severity.state)) {
     const ids = new Set(items.map((i) => i?.id));
-    // An unsettled BLOCKING / security item (no final yet: the arbiter is still owed it; or a final that waits for a human) may still end up accepted, so it counts as accepted for the same-file test.
+    // An unsettled BLOCKING / security item may still end up accepted, so it counts as accepted for the same-file test: no final yet (the arbiter is still owed it), a final that waits for a human, or a
+    // judge dismissal a settle test can still overturn (final by the judge, not ACCEPT, disputedBug and settleTest.possible, no test result yet: `triage settle` may make it an ACCEPT by test).
     // Only items already in the state at this point: a BLOCKING accepted in a LATER round on the same file is not caught (a suggestion already turned into a FOLLOW-UP is not revisited).
-    const holds = (i) => isObject(i) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)) && (!isObject(i.final) || i.final.needsHuman === true);
+    const settleTestable = (i) => i.final.by === 'judge' && i.final.decision !== 'ACCEPT' && i.judge?.disputedBug === true && i.judge.settleTest?.possible === true && (i.test?.status ?? 'none') === 'none';
+    const holds = (i) => isObject(i) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)) && (!isObject(i.final) || i.final.needsHuman === true || settleTestable(i));
     const asAccepted = (i) => (holds(i) ? { ...i, final: { decision: 'ACCEPT', by: 'pending', needsHuman: false } } : i);
     view = { ...severity.state, rounds: (severity.state.rounds ?? []).map((r) => ({ ...r, items: (r?.n === severity.round ? [...(r.items ?? []).filter((i) => !ids.has(i?.id)), ...items] : (r?.items ?? [])).map(asAccepted) })) };
   }
