@@ -320,6 +320,40 @@ test('#352 R37-F1: a script / package script that ends in a redirected or condit
     }
   }
 });
+// (#352 R38: a text hands its caller only what it did at its own top level and surely reached. A level still open when the text ends (a { } group whose closer has a redirection that can fail, a group in a group, an eval /
+// bash -c text with one) is never given back by a later command, so a switch made in it was handed over as certain: `{ git switch agent/x; } < /missing` as the last command of reset.sh, then
+// `bash ./reset.sh; <push>` from main sends main when the redirection fails)
+test('#352 R38: a script / package script ending in a level that may not have run does not hand its switched branch to its caller', () => {
+  const at = (cmd, files) => evaluateGitCommand(cmd, {
+    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', files),
+  });
+  const files = (body) => ({ 'reset.sh': `#!/bin/bash\n${body}\n`, 'package.json': JSON.stringify({ name: 'x', scripts: { reset: body, other: 'echo hi' } }) });
+  const bodies = [
+    // the open level at the end of the text
+    '{ git switch agent/x; } < /missing', '{ git switch agent/x; } > /missing', '{ git switch agent/x; } 2>/dev/null', '{ { git switch agent/x; }; } < /missing',
+    "eval 'git switch agent/x' < /missing", 'bash -c "git switch agent/x" < /missing',
+    // the same in other levels, refused before: pinned
+    'false && { git switch agent/x; }', 'true || { git switch agent/x; }', 'if false; then { git switch agent/x; }; fi', 'false && ( git switch agent/x )', '( git switch agent/x ) < /missing',
+    'x() { git switch agent/x; }', "trap 'git switch agent/x' USR1",
+    // a loop body change is not handed on whatever stops the body running
+    'for b in agent/x; do break; git switch $b; done', 'for b in agent/x; do continue; git switch $b; done', 'for b in agent/x; do false && git switch $b; done',
+    'for b in agent/x; do { git switch $b; } < /missing; done', 'for b in agent/x; do git switch $b 2>/dev/null; done', '! for b in agent/x; do git switch $b; done',
+    'for b in agent/x; do git switch $b; done < /missing', 'false && for b in agent/x; do git switch $b; done', 'for b in agent/x; do if false; then git switch $b; fi; done',
+  ];
+  for (const body of bodies) {
+    for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
+      for (const sep of [';', '&&']) {
+        const r = at(`${caller} ${sep} ${PB} origin HEAD`, files(body));
+        assert.equal(r.decision, 'deny', `${what} ending in \`${body}\`, then ${sep}: allowed`);
+      }
+    }
+  }
+  // (twin: a switch at the text's own top level is handed over)
+  for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
+    const r = at(`${caller}; ${PB} origin HEAD`, files('git switch agent/x'));
+    assert.equal(r.decision, 'allow', `twin ${what}: ${r.reason}`);
+  }
+});
 // (#352 R36-F1: a loop's own level and depth come from the whole of its range, not from its first listed command, which is a command of a substitution / group / loop in its header)
 test('#352 R36-F1: a loop whose header holds a substitution, a group or a loop is judged at its own level', () => {
   const body = (inner) => `${PB} origin HEAD; cd /work/other; ${inner}`;

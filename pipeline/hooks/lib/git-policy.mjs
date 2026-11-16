@@ -3230,6 +3230,31 @@ function evalString(str, startDir, ctx, level, child = false) {
     return false;
   };
   const surelyRan = (c) => c.ctl?.loop === true && !c.ctl.cond && !c.ctl.fn && !c.ctl.trap && (c.loops?.length ?? 0) > 0 && c.loops.every(literalFor);
+  // (the levels above depth k are given back, innermost first, as the command that ends them (or the end of the text, #352 R38) finds them)
+  const closeLevels = (k, atEnd = false) => {
+    while (levels.length > k) {
+      const l = levels.pop();
+      const outer = levels[levels.length - 1];
+      if (l.e.kind === 'sub' || l.e.proc) {
+        // (a directory a text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'. A subshell's own snapshot is the directory the line goes on in, whatever a text inside it did: R10-F5)
+        if (l.e.kind === 'sub' || (dir !== null && !hazard)) dir = l.dir;
+        if (l.state) { forgetBranches(); aliasesUnsure(l.al); } // (#352 R11-B1: an alias it (re)defined is unsure too: the level may not have run, as for a change that is not certain)
+      }
+      else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e) && !(atEnd && x.ran && x.up.length === 1)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
+      else if (l.e.kind === 'brace' && (l.e.sep === ';' || l.e.sep === '&') && !l.doubt) {
+        // (#352 R10: a { } group the line surely enters (first, or after ; or &: one after && or || is a `blk`) is this shell going on. A change certain at its top stays certain after the closer, settled by
+        // the operator that follows it (`{ git switch x; } && push`; `{ [ -f x ] && git switch x; } && push`: the group's status is its last list's, so push runs only when the switch did). One in a negated,
+        // piped or backgrounded group was never certain: the parser marks its commands so.)
+        const at = levels.length;
+        trackers = trackers.map((x) => (x.up[at] === l.e ? { ...x, up: x.up.slice(0, at) } : x));
+        if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
+      } else {
+        if (l.lost) forgetState(); else if (l.state) forgetBranches();
+        if (l.state) aliasesUnsure(l.al);
+        if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
+      }
+    }
+  };
   const frames = [];
   const memo = ctx.readingMemo && ctx.readingMemo.str === str && ctx.readingMemo.level === level ? ctx.readingMemo : null; // (the readings of a loop word share the carry of each loop: judgeReadings)
   try {
@@ -3279,28 +3304,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (levels) {
       let k = 0;
       while (k < levels.length && k < c.up.length && levels[k].e === c.up[k]) k++;
-      while (levels.length > k) {
-        const l = levels.pop();
-        const outer = levels[levels.length - 1];
-        if (l.e.kind === 'sub' || l.e.proc) {
-          // (a directory a text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'. A subshell's own snapshot is the directory the line goes on in, whatever a text inside it did: R10-F5)
-          if (l.e.kind === 'sub' || (dir !== null && !hazard)) dir = l.dir;
-          if (l.state) { forgetBranches(); aliasesUnsure(l.al); } // (#352 R11-B1: an alias it (re)defined is unsure too: the level may not have run, as for a change that is not certain)
-        }
-        else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
-        else if (l.e.kind === 'brace' && (l.e.sep === ';' || l.e.sep === '&') && !l.doubt) {
-          // (#352 R10: a { } group the line surely enters (first, or after ; or &: one after && or || is a `blk`) is this shell going on. A change certain at its top stays certain after the closer, settled by
-          // the operator that follows it (`{ git switch x; } && push`; `{ [ -f x ] && git switch x; } && push`: the group's status is its last list's, so push runs only when the switch did). One in a negated,
-          // piped or backgrounded group was never certain: the parser marks its commands so.)
-          const at = levels.length;
-          trackers = trackers.map((x) => (x.up[at] === l.e ? { ...x, up: x.up.slice(0, at) } : x));
-          if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
-        } else {
-          if (l.lost) forgetState(); else if (l.state) forgetBranches();
-          if (l.state) aliasesUnsure(l.al);
-          if (outer) { outer.lost ||= l.lost; outer.state ||= l.state; }
-        }
-      }
+      closeLevels(k);
     }
     if (hazard) forgetState();
     // (#478 R1-B1, see failGroup: here, once the levels this command ends are given back and BEFORE settle, which forgets the cd's tracker at the group's first command (its operator is ||): the snapshot is the
@@ -3476,6 +3480,9 @@ function evalString(str, startDir, ctx, level, child = false) {
   // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop whose words are not literal made may not either; when the text ends nothing
   // after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text ends in: as if a command after `;` followed, it is forgotten
   // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). The one kept: a body of loops over literal non-empty word lists only (`ran`), which surely ran)
+  // (#352 R38: nor does a level still open at the end hand its changes on: nothing after it gives it back (a closer with no redirection emits no command; `{ git switch b; } < /missing` as the last command), so the
+  // levels are closed here as the next command would, and only a change at the text's own top level, or directly in the body of one literal loop (`ran`, one level), is kept)
+  if (levels) closeLevels(0, true);
   for (const x of trackers) if (x.and || (x.scoped && !x.ran)) forget(x);
   return allowed();
   } finally {
