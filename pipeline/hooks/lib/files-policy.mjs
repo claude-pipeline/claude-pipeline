@@ -57,7 +57,7 @@ const PROTECTED_REL = [
   // local settings file (where a hook can be declared) are held like settings.json. Every OTHER account config dir (~/.claude-<name>, $CLAUDE_CONFIG_DIR) gets the same three, see configRoots.
   '.claude/hooks',
   '.claude/settings.local.json',
-  // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
+  // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it (typed words, and clicks: a pending click, its settled outcome, round tickets; #472), P merge and the guard read it. The guard refuses running the recorder or the click libraries by hand (OWNER_GO_RECORDER)
   '.claude/pipeline-state/owner-go',
   // cp #256: the machine-wide Codex outage record (status.json: the last quota stop and the PRs waiting for Codex; only pipeline commands write it) and Codex's own session
   // logs (the weekly-usage figure is read from them, so an agent may not write them)
@@ -872,7 +872,9 @@ function physicalTargets(target, ctx) {
 }
 
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
-const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
+// #472: and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs): run by hand with an injected check they would write a pending click with a made-up capture-time hook result.
+const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go(?:-click(?:-hook)?)?\.mjs$/i;
+const OWNER_GO_WORD = /owner-go(?:-click(?:-hook)?)?\.mjs/i;
 
 const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
@@ -5051,8 +5053,13 @@ function evaluateBashForFilesFrame(command, opts) {
     checkDeadline(ctx.budget); // (the evaluation deadline)
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
-    if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
+    if (runs && c.argv.some((w) => OWNER_GO_WORD.test(toPosix(expandRefs(w, ctx))))) {
       return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
+    }
+    // #472: a runtime that reads its program from stdin (a heredoc body, a here-string, a pipe: `node --input-type=module <<EOF`, `node - <<< …`, `echo … | node`) names no file in its words, so
+    // the check above cannot see what it imports. When the line (prose values masked, a heredoc body included) names an owner-go library, that program is refused.
+    if (RUNTIMES.has(baseOf(c.argv[0])) && c.argv.slice(1).every((w) => w === '-' || w.startsWith('-')) && OWNER_GO_WORD.test(toPosix(expandRefs(scanRaw, ctx)))) {
+      return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
     }
   }
 

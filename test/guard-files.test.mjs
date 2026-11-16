@@ -976,6 +976,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'bun ./pipeline/hooks/owner-go.mjs',
     './pipeline/hooks/owner-go.mjs < /tmp/in.json',
     `node -e "import('./pipeline/hooks/lib/owner-go.mjs').then((m) => m.recordApproval({}))"`,
+    `node --input-type=module <<'EOF'\nimport { recordApproval } from './pipeline/hooks/lib/owner-go.mjs';\nEOF`, // (#472: a program read from stdin)
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     'cat pipeline/hooks/owner-go.mjs',
@@ -983,6 +984,44 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'git diff -- pipeline/hooks/lib/owner-go.mjs',
     'node --test test/owner-go.test.mjs',
     'node /home/u/.claude/pipeline/hooks/stack-dev-bind.mjs', // (the other installed hooks keep their read-only standing)
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// #472 (Task 7): the click libraries record an owner "merge" from a dialog answer. A pending marker keeps the capture-time hook fingerprint the hook passed in, so a hand-run
+// recorder with an injected check would write a pending with a made-up capture. Running them by hand is refused on every route, like the recorder itself.
+test('#472 owner-go-click: running the click libraries by hand (a path, program text, a heredoc, a here-string) is refused; reading, testing and committing them is not', () => {
+  const LIBS = ['owner-go-click.mjs', 'owner-go-click-hook.mjs'];
+  for (const lib of LIBS) {
+    const inst = `/home/u/.claude/pipeline/hooks/lib/${lib}`;
+    for (const cmd of [
+      `node ${inst}`,
+      `node ~/.claude/pipeline/hooks/lib/${lib}`,
+      `node ${CHECKOUT}/pipeline/hooks/lib/${lib} < /tmp/in.json`,
+      `node pipeline/hooks/lib/${lib}`,
+      `bun ./pipeline/hooks/lib/${lib}`,
+      `./pipeline/hooks/lib/${lib} < /tmp/in.json`,
+      `node -e "import('./pipeline/hooks/lib/${lib}').then((m) => m.recordClick({ hookCheck: () => ({ ok: true }) }))"`,
+      `node --input-type=module -e "import('./pipeline/hooks/lib/${lib}').then((m) => m.recordClick({ check: () => null }))"`,
+      `node --input-type=module -e "import { recordClick } from '${inst}'; recordClick({})"`,
+      `node --input-type=module <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nrecordClick({ check: () => null });\nEOF`,
+      `node --input-type=module <<EOF\nconst m = await import('${inst}');\nEOF`,
+      `node --input-type=module <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `node - <<< "await import('${inst}')"`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type=module`,
+    ]) assert.equal(bash(cmd), 'deny', cmd);
+    for (const cmd of [
+      `cat pipeline/hooks/lib/${lib}`,
+      `git add pipeline/hooks/lib/${lib}`,
+      `git diff -- pipeline/hooks/lib/${lib}`,
+      `grep -n recordClick pipeline/hooks/lib/${lib}`,
+    ]) assert.equal(bash(cmd), 'allow', cmd);
+  }
+  for (const cmd of [
+    'node scripts/test.mjs owner-go-click.test.mjs',
+    'node scripts/test.mjs owner-go-click-hook.test.mjs owner-go-click-pending.test.mjs',
+    'node --test test/owner-go-click.test.mjs',
+    'node --test test/owner-go-click-hook.test.mjs',
+    'node /home/u/.claude/pipeline/bin/pipeline.mjs merge --pr 5 --owner-go',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 

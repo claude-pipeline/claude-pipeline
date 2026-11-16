@@ -10,8 +10,11 @@
 // while the agent was still working (a queued prompt records nothing).
 // (#261) The SAME script is also registered on PostToolUse for AskUserQuestion (click-to-approve, lib/owner-go-click.mjs): the owner's click on a dialog the pipeline
 // issued is verified against the transcript and recorded like the typed words (lib/owner-go-click-hook.mjs). PostToolUse plain stdout does NOT reach the model, so the line goes out as JSON hookSpecificOutput.additionalContext (R1-F1): one line says the
-// click is recorded, declined (nothing approved) or could not be verified (the owner types the closing words instead); nothing is printed for an AskUserQuestion that is
+// click is recorded, declined (nothing approved), received and verified when used (#472: Claude Code 2.1.323 writes the answer to the transcript only after this hook returns, so the
+// click is kept pending and the consumer verifies it) or could not be verified (the owner types the closing words instead); nothing is printed for an AskUserQuestion that is
 // not one of ours. The dialog-hook check (lib/dialog-hooks.mjs) is loaded lazily: if it cannot load, no click is admitted.
+// (#472) This script and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs) are never run by hand: a pending click keeps the capture-time hook result this hook passes
+// in, so the guard (lib/files-policy.mjs OWNER_GO_RECORDER) refuses a runtime that runs them, whether by path, program text, a heredoc or a here-string.
 async function onPrompt(input) {
   const { recordApproval, recordRuling, recordRoundGrant, recordPastRoundGrant, rulingNudge, queuedNudge } = await import('./lib/owner-go.mjs');
   const record = recordApproval(input);
