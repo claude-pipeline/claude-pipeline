@@ -211,3 +211,4 @@ full record.
 - 2026-11-16 · #527 · Click-to-approve on 2.1.323: pending clicks verified when used, round tickets (#472) · risk high · rounds 7 · arbiter 7 · blocked · Codex 7d: 14228 runs (13823 high)
 - 2026-11-16 · #534 · Reliability follow-ups: round codex pick-up marker, job-dir delete order, fail-fast and signal-gated tests · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 14494 runs (14084 high)
 - 2026-11-16 · #527 · Click-to-approve on 2.1.323: pending clicks verified when used, round tickets (#472) · risk high · rounds 8 · arbiter 8 · blocked · Codex 7d: 14725 runs (14312 high)
+- 2026-11-16 · #527 · Click-to-approve on 2.1.323: pending clicks verified when used, round tickets (#472) · risk high · rounds 10 · arbiter 9 · substitute 1 · awaiting-owner-merge · Codex 7d: 15277 runs (14833 high)
