@@ -1870,7 +1870,8 @@ function addFiles(f, rec, word, P, st, fi, depth, exists, into, frames = null) {
 
 // #506: does the command at idx write a name below a `.git` directory (a redirection, `exec N>`, git --output, cp / mv / tee / install ...)? A write to the repository's HEAD or refs moves its
 // branch without any git command the guard reads. Only a target that can be named is judged (a run-time word is not: `> "$OUT"` is everyday); `.gitignore` / `.github` are no .git directory.
-const UNDER_GIT = /(?:^|\/)\.git(?:\/|$)/;
+// (R1-B3: only a name that can move a branch: the directory itself (a copy onto it), HEAD, a linked worktree's HEAD, config, refs, packed-refs; an exclude file, a hook or a message file cannot)
+const UNDER_GIT = /(?:^|\/)\.git(?:\/*$|\/(?:HEAD|config|packed-refs|refs(?:\/|$)|worktrees\/[^/]+\/HEAD$))/;
 export function writesUnderGit(f, idx) {
   for (const rec of f.recs) {
     if (rec.idx !== idx || rec.dest === null || rec.dest === undefined || rec.inline !== undefined) continue;

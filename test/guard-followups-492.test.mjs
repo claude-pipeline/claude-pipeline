@@ -136,6 +136,24 @@ describe('#506: a write that may land under a repository\'s .git makes its branc
   ]) test(`not under .git: ${why} stays allowed`, () => expect('allow', line));
 });
 
+// R1-B3: only a write that can move a branch (HEAD, a linked worktree's HEAD, config, refs, packed-refs, or the .git directory itself) makes the branches unknown
+describe('R1-B3: a write below .git that cannot move a branch stays allowed', () => {
+  for (const [why, line] of [
+    ['an exclude file', 'echo dist/ >> .git/info/exclude; git push'],
+    ['a hook copy', 'cp pre-commit.sample .git/hooks/pre-commit; git push'],
+    ['a commit message file', 'echo msg > .git/COMMIT_EDITMSG; git push'],
+  ]) test(`allowed: ${why}`, () => expect('allow', line));
+  for (const [why, line] of [
+    ['packed-refs', 'echo x > .git/packed-refs; git push'],
+    ['a linked worktree HEAD', 'echo ref > .git/worktrees/w/HEAD; git push'],
+    ['config', 'echo x >> .git/config; git push'],
+    ['a ref', 'echo abc > .git/refs/heads/agent/x; git push'],
+    ['a copy onto the .git directory', 'cp -r other/.git .git; git push'],
+    ['rsync onto .git/', 'rsync -a other/.git/ .git/; git push'],
+    ['tar into .git', 'tar -xf a.tar -C .git; git push'],
+  ]) test(`denied: ${why}`, () => expect('deny', line));
+});
+
 // ---- #508 ----
 describe('#508: a PATH set before the failure group makes even an echo not inert', () => {
   // (the clause `assignedNames(ctx)` of inertInFailGroup: the PATH is set BEFORE the group, so the group's own words (`echo`, `exit`) are all plain data commands)
