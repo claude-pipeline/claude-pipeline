@@ -174,7 +174,18 @@ function roundOfJob(tag, state, pr, round) {
 
 const fullSha = (ref, root) => revParse(`${ref}^{commit}`, { cwd: root });
 
+// A refusal that is thrown after the round is known to be recorded carries pickedUp:true too (every JSON of that call does).
 async function roundCodex(rest, ctx) {
+  const seen = { pickedUp: false };
+  try {
+    return await roundCodexRun(rest, ctx, seen);
+  } catch (err) {
+    if (seen.pickedUp && err instanceof Fail && err.output !== null && typeof err.output === 'object') err.output = { ...err.output, pickedUp: true };
+    throw err;
+  }
+}
+
+async function roundCodexRun(rest, ctx, seen) {
   const { values } = parseCommandArgs(rest, {
     pr: { type: 'string' }, round: { type: 'string' }, base: { type: 'string' }, head: { type: 'string' },
     'max-minutes': { type: 'string' }, repo: { type: 'string' },
@@ -193,8 +204,17 @@ async function roundCodex(rest, ctx) {
   const { state: before, recorded } = checkIdentity(root, pr, round, { mayBeRecorded: true });
   const existing = readJob(name, { cwd: root });
   let runId;
+  // The recorded round is the one reviewed at its toHead: a checked-out HEAD past it holds a commit no review has seen (an explicit --head is compared with the job's instead).
+  // Checked before the wait and again after it: HEAD can move while the job runs.
+  const checkHeadAtRecorded = () => {
+    const recordedTo = existing.tag.split(':')[3];
+    if (values.head === undefined && fullSha('HEAD', root) !== recordedTo) {
+      throw new Fail(EXIT.FAILED, { ok: false, error: 'head-moved-since-round', message: `round ${round} was recorded at ${recordedTo} but HEAD is another commit: that result is not a review of HEAD; run round ${round + 1} instead`, recordedHead: recordedTo, tag: existing.tag, runId: existing.runId });
+    }
+  };
   // A round that was already recorded: no Codex run happened in this call, and the output says so.
   const pickedUp = recorded;
+  seen.pickedUp = pickedUp !== undefined;
   const marked = (r) => (pickedUp ? { ...r, output: { ...r.output, pickedUp: true } } : r);
 
   if (recorded) {
@@ -208,11 +228,7 @@ async function roundCodex(rest, ctx) {
         throw new Fail(EXIT.FAILED, { ok: false, error: 'job-conflict', message: `job ${name} ran with another --${flag} (tag ${existing.tag})`, tag: existing.tag, runId: existing.runId });
       }
     }
-    // The recorded round is the one reviewed at its toHead: a checked-out HEAD past it holds a commit no review has seen (an explicit --head is compared above).
-    const recordedTo = existing.tag.split(':')[3];
-    if (values.head === undefined && fullSha('HEAD', root) !== recordedTo) {
-      throw new Fail(EXIT.FAILED, { ok: false, error: 'head-moved-since-round', message: `round ${round} was recorded at ${recordedTo} but HEAD is another commit: that result is not a review of HEAD; run round ${round + 1} instead`, recordedHead: recordedTo, tag: existing.tag, runId: existing.runId });
-    }
+    checkHeadAtRecorded();
     runId = existing.runId;
   } else {
     let base = values.base;
@@ -280,6 +296,7 @@ async function roundCodex(rest, ctx) {
   if (snap.state === 'lost' || snap.state === 'missing') {
     return marked({ exitCode: snap.state === 'missing' ? EXIT.USAGE : EXIT.FAILED, output: { ok: false, ...jobInfo, ...snap, doc: SPECIAL } });
   }
+  if (recorded) checkHeadAtRecorded(); // a HEAD that moved during the wait: the finished job is not a review of it
   return marked(await finish({ root, ctx, pr, round, snap, jobInfo }));
 }
 

@@ -412,8 +412,52 @@ test('a recorded round is not picked up once HEAD moved past its toHead: head-mo
   const r = rc(w, []);
   assertExit(r, 1, r.stdout + r.stderr);
   assert.equal(r.json.error, 'head-moved-since-round');
+  assert.equal(r.json.pickedUp, true);
   assert.equal('codex' in r.json, false, 'the old result was not reported');
   assert.equal(w.stateText(), before);
+});
+
+// R1-B1 / R1-B2: round 1 is recorded at A and its job is still running when the command reads it (HEAD is A: adopted); the state or HEAD then changes during the wait.
+test('a recorded round whose HEAD moved DURING the wait is refused too: head-moved-since-round with pickedUp: true, the finished job is not reported', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const emit = emitter(w);
+  assertExit(w.codex(1, findingsOf([], [low()])), 0); // round 1 recorded at A (HEAD)
+  const okJson = JSON.stringify({ ok: true, counts: { blocking: 0, suggestions: 1, worth_considering: 0 }, reviewer: 'judge', codexPath: 'x/round-1' });
+  startJob(w, tagOf(w, w.base, w.head), emit(0, okJson, true));
+  const hold = join(w.scratch, 'hold');
+  const run = startRound(w, [], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  await untilExists(`${hold}.reached`); // the check before the wait passed: HEAD is still A
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  w.repo.commit('fix'); // HEAD moves to B during the wait
+  emit.release();
+  writeFileSync(hold, 'go\n');
+  const r = await run.done;
+  assert.equal(r.code, 1, r.out);
+  assert.equal(r.json.error, 'head-moved-since-round');
+  assert.equal(r.json.pickedUp, true);
+  assert.equal('codex' in r.json, false, 'the old result was not reported');
+});
+
+test('every JSON of a call for an already recorded round carries pickedUp: true, a refusal after the wait too (identity-mismatch)', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const emit = emitter(w);
+  assertExit(w.codex(1, findingsOf([], [low()])), 0);
+  const okJson = JSON.stringify({ ok: true, counts: { blocking: 0, suggestions: 1, worth_considering: 0 }, reviewer: 'judge', codexPath: 'x/round-1' });
+  startJob(w, tagOf(w, w.base, w.head), emit(0, okJson, true));
+  const hold = join(w.scratch, 'hold');
+  const run = startRound(w, ['--base', w.base, '--head', w.head], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  await untilExists(`${hold}.reached`);
+  assertExit(w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']), 0);
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  const h2 = w.repo.commit('fix');
+  w.prHead(h2);
+  assertExit(w.codex(1, findingsOf([], [low()]), { from: w.base, to: h2 }), 0); // recorded again at another head during the wait
+  emit.release();
+  writeFileSync(hold, 'go\n');
+  const r = await run.done;
+  assert.equal(r.code, 1, r.out);
+  assert.equal(r.json.error, 'identity-mismatch');
+  assert.equal(r.json.pickedUp, true);
 });
 
 test('reviewer fable WITH an arbiter record: arbiter needed is not called (the record is untouched) and the state is reported', (t) => {
