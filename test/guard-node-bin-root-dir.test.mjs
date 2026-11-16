@@ -93,6 +93,15 @@ test('#352: `false && serve.sh` (exec npm start -> next start, next a node progr
   }
 });
 
+test('#352 trade-off (R32 redesign, R33-F1): the same serve.sh printing with zsh print instead of echo is refused by the files guard', () => {
+  // zsh print is not judged read-only (main's behaviour) after a cd known only at run time; the real
+  // serve-wallboard.sh switches to echo. Pinned so the trade-off is visible and cannot drift unnoticed.
+  const sh = SERVE.replace('echo "starting', 'print "starting');
+  assert.notEqual(sh, SERVE, 'the fixture still holds the echo line this test rewrites');
+  const r = run('files', `false && ${PROJ}/scripts/serve.sh`, { ...project('files', { start: 'next start' }, NEXT_JS), 'scripts/serve.sh': sh });
+  assert.equal(r.decision, 'deny', `print shape: ${r.reason}`);
+});
+
 test('#352 negative controls: a shell script in .bin/next, or a script that writes the zsh startup file in pieces, is still refused', () => {
   const sh = (g) => `#!/bin/sh\n${BAD[g]}\n`;
   for (const g of GUARDS) {
