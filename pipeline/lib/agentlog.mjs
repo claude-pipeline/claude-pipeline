@@ -172,6 +172,8 @@ export function logRelPath(root, agentLog) {
 
 const isRaceFailure = (err) => err instanceof GitError && /rejected|non-fast-forward|fetch first|stale info|failed to push some refs/i.test(err.stderr ?? '');
 const REMOTE_LOG_REF = `refs/remotes/${REMOTE}/${AGENT_LOG_BRANCH}`;
+// The remote's default branch as git must READ it: fully qualified, because an abbreviated `origin/<b>` resolves through refs/tags and refs/heads first (#454).
+const remoteDefaultRef = (defaultBranch) => `refs/remotes/${REMOTE}/${defaultBranch}`;
 
 // Refreshes the remote-tracking copy of the log branch. -> { tip, exists, refreshed }: `exists` false means the remote has no such
 // branch (a normal state before the first publish); any other failure is a real one and throws.
@@ -275,7 +277,7 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }
           g(['fetch', '--no-tags', REMOTE, `+refs/heads/${defaultBranch}:refs/remotes/${REMOTE}/${defaultBranch}`], root, NETWORK_TIMEOUT_MS);
         } catch { /* offline default branch: seed from the cached ref, or the header */ }
         // No regular log file on the branch (a new branch, or something else at that path): start from main's copy, else the header.
-        existing = read(`${REMOTE}/${defaultBranch}`);
+        existing = read(remoteDefaultRef(defaultBranch));
       }
       const { text, fresh } = appendLines(existing, clean);
       if (fresh.length === 0) return { commit: tip, pushed: false, lines: [] }; // all already in the log: nothing to push
@@ -317,7 +319,7 @@ export function originLogLines(root, { logFile, defaultBranch, fetch = false, tr
     }
     const rel = relative(root, logFile).split('\\').join('/');
     const run = (args) => git(args, o);
-    const text = readRegularFile(run, `${REMOTE}/${defaultBranch}`, rel, { strictRef: true }); // origin/<default> missing = unreadable
+    const text = readRegularFile(run, remoteDefaultRef(defaultBranch), rel, { strictRef: true }); // origin/<default> missing = unreadable
     const lines = new Set(text === null ? [] : text.split('\n').map((l) => l.replace(/\r$/, '')));
     const branchText = branchExists && (branchRefreshed || trustCachedBranch) ? readRegularFile(run, REMOTE_LOG_REF, rel) : null; // no log branch yet is null; a hostile or oversized file makes the whole read fail closed
     if (branchText !== null) for (const l of branchText.split('\n')) lines.add(l.replace(/\r$/, ''));
