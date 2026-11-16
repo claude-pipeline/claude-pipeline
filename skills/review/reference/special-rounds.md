@@ -23,8 +23,8 @@ The old, still valid way to run a round one command at a time (what `P round cod
 ## Old 2.5 and 2.6 (publish, fix, outcome)
 
 5. **Publish and fix.** `P comment --pr N --kind triage` FIRST, then `P followups create --round R` for FOLLOW-UP items, then the triage comment again
-   (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits (same line: return immediately when done; no background work; waits only via `job wait`, max 3);
-   push (Rule 8). Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
+   (issue links). ACCEPT items: one `implementer` dispatch with `P state show --round R --accepted`; it fixes, adds tests, runs `verify.quick`, commits (same line: return immediately when done; no background work; waits only via `job wait`, max 3).
+   Tell it: "fix only the accepted items; no new mechanism, option or helper module". BEFORE the push run `P state fix-scope --round R` (read-only: what the fix commits since round R's head add): `flagged: true` (more non-test lines than `review.fix_round_max_lines`, or a new non-test source file; new exports are advisory text only) ⇒ AskUserQuestion with the `reasons`: "its own PR" / "plan first" / "push as is", and NO push until the owner has answered (a prompt, never a gate: an unflagged or unmeasurable result pushes as usual). Then push (Rule 8). Then **`P state mark-implemented --ids <ids>`** for each fixed ACCEPT item: `review-complete` refuses an ACCEPT that is not marked, from ANY round,
    and exit 2 `no-code-change` means the fix changed no code (back to the implementer; marking never replaces a fix).
 6. **Outcome.** `P state outcome`: `clean` ⇒ leave the loop; `needsHuman` non-empty ⇒ see Rulings; more rounds left ⇒ round R+1 (the Codex fix
    check reviews only what changed since this round's head); none left ⇒ park, cause `unresolved: <ids>`, except one case: `reachedMax`, no
