@@ -2038,6 +2038,7 @@ function judgeScoped(text, dir, ctx, level, sf, child = false) {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   // Why (#81 Codex R1-B1): the names a text assigns (assignedOf) and the words it mentions (the dynamic-script fallback) are those of EVERY text being judged, the script's own among them
   const scopes = (ctx.scopeTexts ??= []);
+  ctx.judgedTexts = (ctx.judgedTexts ?? 0) + 1; // (#505: a text of a script was read and walked: what it did to the branches is recorded; see SOURCING in evalString)
   scopes.push(text);
   try {
     return judgeScopedIn(text, dir, ctx, level, sf, child);
@@ -3018,6 +3019,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (!argv.length) { recordAssigned(c, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
+    const judged0 = ctx.judgedTexts ?? 0;
     if (VAR_BUILTINS.includes(name)) {
       const d = declAttrs(argv);
       for (const [k, v] of d.assigns) {
@@ -3117,7 +3119,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     markPackageState(ctx.budget, [argv], { dirs: dir === null ? null : [dir], expand: (w) => expandVars(w, ctx), home: ctx.home, p: path }); // (what this command may change, for the package scripts after it)
     if (SOURCING.includes(name)) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
-      forgetState();
+      // (#505: a file that was read and walked (a git change in it, or a write below .git, was recorded or marked unknown by that walk) leaves the branches as they are; only one never walked -- missing, a name known at run time -- marks every branch unknown)
+      forgetState((ctx.judgedTexts ?? 0) <= judged0);
       for (const k of Object.keys(ctx.vars)) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
       // the check above ran before these became unsure: run it again for what follows (`F=run.sh; source env.sh; bash "$F"`)
       const unsure = unsureVarReachingCommand(cmds.slice(i + 1), ctx);

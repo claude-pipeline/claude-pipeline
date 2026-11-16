@@ -150,6 +150,34 @@ describe('#508: a PATH set before the failure group makes even an echo not inert
   });
 });
 
+// ---- the #505 mark must not over-deny everyday sourcing (cwd on agent/x, no checkout earlier on the line) ----
+describe('#505 over-denial check: a readable sourced file with no git / .git write in it leaves the branch known', () => {
+  const home = (p) => resolve(HOME, p);
+  const FILES = {
+    [resolve('/work/repo/venv/bin/activate')]: 'export VIRTUAL_ENV=/work/repo/venv\nexport PATH="$VIRTUAL_ENV/bin:$PATH"\n',
+    [resolve('/work/repo/env.sh')]: 'export FOO=1\nexport BAR=2\n',
+    [home('.nvm/nvm.sh')]: 'export NVM_DIR=/home/u/.nvm\nnvm_ls() { echo x; }\n',
+    [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n',
+  };
+  const OK = (line) => test(`allowed: ${line}`, () => expect('allow', line, FILES));
+  // A `source` makes the DIRECTORY unknown (a sourced file may cd and the guard does not follow it): a bare push right after it is refused, as on origin/main (unchanged by the mark, which is about branches).
+  const KEPT = (line) => test(`denied as on main (the directory, not the mark): ${line}`, () => {
+    const v = gitRun(line, FILES);
+    assert.equal(v.decision, 'deny', line);
+    assert.doesNotMatch(v.reason, /cannot determine the current branch/, v.reason);
+  });
+  KEPT('source venv/bin/activate && git push');
+  KEPT('. ./env.sh; git push');
+  OK('source env.sh; cd /work/repo/sub; git push');
+  test('a sourced file that is never read (missing) marks every branch unknown: a directory entered afterwards is denied', () => {
+    expect('deny', 'source nothere.sh; cd /work/repo/sub; git push', FILES);
+  });
+  OK('bash build.sh; git push');
+  test('but a sourced file that does switch the branch still denies', () => {
+    expect('deny', 'source env.sh; git push', { [resolve('/work/repo/env.sh')]: 'git checkout main\n' });
+  });
+});
+
 // Over-denial guard: ordinary work stays allowed after every change above.
 describe('ordinary work stays allowed', () => {
   const OK = (name, line, files) => test(`allowed: ${name}`, () => expect('allow', line, files));
