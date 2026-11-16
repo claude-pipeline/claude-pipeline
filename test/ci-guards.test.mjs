@@ -1143,6 +1143,17 @@ const reviewComment = (s, { hash = reviewedHash(s), at = T('10:01'), updated = a
 });
 const withLog = (repo) => { cleanChange(repo); repo.write('docs/agent-log.md', '- 2026-10-01 a line the pipeline appended\n'); };
 
+test('review_check: the status line names the substitute rounds as a list, not a min-max range (#2163)', async () => {
+  const s = await setup(withLog, REVIEW_ON);
+  const body = reviewCompleteBody({
+    contentHash: reviewedHash(s), base: s.repo.base, head: s.head, rounds: 4, codexModel: 'gpt-6-astra', modelProofDigest: null,
+    substitute: { rounds: [1, 4], agents: ['opus'], models: ['claude-opus'] }, substituteDigest: 'd'.repeat(64),
+  });
+  const r = await exec(s, { comments: [reviewComment(s, { body })] });
+  assert.equal(r.code, 0, r.stderr);
+  assert.match(r.byContext('Cross-model review').description, /Codex gpt-6-astra, substitute rounds 1, 4$/);
+});
+
 test('review_check: the latest review-complete comment whose hash is the head\'s content posts Cross-model review success (agent log left out)', async () => {
   const s = await setup(withLog, REVIEW_ON);
   const r = await exec(s, { comments: [reviewComment(s)] });
