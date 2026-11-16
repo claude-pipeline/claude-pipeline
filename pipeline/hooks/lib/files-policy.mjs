@@ -2751,7 +2751,6 @@ const GLOB_PATTERNS = {
   xxd: [optLit('-r', true)],
   openssl: ['-out', '-sign', '-prverify'].map((o) => optLit(o, false)),
 };
-GLOB_PATTERNS.print = [OPT_ANY]; // (R30-F2: for print only its option area, see globOptionRisky)
 for (const n of ['sort', 'tree', 'jq', 'sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']) GLOB_PATTERNS[n] = [OPT_ANY];
 // rsync (R5-B3): the options that delete (at the destination, or the sources); the same engine
 const RSYNC_DELETE_PATTERNS = ['--del', '--delete', '--delete-before', '--delete-during', '--delete-delay', '--delete-after', '--delete-excluded', '--delete-missing-args', '--remove-source-files', '--remove-sent-files'].map((o) => optLit(o, false));
@@ -2835,42 +2834,6 @@ function unquotedGlob(raw) {
   const t = withoutQuotes(raw);
   return t === null || /[*?[(^]|\S[#~]|<[\d-]*>/.test(t.replace(/\\[\s\S]/g, ''));
 }
-// #352 R30 / R31: the option area of zsh's print, read once for the format check (readOnlyWith) and the glob check (globOptionRisky). It runs from the first word to the word that ends it, which is
-// included. R31 (one class rule): the area ends ONLY at a lone `-` or `--`, or at a word that is certain to reach print as exactly one word that does not start with a dash or a plus: `fixed(w)`, a word
-// with no unquoted glob character / group / qualifier and no unquoted expansion (a quoted run-time part, `"a $Y"`, is fine). Any other word that does not start with a dash (`x*`, `x*(N)`, `p*(P:-f%d:)`,
-// `$X`, `x$Y`) may vanish, split or turn into option words at run time (a qualifier can ADD words: `(P:-f%d:)`, `(e:...:)`), so what follows it may be options: the call is bad.
-// A third kind, `transparent(w)`: an unquoted glob word that starts with a literal character (not `-` / `+` / a glob character) and holds no group, qualifier or expansion (only `*`, `?`, `[..]`) can only
-// vanish or become names that start with that same character: it neither ends the area nor makes the call bad, the scan goes on past it (`print -l x* "a $Y"`; `print x* -f%d …` reads the -f%d).
-// (`fixed` absent: the text of the word is judged, no glob character and no `$` / backtick.) R30-B1 / F1: a word of it that holds a run-time part is bad (the call is not read-only): a word that starts with
-// `$` or a backtick, a word that starts with a dash or a plus and holds one anywhere (`-"$O"`, `-x$(…)`), and the value word of -C / -f / -x / -X, which is read like an option (`-C $(echo 1 -f %d)`
-// splits into `-f %d`). An option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`).
-// R29-F3: -f makes print zsh's printf, which reads the operand of a numeric conversion (or a `*`) as arithmetic: `fmt` is the format (null: not known), `end` the number of words of the area.
-function printScan(ws, fixed = null, transparent = null) {
-  const out = { end: ws.length };
-  for (let i = 0; i < ws.length; i++) {
-    const a = ws[i];
-    if (/^[$`]/.test(a) || (/^[-+]/.test(a) && RUNTIME_PART.test(a))) return { bad: true, end: ws.length };
-    if (a === '-' || a === '--') { out.end = i + 1; break; }
-    if (!/^[-+]/.test(a)) {
-      if (fixed !== null && !fixed(a)) {
-        if (transparent !== null && transparent(a)) continue;
-        return { bad: true, end: ws.length };
-      }
-      out.end = i + 1;
-      break;
-    }
-    for (let k = 1; k < a.length; k++) {
-      if ('vsSzuPp'.includes(a[k])) return { bad: true, end: ws.length };
-      if ('CfxX'.includes(a[k])) {
-        const value = k < a.length - 1 ? a.slice(k + 1) : ws[++i];
-        if (value !== undefined && RUNTIME_PART.test(value)) return { bad: true, end: ws.length };
-        if (a[k] === 'f') out.fmt = out.fmt === undefined ? (value ?? null) : null; // (a second -f: which one wins is not modelled)
-        break;
-      }
-    }
-  }
-  return out;
-}
 // The options end at a lone `--` for the tools that read it so (a pathspec or a file after it is no option)
 const DASHDASH_ENDS = new Set(['git', 'rg', 'sort', 'tree', 'jq', 'xxd', 'sed', 'gsed']);
 function globWordMeets(a, pats) {
@@ -2879,19 +2842,15 @@ function globWordMeets(a, pats) {
 // `orig`: the words as written. R6-B1: a word that expansion changed (`D="--[d]elete"; find DIR $D`) is matched against the files after the expansion, so each blank-split piece of it is tested, whatever the raw text says.
 // #312: `lit` is the parser's own list of the words with no unquoted glob character and no expansion in them (cmd.litWords, read from the lexer's per-word quoting): `rg '^(a|b)' DIR/*.md` has an unquoted
 // glob, but the quoted program is no glob. Absent (a command the parser did not build): the line-wide reading, as before. A word that is both quoted and unquoted on the command is not listed (the text is the key).
-function globOptionRisky(name, args, raw, orig = args, lit = undefined, fixed = null) {
+function globOptionRisky(name, args, raw, orig = args, lit = undefined) {
   const pats = GLOB_PATTERNS[name];
   if (!pats || !args.some((a) => GLOB_CHARS.test(a))) return false;
   const globs = unquotedGlob(raw);
-  const limit = name === 'print' ? Math.min(args.length, printScan(orig, fixed, PRINT_TRANSPARENT).end) : args.length; // (print: its option area only; a word after the first operand or `--` is no option)
-  for (let i = 0; i < limit; i++) {
+  for (let i = 0; i < args.length; i++) {
     const a = args[i];
     if (a === '--' && DASHDASH_ENDS.has(name)) break;
     if (!GLOB_CHARS.test(a)) continue;
-    // (print: a word that is fixed, quoted or literal with no unquoted glob character, is no glob whatever its text holds: `print "starting $(date)"`. R31: a word that ends the area and is not fixed
-    // makes the call bad in printScan, so none is left here to exempt: a glob qualifier (`p*(P:-f%d:)`) can add option words, a glob that matches no file (`(N)`) vanishes)
-    if (name === 'print' && orig[i] === a && fixed !== null && fixed(a)) continue;
-    if (globs &&!(lit !== undefined && orig[i] === a && lit.has(a)) && globWordMeets(a, pats)) return true;
+    if (globs && !(lit !== undefined && orig[i] === a && lit.has(a)) && globWordMeets(a, pats)) return true;
     if (orig[i] !== a && a.split(/\s+/).some((piece) => globWordMeets(piece, pats))) return true;
   }
   return false;
@@ -3152,7 +3111,7 @@ function isReadOnly(cmd, ctx) {
   if (!argv.length) return false;
   const name = baseOf(argv[0]);
   const shadow = ctx.shadowed?.get(cmd);
-  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !(PATH_BUILTINS.has(name) || (name === 'print' && ctx.selfZsh)))) return false; // (#265 e; zsh's print is a builtin a PATH change does not move, bash has none)
+  if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !PATH_BUILTINS.has(name))) return false; // (#265 e)
   const judged = judgedWords(name, argv.slice(1), ctx);
   if (judged.unknown) return false;
   if (evaluatesSubscript(name, argv.slice(1), ctx, cmd.raw)) return false;
@@ -3162,31 +3121,12 @@ function isReadOnly(cmd, ctx) {
   if (PROGRAM_TOOLS.has(name) && !(name === 'sed' || name === 'gsed' ? sedReadOnly(argv.slice(1)) : awkReadOnly(argv.slice(1), cmd.env))) return false;
   return readOnlyWith(name, judged.args, cmd, ctx, argv);
 }
-// R31: is the word certain to reach print as exactly one word (cmd.plainWords, the parser's reading of its quoting; a command it did not build: the text holds no glob character and no run-time part)
-const printFixed = (cmd) => (w) => (cmd.plainWords ? cmd.plainWords.has(w) : !GLOB_CHARS.test(w) && !RUNTIME_PART.test(w));
-// (R31: a glob word that starts with a plain literal character and holds only `*`, `?` and `[..]` after it: no group, qualifier, extended-glob character (`# ~ ^ @ ! < > |`), `{`, `=` or run-time part)
-const PRINT_TRANSPARENT = (w) => /^[^-+*?[(^<>~#@!{=$`|\s]/.test(w) && !/[()^<>~#@!|{$`]/.test(w.slice(1));
 function readOnlyWith(name, args, cmd, ctx, argv) {
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
-  const fixed = printFixed(cmd);
-  if (globOptionRisky(name, args, cmd.raw, argv.slice(1), cmd.litWords, fixed)) return false; // (R4-F3 / R5-B2: a glob-spelled option; #312: a quoted word is no glob)
+  if (globOptionRisky(name, args, cmd.raw, argv.slice(1), cmd.litWords)) return false; // (R4-F3 / R5-B2: a glob-spelled option; #312: a quoted word is no glob)
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
-  }
-  // (#352 merge of main: zsh's print writes its words to standard output like echo; an option cluster before the first operand that binds a name (-v), feeds the history (-s / -S) or the
-  // edit buffer (-z), writes to a numbered descriptor (-u, -p) or prompt-expands its words (-P) is not read-only. A word after `-` / `--` or the first operand ends the options.
-  // R28-F2: an option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`), and the scan goes on after it.
-  // R29-F3: -f makes print zsh's printf, which reads the operand of a numeric conversion (or a `*`) as arithmetic: the format, as written and as expanded, must convert no number
-  // (printfFormatEvaluates, as for printf), and no word may hold a subscript-evaluation form. A word that may still start with `-` at run time (`print "$O" x`) may be any option.
-  // R30: printScan reads the option area once (a run-time part in any word of it, a value word included, is no read-only call); a glob-spelled word of it is judged by globOptionRisky.)
-  if (name === 'print') {
-    const raw = printScan(argv.slice(1), fixed, PRINT_TRANSPARENT);
-    const now = printScan(args);
-    if (raw.bad || now.bad) return false;
-    if (raw.fmt === undefined && now.fmt === undefined) return true;
-    if (raw.fmt == null || now.fmt == null || printfFormatEvaluates(raw.fmt) || printfFormatEvaluates(now.fmt)) return false;
-    return ![...args, ...argv.slice(1)].some((w) => SUBSCRIPT_FORM.test(w));
   }
   if (name === 'find') return !args.some((a) => FIND_UNSAFE.test(a));
   if (name === 'git') return gitReadOnly(args) && !toolEnvTouched(cmd, ctx, GIT_TOOL_ENV);
@@ -5131,7 +5071,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const at = ctx.frames.indexOf(frame);
     for (const d of unique([...assumedCwds(ctx), ...below])) {
       countCdRun(ctx.budget);
-      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _selfZsh: ctx.selfZsh, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
+      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
       if (r.decision === 'deny') return deny(`after a cd into a directory known only at run time, ${r.reason} (judged as if the directory were ${d})${ctx.bareCd ? BARE_CD_HINT : ''}`);
     }
   }

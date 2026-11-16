@@ -59,8 +59,9 @@ program.hook('preAction', (event)=>{ return event; });
 program.configureHelp({ formatHelp: (cmd, helper)=>(0, _x.format)(cmd, helper), subcommandTerm: (cmd)=>\`\${cmd.name()} \${cmd.usage()}\` });
 program.command('start').action((options, directory)=>import('../cli/next-start.js').then((mod)=>mod.nextStart(options, directory)));
 `;
-// serve.sh as the real one is shaped: a zsh script that moves to the parent of its own directory and runs the package's start script
-const SERVE = '#!/bin/zsh\n# starts the app\nexport PATH="$HOME/.npm-global/bin:/opt/homebrew/bin:$PATH"\ncd "${0:A:h:h}" || exit 1\nprint "starting $(date \'+%F\')"\nexec npm start\n';
+// serve.sh as the real one is shaped: a zsh script that moves to the parent of its own directory and runs the package's start script. (R32 redesign: the real one prints with zsh print, which is not
+// judged read-only (main's behaviour: it is refused after a cd known only at run time); this fixture says echo so the test stays about the node program, not about print)
+const SERVE = '#!/bin/zsh\n# starts the app\nexport PATH="$HOME/.npm-global/bin:/opt/homebrew/bin:$PATH"\ncd "${0:A:h:h}" || exit 1\necho "starting $(date \'+%F\')"\nexec npm start\n';
 const project = (guard, scripts, bin) => ({
   'package.json': JSON.stringify({ name: 'x', version: '1.0.0', scripts }),
   'scripts/serve.sh': SERVE,

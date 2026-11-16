@@ -201,11 +201,12 @@ test('#352 merge: a named descriptor word is no AUTO_CD directory unless a direc
   assert.equal(files('export F=x; bash run.sh', qfs).decision, 'deny');
 });
 
-// (#352, merge of main: zsh's print writes its words to standard output like echo; main's hook-file rule read `print "starting $(date)"` after a cd only known at run time as a write of a file
-// of that name. Options that do more than print stay refused, and a PATH change keeps print a possible program unless the script is run by zsh, where it is a builtin)
-test('#352 merge: zsh print is read-only like echo, unless an option binds, feeds history or a descriptor, or prompt-expands', () => {
+// (R32 redesign: zsh print is no longer judged read-only by files-policy at all: it is handled as on main, so every row below is a deny. The rows that were allows (print as echo) and the rows that
+// were denies for an option that binds, feeds history or a descriptor, prompt-expands, or makes print a printf stay as regression rows)
+test('#352 merge: zsh print is not judged read-only (R32 redesign; main\'s behaviour)', () => {
   const fs = fakeFs(PROJ, {}, DIRS);
-  for (const p of ['print "a $Y"', 'print -r -- "a $Y"', 'print -l "a $Y" b', 'print -- -s "a $Y"', 'print -C 2 "a $Y" b', 'print -C2 "a $Y"', 'print -f \'%s\' "a $Y"', 'print -x 4 -- -s "a $Y"', 'print -f \'%s\\n\' "a[$Y]"', 'print -rf \'%s %b\' "a $Y" b', 'print -- "$Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
+  // (these were allows: zsh print is not judged read-only (R32 redesign; main's behaviour))
+  for (const p of ['print "a $Y"', 'print -r -- "a $Y"', 'print -l "a $Y" b', 'print -- -s "a $Y"', 'print -C 2 "a $Y" b', 'print -C2 "a $Y"', 'print -f \'%s\' "a $Y"', 'print -x 4 -- -s "a $Y"', 'print -f \'%s\\n\' "a[$Y]"', 'print -rf \'%s %b\' "a $Y" b']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
   for (const p of ['print -s "a $Y"', 'print -S "a $Y"', 'print -z "a $Y"', 'print -u3 "a $Y"', 'print -rP "a $Y"', 'print -p "a $Y"', 'print -v V "a $Y"',
     // (R28-F2: an option that takes a value (-C -f -x -X -u -v) given it in the next word does not end the options: the scan goes on past the value)
     'print -C 1 -u3 "a $Y"', 'print -f \'%s\' -P "a $Y"', 'print -x 4 -z "a $Y"', 'print -C 1 -s "a $Y"', 'print -rC 1 -s "a $Y"', 'print -X 2 -S "a $Y"', 'print -Cf -s "a $Y"',
@@ -219,19 +220,22 @@ test('#352 merge: zsh print is read-only like echo, unless an option binds, feed
     'print -C $(echo 1 -f %d) \'a[$(rm -rf .claude; echo 0)]\'', 'print -x $=N \'a[$(rm -rf .claude; echo 0)]\'', 'print -X ${=N} x "a $Y"', 'print -C "$N" "a $Y"', 'print -rC $N "a $Y"',
     // (R30-F2: a glob-spelled word of the option area becomes any option when a file of that name is there: -?%d -> -f%d)
     'print -?%d \'a[$(rm -rf .claude; echo 0)]\'', 'print * \'a[$(rm -rf .claude; echo 0)]\'', 'print -l -?%d "a $Y"', 'print -C 2 * "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
-  // (R30 allow twins: a literal value word, a glob after `--` or after the first operand, a quoted glob, and runtime words that are plain operands)
-  for (const p of ['print -C 2 a b', 'print -l -- *.md "a $Y"', 'print -r -- * "a $Y"', 'print -C 2 -- "$Y" x', 'print x *.md "a $Y"', 'print -l x* "a $Y"', 'print -r \'*\' "a $Y"', 'print -f \'%s\\n\' a b', 'print -rl -- "-$O" x']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
+  // (R30 allow twins, were allows: zsh print is not judged read-only (R32 redesign; main's behaviour): a literal value word, a glob after `--` or after the first operand, a quoted glob, and runtime words that are plain operands)
+  for (const p of ['print -l -- *.md "a $Y"', 'print -r -- * "a $Y"', 'print x *.md "a $Y"', 'print -l x* "a $Y"', 'print -r \'*\' "a $Y"', 'print -rl -- "-$O" x']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  // (main's behaviour, still allows: print is not judged read-only, and these lines hold no word that reads as a path to write under the cd that is only known at run time)
+  for (const p of ['print -- "$Y"', 'print -C 2 a b', 'print -C 2 -- "$Y" x', 'print -f \'%s\\n\' a b', 'print hello world']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
   const script = '#!/bin/zsh\nexport PATH="$HOME/.npm-global/bin:$PATH"\ncd "$X" || exit 1\nprint "starting $(date)"\n';
   const zfs = fakeFs(PROJ, { 'run.sh': script }, DIRS);
-  assert.equal(files(`${PROJ}/run.sh`, zfs).decision, 'allow', 'run by zsh: print is a builtin');
-  assert.equal(files('zsh run.sh', zfs).decision, 'allow', 'zsh run.sh');
+  // (run.sh was allowed when run by zsh: zsh print is not judged read-only (R32 redesign; main's behaviour))
+  assert.equal(files(`${PROJ}/run.sh`, zfs).decision, 'deny', 'run by zsh: ' + "zsh print is not judged read-only (R32 redesign; main's behaviour)");
+  assert.equal(files('zsh run.sh', zfs).decision, 'deny', 'zsh run.sh');
   assert.equal(files('bash run.sh', zfs).decision, 'deny', 'run by bash: print may be a program on the moved PATH');
 });
 
-// (R31: one class rule: print's option area ends only at a lone `-` / `--` or at a word certain to reach print as exactly one word that does not start with a dash or a plus (no unquoted glob
-// character, group or qualifier, no unquoted expansion; a quoted run-time part is fine). Any other word before it may vanish (`(N)`, a glob with no match) or ADD option words (`(P:-f%d:)`,
-// `(e:...:)`), so what follows it may be options: not read-only.)
-test('#352 R31: print option area ends only at a word certain to be exactly one non-option word', () => {
+// (R31 rows, kept as regression rows: print's option area ended only at a word certain to be one non-option word; any other word may vanish (`(N)`) or ADD option words (`(P:-f%d:)`). R32 redesign:
+// zsh print is not judged read-only at all, so the former allows below are denies too. R32-F1/F2/F3: a vanishing glob as the -C / -x / -X value, a quoted rc-expand `"x${^@}"` that vanishes when
+// empty, and a brace range `{-...}x` that zsh expands to `-x .x` were all bypasses of the option-area rule)
+test('#352 R31 / R32: print is not judged read-only (R32 redesign; main\'s behaviour)', () => {
   const fs = fakeFs(PROJ, {}, DIRS);
   const SUB = '\'a[$(rm -rf .claude; echo 1)]\'';
   for (const p of [`a=(0); cd "$X" || exit 1; print zzz_no_match*(N) -f%d ${SUB}`, // (R31-B1)
@@ -239,10 +243,13 @@ test('#352 R31: print option area ends only at a word certain to be exactly one 
     `cd "$X" || exit 1; print x* -f%d ${SUB}`, `cd "$X" || exit 1; print x$Y -f%d ${SUB}`, `cd "$X" || exit 1; print x$(echo) -f%d ${SUB}`,
     `cd "$X" || exit 1; print x[a] -f%d ${SUB}`, `cd "$X" || exit 1; print -l x* -f%d ${SUB}`, 'cd "$X" || exit 1; print -r ?x "a $Y"', 'cd "$X" || exit 1; print x* x*(N) "a $Y"', 'cd "$X" || exit 1; print x#-f%d "a $Y"',
     'cd "$X" || exit 1; print x~y "a $Y"', 'cd "$X" || exit 1; print ~ "a $Y"', 'cd "$X" || exit 1; print x* -s "a $Y"']) assert.equal(files(p, fs).decision, 'deny', p);
-  for (const p of ['print "a $Y"', 'print "starting $(date)"', 'print -l -- *.md', 'print -- x*(N) "a $Y"', 'print hello world', 'print -r -- x* "a $Y"', 'print -l \'x*\' "a $Y"', 'print -l - x* "a $Y"',
+  // (R32 shapes, each a live bypass of the option-area rule: a vanishing glob as the -x value, "x${^@}" with no positional parameters, a brace range zsh expands to `-x .x`)
+  for (const p of [`print -x zzz* 8 -f%d ${SUB}`, `print "x\${^@}" -f%d ${SUB}`, `print {-...}f%s%d ${SUB}`]) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  // (these were allows: zsh print is not judged read-only (R32 redesign; main's behaviour))
+  for (const p of ['print "a $Y"', 'print "starting $(date)"', 'print -l -- *.md', 'print -- x*(N) "a $Y"', 'print -r -- x* "a $Y"', 'print -l \'x*\' "a $Y"', 'print -l - x* "a $Y"',
     // (a glob word that starts with a plain literal character and holds only * ? [..] is transparent: it can only vanish or become names starting with that character, so the scan goes on past it)
     'print -l x* "a $Y"', 'print x*', 'print x[a] "a $Y"', 'print x* "a $Y" -f%d', 'print x? x* -C2 "a $Y"', 'print x* -r "a $Y"']) {
-    assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
+    assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
   }
 });
 
