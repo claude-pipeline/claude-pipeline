@@ -3288,6 +3288,12 @@ function rsyncFlags(argv, ctx, raw) {
 // #478 R1-F1: is every name that the words of this rsync command hold given its value once, by a command that surely runs before it? (`N=-n; rsync -a --delete $N SRC ~/`: yes. `[ -n "$DRY" ] && N=-n`, an
 // if / loop / group / subshell / pipe stage / background job, a second assignment, a prefix of the rsync command itself (the shell expands the word first), a function or a sourced file that may set it: no.)
 // A word that holds a substitution, a backtick or an expansion form other than `$NAME` / `${NAME}` is not read. A name the line never gives is no value the line made.
+// #493: the next command at the text's own level (the parser lists a substitution's inner commands before the command that holds them: cmds[site + 1] can be one of them)
+const nextTopSep = (cmds, i) => {
+  if (cmds[i]?.depth > 0) return cmds[i + 1]?.sep;
+  for (let j = i + 1; j < cmds.length; j++) if (!(cmds[j].depth > 0)) return cmds[j].sep;
+  return undefined;
+};
 const SURE_BINDERS = new Set(['export', 'declare', 'typeset', 'readonly']);
 function rsyncNamesSure(cmds, idx, ctx) {
   // the names a text refers to (null: a form that is not read: a substitution, a backtick, an expansion other than $NAME / ${NAME})
@@ -3335,7 +3341,7 @@ function rsyncNamesSure(cmds, idx, ctx) {
     const [site] = sites;
     const c = cmds[site];
     const sure = site < limit && (c.argv.length === 0 || SURE_BINDERS.has(baseOf(c.argv[0]))) && c.depth === 0
-      && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && cmds[site + 1]?.sep !== '|' && cmds[site + 1]?.sep !== '&'
+      && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && !['|', '&'].includes(nextTopSep(cmds, site))
       && !mayNotRun(cmds, from, site);
     if (!sure) return false;
     // (#478 R2-B2: a value that holds a name is only as sure as that name was before this site: `[ -n "$DRY" ] && N=-n; OPTS="-a --delete $N"`)

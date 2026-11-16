@@ -2155,7 +2155,14 @@ function checkCandidateScripts(sf, dir, ctx, level) {
 // (flowStart / inFlow: the first command that may run conditionally or repeatedly, see line-writes.mjs)
 
 // A command followed by | or & ran in a subshell (a pipeline stage / background job): what it assigned or changed is lost.
-const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&';
+// #493: the next command is read from the text's own level for a command of it (the parser lists a `$( )`'s inner commands before the command that holds them, so cmds[i + 1] can be an inner command:
+// `cd /other | tee "$(date)"; git push`); a command inside a substitution keeps the flat reading (as nextAt in evalString).
+const nextSep = (cmds, i) => {
+  if (cmds[i]?.depth > 0) return cmds[i + 1]?.sep;
+  for (let j = i + 1; j < cmds.length; j++) if (!(cmds[j].depth > 0)) return cmds[j].sep;
+  return undefined;
+};
+const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || nextSep(cmds, i) === '|' || nextSep(cmds, i) === '&';
 const VALUE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select']);
 const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree', 'config']);
 
