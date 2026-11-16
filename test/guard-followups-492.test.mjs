@@ -99,6 +99,43 @@ describe('#505: every branch is unknown, also the ones no entry was made for', (
   });
 });
 
+// ---- #506 ----
+describe('#506: a write that may land under a repository\'s .git makes its branch unknown', () => {
+  const GIT_HEAD = '/work/repo/.git/HEAD';
+  const FIRST = 'git checkout agent/y && '; // (an entry for the directory, as in the R2 rows)
+  test('(1) exec 3>.git/HEAD on an earlier line, a group that writes through descriptor 3', () => {
+    expect('deny', `${FIRST}bash build.sh; git push`, { [BUILD]: `exec 3>${GIT_HEAD}\ncd dist || { echo 'ref: refs/heads/main' >&3; exit 1; }\n` });
+  });
+  test('(2) exec >.git/HEAD earlier, then a plain echo in the group', () => {
+    expect('deny', `${FIRST}bash build.sh; git push`, { [BUILD]: `exec >${GIT_HEAD}\ncd dist || { echo hi; exit 1; }\n` });
+  });
+  test('(3) the caller\'s own redirect of the script', () => {
+    expect('deny', `${FIRST}bash build.sh > ${GIT_HEAD}; git push`, { [BUILD]: 'make\n' });
+  });
+  test('(3) with no entry for the directory yet (the caller is on agent/x)', () => {
+    expect('deny', `bash build.sh > ${GIT_HEAD}; git push`, { [BUILD]: 'make\n' });
+  });
+  for (const [why, line] of [
+    ['a typed git --output', `git log --output=.git/HEAD; git push`],
+    ['a typed git --output, absolute', `git log --output=${GIT_HEAD}; git push`],
+    ['a typed redirect', `echo ref > ${GIT_HEAD}; git push`],
+    ['a typed append', `echo ref >> .git/HEAD; git push`],
+    ['a tee', `echo ref | tee .git/HEAD; git push`],
+    ['a cp', `cp main.ref .git/HEAD; git push`],
+    ['a mv', `mv main.ref ${GIT_HEAD}; git push`],
+    ['an install', `install -m 644 main.ref .git/HEAD; git push`],
+    ['an exec redirect', `exec 3>.git/HEAD; git push`],
+  ]) test(`typed on the line: ${why}`, () => expect('deny', line));
+  for (const [why, line] of [
+    ['a log in /tmp', 'git log --oneline > /tmp/log.txt; git push'],
+    ['a .gitignore edit', 'echo node_modules >> .gitignore; git push'],
+    ['a .github file', 'cp a.yml .github/a.yml; git push'],
+    ['a .gitkeep', 'echo > docs/.gitkeep; git push'],
+    ['a git --output to /tmp', 'git log --output=/tmp/log.txt; git push'],
+    ['a tee to a log', 'npm test | tee out.log; git push'],
+  ]) test(`not under .git: ${why} stays allowed`, () => expect('allow', line));
+});
+
 // Over-denial guard: ordinary work stays allowed after every change above.
 describe('ordinary work stays allowed', () => {
   const OK = (name, line, files) => test(`allowed: ${name}`, () => expect('allow', line, files));
