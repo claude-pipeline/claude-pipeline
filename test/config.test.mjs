@@ -1172,3 +1172,16 @@ test('review.size_only_medium_reviewer: judge (default) or fable, anything else 
     assert.ok(has(validateConfig({ ...minimal(), review: { size_only_medium_reviewer: bad } }), 'review.size_only_medium_reviewer'), JSON.stringify(bad));
   }
 });
+
+test('ci.merge_checks defaults to [] (frozen), must be an array of strings, and is not part of the required (protection) list', () => {
+  assert.deepEqual(DEFAULTS.ci.merge_checks, []);
+  assert.ok(Object.isFrozen(DEFAULTS.ci.merge_checks));
+  for (const bad of ['Replay from zero', [1], [{}], null]) {
+    assert.ok(has(validateConfig({ ...minimal(), ci: { merge_checks: bad } }), 'ci.merge_checks'), JSON.stringify(bad));
+  }
+  const ok = validateConfig({ ...minimal(), ci: { merge_checks: ['Replay from zero'] } });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.deepEqual(ok.config.ci.merge_checks, ['Replay from zero']);
+  // ci-wait waits for them, but branch protection / `protect` / the final gate list must not start requiring them
+  assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: false, merge_checks: ['Replay from zero'] }), ['build']);
+});

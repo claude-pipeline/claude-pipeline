@@ -37,6 +37,14 @@
 // {mergeable, mergeStateStatus}) is asked: CONFLICTING / DIRTY => verdict `conflicting` (merge the base, then the resolution round).
 // UNKNOWN (GitHub still computing it) is re-read once after one interval inside the wait loop, then the old verdict stands; an
 // absent or throwing reader leaves the old verdict as well (never a guess, never a pass).
+// `options.mergeChecks` (config ci.merge_checks): names the repo's own merge command requires although branch protection does not
+// (EagleWatch "Replay from zero"). Each is one more unpinned identity (listed in `checks` with source: 'merge_checks') waited on and
+// judged exactly like a required one; a name that is already required is not doubled. They never decide `unverified` /
+// `no-required-checks`: those speak about the policy sources alone.
+// `options.e2eLabel` (config ci.e2e_label): on a PR carrying that label (`readers.labels()`, read once at the end) a `passed` result
+// also reports `others: [{name, status, url}]`, the head's NON-required check runs / statuses that are still running or red, so a
+// green required set never hides a pending or failed e2e suite. Report only: the verdict is not changed. An unreadable label read
+// leaves the plain result.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -117,7 +125,7 @@ function identitiesOf(sources) {
 }
 
 export async function waitForCi({ readers, options, clock, onProgress = () => {} }) {
-  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, configChecks = [] } = options;
+  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, configChecks = [], mergeChecks = [], e2eLabel = null } = options;
   const start = clock.now();
   const elapsed = () => clock.now() - start;
 
@@ -311,9 +319,9 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         producers.push({ state, url: status.target_url ?? null, status });
       }
     }
-    if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null };
+    if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null, ...(identity.source ? { source: identity.source } : {}) };
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
-    const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url };
+    const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url, ...(identity.source ? { source: identity.source } : {}) };
     if (worst.status) statusBasis.set(out, worst.status);
     return out;
   };
@@ -374,6 +382,36 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     }
   };
 
+  // The head's checks that nobody requires (not an identity) and that are still running or red, on a PR carrying the e2e label; null
+  // when this does not apply (no label configured, no reader, the label absent, an unreadable read). A check run is judged by its
+  // latest run per app; a status by its latest per context.
+  const otherChecks = async (obs, identities) => {
+    if (!e2eLabel || !readers.labels) return null;
+    try {
+      if (!(await readers.labels()).includes(e2eLabel)) return null;
+    } catch {
+      return null;
+    }
+    const known = new Set(identities.map((i) => i.name));
+    const out = [];
+    const seen = new Set();
+    for (const name of obs.checkRuns.map((r) => r?.name)) {
+      if (typeof name !== 'string' || known.has(name) || seen.has(name)) continue;
+      seen.add(name);
+      for (const run of latestRuns(obs.checkRuns, name, null)) {
+        if (run.status === 'completed' && (GOOD.has(run.conclusion) || run.conclusion === 'skipped')) continue;
+        out.push({ name, status: run.status === 'completed' ? run.conclusion : run.status ?? 'unknown', url: run.html_url ?? null });
+      }
+    }
+    for (const context of obs.statuses.map((x) => x?.context)) {
+      if (typeof context !== 'string' || known.has(context) || seen.has(context)) continue;
+      seen.add(context);
+      const status = latestStatus(obs.statuses, context);
+      if (status.state !== 'success') out.push({ name: context, status: status.state, url: status.target_url ?? null });
+    }
+    return out;
+  };
+
   const statusEvidenceOf = (failures) => failures.map((f) => statusBasis.get(f)).filter(Boolean).map((x) => ({ context: x.context, id: x.id ?? null, state: x.state, createdAt: x.created_at ?? null }));
 
   const describe = (states) => states.map((s) => `${s.name}=${s.state}`).join(', ');
@@ -429,7 +467,9 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       return result(EXIT.FAILED, 'no-required-checks', { message: 'neither branch protection nor a ruleset requires any status check on the base branch' });
     }
     const unverified = sources.classic.kind === 'unreadable' || sources.rules.kind === 'unreadable';
-    const identities = identitiesOf(sources);
+    const required = identitiesOf(sources);
+    const mergeIdentities = [...new Set(mergeChecks)].filter((name) => !required.some((i) => i.name === name)).map((name) => ({ name, appId: null, source: 'merge_checks' }));
+    const identities = [...required, ...mergeIdentities];
 
     // Everything from the evaluation to the verdict. `confirmed` is true on the second pass, which a failure read from a commit
     // status, or an absence verdict past --appear-timeout, triggers: the head's check runs and statuses are read again first, so a
@@ -463,7 +503,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         configChecks: diagnostics,
       });
     };
-    if (identities.length === 0) return unverifiedResult();
+    if (required.length === 0) return unverifiedResult();
 
     const bad = states.filter((s) => isBad(s.state));
     const waiting = states.filter((s) => isWaiting(s.state));
@@ -538,7 +578,11 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (again.isDraft) return result(EXIT.FAILED, 'draft', { message: 'the PR went back to draft' });
     if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
-    return result(EXIT.OK, 'passed');
+    const others = await otherChecks(obs, identities);
+    if (others !== null && others.length > 0) {
+      return result(EXIT.OK, 'passed', { others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
+    }
+    return result(EXIT.OK, 'passed', others === null ? {} : { others });
     };
     return decide({ checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) }, false);
   };

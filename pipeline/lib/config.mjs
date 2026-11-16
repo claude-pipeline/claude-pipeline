@@ -57,13 +57,16 @@ export const DEFAULTS = deepFreeze({
   verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0, after_fix: 'full' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
+  // merge_checks: check names the repo's own merge command also requires although branch protection does not (EagleWatch: "Replay
+  // from zero"). Only `pipeline ci-wait` reads them: it waits for each and judges it like a required check (a check that never
+  // appears ends `missing`, so list only checks that always report). They are NOT part of the protected set (requiredChecks).
   // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
   // which only exists for user-owned repos: an org-owned repo MUST list its approvers. The same logins (or the owner) are the
   // authors whose review-complete comment counts for review_check.
   // review_check: the pipeline-guards workflow also posts a "Cross-model review" status (success only when the latest
   // review-complete comment's content hash is the PR head's), and preflight, `protect` and the gate require it. Off by
   // default: turn it on in the same change that applies branch protection with it, or every merge waits for a missing check.
-  ci: { required_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, review_check: false, approvers: [] },
+  ci: { required_checks: [], merge_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, review_check: false, approvers: [] },
   // {sha} is required: the approved head is passed to the merge so a head that moved after review can never merge.
   // behind_base (read from the BASE branch's copy only, and only by `P merge --owner-go`): 'update' (default) = a PR that lacks commits of its base
   // must be updated and re-verified; 'disjoint' = it may merge as is when main's new commits touch none of the PR's files (and none of the
@@ -204,7 +207,7 @@ const KEYS = {
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
   ci_proof: ['workflow', 'job', 'event', 'steps'],
-  ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'review_check', 'approvers'],
+  ci: ['required_checks', 'merge_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'review_check', 'approvers'],
   merge: ['command', 'wait_minutes', 'behind_base', 'behind_base_stale_paths', ...MERGE_HOLD_KEYS],
   preview: ['environment', 'smoke', 'provider'],
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback', 'watch'],
@@ -838,6 +841,7 @@ export function validateConfig(obj) {
   const ci = section(config, 'ci', errors);
   if (ci) {
     checkStrArray(ci.required_checks, 'ci.required_checks', errors);
+    checkStrArray(ci.merge_checks, 'ci.merge_checks', errors);
     if (ci.e2e_label !== null && typeof ci.e2e_label !== 'string') errors.push('ci.e2e_label must be a string or null');
     if (typeof ci.draft_while_iterating !== 'boolean') errors.push('ci.draft_while_iterating must be a boolean');
     if (!Array.isArray(ci.approvers) || !ci.approvers.every((l) => typeof l === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$/.test(l))) {

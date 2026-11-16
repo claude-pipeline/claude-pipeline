@@ -251,3 +251,38 @@ test('ci-wait (real gh args): an absent required check on a CONFLICTING PR is ve
   assert.deepEqual(r.json.mergeState, { mergeable: 'CONFLICTING', state: 'DIRTY' });
   assert.ok(fake.lines().includes('pr view 5 --json mergeable,mergeStateStatus'));
 });
+
+test('ci-wait: ci.merge_checks is waited on as well, and on a ci.e2e_label PR a still-running non-required check is reported as others (in-process)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}  merge_checks: [Replay from zero]\n  e2e_label: run-e2e\n`);
+  repo.commit('init');
+  let t = 0;
+  const calls = [];
+  const gh = {
+    prView: (n, fields) => {
+      calls.push(fields.join(','));
+      return fields.includes('labels') ? { labels: [{ name: 'run-e2e' }] } : pr();
+    },
+    protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'ci', app_id: 15368 }] } } }),
+    branchRules: () => [],
+    checkRunsOf: () => [
+      run(1, 'ci', 'success'),
+      // the merge check finishes on the third read; the e2e suite is not required and is still running
+      ...(t >= 30_000 ? [run(2, 'Replay from zero', 'success')] : [{ ...run(2, 'Replay from zero', null), status: 'in_progress', conclusion: null }]),
+      { ...run(3, 'Playwright suite', null), status: 'in_progress', conclusion: null },
+    ],
+    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
+  };
+  const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
+  const r = await ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(t, 30_000, 'held until the merge check passed');
+  assert.deepEqual(r.output.checks.map((c) => [c.name, c.state, c.source]), [['ci', 'pass', undefined], ['Replay from zero', 'pass', 'merge_checks']]);
+  assert.deepEqual(r.output.others, [{ name: 'Playwright suite', status: 'in_progress', url: 'https://github.example/runs/3' }]);
+  assert.ok(calls.includes('labels'));
+});
+
+test('meta: the usage names the new output fields and verdict', () => {
+  for (const word of ['conflicting', 'others']) assert.ok(meta.usage.includes(word), word);
+});
