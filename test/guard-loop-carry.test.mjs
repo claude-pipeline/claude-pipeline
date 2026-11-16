@@ -412,6 +412,31 @@ test('#352 R38-F2: a script / package script / bash -c text / sourced file never
     assert.equal(r.decision, 'allow', `named push after ${what}: ${r.reason}`);
   }
 });
+// (#352 R38-F2, same rule for the other child processes of a text: a ( ) subshell and a $( ) / backtick substitution end early on an `exit` while the line goes on, so a level never hands a state change to the commands after it.
+// Held already by the level close (a change in a sub level makes the branches unknown); pinned here, in a line and in a script run by bash, with the twins that change nothing)
+test('#352 R38-F2: a subshell / command substitution never hands a state change to the commands after it (it may have exited before it)', () => {
+  const at = (cmd, files, cwd) => evaluateGitCommand(cmd, {
+    cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(cwd, files),
+  });
+  const levels = [
+    '( exit 0; git switch agent/x ); PUSH', '( [ -f s ] && exit 0; git switch agent/x ) && PUSH', 'x=$(exit 0; git switch agent/x); PUSH', 'echo "$( [ -f s ] && exit 0; git switch agent/x )"; PUSH',
+    'echo `exit 0; git switch agent/x`; PUSH', '( git switch agent/x ); PUSH', 'x=$(git switch agent/x); PUSH', '( cd /work/repo && git switch agent/x ); PUSH',
+    'git switch agent/x; ( git switch main; exit 0; git switch agent/x ); PUSH', 'git switch agent/x; x=$(git switch main; exit 0; git switch agent/x); PUSH',
+  ];
+  const HEAD = `${PB} origin HEAD`;
+  for (const l of levels) {
+    const line = l.replace('PUSH', HEAD);
+    assert.equal(at(line, {}, '/work/other').decision, 'deny', `line: ${line}`);
+    assert.equal(at('bash ./run.sh', { 'run.sh': `#!/bin/bash\n${line}\n` }, '/work/other').decision, 'deny', `in a script: ${line}`);
+    assert.equal(at(line.replace(HEAD, `${PB} origin agent/x`), {}, '/work/other').decision, 'allow', `twin naming the branch: ${line}`);
+  }
+  // (twins: a level that changes nothing leaves the state as it was, on a feature branch)
+  for (const l of ['( echo hi ); PUSH', 'x=$(echo hi); PUSH', 'echo "$(git status)"; PUSH', '( cd sub && ls ) && PUSH']) {
+    const line = l.replace('PUSH', HEAD);
+    assert.equal(at(line, {}, GIT_ROOT).decision, 'allow', `twin: ${line}`);
+    assert.equal(at('bash ./run.sh', { 'run.sh': `#!/bin/bash\n${line}\n` }, GIT_ROOT).decision, 'allow', `twin in a script: ${line}`);
+  }
+});
 // (#352 R36-F1: a loop's own level and depth come from the whole of its range, not from its first listed command, which is a command of a substitution / group / loop in its header)
 test('#352 R36-F1: a loop whose header holds a substitution, a group or a loop is judged at its own level', () => {
   const body = (inner) => `${PB} origin HEAD; cd /work/other; ${inner}`;
