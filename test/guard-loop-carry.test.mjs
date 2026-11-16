@@ -195,7 +195,7 @@ test('#352 R30-F3: a -P / -- after the cd operand makes the cd fail (two operand
 // (#352 R35-B1, R35-B2, R35-F1, R35-F2: ONE rule. A cd / state change is trusted to have run only when it surely did: in a loop's replay a cd REPLACES the places the body may end in only when it is
 // certain there (after ;, not in a branch, an inner loop, the background or a pipeline stage, not negated, every level between the loop and it entered by ;, no redirection that can fail on it, on the
 // closer of its { } group or on the eval that holds it); any other ADDS its target. A `continue` that reaches the loop ends an iteration where it stands. On the straight line, a change with a
-// redirection that can fail is not certain (the directory / branch after it is unknown). Redirections that cannot fail (`2>/dev/null`, `>&2`, `2>&1`, `&>/dev/null`) change nothing.)
+// redirection that can fail is not certain (the directory / branch after it is unknown). (#352 R36: NO redirection is firm, see the R36 test below.)
 test('#352 R35-B1/B2/F1/F2: a cd or state change that may not have run is not trusted', () => {
   const loopRows = [
     ['failing redirection on the cd back (R35-B1)', `cd /work/other; cd ${GIT_ROOT} < /missing`],
@@ -233,18 +233,12 @@ test('#352 R35-B1/B2/F1/F2: a cd or state change that may not have run is not tr
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
   }
   for (const [what, line] of [
-    ['cd back with 2>/dev/null, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd ${GIT_ROOT} 2>/dev/null; done`],
-    ['cd back with >/dev/null 2>&1, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd ${GIT_ROOT} >/dev/null 2>&1; done`],
-    ['cd back in a { } group with 2>/dev/null on its closer', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; { cd ${GIT_ROOT}; } 2>/dev/null; done`],
     ['cd back in an eval after ;', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; eval 'cd ${GIT_ROOT}'; done`],
     ['continue of an inner loop only', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; for j in a; do continue; done; cd ${GIT_ROOT}; done`],
     ['break before the cd back (no next iteration from there)', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; if [ -f stop ]; then break; fi; cd ${GIT_ROOT}; done`],
     ['a zero-run inner loop, then the cd back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; while false; do cd /tmp; done; cd ${GIT_ROOT}; done`],
     ['continue after the cd back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd ${GIT_ROOT}; continue; done`],
-    ['straight line: cd back with 2>/dev/null', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with &>/dev/null, after &&', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
-    ['straight line: cd back with >&2', `cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
-    ['straight line: switch with 2>/dev/null', `cd /work/other; git switch agent/x 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: a bare >x in the { } group is no closer', `cd /work/other; { cd ${GIT_ROOT}; >x; }; ${PB} origin HEAD`],
     ['a bare >x in the { } group is no closer, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; { cd ${GIT_ROOT}; >x; }; done`],
     ['straight line: a failing redirection on a command that moves nothing', `cd ${GIT_ROOT}; git branch -a > /missing/f; ${PB} origin HEAD`],
@@ -252,4 +246,73 @@ test('#352 R35-B1/B2/F1/F2: a cd or state change that may not have run is not tr
     allows(what, line);
     allows(`${what}, in a script`, RUN_SH, script('echo', line));
   }
+});
+// (#352 R36, the final simple rule: NO redirection is firm. A cd / state change carrying any redirection (`2>/dev/null`, `>&2`, `2>&1`, a heredoc ...) may not have run: `exec 2>&-; cd d >&2` fails
+// (bad descriptor) and so does `ulimit -S -n 3; cd d 2>/dev/null` (too many open files). A failed redirection makes the command exit non-zero, so the command chained to it with && still runs only when it ran.)
+test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35 allows with 2>/dev/null, >&2, &>/dev/null flip to deny)', () => {
+  const loopRows = [
+    ['closed stderr, cd back with >&2 (R36-B1)', `exec 2>&-; cd /work/other; cd ${GIT_ROOT} >&2`],
+    ['closed stderr, cd back with 2>&1', `exec 1>&-; cd /work/other; cd ${GIT_ROOT} 2>&1`],
+    ['lowered descriptor limit, cd back with 2>/dev/null (R36-F2)', `ulimit -S -n 3; cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ulimit -S -n 256`],
+    ['cd back with 2>/dev/null (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null`],
+    ['cd back with >/dev/null 2>&1 (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >/dev/null 2>&1`],
+    ['cd back in a { } group with 2>/dev/null on its closer (R35 allow flipped)', `cd /work/other; { cd ${GIT_ROOT}; } 2>/dev/null`],
+  ];
+  for (const [what, body] of loopRows) {
+    const loop = `for i in 1 2; do ${PB} origin HEAD; ${body}; done`;
+    denies(what, loop, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', loop), DIRS);
+  }
+  for (const [what, line] of [
+    ['straight line: closed stderr, cd back with >&2 (R36-B1)', `exec 2>&-; cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
+    ['straight line: closed stderr, cd back with 2>&1', `exec 2>&-; cd /work/other; cd ${GIT_ROOT} 2>&1; ${PB} origin HEAD`],
+    ['straight line: lowered descriptor limit, cd back with 2>/dev/null (R36-F2)', `cd /work/other; ulimit -S -n 3; cd ${GIT_ROOT} 2>/dev/null; ulimit -S -n 256; ${PB} origin HEAD`],
+    ['straight line: lowered descriptor limit, switch with 2>/dev/null', `ulimit -S -n 3; git switch agent/x 2>/dev/null; ulimit -S -n 256; ${PB} origin HEAD`],
+    ['straight line: switch with 2>/dev/null (R35 allow flipped)', `cd /work/other; git switch agent/x 2>/dev/null; ${PB} origin HEAD`],
+    ['straight line: cd back with 2>/dev/null (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
+    ['straight line: cd back with >&2 (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
+    ['straight line: cd back with 2>/dev/null, then another command, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && true; ${PB} origin HEAD`],
+  ]) {
+    denies(what, line, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
+  }
+  // (the && chain stays sound and is not over-refused: a failed redirection makes the cd exit non-zero, so what is chained to it with && runs only when the cd ran)
+  for (const [what, line] of [
+    ['cd back with 2>/dev/null && push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
+    ['cd back with >&2 && push', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
+    ['cd back with &>/dev/null && push (R35 allow kept)', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || exit, then push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
+  ]) {
+    allows(what, line);
+    allows(`${what}, in a script`, RUN_SH, script('echo', line));
+  }
+});
+// (#352 R36-F1: a loop's own level and depth come from the whole of its range, not from its first listed command, which is a command of a substitution / group / loop in its header)
+test('#352 R36-F1: a loop whose header holds a substitution, a group or a loop is judged at its own level', () => {
+  const body = (inner) => `${PB} origin HEAD; cd /work/other; ${inner}`;
+  const heads = [
+    ['for over a substitution', (b) => `for i in $(echo 1 2); do ${b}; done`],
+    ['while on a substitution', (b) => `while test "$(cat f)" = go; do ${b}; done`],
+    ['while on a { } group', (b) => `while { true; }; do ${b}; done`],
+    ['for over a substitution holding a loop', (b) => `for i in $(for j in a; do echo $j; done); do ${b}; done`],
+  ];
+  const inners = [
+    ['a cd in an eval behind &&', `false && eval 'cd ${GIT_ROOT}'`],
+    ['a cd in a { } group with a failing redirection', `{ cd ${GIT_ROOT}; } < /missing`],
+    ['a cd in a loop that runs zero times', `while false; do cd ${GIT_ROOT}; done`],
+  ];
+  for (const [hw, head] of heads) {
+    for (const [iw, inner] of inners) {
+      const loop = head(body(inner));
+      denies(`${hw}: ${iw}`, loop, {}, DIRS);
+      denies(`${hw}: ${iw}, in a script`, RUN_SH, script('echo', loop), DIRS);
+    }
+  }
+  // (allow twins: the cd back surely runs, whatever the header holds)
+  for (const [hw, head] of heads) {
+    const loop = head(body(`cd ${GIT_ROOT}`));
+    allows(`${hw}: a plain cd back`, loop);
+    allows(`${hw}: a plain cd back, in a script`, RUN_SH, script('echo', loop));
+  }
+  allows('for over a substitution: stays in the repository', `for i in $(echo 1 2); do cd sub && ${PB} origin HEAD; cd ..; done`);
 });
