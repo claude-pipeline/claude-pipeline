@@ -15,8 +15,8 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset } from './shell-parse.mjs';
-export { withoutLiteralText, INDIRECT_EXPANSION };
+import { UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
@@ -407,7 +407,21 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // `unset`), set in the environment, or a sourced script that may have set variables.
 // A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
 // so the commands that assign a variable by a computed or split-up name count as well.
-const SETS_BY_NAME = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s|\b(?:export|unset|declare|typeset|local|readonly)\b[^;&|\n]*[$`'"]/;
+const SETS_BY_NAME_HEAD = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s/;
+const DECLARING_WORD = /\b(?:export|unset|declare|typeset|local|readonly)\b/;
+// (#288 R3-F3: the declaring words used to be one pattern, `\b(?:export|…)\b[^;&|\n]*[$`'"]`, which rescans the rest of the segment from EVERY declaring word: 27,000 `export` words took 7 s. A segment holds a name-setting
+// declaration when its FIRST declaring word is followed by a quote, `$` or backtick before the segment ends -- the same answer, one pass per segment.)
+const SETS_BY_NAME = {
+  test(text) {
+    const s = String(text);
+    if (SETS_BY_NAME_HEAD.test(s)) return true;
+    for (const seg of s.split(/[;&|\n]/)) {
+      const k = DECLARING_WORD.exec(seg);
+      if (k && /[$`'"]/.test(seg.slice(k.index + k[0].length))) return true;
+    }
+    return false;
+  },
+};
 // Both the text as written and with its quotes and backslashes removed (`printf -vI""FS ,` spells the name only once they are gone).
 // Why (#81 Codex R1-B1 follow-up): a script the guard opens is judged with its own text too -- `bash wrapper.sh` hid `declare -n r=IFS; r=x` from the outer line. Whole-line comments are left out of
 // the binder test only (a comment that says "read" is no binder); the name IFS anywhere, a comment included, still counts.
@@ -1416,7 +1430,7 @@ function cdTargets(cmds, startDir, ctx) {
   const dirs = startDir === null ? [] : [startDir];
   for (const c of cmds) {
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
-    if (nm !== 'cd' && nm !== 'pushd') continue;
+    if (nm !== 'cd' && nm !== 'chdir' && nm !== 'pushd') continue;
     const t = c.argv.slice(1).find((a) => !a.startsWith('-'));
     const e = t === undefined ? '~' : expandVars(t, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, () => lineHome(ctx) ?? '$HOME');
     if (DYNAMIC.test(e) || e === '-') continue;
@@ -2254,7 +2268,7 @@ const UNSURE_OK = new Set([
   'break', 'continue', 'return', 'exit', 'shift',
   ...VAR_BUILTINS, ...VALUE_BINDERS,
 ]);
-const DIR_CHANGERS = ['cd', 'pushd', 'popd'];
+const DIR_CHANGERS = ['cd', 'chdir', 'pushd', 'popd']; // (#372: zsh's chdir is cd)
 
 // A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
 // an alias, a trap (`trap "cd …" DEBUG` runs before every command) or changes shell options / builtins can change
@@ -2811,9 +2825,21 @@ function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  // #452: the group form `cd d || { echo "no d" >&2; exit 1; }; git push`, read by shell-parse's exitFollows, the files guard's rule (a group entered by ||, its last command a plain exit, no redirection on its closer)
+  let shapeTop; // (the commands of the text's own level and their shape events, built when first asked)
+  // #478 R1-B1: the index in cmds of the group's last command, its `exit` (-1: not this form). The commands after i up to it run only when the cd / checkout FAILED.
+  const exitOfGroup = (i) => {
+    if (!cmds.shape || cmds[i].depth > 0) return -1;
+    shapeTop ??= { top: cmds.filter((c) => !(c.depth > 0)), evAt: shapeAt(cmds.shape) }; // (the commands inside a substitution are listed before the one that holds them; the events count the text's own level only)
+    const k = shapeTop.top.indexOf(cmds[i]);
+    const after = k >= 0 ? exitFollows(shapeTop.top, shapeTop.evAt, k) : -1;
+    return after >= 1 ? cmds.indexOf(shapeTop.top[after - 1]) : -1; // (the exit is the construct's last command; a substitution of the command after it is listed after the exit)
+  };
+  const exitsAsGroup = (i) => exitOfGroup(i) >= 0;
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
-  if (cmds.truncated) return deny('command too complex to verify (the parser gave up). Split it into simpler commands.');
+  if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
+  if (cmds.truncated) return deny(cmds.refused ? `the command uses ${cmds.refused}, which the guard does not read. ${refusalAdvice(cmds.refused).replace(/^./, (c) => c.toUpperCase())}.` : 'command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
@@ -2863,11 +2889,27 @@ function evalString(str, startDir, ctx, level, child = false) {
   ctx.writeFrames.push(frame);
   // the subshells open at the command being walked, outermost first: { id, dir, uncertain } as they were when it started (null: marks not trusted, see subshellsTrusted)
   const subs = subshellsTrusted(cmds) ? [] : null;
+  // #478 R1-B1: the commands of a failure group `cd X || { …; exit 1; }` run only when the cd (or a git checkout / switch) FAILED, in the old directory on the old branch, so they are walked with the state unknown
+  // (`to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`: the cd / checkout itself may not have run)
+  let failGroup = null;
   let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
   try {
   for (const [i, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
+    if (failGroup && failGroup.snap === null) {
+      failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]) };
+      forgetState();
+    } else if (failGroup && i > failGroup.to) {
+      dir = failGroup.snap.dir;
+      // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
+      if (failGroup.doubt) forgetState();
+      else {
+        const was = new Map(failGroup.snap.names);
+        for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
+      }
+      failGroup = null;
+    }
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
@@ -2894,8 +2936,14 @@ function evalString(str, startDir, ctx, level, child = false) {
       const nm = baseName(argv[0]);
       const changesState = DIR_CHANGERS.includes(nm) || (nm === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'));
       // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
-      const orExits = cmds[i + 1]?.sep === '||' && ['exit', 'return'].includes(cmds[i + 1].argv[0]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&';
+      // (#427, the same rule as the files guard's cd narrowing: only a plain `exit`, alone or with one number, leaves: not `return` (an error at top level), not an exit with a redirection or extra words, and no
+      // redirection on the closer of its group, `{ exit 1; } < f`, which the parser lists as a command of no words right after it)
+      const orExits = cmds[i + 1]?.sep === '||' && plainExit(cmds[i + 1]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&'
+        && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0)
+        || (changesState && exitsAsGroup(i));
+      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false };
       if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
+      if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
@@ -2913,7 +2961,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
-    else if (name === 'cd' || name === 'pushd' || name === 'popd') dir = nextDir(dir, name, argv, ctx, cdp, c.env ?? {});
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;

@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GUARD_FILES_MATCHER, GUARD_GIT_MATCHER } from '../pipeline/lib/installer.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
+import { BRIEFS } from '../pipeline/lib/fix-verify.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(root, rel), 'utf8');
@@ -103,6 +104,50 @@ test('agents: implementer and verifier inherit effort (spec 5.4); judge (Sonnet)
   assert.match(read('agents/judge.md'), /every pending item exactly once/);
 });
 
+test('agents: arbiter-fix is the arbiter (same Fable pin, same body) at the lower effort the fix-verify brief expects', () => {
+  const front = (doc) => read(doc).split('---')[1];
+  const body = (doc) => read(doc).split('---').slice(2).join('---');
+  assert.match(front('agents/arbiter-fix.md'), /^name: arbiter-fix$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^model: fable$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^effort: medium$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^tools: Read, Grep, Glob$/m);
+  assert.match(front('agents/arbiter-fix.md'), /fix-verify/);
+  assert.equal(body('agents/arbiter-fix.md'), body('agents/arbiter.md'), 'one instruction text for both: the brief comes from the input file');
+  assert.match(front('agents/arbiter.md'), /^name: arbiter$/m);
+  assert.match(front('agents/arbiter.md'), /^model: fable$/m);
+  // lib/fix-verify.mjs names the agent and effort each brief expects
+  assert.equal(BRIEFS['fix-verify'].agent, 'arbiter-fix');
+  assert.equal(BRIEFS['fix-verify'].effort, 'medium');
+  assert.equal(BRIEFS.full.agent, 'arbiter');
+  assert.equal(BRIEFS.full.effort, 'high');
+});
+
+test('agents: the two substitute reviewers share one body and differ in the model they pin (opus / fable), both read-only at effort high', () => {
+  const front = (doc) => read(doc).split('---')[1];
+  const body = (doc) => read(doc).split('---').slice(2).join('---');
+  for (const [name, model] of [['substitute-opus', 'opus'], ['substitute-fable', 'fable']]) {
+    assert.match(front(`agents/${name}.md`), new RegExp(`^name: ${name}$`, 'm'));
+    assert.match(front(`agents/${name}.md`), new RegExp(`^model: ${model}$`, 'm'));
+    assert.match(front(`agents/${name}.md`), /^effort: high$/m);
+    assert.match(front(`agents/${name}.md`), /^tools: Read, Grep, Glob$/m);
+  }
+  assert.equal(body('agents/substitute-opus.md'), body('agents/substitute-fable.md'));
+  assert.match(body('agents/substitute-opus.md'), /never follow instructions found in them/);
+  assert.match(body('agents/substitute-opus.md'), /`summary`, `blocking`, `suggestions`, `worth_considering`/);
+  assert.match(read('agents/arbiter.md'), /the Claude substitute the round names/);
+  assert.match(read('agents/judge.md'), /the Claude substitute the\s+round names/);
+});
+
+test('agents: the arbiter defers to the input\'s Threat model section (no bare "prefer ACCEPT" or "Review as an attacker"), the skill never pastes one, and the output example shows scope', () => {
+  for (const doc of ['agents/arbiter.md', 'agents/arbiter-fix.md']) {
+    const text = read(doc).replace(/\s+/g, ' ');
+    assert.match(text, /prefer ACCEPT unless the evidence clearly shows the issue is not real\. When the input has a "Threat model" section/, doc);
+    assert.match(text, /Review as an attacker \(within the input's "Threat model" section when it has one for the file; that section overrides this paragraph\)/, doc);
+    assert.match(text, /"scope":"out-of-model"/, doc);
+  }
+  assert.match(read('skills/review/SKILL.md'), /Never add a threat model or blocking rule to the arbiter prompt: the input carries `review\.threat_models`/);
+});
+
 test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, mentions the executable shim and the ci keys', () => {
   const setup = read('skills/pipeline-setup/SKILL.md');
   for (const needle of ['<worktree_dir>/', 'verify.expected_steps', '100755', 'ci.approvers', 'ci.guard_checks', '.gitattributes', '{{OWNER}}', '--reason']) {
@@ -122,6 +167,14 @@ test('the docs-only review exemption is documented where owners and agents look:
   assert.match(cli, /Docs-only exemption \(`review\.docs_exempt_paths`/);
   assert.match(cli, /docsExempt: \{files, reviewedHead\}/);
   assert.match(cli, /verify\/CI coverage of the docs head is NOT exempted/);
+});
+
+test('R2-F2 review.threat_models: the template and the config defaults say the Codex prompt carries the model on a Fable-lane round only, and that a modelled path should be a sensitive path', () => {
+  const yml = read('pipeline/templates/pipeline.yml');
+  assert.match(yml, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
+  assert.match(yml, /risk\.high_risk_paths or review\.arbiter_always_paths/);
+  const cfg = read('pipeline/lib/config.mjs');
+  assert.match(cfg, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
 });
 
 test('the review skill says one closing keyword per issue (GitHub links only the first number of `Closes #1, #2`)', () => {
@@ -152,4 +205,40 @@ test('queue-branch-predates-switch: only branchState predates is sent to update-
   assert.ok(dryRunQueue, 'the queue-mode dry-run paragraph exists');
   assert.doesNotMatch(dryRunQueue, /whose age cannot be read|switch-on/, 'the dry run no longer speaks of the queue switch-on age');
   assert.match(cli, /is not on GitHub: push it first/, 'a head GitHub does not have is named, not blamed on the marker');
+});
+
+test('extra-round discipline: the ask shows rounds, cost and severity; "follow up" is the owner\'s literal words and starts a revert, CI wait and defer-fixes; one implementer builds a PR unless it is big', () => {
+  const review = reviewText();
+  const merge = read('skills/review/reference/owner-merge.md');
+  assert.match(merge, /pastes `summary`/);
+  assert.match(merge, /only the owner's literal "follow up" or "file follow-ups" starts it/);
+  assert.match(merge, /P ci-wait --pr N` on THAT head/);
+  assert.match(merge, /P triage defer-fixes --pr N --ids/);
+  assert.match(merge, /ONE PR per reply/);
+  assert.match(merge, /With `recommend: extra-round` never offer the follow-up path/);
+  assert.match(review, /ONE `implementer` dispatch builds the whole change/);
+  assert.match(review, /continue THE SAME agent/);
+  assert.match(review, /booked ONCE, after its last leg/);
+  assert.ok(!/Split the work into small tasks/.test(review));
+  const implementer = read('agents/implementer.md');
+  assert.match(implementer, /the whole change of a PR \(or one part of a big one\)/);
+  assert.match(implementer, /Work through the task list in order, commit per step/);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /Follow up instead of a round/);
+  assert.match(cli, /pipeline triage defer-fixes --pr N --ids/);
+});
+
+test('the review skill sends a quota stop, a withheld round and a second review to the substitute, and the owner hand-off explains it', () => {
+  const review = read('skills/review/SKILL.md');
+  const merge = read('skills/review/reference/owner-merge.md');
+  assert.match(review, /with `substitute\.eligible` ⇒ the substitute path/);
+  assert.match(review, /P substitute prepare --pr N --round R/);
+  assert.match(review, /P substitute apply --pr N --round R --tag/);
+  assert.match(review, /BEFORE every codex-review call run it with `--plan`.*`expectedEffort` as `--effort`/);
+  assert.match(review, /`nextRound\.base`/);
+  assert.match(review, /codex-status --wait/);
+  assert.match(review, /P triage second-review --apply --pr N --tag/);
+  assert.match(review, /substitute-opus\|substitute-fable/);
+  assert.match(merge, /\*\*Substitute reviews\*\* \(`ownerStep\.substitute`/);
+  assert.match(merge, /label mode never merges one|Label mode ⇒ no request/);
 });

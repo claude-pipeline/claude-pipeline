@@ -11,6 +11,7 @@ import { pipelineStateDir } from './repo.mjs';
 import { withLock } from './locks.mjs';
 import { agentLogLine } from './render.mjs';
 import { isInside } from './paths.mjs';
+import { isSubstituteRound } from './state.mjs';
 
 // Same text as pipeline/templates/agent-log.md, which `pipeline-setup` copies into new projects.
 export const AGENT_LOG_HEADER = [
@@ -87,10 +88,22 @@ export function appendToQueue(cwd, line, at = new Date().toISOString(), { afterM
   return clean;
 }
 
-// How many rounds had the arbiter consulted. A round counts when it records `arbiter.called`, or when any of its items
-// carries an arbiter ruling (the review loop stores the ruling on the item).
+// How many rounds had the arbiter (Fable) consulted. A round counts when it records `arbiter.called`, when its Fable pass was proven (a Fable
+// round with zero items has no ruling to show for it), or when any of its items carries an arbiter ruling (the review loop stores the ruling on the item).
 export function countArbiterCalls(state) {
-  return (state?.rounds ?? []).filter((r) => r?.arbiter?.called === true || (r?.items ?? []).some((i) => i?.arbiter)).length;
+  return (state?.rounds ?? []).filter((r) => r?.arbiter?.called === true || r?.arbiter?.proofOk === true || (r?.items ?? []).some((i) => i?.arbiter)).length;
+}
+
+// How many of those were proven fix-verify passes (the narrow "verify these fixes" brief at lower effort: lib/fix-verify.mjs).
+export function countFixVerifyCalls(state) {
+  return (state?.rounds ?? []).filter((r) => r?.arbiter?.brief === 'fix-verify' && r.arbiter.proofOk === true).length;
+}
+
+// How many reviews a Claude stand-in gave for Codex: its rounds, plus its second reviews (a Codex second review is not one).
+export function countSubstituteCalls(state) {
+  const rounds = state?.rounds ?? [];
+  const second = rounds.flatMap((r) => r?.items ?? []).filter((i) => typeof i?.secondReview?.by === "string" && i.secondReview.by.startsWith("substitute")).length;
+  return rounds.filter(isSubstituteRound).length + second;
 }
 
 export function buildAgentLogLine({ state, pr, title, outcome, now = new Date() }) {
@@ -101,6 +114,8 @@ export function buildAgentLogLine({ state, pr, title, outcome, now = new Date() 
     risk: state?.risk ?? 'unknown',
     rounds: state?.rounds?.length ?? 0,
     arbiterCalls: countArbiterCalls(state),
+    fixVerifyCalls: countFixVerifyCalls(state),
+    substituteCalls: countSubstituteCalls(state),
     outcome,
   });
 }
@@ -157,6 +172,8 @@ export function logRelPath(root, agentLog) {
 
 const isRaceFailure = (err) => err instanceof GitError && /rejected|non-fast-forward|fetch first|stale info|failed to push some refs/i.test(err.stderr ?? '');
 const REMOTE_LOG_REF = `refs/remotes/${REMOTE}/${AGENT_LOG_BRANCH}`;
+// The remote's default branch as git must READ it: fully qualified, because an abbreviated `origin/<b>` resolves through refs/tags and refs/heads first (#454).
+const remoteDefaultRef = (defaultBranch) => `refs/remotes/${REMOTE}/${defaultBranch}`;
 
 // Refreshes the remote-tracking copy of the log branch. -> { tip, exists, refreshed }: `exists` false means the remote has no such
 // branch (a normal state before the first publish); any other failure is a real one and throws.
@@ -260,7 +277,7 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }
           g(['fetch', '--no-tags', REMOTE, `+refs/heads/${defaultBranch}:refs/remotes/${REMOTE}/${defaultBranch}`], root, NETWORK_TIMEOUT_MS);
         } catch { /* offline default branch: seed from the cached ref, or the header */ }
         // No regular log file on the branch (a new branch, or something else at that path): start from main's copy, else the header.
-        existing = read(`${REMOTE}/${defaultBranch}`);
+        existing = read(remoteDefaultRef(defaultBranch));
       }
       const { text, fresh } = appendLines(existing, clean);
       if (fresh.length === 0) return { commit: tip, pushed: false, lines: [] }; // all already in the log: nothing to push
@@ -302,7 +319,7 @@ export function originLogLines(root, { logFile, defaultBranch, fetch = false, tr
     }
     const rel = relative(root, logFile).split('\\').join('/');
     const run = (args) => git(args, o);
-    const text = readRegularFile(run, `${REMOTE}/${defaultBranch}`, rel, { strictRef: true }); // origin/<default> missing = unreadable
+    const text = readRegularFile(run, remoteDefaultRef(defaultBranch), rel, { strictRef: true }); // origin/<default> missing = unreadable
     const lines = new Set(text === null ? [] : text.split('\n').map((l) => l.replace(/\r$/, '')));
     const branchText = branchExists && (branchRefreshed || trustCachedBranch) ? readRegularFile(run, REMOTE_LOG_REF, rel) : null; // no log branch yet is null; a hostile or oversized file makes the whole read fail closed
     if (branchText !== null) for (const l of branchText.split('\n')) lines.add(l.replace(/\r$/, ''));

@@ -3,7 +3,7 @@
 // are stored and read (real folders and files only, a day at most). All in a temp home.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -14,11 +14,11 @@ import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
   accountHome, approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
-  parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
+  parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantLookups, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
-import { OWNER_ENTRY, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, linesOf, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -27,10 +27,13 @@ const REQUEST = `Two items for you.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS}
 
 const tmp = () => mkdtempSync(join(tmpdir(), 'owner-go-unit-'));
 // (R1-B2: a transcript has the shape Claude Code gives it and the guard protects, <config dir>/projects/<project>/<session>.jsonl: the use-time check takes no other)
+// #191 A3: a reply is only read when its opening prompt is in the file (text before the first prompt has no known origin), so a fixture that starts with the agent's text gets a genuine
+// typed owner prompt in front of it. Dedicated orphan-text negatives write their file themselves (test/owner-go-visible-turns.test.mjs).
+const withOpening = (entries) => (entries[0]?.type === 'assistant' ? [{ type: 'user', message: { content: 'go' }, promptId: 'pid-open', ...OWNER_ENTRY }, ...entries] : entries);
 function transcript(dir, entries) {
   mkdirSync(join(dir, '.claude', 'projects', '-repo'), { recursive: true });
   const file = join(dir, '.claude', 'projects', '-repo', `t-${Math.random().toString(36).slice(2)}.jsonl`);
-  writeFileSync(file, `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(file, linesOf(withOpening(entries))); // (#191 R1-B1: with the uuid / parentUuid chain Claude Code writes)
   return file;
 }
 const user = (text) => ({ type: 'user', message: { content: text } });
@@ -945,7 +948,7 @@ test('#128 a synthetic "merge" or ruling word is never recorded, even when the t
 const AT = Date.parse('2026-11-03T10:00:00Z');
 const nowAt = () => AT;
 const stamp = (ms) => new Date(AT + ms).toISOString();
-const lines = (entries) => `${entries.map((e) => JSON.stringify(e)).join('\n')}\n`;
+const lines = linesOf;
 // A "merge" the hook recorded at AT (before the transcript had it, as it may), then the transcript gets `appended`. Returns the pieces to ask with.
 function mergeWorld(_home, { appended, recordedId = 'pid-m', head = [promptEntry('go'), said(REQUEST)], raw = null } = {}) {
   const home = tmp(); // (a world of its own: records of the same session would answer for each other)
@@ -962,7 +965,8 @@ test('#128 provenance: a record is used only when its transcript entry (found by
   const home = tmp();
   const head = [promptEntry('go'), said(REQUEST)];
   assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', OWNER_META, 'pid-m')] })), [true, true, 'ok'], 'typed by the owner');
-  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', { ...OWNER_META, promptSource: 'queued' }, 'pid-m')] }))[0], true, 'queued while the agent worked');
+  // #191 B2: an answer typed while the agent was busy (promptSource queued) is delivered after whatever the agent printed meanwhile, so it approves nothing (it was 'owner' before)
+  assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', { ...OWNER_META, promptSource: 'queued' }, 'pid-m')] })), [false, false, 'provenance'], 'queued while the agent worked');
   for (const [name, meta] of [['scheduled', SCHEDULED_META], ['peer', PEER_META], ['notice', NOTICE_META], ['headless sdk', SDK_META], ['sdk-cli entrypoint', { entrypoint: 'sdk-cli', origin: { kind: 'human' }, promptSource: 'typed' }]]) {
     assert.deepEqual(askedFor(mergeWorld(home, { appended: [promptEntry('merge', meta, 'pid-m')] })), [false, false, 'provenance'], name);
   }
@@ -1259,6 +1263,85 @@ test('owner-go round grant: ownerGrantedRounds returns ALL open matching records
   writeFileSync(join(ownerGoDir(home3), 'sess-9.jsonl'), line);
   writeFileSync(file, [line, `${JSON.stringify({ ...rec, v: 2 })}\n`, `${JSON.stringify({ ...rec, prompt: 'extra round, I mean it' })}\n`, `${JSON.stringify({ ...rec, kind: 'ruling' })}\n`].join(''));
   assert.equal(ownerGrantedRounds({ ...q, home: home3 }).length, 1, 'only the genuine line');
+});
+
+// R2-B1: the STRICT lookups `triage defer-fixes` uses. ownerGrantedRounds / ownerGrantGap read through a reader that never throws, so an unreadable record read as "no grant"
+// and a deferral could pass over the owner's extra round; the strict lookups throw on any skipped read and still answer "no grant" for a folder that was never created.
+test('owner-go round grant: ownerGrantLookups (strict) answers like the tolerant ones when everything is readable, and "none" for a folder that does not exist', () => {
+  const none = ownerGrantLookups({ repo: REPO, pr: 58, home: tmp(), now: () => AT });
+  assert.deepEqual([none.grants(4), none.grantGap(4)], [[], 'none']);
+  const home = tmp();
+  recordRoundGrant(input(home, 'extra round', [said(RASK)], { session_id: 'sess-a' }), { home, now: () => AT });
+  const strict = ownerGrantLookups({ repo: REPO, pr: 58, home, now: () => AT + 1000 });
+  assert.deepEqual(strict.grants(4).map((r) => r.session), ['sess-a']);
+  assert.equal(strict.grantGap(4), 'ok');
+  assert.deepEqual([strict.grants(5), strict.grantGap(5)], [[], 'none'], 'another round: none, not a failure');
+  assert.equal(ownerGrantLookups({ repo: REPO, pr: 58, home, now: () => AT + 25 * 3600_000 }).grantGap(4), 'none', 'a record older than a day is no grant, not a failure');
+});
+
+test('owner-go round grant: ownerGrantLookups throws when a read was skipped, where the tolerant lookups answer "none"', { skip: process.platform === 'win32' }, () => {
+  const seeded = () => {
+    const home = tmp();
+    recordRoundGrant(input(home, 'extra round', [said(RASK)], { session_id: 'sess-a' }), { home, now: () => AT });
+    return home;
+  };
+  const q = (home) => ({ repo: REPO, pr: 58, home, now: () => AT + 1000 });
+  const both = (home, re, why) => {
+    const strict = ownerGrantLookups(q(home));
+    assert.throws(() => strict.grants(4), re, `${why}: grants`);
+    assert.throws(() => strict.grantGap(4), re, `${why}: grantGap`);
+  };
+  // a session file the reader cannot read: the grant may be in it
+  const unreadable = seeded();
+  chmodSync(join(ownerGoDir(unreadable), 'sess-a.jsonl'), 0o000);
+  if (process.getuid?.() !== 0) {
+    both(unreadable, /cannot be read \(EACCES\)/, 'unreadable file');
+    assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, anyHead: true, home: unreadable, now: () => AT + 1000 }), 'none', 'the tolerant lookup is blind to it');
+  }
+  chmodSync(join(ownerGoDir(unreadable), 'sess-a.jsonl'), 0o600);
+  // a record file over the size limit, and one that is not a regular file
+  const big = seeded();
+  writeFileSync(join(ownerGoDir(big), 'sess-big.jsonl'), Buffer.alloc(1024 * 1024 + 1, 0x20));
+  both(big, /sess-big\.jsonl is over the size limit/, 'oversized file');
+  const odd = seeded();
+  mkdirSync(join(ownerGoDir(odd), 'sess-dir.jsonl'));
+  both(odd, /sess-dir\.jsonl is not a regular file/, 'a folder named like a record file');
+  // the records folder is a file or a link
+  const asFile = tmp();
+  mkdirSync(join(asFile, '.claude', 'pipeline-state'), { recursive: true });
+  writeFileSync(ownerGoDir(asFile), '');
+  both(asFile, /is not a real folder/, 'records folder is a file');
+  const linked = tmp();
+  mkdirSync(join(linked, '.claude', 'pipeline-state'), { recursive: true });
+  symlinkSync(tmp(), ownerGoDir(linked));
+  both(linked, /is not a real folder/, 'records folder is a link');
+  // the consumed-grants folder is not a real folder: every marker would read as spent
+  const consumed = seeded();
+  writeFileSync(join(ownerGoDir(consumed), 'consumed'), '');
+  both(consumed, /consumed-grants folder is not a real folder/, 'consumed is a file');
+  // R3-B1: the consumed-grants folder is a real folder but cannot be searched: the marker lookup fails with EACCES, which is not proof the grant was spent
+  if (process.getuid?.() !== 0) {
+    const closed = seeded();
+    const consumedDir = join(ownerGoDir(closed), 'consumed');
+    mkdirSync(consumedDir);
+    chmodSync(consumedDir, 0o000);
+    try {
+      both(closed, /cannot be checked \(EACCES\)/, 'consumed folder cannot be searched');
+      assert.equal(ownerGrantGap({ repo: REPO, pr: 58, k: 4, anyHead: true, home: closed, now: () => AT + 1000 }), 'none', 'the tolerant lookup treats the grant as spent');
+    } finally {
+      chmodSync(consumedDir, 0o700);
+    }
+    // a marker that really exists stays spent, with no failure
+    const claimedHome = seeded();
+    const [record] = ownerGrantLookups(q(claimedHome)).grants(4);
+    assert.equal(claimGrantMarkers([record], { repo: REPO, pr: 58, k: 4, head: 'a'.repeat(40), checkout: null }, { home: claimedHome, now: () => AT }).ok, true);
+    const after = ownerGrantLookups(q(claimedHome));
+    assert.deepEqual([after.grants(4), after.grantGap(4)], [[], 'none'], 'a consumed grant is spent, not a failure');
+  }
+  // the recorded repository moves are present but unreadable
+  const moves = seeded();
+  writeFileSync(join(ownerGoDir(moves), 'repo-moves.json'), 'not json');
+  both(moves, /repository moves cannot be read/, 'repo-moves.json is garbage');
 });
 
 test('owner-go round grant: records are written and read only through real folders and files', { skip: process.platform === 'win32' }, () => {
@@ -1570,6 +1653,14 @@ test('#128 legacy grant: no transcript_path / prompt_id: the owner\'s typed word
   assert.equal(ownerGrantGap(w.q), 'ok');
   assert.deepEqual(w.verify(), [true, undefined]);
   assert.equal(readFileSync(join(ownerGoDir(w.home), `${LEGACY_SESSION}.jsonl`), 'utf8'), `${JSON.stringify(w.record)}\n`, 'the record is not rewritten');
+});
+
+test('#191 B2 legacy grant: a consumed grant (no prompt_id, matched by its words) whose entry is queued is refused at the final gate; the same words typed verify', () => {
+  const queued = legacyWorld({ entries: [promptEntry('go'), said(RASK), typed('extra round', { ...OWNER_META, promptSource: 'queued' })] });
+  assert.equal(ownerGrantGap(queued.q), 'provenance');
+  assert.deepEqual(ownerGrantedRounds(queued.q), []);
+  assert.deepEqual(queued.verify(), [false, 'provenance']);
+  assert.deepEqual(legacyWorld({ entries: legacyEntries }).verify(), [true, undefined], 'typed: unchanged');
 });
 
 test('#128 legacy grant: one real transcript reached through a symlinked second config dir counts once', () => {

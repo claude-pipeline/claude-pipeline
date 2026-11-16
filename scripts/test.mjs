@@ -1,15 +1,19 @@
 // Cross-version test runner: Node 20 has no --test globbing and cmd.exe does not expand globs,
 // so list the test files ourselves and hand them to node --test.
-//   node scripts/test.mjs [--shard I/N] [name-substring ...]
+//   node scripts/test.mjs [--shard I/N] [name-substring | exact-file.test.mjs ...]
+// A name ending in .test.mjs selects exactly that file (no substring match); any other name is a substring filter
+// (scripts/lib/select-tests.mjs). A name of either kind that matches no file exits 2, so a rename cannot quietly shrink a check.
 // --shard I/N runs bin I of N (balanced by measured time, scripts/lib/test-weights.json, bytes for unmeasured files;
 // scripts/lib/shard.mjs); the Windows CI job uses 3 shards.
 // CP_TEST_TIMES=<path> also records each file's wall-clock time into <path> as { file: { spanMs } }
 // (scripts/lib/file-times-preload.mjs); CI prints it so scripts/shard-weights.mjs can refresh the weights.
-import { readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MAX_SHARDS, parseShard, shardFiles } from './lib/shard.mjs';
+import { selectTestFiles } from './lib/select-tests.mjs';
 import { collectFileTimes } from './lib/file-times.mjs';
 import { realRegistryFile, registryChange, snapshotRegistry } from './lib/registry-snapshot.mjs';
 
@@ -26,9 +30,13 @@ for (let k = 0; k < args.length; k++) {
     process.exit(2);
   }
 }
-let names = readdirSync(testDir)
-  .filter((f) => f.endsWith('.test.mjs'))
-  .filter((f) => only.length === 0 || only.some((o) => f.includes(o)));
+const selected = selectTestFiles(readdirSync(testDir), only);
+if (selected.missing.length > 0) {
+  const describe = (o) => (o.endsWith('.test.mjs') ? `${o} (exact file name)` : `${o} (substring filter)`);
+  console.error(`no test file in test/ matches: ${selected.missing.map(describe).join(', ')}`);
+  process.exit(2);
+}
+let names = selected.names;
 if (shard) {
   let weights = {};
   try { weights = JSON.parse(readFileSync(join(libDir, 'test-weights.json'), 'utf8')); } catch { /* no weights: bytes */ }
@@ -39,10 +47,13 @@ if (files.length === 0) {
   console.error(shard ? `no test files in shard ${shard.i}/${shard.n}` : 'no test files matched');
   process.exit(2);
 }
-// A fixed machine id keeps lock tests from creating a machine-id file in the developer's own pipeline state folder.
+// A fixed machine id keeps lock tests from creating a machine-id file in the developer's own pipeline state folder; a scratch Codex usage
+// ledger keeps every codex-review / second-review the suite runs out of the account's real weekly figure (and the real figure out of the tests' summary lines).
+const usageDir = mkdtempSync(join(tmpdir(), 'cp-codex-usage-'));
 const env = {
   ...process.env,
   PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
+  PIPELINE_CODEX_USAGE_FILE: join(usageDir, 'codex-usage.jsonl'),
 };
 const timesOut = process.env.CP_TEST_TIMES;
 const nodeArgs = timesOut ? ['--import', pathToFileURL(join(libDir, 'file-times-preload.mjs')).href] : [];
@@ -50,6 +61,7 @@ if (timesOut) rmSync(`${timesOut}.jsonl`, { force: true });
 // The suite must not touch the account's real Fable floor registry (tests use a scratch PIPELINE_MODEL_FLOOR_DIR): compare before and after.
 const registryBefore = snapshotRegistry();
 const r = spawnSync(process.execPath, [...nodeArgs, '--test', ...files], { stdio: 'inherit', env });
+rmSync(usageDir, { recursive: true, force: true });
 const registryProblem = registryChange(registryBefore, snapshotRegistry(), realRegistryFile());
 if (registryProblem) console.error(`FAIL: ${registryProblem}`);
 if (timesOut) {

@@ -13,10 +13,12 @@ import { cli, ghEntries, PR, QUEUE_AWARE_SHA, ymlFor } from './helpers/gate-env.
 import { RUN, ciRow, setup, ymlWith } from './helpers/ci-proof-env.mjs';
 import { ciEntries, okGate } from './helpers/ci-proof-merge-env.mjs';
 import { scenario } from './helpers/gate-env.mjs';
+import { readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { treeFingerprint } from '../pipeline/lib/git.mjs';
 import { verifyReportCheck } from '../pipeline/lib/finalgate.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { answer, blocker, holdCalls, holdFiles, holdYml, seq } from './helpers/merge-hold-env.mjs';
 
 const scratch = mkdtempSync(join(tmpdir(), 'cp-dryrun-'));
@@ -28,7 +30,7 @@ const contents = (sha, text) => ({ match: `repos/acme/widgets/contents/\\.claude
 
 // What GitHub says about the PR for the dry run: the same reply as ghEntries gives, plus baseRefOid (only a readOnly gate asks for it).
 const prReply = (s, o = {}) => ({
-  state: 'OPEN', headRefOid: s.head, baseRefName: 'main', isDraft: false, labels: (o.labels ?? []).map((name) => ({ name })), mergeable: 'MERGEABLE',
+  state: 'OPEN', headRefOid: s.head, baseRefName: o.baseRefName ?? 'main', isDraft: false, labels: (o.labels ?? []).map((name) => ({ name })), mergeable: 'MERGEABLE',
   mergeStateStatus: o.merge ?? 'CLEAN', baseRefOid: o.baseRefOid ?? s.baseTip ?? 'b'.repeat(40),
 });
 const script = (s, o = {}) => [
@@ -246,6 +248,7 @@ test('dry run, ownerMerge > 0 under owner_approval: chat -> ownerStep owner-runs
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, true);
   assert.deepEqual(d.r.json.ownerStep, { kind: 'owner-runs', command: `node scripts/fake-merge.mjs ${PR} ${s.head}` });
+  assert.equal('closing' in d.r.json.ownerStep, false, 'owner-runs has no closing lines');
   assert.ok(!JSON.stringify(d.r.json).includes('Ready to merge'), 'no request line');
   assert.deepEqual(d.writes, []);
 });
@@ -258,7 +261,7 @@ test('dry run, clean PR with no owner item that is not a low-risk review -> owne
   writeFileSync(file, JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), risk: 'high' }));
   const d = dry(s);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
-  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets` });
+  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets`, closing: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets\n${readyLine([PR])}` });
 });
 
 test('dry run, a resumed run record -> ownerStep owner-approval-flags (reported, not refused)', () => {
@@ -276,6 +279,25 @@ test('dry run, a resumed run record -> ownerStep owner-approval-flags (reported,
   const d = dry(s);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.ownerStep.kind, 'owner-approval-flags');
+  assert.equal('closing' in d.r.json.ownerStep, false, 'owner-approval-flags has no closing lines');
+  assert.deepEqual(d.writes, []);
+});
+
+test('dry run, a run-resumed EVENT with an unmarked record (R9-B1) -> ownerStep owner-approval-flags, like a resumed record', () => {
+  const s = setup({});
+  s.fake.setScript(script(s));
+  assertExit(s.gate(), 0);
+  const record = {
+    v: 1, repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main', step: 'gate', outcome: null, next: '', detail: '', head: null,
+    request: '', tasks: [], verify: null, round: 0, mergeSha: null, inFlight: null, heartbeat: null, agentLogLine: null, cliVersion: null, history: [],
+  };
+  let body = '';
+  writeSummaryComment({ viewer: () => 'me', listComments: () => [], upsertComment: (num, m, b) => { body = b; return { id: 77, url: 'u', action: 'created' }; } }, PR, { record });
+  const event = { id: 78, user: { login: 'me' }, body: renderEvent('run-resumed', `pr${PR}-aaaaaaaaaaaa`, 'taken over', { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) }) };
+  s.fake.setScript(script(s, { gh: { comments: [{ id: 77, user: { login: 'me' }, body }, event] } }));
+  const d = dry(s);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.ownerStep.kind, 'owner-approval-flags');
   assert.deepEqual(d.writes, []);
 });
 
@@ -288,7 +310,7 @@ test('dry run --owner-go: the owner-go route preconditions are checked live, the
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.deepEqual([d.r.json.wouldMerge, d.r.json.mode], [true, 'owner-go']);
-  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets` });
+  assert.deepEqual(d.r.json.ownerStep, { kind: 'say-merge', line: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets`, closing: `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets\n${readyLine([PR])}` });
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
@@ -324,6 +346,7 @@ test('dry run --owner-go, chat mode, a protected diff -> say-merge with the LIVE
   assert.doesNotMatch(ownerStep.line, /items none/);
   assert.equal(ownerStep.areaIds.length, 1);
   assert.equal(ownerStep.areas, `Areas ${ownerStep.areaIds.join(' ')}`);
+  assert.equal(ownerStep.closing, [ownerStep.areas, ownerStep.line, readyLine([PR])].join('\n'), 'closing = the Areas line, the Head line, the 🔀 line, nothing else');
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
@@ -387,10 +410,25 @@ test('dry run --owner-go, behind its base but disjoint: wouldMerge, `behind` set
   assert.deepEqual(d.r.json.behind, { behindBy: 1, mergeBase: s.baseTip, baseRefOid: tip, mainFiles: 1, rule: 'disjoint' });
   assert.equal(d.r.json.ownerStep.kind, 'say-merge');
   assert.equal(d.r.json.ownerStep.behindNote, "behind main by 1 commit(s); main's 1 new file(s) touch none of this PR's files");
+  assert.doesNotMatch(d.r.json.ownerStep.closing, /behind main/, 'the behind note is prose above the block, not part of it');
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
   noGitWrites(d);
   assert.equal(s.repo.git(['for-each-ref']), before);
+});
+
+test('dry run --owner-go, behind its base: the behindNote names the branch origin/HEAD names, not pipeline.yml\'s default_branch (R1-F4)', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  s.repo.git(['update-ref', 'refs/remotes/origin/develop', tip]);
+  s.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop']); // pipeline.yml still says main
+  // GitHub's default is develop too: a local default that is not GitHub's is refused (#430, #448), so the fixture must agree with it.
+  const repoView = { match: '^repo view', stdoutJson: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'develop' }, url: 'https://github.com/acme/widgets' } };
+  s.fake.setScript(script(s, { before: [repoView], baseRefOid: tip, baseRefName: 'develop', behindBy: 1, gh: { compareBase: tip, base: 'develop' } }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
+  assert.equal(d.r.json.ownerStep.behindNote, "behind develop by 1 commit(s); develop's 1 new file(s) touch none of this PR's files");
 });
 
 test('dry run --owner-go, up to date: behind is null and there is no behindNote', () => {
@@ -464,6 +502,7 @@ test('dry run --owner-go, queue ON, branch BEHIND: queue:true, no behind-base bl
   assert.equal(d.r.json.ownerStep.kind, 'say-merge');
   assert.equal(d.r.json.ownerStep.line, `Head ${s.head.slice(0, 12)} · items none · repo acme/widgets`);
   assert.equal(d.r.json.ownerStep.queueNote, QUEUE_NOTE);
+  assert.equal(d.r.json.ownerStep.closing, `${d.r.json.ownerStep.line}\n${readyLine([PR])}`, 'the queue note is prose above the block, not part of it');
   assert.equal('behindNote' in d.r.json.ownerStep, false);
   assert.deepEqual(d.writes, []);
   assert.deepEqual(s.mergeCalls(), []);
@@ -607,4 +646,19 @@ test('dry run --owner-go with merge.hold_* keys: queue OFF reports a hold ahead;
   assert.equal('holds' in d.r.json, false);
   assert.equal('holdEligible' in d.r.json.ownerStep, false);
   assert.deepEqual(holdCalls(on), [], 'the hold provider was never asked');
+});
+
+test('dry run, cp-like config (owner_approval chat, every path a P-path hit, P-path ignored for risk) with a recorded LOW risk: ends at the owner step, never the low-risk path', () => {
+  const yml = `${ymlFor()}hard_stops:\n  paths: ['src/**']\nowner_approval: chat\nrisk:\n  ignore_hard_stop_rules: [P-path]\n`;
+  const s = scenario({ yml, gh: { mergeStateStatus: 'CLEAN' } });
+  s.fake.setScript(script(s));
+  const g = s.gate();
+  assertExit(g, 0, `${g.stderr}${g.stdout}`);
+  assert.ok(g.json.ownerMerge > 0, 'the P-path hit is still an owner-merge item');
+  const statePath = join(s.repo.dir, '.review', 'state.json');
+  if (existsSync(statePath)) writeFileSync(statePath, JSON.stringify({ ...JSON.parse(readFileSync(statePath, 'utf8')), risk: 'low' }));
+  const d = dry(s);
+  assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
+  assert.equal(d.r.json.ownerStep?.kind, 'owner-runs');
+  assert.notEqual(d.r.json.ownerStep, null, 'a low recorded risk must not skip the owner step');
 });

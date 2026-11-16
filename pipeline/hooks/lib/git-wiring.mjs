@@ -51,7 +51,9 @@ export function realGitWiring() {
 // Phase 3b: the repository a bare gh command in a checkout acts on is read from its remotes (`git remote -v`, no network). gh may pick
 // any of them (upstream, a `gh repo set-default`), so the answer is a repository only when every remote names the same one; none, or
 // several, is unknown (the policy then refuses the merge and asks for -R owner/name).
-const COMMITTED_REFS = ['HEAD', 'origin/HEAD', 'origin/main', 'origin/master'];
+// (the remote's refs FULLY QUALIFIED: git resolves an abbreviated `origin/main` through refs/tags and refs/heads before refs/remotes, so a local branch or tag of that name would
+// otherwise stand in for the remote's copy and hide a chat config, #454)
+const COMMITTED_REFS = ['HEAD', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'];
 const defaultGitShow = (root, ref) => {
   const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: LOOKUP_TIMEOUT_MS });
   return r.code === 0 ? r.stdout : null;

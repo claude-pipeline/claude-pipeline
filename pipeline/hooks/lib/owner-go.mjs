@@ -33,6 +33,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { REPO_NAME, readRepoMoves, sameRepo } from './repo-moves.mjs';
+import { clickProvenance } from './owner-go-click.mjs';
 import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
@@ -43,7 +44,7 @@ const PROVENANCE_CHUNK_BYTES = 4 * 1024 * 1024; // promptProvenance reads the tr
 const PROVENANCE_CAP_BYTES = 64 * 1024 * 1024; // … and gives up (missing) this far back
 const FALLBACK_WINDOW_MS = 120 * 1000; // a record with no prompt_id is matched to a transcript entry by its text within this much time
 const MAX_RECORD_BYTES = 1024 * 1024; // one session file; a bigger one is not read
-const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+export const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export const HEAD_CHARS = 12; // the head is shown (and matched) by its first 12 characters at least
 
 // The account's home from the OS user database, NOT $HOME: `HOME=/tmp/x P merge …` must not point the check at a folder the agent
@@ -269,11 +270,56 @@ export function entrySource(e) {
 // of 'unknown' source in it is not trusted (an interrupt marker, a compaction summary, a source this list does not know).
 const hasProvenanceField = (e) => e.promptSource !== undefined || e.origin !== undefined || e.entrypoint !== undefined || e.turnOrigin !== undefined;
 
-// The parsed entries of the transcript's last `tailBytes` (a cut first line dropped); [] when it cannot be read as a regular file.
+// #191 (A2/F1/F2): which prompt entries start a turn the owner SEES. A synthetic prompt with promptSource 'system' AND entrypoint 'cli' is a turn the interactive UI starts itself (a task
+// notice, an Agent hand-back, a peer or plugin message, a scheduled wake-up, auto-continuation) and renders: isMeta hides the PROMPT, never the assistant text of the reply. The agent
+// can cause each of these and fill it with a request line; that is no bypass, because what it prints is on the owner's screen when they answer (the premise of #189's promotion of a
+// ruling ask, written down here for every reader). A headless `claude -p --resume <session>` turn (promptSource sdk / entrypoint sdk-cli), any other non-human origin and anything else
+// that is not the owner's writes into the owner's transcript and shows NOTHING on screen.
+const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource === 'system' && e.entrypoint === 'cli';
+// An INVISIBLE turn: a prompt entry that is not the owner's and not visibleSynthetic, with provenance to say so. F1: an entry carrying a provenance field whose source entrySource
+// cannot place ('unknown': a value Claude Code adds later) counts as invisible too (fail closed); a 'unknown' entry with no such provenance (an interrupt marker, a harness note of the interactive
+// process, a legacy transcript; unplacedProvenance below says what counts) is a plain boundary as before. Only prompt entries are turns: a tool_result user entry is never one (F7). A compaction-summary entry (it carries isCompactSummary or isVisibleInTranscriptOnly; only the
+// fully flagged one is hidden, isHiddenSummary) is no turn the agent started: a half-flagged one of unknown source stays the plain boundary #189 pinned, in every mode.
+// R4-F1: does an entry of unknown source carry provenance that says "not the owner's"? Claude Code writes `entrypoint: "cli"` (and userType) on EVERY line of an interactive transcript, and a
+// harness line inside the owner's own visible turn (an isMeta skill body or system-reminder note, a `!` block's output, an interrupt marker) has promptSource / origin / turnOrigin null or
+// absent: none of that is provenance, so such a line is a plain boundary as before #191 and the request printed after it still binds. What counts: a promptSource, origin or turnOrigin that is
+// set (a value this list does not know stays invisible, fail closed) or an entrypoint other than "cli" (a headless sdk-cli is synthetic already, so that is an unknown future one).
+const isSet = (v) => v !== undefined && v !== null;
+const unplacedProvenance = (e) => isSet(e.promptSource) || isSet(e.origin) || isSet(e.turnOrigin) || (isSet(e.entrypoint) && e.entrypoint !== 'cli');
+const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
+const invisibleTurn = (e) => {
+  if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
+  const source = entrySource(e);
+  return source === 'synthetic' || (source === 'unknown' && unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined);
+};
+// R5-F1 (Fable): a note of unknown source WITHOUT unplaced provenance (unplacedNote) is visible or not as the turn it ORIGINATES from, the principle of R1-B1 below: a headless run (top prompt
+// promptSource sdk, invisible) can write a skill body or system-reminder note whose own fields look interactive (isMeta, null provenance, entrypoint cli), and what it prints after it must not bind.
+// Probe, Claude Code 2.1.322, 2026-11-11: `CLAUDE_CODE_ENTRYPOINT=cli claude -p "..."` still wrote entrypoint "sdk-cli" (promptSource "sdk") on all 20 lines, so that override is NOT honoured today;
+// the chain rule is defence in depth, so the guarantee does not rest on a field the writing process sets. Machine-wide transcripts carry only entrypoint cli / sdk-cli / sdk-py.
+// parent[i] (originsOf): the index of the prompt entry that prompt entry i's parentUuid chain resolves to (-1: it does not). A string parentUuid that resolves nowhere in the window fails closed
+// (invisible), and so does a chain that ends at a non-prompt root (e.g. the SessionStart attachment above the /clear caveat and command notes: they sit before the first owner prompt and carry no
+// assistant text, so what they mute is never an ask; pinned by R6-F1); only an entry with no parentUuid at all (a legacy transcript) leaves its own fields to decide (visible); a chain of notes
+// resolves transitively, a cycle fails closed.
+function invisibleNote(entries, parent, first) {
+  const seen = new Set();
+  for (let i = first; ; ) {
+    const e = entries[i];
+    if (invisibleTurn(e)) return true;
+    if (!unplacedNote(e)) return false; // the owner's prompt, a visibleSynthetic turn or a plain boundary of its own: its own fields said so
+    if (typeof e.parentUuid !== 'string') return false;
+    if (seen.has(i) || parent[i] < 0) return true; // a cycle, or a parent outside the window
+    seen.add(i);
+    i = parent[i];
+  }
+}
+
+// The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
+// no entries when it cannot be read as a regular file.
 function tailEntries(transcriptPath, tailBytes) {
   let raw = '';
+  let reachedStart = true;
   try {
-    if (!lstatSync(transcriptPath).isFile()) return [];
+    if (!lstatSync(transcriptPath).isFile()) return { entries: [], reachedStart: false };
     const fd = openSync(transcriptPath, constants.O_RDONLY | (constants.O_NONBLOCK ?? 0));
     try {
       const size = fstatSync(fd).size;
@@ -281,19 +327,19 @@ function tailEntries(transcriptPath, tailBytes) {
       const buf = Buffer.alloc(len);
       readSync(fd, buf, 0, len, size - len);
       raw = buf.toString('utf8');
-      if (len < size) raw = raw.slice(raw.indexOf('\n') + 1); // drop the cut first line
+      if (len < size) { raw = raw.slice(raw.indexOf('\n') + 1); reachedStart = false; } // drop the cut first line
     } finally {
       closeSync(fd);
     }
   } catch {
-    return [];
+    return { entries: [], reachedStart: false };
   }
-  const out = [];
+  const entries = [];
   for (const line of raw.split('\n')) {
     if (!line.trim()) continue;
-    try { out.push(JSON.parse(line)); } catch { /* a torn line */ }
+    try { entries.push(JSON.parse(line)); } catch { /* a torn line */ }
   }
-  return out;
+  return { entries, reachedStart };
 }
 
 // The text of the last assistant reply in the transcript when it holds a 🔀 merge request ('' when none). Only the
@@ -356,7 +402,7 @@ const inputSurfacesAsk = (input) => { const text = toolUseText(input); return te
 const isHiddenSummary = (e) => e?.type === 'user' && e.isCompactSummary === true && e.isVisibleInTranscriptOnly === true;
 // The newest user/assistant entry when it is a prompt whose text is `prompt` (the submission being recorded, already in the transcript), else null.
 function currentPromptEntry(transcriptPath, prompt) {
-  const entries = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
+  const { entries } = tailEntries(transcriptPath, TRANSCRIPT_TAIL_BYTES);
   for (let i = entries.length - 1; i >= 0; i--) {
     const e = entries[i];
     if ((e?.type !== 'user' && e?.type !== 'assistant') || isHiddenSummary(e)) continue;
@@ -376,69 +422,153 @@ function currentPromptEntry(transcriptPath, prompt) {
 // with text voids an earlier promoted slot while a tool-only one leaves it. Why this is no weaker: the ask was agent-written in either kind of turn; what binds is the owner's TYPED answer
 // (entrySource 'owner', promptProvenance at use time), the ids on the last line and the content digest owner-ruling recomputes. The slot binds only its own PR / ids / digest.
 // This narrows R1-F3; the PR calls it out for the owner.
-// Only a prompt entry with promptSource 'system' AND entrypoint 'cli' promotes (a notice the interactive UI renders). An 'sdk' / 'sdk-cli' turn (a headless `claude -p --resume` of this
+// Only a visibleSynthetic prompt entry (promptSource 'system' AND entrypoint 'cli': a notice the interactive UI renders) promotes. An 'sdk' / 'sdk-cli' turn (a headless `claude -p --resume` of this
 // session writes into the owner's transcript and shows nothing on screen), any other non-human origin and an unknown source keep R1-F3: ANY text voids the slot.
-// Fable plan pass finding 2 (queued answers): an owner prompt typed while the agent was busy (promptSource 'queued') can be delivered after a promoted ask the owner never saw. So the
-// result says which slot is promoted; recordRuling stamps `ask_turn: 'synthetic'` on that record and refuses a queued current entry, and promptProvenance refuses such a record whose prompt
-// entry is queued. (An owner-turn ask has a narrower, pre-existing form of this: a follow-up issue.)
-export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
-  const replies = [''];
-  const voided = new Set(); // slots (indexes of replies) whose ask a dropped reply replaced
-  const promoted = new Set(); // slots (indexes of replies) that are an ask promoted out of a synthetic turn
-  let lastIsPrompt = false; // is the newest user/assistant entry a prompt (the owner's current one)?
-  let lastPromptText = '';
-  let skipping = false; // inside a synthetic turn: its prompt and the replies to it
-  let turn = null; // the synthetic turn being read (skipSynthetic): { promote, text, surfacedAfterText, anything }
-  const flush = () => {
-    if (turn === null) return;
-    const t = turn;
-    turn = null;
-    if (t.promote && !t.surfacedAfterText && presentedRuling(t.text) !== null) {
-      replies.push(t.text);
-      promoted.add(replies.length - 1);
-      lastIsPrompt = false;
-    } else if (t.anything) voided.add(replies.length - 1);
+// #191 A2 (every other reader, skipSynthetic false: merge, extra round): an invisible turn is a boundary as before (it opens a new EMPTY slot, so an older request stays stale) but its
+// assistant text is never added to that slot, so nothing an invisible turn prints can be bound by the owner's next "merge" / "extra round" (the owner never saw it); the owner is asked again.
+// #191 A3 (cut-off origin, all modes): the tail read starts at an arbitrary byte, so the text before the window's first prompt entry (slot 0) belongs to a turn whose prompt was cut off
+// and whose origin is unknown; slot 0 is never a reply (in a whole file it is text before any prompt, which a real transcript does not hold). Accepted cost: an ask turn longer than
+// the window is refused once and the re-ask recovers.
+// Queued answers (#189 finding 2, widened by #191 Part B): the result says which slot is a promoted ask (recordRuling stamps `ask_turn: 'synthetic'` on its record). An owner prompt typed while the
+// agent was busy (promptSource 'queued') is delivered after a promoted ask the owner never saw, or after an owner-turn ask newer than what was on screen: the recorders refuse it (queuedAnswer) and
+// promptProvenance refuses its record at use time, for every kind of ask.
+// #191 R1-B1 (Codex round 1, arbiter ACCEPT): attribution by ORIGINATING PROMPT, not by position. A headless `claude -p --resume <session>` process (invisible) can still be running when
+// the owner types: what it appends AFTER the owner's prompt (or between the owner's interactive reply entries) used to join the owner's slot, and the LAST 🔀 / ⚖️ / 🔁 line won, so an
+// invisible request beat the one the owner was shown. Claude Code writes `uuid` and `parentUuid` on every entry (confirmed on test/fixtures/transcripts/*.jsonl, 8 of 8 files carry both),
+// and each process chains its entries to its own prompt, so originsOf walks parentUuid back from an assistant entry (or a tool_result user entry, which the ruling reader inspects) to the
+// first prompt entry and the text joins THAT prompt's slot:
+//  - the slot read is still the positional one: the newest slot before the owner's current prompt (older slots are never revived), but a slot is its prompt's own text wherever it sits
+//    (interleaving 1: an sdk prompt BEFORE the owner's, its text after the interactive reply; interleaving 2: an sdk prompt written during the interactive reply);
+//  - an invisible turn's text (merge / round mode) is never any slot's; in ruling mode it is that synthetic turn's content (it voids the slot before ITS prompt when it shows anything,
+//    never promotes unless it is a visibleSynthetic turn) and never the owner slot's;
+//  - an invisible turn that opens AFTER the last activity of the slot being read makes it stale (the strict A2 rule, unchanged: an older ask is not revived across a hidden turn); one that
+//    opened while the slot was still being written (interleaved) does not, because the owner's turn went on after it;
+//  - late text from an older VISIBLE turn that arrives after a newer prompt joins that older slot: it is not the slot right before the owner's prompt, so it binds nothing. R2-B1 (Codex
+//    round 2, arbiter ACCEPT): but the owner SAW it, and when it lands after the selected slot's last entry (and before the owner's prompt) the last thing displayed was not the selected
+//    request, so the selected slot is stale and the reply is '' (fail closed, like a mute). Text from any visible slot other than the selected one counts (assistant text only: a tool-only
+//    entry shows nothing); text that landed BEFORE the selected slot's last entry (interleaved) does not. A single interactive session cannot produce this order, so normal use is unchanged;
+//    R3-B1: "the selected slot's last entry" is its last SHOWN one (its last assistant text), so its own trailing tool-only entry cannot hide a later request; #241: a tool block of another visible slot
+//    that surfaces an ask counts as shown too; R3-F1: so does a visibleSynthetic skip turn's text or surfaced ask (ruling reader), whenever its prompt opened;
+//  - (a void by a synthetic turn that shows something after the slot's last activity is the separate ruling-mode rule above);
+//  - an entry whose chain does not resolve to a prompt entry inside the window (no parentUuid, a uuid not in the window, a cycle, a duplicate uuid on the way, a chain that ends at no prompt)
+//    is DROPPED in a modern transcript (fail closed; subsumes A3 for assistant text, whose prompt was cut off by the window). A compaction is transparent to the walk: a hidden summary and
+//    a `compact_boundary` system entry are stepped over (the boundary has parentUuid null and logicalParentUuid the entry before it); a boundary whose past is outside the window drops.
+//  - a LEGACY transcript, no entry of which has a uuid, keeps the positional attribution (text belongs to the newest prompt before it). The fallback is keyed on that absence only, never on
+//    anything the agent can print: one entry with a uuid anywhere in the window makes it modern.
+// Residual: a process that chains its entries to the owner's prompt on purpose would still be attributed to it; that takes writing the transcript file itself (guard-files refuses a tool write).
+function originsOf(entries) {
+  const origin = new Array(entries.length).fill(-1); // entry index -> index of its originating prompt entry (-1: none)
+  const parent = new Array(entries.length).fill(-1); // prompt entry index -> index of the prompt its parentUuid chain resolves to (-1: none; R5-F1)
+  const isPrompt = (e) => isPromptEntry(e) && !isHiddenSummary(e);
+  if (!entries.some((e) => typeof e?.uuid === 'string')) {
+    let latest = -1;
+    entries.forEach((e, i) => { if (isPrompt(e)) latest = i; origin[i] = latest; });
+    return { origin, parent };
+  }
+  const at = new Map(); // uuid -> entry index
+  const twice = new Set(); // a uuid two entries claim: any chain through it is ambiguous
+  entries.forEach((e, i) => { if (typeof e?.uuid === 'string') { if (at.has(e.uuid)) twice.add(e.uuid); else at.set(e.uuid, i); } });
+  const memo = new Map(); // uuid -> origin found from there (-1: none)
+  const resolve = (first) => {
+    const path = [];
+    const seen = new Set();
+    let id = first;
+    let found = -1;
+    while (typeof id === 'string') {
+      if (memo.has(id)) { found = memo.get(id); break; }
+      if (seen.has(id) || twice.has(id) || !at.has(id)) break;
+      seen.add(id);
+      path.push(id);
+      const j = at.get(id);
+      const n = entries[j];
+      if (isPrompt(n)) { found = j; break; }
+      const compaction = isHiddenSummary(n) || (n?.type === 'system' && n.subtype === 'compact_boundary');
+      id = typeof n?.parentUuid === 'string' ? n.parentUuid : compaction && typeof n?.logicalParentUuid === 'string' ? n.logicalParentUuid : null;
+    }
+    for (const u of path) memo.set(u, found);
+    return found;
   };
-  for (const e of tailEntries(transcriptPath, tailBytes)) {
+  entries.forEach((e, i) => {
+    if (isPrompt(e)) { origin[i] = i; parent[i] = resolve(e?.parentUuid); } else origin[i] = resolve(e?.parentUuid);
+  });
+  return { origin, parent };
+}
+
+export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
+  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  const { origin, parent } = originsOf(entries);
+  const hidden = (i) => invisibleNote(entries, parent, i);
+  // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
+  const turns = [];
+  const turnAt = new Map(); // prompt entry index -> turn
+  entries.forEach((e, i) => {
     const content = e?.message?.content;
-    if (e?.type === 'user') {
-      if (isHiddenSummary(e)) continue;
-      const isPrompt = isPromptEntry(e);
-      if (isPrompt) flush();
-      if (isPrompt && skipSynthetic && entrySource(e) === 'synthetic') {
-        skipping = true;
-        turn = { promote: e.promptSource === 'system' && e.entrypoint === 'cli', text: '', surfacedAfterText: false, anything: false };
+    if (e?.type === 'user' && isHiddenSummary(e)) return;
+    if (e?.type === 'user' && isPromptEntry(e)) {
+      // skip (ruling reader): a turn whose prompt the owner did not type; mute (every other reader): an invisible turn, a boundary whose text is never added (#191 A2); slot: everything else
+      const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || hidden(i) ? 'skip' : 'slot') : hidden(i) ? 'mute' : 'slot';
+      const t = { pos: i, e, kind, content: [], lastPos: i, textPos: -1, shownPos: -1 };
+      turns.push(t);
+      turnAt.set(i, t);
+    } else if ((e?.type === 'user' || e?.type === 'assistant') && Array.isArray(content)) {
+      const t = turnAt.get(origin[i]);
+      if (t) { // (no turn: an unresolved chain, or text before the window's first prompt: dropped)
+        t.content.push(e);
+        t.lastPos = i;
+        const text = e.type === 'assistant' && content.some((b) => b?.type === 'text' && typeof b.text === 'string' && showsText(b.text));
+        if (text) t.textPos = i;
+        // #241: what the owner can read is the text AND a tool block that surfaces an ask (the detectors the ruling reader uses below)
+        if (text || content.some((b) => (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) || (b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content))))) t.shownPos = i;
+      }
+    }
+  });
+  // The reply slots: what the owner's "merge" / "extra round" / ruling can answer, in prompt order. A skipped turn (ruling reader) is promoted into one (#189) or voids the slot before it (R1-F3..R5-B2, below).
+  const slots = [];
+  const mutes = []; // positions of the invisible prompts (merge / round readers)
+  const shownSkips = []; // R3-F1: the last shown position of each visibleSynthetic skip turn that was not promoted
+  for (const t of turns) {
+    if (t.kind === 'mute') { mutes.push(t.pos); continue; }
+    if (t.kind === 'slot') {
+      let text = '';
+      for (const e of t.content) if (e.type === 'assistant') for (const b of e.message.content) if (b?.type === 'text' && typeof b.text === 'string') text += `${b.text}\n`;
+      slots.push({ turn: t, lastPos: t.lastPos, text, promoted: false, voided: false });
+      continue;
+    }
+    // a skipped turn: the order of its entries decides (see the promotion rule above)
+    let text = '';
+    let surfacedAfterText = false;
+    let anything = false;
+    for (const e of t.content) {
+      if (e.type === 'user') {
+        if (e.message.content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { surfacedAfterText = true; anything = true; }
         continue;
       }
-      if (isPrompt) skipping = false;
-      else if (skipping) {
-        if (Array.isArray(content) && content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { turn.surfacedAfterText = true; turn.anything = true; }
-        continue;
+      for (const b of e.message.content) {
+        if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { text += `${b.text}\n`; surfacedAfterText = false; anything = true; }
+        else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
       }
-      if (isPrompt) {
-        replies.push('');
-        lastPromptText = promptTextOf(e);
-      }
-      lastIsPrompt = isPrompt;
-    } else if (e?.type === 'assistant' && Array.isArray(content)) {
-      if (skipping) {
-        for (const b of content) {
-          if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { turn.text += `${b.text}\n`; turn.surfacedAfterText = false; turn.anything = true; }
-          else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { turn.surfacedAfterText = true; turn.anything = true; }
-        }
-        continue;
-      }
-      lastIsPrompt = false;
-      for (const b of content) if (b?.type === 'text' && typeof b.text === 'string') replies[replies.length - 1] += `${b.text}\n`;
+    }
+    if (visibleSynthetic(t.e) && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
+    else if (anything) {
+      const before = slots[slots.length - 1];
+      if (before && before.lastPos < t.pos) before.voided = true; // (a slot still being written when this turn opened was not replaced by it: interleaved, not later)
+      // R3-F1: ... but a VISIBLE synthetic turn's text or surfaced ask is on the owner's screen wherever its prompt opened: when it lands after the selected slot's last shown entry (checked below),
+      // that request is stale. An invisible turn (sdk, non-human origin, unknown source) is never shown, so the interleaved exemption above stays for it.
+      if (visibleSynthetic(t.e)) shownSkips.push(t.shownPos);
     }
   }
-  flush();
-  // Only the reply right before the owner's prompt: when the newest entry is that prompt, its own (empty) slot is skipped, and that is
-  // the ONLY slot that may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an
-  // older request is never revived by a later "merge": the agent shows it again.
-  const current = lastIsPrompt && (prompt === undefined || plain(prompt) === lastPromptText);
-  const last = replies.length - 1 - (current && replies.length > 1 ? 1 : 0);
-  return voided.has(last) ? { text: '', promoted: false } : { text: replies[last] ?? '', promoted: promoted.has(last) };
+  // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
+  // may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an older request is never revived by a later "merge": the agent shows it again.
+  const newest = [...turns].reverse().find((t) => t.kind !== 'skip');
+  const current = newest?.kind === 'slot' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
+  const candidates = current ? slots.filter((x) => x.turn !== newest) : slots;
+  const last = candidates[candidates.length - 1]; // (none: only text before the window's first prompt, which has no known origin, A3)
+  // R2-B1: assistant text of ANY other visible slot after the selected slot's last SHOWN entry was the last thing the owner was shown: the selected request is stale, exactly like a mute.
+  // R3-B1: the selected slot's last shown entry is its last assistant text (textPos), not lastPos: a tool-only entry or a tool result of the selected slot shows nothing and must not hide
+  // a later request of another slot. #241: a tool block of another visible slot that surfaces an ask (shownPos) counts as shown too, not the selected slot's own. R3-F1: so does a visibleSynthetic skip turn's.
+  const shownAfter = !last || candidates.some((x) => x !== last && x.turn.shownPos > last.turn.textPos) || shownSkips.some((pos) => pos > last.turn.textPos);
+  if (!last || last.voided || shownAfter || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
+  return { text: last.text, promoted: last.promoted };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
 
@@ -482,6 +612,12 @@ export function notOwnerWords(input, transcriptPath) {
   return currentEntryIsSynthetic(transcriptPath, input?.prompt);
 }
 
+// #191 Part B: the owner typed this answer while the agent was still working (promptSource 'queued'). Claude Code delivers such a prompt after everything the agent printed meanwhile, so it
+// is read as the answer to the LAST ask of that reply, which may be newer than what the owner had on screen when typing; the transcript cannot tell (the queue-operation entries are no
+// record of when the owner typed). So it records nothing and approves nothing, for a "merge", an "extra round" and a ruling alike: the agent shows the request again, the owner answers once more.
+// True only when the transcript already holds the entry; for a hook that runs before it does, promptProvenance refuses the record at use time.
+const queuedAnswer = (input) => currentPromptEntry(String(input?.transcript_path ?? ''), input?.prompt)?.promptSource === 'queued';
+
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
 function notOwnerPrompt(input) {
   if (input?.hook_event_name !== undefined && input.hook_event_name !== 'UserPromptSubmit') return true;
@@ -509,6 +645,20 @@ export function realDirChain(home, rel) {
   return true;
 }
 
+// The binding a "merge" answer makes, as one pure function of the answer and the text it answers (#261: the typed recorder runs it on the owner's prompt and the reply's last request; the
+// click recorder, owner-go-click.mjs, on the chosen answer and the dialog's question, which carries the same closing lines). Returns { prs, requests } or null (the answer is no approval).
+export function approvalBinding(answer, shownText) {
+  const a = parseApproval(answer);
+  if (!a) return null;
+  const shown = presentedRequests(shownText);
+  const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
+  const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
+  const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
+  // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
+  const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
+  return { prs, requests };
+}
+
 // The recorder. Writes one line to <home>/.claude/pipeline-state/owner-go/<session>.jsonl for an owner prompt that approves;
 // returns the record, or null (not an approval, a subagent, no session, or the write failed). Never throws.
 export function recordApproval(input, { home = accountHome(), now = Date.now } = {}) {
@@ -519,12 +669,8 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
     const a = parseApproval(input?.prompt);
     if (!a) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's "merge")
-    const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
-    const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
-    const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
-    const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
-    // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
-    const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
+    if (queuedAnswer(input)) return null; // (#191 B1)
+    const { prs, requests } = approvalBinding(String(input.prompt), lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
     const record = {
       v: 1,
       ts: new Date(now()).toISOString(),
@@ -550,7 +696,7 @@ const promptRefs = (input) => ({
 });
 
 // Appends one record to <home>/.claude/pipeline-state/owner-go/<session>.jsonl; the record, or null when it cannot be written safely.
-function appendRecord(home, session, record) {
+export function appendRecord(home, session, record) {
   if (!realDirChain(home, OWNER_GO_REL)) return null;
   const file = path.join(ownerGoDir(home), `${session}.jsonl`);
   try {
@@ -570,6 +716,13 @@ function appendRecord(home, session, record) {
 
 export const RULING_PROMPT_MAX = 1000; // a ruling answer is only decisions (rulingsIn); a longer prompt is no answer and is not recorded (never cut)
 
+// The binding a ruling answer makes: the ruling line the text ENDS with (presentedRuling) when the answer is a plausible one (non-empty, at most RULING_PROMPT_MAX; what it decides per item is
+// rulingsIn's job at use time). Pure, shared with the click recorder (#261). Returns { repo, pr, ids, content } or null.
+export function rulingBinding(answer, shownText) {
+  if (typeof answer !== 'string' || answer.trim() === '' || answer.length > RULING_PROMPT_MAX) return null;
+  return presentedRuling(shownText);
+}
+
 // Phase 3b, the ruling recorder (same hook, same folder): when the reply right before the owner's prompt ends with the ruling line
 // (presentedRuling), writes the prompt's words, bound to that repository, PR and those item ids. Returns the record, or null. Never throws.
 export function recordRuling(input, { home = accountHome(), now = Date.now } = {}) {
@@ -578,12 +731,11 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
     const session = String(input?.session_id ?? '');
     if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's words)
+    if (queuedAnswer(input)) return null; // (#191 B1)
     const reply = lastReply(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true });
-    const asked = presentedRuling(reply.text);
+    const asked = rulingBinding(input.prompt, reply.text);
     if (!asked) return null;
-    // #189 (Fable plan pass finding 2): an ask promoted out of a synthetic turn may never have been seen by the owner, so an answer the owner QUEUED while the agent was busy is no answer to it
-    // (refused here when the entry is already in the transcript; promptProvenance refuses it later for a record written before the transcript had it). The record says which kind of ask it answers.
-    if (reply.promoted && currentPromptEntry(String(input?.transcript_path ?? ''), input.prompt)?.promptSource === 'queued') return null;
+    // (#189 finding 2 refused a queued answer to a PROMOTED ask only; #191 B1 refuses every queued answer above. The record still says which kind of ask it answers: ask_turn is the audit trail.)
     return appendRecord(home, session, {
       v: 1, kind: 'ruling', ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
@@ -611,6 +763,25 @@ export function rulingNudge(input) {
   }
 }
 
+// #191 F3/F6, the hook's second nudge: the owner's prompt reads as a "merge", an "extra round" or a ruling answer but its transcript entry is queued, so nothing was recorded. Said once to the
+// agent (plain text on stdout, never blocking): re-run the request command so the closing lines are FRESH (a stale Head line re-shown by hand would bind a stale head) and ask again. Said
+// whether or not an ask was shown (over-nudging is harmless); not for a prompt that is evidently not the owner's. Takes precedence over the ruling nudge.
+export const QUEUED_NUDGE = '[claude-pipeline owner-go] the owner\'s answer was typed while the agent was still working, so it was not recorded: re-run the dry run (`P merge --pr N --dry-run --owner-go`), `P triage round-request` or `P triage ruling-request`, show the FRESH closing lines, and ask the owner once more after the reply ends.';
+export function queuedNudge(input) {
+  try {
+    if (notOwnerPrompt(input)) return null;
+    const answer = input?.prompt;
+    if (typeof answer !== 'string') return null;
+    const readsAsAnswer = parseApproval(answer) !== null
+      || (answer.length <= ROUND_GRANT_PROMPT_MAX && (parseRoundGrant(answer) !== null || parsePastRoundGrant(answer) !== null))
+      || (answer.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim()));
+    if (!readsAsAnswer || notOwnerWords(input, String(input?.transcript_path ?? ''))) return null;
+    return queuedAnswer(input) ? QUEUED_NUDGE : null;
+  } catch {
+    return null;
+  }
+}
+
 // Every valid "merge" record younger than maxAgeMs, from one session's file or (session null) from all of them. Never throws.
 export function readApprovals(opts = {}) {
   return readRecords(opts).filter((r) => r.kind === undefined).map((r) => ({
@@ -619,29 +790,41 @@ export function readApprovals(opts = {}) {
     prompt_id: typeof r.prompt_id === 'string' ? r.prompt_id : null,
     transcript_path: typeof r.transcript_path === 'string' ? r.transcript_path : null,
     prompt: typeof r.prompt === 'string' ? r.prompt : null,
+    ...(r.via === 'ask' ? { via: 'ask', ask: r.ask } : {}),
     prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
     requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string').map((q) => ({ ...q, repo: typeof q.repo === 'string' ? q.repo : null })) : [],
   }));
 }
 
 // Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
-function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES } = {}) {
+// `problems` (an array; the strict lookup ownerGrantLookups passes one): each read that was skipped is described in it (the folder or a file that cannot be read, a
+// file that is not a regular file or is over maxBytes); an absent folder or a file that vanished is no problem. Without it a skipped read is silent, as before.
+export function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES, problems = null } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
+  const note = (why) => { if (Array.isArray(problems)) problems.push(why); };
   try {
-    if (!lstatSync(dir).isDirectory()) return out;
+    if (!lstatSync(dir).isDirectory()) {
+      note(`${dir} is not a real folder`);
+      return out;
+    }
     names = session === null ? readdirSync(dir).filter((n) => n.endsWith('.jsonl')) : SESSION_RE.test(String(session)) ? [`${session}.jsonl`] : [];
-  } catch {
+  } catch (err) {
+    if (err?.code !== 'ENOENT') note(`${dir} cannot be read (${err?.code ?? 'error'})`);
     return out;
   }
   const t = now();
+  const clicks = new Set(); // #261: a click's record is written after its marker, so a crash-and-retry can leave two of one click: readers keep the first (the click id is the identity)
   for (const name of names) {
     const file = path.join(dir, name);
     let text = '';
     try {
       const st = lstatSync(file);
-      if (!st.isFile() || st.size > maxBytes) continue;
+      if (!st.isFile() || st.size > maxBytes) {
+        note(`${file} is ${st.isFile() ? 'over the size limit' : 'not a regular file'}`);
+        continue;
+      }
       const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
       try {
         const buf = Buffer.alloc(st.size);
@@ -650,7 +833,8 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
       } finally {
         closeSync(fd);
       }
-    } catch {
+    } catch (err) {
+      if (err?.code !== 'ENOENT') note(`${file} cannot be read (${err?.code ?? 'error'})`);
       continue;
     }
     for (const line of text.split('\n')) {
@@ -659,6 +843,7 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
       if (r?.v !== 1 || `${r.session}.jsonl` !== name) continue;
       const at = Date.parse(r.ts);
       if (!Number.isFinite(at) || at > t + FUTURE_SKEW_MS || t - at > maxAgeMs) continue;
+      if (r.via === 'ask' && typeof r.ask?.clickId === 'string') { if (clicks.has(r.ask.clickId)) continue; clicks.add(r.ask.clickId); }
       out.push(r);
     }
   }
@@ -703,7 +888,7 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
   const scan = scanBackwards(file, (e) => { if (match.is(e)) found.push(e); return found.length >= 2; }, match.wants, { chunkBytes, capBytes });
   if (scan === null || found.length === 0) return 'missing';
   if (found.length > 1) return 'synthetic';
-  if (record.ask_turn === 'synthetic' && found[0].promptSource === 'queued') return 'synthetic'; // (#189 Fable plan pass finding 2: a queued answer to an ask the owner may never have seen)
+  if (found[0].promptSource === 'queued') return 'synthetic'; // (#191 B2, every record kind: a queued answer may land on an ask newer than what the owner had on screen; #189 refused only a promoted ask's)
   const source = entrySource(found[0]);
   if (source !== 'unknown') return source;
   // unknown: legacy only if the whole transcript is free of provenance fields
@@ -714,7 +899,7 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
 
 // Visits the parsed lines of a file newest first, in chunk-sized reads, at most capBytes back from the end; `wants(line)` filters before the
 // parse and `visit(entry)` returns true to stop. Returns { reachedStart } (did the scan cover the whole file?) or null when it cannot be read.
-function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
+export function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
   let fd;
   try {
     if (!lstatSync(file).isFile()) return null;
@@ -802,8 +987,12 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
 function ownedBy(list, { grant = false, home } = {}) {
   const memo = new Map();
   return list.filter((r) => {
-    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${r.ask_turn}\0${grant ? r.session : ''}`;
+    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${r.ask_turn}\0${grant ? r.session : ''}\0${r.via}\0${r.ask?.clickId}`;
     if (!memo.has(key)) {
+      if (r.via === 'ask') { // #261: the answer to a click dialog, not a typed prompt: its proof is the dialog's tool_result entry (clickProvenance)
+        memo.set(key, clickProvenance(r, { home }));
+        return memo.get(key) === 'owner';
+      }
       const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
       const file = derive ? legacyTranscriptOf(r.session, { home }) : r.transcript_path;
       memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, { home }));
@@ -945,6 +1134,11 @@ export function ownerItemsDigest(items) {
 // #128: the grant is as strict as a "merge": a harness-injected turn is never recorded (notOwnerWords), and a record counts only while its prompt
 // is still the owner's in the transcript (promptProvenance, ownedBy) — at the cap lookup (ownerGrantedRounds) and at the final gate (verifyOwnerGrant).
 // Residual: as for "merge" and rulings (see the top of this file), plus a nested `claude -p --resume` the guards do not name (cp issue).
+// A second, distinct line approves a round that ALREADY RAN (before cp #104, so it carries no grant): `P triage round-request --past` prints
+//   `🔂 Approve past review round #N: round <k> · head <sha12> · repo <owner/name>`
+// and the same recorder stores the owner's words as a kind 'past-round' record. The two kinds never cross: a past-round record is invisible to
+// every extra-round reader (isRoundRecord: codex-review, ownerGrantedRounds, round-request), an extra-round record to the past-round readers
+// (isPastRoundRecord, pastRoundGrantsFor), and verifyOwnerGrant takes a past-round record only for an `ownerGrant` with `past: true`.
 const ROUND_LINE = new RegExp(`^\\s*(?:🔁)?\\s*Extra review round needed\\s+#(\\d{1,6})\\s*:\\s*round\\s+(\\d{1,3})\\s*(?:·|\\|)\\s*head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
 export const ROUND_GRANT_PROMPT_MAX = 300; // a grant is a few words; a longer prompt is not one and is not recorded (never cut)
 
@@ -957,12 +1151,33 @@ export function presentedRoundRequest(text) {
   return { pr: Number(m[1]), k: Number(m[2]), head: m[3].toLowerCase(), repo: m[4].toLowerCase() };
 }
 
+// The past-round line (same head / repo rules as ROUND_LINE; a different sentence, so neither parser accepts the other's line).
+const PAST_ROUND_LINE = new RegExp(`^\\s*(?:🔂)?\\s*Approve past review round\\s+#(\\d{1,6})\\s*:\\s*round\\s+(\\d{1,3})\\s*(?:·|\\|)\\s*head\\s+([0-9a-f]{${HEAD_CHARS},40})\\s*(?:·|\\|)\\s*repo\\s+(${REPO_NAME})\\s*$`, 'i');
+
+// The past-round request a reply ENDS with (its last non-blank line). Returns { pr, k, head (lower case, 12..40), repo (lower case) } or null.
+export function presentedPastRoundRequest(text) {
+  const lines = String(text ?? '').split(/\r?\n/);
+  while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+  const m = PAST_ROUND_LINE.exec(lines[lines.length - 1] ?? '');
+  if (!m) return null;
+  return { pr: Number(m[1]), k: Number(m[2]), head: m[3].toLowerCase(), repo: m[4].toLowerCase() };
+}
+
 // A prompt that grants: "extra round", "grant round 4 #1544", "extra review round, please". Same strictness as parseApproval: the words
 // after the opener are targets (#N = a PR, a bare integer = the PR or the round, resolved against the request line by the recorder) and
 // filler only; "extra round?", "no extra round", "grant round 4 after CI", "why extra round" grant nothing. Returns null or { prs, numbers }.
 export function parseRoundGrant(prompt) {
+  return parseRoundWords(prompt, /^(?:extra|grant)\s+(?:review\s+)?round(?![A-Za-z0-9_-])([\s\S]*)$/i);
+}
+
+// The owner's words for a past round: the same openers plus "approve" ("approve round", "approve past round 5 #1448"), same target rules.
+export function parsePastRoundGrant(prompt) {
+  return parseRoundWords(prompt, /^(?:extra|grant|approve)\s+(?:past\s+)?(?:review\s+)?round(?![A-Za-z0-9_-])([\s\S]*)$/i);
+}
+
+function parseRoundWords(prompt, opener) {
   const t = String(prompt ?? '').trim();
-  const m = /^(?:extra|grant)\s+(?:review\s+)?round(?![A-Za-z0-9_-])([\s\S]*)$/i.exec(t);
+  const m = opener.exec(t);
   if (!m) return null;
   const rest = m[1];
   if (rest.includes('?')) return null;
@@ -977,22 +1192,42 @@ export function parseRoundGrant(prompt) {
   return { prs: [...new Set(prs)], numbers: [...new Set(numbers)] };
 }
 
+// The binding an "extra round" answer makes (pure, shared with the click recorder, #261): the request line the text ENDS with, when the answer is a grant (parseRoundGrant, at most
+// ROUND_GRANT_PROMPT_MAX) and every PR or round it names is the line's. Returns { pr, k, head, repo } or null.
+export function roundBinding(answer, shownText, { parse = parseRoundGrant, present = presentedRoundRequest } = {}) {
+  if (typeof answer !== 'string' || answer.trim() === '' || answer.length > ROUND_GRANT_PROMPT_MAX) return null;
+  const g = parse(answer);
+  if (!g) return null;
+  const asked = present(shownText);
+  if (!asked) return null;
+  if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
+  return asked;
+}
+
 // The extra-round recorder (same hook, same folder): when the reply right before the owner's prompt ends with the request line, writes the
 // prompt verbatim, bound to that repository, PR, counted round and head. A PR or round the prompt names must be the line's; anything else
 // records nothing. Returns the record, or null. Never throws.
-export function recordRoundGrant(input, { home = accountHome(), now = Date.now } = {}) {
+export function recordRoundGrant(input, opts = {}) {
+  return recordRoundKind(input, opts, { kind: 'extra-round', parse: parseRoundGrant, present: presentedRoundRequest });
+}
+
+// The past-round recorder: the same checks, for a reply that ends with the 🔂 line; writes a kind 'past-round' record. Returns the record, or null. Never throws.
+export function recordPastRoundGrant(input, opts = {}) {
+  return recordRoundKind(input, opts, { kind: 'past-round', parse: parsePastRoundGrant, present: presentedPastRoundRequest });
+}
+
+function recordRoundKind(input, { home = accountHome(), now = Date.now } = {}, { kind, parse, present }) {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
     if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > ROUND_GRANT_PROMPT_MAX) return null;
-    const g = parseRoundGrant(input.prompt);
-    if (!g) return null;
+    if (!parse(input.prompt)) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
-    const asked = presentedRoundRequest(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
+    if (queuedAnswer(input)) return null; // (#191 B1)
+    const asked = roundBinding(input.prompt, lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }), { parse, present });
     if (!asked) return null;
-    if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
     return appendRecord(home, session, {
-      v: 1, kind: 'extra-round', ts: new Date(now()).toISOString(), session,
+      v: 1, kind, ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
       cwd: typeof input.cwd === 'string' ? input.cwd : null,
       repo: asked.repo, pr: asked.pr, k: asked.k, head: asked.head, ...promptRefs(input), prompt: input.prompt,
@@ -1003,9 +1238,11 @@ export function recordRoundGrant(input, { home = accountHome(), now = Date.now }
 }
 
 const FULL_HEAD = /^[0-9a-f]{40}$/;
-// Is this a well-formed extra-round record (the hook's own shape)? A hand-edited prompt no longer hashes to prompt_sha256.
-function isRoundRecord(r) {
-  return r?.kind === 'extra-round' && typeof r.session === 'string' && typeof r.ts === 'string' && typeof r.prompt_sha256 === 'string'
+// Is this a well-formed record of that kind (the hook's own shape)? A hand-edited prompt no longer hashes to prompt_sha256.
+const isRoundRecord = (r) => isGrantRecord(r, 'extra-round');
+const isPastRoundRecord = (r) => isGrantRecord(r, 'past-round');
+function isGrantRecord(r, kind) {
+  return r?.kind === kind && typeof r.session === 'string' && typeof r.ts === 'string' && typeof r.prompt_sha256 === 'string'
     && repoKey(r.repo) === r.repo && Number.isInteger(r.pr) && Number.isInteger(r.k) && /^[0-9a-f]{12,40}$/.test(String(r.head))
     && typeof r.prompt === 'string' && r.prompt.trim() !== '' && r.prompt.length <= ROUND_GRANT_PROMPT_MAX
     && createHash('sha256').update(r.prompt).digest('hex') === r.prompt_sha256;
@@ -1035,14 +1272,23 @@ function chainState(home, rel) {
   return 'ok';
 }
 
+// Is this record's marker spent? A marker lookup that fails for a reason other than "not there" still counts as spent (the tolerant lookups), but the strict one
+// (opts.problems) records it, so a consumed folder that cannot be searched does not hide an unspent grant (R3-B1).
+function spentMarker(record, { home, problems = null } = {}) {
+  const marker = readGrantMarker(grantIdOf(record), { home });
+  if (marker.lookupError && Array.isArray(problems)) problems.push(`a grant's marker cannot be checked (${marker.lookupError})`);
+  return marker.spent;
+}
+
 // The unspent records (before the provenance check) for this repository, PR, counted round k, newest first (see ownerGrantedRounds).
-function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
+const grantsFor = (q = {}) => grantRecordsFor(isRoundRecord, q);
+function grantRecordsFor(isKind, { repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || (!anyHead && !FULL_HEAD.test(String(head)))) return [];
   const moves = movesOf(opts);
   return readRecords(opts)
-    .filter((r) => isRoundRecord(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
-      && !readGrantMarker(grantIdOf(r), { home: opts.home }).spent)
+    .filter((r) => isKind(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
+      && !spentMarker(r, opts))
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
 }
 
@@ -1052,12 +1298,54 @@ function grantsFor({ repo, pr, k, head, anyHead = false, ...opts } = {}) {
 // #128: only a record whose prompt is the owner's (promptProvenance) counts, as for a "merge".
 export const ownerGrantedRounds = (q = {}) => ownedBy(grantsFor(q), { grant: true, home: q.home });
 
+// The same lookup for the owner's approval of a PAST round (kind 'past-round'): unspent, < 24 h, bound to (repo, pr, k, head); pastRoundGrantsFor is before the provenance check,
+// ownerPastRoundRecords after it (the owner's own prompts only). Nothing in the extra-round path reads these.
+export const pastRoundGrantsFor = (q = {}) => grantRecordsFor(isPastRoundRecord, q);
+export const ownerPastRoundRecords = (q = {}) => ownedBy(pastRoundGrantsFor(q), { grant: true, home: q.home });
+// Every past-round record the owner typed for (repo, pr, k, full head), at ANY age and whatever its marker says, newest first: `state past-round-grant` resumes from a
+// record whose marker an earlier, interrupted run already spent (the lookups above skip spent records).
+export function ownerPastRoundHistory({ repo, pr, k, head, ...opts } = {}) {
+  const key = repoKey(repo);
+  if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || !FULL_HEAD.test(String(head))) return [];
+  const moves = movesOf(opts);
+  const found = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES })
+    .filter((r) => isPastRoundRecord(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && head.startsWith(r.head))
+    .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+  return ownedBy(found, { grant: true, home: opts.home });
+}
+
 // Why ownerGrantedRounds found nothing, for the message: 'none' (no such record), 'provenance' (records exist but none is confirmed as typed
 // by the owner) or 'ok' (at least one is the owner's).
 export function ownerGrantGap(q = {}) {
   const found = grantsFor(q);
   if (found.length === 0) return 'none';
   return ownedBy(found, { grant: true, home: q.home }).length > 0 ? 'ok' : 'provenance';
+}
+
+// STRICT lookups for `triage defer-fixes` (and the follow-up recommendation of `triage round-request`), which must not defer past a grant it could not see: ownerGrantedRounds and
+// ownerGrantGap answer [] / 'none' when the records cannot be read (readRecords never throws), so here every skipped read makes a lookup THROW instead: the records folder present but
+// unreadable or not a real folder, a session file that cannot be read, is not a regular file or is over the size limit, a repo-moves file that is present but unreadable, and a
+// consumed-grants folder that is not a real folder (readGrantMarker would call every grant spent), and a marker whose lookup fails for any reason but "not there" (a consumed folder that cannot be searched). An absent folder (nothing was ever recorded) is no grant, as before.
+// Returns { grants(k), grantGap(k) } for the repository and PR at counted round k and ANY head: grants -> the records the owner typed (provenance confirmed), grantGap -> 'none' | 'provenance' | 'ok'.
+export function ownerGrantLookups({ repo, pr, home = accountHome(), now = Date.now } = {}) {
+  const base = [];
+  const moves = readRepoMoves({ home });
+  if (moves.error) base.push(`the recorded repository moves cannot be read (${moves.error})`);
+  if (chainState(home, CONSUMED_REL) === 'unsafe') base.push('the consumed-grants folder is not a real folder');
+  const read = (k) => {
+    const problems = [...base];
+    const found = grantsFor({ repo, pr, k, anyHead: true, home, now, repoMoves: moves.moves, problems });
+    if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
+    return found;
+  };
+  return {
+    grants: (k) => ownedBy(read(k), { grant: true, home }),
+    grantGap(k) {
+      const found = read(k);
+      if (found.length === 0) return 'none';
+      return ownedBy(found, { grant: true, home }).length > 0 ? 'ok' : 'provenance';
+    },
+  };
 }
 
 // R2-F3 for a grant: text to append to a refusal when the unconfirmed records' transcripts are under a config dir this process does not know ('' otherwise).
@@ -1107,7 +1395,8 @@ export function claimGrantMarkers(records, body, { home = accountHome(), now = D
 }
 
 // What is on disk for a grant id: { spent: false, verifiable: false } (no marker), { spent: true, verifiable: true, marker } or
-// { spent: true, verifiable: false } (a partial, unparseable, linked or otherwise odd marker, or an unsafe folder: spent, never trusted).
+// { spent: true, verifiable: false } (a partial, unparseable, linked or otherwise odd marker, or an unsafe folder: spent, never trusted); the last also
+// carries lookupError (an error code) when the marker could not even be looked up (not ENOENT), which is not proof it exists.
 export function readGrantMarker(grantId, { home = accountHome() } = {}) {
   const file = markerPath(grantId, { home });
   if (file === null) return { spent: true, verifiable: false };
@@ -1117,7 +1406,7 @@ export function readGrantMarker(grantId, { home = accountHome() } = {}) {
   try {
     if (!lstatSync(file).isFile()) return { spent: true, verifiable: false };
   } catch (err) {
-    return err?.code === 'ENOENT' ? { spent: false, verifiable: false } : { spent: true, verifiable: false };
+    return err?.code === 'ENOENT' ? { spent: false, verifiable: false } : { spent: true, verifiable: false, lookupError: err?.code ?? 'unknown' };
   }
   try {
     const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
@@ -1150,7 +1439,9 @@ export function verifyOwnerGrant({ repo, pr, k, toHead, ownerGrant } = {}, opts 
   const id = ownerGrant?.grantId;
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || !FULL_HEAD.test(String(toHead))) return { ok: false, reason: 'malformed' };
   if (!GRANT_ID.test(String(id)) || typeof ownerGrant.quote !== 'string' || (ownerGrant.k !== undefined && ownerGrant.k !== k)) return { ok: false, reason: 'malformed' };
-  const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isRoundRecord(r) && grantIdOf(r) === id);
+  if (ownerGrant.past !== undefined && typeof ownerGrant.past !== 'boolean') return { ok: false, reason: 'malformed' };
+  const isKind = ownerGrant.past === true ? isPastRoundRecord : isRoundRecord; // a past-round approval backs only a `past` grant, an extra-round grant only a non-past one
+  const record = readRecords({ ...opts, maxAgeMs: Infinity, maxBytes: VERIFY_MAX_BYTES }).find((r) => isKind(r) && grantIdOf(r) === id);
   if (!record) return { ok: false, reason: 'no-record' };
   const moves = movesOf(opts);
   if (!sameRepo({ recorded: record.repo, recordedAt: record.ts, current: key, moves }) || record.pr !== pr || record.k !== k || !toHead.startsWith(record.head)) return { ok: false, reason: 'mismatch' };

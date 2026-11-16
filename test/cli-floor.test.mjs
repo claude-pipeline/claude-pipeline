@@ -11,8 +11,8 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { scratchFloorDir } from './helpers/floor-env.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { scratchFloorDir, floorEnv } from './helpers/floor-env.mjs';
+import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { raiseFloor, readFloor, resetFloor, withFloorLock } from '../pipeline/lib/model-floor.mjs';
 
 process.env.PIPELINE_MACHINE_ID ||= 'test-machine-id'; // the in-process floor lock must not create a machine-id file in the real pipeline state folder
@@ -41,6 +41,7 @@ const FINDINGS = {
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute() to a.js', headRefName: 'feat/x' } },
   { match: '^repo view', stdoutJson: REPO_VIEW },
+  ...NO_COMMENTS,
 ];
 const JUDGE = {
   items: Object.entries({ 'R1-B1': ['ACCEPT'], 'R1-S1': ['REJECT', 'high'], 'R1-S2': ['REJECT', 'low'], 'R1-W1': ['FOLLOW-UP'] }).map(([id, [decision, confidence = 'high']]) => ({
@@ -62,7 +63,7 @@ const NEWER = 'claude-fable-5-3';
 const SCRUBBED = ['AI_AGENT', 'CLAUDE_CODE_EXECPATH', 'PIPELINE_TEST_MODE', 'PIPELINE_TEST_FLOOR_PAUSE', 'PIPELINE_TEST_FLOOR_WAIT_MS', 'PIPELINE_ACCOUNT_PROJECTS_DIR', 'NODE_OPTIONS'];
 
 function world(t) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', pipelineYml());
   repo.write('.gitignore', '.review/\n');
@@ -84,7 +85,7 @@ function world(t) {
     env(extra = {}) {
       const env = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, FAKE_CODEX_CAPTURE: join(scratch, 'codex-capture.jsonl'),
-        PIPELINE_LOCK_DIR: join(scratch, 'locks'), PIPELINE_MODEL_FLOOR_DIR: w.floor, PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
+        PIPELINE_LOCK_DIR: join(scratch, 'locks'), ...floorEnv(w.floor), PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
       };
       for (const k of [...SCRUBBED, 'FAKE_CODEX_OUTPUT']) delete env[k];
       return { ...env, ...extra };

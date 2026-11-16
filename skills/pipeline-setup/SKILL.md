@@ -45,6 +45,8 @@ Use implementer subagents for the file work; give each the exact template path +
   clean install → typecheck → lint/static guards → unit tests → database reset + all migrations
   + permission/policy tests → production build → Playwright E2E smoke (screenshots to
   `.verify/screenshots/`). `--quick` = typecheck + lint + tests related to changed files.
+  A script agents run (`verify.mjs`, and any script it starts) must not spell the config-root path, even in a comment: the guard refuses a script whose text names
+  it and which writes, and `pipeline preflight` warns about it. Describe the file in words.
 - Writes `.verify/report.json` (per step: status `pass|fail|not-run|skipped`, duration, error excerpt, `skipReason` when skipped; plus `mode`,
   `expectedSteps`, git head/tree/dirty). Fail fast.
 - Add missing tooling: Vitest (JS/TS unit), Playwright (`e2e/smoke/*.spec.ts`, own config +
@@ -89,7 +91,11 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
   `templates/workflows/verify.yml`. If it already has CI (and minutes are a constraint), keep it
   and make sure the required checks always report: remove `paths:`/`paths-ignore:` trigger
   filters from required workflows and use a job-level docs-only skip instead (a workflow that
-  never triggers never reports, which blocks every such PR).
+  never triggers never reports, which blocks every such PR). Also add a step `node scripts/pipeline/workflow-contexts.mjs` to
+  the project's REQUIRED PR-check workflow (it fails a PR that adds a workflow GitHub rejects as a whole, e.g. `runner.temp` in a
+  job-level `env:`) and say so in the setup report; `P vendor --check` warns `workflow-contexts-unwired` until some workflow runs it.
+  The `verify.yml` template already runs that step before `node scripts/verify.mjs`.
+- Set `ci.draft_while_iterating: true` only when every heavy required workflow (a) skips drafts (job `if: !github.event.pull_request.draft` or equivalent), (b) lists `ready_for_review` and `converted_to_draft` in its `pull_request`/`pull_request_target` `types` (a bare `pull_request:` gets neither: the default types are opened, synchronize, reopened), and (c) puts one PR's runs in one concurrency group with `cancel-in-progress`, so the `converted_to_draft` run cancels a running suite: `pipeline redraft` then turns a ready PR back to draft before a fix push, so CI runs once at re-ready. The `verify.yml` and `pipeline-guards.yml` templates already do; existing CI must meet the same rule. Otherwise leave it `false`.
 - Branch protection is applied **after the onboarding PR merges**: `P protect --repo .` prints
   the exact `gh api` calls (required checks = `ci.required_checks` + the two guard contexts, each pinned to GitHub Actions;
   a check another app posts, such as `Vercel`, keeps its current app or takes `--pin Vercel=<app id>`); `P protect --repo . --apply` (requires the session to have been
@@ -99,7 +105,7 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
 
 ### e. Test-integrity + hard-stop checks
 
-`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `queue-guards-run`, `smoke` and `supabase-local`
+`P vendor --repo .` copies `ci-guard`, `ci-guards-run`, `queue-guards-run`, `smoke`, `supabase-local` and `workflow-contexts`
 (plus `lib/`, `vendor/js-yaml.mjs` and a `VERSION` file) into `scripts/pipeline/` (and removes a `stop-verify.mjs` an earlier vendor left there), and appends
 `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to `.gitattributes` so a Windows checkout cannot
 rewrite them (commit that file; `P vendor --repo . --check` reports drift and warns when the lines are

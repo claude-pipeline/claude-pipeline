@@ -30,8 +30,22 @@ const isAbsolutePosix = (s, platform = process.platform) => s.startsWith('/') ||
 
 // Normalised POSIX form: absolute, ".." resolved, no trailing slash (except a bare root), and
 // lower-cased on case-insensitive platforms (unless `fold` is false: the spelling to ask the disk about).
+// (an absolute path normalises the same whatever the working directory, so those answers are kept, bounded: the guards ask about the same roots and words again and again)
+const normalised = new Map();
 function normalise(p, platform, fold = true) {
-  let s = toPosix(p);
+  const s0 = toPosix(p);
+  if (!isAbsolutePosix(s0, platform) || s0.length > 512) return normaliseUncached(s0, platform, fold);
+  const key = `${platform}\0${fold ? 1 : 0}\0${s0}`;
+  let out = normalised.get(key);
+  if (out === undefined) {
+    out = normaliseUncached(s0, platform, fold);
+    if (normalised.size >= 8192) normalised.clear();
+    normalised.set(key, out);
+  }
+  return out;
+}
+function normaliseUncached(p, platform, fold) {
+  let s = p;
   if (!isAbsolutePosix(s, platform)) s = `${toPosix(process.cwd())}/${s}`;
   const unc = /^\/\/[^/]/.test(s); // keep a UNC prefix; posix.normalize would collapse "//" to "/"
   // (on Windows `..` stops at the drive root and at the share root of a UNC path)

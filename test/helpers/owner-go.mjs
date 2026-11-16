@@ -12,12 +12,28 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { accountHome, areasBlock, ownerGoDir, recordApproval, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
+import { accountHome, areasBlock, ownerGoDir, recordApproval, recordPastRoundGrant, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
 const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
 // What Claude Code writes on a prompt entry the owner typed (#128): the use-time provenance check accepts a record only for such an entry.
 export const OWNER_ENTRY = { origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli' };
+
+// #191 R1-B1: Claude Code writes `uuid` and `parentUuid` on every transcript entry, and the readers (lastReply) attribute an assistant entry to its prompt through that chain.
+// link() gives a fixture the chain a sequential session has: an entry without a uuid gets one, an entry without a `parentUuid` key points at the entry before it. An entry that sets either
+// keeps it (a test of interleaved or cut-off output sets parentUuid itself: null, a uuid outside the file, another turn's). A compact_boundary system entry is written the way Claude Code
+// writes it: parentUuid null and logicalParentUuid the entry before it (the chain a mid-turn compaction keeps). Idempotent.
+export function link(entries) {
+  let prev = null;
+  return entries.map((e) => {
+    const uuid = e.uuid ?? `u-${randomUUID()}`;
+    const boundary = e.type === 'system' && e.subtype === 'compact_boundary';
+    const out = { ...e, uuid, parentUuid: 'parentUuid' in e ? e.parentUuid : boundary ? null : prev, ...(boundary && !('logicalParentUuid' in e) ? { logicalParentUuid: prev } : {}) };
+    prev = uuid;
+    return out;
+  });
+}
+export const linesOf = (entries) => `${link(entries).map((e) => JSON.stringify(e)).join('\n')}\n`;
 
 // Where a test transcript lives: <account home>/.claude-ownergo-test-<uuid>/projects/-repo/t.jsonl, a root the use-time provenance check accepts (R1-B2; lib/paths.mjs isTranscriptFile).
 // Codex #145 P1 / fix round: only a folder directly under the account's home with the guard's name shape is a root ($CLAUDE_CONFIG_DIR is none), so a temp dir's own .claude/ is not one.
@@ -52,6 +68,8 @@ export const ownerSays = (t, prompt, reply, entry, after) => said(t, prompt, rep
 export const ownerRules = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRuling, entry, after);
 // Owner-granted extra round: the same for the owner's `extra round` (the reply ends with roundRequest's line).
 export const ownerGrants = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordRoundGrant, entry, after);
+// The same for the owner's approval of a PAST round (the reply ends with pastRoundRequest's line).
+export const ownerApprovesPast = (t, prompt, reply, entry, after) => said(t, prompt, reply, recordPastRoundGrant, entry, after);
 
 // Files this process wrote and has not removed yet. Removed at exit, so an uncaught error or a failed test before t.after still leaves
 // nothing behind. Only paths this process itself wrote are ever touched: production accepts `test-<uuid>` session names and reads
@@ -69,11 +87,11 @@ function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined
   const dir = mkdtempSync(join(tmpdir(), 'owner-go-'));
   const transcript = transcriptIn(t);
   const promptId = `pid-${randomUUID()}`;
-  writeFileSync(transcript, `${[
+  writeFileSync(transcript, linesOf([
     { type: 'user', message: { content: 'ship it' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
     { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
     { type: 'user', message: { content: prompt }, promptId, ...entry },
-  ].map((e) => JSON.stringify(e)).join('\n')}\n`);
+  ]));
   const session = `test-${randomUUID()}`;
   const file = join(ownerGoDir(), `${session}.jsonl`);
   cleanupAtExit(file);
@@ -89,7 +107,7 @@ function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined
       { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
     ];
     if (after !== 'missing') kept.push({ type: 'user', message: { content: prompt }, promptId, ...after });
-    writeFileSync(transcript, `${kept.map((e) => JSON.stringify(e)).join('\n')}\n`);
+    writeFileSync(transcript, linesOf(kept));
   }
   t.after(() => {
     rmSync(file, { force: true });
@@ -110,6 +128,9 @@ export const rulingRequest = (pr, ids, repo = 'acme/widgets', content = 'c0ffee0
 // A reply that asks for one more counted review round, as `P triage round-request` prints it (k = the counted ordinal; head >= 12 hex).
 export const roundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${repo}`;
 
+// A reply that asks the owner to approve a round that already ran, as `P triage round-request --past` prints it.
+export const pastRoundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k} ran before the cap existed.\n🔂 Approve past review round #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${repo}`;
+
 // The flags P merge takes for it.
 export const approvalFlags = (head, items) => ['--owner-approved-head', head, '--owner-approved-items', items];
 
@@ -121,7 +142,7 @@ export function runHook(t, { entries, prompt, entry = OWNER_ENTRY, appended = tr
   const transcript = transcriptIn(t);
   const promptId = `pid-${randomUUID()}`;
   const all = appended ? [...entries, { type: 'user', message: { content: prompt }, promptId, ...entry }] : entries;
-  writeFileSync(transcript, `${all.map((e) => JSON.stringify(e)).join('\n')}\n`);
+  writeFileSync(transcript, linesOf(all));
   const session = `test-${randomUUID()}`;
   const file = join(ownerGoDir(), `${session}.jsonl`);
   t.after(() => {

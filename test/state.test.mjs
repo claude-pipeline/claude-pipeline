@@ -13,6 +13,13 @@ import {
   decodeFromComment,
   addRound,
   updateItems,
+  SUPPORTED_STATE_VERSION,
+  STATE_VERSION_DEFERRAL,
+  STATE_VERSION_SUBSTITUTE,
+  STATE_VERSION_OUT_OF_MODEL,
+  maxRiskOf,
+  stateNeedsOutOfModelVersion,
+  withStateVersion,
 } from '../pipeline/lib/state.mjs';
 
 function tmp() {
@@ -447,6 +454,166 @@ test('addRound persists promptSha256; it survives save, comment encode/decode an
     saveState(dir, old);
     assert.deepEqual(loadState(dir), old);
     assert.deepEqual(decodeFromComment(encodeForComment(old)), old);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- cp #256: substitute rounds, state version 4, maxRisk -------------------------------------------------------------------
+
+const subRound = (over = {}) => ({
+  n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], firstReviewer: 'substitute',
+  substitute: { agent: 'substitute-opus', models: ['claude-opus-4-8'], reason: 'quota', resetAt: null }, ...over,
+});
+
+test('addRound keeps the substitute fields (firstReviewer, substitute, wholePr, reviewBase, patchSha256, risk, governor, budget); a plain round carries none', () => {
+  const s0 = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'medium' });
+  const full = addRound(s0, subRound({
+    wholePr: true, reviewBase: 'fork', reviewBaseKind: 'merge-base', patchSha256: 'cd'.repeat(32), risk: 'high',
+    governor: { usedPct: 93, threshold: 'hard' }, budget: { used: 6, budget: 6 },
+  })).rounds[0];
+  assert.equal(full.firstReviewer, 'substitute');
+  assert.deepEqual(full.substitute, { agent: 'substitute-opus', models: ['claude-opus-4-8'], reason: 'quota', resetAt: null });
+  assert.deepEqual([full.wholePr, full.reviewBase, full.patchSha256, full.risk], [true, 'fork', 'cd'.repeat(32), 'high']);
+  assert.deepEqual(full.governor, { usedPct: 93, threshold: 'hard' });
+  assert.deepEqual(full.budget, { used: 6, budget: 6 });
+  const plain = addRound(s0, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], wholePr: false }).rounds[0];
+  for (const k of ['firstReviewer', 'substitute', 'wholePr', 'patchSha256', 'risk', 'governor', 'budget']) assert.equal(Object.hasOwn(plain, k), false, k);
+  const input = { agent: 'substitute-opus' };
+  const copied = addRound(s0, subRound({ substitute: input })).rounds[0];
+  input.agent = 'changed';
+  assert.equal(copied.substitute.agent, 'substitute-opus', 'copied, not shared');
+});
+
+test('state version 4: a substitute round, a substitute second review, a governor or a budget decision save as 4; a plain state stays as it was', () => {
+  assert.equal(STATE_VERSION_SUBSTITUTE, 4);
+  assert.ok(STATE_VERSION_SUBSTITUTE > STATE_VERSION_DEFERRAL, 'a reader from before this change (supports up to the deferral version) refuses it');
+  const s0 = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' });
+  const plain = addRound(s0, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [] });
+  assert.equal(plain.version, 1);
+  assert.equal(addRound(s0, subRound()).version, 4);
+  assert.equal(addRound(s0, subRound({ substitute: undefined, firstReviewer: undefined, governor: { usedPct: 91, threshold: 'hard' } })).version, 4, 'governor');
+  assert.equal(addRound(s0, subRound({ substitute: undefined, firstReviewer: undefined, budget: { used: 7, budget: 6 } })).version, 4, 'budget');
+  // a later writer keeps the higher version
+  assert.equal(addRound({ ...addRound(s0, subRound()), version: 3 }, { n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: 'h2', items: [] }).version, 4);
+  assert.equal(withStateVersion(addRound(s0, subRound()), 2).version, 4);
+  // a substitute second review lands through updateItems
+  const withItem = addRound(s0, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [it('R1-B1')] });
+  assert.equal(updateItems(withItem, 1, [it('R1-B1', { secondReview: { by: 'substitute-opus', decision: 'REJECT' } })]).version, 4);
+  assert.equal(updateItems(withItem, 1, [it('R1-B1', { secondReview: { by: 'codex', decision: 'REJECT' } })]).version, 1);
+});
+
+test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForComment raise a state that holds a substitute round, and a state above the supported version is refused', () => {
+  const dir = tmp();
+  try {
+    const s = addRound(emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' }), subRound());
+    const stale = { ...s, version: 1 }; // a writer that rebuilt the state from an old copy
+    saveState(dir, stale);
+    assert.equal(loadState(dir).version, 4);
+    assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
+    saveState(dir, { ...s, version: SUPPORTED_STATE_VERSION + 1 });
+    assert.throws(() => loadState(dir), /version 6.*supports.*5/);
+    assert.equal(decodeFromComment(encodeForComment({ ...s, version: SUPPORTED_STATE_VERSION + 1 })), null);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---- #374: the state version for the out-of-model semantics (N1 / F4) and round.trustedConfigSha ------------------------------------------------------
+
+test('addRound persists trustedConfigSha (a sha, or null for "pinned unavailable") and a plain round carries none; it survives save / load / comment round trip', () => {
+  const base = emptyState({ repo: 'a/b', pr: 7, branch: 'x' });
+  const round = { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'c', items: [] };
+  assert.equal(Object.hasOwn(addRound(base, round).rounds[0], 'trustedConfigSha'), false);
+  const withSha = addRound(base, { ...round, trustedConfigSha: 'f'.repeat(40) });
+  assert.equal(withSha.rounds[0].trustedConfigSha, 'f'.repeat(40));
+  const pinnedNull = addRound(base, { ...round, trustedConfigSha: null });
+  assert.equal(pinnedNull.rounds[0].trustedConfigSha, null, 'null is a pinned "unavailable", not "absent"');
+  const dir = tmp();
+  try {
+    saveState(dir, withSha);
+    assert.deepEqual(loadState(dir), withSha);
+    assert.deepEqual(decodeFromComment(encodeForComment(withSha)), withSha);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('maxRisk only goes up: a smaller diff never lowers it, and a legacy state starts it from what it recorded (fail toward high)', () => {
+  const add = (s, n, risk) => addRound(s, { n, fromHead: 'a', toHead: 'b', contentHashAtToHead: `h${n}`, items: [], ...(risk ? { risk } : {}) });
+  let s = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'medium' });
+  s = add(s, 1, 'medium');
+  assert.equal(s.maxRisk, 'medium');
+  s = add({ ...s, risk: 'high' }, 2, 'high');
+  assert.equal(s.maxRisk, 'high');
+  s = add({ ...s, risk: 'low' }, 3, 'low'); // the diff shrank: state.risk is shown as-is, maxRisk stays
+  assert.equal(s.maxRisk, 'high');
+  assert.equal(s.rounds.map((r) => r.risk).join(), 'medium,high,low');
+  // R4-14: legacy states (no maxRisk)
+  assert.equal(maxRiskOf({ risk: 'medium', rounds: [] }), 'medium');
+  assert.equal(maxRiskOf({ risk: 'low', rounds: [{ risk: 'high' }, { risk: 'low' }] }), 'high', 'the highest recorded round risk counts');
+  assert.equal(maxRiskOf({ risk: null, rounds: [{ n: 1 }] }), 'high', 'nothing readable: fail toward high');
+  assert.equal(maxRiskOf({ risk: 'weird', maxRisk: 7, rounds: [] }), 'high');
+  assert.equal(maxRiskOf({ risk: 'low', maxRisk: 'high', rounds: [] }), 'high');
+  assert.equal(maxRiskOf(null), 'high');
+  // a legacy state gains maxRisk on its next round, from what it recorded
+  const legacy = { ...emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'high' }) };
+  assert.equal(add({ ...legacy, rounds: [{ n: 1, items: [] }] }, 2, 'low').maxRisk, 'high', 'state.risk high is read');
+  assert.equal(add({ repo: 'o/r', pr: 3, rounds: [{ n: 1, items: [] }] }, 2, 'low').maxRisk, 'high', 'an earlier round with nothing readable: high');
+});
+
+test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOfModel; withStateVersion then lifts the state to the next version', () => {
+  const plain = sampleState();
+  assert.equal(stateNeedsOutOfModelVersion(plain), false);
+  assert.equal(plain.version, 1, 'an ordinary state stays at version 1 (readable by every old CLI)');
+  const marked = updateItems(plain, 1, [it('R1-S1', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r', outOfModel: 'guards' } })]);
+  assert.equal(stateNeedsOutOfModelVersion(marked), true);
+  const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
+  assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_OUT_OF_MODEL);
+  assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
+  assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
+  assert.equal(stateNeedsOutOfModelVersion(null), false);
+});
+
+test('N1/F4: a state carrying BOTH substitute data and an out-of-model final is written as version 5 (the highest any feature needs), and a substitute-only state stays 4', () => {
+  const dir = tmp();
+  try {
+    const s0 = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' });
+    const subOnly = addRound(s0, subRound({ items: [it('R1-S1', { bucket: 'SUGGESTION' })] }));
+    assert.equal(subOnly.version, STATE_VERSION_SUBSTITUTE);
+    const both = updateItems(subOnly, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r', outOfModel: 'guards' } })]);
+    assert.equal(both.version, STATE_VERSION_OUT_OF_MODEL);
+    assert.equal(both.rounds[0].firstReviewer, 'substitute');
+    const stale = { ...both, version: 1 }; // a writer that rebuilt the state from an old copy
+    saveState(dir, stale);
+    assert.equal(loadState(dir).version, STATE_VERSION_OUT_OF_MODEL);
+    assert.equal(decodeFromComment(encodeForComment(stale)).version, STATE_VERSION_OUT_OF_MODEL);
+    // a later round on the version-5 state keeps 5
+    assert.equal(addRound(both, { n: 2, fromHead: 'b', toHead: 'c', contentHashAtToHead: 'h2', items: [] }).version, STATE_VERSION_OUT_OF_MODEL);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('N1: an old reader (the pre-#374 loadState rule: refuse a version above 4, the substitute version) refuses a state holding an outOfModel final, and its unfiled FOLLOW-UP is never read as complete', () => {
+  // A fixture of the pre-change reader: state.mjs#newerThanSupported with SUPPORTED_STATE_VERSION 4, as installed CLIs still have it.
+  const OLD_SUPPORTED = 4;
+  const oldReaderRefuses = (state) => Number.isFinite(state.version) && state.version > OLD_SUPPORTED;
+  const plain = sampleState();
+  assert.equal(oldReaderRefuses(plain), false, 'a plain state round-trips through an old reader');
+  const marked = withStateVersion(updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r', outOfModel: 'guards' } })]), STATE_VERSION_OUT_OF_MODEL);
+  assert.equal(oldReaderRefuses(marked), true, 'the old reader never gets as far as reading the unfiled FOLLOW-UP');
+  const dir = tmp();
+  try {
+    saveState(dir, plain);
+    assert.deepEqual(loadState(dir), plain, 'a plain state round-trips unchanged');
+    saveState(dir, marked);
+    assert.deepEqual(loadState(dir), marked, 'the new reader loads it');
+    // The new reader's own refusal rule is unchanged: one version up is refused.
+    saveState(dir, { ...marked, version: SUPPORTED_STATE_VERSION + 1 });
+    assert.throws(() => loadState(dir), /newer pipeline wrote it/);
+    assert.equal(decodeFromComment(encodeForComment({ ...marked, version: SUPPORTED_STATE_VERSION + 1 })), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
