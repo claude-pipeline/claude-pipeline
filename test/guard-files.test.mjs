@@ -1060,6 +1060,8 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat -- /tmp/p.mjs | node -`,
       `base64 -d <<< "aW1wb3J0KCcuL3BpcGVsaW5lL2hvb2tzL2xpYi8ke2xpYn0nKQ==" | node --input-type=module; echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs`,
       `echo "import('./pipeline/hooks/lib/${lib}')" | sed s/a/b/ | node -`,
+      // (R5-F1: a line that redefines echo / printf / cat with an alias does not get the literal-printer reading; the alias words are read as part of the whole line)
+      `alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
       // (R4-F1: a name the line gave a value and then rebinds at run time still reads as its stale value after expansion: the text AS WRITTEN decides)
       `P=x true; read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
       `export P=x; printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
@@ -1085,11 +1087,14 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
   for (const cmd of [
     "node scripts/test.mjs owner-go-click.test.mjs && git commit -m \"$(cat <<'EOF'\nguard: refuse owner-go-click.mjs read from stdin\nEOF\n)\"",
     "node scripts/test.mjs owner-go-click-hook.test.mjs; (true); git add pipeline/hooks/lib/owner-go-click-hook.mjs",
+    // (R5-F2: another command's output can feed the runtime; the message names that cause too)
+    'git add pipeline/hooks/lib/owner-go-click.mjs; git status --short | node scripts/x.mjs',
   ]) {
     const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
     assert.equal(r.decision, 'deny', cmd);
     assert.match(r.reason, /runs a JavaScript runtime and is not a plain command line/, cmd);
     assert.match(r.reason, /Run the runtime on a line of its own, or keep the library name off that line/, cmd);
+    assert.match(r.reason, /or the output of another command/, cmd);
   }
   for (const cmd of [
     'node scripts/test.mjs owner-go-click.test.mjs',

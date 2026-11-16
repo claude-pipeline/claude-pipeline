@@ -2151,7 +2151,7 @@ function zshAlternationAt(s, i) {
 // Why: the stream rebuild (producePieces) takes echo / printf / cat for the shell's own; a line that can make a name run something else -- an alias, a builtin turned
 // off (enable -n, zsh disable), zsh's functions / aliases / builtins tables (`functions[echo]=:`, `read -A aliases`), autoload, a sourced or eval'd text, a trap --
 // switches the rebuild off for the whole line (as does any function it defines: ctx.fns). Codex review 4 of #50; the owner chose this over chasing each name.
-const REDEF_CMDS = new Set(['alias', 'unalias', 'enable', 'disable', 'functions', 'unfunction', 'unhash', 'autoload', 'source', '.', 'eval', 'emulate', 'zmodload', 'trap']);
+export const REDEF_CMDS = new Set(['alias', 'unalias', 'enable', 'disable', 'functions', 'unfunction', 'unhash', 'autoload', 'source', '.', 'eval', 'emulate', 'zmodload', 'trap']);
 const REDEF_TABLE = /^(?:dis_)?(?:functions|functions_source|aliases|galiases|saliases|builtins|reswords)(?:\[|\+?=|$)/;
 function noteRedef(ctx, argv, env) {
   if (!ctx.defs || ctx.defs.redef) return;

@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -4258,10 +4258,10 @@ const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE|UPDATE_REMOTE|INSTALL_
 const RUNTIMES = new Set(['node', 'nodejs', 'bun', 'deno', 'npx', 'tsx']);
 // #472 (R2-B1 R2-F1 R2-F2) Whether the line is flat enough to trust a reading of one command's OWN stdin source: simple commands joined by && || ; | |& or a newline, every one at depth 0 (so no `$(…)`, backticks, `bash -c`,
 // process substitution or other nested text), none command-less (a redirect on a group or subshell stands alone), no `exec` carrying a redirect (it rebinds the stdin of every command after it), no group, subshell, compound
-// command or function (the parser's flatSeq, which also fails on a cut-short parse or a heredoc it cannot place). Each of those hands a runtime stdin that the walk below does not follow, so such a line is read as a whole.
+// command or function, and no command that redefines a name (an alias, `eval`, `source`…: the parser's REDEF_CMDS; R5-F1) (the parser's flatSeq, which also fails on a cut-short parse or a heredoc it cannot place). Each of those hands a runtime stdin that the walk below does not follow, so such a line is read as a whole.
 function isFlatLine(cmds) {
   return cmds.flatSeq === true && !cmds.dynamic && !(cmds.fns?.size > 0)
-    && cmds.every((c) => (c.depth ?? 0) === 0 && c.argv.length > 0 && !((c.redirects ?? []).length && c.argv.slice(0, 3).some((w) => baseOf(w) === 'exec')));
+    && cmds.every((c) => (c.depth ?? 0) === 0 && c.argv.length > 0 && !REDEF_CMDS.has(baseOf(c.argv[0])) && !((c.redirects ?? []).length && c.argv.slice(0, 3).some((w) => baseOf(w) === 'exec')));
 }
 // #472 (R3-F1) A stdin source whose text is not on the line: a file (`< F`, `0< F`, `<> F`) or a descriptor (`<&N`, `<&$fd`). A `{name}` word in front of a redirect (`: {fd}<<< …`) opens a descriptor that stays open after its command.
 const unknownSource = (r) => r.op === '<&' || r.op === '<>' || (r.op === '<' && !/^<\(/.test(r.target ?? ''));
@@ -5121,7 +5121,7 @@ function evaluateBashForFilesFrame(command, opts) {
           return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
         }
       } else if (wholeLineTexts(cmds, raw).some((t) => OWNER_GO_WORD.test(toPosix(expandRefs(t, ctx))))) {
-        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file or a descriptor may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
+        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor or the output of another command may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
       }
     }
   }
