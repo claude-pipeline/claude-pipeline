@@ -1055,6 +1055,16 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node - <> /tmp/p.mjs`,
       `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat < /tmp/p.mjs | node -`,
       `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat /tmp/p.mjs | tee /dev/null < /tmp/p.mjs | node -`,
+      // (R4-B1: every stage feeding a runtime must be a literal printer; a file operand, a decoder or any other command makes the text unknown)
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat /tmp/p.mjs | node --input-type=module`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat -- /tmp/p.mjs | node -`,
+      `base64 -d <<< "aW1wb3J0KCcuL3BpcGVsaW5lL2hvb2tzL2xpYi8ke2xpYn0nKQ==" | node --input-type=module; echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | sed s/a/b/ | node -`,
+      // (R4-F1: a name the line gave a value and then rebinds at run time still reads as its stale value after expansion: the text AS WRITTEN decides)
+      `P=x true; read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `export P=x; printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      // (a backslash-newline inside an unquoted heredoc splits the name in the raw text; the shell joins it)
+      `node --input-type=module <<EOF\nimport('./pipeline/hooks/lib/${lib.slice(0, 9)}\\\n${lib.slice(9)}')\nEOF`,
     ]) assert.equal(bash(cmd), 'deny', cmd);
     for (const cmd of [
       `cat pipeline/hooks/lib/${lib}`,

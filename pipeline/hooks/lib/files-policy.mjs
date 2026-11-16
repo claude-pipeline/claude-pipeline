@@ -4266,9 +4266,16 @@ function isFlatLine(cmds) {
 // #472 (R3-F1) A stdin source whose text is not on the line: a file (`< F`, `0< F`, `<> F`) or a descriptor (`<&N`, `<&$fd`). A `{name}` word in front of a redirect (`: {fd}<<< …`) opens a descriptor that stays open after its command.
 const unknownSource = (r) => r.op === '<&' || r.op === '<>' || (r.op === '<' && !/^<\(/.test(r.target ?? ''));
 const namesFd = (c) => (c.redirects ?? []).length > 0 && c.argv.some((w) => /^\{[A-Za-z_]\w*\}$/.test(w));
+// #472 (R4-B1) A pipe stage whose output is the text on the line: `echo`, `printf` without `-v`, or `cat` with no file operand (its stdin is then the stage before it, or a heredoc or here-string it carries). Any other stage (a file
+// operand, a decoder, a filter, `tee`, a function) makes what the runtime receives unknown, so the caller reads the whole line.
+function literalPrinter(u) {
+  const name = baseOf(u.argv[0] ?? '');
+  const ops = u.argv.slice(1);
+  return name === 'echo' || (name === 'printf' && !ops.some((w) => /^-[A-Za-z]*v/.test(w))) || (name === 'cat' && ops.every((w) => /^-[A-Za-z]+$/.test(w)));
+}
 // #472 (R1-B1) The text a command's own stdin source hands it, for a FLAT line (isFlatLine): the bodies of the heredocs on the line (the parser's spans; the whole line when they cannot be placed: fail closed), its here-string
 // and `< <(…)` words, and, when it receives a pipe, the words and bodies of the commands feeding it (the run of `|` stages before it). Not for a line with a group, a subshell or nested text: there the pipe or the stdin
-// reaches the runtime through the shell, not through this walk (R2). Returns null when a stdin source of the runtime (or of a stage feeding it) is a file or a descriptor, or any command on the line keeps a descriptor open or
+// reaches the runtime through the shell, not through this walk (R2). Returns null when a stdin source of the runtime (or of a stage feeding it) is a file or a descriptor, or a stage feeding it is not a literal printer (R4-B1), or any command on the line keeps a descriptor open or
 // duplicates one: the text is then not known and the caller reads the whole line (R3-F1).
 function stdinProgramTexts(cmds, ci, raw) {
   if (cmds.some((x) => namesFd(x) || (x.redirects ?? []).some((r) => r.op === '<&' || r.op === '<>'))) return null;
@@ -4281,7 +4288,7 @@ function stdinProgramTexts(cmds, ci, raw) {
   let next = c;
   for (let j = ci - 1; j >= 0 && (next.sep === '|' || (cmds[j].depth ?? 0) > (c.depth ?? 0)); j--) {
     const u = cmds[j];
-    if ((u.redirects ?? []).some(unknownSource)) return null;
+    if ((u.redirects ?? []).some(unknownSource) || !literalPrinter(u)) return null;
     texts.push(...u.argv, ...Object.values(u.env ?? {}), ...(u.redirects ?? []).map((r) => r.target ?? ''), ...own(u));
     next = u;
   }
@@ -4292,7 +4299,8 @@ function stdinProgramTexts(cmds, ci, raw) {
 function wholeLineTexts(cmds, raw) {
   const spans = cmds.heredocSpans;
   const bodies = Array.isArray(spans) ? spans.filter((sp) => Array.isArray(sp) && sp[1] >= sp[0] && sp[1] <= raw.length).map(([a, b]) => raw.slice(a, b)) : [];
-  return [raw, ...bodies, ...cmds.flatMap((u) => [...u.argv, ...Object.values(u.env ?? {}), ...(u.redirects ?? []).map((r) => r.target ?? '')])];
+  // (the shell joins a backslash-newline inside an unquoted heredoc body, so a name split across it reads whole there: the raw line is also read with every backslash-newline, and the tabs after it, removed)
+  return [raw, raw.replace(/\\\r?\n\t*/g, ''), ...bodies, ...cmds.flatMap((u) => [...u.argv, ...Object.values(u.env ?? {}), ...(u.redirects ?? []).map((r) => r.target ?? '')])];
 }
 
 function setsSeamForPipeline(cmds) {
@@ -5098,13 +5106,17 @@ function evaluateBashForFilesFrame(command, opts) {
     // Decided from the command's OWN stdin source, not from the shape of its words (`--input-type module` and `- x` are ordinary words that still run stdin): a heredoc, a here-string or a `< <(…)` on it, or the receiving
     // side of a pipe. When the text that source hands it names an owner-go library, the command is refused. A library named elsewhere on the line (`git add LIB && node --test`) is none of its business.
     // That reading is trusted ONLY when every stdin source of the runtime is text that is fully known: a flat line (isFlatLine) whose runtime, and every pipe stage before it, takes a heredoc, a here-string, a `< <(…)` or a pipe, with no
-    // `$` or backtick left in that text after expandRefs (R3-F1: a run-time variable), no file or descriptor source and no kept-open descriptor on the line. Anything else (a group, a subshell, a compound command, a function, an `exec`
+    // `$` or backtick in that text, as written or after expandRefs (R3-F1, R4-F1: a run-time variable), no pipe stage that is not a literal printer (R4-B1), no file or descriptor source and no kept-open descriptor on the line. Anything else (a group, a subshell, a compound command, a function, an `exec`
     // redirect, a command-less redirect, nested text, a variable, a file, a descriptor) cannot be followed command by command, so it fails closed: a runtime is refused when the whole raw line, or the decoded words of any command on it
     // (R3-B1: shell quotes can split a name in the raw line), name an owner-go library.
+    // What this refuses is a library name that appears AS WRITTEN: in a decoded word, a heredoc body (joined over a backslash-newline) or the raw line. It is a text scan, so a name built, split or encoded at run time
+    // (`printf 'owner-\x2dgo…'`, two printf words, a string joined inside the program) or a program staged in a file earlier (`node /tmp/p.mjs`) is the documented residual (files-policy.mjs, RESIDUALS at the top;
+    // owner-go-click.mjs header), not a hole in this rule.
     if (RUNTIMES.has(baseOf(c.argv[0]))) {
       const own = isFlatLine(cmds) ? stdinProgramTexts(cmds, ci, raw) : null;
       const known = own?.map((t) => toPosix(expandRefs(t, ctx)));
-      if (known && !known.some((t) => /[$`]/.test(t))) {
+      // (R4-F1: the text AS WRITTEN decides: a name the line gave a value and then rebinds at run time (`P=x true; read -r P …`) expands to its stale value and would hide the `$`)
+      if (known && !own.some((t) => /[$`]/.test(t)) && !known.some((t) => /[$`]/.test(t))) {
         if (known.some((t) => OWNER_GO_WORD.test(t))) {
           return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
         }
