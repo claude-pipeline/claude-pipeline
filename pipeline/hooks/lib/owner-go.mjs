@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { REPO_NAME, readRepoMoves, sameRepo } from './repo-moves.mjs';
-import { clickProvenance, settlePendingClicks } from './owner-go-click.mjs';
+import { clickProvenance, pendingClickProblems, settlePendingClicks } from './owner-go-click.mjs';
 import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
@@ -645,8 +645,9 @@ export function realDirChain(home, rel) {
       if (!lstatSync(p).isDirectory()) return false;
     } catch (err) {
       if (err?.code !== 'ENOENT') return false;
-      try { mkdirSync(p, { mode: 0o700 }); } catch { return false; }
-      if (!lstatSync(p).isDirectory()) return false;
+      // (#472: two claimers creating the folder at once: the loser's mkdir says EEXIST, which is fine when what is there is a real directory, checked just below)
+      try { mkdirSync(p, { mode: 0o700 }); } catch (e) { if (e?.code !== 'EEXIST') return false; }
+      try { if (!lstatSync(p).isDirectory()) return false; } catch { return false; }
     }
   }
   return true;
@@ -1298,16 +1299,244 @@ function spentMarker(record, { home, problems = null } = {}) {
   return marker.spent;
 }
 
+// ---- #472: round tickets, coverage and the per-grant marker every covered grant ends up with ------------------------------------------------------
+// Why: a click is verified late on Claude Code 2.1.323 (settlePendingClicks), so a round grant can become a record AFTER an extra-round claim of its round was made, and two claimers with disjoint
+// snapshots (one holds the typed word, the other the late click) would each claim a "different" grant: two runs for one round. So every extra-round claim first creates ONE O_EXCL ticket
+// `round-claims/<key16>.<n>.json` for (repository, PR, counted round k) (claimGrantMarkers, `ticket: true`): the claims of a round are totally ordered by their tickets, and a claim may only take
+// ticket n+1 while it holds a grant answered after ticket n. A grant answered at or before a ticket is COVERED by it: spent for every new reader (roundCoverage), and, so that readers that know
+// nothing about tickets (an older checkout's `pipeline.mjs`, a downgrade) see it spent too, it gets its own ordinary per-grant marker (the claim's sweep, settlePendingClicks, or the reader repair in
+// grantRecordsFor). Coverage governs the availability of a grant for another claim ONLY: verifyOwnerGrant keeps judging historical proof by record + own marker, at any age.
+export const ROUND_CLAIMS_REL = `${OWNER_GO_REL}/round-claims`;
+const TICKET_NAME = /^([0-9a-f]{16})\.([1-9]\d{0,5})\.json$/;
+const CONSUMED_NAME = /^([0-9a-f]{16})\.json$/;
+const SOURCE_MAX_BYTES = 64 * 1024;
+
+// Why (#472): the key one round's tickets are named by, sha256(repoKey|pr|k)[:16]; null for a repository that is none.
+export const roundTicketKey = (repo, pr, k) => {
+  const key = repoKey(repo);
+  return key === null ? null : createHash('sha256').update(`${key}|${pr}|${k}`).digest('hex').slice(0, 16);
+};
+
+// A ticket or marker file read for coverage: { state: 'ok', value, mtimeMs } | { state: 'bad', mtimeMs } (there, but not JSON, too big or unreadable: UNPARSEABLE) | { state: 'error' } (it cannot even be
+// looked at, or it is no plain file: a link, a folder). `io.lstatSync` is a test seam.
+function readSourceFile(file, io) {
+  let st;
+  try {
+    st = (io.lstatSync ?? lstatSync)(file);
+    if (!st.isFile()) return { state: 'error' };
+  } catch {
+    return { state: 'error' };
+  }
+  try {
+    const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    try {
+      const got = fstatSync(fd);
+      if (!got.isFile() || got.size > SOURCE_MAX_BYTES) return { state: 'bad', mtimeMs: st.mtimeMs };
+      const buf = Buffer.alloc(got.size);
+      readSync(fd, buf, 0, got.size, 0);
+      return { state: 'ok', value: JSON.parse(buf.toString('utf8')), mtimeMs: st.mtimeMs };
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return { state: 'bad', mtimeMs: st.mtimeMs };
+  }
+}
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const validTicket = (v, key, n) => isPlainObject(v) && v.v === 1 && repoKey(v.repo) === v.repo && Number.isInteger(v.pr) && Number.isInteger(v.k) && v.n === n && roundTicketKey(v.repo, v.pr, v.k) === key
+  && FULL_HEAD.test(String(v.head)) && typeof v.consumedAt === 'string' && Number.isFinite(Date.parse(v.consumedAt)) && Array.isArray(v.grantIds) && v.grantIds.every((g) => GRANT_ID.test(String(g)));
+const validMarker = (v, id) => isPlainObject(v) && v.v === 1 && v.grantId === id && repoKey(v.repo) === v.repo && Number.isInteger(v.pr) && Number.isInteger(v.k) && FULL_HEAD.test(String(v.head))
+  && typeof v.consumedAt === 'string' && Number.isFinite(Date.parse(v.consumedAt));
+const indeterminate = (why) => ({ state: 'indeterminate', why });
+
+// Why (#472): the round tickets of (repo, pr, k) (and of the names the recorded repository moves map them to), read for coverage and for the claim's ticket number. -> { state: 'ok', tickets: [{ id:
+// '<key16>.<n>', n, parseable, repo, pr, k, head, consumedAt, grantIds, checkout: null, mtimeMs }] sorted by n } | { state: 'indeterminate', why }. A missing folder is no ticket; an unsafe folder, a listing that
+// fails, a name that is no ticket name, and a ticket that cannot be looked at or is no plain file make it INDETERMINATE (fail closed). A ticket that is there but unparseable is kept with its mtime and no
+// head: it covers by time only and is never a repair source (it has no head to copy). `io.readdirSync` / `io.lstatSync` are test seams.
+export function readRoundTickets({ home = accountHome(), repo, pr, k, moves = [], io = {} } = {}) {
+  const chain = chainState(home, ROUND_CLAIMS_REL);
+  if (chain === 'missing') return { state: 'ok', tickets: [] };
+  if (chain === 'unsafe') return indeterminate('the round-claims folder is not a real folder');
+  const names = [repo, ...moves.flatMap((m) => [m?.from, m?.to])].map((r) => roundTicketKey(r, pr, k)).filter((x) => x !== null);
+  const wanted = new Set(names);
+  let listing;
+  try {
+    listing = (io.readdirSync ?? readdirSync)(path.join(home, ...ROUND_CLAIMS_REL.split('/')));
+  } catch (err) {
+    return indeterminate(`the round-claims folder cannot be listed (${err?.code ?? 'error'})`);
+  }
+  const tickets = [];
+  for (const name of listing) {
+    const m = TICKET_NAME.exec(name);
+    if (m === null) return indeterminate(`the round-claims folder holds ${name}, which is no ticket`);
+    if (!wanted.has(m[1])) continue;
+    const n = Number(m[2]);
+    const r = readSourceFile(path.join(home, ...ROUND_CLAIMS_REL.split('/'), name), io);
+    if (r.state === 'error') return indeterminate(`the ticket ${name} cannot be checked`);
+    const id = `${m[1]}.${n}`;
+    tickets.push(r.state === 'ok' && validTicket(r.value, m[1], n)
+      ? { id, n, parseable: true, repo: r.value.repo, pr: r.value.pr, k: r.value.k, head: r.value.head, consumedAt: r.value.consumedAt, grantIds: r.value.grantIds, checkout: null, mtimeMs: r.mtimeMs }
+      : { id, n, parseable: false, mtimeMs: r.mtimeMs });
+  }
+  return { state: 'ok', tickets: tickets.sort((a, b) => a.n - b.n) };
+}
+
+// The ordinary consumed markers as coverage sources (a claim by ticket-less code leaves nothing else, F1). A verifiable marker WITHOUT `coveredBy` is a source with its own fields; one WITH `coveredBy`
+// is derived (its source is present) and skipped; an unparseable one is a source by mtime. Same indeterminate rules as the tickets (names must be `<16 hex>.json`).
+function readConsumedSources({ home, io }) {
+  const chain = chainState(home, CONSUMED_REL);
+  if (chain === 'missing') return { state: 'ok', sources: [] };
+  if (chain === 'unsafe') return indeterminate('the consumed-grants folder is not a real folder');
+  const dir = path.join(home, ...CONSUMED_REL.split('/'));
+  let listing;
+  try {
+    listing = (io.readdirSync ?? readdirSync)(dir);
+  } catch (err) {
+    return indeterminate(`the consumed-grants folder cannot be listed (${err?.code ?? 'error'})`);
+  }
+  const sources = [];
+  for (const name of listing) {
+    const m = CONSUMED_NAME.exec(name);
+    if (m === null) return indeterminate(`the consumed-grants folder holds ${name}, which is no marker`);
+    const r = readSourceFile(path.join(dir, name), io);
+    if (r.state === 'error') return indeterminate(`the marker ${name} cannot be checked`);
+    if (r.state === 'ok' && validMarker(r.value, m[1])) {
+      if (typeof r.value.coveredBy === 'string') continue;
+      sources.push({ id: m[1], parseable: true, repo: r.value.repo, pr: r.value.pr, k: r.value.k, head: r.value.head, consumedAt: r.value.consumedAt, checkout: typeof r.value.checkout === 'string' ? r.value.checkout : null, mtimeMs: r.mtimeMs });
+    } else {
+      sources.push({ id: m[1], parseable: false, mtimeMs: r.mtimeMs });
+    }
+  }
+  return { state: 'ok', sources };
+}
+
+// Tickets + consumed markers for one round. -> { state: 'ok', tickets, sources } | { state: 'indeterminate', why }.
+function coverageSources({ home, repo, pr, k, moves, io }) {
+  const t = readRoundTickets({ home, repo, pr, k, moves, io });
+  if (t.state !== 'ok') return t;
+  const c = readConsumedSources({ home, io });
+  if (c.state !== 'ok') return c;
+  return { state: 'ok', tickets: t.tickets, sources: [...t.tickets, ...c.sources] };
+}
+
+// The sources that cover `record` (answered at or before the source's consumedAt, or before an unparseable source's mtime; same PR and round, the source's head starting with the record's, the source's
+// repository the current one or moved to it after the claim), parseable ones in front.
+function coveringSources(record, sources, key, moves) {
+  const at = Date.parse(record.ts);
+  const hits = sources.filter((s) => (s.parseable
+    ? s.pr === record.pr && s.k === record.k && sameRepo({ recorded: s.repo, recordedAt: s.consumedAt, current: key, moves }) && s.head.startsWith(record.head) && Date.parse(s.consumedAt) >= at
+    : s.mtimeMs >= at));
+  return [...hits.filter((s) => s.parseable), ...hits.filter((s) => !s.parseable)];
+}
+
+// Why (#472): is this extra-round grant spent by a claim of its round that was made after it was answered? 'covered' | 'absent' | 'indeterminate' (a folder that is unsafe or cannot be listed, a stray name, an
+// lstat that fails: the grant then counts as spent, strict lookups report it, and a claim is refused `unsafe`). Extra-round records only (a past-round record, which shares the readers, is always 'absent': F6).
+// `repo` is the repository the caller asks about (default the record's own); `moves` the recorded repository moves. Sources: the round tickets and every ordinary consumed marker (see readConsumedSources).
+export function roundCoverage(record, { home = accountHome(), moves = [], repo, io = {} } = {}) {
+  if (!isRoundRecord(record)) return 'absent';
+  const key = repoKey(repo ?? record.repo);
+  if (key === null) return 'absent';
+  const s = coverageSources({ home, repo: key, pr: record.pr, k: record.k, moves, io });
+  if (s.state !== 'ok') return 'indeterminate';
+  return coveringSources(record, s.sources, key, moves).length > 0 ? 'covered' : 'absent';
+}
+
+// The first covering source with a parseable body, as { id, repo, pr, k, head, consumedAt, checkout }: what the sweep and the repair copy into the grant's own marker (its head and consumedAt, never `now`).
+// null when nothing parseable covers it (an unparseable source covers by time but has no head to copy: F3) or coverage is indeterminate.
+export function roundCoverageSource(record, { home = accountHome(), moves = [], repo, io = {} } = {}) {
+  if (!isRoundRecord(record)) return null;
+  const key = repoKey(repo ?? record.repo);
+  if (key === null) return null;
+  const s = coverageSources({ home, repo: key, pr: record.pr, k: record.k, moves, io });
+  if (s.state !== 'ok') return null;
+  const hit = coveringSources(record, s.sources, key, moves).find((x) => x.parseable);
+  return hit === undefined ? null : sourceCopy(hit);
+}
+const sourceCopy = (s) => ({ id: s.id, repo: s.repo, pr: s.pr, k: s.k, head: s.head, consumedAt: s.consumedAt, checkout: s.checkout });
+
+// Exclusively creates consumed/<grantId>.json holding `body` (written and fsynced; the folder too). 'ok' | 'exists' | 'error'. Any error AFTER the file exists leaves it behind: it reads as SPENT (and
+// unverifiable), as everywhere. `io.writeSync` / `io.fsyncSync` are the tests' fault seams.
+function writeMarkerFile(grantId, body, { home, io = {} }) {
+  const file = markerPath(grantId, { home });
+  if (file === null) return 'error';
+  let fd;
+  try {
+    fd = openSync(file, OPEN_EXCL, 0o600);
+  } catch (err) {
+    return err?.code === 'EEXIST' ? 'exists' : 'error';
+  }
+  try {
+    (io.writeSync ?? writeSync)(fd, `${JSON.stringify(body)}\n`);
+    (io.fsyncSync ?? fsyncSync)(fd);
+  } catch {
+    try { closeSync(fd); } catch { /* spent either way */ }
+    return 'error';
+  }
+  try { closeSync(fd); } catch { return 'error'; }
+  return 'ok';
+}
+const derivedMarker = (grantId, source) => ({ v: 1, grantId, repo: source.repo, pr: source.pr, k: source.k, head: source.head, consumedAt: source.consumedAt, checkout: source.checkout ?? null, coveredBy: source.id });
+
+// Why (#472): a covered grant's OWN per-grant marker, copied from the parseable source that covers it (head and consumedAt of the source, `coveredBy` = its id). Called by settlePendingClicks (before and
+// after it appends a click's record), and by the reader repair. Never gated by the environment (F8). -> { coverage: 'absent' | 'covered' | 'indeterminate', marked: 'none' | 'written' | 'exists' | 'error' }
+// ('none': nothing to write, no parseable source covers it or it is not covered).
+export function markCoveredGrant(record, { home = accountHome(), moves, repo, io = {} } = {}) {
+  if (!isRoundRecord(record)) return { coverage: 'absent', marked: 'none' };
+  const key = repoKey(repo ?? record.repo);
+  const id = grantIdOf(record);
+  if (key === null || id === null) return { coverage: 'absent', marked: 'none' };
+  const m = moves ?? readRepoMoves({ home }).moves;
+  const s = coverageSources({ home, repo: key, pr: record.pr, k: record.k, moves: m, io });
+  if (s.state !== 'ok') return { coverage: 'indeterminate', marked: 'none' };
+  const hits = coveringSources(record, s.sources, key, m);
+  if (hits.length === 0) return { coverage: 'absent', marked: 'none' };
+  const source = hits.find((x) => x.parseable);
+  if (source === undefined) return { coverage: 'covered', marked: 'none' };
+  if (!realDirChain(home, CONSUMED_REL)) return { coverage: 'covered', marked: 'error' };
+  const made = writeMarkerFile(id, derivedMarker(id, sourceCopy(source)), { home, io });
+  return { coverage: 'covered', marked: made === 'ok' ? 'written' : made };
+}
+
 // The unspent records (before the provenance check) for this repository, PR, counted round k, newest first (see ownerGrantedRounds).
+// #472: an extra-round record is also spent when a claim of its round covers it (roundCoverage: indeterminate counts as spent and, in strict mode, is a problem), and a covered one whose own marker is
+// missing gets it written here (the repair; `settle: false` is the read-only paths' opt-out; the environment never gates it). Past-round records are never covered (F6).
+// `opts.io.afterSpentCheck(record)` (tests): runs once for each record this call keeps, after its spent and coverage checks.
 const grantsFor = (q = {}) => grantRecordsFor(isRoundRecord, q);
 function grantRecordsFor(isKind, { repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || (!anyHead && !FULL_HEAD.test(String(head)))) return [];
   const moves = movesOf(opts);
+  const extra = isKind === isRoundRecord;
+  let sources = null; // read once, and only when a record gets this far
   return readRecords(opts)
-    .filter((r) => isKind(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
-      && !spentMarker(r, opts))
+    .filter((r) => {
+      if (!(isKind(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head)))) return false;
+      if (spentMarker(r, opts)) return false;
+      if (extra) {
+        sources ??= coverageSources({ home: opts.home ?? accountHome(), repo: key, pr, k, moves, io: opts.io ?? {} });
+        if (sources.state !== 'ok') {
+          if (Array.isArray(opts.problems) && !opts.problems.some((p) => p.startsWith("a grant's round claims"))) opts.problems.push(`a grant's round claims cannot be checked (${sources.why})`);
+          return false;
+        }
+        const hits = coveringSources(r, sources.sources, key, moves);
+        if (hits.length > 0) {
+          const source = hits.find((x) => x.parseable);
+          if (source !== undefined && opts.settle !== false) repairMarker(r, source, { home: opts.home ?? accountHome(), io: opts.io });
+          return false;
+        }
+      }
+      opts.io?.afterSpentCheck?.(r);
+      return true;
+    })
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+}
+// The reader repair: the covered grant's own marker, if it is still missing. A failure is ignored (the grant stays spent for new readers; the next read tries again).
+function repairMarker(record, source, { home, io }) {
+  try {
+    const id = grantIdOf(record);
+    if (id === null || !realDirChain(home, CONSUMED_REL)) return;
+    writeMarkerFile(id, derivedMarker(id, sourceCopy(source)), { home, io });
+  } catch { /* spent for new readers either way */ }
 }
 
 // Every record for this repository, PR, counted round k whose recorded head starts the full head under review, younger than 24 h, with NO
@@ -1353,6 +1582,9 @@ export function ownerGrantLookups({ repo, pr, home = accountHome(), now = Date.n
   const read = (k) => {
     const problems = [...base];
     const found = grantsFor({ repo, pr, k, anyHead: true, home, now, repoMoves: moves.moves, problems });
+    // #472: a round click that is still unverified (read AFTER the grants, so one this read just settled is no longer in it; computed in every read, never cached in `base`, so a lookup made after the
+    // grace still sees it) is a grant this lookup could not see: defer-fixes / round-request must not read "no grant" over it. It stays a problem until its evidence could no longer matter.
+    problems.push(...pendingClickProblems({ home, repo, pr, kinds: ['round'], now, moves: moves.moves }));
     if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
     return found;
   };
@@ -1374,25 +1606,70 @@ export const ownerGrantConfigDirHint = (q = {}) => configDirHint(grantsFor(q), {
 // and fsynced (the folder too, except on Windows), and any error after the marker exists leaves it SPENT. Returns { ok:true, claimed:[{ grantId,
 // file }] } or { ok:false, reason: 'used' (a marker was there) | 'spent' (we created it, then failed) | 'unsafe' | 'invalid' | 'none' }.
 // `io` replaces writeSync / fsyncSync (tests).
-export function claimGrantMarkers(records, body, { home = accountHome(), now = Date.now, io = {} } = {}) {
+// Why (#472) `ticket: true` (the extra-round claim of review-round.mjs; the past-round claim in state.mjs stays ticket-less): the claim first takes ONE O_EXCL round ticket for (repo, pr, k), so claims of a
+// round are totally ordered and two claimers with disjoint snapshots cannot both win (see the block above grantRecordsFor). 1. read the tickets (indeterminate -> `unsafe`; n = the highest ticket); 2. re-run
+// roundCoverage on every record: at least ONE must be `absent` (head-aware, the predicate admission applies), else `used` (indeterminate -> `unsafe`); 3. create ticket n + 1 (EEXIST -> `used`; an error
+// after it exists -> `spent`, the ticket stands); 4. write the per-grant markers (as without a ticket, but with `coveredBy`, the ticket's head and consumedAt; an EEXIST marker that is verifiable, for
+// this repo / PR / round / head and `coveredBy` this very ticket was written by a reader's repair between steps 3 and 4 and counts as ours: F2); 5. sweep: every extra-round grant of the round
+// covering `body.head` that was answered at or before the ticket gets the missing marker too (a failed write -> `spent`; the ticket stands and readers repair the rest). Returns the same shapes, plus
+// `ticket` ('<key16>.<n>') on success. Test seams in `io`: writeSync / fsyncSync (every write of the claim), readdirSync / lstatSync (coverage), afterTicket (between steps 3 and 4).
+export function claimGrantMarkers(records, body, { home = accountHome(), now = Date.now, io = {}, ticket = false, repoMoves } = {}) {
   const ids = [...new Set((records ?? []).map(grantIdOf))];
   if ((records ?? []).length === 0) return { ok: false, reason: 'none' };
   const key = repoKey(body?.repo);
   if (ids.includes(null) || key === null || !Number.isInteger(body?.pr) || !Number.isInteger(body?.k) || !FULL_HEAD.test(String(body?.head))) return { ok: false, reason: 'invalid' };
   if (!realDirChain(home, CONSUMED_REL)) return { ok: false, reason: 'unsafe' };
-  const write = io.writeSync ?? writeSync;
   const sync = io.fsyncSync ?? fsyncSync;
   const claimed = [];
+  let round = null; // the ticket this claim holds: { id, head, consumedAt }
+  if (ticket) {
+    const moves = movesOf({ home, repoMoves });
+    const read = coverageSources({ home, repo: key, pr: body.pr, k: body.k, moves, io });
+    if (read.state !== 'ok') return { ok: false, reason: 'unsafe' };
+    const coverage = records.map((r) => (coveringSources(r, read.sources, key, moves).length > 0 ? 'covered' : 'absent'));
+    if (!coverage.includes('absent')) return { ok: false, reason: 'used' };
+    const n = read.tickets.reduce((most, t) => Math.max(most, t.n), 0) + 1;
+    const id = `${roundTicketKey(key, body.pr, body.k)}.${n}`;
+    const consumedAt = new Date(now()).toISOString();
+    if (!realDirChain(home, ROUND_CLAIMS_REL)) return { ok: false, reason: 'unsafe' };
+    const file = path.join(home, ...ROUND_CLAIMS_REL.split('/'), `${id}.json`);
+    let fd;
+    try {
+      fd = openSync(file, OPEN_EXCL, 0o600);
+    } catch (err) {
+      return { ok: false, reason: err?.code === 'EEXIST' ? 'used' : 'unsafe', claimed };
+    }
+    try {
+      (io.writeSync ?? writeSync)(fd, `${JSON.stringify({ v: 1, repo: key, pr: body.pr, k: body.k, n, head: body.head, consumedAt, grantIds: [...ids].sort() })}\n`);
+      sync(fd);
+    } catch {
+      try { closeSync(fd); } catch { /* the ticket stands either way */ }
+      return { ok: false, reason: 'spent', claimed };
+    }
+    try { closeSync(fd); } catch { return { ok: false, reason: 'spent', claimed }; }
+    if (process.platform !== 'win32') {
+      try {
+        const dfd = openSync(path.dirname(file), constants.O_RDONLY);
+        try { sync(dfd); } finally { closeSync(dfd); }
+      } catch {
+        return { ok: false, reason: 'spent', claimed };
+      }
+    }
+    round = { id, head: body.head, consumedAt };
+    io.afterTicket?.({ id });
+  }
+  const write = io.writeSync ?? writeSync;
   for (const grantId of ids.sort()) {
     const file = markerPath(grantId, { home });
     let fd;
     try {
       fd = openSync(file, OPEN_EXCL, 0o600);
     } catch (err) {
+      if (err?.code === 'EEXIST' && round !== null && repairedByThisTicket(grantId, { home, key, body, ticket: round })) { claimed.push({ grantId, file }); continue; }
       return { ok: false, reason: err?.code === 'EEXIST' ? 'used' : 'unsafe', grantId, claimed };
     }
     try {
-      write(fd, `${JSON.stringify({ v: 1, grantId, repo: key, pr: body.pr, k: body.k, head: body.head, consumedAt: new Date(now()).toISOString(), checkout: typeof body.checkout === 'string' ? body.checkout : null })}\n`);
+      write(fd, `${JSON.stringify({ v: 1, grantId, repo: key, pr: body.pr, k: body.k, head: body.head, consumedAt: round === null ? new Date(now()).toISOString() : round.consumedAt, checkout: typeof body.checkout === 'string' ? body.checkout : null, ...(round === null ? {} : { coveredBy: round.id }) })}\n`);
       sync(fd);
     } catch {
       try { closeSync(fd); } catch { /* spent either way */ }
@@ -1409,7 +1686,31 @@ export function claimGrantMarkers(records, body, { home = accountHome(), now = D
       return { ok: false, reason: 'spent', claimed };
     }
   }
-  return { ok: true, claimed };
+  if (round !== null && !sweepCovered({ home, now, io, key, body, ticket: round, repoMoves, held: new Set(ids) })) return { ok: false, reason: 'spent', claimed };
+  return { ok: true, claimed, ...(round === null ? {} : { ticket: round.id }) };
+}
+
+// F2: a marker that already stands for this grant is OUR claim's when it is verifiable, for this repository / PR / round / head, and `coveredBy` this very ticket (a reader's repair wrote it between the ticket
+// and the marker step).
+function repairedByThisTicket(grantId, { home, key, body, ticket }) {
+  const m = readGrantMarker(grantId, { home });
+  return m.verifiable && m.marker.repo === key && m.marker.pr === body.pr && m.marker.k === body.k && m.marker.head === body.head && m.marker.coveredBy === ticket.id;
+}
+
+// The claim's sweep (step 5): every extra-round grant of (repo, pr, k) covering the claimed head that was answered at or before the ticket, settled records included, gets its own marker from this ticket
+// when it has none (a marker that already stands is fine: that grant is spent). false when a write failed.
+function sweepCovered({ home, now, io, key, body, ticket, repoMoves, held }) {
+  const moves = movesOf({ home, repoMoves });
+  const upTo = Date.parse(ticket.consumedAt);
+  const source = { id: ticket.id, repo: key, pr: body.pr, k: body.k, head: ticket.head, consumedAt: ticket.consumedAt, checkout: typeof body.checkout === 'string' ? body.checkout : null };
+  for (const r of readRecords({ home, now })) {
+    if (!isRoundRecord(r) || !sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) || r.pr !== body.pr || r.k !== body.k || !body.head.startsWith(r.head) || Date.parse(r.ts) > upTo) continue;
+    const id = grantIdOf(r);
+    if (id === null || held.has(id)) continue;
+    const made = writeMarkerFile(id, derivedMarker(id, source), { home, io });
+    if (made === 'error') return false;
+  }
+  return true;
 }
 
 // What is on disk for a grant id: { spent: false, verifiable: false } (no marker), { spent: true, verifiable: true, marker } or

@@ -15,7 +15,7 @@ import {
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
   accountHome, approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, recordPastRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantLookups, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
-  ROUND_CLAIMS_REL, roundTicketKey, roundCoverage, roundCoverageSource, pastRoundGrantsFor, ownerPastRoundRecords,
+  readRecords, ROUND_CLAIMS_REL, roundTicketKey, roundCoverage, roundCoverageSource, pastRoundGrantsFor, ownerPastRoundRecords,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
@@ -2045,12 +2045,15 @@ test('round coverage: a repository moved AFTER the answer: a ticket under either
 test('round coverage: an unsafe folder, a failed listing, a stray name, a linked ticket and an lstat that fails are INDETERMINATE: spent for tolerant reads, a problem for strict ones, `unsafe` for a claim', { skip: process.platform === 'win32' }, () => {
   const strictProblem = (home) => assert.throws(() => ownerGrantLookups({ repo: REPO, pr: 58, home, now: () => AT + 4000 }).grants(4), /round claims cannot be checked/);
   const check = (label, home, { io } = {}) => {
-    const records = twoGrants(home);
+    twoGrants(home); // (its own read already counts the grants as spent in these worlds: take the records as written)
+    const records = readRecords({ home, now: () => AT + 2000, settle: false }).filter((r) => r.kind === 'extra-round');
+    assert.equal(records.length, 2);
     assert.equal(roundCoverage(records[0], { home, repo: REPO, moves: [], io }), 'indeterminate', label);
     assert.deepEqual(open(home, { io }), [], `${label}: tolerant lookups count the grant as spent`);
     const c = claimT(records, home, { io });
     assert.deepEqual([c.ok, c.reason], [false, 'unsafe'], label);
-    assert.equal(existsSync(join(ownerGoDir(home), 'consumed')), false, `${label}: nothing was claimed`);
+    const consumedDir = join(ownerGoDir(home), 'consumed');
+    assert.deepEqual(existsSync(consumedDir) ? readdirSync(consumedDir) : [], [], `${label}: nothing was claimed`);
     if (io === undefined) strictProblem(home);
   };
   const linked = tmp();
@@ -2082,7 +2085,8 @@ test('round coverage: an unsafe folder, a failed listing, a stray name, a linked
   mkdirSync(TICKETS(listing), { recursive: true });
   check('a listing that fails', listing, { io: { readdirSync: () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }); } } });
   const lstatFails = tmp();
-  writeTicket(lstatFails);
+  mkdirSync(TICKETS(lstatFails), { recursive: true });
+  writeFileSync(join(TICKETS(lstatFails), `${KEY}.1.json`), '{"v":1'); // (a garbled one: a valid ticket would be repaired from by the reads that set the world up)
   check('an lstat that fails', lstatFails, { io: { lstatSync: (p, ...rest) => { if (String(p).endsWith('.json')) throw Object.assign(new Error('EIO'), { code: 'EIO' }); return lstatSync(p, ...rest); } } });
   if (process.getuid?.() !== 0) {
     const closed = tmp();

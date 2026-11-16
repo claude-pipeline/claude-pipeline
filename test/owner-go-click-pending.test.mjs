@@ -881,8 +881,83 @@ test('strict lookups keep an unresolved round click until its evidence expires (
     assert.doesNotThrow(() => run(() => lookups(grace, { pr: 59 }).grants(3)), 'another PR');
   }
   const expired = capturedMs + CAPTURE_SKEW_MS + MAX_AGE_MS + 1000;
-  withSwitch('off', () => assert.equal(refusal(expired).eligible, false, 'with the switch off and nothing settled it still refuses until the expiry'));
+  withSwitch('off', () => assert.equal(refusal(expired - 3000).eligible, false, 'with the switch off and nothing settled it still refuses right up to the expiry'));
+  withSwitch('off', () => assert.equal(refusal(expired).eligible, true, 'and not after it, settled or not'));
   withSwitch(undefined, () => w.settle({ now: () => expired }));
   assert.deepEqual([settledOf(w)?.outcome, settledOf(w)?.reason], ['refused', 'evidence-expired']);
   assert.equal(refusal(expired).eligible, true, 'a NEW lookup no longer refuses for it');
+});
+
+// ---- Task 6: a pending marker is only a pointer (the forgery net) ---------------------------------------------------------------------------
+// Each forged pointer below is settled through the SAME checks the immediate path applies, so it records nothing and spends nothing; the refusal is the one named.
+
+const forged = async (t, { opts = {}, hook = {}, prepare = () => {}, settleAt = (w) => w.t, label }) => {
+  const w = pw(t, opts);
+  assert.ok((await w.hook(hook)).pending, `${label}: captured`);
+  prepare(w);
+  w.flush();
+  w.t = settleAt(w);
+  const o = only(w.settle(), w)[0];
+  assert.equal(w.records().length, 0, `${label}: nothing recorded`);
+  assert.equal(existsSync(w.spentFile), false, `${label}: nothing spent`);
+  return o;
+};
+const repoint = (w, patch) => writeFileSync(w.pendingFile(), `${JSON.stringify({ ...readJson(w.pendingFile()), ...patch })}\n`);
+
+test('a forged pending is settled by the transcript, not believed: hook-answered fixtures, a model-prefilled dialog, another session\'s transcript, a subagent or /tmp copy, another hook fingerprint, an ask that is gone, a stale answer', async (t) => {
+  for (const fixture of ['pretooluse-hook-answer', 'permissionrequest-hook-answer']) {
+    const o = await forged(t, { opts: { fixture }, label: fixture });
+    assert.deepEqual([o.outcome, o.reason], ['refused', 'not-a-human-answer'], fixture);
+  }
+  const prefilled = await forged(t, { label: 'model-prefilled', prepare: (w) => {
+    w.use.message.content.find((b) => b.type === 'tool_use').input = { questions: [w.dialog], answers: { [w.dialog.question]: 'Merge' } };
+    writeFileSync(w.file, w.text([w.prompt, w.use]));
+  } });
+  assert.deepEqual([prefilled.outcome, prefilled.reason], ['refused', 'tool-use-shape']);
+  const other = await forged(t, { label: 'another session', prepare: (w) => {
+    const session = 'some-other-session';
+    const clickId = clickIdOf(session, w.toolUseId, w.askId);
+    rmSync(w.pendingFile());
+    writeFileSync(w.pendingFile(clickId), `${JSON.stringify({ v: 1, askId: w.askId, clickId, session, toolUseId: w.toolUseId, transcriptPath: w.file, cwd: null, hookLayersSha256: null, capturedAt: new Date(w.t).toISOString() })}\n`);
+    w.clickId = clickId;
+  } });
+  assert.deepEqual([other.outcome, other.reason], ['refused', 'session']);
+  for (const [label, where] of [['a copy in /tmp', (w) => join(tmpdir(), `forged-${w.askId}.jsonl`)], ['a subagent transcript', (w) => join(w.home, '.claude-click-test', 'projects', '-repo', 'subagents', 'agent-1.jsonl')]]) {
+    const o = await forged(t, { label, prepare: (w) => {
+      const copy = where(w);
+      mkdirSync(join(copy, '..'), { recursive: true });
+      writeFileSync(copy, readFileSync(w.file));
+      repoint(w, { transcriptPath: copy });
+    } });
+    assert.deepEqual([o.outcome, o.reason], ['refused', 'transcript-not-protected'], label);
+  }
+  const fp = 'a'.repeat(64);
+  const changed = await forged(t, { opts: { hookLayersSha256: fp }, hook: { hookCheck: () => ({ ok: true, hookLayersSha256: fp }) }, label: 'another fingerprint', prepare: (w) => repoint(w, { hookLayersSha256: 'b'.repeat(64) }) });
+  assert.deepEqual([changed.outcome, changed.reason], ['refused', 'dialog-hooks-changed']);
+  const gone = await forged(t, { label: 'ask gone', prepare: (w) => rmSync(join(asksDir(w.home), `${w.askId}.json`)) });
+  assert.deepEqual([gone.outcome, gone.reason], ['refused', 'ask-gone']);
+  const stale = await forged(t, { label: 'stale', settleAt: (w) => w.answeredAt + MAX_AGE_MS + 5000 });
+  assert.deepEqual([stale.outcome, stale.reason], ['refused', 'stale']);
+});
+
+test('a pointer with a clickId that is not the hash of its own fields is skipped; a second pointer on a spent ask is refused spent and the ask yields one record', async (t) => {
+  const w = pw(t);
+  assert.ok((await w.hook()).pending);
+  const bad = 'f'.repeat(16);
+  rmSync(w.pendingFile());
+  writeFileSync(w.pendingFile(bad), `${JSON.stringify({ v: 1, askId: w.askId, clickId: bad, session: w.session, toolUseId: w.toolUseId, transcriptPath: w.file, cwd: null, hookLayersSha256: null, capturedAt: new Date(w.t).toISOString() })}\n`);
+  w.flush();
+  assert.deepEqual(w.settle().outcomes, [{ askId: w.askId, clickId: bad, outcome: 'skipped', reason: 'pending-invalid' }]);
+  assert.equal(w.records().length, 0);
+  // replay: a second click on the same ask after the first one was settled
+  const r = pw(t);
+  assert.ok((await r.hook()).pending);
+  const second = r.extra('toolu_second');
+  assert.ok((await r.hook({}, { tool_use_id: 'toolu_second' })).pending);
+  r.flush();
+  second.flush();
+  const outcomes = r.settle().outcomes.map((o) => [o.outcome, o.reason ?? null]);
+  assert.deepEqual(outcomes.sort(), [['recorded', null], ['refused', 'spent']].sort());
+  assert.equal(r.records().length, 1, 'one record, one spent');
+  assert.equal(readdirSync(asksDir(r.home)).filter((n) => n.endsWith('.spent')).length, 1);
 });

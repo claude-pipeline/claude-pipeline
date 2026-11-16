@@ -512,7 +512,8 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
       // discard-round); the first claimer on the machine wins. A failed claim discards the reviewer's answer.
       claimGrant = () => {
-        const claim = claimGrantMarkers(records, { repo: adm.ghRepo.slug, pr, k, head, checkout: root });
+        // #472: an extra-round claim takes a round ticket first, so claims of one round are totally ordered (owner-go.mjs claimGrantMarkers); `used` covers a grant a ticket already covers.
+        const claim = claimGrantMarkers(records, { repo: adm.ghRepo.slug, pr, k, head, checkout: root }, { ticket: true });
         if (!claim.ok) {
           throw new Fail(EXIT.USAGE, {
             ok: false, error: 'round-cap',

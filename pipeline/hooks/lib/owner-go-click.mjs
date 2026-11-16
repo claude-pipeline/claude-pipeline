@@ -19,8 +19,9 @@ import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readdi
 import path from 'node:path';
 import { isTranscriptFile } from '../../lib/paths.mjs';
 import {
-  MAX_AGE_MS, SESSION_RE, accountHome, appendRecord, approvalBinding, ownerGoDir, readRecords, realDirChain, repoKey, roundBinding, rulingBinding, rulingsIn, scanBackwards,
+  MAX_AGE_MS, SESSION_RE, accountHome, appendRecord, approvalBinding, markCoveredGrant, ownerGoDir, readRecords, realDirChain, repoKey, roundBinding, rulingBinding, rulingsIn, scanBackwards,
 } from './owner-go.mjs';
+import { readRepoMoves, sameRepo } from './repo-moves.mjs';
 
 // The Claude Code builds whose click transcripts were recorded and checked. Each build needs its fixture set under test/fixtures/click/<build>/, recorded by scripts/click-spike.mjs (the tests
 // run the whole matrix for every build listed here). Installed (protected) code, never pipeline.yml: a repo may switch clicks OFF, never widen this.
@@ -667,13 +668,59 @@ function settleOne(p, { home, now, nowMs, io, scanned }) {
   const answeredAt = Date.parse(ev.answeredAt);
   const bad = evidenceRefusal({ ask, ev, session: p.session, now }) ?? (nowMs - answeredAt > MAX_AGE_MS ? 'stale' : null) ?? (Math.abs(answeredAt - p.capturedMs) > CAPTURE_SKEW_MS ? 'capture-skew' : null);
   if (bad !== null) return finish('refused', bad);
-  const r = admitClick({ ask, ev, session: p.session, toolUseId: p.toolUseId, transcriptPath: p.transcriptPath, cwd: p.cwd, hc: { ok: true, hookLayersSha256: p.hookLayersSha256 }, home, io });
+  // Why (#472): a late-settled EXTRA-ROUND click may already be covered by a round ticket (or an old claim's marker): it then needs its OWN per-grant marker, which readers that know nothing of tickets check.
+  // Written BEFORE the record is appended (append -> check order: the claimer creates its ticket first and sweeps second, so one side always sees the other) and AGAIN after, to catch a ticket created in
+  // between. The first attempt is best effort; the second must succeed, else the click stays `retry` (no `.settled`) and the next settle finishes it from the spent marker. Never gated by the environment.
+  const mark = (record) => { try { return markCoveredGrant(record, { home }).marked; } catch { return 'error'; } };
+  const append = io.appendRecord ?? appendRecord;
+  const marking = { ...io, appendRecord: (h, s, record) => { if (record?.kind === 'extra-round') mark(record); return append(h, s, record); } };
+  const r = admitClick({ ask, ev, session: p.session, toolUseId: p.toolUseId, transcriptPath: p.transcriptPath, cwd: p.cwd, hc: { ok: true, hookLayersSha256: p.hookLayersSha256 }, home, io: marking });
   if (r.recorded) {
-    // TASK 5 SEAM (#472): a recorded EXTRA-ROUND click is where its per-grant consumed marker is written when a round ticket already covers it (roundCoverage, owner-go.mjs), BEFORE the `.settled` below.
+    if (r.recorded.kind === 'extra-round' && mark(r.recorded) === 'error') return { outcome: 'retry', reason: 'marker-write-failed' };
     return finish('recorded');
   }
   if (r.declined !== undefined) return finish('declined');
   return r.retry ? { outcome: 'retry', reason: r.refused } : finish('refused', r.refused);
+}
+
+// Why (#472): the unresolved round clicks of one repository (repository moves followed) and PR, for the STRICT grant lookups (ownerGrantLookups: `triage defer-fixes`, `round-request`), which must not read
+// "no grant" over an owner click they could not verify. Every pointer of a round ask for that repository / PR with no `.settled` is a problem until its evidence could no longer matter
+// (now > capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS: even a verified grant would be past its 24 h window): waiting, retried, retired after the grace (the grace is scheduling only, never evidence), garbled
+// (its age is then its file's mtime) or with an ask that cannot be read (it cannot be told whose it is, so it counts). Plus an asks folder that cannot be read. Never settles, never writes, never throws.
+// -> [string]. `moves` replaces the recorded repository moves (tests).
+export function pendingClickProblems({ home = accountHome(), repo, pr, kinds = ['round'], now = Date.now, moves } = {}) {
+  const out = [];
+  try {
+    const key = repoKey(repo);
+    if (key === null || !Number.isInteger(pr)) return out;
+    const nowMs = now();
+    let names;
+    try {
+      names = readdirSync(asksDir(home));
+    } catch (err) {
+      if (err?.code !== 'ENOENT') out.push(`the asks folder cannot be read (${err?.code ?? 'error'}), so an unresolved owner click cannot be ruled out`);
+      return out;
+    }
+    const have = new Set(names);
+    const recorded = moves ?? readRepoMoves({ home }).moves;
+    for (const name of names) {
+      const m = PENDING_RE.exec(name);
+      if (m === null || have.has(`${m[1]}.${m[2]}.settled`)) continue;
+      const loaded = readAsk(m[1], { home });
+      if (loaded.ok) {
+        const a = loaded.ask;
+        if (!kinds.includes(a.kind) || !a.prs.includes(pr) || !sameRepo({ recorded: a.repo, recordedAt: a.issuedAt, current: key, moves: recorded })) continue;
+      }
+      const r = readPending(name, home, nowMs);
+      let capturedMs = r.pending?.capturedMs;
+      if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
+      if (nowMs > capturedMs + CAPTURE_SKEW_MS + MAX_AGE_MS) continue;
+      out.push(`an owner click on a round ask for #${pr} (${m[1]}) is not verified yet, so a grant it carries cannot be ruled out`);
+    }
+  } catch {
+    out.push('pending owner clicks cannot be checked');
+  }
+  return out;
 }
 
 // ---- the proof every consumer asks (B4) ---------------------------------------------------------------------------------------------------
