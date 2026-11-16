@@ -12,7 +12,7 @@ import { readClassicRequired } from '../lib/protection.mjs';
 
 export const meta = {
   summary: 'wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict',
-  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?}; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
+  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?}; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
 };
 
 export const DEFAULT_APPEAR_SECONDS = 300;
@@ -45,6 +45,7 @@ export const run = guarded(async (argv, ctx) => {
       const v = gh.prView(pr, ['headRefOid', 'isDraft', 'createdAt', 'baseRefName']);
       return { head: v.headRefOid, isDraft: v.isDraft === true, createdAt: v.createdAt, base: v.baseRefName };
     },
+    mergeable: async () => gh.prView(pr, ['mergeable', 'mergeStateStatus']), // only read when a required check never appeared: a conflicting PR runs no workflow (#471)
     classic: async (base) => readClassicRequired(gh, base),
     rules: async (base) => gh.branchRules(base),
     checkRuns: async (head) => gh.checkRunsOf(head),

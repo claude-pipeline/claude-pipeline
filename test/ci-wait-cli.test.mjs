@@ -234,3 +234,20 @@ test('ci-wait (real gh args): the failing status\'s Actions run is read with `gh
   assert.match(r.json.message, /Cross-model review=fail .*\(result predates ready\)/);
   assert.ok(fake.lines().includes('api repos/acme/widgets/actions/runs/555'), fake.lines().join('\n'));
 });
+
+test('ci-wait (real gh args): an absent required check on a CONFLICTING PR is verdict `conflicting`, read with `gh pr view --json mergeable,mergeStateStatus` (#471)', () => {
+  // the first matching entry wins: the mergeability read goes before the base script's general PR view
+  const fake = createFakeGh([{ match: '^pr view 5 --json mergeable,mergeStateStatus$', stdoutJson: { mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' } }, ...base([
+    { match: '/check-runs', stdout: pages([run(2, 'ci', 'success')]) },
+    { match: '/statuses', stdout: '[]\n' },
+    { match: '/timeline', stdout: '[]\n' },
+    { match: '/actions/runs', stdout: '[]\n' },
+  ])]);
+  // `lint` is required but never reports (no workflow ran: the PR conflicts); --appear-timeout 0 puts the first poll past the window
+  const r = cli(['ci-wait', '--pr', '5', '--appear-timeout', '0', '--interval', '1'], { repo: repoWith(), fake });
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.equal(r.json.verdict, 'conflicting');
+  assert.equal(r.json.message, 'merge conflict with main: merge the base, then run the resolution round');
+  assert.deepEqual(r.json.mergeState, { mergeable: 'CONFLICTING', state: 'DIRTY' });
+  assert.ok(fake.lines().includes('pr view 5 --json mergeable,mergeStateStatus'));
+});

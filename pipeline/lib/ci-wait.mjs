@@ -31,6 +31,12 @@
 // GitHub Actions run (`.../actions/runs/<id>`, job suffix ignored) whose run_started_at (else created_at) is strictly before
 // T_marker. The run is read lazily through the optional `readers.workflowRun(id)`, once per run per poll; an absent reader, an
 // unreadable run, an unreadable time or a url that is not an Actions run falls back to the created_at rule alone (never a pass).
+// A PR that CONFLICTS with its base gets no pull_request workflow run at all, so its required checks stay absent and the
+// wait would end `missing` / `stale-skipped` and send the session looking for a CI problem that is not there (#471). At that
+// terminal point (and only there: a pass or a failure never reads it) the optional reader `readers.mergeable()` (gh's
+// {mergeable, mergeStateStatus}) is asked: CONFLICTING / DIRTY => verdict `conflicting` (merge the base, then the resolution round).
+// UNKNOWN (GitHub still computing it) is re-read once after one interval inside the wait loop, then the old verdict stands; an
+// absent or throwing reader leaves the old verdict as well (never a guess, never a pass).
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -128,6 +134,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let runStartMemo = new Map(); // Actions run id -> ms the run started, or null (unreadable); per poll, like markerAtMemo
   let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
+  let mergeRetried = false; // the one extra read of a mergeability GitHub had not computed yet
 
   const getReadyAt = async (pr) => {
     if (readyAtMemo !== undefined) return readyAtMemo;
@@ -351,6 +358,22 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return predating;
   };
 
+  // 'conflicting' | 'unknown' | 'clear', with the raw state for the output. Never throws: an unreadable one is 'clear' (no verdict change).
+  const getMergeability = async () => {
+    if (!readers.mergeable) return { kind: 'clear' };
+    try {
+      const v = await readers.mergeable();
+      const mergeable = typeof v?.mergeable === 'string' ? v.mergeable.toUpperCase() : null;
+      const state = typeof v?.mergeStateStatus === 'string' ? v.mergeStateStatus.toUpperCase() : null;
+      const mergeState = { mergeable, state };
+      if (mergeable === 'CONFLICTING' || state === 'DIRTY') return { kind: 'conflicting', mergeState };
+      if (mergeable === null || mergeable === 'UNKNOWN') return { kind: 'unknown', mergeState };
+      return { kind: 'clear', mergeState };
+    } catch {
+      return { kind: 'clear' };
+    }
+  };
+
   const statusEvidenceOf = (failures) => failures.map((f) => statusBasis.get(f)).filter(Boolean).map((x) => ({ context: x.context, id: x.id ?? null, state: x.state, createdAt: x.created_at ?? null }));
 
   const describe = (states) => states.map((s) => `${s.name}=${s.state}`).join(', ');
@@ -478,6 +501,17 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         const stale = absent.filter((s) => s.state === 'stale-skip');
         const staleFails = absent.filter((s) => s.state === 'stale-fail' || s.state === 'superseded');
         const skipNote = stale.length ? `only a draft-era skip for: ${stale.map((s) => s.name).join(', ')}` : '';
+        if (missing.length > 0 || staleFails.length === 0) {
+          // An absence verdict (missing / stale-skipped): is the PR conflicting with its base, so that no workflow ran at all?
+          const m = await getMergeability();
+          if (m.kind === 'unknown' && !mergeRetried && elapsed() < timeoutMs) {
+            mergeRetried = true;
+            return null;
+          }
+          if (m.kind === 'conflicting') {
+            return result(EXIT.FAILED, 'conflicting', { message: `merge conflict with ${pr.base ?? 'the base branch'}: merge the base, then run the resolution round`, mergeState: m.mergeState });
+          }
+        }
         if (missing.length > 0) {
           const named = (state) => staleFails.filter((s) => s.state === state).map((s) => s.name).join(', ');
           const failNote = named('stale-fail') ? `a draft-era failure stands for: ${named('stale-fail')}` : '';

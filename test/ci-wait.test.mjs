@@ -23,7 +23,7 @@ const at = (v, t, n) => (typeof v === 'function' ? v(t, n) : v);
 function sim(world, options = {}) {
   let t = 0;
   const calls = [];
-  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [], markers: 0, runs: [] }; // the base each policy read asked for
+  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [], markers: 0, runs: [], mergeable: 0, labels: 0 }; // the base each policy read asked for
   const readers = {
     pr: async () => at(world.pr ?? PR, t / 1000),
     classic: async (base) => {
@@ -57,6 +57,18 @@ function sim(world, options = {}) {
       workflowRun: async (id) => {
         reads.runs.push(id);
         return at(world.workflowRun, t / 1000, id);
+      },
+    }),
+    ...(world.mergeable === undefined ? {} : {
+      mergeable: async () => {
+        reads.mergeable += 1;
+        return at(world.mergeable, t / 1000, reads.mergeable);
+      },
+    }),
+    ...(world.labels === undefined ? {} : {
+      labels: async () => {
+        reads.labels += 1;
+        return at(world.labels, t / 1000, reads.labels);
       },
     }),
     suiteRuns: async (id) => {
@@ -1290,4 +1302,61 @@ test('R1-F1: the run is read once per poll (memoised), not once per status evalu
   // 8 polls (0..105 s) read the run once each with the memo; without it each poll reads twice (16)
   assert.deepEqual([...new Set(s.reads.runs)], ['555']);
   assert.equal(s.reads.runs.length, 8, String(s.reads.runs.length));
+});
+
+// ---- a conflicting PR runs no pull_request workflow: say so instead of `missing` (#471) ----------------------------------------
+
+const MERGEABLE = (name) => fx(`pr-mergeable-${name}.json`); // gh pr view --json mergeable,mergeStateStatus, captured shapes
+
+test('#471: required checks that never appeared on a CONFLICTING PR end as `conflicting` with the remedy, not `missing`', async () => {
+  const s = sim({ classic: present('A', 'B'), checkRuns: [cr('A', 'success')], mergeable: MERGEABLE('conflicting') });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'conflicting');
+  assert.equal(s.elapsed(), 300_000, 'only after the appear window, like missing');
+  assert.equal(r.output.message, 'merge conflict with main: merge the base, then run the resolution round');
+  assert.deepEqual(r.output.mergeState, { mergeable: 'CONFLICTING', state: 'DIRTY' });
+  assert.equal(r.output.checks.find((c) => c.name === 'B').state, 'missing');
+});
+
+test('#471: a draft-era-skipped required check on a DIRTY PR is `conflicting` too (stale-skipped is the other absence verdict)', async () => {
+  const s = sim({ ...lateAggregate({ appearAt: 99999, shardDoneAt: 0 }), mergeable: { mergeable: null, mergeStateStatus: 'DIRTY' } });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'conflicting');
+  assert.equal(s.elapsed(), 300_000);
+  assert.match(r.output.message, /^merge conflict with main: merge the base/);
+});
+
+test('#471: mergeable still being computed is re-read once after one interval inside the wait loop: CONFLICTING then => conflicting', async () => {
+  const s = sim({ classic: present('A'), mergeable: (t, n) => (n === 1 ? MERGEABLE('unknown') : MERGEABLE('conflicting')) });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'conflicting');
+  assert.equal(s.reads.mergeable, 2);
+  assert.equal(s.elapsed(), 315_000, 'one extra interval, no more');
+});
+
+test('#471: mergeable that stays unknown is never waited on forever: the second read falls back to `missing`', async () => {
+  const s = sim({ classic: present('A'), mergeable: MERGEABLE('unknown') });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'missing');
+  assert.equal(s.reads.mergeable, 2);
+  assert.equal(s.elapsed(), 315_000);
+});
+
+test('#471: a mergeable PR, an unreadable mergeability, and a command without the reader all keep `missing` (never a guess)', async () => {
+  const clean = sim({ classic: present('A'), mergeable: MERGEABLE('clean') });
+  assert.equal((await clean.run()).output.verdict, 'missing');
+  assert.equal(clean.reads.mergeable, 1);
+  const broken = sim({ classic: present('A'), mergeable: () => { throw new Error('HTTP 502'); } });
+  assert.equal((await broken.run()).output.verdict, 'missing');
+  const none = sim({ classic: present('A') });
+  assert.equal((await none.run()).output.verdict, 'missing');
+});
+
+test('#471: mergeability is only read for an absence verdict: a pass, a failure and a stale failure that stands never read it', async () => {
+  const pass = sim({ classic: present('A'), checkRuns: [cr('A', 'success')], mergeable: MERGEABLE('conflicting') });
+  assert.equal((await pass.run()).output.verdict, 'passed');
+  const fail = sim({ classic: present('A'), checkRuns: [cr('A', 'failure')], mergeable: MERGEABLE('conflicting') });
+  assert.equal((await fail.run()).output.verdict, 'failed');
+  assert.equal(pass.reads.mergeable + fail.reads.mergeable, 0);
 });
