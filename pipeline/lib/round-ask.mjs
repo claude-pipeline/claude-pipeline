@@ -178,7 +178,10 @@ export function askSummary({ rounds, cost, open, notClean, follow, discard, long
   } else {
     lines.push('Recommended: one more round (type "extra round").');
   }
-  const why = follow.eligible
+  // A blocking loop says the same thing here as in the Recommended line above: the one-sentence why must not argue for the round the summary advises against.
+  const why = words === 'stop and park or split'
+    ? 'The last two counted rounds each accepted a new BLOCKING item, so another round is unlikely to settle it: stop and park, or split the PR with a dependency-aware plan.'
+    : follow.eligible
     ? 'Every open item is low severity and each fix can be taken out and filed as a follow-up, so nothing unreviewed would ship.'
     : sentence(`Another round is the safe path: ${follow.refusals[0] ?? 'the open items cannot be deferred'}`);
   return { summary: lines.join('\n'), why, recommended: words };
