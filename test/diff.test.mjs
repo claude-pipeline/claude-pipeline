@@ -303,8 +303,7 @@ test('testsAdded: counts test files that gained lines, added test-case calls, an
     'diff --git a/src/a.js b/src/a.js', '--- a/src/a.js', '+++ b/src/a.js', '@@ -1,1 +1,3 @@', '-old', '+new1', '+new2', "+it('looks like a case but is source', () => {});",
     'diff --git a/test/a.test.mjs b/test/a.test.mjs', '--- a/test/a.test.mjs', '+++ b/test/a.test.mjs', '@@ -5,0 +6,4 @@',
     "+test('one', () => {});", "+  it.each([1])('two', () => {});", '+  assert.ok(true);', "+// test('a comment')", '',
-  ].join('
-');
+  ].join('\n');
   const r = testsAdded(parseUnifiedDiff(diff), ['test/**']);
   assert.deepEqual([r.files, r.cases, r.sourceLines, r.testLines], [1, 2, 4, 4]);
   assert.equal(r.line, 'Tests added: 1 files, 2 cases; changed source lines : test lines = 4 : 4');

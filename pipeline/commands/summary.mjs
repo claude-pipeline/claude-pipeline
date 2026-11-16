@@ -109,7 +109,7 @@ export const run = guarded(async (argv, ctx) => {
   return guardGh(() => {
     const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
     const { title } = view;
-    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state) });
+    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine });
     // The weekly Codex spend rides at the end of the line (agent-log close's pending-line match tolerates it).
     const usage = codexUsage({ env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
     const usageText = codexUsageSuffix(usage);

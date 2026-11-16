@@ -152,7 +152,8 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --plan [--repo DIR]
     at least review.codex_budget.soft, every other round that is not protected use review.effort.small_fix. Protected rounds always keep the normal effort: round 1, the first round after a maxRisk rise (or one that sees the rise),
     a round with confirmFixed items, a resolution-only round, a whole-PR round that is owed. The round records effort; a round the governor lowered also records governor:{usedPct, threshold, observedAt} (state version 4)
   --plan prints what the round would do and runs nothing, writes no route.json and no round: {ok, plan:{route: codex|substitute, evidence: none|budget|governor, effort, why, round, base, wholePrOwed, protected, small, lowered?, budget:{used, budget},
-    governor:{usedPct, soft, hard, observedAt}|null, facts:{changedLines, newFile, sensitive}}, expectedEffort}; the skill passes expectedEffort as --effort (--effort is optional with --plan)
+    governor:{usedPct, soft, hard, observedAt}|null, facts:{changedLines, newFile, sensitive}, reviewKind, resolutionOnly?, resolutionIneligible?}, expectedEffort}; the skill passes expectedEffort as --effort (--effort is optional with --plan)
+    reviewKind (display only) = what the round would review: merge-base (round 1 / a whole PR owed) | previous | synthetic (the default branch merged in cleanly) | resolution (resolutionOnly: true) | whole-pr; resolutionIneligible = the short code (and detail) of why the free resolution-only round was refused, when it was tried
   a small fix-check (not protected, see above) goes to the substitute instead of Codex when the PR has used review.codex_round_budget Codex runs (recorded Codex rounds and recorded Codex second reviews in the state; a killed or retried run
     does not count) or the weekly Codex quota used is at least review.codex_budget.hard (P codex-status; an unreadable figure turns the governor off). Codex is not run: exit 3 {ok:false, unavailable:true, reason:withheld, message,
     substitute:{eligible:true, why: budget-spent|governor-hard, evidence: budget|governor, agent, resetAt:null}, plan}; route.json holds {evidence: budget, budget:{used, budget}} or {evidence: governor, governor:{usedPct, threshold, observedAt}}
@@ -191,7 +192,7 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --plan [--repo DIR]
     is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}
   when that merge conflicted and the resolution only chose lines the two sides already had, Codex reviews just the resolution:
     {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise
-    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not
+    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not; every round output also carries reviewKind
     taken alone
   exit 3 {ok:false, unavailable:true, reason: quota|model|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries
     substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex's own turn.failed event, confirmed by its session log when found) or a proven refused model (below) with
@@ -759,7 +760,7 @@ run Codex's review round (codex) or the publish half of a round (publish) as one
 
 ```
 pipeline round codex --pr N --round R [--base B] [--head H] [--max-minutes M] [--repo DIR]   (M default 60, max 120)   RUN IT IN THE BACKGROUND (Bash run_in_background): it waits for Codex
-  -> exit 0 {ok, codex:{counts, codexPath, baseOnly?, resolutionOnly?, fromState?}, reviewer, arbiter?}   arbiter: the JSON of `arbiter needed --pr N --round R` verbatim, run once when reviewer is fable and the round has no arbiter record
+  -> exit 0 {ok, codex:{counts, codexPath, baseOnly?, resolutionOnly?, reviewKind?, resolutionIneligible?, fromState?}, reviewer, arbiter?}   reviewKind = what the round reviewed (merge-base | previous | synthetic | resolution | whole-pr; synthetic with no change of its own is baseOnly), resolutionIneligible = why the free resolution-only round was refused (the short code, e.g. history-nonmerge), display only   arbiter: the JSON of `arbiter needed --pr N --round R` verbatim, run once when reviewer is fable and the round has no arbiter record
      (with an arbiter record: arbiterState:{recorded, proofOk}; `arbiter needed` is not a read, so it is not called again)
   -> a failed `arbiter needed` (non-zero exit or no JSON): {ok:false, step:"arbiter-needed", error, result:<its JSON>, codex, reviewer} with the step's exit code (error copied from the child; same shape as round publish), e.g. stale-terminal with restartRequired
   -> exit 0 {ok, state:"running", next:"rerun round codex"}: still running after M minutes; the same command adopts the same job
@@ -918,7 +919,7 @@ pipeline stats rounds [--repo-slug owner/name]... [--since YYYY-MM-DD] [--pr N].
   -> {ok, since, repos, totals, prs, warnings}: for the PRs merged since the date (default 7 days ago) in each --repo-slug (default: the repository gh resolves from the current directory), the PR's comments are
      read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had
      to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | deferred = its accepts were all deferred past the cap | nothing-accepted), blockingLoopPrs, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,
-     countedRounds, pastCapRounds, usd, blockingLoop, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), acceptedBlocking, admission?, previous?, found?}]}]. --pr N limits it to those PRs (merged or not listed by date).
+     countedRounds, pastCapRounds, usd, blockingLoop, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), reviewKind, resolutionIneligible, acceptedBlocking, admission?, previous?, found?}]}]. --pr N limits it to those PRs (merged or not listed by date).
      Without --json the same numbers print as a plain-text table. Only the viewer's own comments count (the pipeline's comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR or repository, unreadable) is named in `warnings`. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.
      Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.
 ```
@@ -930,7 +931,7 @@ Exit: 0 · 2 usage (a bad `--since`, `--pr` or `--repo-slug`) · 3 GitHub unavai
 upsert the PR summary comment and print the agent-log line.
 
 ```
-pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, codexUsage}   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; both lines end with " · Codex 7d: N runs (H high[, X xhigh])" when the pipeline ran Codex in the last 7 days, any repo: codexUsage {runs, high, xhigh, failed}, from <home>/.claude/pipeline-state/codex-usage.jsonl)
+pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, codexUsage, testsAdded?}   (testsAdded: "Tests added: N files, M cases; changed source lines : test lines = a : b" from the PR diff and integrity.test_globs; a soft signal, left out when it cannot be computed)   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; both lines end with " · Codex 7d: N runs (H high[, X xhigh])" when the pipeline ran Codex in the last 7 days, any repo: codexUsage {runs, high, xhigh, failed}, from <home>/.claude/pipeline-state/codex-usage.jsonl)
 ```
 
 Exit: 0 · 2 usage / no state · 3 GitHub (`gh`) unavailable.
