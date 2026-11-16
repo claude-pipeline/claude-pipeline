@@ -1740,6 +1740,15 @@ test('applyPostMaxDefault: a PENDING or human-owed BLOCKING / security item in t
   assert.equal(pm([low, dismissed, pendingLow])[0].final.decision, 'FOLLOW-UP');
 });
 
+// R3-F2: the hold reaches an item in ANOTHER round of the state (not only the rated round).
+test('applyPostMaxDefault: a human-owed BLOCKING item from an earlier round in the same file keeps the round\'s low suggestion an ACCEPT until it is settled', () => {
+  const low = lowAccept({ file: 'src/a.js' });
+  const owed = (final) => item({ round: 4, bucket: 'BLOCKING', category: 'logic', final, file: 'src/a.js' });
+  const crossRound = (earlier) => ({ severity: { state: { rounds: [round(4, [earlier]), round(5, [low])], maxRounds: 3 } } });
+  assert.equal(pm([low], crossRound(owed({ ...settled('REJECT', 'judge'), needsHuman: true })))[0].final.decision, 'ACCEPT', 'round-4 item waits for a human');
+  assert.equal(pm([low], crossRound(owed(settled('REJECT', 'arbiter'))))[0].final.decision, 'FOLLOW-UP', 'round-4 item settled REJECT (needsHuman false)');
+});
+
 // R3-F1: a judge-final dismissal that `triage settle` can still overturn (disputed, testable, no test result yet) may still end up accepted, so it holds the file too.
 test('applyPostMaxDefault: a judge-final REJECT that a settle test can still overturn holds the file; once the test result is in, the final decides', () => {
   const low = lowAccept({ file: 'src/a.js' });
