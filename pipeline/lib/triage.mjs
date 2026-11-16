@@ -1187,6 +1187,10 @@ const entryPaths = (f) => [...new Set([f?.oldPath, f?.newPath, f?.path].filter((
 // judge dismissal a settle test can still overturn (final by the judge, not ACCEPT, disputedBug and settleTest.possible, no test result yet: `triage settle` may make it an ACCEPT by test).
 const settleTestable = (i) => i.final.by === 'judge' && i.final.decision !== 'ACCEPT' && i.judge?.disputedBug === true && i.judge.settleTest?.possible === true && (i.test?.status ?? 'none') === 'none';
 const unsettledHold = (i) => isObject(i) && (!isObject(i.final) || i.final.needsHuman === true || settleTestable(i));
+// Why an unsettledHold item holds its file, for the refusal text.
+const holdWhy = (i) => (!isObject(i.final)
+  ? 'it still awaits a ruling'
+  : i.final.needsHuman === true ? 'it waits for a human' : 'the judge dismissed it, but a settle test is still possible: run `triage settle` to decide it');
 // -> { level: 'low' | 'high', reasons: [why it is high] }. `files` = the PR's reviewed diff (git.mjs#diffFiles entries); null/undefined = unknown, so high.
 export function itemSeverity(item, { state, config, files, baseConfig } = {}) {
   const high = (reason) => ({ level: 'high', reasons: [reason] });
@@ -1203,9 +1207,10 @@ export function itemSeverity(item, { state, config, files, baseConfig } = {}) {
   if (hits.length > 1) return high(`${asciiLine(item.file, 60)} is ambiguous in the reviewed diff`);
   // The same file under either side of a rename: the entry resolved above names both paths, and a finding at the other one is in this file too.
   const sameFile = entryPaths(hits[0]);
-  if (allItems(state).some((i) => (i.final?.decision === 'ACCEPT' || unsettledHold(i)) && sameFile.includes(i.file) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)))) {
-    return high(`${asciiLine(item.file, 60)} also holds an accepted BLOCKING or security finding`);
-  }
+  const sameFileSerious = allItems(state).filter((i) => sameFile.includes(i.file) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)));
+  if (sameFileSerious.some((i) => i.final?.decision === 'ACCEPT' && i.final.needsHuman !== true)) return high(`${asciiLine(item.file, 60)} also holds an accepted BLOCKING or security finding`);
+  const unsettled = sameFileSerious.find(unsettledHold);
+  if (unsettled !== undefined) return high(`${asciiLine(item.file, 60)} also holds ${asciiLine(unsettled.id, 40)}, a BLOCKING or security item not settled yet (${holdWhy(unsettled)}), which may still be accepted`);
   // The union of the working-tree and the default branch's committed sensitive lists (callers pass baseConfig; a PR must not shrink its own list).
   if (isSensitivePath(hits[0], config) || (baseConfig && isSensitivePath(hits[0], baseConfig))) return high(`${asciiLine(item.file, 60)} is on a sensitive path`);
   return { level: 'low', reasons: [] };

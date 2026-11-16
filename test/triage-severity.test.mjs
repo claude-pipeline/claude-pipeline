@@ -252,7 +252,15 @@ test('deferEligibility #496: a same-file security item the judge dismissed with 
   const fix = item({ id: 'R2-S1', file: 'src/a.js' });
   const held = levels(stateOf([fix, dismissed()]));
   assert.equal(held.eligible, false, 'the dismissed auth item can still be settled into an ACCEPT');
-  assert.match(held.refusals.join(';'), /R2-S1 is not low severity \(src\/a\.js also holds an accepted BLOCKING or security finding\)/);
+  // R1-F2: nothing in the file is accepted, so the reason names the item and why it holds, with the remedy; the old "accepted" wording is for a real accepted finding only.
+  assert.match(held.refusals.join(';'), /R2-S1 is not low severity \(src\/a\.js also holds R2-W1, a BLOCKING or security item not settled yet \(the judge dismissed it, but a settle test is still possible: run `triage settle` to decide it\), which may still be accepted\)/);
+  assert.doesNotMatch(held.refusals.join(';'), /accepted BLOCKING or security finding/);
+  const awaiting = levels(stateOf([fix, dismissed({ final: undefined })]));
+  assert.match(awaiting.refusals.join(';'), /also holds R2-W1, a BLOCKING or security item not settled yet \(it still awaits a ruling\)/);
+  const human = levels(stateOf([fix, dismissed({ final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, reason: 'x' } })]));
+  assert.match(human.refusals.join(';'), /also holds R2-W1, a BLOCKING or security item not settled yet \(it waits for a human\)/);
+  const real = levels(stateOf([fix, dismissed({ final: { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'yes' } })]));
+  assert.match(real.refusals.join(';'), /src\/a\.js also holds an accepted BLOCKING or security finding/);
   for (const [label, over] of [['no settle test possible', { judge: { decision: 'REJECT', confidence: 'high', disputedBug: true, settleTest: { possible: false, plan: '' } } }], ['not a disputed bug', { judge: { decision: 'REJECT', confidence: 'high', disputedBug: false, settleTest: { possible: true, plan: 'x' } } }], ['already settled as not a bug', { test: { status: 'refuted', evidence: 'x' } }], ['another file', { file: 'src/big.js' }]]) {
     const r = levels(stateOf([fix, dismissed(over)]));
     assert.equal(r.eligible, true, `${label}: ${r.refusals.join('; ')}`);
