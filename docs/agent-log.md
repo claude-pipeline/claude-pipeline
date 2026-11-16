@@ -208,3 +208,4 @@ full record.
 - 2026-11-16 · #474 · Fewer controller turns per review round: round codex (background) + round publish, job full stdout, review skill split · risk high · rounds 21 · arbiter 14 · substitute 2 · awaiting-owner-merge · Codex 7d: 12826 runs (12435 high)
 - 2026-11-16 · #527 · Click-to-approve on 2.1.323: pending clicks verified when used, round tickets (#472) · risk high · rounds 6 · arbiter 6 · blocked · Codex 7d: 13564 runs (13166 high)
 - 2026-11-16 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 37 · arbiter 37 (fix-verify 2) · substitute 2 · blocked · Codex 7d: 14175 runs (13771 high)
+- 2026-11-16 · #527 · Click-to-approve on 2.1.323: pending clicks verified when used, round tickets (#472) · risk high · rounds 7 · arbiter 7 · blocked · Codex 7d: 14228 runs (13823 high)
