@@ -104,6 +104,24 @@ describe('#482: a failure group that ends the text is restored when the text end
     const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { git checkout main; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
+  // #491 R2: the restore is an allow-list (a directory change opened the group and every command in it is inert), not a deny-list of literal `git <state word>`
+  const CLEAN = resolve('/work/repo/cleanup.sh');
+  test('R2-F1: a script the group runs that switches the branch (`bash /abs/cleanup.sh`) is not hidden by the restore (denied, as on main)', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  test('R2-F1: the same with `source /abs/cleanup.sh` (denied, as on main)', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { source /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  test('R2-F1: a nested `cd /work/repo && git checkout main` in a script the group runs (denied, as on main)', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'cd /work/repo && git checkout main\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  test('R2-B1: a `git -C /work/repo checkout agent/y` in the group does not leave the recorded agent/y to the caller (push not allowed)', () => {
+    const v = gitRun('bash build.sh; git push', { [BUILD]: 'git checkout main || { echo no; git -C /work/repo checkout agent/y; exit 1; }\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
   test('the #482 case with a command in the group that does not change git state is still restored (allowed)', () => {
     const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
     assert.equal(v.decision, 'allow', v.reason);
