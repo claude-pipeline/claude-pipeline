@@ -1,7 +1,7 @@
 // Full stdout capture and `job wait --until-done` (plan C §2).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, statSync } from 'node:fs';
+import { mkdtempSync, readFileSync, existsSync, rmSync, writeFileSync, statSync, openSync, closeSync, constants as fsConstants } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -237,7 +237,15 @@ async function raceReadFull(t, extraArgs, runIdOfA = 'run-A') {
   child.stdout.on('data', (d) => { out += d; });
   const closed = new Promise((resolve) => child.on('close', resolve));
   const { open } = await import('node:fs/promises');
-  const writer = await open(join(dir, 'stdout'), 'w'); // resolves only once the child is reading the capture
+  // Resolves only once the child is reading the capture; a child that exits first never will, so the open is raced against its close.
+  const fifo = join(dir, 'stdout');
+  const opening = open(fifo, 'w');
+  const writer = await Promise.race([opening, closed.then(() => null)]);
+  if (writer === null) {
+    closeSync(openSync(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK)); // frees the blocked open (and its libuv thread)
+    await opening.then((h) => h.close(), () => {});
+    assert.fail(`the reader child exited before it opened the capture: ${out}`);
+  }
   writeFileSync(join(dir, 'meta.json'), meta('run-B'));
   rmSync(join(dir, 'exit.json'));
   await writer.write('B output');
@@ -246,13 +254,13 @@ async function raceReadFull(t, extraArgs, runIdOfA = 'run-A') {
   return JSON.parse(out);
 }
 
-test('--run-id A read: a run B that replaces the directory during the output read answers replaced, never A identity + B stdout', { skip: process.platform === 'win32' }, async (t) => {
+test('--run-id A read: a run B that replaces the directory during the output read answers replaced, never A identity + B stdout', { skip: process.platform === 'win32', timeout: 60_000 }, async (t) => {
   const r = await raceReadFull(t, ',expectRunId:"run-A"');
   assert.equal(r.state, 'replaced');
   assert.equal('output' in r, false);
 });
 
-test('no run id: a run B that replaces the directory during the output read is re-read as run B, never A identity + B stdout', { skip: process.platform === 'win32' }, async (t) => {
+test('no run id: a run B that replaces the directory during the output read is re-read as run B, never A identity + B stdout', { skip: process.platform === 'win32', timeout: 60_000 }, async (t) => {
   const r = await raceReadFull(t, '');
   assert.notEqual(r.runId, 'run-A');
   assert.equal('output' in r, false);
