@@ -189,3 +189,4 @@ full record.
 - 2026-11-14 · #476 · Codex model config: shape check, retired-model stand-in, say where effort/model come from (#443 #431 #445) · risk high · rounds 7 · arbiter 4 · awaiting-owner-merge · Codex 7d: 11113 runs (10841 high)
 - 2026-11-16 · #476 · Codex model config: shape check, retired-model stand-in, say where effort/model come from (#443 #431 #445) · risk high · rounds 7 · arbiter 4 · merged · Codex 7d: 11389 runs (11117 high)
 - 2026-11-16 · #495 · Substitute rounds listed, not a range; full remote refs at the last short sites; exemption wording (#454 #480, EW #2163) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 11819 runs (11526 high)
+- 2026-11-16 · #489 · Review brakes: fix-scope check, post-limit follow-ups, round trip-wire (#374 PR B) · risk high · rounds 6 · arbiter 5 · awaiting-owner-merge · Codex 7d: 11828 runs (11530 high)
