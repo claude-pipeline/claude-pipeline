@@ -190,7 +190,8 @@ function gitInfo(root, defaultBranch) {
   const o = { cwd: root };
   const safe = (fn) => { try { return fn(); } catch { return null; } };
   const head = safe(() => headSha(o));
-  const baseRef = `origin/${defaultBranch}`;
+  // fully qualified: an abbreviated `origin/<b>` resolves through refs/tags and refs/heads before refs/remotes (#454)
+  const baseRef = `refs/remotes/origin/${defaultBranch}`;
   const base = safe(() => revParse(baseRef, o));
   return {
     head,
