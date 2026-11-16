@@ -100,7 +100,11 @@ export function predictNextRound({ root, config, state, head }) {
   let merges = 0;
   let ownCommits = 0;
   const mergeCommits = []; // [sha, ...parents] of every merge on the first-parent chain
-  for (const line of git(['rev-list', '--first-parent', '--parents', headFull, `^${anchor}`], o).split('\n').filter(Boolean)) {
+  const chain = git(['rev-list', '--first-parent', '--parents', headFull, `^${anchor}`], o).split('\n').filter(Boolean);
+  // The last reviewed head is on HEAD's first-parent chain exactly when the oldest listed commit's first parent is the anchor (the walk resolutionReviewBase's history rule makes,
+  // history-not-first-parent). After a rewritten history the list holds the default branch's commits too, so nothing below may be read as "the PR's own commits".
+  const anchorOnChain = chain.length > 0 && chain.at(-1).split(' ')[1] === anchor;
+  for (const line of chain) {
     const parents = line.split(' ');
     if (parents.length > 2) {
       merges += 1;
@@ -120,12 +124,13 @@ export function predictNextRound({ root, config, state, head }) {
   if (resolutionIneligible !== undefined) nextRound.resolutionIneligible = asciiLine(resolutionIneligible, 160);
   // The free kinds are conditional: a judge-to-Fable escalation and a PR that does not target the default branch are not modelled above, and either makes the real round counted (whole-PR for the escalation, the range since the last reviewed head for another base branch).
   const unlessCounted = ' (unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates)';
-  if (previousClean && ownCommits > 0) {
+  if (previousClean && ownCommits > 0 && anchorOnChain) {
     const revert = `revert the ${plural(ownCommits, 'own commit')} since the last reviewed head (newest first)`;
-    // A free recording after the revert is promised only when it is proven: a clean trial merge (kind 'synthetic') AND every merge in the range is a clean, unedited,
-    // two-parent merge of the default branch: exactly two parents, the second on the default-branch ref (the check resolutionReviewBase's history rule makes), and the
-    // merge commit's tree equal to the clean trial merge of its parents (an edited merge keeps its own changes in the range after the revert). A conflicting merge keeps the PR
-    // whole-PR (the reverted commits stay in the history, so the resolution-only proof refuses too), and a merge of a topic branch leaves its changes in the range.
+    // With a merge in the range, nothing is promised after the revert: the filter below only decides WHICH wording shows, and the owner confirms by running round-request again
+    // (the revert's result is the only proof: identical edits on both sides, for one, are removed by the revert but kept by the synthetic base). The filter: a clean trial merge
+    // (kind 'synthetic') AND every merge in the range is a clean, unedited, two-parent merge of the default branch: exactly two parents, the second on the default-branch ref (the
+    // check resolutionReviewBase's history rule makes), and the merge commit's tree equal to the clean trial merge of its parents. A conflicting merge keeps the PR whole-PR (the
+    // reverted commits stay in the history, so the resolution-only proof refuses too), and a merge of a topic branch or an edited merge leaves its changes in the range.
     const cleanDefaultMerge = ([sha, p1, p2, ...more]) => {
       if (more.length > 0 || !isAncestor(p2, baseRef, o)) return false;
       try {
@@ -138,7 +143,7 @@ export function predictNextRound({ root, config, state, head }) {
     nextRound.alternative = merges === 0
       ? `${revert}; that restores the reviewed content and needs no round`
       : review.kind === 'synthetic' && mergeCommits.every(cleanDefaultMerge)
-        ? `${revert}; the default branch merges cleanly, so a free base-only recording would then follow${unlessCounted}`
+        ? `${revert}; a free base-only recording may then follow (the default branch merges cleanly; run round-request again after the revert to confirm)${unlessCounted}`
         : `${revert}; that does not make the next round free here: a merge since the last reviewed head is not a clean, unedited merge of the default branch, so a counted round would still follow`;
   }
   const words = {

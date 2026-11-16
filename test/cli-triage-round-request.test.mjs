@@ -360,7 +360,7 @@ test('round-request nextRound: after a conflicting merge the alternative does no
   assert.doesNotMatch(r.json.nextRound.alternative, /free base-only recording/);
 });
 
-test('round-request nextRound: after a clean merge of the default branch the alternative says a free base-only recording would follow', (t) => {
+test('round-request nextRound: after a clean merge of the default branch the alternative hints that a free base-only recording may follow, to confirm with round-request', (t) => {
   const w = roundWorld(t);
   const { h2 } = w.atCap();
   w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
@@ -374,7 +374,7 @@ test('round-request nextRound: after a clean merge of the default branch the alt
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 1, ownCommits: 1 }, 'synthetic']);
-  assert.match(r.json.nextRound.alternative, /the default branch merges cleanly, so a free base-only recording would then follow \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)$/);
+  assert.match(r.json.nextRound.alternative, /a free base-only recording may then follow \(the default branch merges cleanly; run round-request again after the revert to confirm\) \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)$/);
 });
 
 // Failure caught: a clean synthetic base was taken as proof of a free recording, but a merged TOPIC branch keeps its changes in the range after the revert, so the round is counted.
@@ -440,6 +440,42 @@ test('round-request nextRound: a merge of the default branch that carries its ow
   w.repo.git(['add', '-A']);
   w.repo.git(['commit', '-q', '--no-edit']);
   notFree(ask(w));
+});
+
+// Failure caught: identical edits on both sides make a clean, unedited merge, yet the revert removes the own side's copy while the synthetic base keeps it: the range is not empty.
+// Nothing is promised after a merge: the hint says "may" and tells the owner to run round-request again.
+test('round-request nextRound: with the same file added on both sides the alternative is only a hint to confirm after the revert', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  w.repo.write('src/d.js', 'export const d = 1;\n');
+  w.repo.commit('own commit adds c and d');
+  w.repo.checkout('main');
+  w.repo.write('src/c.js', 'export const c = 1;\n'); // the identical file, added independently on the default branch
+  w.repo.commit('main adds the same c');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.nextRound.kind, 'synthetic');
+  assert.match(r.json.nextRound.alternative, /a free base-only recording may then follow .*run round-request again after the revert to confirm/);
+  assert.doesNotMatch(r.json.nextRound.alternative, /would then follow/);
+});
+
+// Failure caught: after a rewritten history the list since the reviewed head holds the default branch's commits, and the revert advice told the owner to revert THEIR work.
+test('round-request nextRound: a reviewed head that is not on the first-parent chain of HEAD gives no revert alternative', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  w.repo.git(['reset', '--hard', 'HEAD~1']); // the reviewed head is dropped, then something else is committed
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  w.repo.commit('rewritten own commit');
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.nextRound.previousClean, true);
+  assert.equal(r.json.nextRound.alternative, undefined);
+  assert.doesNotMatch(r.json.summary, /No-round alternative/);
 });
 
 // Failure caught: a prediction that throws must never cost the owner the closing line.
