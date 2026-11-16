@@ -116,6 +116,34 @@ export function queueCatchUpState({ gh, branch, head }) {
   return reply('unknown', `GitHub's comparison of ${sha.slice(0, 12)} with the branch answered ${JSON.stringify(rel?.status ?? null)}`, { queueAwareSha: sha, unreadable: true });
 }
 
+// The `beforeUpdate` of the queue catch-up (bringUpToDate calls it with { head, cycles } before EVERY update PUT, and, with checkBeforeCap, also when a later
+// cycle finds the branch still behind): the checks that let the first update through are repeated for every later one, because the state can change while an update's
+// checks are waited for (another checkout can queue the head: queueing does not move the head, so expected_head_sha still matches, and an update then drops the entry).
+//   - the branch now contains the marker commit: one accepted update cures "predates" (the new head is the base tip merged in), so the catch-up is DONE:
+//     { error: 'up-to-date' } (success, no further update, even if the base moved again: in queue mode a moved base needs no catch-up)
+//   - the PR has a live queue entry, or the queue state / the marker cannot be read: a refusal, no PUT ('queue-entry-live' | 'queue-unreadable')
+//   - the queue was switched off meanwhile: null (no marker to honour, it is a plain behind PR again); a marker that no longer yields a verdict: 'queue-mode', ok, no PUT
+// -> async ({ head }) => null | { error, ...extra }. Never throws.
+export function queueCatchUpBeforeUpdate({ gh, pr, branch }) {
+  return async ({ head } = {}) => {
+    let q;
+    try {
+      q = queueModeFor({ gh, pr });
+    } catch (err) {
+      if (!(err instanceof QueueUnreadable)) throw err;
+      return { error: 'queue-unreadable', message: `${err.message}: nothing more was updated` };
+    }
+    if (!q.queue) return null;
+    const queued = q.state.inQueue === true || Boolean(q.state.entry);
+    const old = queueCatchUpState({ gh, branch, head });
+    if (old.kind === 'current') return { error: 'up-to-date', behindBy: null, message: `${old.why}: in queue mode that is all the catch-up needs, so the branch is not updated again` };
+    if (queued) return { error: 'queue-entry-live', message: `PR #${pr} was queued while it was being caught up: another update would move the approved head and drop its queue entry, so nothing more was updated` };
+    if (old.needed && old.unreadable) return { error: 'queue-unreadable', message: old.headUnknown === true ? `${old.why}; nothing more was updated` : `the merge-queue marker could not be checked (${old.why}): try again in a minute; nothing more was updated` };
+    if (old.kind !== 'predates') return { error: 'queue-mode', ok: true, message: `the base branch has a merge queue and ${old.why}: no further catch-up; nothing more was updated` };
+    return null;
+  };
+}
+
 // The refusal text of P merge for a branch whose merge script may not know the queue (kind predates | unknown). Only 'predates' is remedied by a catch-up: an
 // 'unknown' verdict is decided by the BASE's marker (or a failed read), so updating the branch cannot clear it, and the text must not send the agent to do that.
 export function predatesQueueMessage({ pr, state }) {

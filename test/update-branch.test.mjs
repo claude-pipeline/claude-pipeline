@@ -7,6 +7,7 @@ import { join } from 'node:path';
 import { GhError } from '../pipeline/lib/proc.mjs';
 import { createGitHub } from '../pipeline/lib/github.mjs';
 import { bringUpToDate, updateTiming } from '../pipeline/lib/updatebranch.mjs';
+import { queueCatchUpBeforeUpdate } from '../pipeline/lib/merge-queue.mjs';
 import { readSuccessor } from '../pipeline/lib/merge-hold.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { cli, scenario, ghEntries, ymlFor, PR, BASE_SHA, QUEUE_AWARE_SHA } from './helpers/gate-env.mjs';
@@ -710,4 +711,77 @@ test('update-branch, queue ON, the PR is ALREADY QUEUED (a failed marker read wo
     assert.equal(r.json.outcome, 'queue-mode', JSON.stringify(gh));
     assert.deepEqual(puts(s), [], JSON.stringify(gh));
   }
+});
+
+// ---- the queue catch-up repeats its queue and marker checks before EVERY update (R17-B1, R17-F1) ------------------------------------------
+// A queue-aware fake over the stateful world: the queue state, the marker file and the marker-vs-head ancestry are scripted per read, so a second update cycle
+// can be put in front of a PR that was queued, or whose queue state cannot be read, in the meantime, or whose branch the first update already cured.
+function queueWorld({ behind = [1, 1, 0], queueStates = [], predating = () => true } = {}) {
+  const w = world({ behind });
+  const plain = w.gh.compare;
+  w.queueReads = 0;
+  w.gh.compare = (a, b) => {
+    if (a !== QUEUE_AWARE_SHA) return plain(a, b);
+    if (b === 'main') return { status: 'ahead' }; // the base holds its own marker commit
+    return { status: predating(b) ? 'diverged' : 'ahead' };
+  };
+  w.gh.fileAt = () => ({ found: true, text: `${QUEUE_AWARE_SHA}\n` });
+  w.gh.queueState = () => {
+    const q = queueStates[Math.min(w.queueReads, queueStates.length - 1)] ?? { enabled: true, inQueue: false, entry: null };
+    w.queueReads += 1;
+    if (q === 'error') throw new GhError({ code: 1, stderr: 'GraphQL: boom', args: ['api', 'graphql'] });
+    return q;
+  };
+  return w;
+}
+const IDLE = { enabled: true, inQueue: false, entry: null };
+const QUEUED = { enabled: true, inQueue: true, entry: ENTRY };
+const catchUp = (w, extra = {}) => {
+  const hook = queueCatchUpBeforeUpdate({ gh: w.gh, pr: PR, branch: 'main' });
+  return run(w, { expectHead: A, waitChecks: false, beforeUpdate: hook, checkBeforeCap: true, ...extra });
+};
+
+test('queue catch-up: the PR got queued after the first update (a second cycle is due): refused before the second PUT, outcome queue-entry-live, the first update is kept in the result', async () => {
+  const w = queueWorld({ queueStates: [IDLE, QUEUED] });
+  const r = await catchUp(w);
+  assert.equal(r.ok, false);
+  assert.equal(r.outcome, 'queue-entry-live');
+  assert.equal(r.updated, true);
+  assert.equal(r.cycles, 1);
+  assert.equal(w.updates.length, 1, 'an update would move the approved head and drop the queue entry');
+  assert.equal(r.head, B);
+});
+
+test('queue catch-up: the queue state cannot be read before an update: refused (queue-unreadable), no PUT, on the first and on a later cycle', async () => {
+  const first = queueWorld({ queueStates: ['error'] });
+  const r1 = await catchUp(first);
+  assert.equal(r1.outcome, 'queue-unreadable');
+  assert.equal(r1.ok, false);
+  assert.deepEqual(first.updates, []);
+  const later = queueWorld({ queueStates: [IDLE, 'error'] });
+  const r2 = await catchUp(later);
+  assert.equal(r2.outcome, 'queue-unreadable');
+  assert.equal(later.updates.length, 1);
+  assert.equal(r2.updated, true);
+});
+
+test('queue catch-up: after one accepted update the branch holds the marker commit; main moving again ends in success (up-to-date, ok), not another PUT and not cycle-cap, also with --max-cycles 1', async () => {
+  for (const maxCycles of [3, 1]) {
+    const w = queueWorld({ queueStates: [IDLE], predating: (head) => head === A });
+    const r = await catchUp(w, { maxCycles });
+    assert.equal(r.ok, true, `max ${maxCycles}: ${JSON.stringify(r)}`);
+    assert.equal(r.outcome, 'up-to-date');
+    assert.equal(r.updated, true);
+    assert.equal(r.cycles, 1);
+    assert.equal(r.head, B);
+    assert.deepEqual(w.updates, [{ pr: PR, expected: A }], `max ${maxCycles}: one update cures "predates"`);
+  }
+});
+
+test('queue catch-up: a branch that keeps predating (the marker moved on the base) and a PR that stays unqueued is caught up again, as for a behind PR', async () => {
+  const w = queueWorld({ queueStates: [IDLE], predating: () => true, behind: [1, 1, 0] });
+  const r = await catchUp(w);
+  assert.equal(r.outcome, 'up-to-date');
+  assert.equal(r.cycles, 2);
+  assert.equal(w.updates.length, 2);
 });
