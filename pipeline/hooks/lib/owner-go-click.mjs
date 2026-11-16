@@ -383,10 +383,11 @@ export function clickEvidence(transcriptPath, toolUseId, { home = accountHome() 
 const UNCHECKED = () => ({ ok: false, reason: 'dialog-hooks-unchecked' });
 const realSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
-// A PostToolUse hook input for AskUserQuestion -> the record the click makes. Returns { recorded: record, kind, replay? } | { declined: label, replay? } | { refused: reason } | null (not ours: not
-// AskUserQuestion, a subagent, no session, no ask id in the question's first line, an ask this machine never issued). Never throws. Async: the transcript entry lands 100-200 ms after the hook
-// starts (spike S6), so the evidence is polled for up to `pollMs` in 100 ms steps (`sleep` is injectable).
-export async function recordClick(input, { home = accountHome(), now = Date.now, sleep = realSleep, pollMs = 5000, hookCheck = UNCHECKED } = {}) {
+// A PostToolUse hook input for AskUserQuestion -> the record the click makes. Returns { recorded: record, kind, replay? } | { declined: label, replay? } | { pending: { askId, clickId, kind, repo, prs, quotes? } }
+// | { refused: reason } | null (not ours: not AskUserQuestion, a subagent, no session, no ask id in the question's first line, an ask this machine never issued). Never throws. Async: on 2.1.322 the
+// transcript entry lands 100-200 ms after the hook starts (spike S6), so the evidence is polled for up to `pollMs` (500 ms) in 100 ms steps (`sleep` is injectable). On 2.1.323 it lands only after the
+// hooks have returned (#472): an entry still missing after the poll leaves the click PENDING (captureClick), verified when a consumer reads.
+export async function recordClick(input, { home = accountHome(), now = Date.now, sleep = realSleep, pollMs = 500, hookCheck = UNCHECKED } = {}) {
   try {
     if (input?.tool_name !== 'AskUserQuestion' || (input.hook_event_name !== undefined && input.hook_event_name !== 'PostToolUse')) return null;
     if (input.agent_id !== undefined && input.agent_id !== null && input.agent_id !== '') return null;
@@ -409,46 +410,71 @@ export async function recordClick(input, { home = accountHome(), now = Date.now,
       await sleep(POLL_STEP_MS);
       ev = clickEvidence(transcriptPath, toolUseId, { home });
     }
+    const cwd = typeof input.cwd === 'string' ? input.cwd : null;
+    // #472: the entry is not there yet (2.1.323 writes the answer's tool_result only AFTER the PostToolUse hooks return): keep the click as a pending pointer, verified later.
+    if (!ev.ok && ev.reason === 'not-in-transcript') return await captureClick({ input, ask, askId, session, toolUseId, transcriptPath, cwd, home, now, hookCheck });
     if (!ev.ok) return { refused: ev.reason };
-    if (ev.session !== session) return { refused: 'session' };
-    if (ev.dialogSha256 !== ask.dialogSha256) return { refused: 'dialog-differs' };
-    if (!CLICK_BUILDS.includes(ev.version)) return { refused: 'build-not-allowlisted' };
-    const answeredAt = Date.parse(ev.answeredAt);
-    const issuedAt = Date.parse(ask.issuedAt);
-    if (answeredAt < issuedAt || answeredAt > issuedAt + MAX_AGE_MS) return { refused: answeredAt < issuedAt ? 'answered-before-issue' : 'expired' };
-    if (answeredAt > now() + FUTURE_SKEW_MS) return { refused: 'answer-in-the-future' };
-    const clickId = clickIdOf(session, toolUseId, askId);
+    const bad = evidenceRefusal({ ask, ev, session, now });
+    if (bad !== null) return { refused: bad };
 
+    // the dialog-hook check only runs when it can matter: a replay (the marker exists) and a superseded ask never need it, as before
     const spent = readSpent(askId, home);
     if (spent.state === 'bad') return { refused: 'spent' };
-    if (spent.state === 'ok') return finishReplay({ spent: spent.marker, ask, clickId, ev, session, home, input, transcriptPath });
-    if (marked(askId, 'superseded', home)) return { refused: 'superseded' };
-    const hc = await hookCheck({ home, input });
-    if (!hc?.ok) return { refused: hc?.reason ?? 'dialog-hooks' };
-    if (ask.hookLayersSha256 !== null && hc.hookLayersSha256 !== ask.hookLayersSha256) return { refused: 'dialog-hooks-changed' };
-
-    const mapped = answerText(ask, ev.answer);
-    if (mapped.error) return { refused: mapped.error };
-    const cwd = typeof input.cwd === 'string' ? input.cwd : null;
-    const marker = { v: 1, askId, clickId, toolUseId, answeredAt: ev.answeredAt, dialogSha256: ask.dialogSha256, producerVersion: ev.version, hookLayersSha256: hc.hookLayersSha256 ?? null, session, declined: mapped.declined !== undefined };
-    if (mapped.declined !== undefined) {
-      const made = writeExclusive(askFile(askId, 'spent', home), marker, home);
-      return made === 'ok' ? { declined: mapped.declined } : { refused: made === 'exists' ? 'spent' : 'write-failed' };
-    }
-    const bound = bindAnswer(ask, mapped.text, ev.question);
-    if (bound.error) return { refused: bound.error }; // (nothing consumed: the owner can answer the same dialog again, or type)
-    const made = writeExclusive(askFile(askId, 'spent', home), marker, home);
-    if (made !== 'ok') return { refused: made === 'exists' ? 'spent' : 'write-failed' };
-    const record = appendRecord(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: ev.answeredAt, ask: { askId, toolUseId, clickId } }));
-    return record === null ? { refused: 'record-write-failed' } : { recorded: record, kind: ask.kind };
+    const hc = spent.state === 'none' && !marked(askId, 'superseded', home) ? await hookCheck({ home, input }) : null;
+    const { retry: _retry, ...out } = admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home });
+    return out;
   } catch {
     return null;
   }
 }
 
+// Why (#472): the checks on a verified transcript entry that both recorders share, the immediate one above and the deferred one (settlePendingClicks): the session, the dialog, the build allowlist, the
+// ask's own window (answered after it was issued and within MAX_AGE_MS of it) and a future-dated answer. They need no marker and no hook result, so they run first, in this order. -> the refusal reason, or null.
+function evidenceRefusal({ ask, ev, session, now }) {
+  if (ev.session !== session) return 'session';
+  if (ev.dialogSha256 !== ask.dialogSha256) return 'dialog-differs';
+  if (!CLICK_BUILDS.includes(ev.version)) return 'build-not-allowlisted';
+  const answeredAt = Date.parse(ev.answeredAt);
+  const issuedAt = Date.parse(ask.issuedAt);
+  if (answeredAt < issuedAt || answeredAt > issuedAt + MAX_AGE_MS) return answeredAt < issuedAt ? 'answered-before-issue' : 'expired';
+  if (answeredAt > now() + FUTURE_SKEW_MS) return 'answer-in-the-future';
+  return null;
+}
+
+// Why (#472): the tail of the recorder, the part that consumes the ask and writes the record, so the immediate path and settlePendingClicks admit a click through ONE core. `ev` is a transcript entry
+// that passed clickEvidence and evidenceRefusal; `hc` is the dialog-hook check's result (taken now by the immediate path, at capture time for a pending one: the fingerprint must equal the ask's
+// either way; it is not needed, and may be null, for a replay or a superseded ask). -> { recorded, kind, replay? } | { declined, replay? } | { refused, retry? }; `retry: true` marks a refusal that
+// is a state to try again later (an unreadable spent marker, a failed write), not a verdict: the deferred recorder leaves such a click pending. `io` (tests only) replaces the two writes.
+function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home, io = {} }) {
+  const askId = ask.askId;
+  const clickId = clickIdOf(session, toolUseId, askId);
+  const write = io.writeExclusive ?? writeExclusive;
+  const append = io.appendRecord ?? appendRecord;
+  const spent = readSpent(askId, home);
+  if (spent.state === 'bad') return { refused: 'spent', retry: true };
+  if (spent.state === 'ok') return finishReplay({ spent: spent.marker, ask, clickId, ev, session, cwd, home, transcriptPath, io });
+  if (marked(askId, 'superseded', home)) return { refused: 'superseded' };
+  if (!hc?.ok) return { refused: hc?.reason ?? 'dialog-hooks' };
+  if (ask.hookLayersSha256 !== null && hc.hookLayersSha256 !== ask.hookLayersSha256) return { refused: 'dialog-hooks-changed' };
+
+  const mapped = answerText(ask, ev.answer);
+  if (mapped.error) return { refused: mapped.error };
+  const marker = { v: 1, askId, clickId, toolUseId, answeredAt: ev.answeredAt, dialogSha256: ask.dialogSha256, producerVersion: ev.version, hookLayersSha256: hc.hookLayersSha256 ?? null, session, declined: mapped.declined !== undefined };
+  if (mapped.declined !== undefined) {
+    const made = write(askFile(askId, 'spent', home), marker, home);
+    return made === 'ok' ? { declined: mapped.declined } : { refused: made === 'exists' ? 'spent' : 'write-failed', ...(made === 'exists' ? {} : { retry: true }) };
+  }
+  const bound = bindAnswer(ask, mapped.text, ev.question);
+  if (bound.error) return { refused: bound.error }; // (nothing consumed: the owner can answer the same dialog again, or type)
+  const made = write(askFile(askId, 'spent', home), marker, home);
+  if (made !== 'ok') return { refused: made === 'exists' ? 'spent' : 'write-failed', ...(made === 'exists' ? {} : { retry: true }) };
+  const record = append(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: ev.answeredAt, ask: { askId, toolUseId, clickId } }));
+  return record === null ? { refused: 'record-write-failed', retry: true } : { recorded: record, kind: ask.kind };
+}
+
 // The same click again (a hook retried, a crash between the marker and the record): never consumes twice. Same click id and a verifiable marker -> the record exists (returned) or is written now
 // from the marker's own answeredAt; anything else -> refused.
-function finishReplay({ spent, ask, clickId, ev, session, home, input, transcriptPath }) {
+function finishReplay({ spent, ask, clickId, ev, session, cwd, home, transcriptPath, io = {} }) {
   if (spent.clickId !== clickId || spent.answeredAt !== ev.answeredAt || spent.dialogSha256 !== ask.dialogSha256) return { refused: 'spent' };
   if (spent.declined === true) return { declined: ev.answer, replay: true };
   const existing = readRecords({ home, session, maxAgeMs: Infinity }).find((r) => r.via === 'ask' && r.ask?.clickId === clickId);
@@ -457,8 +483,61 @@ function finishReplay({ spent, ask, clickId, ev, session, home, input, transcrip
   if (mapped.error) return { refused: mapped.error };
   const bound = bindAnswer(ask, mapped.text, ev.question);
   if (bound.error) return { refused: bound.error };
-  const record = appendRecord(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd: typeof input.cwd === 'string' ? input.cwd : null, transcriptPath, answeredAt: spent.answeredAt, ask: { askId: ask.askId, toolUseId: spent.toolUseId, clickId } }));
-  return record === null ? { refused: 'record-write-failed' } : { recorded: record, kind: ask.kind, replay: true };
+  const record = (io.appendRecord ?? appendRecord)(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: spent.answeredAt, ask: { askId: ask.askId, toolUseId: spent.toolUseId, clickId } }));
+  return record === null ? { refused: 'record-write-failed', retry: true } : { recorded: record, kind: ask.kind, replay: true };
+}
+
+// ---- pending clicks (#472) ------------------------------------------------------------------------------------------------------------------
+
+export const PENDING_RE = /^(ask-[0-9a-f]{12})\.([0-9a-f]{16})\.pending$/;
+export const PENDING_MAX_PER_ASK = 8; // UNSETTLED pendings one ask may hold (a settled one never counts: settled junk must not block a genuine click)
+const CLICK_ID_RE = /^[0-9a-f]{16}$/;
+const clickFile = (askId, clickId, ext, home) => (ASK_ID_RE.test(String(askId)) && CLICK_ID_RE.test(String(clickId)) ? path.join(asksDir(home), `${askId}.${clickId}.${ext}`) : null);
+
+// Why (#472, the 2.1.323 write order): the click's tool_result entry is not in the transcript when the PostToolUse hook runs, so the transcript cannot be checked yet. Everything that needs no transcript
+// is checked NOW, while the click is fresh, and then only a POINTER is kept: `asks/<askId>.<clickId>.pending`. The pointer admits nothing: settlePendingClicks re-derives everything from the transcript
+// and the ask file when a consumer reads, through the same clickEvidence and admitClick core. The one thing the pointer carries that the transcript cannot is the dialog-hook check's result
+// (`hookLayersSha256`, taken at the click: hooks that could answer the dialog are checked when the dialog is answered, not when someone reads), plus `capturedAt` for the time rules; both are believed
+// only because the PostToolUse hook is their sole writer (guard-files refuses a tool write to owner-go/**, and a hand-run of the click libraries is refused). What is refused here, no pointer: a tool_input that is
+// not one canonical question of this ask (keys beyond questions / metadata, another dialog: only ever an EARLIER refusal, the tool_response is never read), an expired, superseded or already spent ask, and hooks that
+// are unchecked, offending or changed since the ask.
+async function captureClick({ input, ask, askId, session, toolUseId, transcriptPath, cwd, home, now, hookCheck }) {
+  const shown = input.tool_input;
+  if (!isObj(shown) || !Object.keys(shown).every((k) => k === 'questions' || k === 'metadata') || !Array.isArray(shown.questions) || shown.questions.length !== 1) return { refused: 'tool-use-shape' };
+  const dialog = canonicalDialog(shown.questions[0]);
+  if (dialog === null) return { refused: 'dialog-not-canonical' };
+  if (sha256(JSON.stringify(dialog)) !== ask.dialogSha256) return { refused: 'dialog-differs' };
+  if (now() > Date.parse(ask.issuedAt) + MAX_AGE_MS) return { refused: 'expired' };
+  if (readSpent(askId, home).state !== 'none') return { refused: 'spent' };
+  if (marked(askId, 'superseded', home)) return { refused: 'superseded' };
+  const hc = await hookCheck({ home, input });
+  if (!hc?.ok) return { refused: hc?.reason ?? 'dialog-hooks' };
+  if (ask.hookLayersSha256 !== null && hc.hookLayersSha256 !== ask.hookLayersSha256) return { refused: 'dialog-hooks-changed' };
+  return capturePending({ ask, askId, session, toolUseId, transcriptPath, cwd, hc, home, now });
+}
+
+// Why (#472): writes the pending pointer (exclusive create, 0600, fsync) and answers `{ pending: { askId, clickId, kind, repo, prs, quotes? } }` for the line the agent is told. `capturedAt` is taken
+// AFTER the hook check, just before the write (the time rules measure the answer against it). A retried hook finds its own pointer and answers with it without rewriting it; the per-ask cap counts
+// UNSETTLED pointers only (Fable F9) and never refuses the pointer a retry already has. `quotes` (a ruling ask only) is the answer text of each deciding label, the `--owner-quote` the consumer needs.
+function capturePending({ ask, askId, session, toolUseId, transcriptPath, cwd, hc, home, now }) {
+  const clickId = clickIdOf(session, toolUseId, askId);
+  const file = clickFile(askId, clickId, 'pending', home);
+  const result = { pending: { askId, clickId, kind: ask.kind, repo: ask.repo, prs: [...ask.prs], ...(ask.kind === 'ruling' ? { quotes: Object.fromEntries(Object.entries(ask.actions).filter(([, v]) => typeof v === 'string')) } : {}) } };
+  const mine = readSmallJson(file);
+  if (mine.state === 'ok') return mine.value?.clickId === clickId && mine.value.askId === askId ? result : { refused: 'write-failed' };
+  if (mine.state === 'bad') return { refused: 'write-failed' }; // (a half-written pointer is no pointer: the owner types)
+  let unsettled = 0;
+  try {
+    const names = readdirSync(asksDir(home));
+    for (const n of names) {
+      const m = PENDING_RE.exec(n);
+      if (m && m[1] === askId && !names.includes(`${askId}.${m[2]}.settled`)) unsettled++;
+    }
+  } catch { return { refused: 'write-failed' }; }
+  if (unsettled >= PENDING_MAX_PER_ASK) return { refused: 'too-many-pending' };
+  const marker = { v: 1, askId, clickId, session, toolUseId, transcriptPath, cwd, hookLayersSha256: hc.hookLayersSha256 ?? null, capturedAt: new Date(now()).toISOString() };
+  const made = writeExclusive(file, marker, home);
+  return made === 'ok' || made === 'exists' ? result : { refused: 'write-failed' };
 }
 
 // ---- the proof every consumer asks (B4) ---------------------------------------------------------------------------------------------------
