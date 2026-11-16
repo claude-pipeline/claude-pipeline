@@ -192,3 +192,64 @@ test('#352 R30-F3: a -P / -- after the cd operand makes the cd fail (two operand
   allows('cd -- operand', `cd /work/other && cd -- ${GIT_ROOT} && ${PB} origin HEAD`);
   allows('cd -P sub && cd .. in a loop', `for i in 1 2; do ${PB} origin HEAD; cd -P sub && cd ..; done`);
 });
+// (#352 R35-B1, R35-B2, R35-F1, R35-F2: ONE rule. A cd / state change is trusted to have run only when it surely did: in a loop's replay a cd REPLACES the places the body may end in only when it is
+// certain there (after ;, not in a branch, an inner loop, the background or a pipeline stage, not negated, every level between the loop and it entered by ;, no redirection that can fail on it, on the
+// closer of its { } group or on the eval that holds it); any other ADDS its target. A `continue` that reaches the loop ends an iteration where it stands. On the straight line, a change with a
+// redirection that can fail is not certain (the directory / branch after it is unknown). Redirections that cannot fail (`2>/dev/null`, `>&2`, `2>&1`, `&>/dev/null`) change nothing.)
+test('#352 R35-B1/B2/F1/F2: a cd or state change that may not have run is not trusted', () => {
+  const loopRows = [
+    ['failing redirection on the cd back (R35-B1)', `cd /work/other; cd ${GIT_ROOT} < /missing`],
+    ['failing output redirection on the cd back', `cd /work/other; cd ${GIT_ROOT} > /missing/f`],
+    ['failing redirection on the { } group closer', `cd /work/other; { cd ${GIT_ROOT}; } < /missing`],
+    ['failing redirection on the eval that holds the cd', `cd /work/other; eval 'cd ${GIT_ROOT}' < /missing`],
+    ['continue before the cd back (R35-B2)', `cd /work/other; continue; cd ${GIT_ROOT}`],
+    ['conditional continue before the cd back', `cd /work/other; [ -f stop ] && continue; cd ${GIT_ROOT}`],
+    ['continue 2 from an inner loop', `cd /work/other; for j in a; do continue 2; done; cd ${GIT_ROOT}`],
+    ['continue in an eval text', `cd /work/other; eval continue; cd ${GIT_ROOT}`],
+    ['cd back in a while loop that runs zero times (R35-F1)', `cd /work/other; while false; do cd ${GIT_ROOT}; done`],
+    ['cd back in a for loop over no words', `cd /work/other; for j in; do cd ${GIT_ROOT}; done`],
+    ['cd back in an eval behind &&', `cd /work/other; false && eval 'cd ${GIT_ROOT}'`],
+    ['cd back in an eval behind ||', `cd /work/other; true || eval 'cd ${GIT_ROOT}'`],
+    ['cd back in an eval in the background', `cd /work/other; eval 'cd ${GIT_ROOT}' &`],
+    ['cd back in an eval piped', `cd /work/other; eval 'cd ${GIT_ROOT}' | cat`],
+    ['cd back in an if branch', `cd /work/other; if [ -f x ]; then cd ${GIT_ROOT}; fi`],
+    ['relative cd in an inner loop moves again every time', `cd ${GIT_ROOT}/a/b; while [ ! -f stop ]; do cd ..; done`],
+  ];
+  for (const [what, body] of loopRows) {
+    const loop = `for i in 1 2; do ${PB} origin HEAD; ${body}${body.endsWith('&') ? '' : ';'} done`; // (`… & done`: `&;` is a syntax error)
+    denies(what, loop, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', loop), DIRS);
+  }
+  for (const [what, line] of [
+    ['straight line: failing redirection on the cd back (R35-F2)', `cd /work/other; cd ${GIT_ROOT} < /missing; ${PB} origin HEAD`],
+    ['straight line: failing redirection on the cd back, after &&', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
+    ['straight line: failing redirection on the { } group closer', `cd /work/other; { cd ${GIT_ROOT}; } < /missing; ${PB} origin HEAD`],
+    ['straight line: failing redirection on the switch', `cd /work/other; git switch agent/x < /missing; ${PB} origin HEAD`],
+    ['straight line: failing redirection on the checkout', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
+    // (zsh writes a here-document to a temporary file first: TMPPREFIX=/missing/x makes it fail, and the cd does not run (zsh 5.9))
+    ['straight line: a here-document on the cd back', `TMPPREFIX=/missing/x; cd /work/other; cd ${GIT_ROOT} <<E\nx\nE\n${PB} origin HEAD`],
+  ]) {
+    denies(what, line, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
+  }
+  for (const [what, line] of [
+    ['cd back with 2>/dev/null, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd ${GIT_ROOT} 2>/dev/null; done`],
+    ['cd back with >/dev/null 2>&1, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd ${GIT_ROOT} >/dev/null 2>&1; done`],
+    ['cd back in a { } group with 2>/dev/null on its closer', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; { cd ${GIT_ROOT}; } 2>/dev/null; done`],
+    ['cd back in an eval after ;', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; eval 'cd ${GIT_ROOT}'; done`],
+    ['continue of an inner loop only', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; for j in a; do continue; done; cd ${GIT_ROOT}; done`],
+    ['break before the cd back (no next iteration from there)', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; if [ -f stop ]; then break; fi; cd ${GIT_ROOT}; done`],
+    ['a zero-run inner loop, then the cd back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; while false; do cd /tmp; done; cd ${GIT_ROOT}; done`],
+    ['continue after the cd back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd ${GIT_ROOT}; continue; done`],
+    ['straight line: cd back with 2>/dev/null', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
+    ['straight line: cd back with &>/dev/null, after &&', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
+    ['straight line: cd back with >&2', `cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
+    ['straight line: switch with 2>/dev/null', `cd /work/other; git switch agent/x 2>/dev/null; ${PB} origin HEAD`],
+    ['straight line: a bare >x in the { } group is no closer', `cd /work/other; { cd ${GIT_ROOT}; >x; }; ${PB} origin HEAD`],
+    ['a bare >x in the { } group is no closer, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; { cd ${GIT_ROOT}; >x; }; done`],
+    ['straight line: a failing redirection on a command that moves nothing', `cd ${GIT_ROOT}; git branch -a > /missing/f; ${PB} origin HEAD`],
+  ]) {
+    allows(what, line);
+    allows(`${what}, in a script`, RUN_SH, script('echo', line));
+  }
+});

@@ -1993,37 +1993,83 @@ const MAX_LOOP_PASSES = 12; // (the passes over one loop's body, from every star
 const MAX_READING_PASSES = 4; // (the passes over all readings of a loop word, each with what the others left)
 // (R7-F3: no input is known to reach MAX_READING_PASSES, so no test names its refusal: the carry holds only what a body leaves whatever state it started from, and the starts are capped at MAX_LOOP_STARTS + 1,
 // so every reading has contributed everything it can by the second pass; the bound is the fail-closed end of the loop, kept in case a later change makes a reading depend on what another left. MAX_LOOP_PASSES is reached: see guard-loop-fixpoint.test.mjs)
-// The directories a loop body (commands loop.start .. loop.end) can end in when it starts in `from`: its cd / pushd / popd in order, outside any subshell of its own (a cd there is lost with the subshell);
-// one that may not run (after && / ||, in an if / case branch, in the background) keeps the directory it started from as well. null: a place that cannot be named.
+// #352 R35-F2: a redirection that cannot fail: to or from /dev/null, or a copy of stdout / stderr (`2>/dev/null`, `&>/dev/null`, `>&2`, `2>&1`). Any other may fail before the command runs
+// (`< /missing`, `> /missing/f`, an unwritable file), and then the command does not run at all: `cd d < /missing` stays where it was. A here-document or here-string can fail too: zsh writes it to a
+// temporary file first, and `TMPPREFIX=/missing/x` makes that fail ("can't create temp file for here document"; zsh 5.9: the cd does not run).
+const FIRM_NULL_OPS = new Set(['>', '>>', '>|', '&>', '&>>', '<']);
+const redirectsFirm = (rs) => (rs ?? []).every((r) => {
+  const fd = r.fd === null || r.fd === undefined ? null : Number(r.fd);
+  if (r.target === '/dev/null' && FIRM_NULL_OPS.has(r.op)) return fd === null || fd === 0 || fd === 1 || fd === 2;
+  return r.op === '>&' && (r.target === '&1' || r.target === '&2') && (fd === null || fd === 1 || fd === 2);
+});
+// (the closer of a { } group: listed as a command of no words in the group, after its last one, its raw text starting with the `}`; one with no raw text is taken for a closer, the rule only erring toward unknown.
+// A bare `>x` or `A=1 < f` in the group is a command of its own: it fails alone)
+const isCloser = (x) => !x.argv.length && (typeof x.raw !== 'string' || /^\s*\}/.test(x.raw));
+// The directories a loop body (commands loop.start .. loop.end) can end in when it starts in `from`: its cd / pushd / popd in order, outside any subshell of its own (a cd there is lost with the subshell). null: a place
+// that cannot be named. #352 R35 (ONE rule, an ALLOWLIST): a cd REPLACES the places the body may be in only when it surely runs whenever the body reaches it (surelyHere); any other ADDS its target to them, and
+// a `continue` that reaches this loop ends an iteration where it stands (its places are ends as well).
 function loopEndDirs(cmds, loop, from, ctx, cdp) {
   let own = Infinity;
   for (let j = loop.start; j < loop.end; j++) own = Math.min(own, cmds[j].grp?.length ?? 0);
+  const ownUp = cmds[loop.start].up ?? [];
+  const ownLoops = cmds[loop.start].loops?.length ?? 0;
+  // (a command in a subshell of the body, in a text a new process runs, or one a wrapper started does not move this shell, nor continue its loop: one in a text the loop is itself in does, R10-B1)
+  const elsewhere = (x) => (x.grp?.length ?? 0) > own || x.spawn || x.up?.some((u) => u.proc && !ownUp.includes(u));
+  // (a level between the loop and the command is surely entered when the command is: a { } group with no redirection that can fail on its closer (listed as a command of no words in the group, after its
+  // last one), an eval text whose eval has none; an if / case branch, a loop or function body is not (the command's ctl / loops say so))
+  const entered = (u, k) => {
+    if (u.kind === 'brace') {
+      for (let m = k + 1; m < cmds.length && cmds[m].up?.includes(u); m++) if (isCloser(cmds[m]) && !redirectsFirm(cmds[m].redirects)) return false;
+      return true;
+    }
+    if (u.kind === 'text') {
+      let m = k - 1;
+      while (m >= 0 && cmds[m].up?.includes(u)) m--;
+      return m >= 0 && redirectsFirm(cmds[m].redirects);
+    }
+    return u.kind === 'blk';
+  };
+  // (the command surely runs in this shell whenever the body reaches it: after `;` (first of its list), at the loop's own loop depth (a loop inside the body may run zero times), not in a branch, a function or
+  // trap body, not negated, not a pipeline stage or in the background, no redirection that can fail on it, and every level between the loop and it entered by `;` (not behind && / || / &: `false && eval 'cd d'`))
+  const surelyHere = (x, k) => x.sep === ';' && !x.ctl?.cond && !x.ctl?.fn && !x.ctl?.trap && x.negated !== true && x.bg !== true && x.pipe !== true
+    && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&' && redirectsFirm(x.redirects) && (x.loops?.length ?? 0) <= ownLoops
+    && (x.up ?? []).slice(ownUp.length).every((u) => u.sep === ';' && u.kind !== 'sub' && !u.proc && entered(u, k));
+  // (`continue N` goes on with the loop N levels out, counted from the command's own; a count that is not a plain number may reach any)
+  const continuesThis = (x) => {
+    const n = x.argv.length === 1 ? 1 : x.argv.length === 2 && /^\d+$/.test(x.argv[1]) ? Number(x.argv[1]) : 0;
+    return n < 1 || Math.max(1, (x.loops?.length ?? 0) - n + 1) === ownLoops;
+  };
   let dirs = [from];
+  const ends = [];
   for (let j = loop.start; j < loop.end; j++) {
     const c = cmds[j];
     const nm = c.argv.length ? baseName(c.argv[0]) : '';
-    if (!DIR_CHANGERS.includes(nm) || (c.grp?.length ?? 0) > own || c.spawn || c.up?.some((u) => u.proc && !cmds[loop.start].up.includes(u))) continue; // (a cd in a text a new process runs, or in a command a wrapper started, is lost when it ends: one in a text the loop is itself in is not, R10-B1)
+    if (nm === 'continue' && !elsewhere(c) && continuesThis(c)) { ends.push(...dirs); continue; } // (#352 R35-B2: the next iteration starts where the continue stands; a `break` / `return` starts none)
+    if (!DIR_CHANGERS.includes(nm) || elsewhere(c)) continue;
     const next = cmds[j + 1];
     // (#427: the same rule as the files guard's cd narrowing: only a plain `exit` leaves, and no redirection on the closer of its group, `{ exit 1; } < f`)
     const orExits = next?.sep === '||' && plainExit(next) && cmds[j + 2]?.sep !== '|' && cmds[j + 2]?.sep !== '&'
       && !(cmds[j + 2] !== undefined && cmds[j + 2].argv.length === 0 && (cmds[j + 2].redirects ?? []).length > 0);
-    const may = c.ctl?.cond || c.sep === '&&' || c.sep === '||' || c.sep === '&' || c.sep === '|' || next?.sep === '&' || next?.sep === '|' || (next?.sep === '||' && !orExits);
+    const sure = surelyHere(c, j) && !(next?.sep === '||' && !orExits);
     let moved = dirs.map((d) => (nm === 'chdir' ? null : nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}))); // (#425 R1-F2: chdir leaves the directory unknown)
     // (`cd a && cd b`: the second runs only when the first did, so the pair either moves twice or not at all. #352 R28-F1: only when the second moves this shell as surely as the first:
-    // not started by a wrapper or in a process of its own, not chdir (no builtin in bash), no redirection that may fail it, not a pipeline stage or in the background; and neither is
+    // not started by a wrapper or in a process of its own, not chdir (no builtin in bash), no redirection that may fail it, not a pipeline stage or in the background, in the first's own level; and neither is
     // negated (`! cd a && cd b`: b runs only when a failed). Else the general rule keeps a as a place the body may end in.)
-    const surely = (x, k) => !x.spawn && !x.up?.some((u) => u.proc && !cmds[loop.start].up.includes(u)) && baseName(x.argv[0]) !== 'chdir' && !(x.redirects ?? []).length
-      && x.negated !== true && x.bg !== true && x.pipe !== true && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&';
-    if (!may && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && (next.grp?.length ?? 0) <= own && !next.ctl?.cond
-      && c.negated !== true && surely(next, j + 1)) {
+    const surely = (x, k) => !elsewhere(x) && baseName(x.argv[0]) !== 'chdir' && redirectsFirm(x.redirects) && !x.ctl?.cond
+      && x.negated !== true && x.bg !== true && x.pipe !== true && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&'
+      && (x.loops?.length ?? 0) === (c.loops?.length ?? 0) && (x.up?.length ?? 0) === (c.up?.length ?? 0) && (x.up ?? []).every((u, m) => c.up[m] === u);
+    if (sure && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && surely(next, j + 1)) {
       const after = moved.map((d) => nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {}));
       moved = [...dirs, ...after];
       j++;
     }
-    dirs = [...new Set(may ? [...dirs, ...moved] : moved)];
+    // (#352 R35-F1: a cd in a loop inside the body may run any number of times: one that moves again from where it took the shell (`cd ..`) leads to places that cannot be listed)
+    if ((c.loops?.length ?? 0) > ownLoops && moved.some((d) => d === null || nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}) !== d)) moved.push(null);
+    dirs = [...new Set(sure ? moved : [...dirs, ...moved])];
     if (dirs.length > 8) return [null];
   }
-  return dirs;
+  const all = [...new Set([...ends, ...dirs])];
+  return all.length > 8 ? [null] : all;
 }
 // The loops of a command list as [start, end) ranges of the commands the parser marks as in that loop (cmd.loops: the `for` / `while` header, its condition and its body), by the index they start at,
 // outermost first: a loop inside a loop is a range of its own inside the outer one, and so is each of two loops with nothing between them. Marks not to be trusted (cmds.ctlBroken): one range from the first loop header on.
@@ -3224,7 +3270,7 @@ function evalString(str, startDir, ctx, level, child = false) {
           if (l.state) { forgetBranches(); aliasesUnsure(l.al); } // (#352 R11-B1: an alias it (re)defined is unsure too: the level may not have run, as for a change that is not certain)
         }
         else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
-        else if (l.e.kind === 'brace' && (l.e.sep === ';' || l.e.sep === '&')) {
+        else if (l.e.kind === 'brace' && (l.e.sep === ';' || l.e.sep === '&') && !l.doubt) {
           // (#352 R10: a { } group the line surely enters (first, or after ; or &: one after && or || is a `blk`) is this shell going on. A change certain at its top stays certain after the closer, settled by
           // the operator that follows it (`{ git switch x; } && push`; `{ [ -f x ] && git switch x; } && push`: the group's status is its last list's, so push runs only when the switch did). One in a negated,
           // piped or backgrounded group was never certain: the parser marks its commands so.)
@@ -3281,6 +3327,9 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (c.chdir !== undefined) { chdirBase = dir; dir = c.chdir === null || dir === null ? null : joinDir(dir, c.chdir, ctx); }
     frame.i = i;
     dirAt.set(i, dir);
+    // (#352 R35-F2: the closer of a { } group is listed as a command of no words in it, after its last one: a redirection on it that can fail (`{ cd d; } < /missing`) fails the group before it runs, so what
+    // the group changed is not handed on as certain when it ends (see the brace rule above))
+    if (isCloser(c) && levels?.length && c.up.length && !redirectsFirm(c.redirects)) levels[levels.length - 1].doubt = true;
     if (!argv.length) { recordAssigned(c, ctx, level); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
@@ -3381,8 +3430,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
     }
     if (verdict && verdict.decision === 'deny') return verdict;
-    if (argv.length > 0 && (changesStateWords || stateChanged(ctx, before))) {
-      const how = certainChange(cmds, c, trusted);
+    const changedState = argv.length > 0 && stateChanged(ctx, before);
+    if (argv.length > 0 && (changesStateWords || changedState)) {
+      const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
       const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', scoped: how === 'chain', lost: changesStateWords, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       if (changesStateWords && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond };
@@ -3416,8 +3466,10 @@ function evalString(str, startDir, ctx, level, child = false) {
 // background (the whole and-or list a `&` ends), not started by a wrapper (spawn: the child's change), and not behind `||` (nor, with nothing before it but the line, behind anything but ; and &&: `cond`). What follows it
 // in its list is settled by evalString (settle): && keeps it, || forgets it, ; ends a conditional one. Marks not to be trusted: nothing is certain.
 // ('chain': it is in a branch / loop / function body or a trap but otherwise as above: the command chained to it with && sees it (`if x; then cd d && git push; fi`: it runs only when the change did), nothing else does)
-function certainChange(cmds, c, trusted) {
+// (#352 R35-F2: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it that can fail (redirectsFirm) means it may not have run at all: not certain)
+function certainChange(cmds, c, trusted, moves = true) {
   if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
+  if (moves && !redirectsFirm(c.redirects)) return null;
   return Object.values(c.ctl).some(Boolean) ? 'chain' : 'certain';
 }
 
