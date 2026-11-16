@@ -74,6 +74,23 @@ export function parseReviewRecord(body) {
 }
 
 /**
+ * The status-line words for the rounds a Claude stand-in reviewed ('' for none): sorted, de-duplicated, a contiguous run as an
+ * en-dash range and everything else as a list ([1, 4] is "rounds 1, 4": a min-max range would read as every round between).
+ */
+export function formatSubstituteRounds(rounds) {
+  const nums = [...new Set(rounds ?? [])].sort((a, b) => a - b);
+  if (nums.length === 0) return '';
+  const parts = [];
+  for (let i = 0; i < nums.length;) {
+    let j = i;
+    while (j + 1 < nums.length && nums[j + 1] === nums[j] + 1) j += 1;
+    parts.push(j > i ? `${nums[i]}–${nums[j]}` : String(nums[i]));
+    i = j + 1;
+  }
+  return `substitute round${nums.length > 1 ? 's' : ''} ${parts.join(', ')}`;
+}
+
+/**
  * comments: [{ id, by, at, updated, body }] (by = author login, at / updated = created_at / updated_at). allowed(login) says
  * whose comments count (login lowercased). Returns { found: false } when no allowed author posted a marker comment, else
  * { found: true, comment, record, reason }: record is null (and reason says why) when the newest one is edited or malformed.

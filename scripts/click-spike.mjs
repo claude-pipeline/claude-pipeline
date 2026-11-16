@@ -37,7 +37,7 @@ const PREFILLED = `Call the AskUserQuestion tool exactly once. Its input must ha
 // How long the script holds a dialog open before it cancels it with its own exit key (a case with a hook that fills the answers in, or with keys, gets this long to be answered).
 export const HOLD_MS = 30_000;
 // A "waits" case (the dialog came with prefilled answers) counts as "Claude Code waited for a person" only if it stayed open at least this long after the tool_use before the script's exit key
-// cancelled it. The script's own minimum is HOLD_MS (the hold starts only after the hook has seen the call, so the tool_use is never later than the hold's start) and the recordings show 33-60 s;
+// cancelled it. The script's own minimum is HOLD_MS (the hold starts only after the hook has seen the call, so the tool_use is never later than the hold's start) and the owner's full run of 2026-11-16T13:42Z shows 56-59 s;
 // 25 s leaves 5 s for timestamp jitter, and is far above anything a stray key press produces (the old recordings were answered 1.4-2 s after the tool_use).
 export const WAITS_MIN_MS = 25_000;
 // The hook cases' answer: the older recordings (2.1.322, 2.1.323) were made when the hook prefilled "Merge", so those fixtures keep passing.
@@ -58,11 +58,11 @@ export const CASES = [
   { name: 'pretooluse-hook-answer', mode: 'answer', prompt: SIMPLE, keys: [], expect: 'hook', answer: HOOK_ANSWER },
   { name: 'permissionrequest-hook-answer', mode: 'permreq', prompt: SIMPLE, keys: [], expect: 'hook', answer: HOOK_ANSWER },
   { name: 'model-prefilled-answers', mode: 'none', prompt: PREFILLED, keys: [], expect: 'prefilled' },
-  // 2.1.323: a PreToolUse hook answering "ask" with prefilled answers. The owner's re-record (their own terminal, 2026-11-15; no key log, the recording script's case keys are empty) shows the dialog staying open about 60 s until the
+  // 2.1.323: a PreToolUse hook answering "ask" with prefilled answers. The owner's full run (their own terminal, 2026-11-16T13:42Z, all 9 cases ok, exit 0; the case keys are empty) shows the dialog staying open about 56 s until the
   // script's exit key cancelled it (an error result, no answer): Claude Code waits for a person. (The earlier recording, answered about 1.5 s after the tool_use with reasonCode hook:PreToolUse,
   // was made by a script that could press keys into the dialog: those were its own stray key presses, not an auto-submit.)
   { name: 'pretooluse-ask-prefill', mode: 'askfill', prompt: SIMPLE, keys: [], expect: 'waits', since: '2.1.323' },
-  // A PreToolUse hook that returns ONLY updatedInput (answers prefilled), no permissionDecision. The same 2.1.323 re-record: the dialog stayed open about 60 s until cancelled.
+  // A PreToolUse hook that returns ONLY updatedInput (answers prefilled), no permissionDecision. The same 2.1.323 full run: the dialog stayed open about 58 s until cancelled.
   { name: 'pretooluse-fill-no-decision', mode: 'fill', prompt: SIMPLE, keys: [], expect: 'waits', since: '2.1.323' },
   { name: 'preview-annotations', mode: 'none', prompt: PREVIEW, keys: [DOWN, ENTER], expect: 'annotated', answer: 'Merge' },
   // Number keys tick options, → goes to the Submit tab, whose first choice submits. Which options end up ticked is not reliable on 2.1.323 (the same keys

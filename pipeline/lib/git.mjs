@@ -705,19 +705,20 @@ export function reviewPatch(from, to, o) {
   return { patch, skipped: names };
 }
 
+// Does this EXACT ref exist? `git rev-parse --verify refs/remotes/origin/<b>` resolves the exact ref first, but with it MISSING it falls through to refs/tags/<name> and refs/heads/<name> (and
+// refs/<name>): a local branch or tag literally named `refs/remotes/origin/<b>` would then read as the remote ref (#455). `git show-ref --verify` looks up the one name only: exit 1 with
+// nothing on stderr is 'missing'; anything else (not a repository, a broken ref store) is a real failure and throws.
+export const refExists = (ref, o) => gitOrNull(['show-ref', '--verify', '--quiet', assertRef(ref, ['show-ref', '--verify', ref])], 1, o) !== null;
+
+// Is the remote-tracking ref refs/remotes/origin/<branch> there, by exact name (see refExists)?
+export const remoteRefExists = (branch, o) => refExists(`refs/remotes/origin/${branch}`, o);
+
 // `refs/remotes/origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
 // a test) falls back to `refs/heads/<branch>`. Both are returned FULLY QUALIFIED: git resolves an abbreviated `origin/<b>` (or a bare `<b>`) through refs/tags and refs/heads
-// first, so a PR that pushes a branch or a tag named `origin/main` would otherwise move the base every hash and fork point measures from (Fable F1, #448). Any other git failure
+// first, so a PR that pushes a branch or a tag named `origin/main` would otherwise move the base every hash and fork point measures from (Fable F1, #448). The remote ref is looked up by exact name (remoteRefExists): a local branch or tag literally named `refs/remotes/origin/<branch>` is not it (#455). Any other git failure
 // is not swallowed.
 export function reviewBaseRef(branch, o) {
-  const remote = `refs/remotes/origin/${branch}`;
-  try {
-    revParse(remote, o);
-    return remote;
-  } catch (err) {
-    if (err instanceof GitError) return `refs/heads/${branch}`;
-    throw err;
-  }
+  return remoteRefExists(branch, o) ? `refs/remotes/origin/${branch}` : `refs/heads/${branch}`;
 }
 
 // The short, human-facing form of a ref reviewBaseRef returned (refs/remotes/origin/main -> origin/main).
@@ -725,18 +726,12 @@ export const displayRef = (ref) => String(ref).replace(/^refs\/remotes\//, '');
 
 // The branch the remote itself calls its default (what refs/remotes/origin/HEAD points at), or null when the clone has none or it is not a plain
 // origin/<branch>, or that ref does not resolve (a dangling symref after a rename fetched with prune: git symbolic-ref does not need the target to exist). A
-// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review. The target is resolved fully qualified, like the symref was read.
+// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review. The target is looked up by exact name (remoteRefExists), like the symref was read.
 export function remoteDefaultBranch(o) {
   const out = gitOrNull(['symbolic-ref', '-q', 'refs/remotes/origin/HEAD'], 1, o);
   const m = /^refs\/remotes\/origin\/(.+)\n?$/.exec(out ?? '');
   if (!m) return null;
-  try {
-    revParse(`refs/remotes/origin/${m[1]}`, o);
-    return m[1];
-  } catch (err) {
-    if (err instanceof GitError) return null;
-    throw err;
-  }
+  return remoteRefExists(m[1], o) ? m[1] : null;
 }
 
 // Is an `origin` remote configured at all? (`git config --get` answers exit 1 with nothing on stderr for a missing key.) A repo without one (a local-only clone, a fixture)
