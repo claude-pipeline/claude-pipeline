@@ -119,5 +119,21 @@ hard_stops:
 review:
   codex_model: gpt-6-astra
   max_rounds: 3
+  # #374 PR C (owner 2026-11-13 rule, scope chosen 2026-11-16): the bash/git guard's threat model. Read from the default branch's config only, so it
+  # applies from the PR after the one that sets or changes it. Guard files only: the owner-go hooks (the typed "merge" recorder, dialog-hooks, and
+  # hook-io / frontmatter which they share) are left out on purpose, since they defend against an agent forging the owner's approval.
+  threat_models:
+    - name: guards
+      paths: ["pipeline/hooks/guard-files.mjs", "pipeline/hooks/guard-git.mjs",
+        "pipeline/hooks/lib/command-fields.mjs", "pipeline/hooks/lib/deny-log.mjs", "pipeline/hooks/lib/files-policy.mjs",
+        "pipeline/hooks/lib/git-policy.mjs", "pipeline/hooks/lib/git-wiring.mjs", "pipeline/hooks/lib/guarded-text.mjs",
+        "pipeline/hooks/lib/line-writes.mjs", "pipeline/hooks/lib/package-scripts.mjs", "pipeline/hooks/lib/repo-moves.mjs",
+        "pipeline/hooks/lib/script-candidates.mjs", "pipeline/hooks/lib/sed-emulate.mjs", "pipeline/hooks/lib/shell-parse.mjs",
+        "pipeline/hooks/lib/sql-clients.mjs", "pipeline/lib/command-guard.mjs", "pipeline/lib/shell-words.mjs"]
+      text: "The guard defends against accidental agent mistakes and casual one-step disguise. A deliberately evasive agent is out of scope (it can write a script and run it). Merge-blocking for guard PRs only: (a) the branch allows something origin/main denies; (b) a miss on a command an agent would plausibly write unprompted; (c) an over-denial of an everyday command; (d) a timeout fail-open on plausible input. Everything else is a FOLLOW-UP (collected in #373)."
+  # Rounds 4+ may use the narrow fix-verify brief on guard / pipeline paths (never on a non-ignored hard-stop hit, a size driver or a flagged fix).
+  fix_verify_after_round: 3
+  # Past the limit (from the second round past it), a low-severity SUGGESTION / WORTH CONSIDERING ruled ACCEPT is filed as a follow-up instead of fixed.
+  post_max_suggestions: follow-up
 
 agent_log: docs/agent-log.md
