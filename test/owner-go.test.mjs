@@ -3,7 +3,7 @@
 // are stored and read (real folders and files only, a day at most). All in a temp home.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, writeFileSync, existsSync } from 'node:fs';
+import { chmodSync, lstatSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, symlinkSync, utimesSync, writeFileSync, writeSync, existsSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { createHash, randomUUID } from 'node:crypto';
@@ -14,11 +14,12 @@ import {
   approvedPr, approvedRequest, lastRequestText, ownerGoDir, ownerItemsDigest, parseApproval, presentedRequests, readApprovals, recordApproval,
   presentedRuling, recordRuling, ownerRuled, rulingsIn, entrySource, notOwnerWords, approvalGap, ownerRulingGap, promptProvenance, rulingNudge, RULING_NUDGE,
   accountHome, approvalConfigDirHint, configDirHint, CONFIG_DIR_HINT, legacyTranscriptOf,
-  parseRoundGrant, presentedRoundRequest, recordRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantLookups, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
+  parseRoundGrant, presentedRoundRequest, recordRoundGrant, recordPastRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantLookups, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
+  ROUND_CLAIMS_REL, roundTicketKey, roundCoverage, roundCoverageSource, pastRoundGrantsFor, ownerPastRoundRecords,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
-import { OWNER_ENTRY, linesOf, ownerGrants, roundRequest, runHook } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, linesOf, ownerGrants, pastRoundRequest, roundRequest, runHook } from './helpers/owner-go.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -1916,4 +1917,306 @@ test('repo moved: a ruling recorded under the old name before the move applies t
   assert.equal(r?.repo, REPO);
   const ruled = (repoMoves) => ownerRuled({ repo: NEW_NAME, pr: 58, id: 'R1-F1', quote: answer, decision: 'FOLLOW-UP', contentOf: () => 'abcdef012345', home, now: NOW, repoMoves });
   assert.deepEqual([ruled(LATER_MOVE), ruled([]), ruled(EARLIER_MOVE)], [true, false, false]);
+});
+
+// ---- #472: round tickets (one per extra-round claim), coverage, and the per-grant marker every covered grant ends up with --------------------
+// Plan: claude-notes/plans/2026-11-16-click-pending-472.md (Task 5). Temp homes only. The grants are the typed ones twoGrants() records (AT and AT + 1000); the click side is in
+// test/owner-go-click-pending.test.mjs.
+const TICKETS = (home) => join(ownerGoDir(home), 'round-claims');
+const KEY = roundTicketKey(REPO, 58, 4);
+const iso = (ms) => new Date(ms).toISOString();
+const ticketBody = (over = {}) => ({ v: 1, repo: REPO, pr: 58, k: 4, n: 1, head: GHEAD, consumedAt: iso(AT + 3000), grantIds: [], ...over });
+function writeTicket(home, over = {}) {
+  const body = ticketBody(over);
+  mkdirSync(TICKETS(home), { recursive: true, mode: 0o700 });
+  const file = join(TICKETS(home), `${roundTicketKey(body.repo, body.pr, body.k)}.${body.n}.json`);
+  writeFileSync(file, `${JSON.stringify(body)}\n`, { mode: 0o600 });
+  return file;
+}
+const open = (home, over = {}) => ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home, now: () => AT + 4000, ...over });
+const claimT = (records, home, over = {}) => claimGrantMarkers(records, BODY, { home, now: () => AT + 3000, ticket: true, ...over });
+const typedAt = (home, ms, session, ask = RASK) => recordRoundGrant(input(home, 'extra round', [said(ask)], { session_id: session }), { home, now: () => ms });
+const withEnv = (value, fn) => {
+  const before = process.env.PIPELINE_CLICK_SETTLE;
+  if (value === undefined) delete process.env.PIPELINE_CLICK_SETTLE; else process.env.PIPELINE_CLICK_SETTLE = value;
+  try { return fn(); } finally { if (before === undefined) delete process.env.PIPELINE_CLICK_SETTLE; else process.env.PIPELINE_CLICK_SETTLE = before; }
+};
+
+test('round tickets: a ticket claim creates round-claims/<key>.1.json, marks EVERY grant it covers (coveredBy the ticket), and a second claim of the same grants is used', () => {
+  assert.equal(ROUND_CLAIMS_REL, '.claude/pipeline-state/owner-go/round-claims');
+  assert.match(KEY, /^[0-9a-f]{16}$/);
+  assert.equal(KEY, createHash('sha256').update(`${REPO}|58|4`).digest('hex').slice(0, 16));
+  assert.notEqual(roundTicketKey(REPO, 58, 5), KEY);
+  assert.notEqual(roundTicketKey(REPO, 59, 4), KEY);
+  assert.equal(roundTicketKey('ACME/App', 58, 4), KEY, 'the repository is lower cased, as everywhere');
+  assert.equal(roundTicketKey('nonsense', 58, 4), null);
+  const home = tmp();
+  const records = twoGrants(home);
+  const ids = records.map(grantIdOf).sort();
+  const c = claimT(records, home);
+  assert.equal(c.ok, true, JSON.stringify(c));
+  assert.deepEqual(readdirSync(TICKETS(home)), [`${KEY}.1.json`]);
+  const file = join(TICKETS(home), `${KEY}.1.json`);
+  if (process.platform !== 'win32') assert.equal(statSync(file).mode & 0o777, 0o600);
+  assert.deepEqual(JSON.parse(readFileSync(file, 'utf8')), ticketBody({ grantIds: ids }));
+  for (const id of ids) {
+    const m = readGrantMarker(id, { home });
+    assert.deepEqual([m.spent, m.verifiable], [true, true], id);
+    assert.deepEqual({ ...m.marker, checkout: undefined }, { v: 1, grantId: id, repo: REPO, pr: 58, k: 4, head: GHEAD, consumedAt: iso(AT + 3000), checkout: undefined, coveredBy: `${KEY}.1` });
+  }
+  assert.deepEqual(open(home), []);
+  const again = claimT(records, home, { now: () => AT + 5000 });
+  assert.deepEqual([again.ok, again.reason], [false, 'used']);
+  assert.deepEqual(readdirSync(TICKETS(home)), [`${KEY}.1.json`], 'no second ticket');
+});
+
+test('round tickets: the sweep marks a covered grant the claim did not hold; a grant answered after the ticket is left; a sweep write that fails refuses `spent` and the ticket stands', () => {
+  const home = tmp();
+  const [newer, older] = twoGrants(home); // newest first: AT + 1000, AT
+  const late = typedAt(home, AT + 9000, 'sess-late'); // answered after the claim below
+  const c = claimT([older], home);
+  assert.equal(c.ok, true, JSON.stringify(c));
+  const swept = readGrantMarker(grantIdOf(newer), { home });
+  assert.deepEqual([swept.verifiable, swept.marker?.coveredBy, swept.marker?.head, swept.marker?.consumedAt], [true, `${KEY}.1`, GHEAD, iso(AT + 3000)], 'swept by the claim');
+  assert.equal(readGrantMarker(grantIdOf(late), { home }).spent, false, 'answered after the ticket: not covered, not marked');
+  assert.deepEqual(open(home, { now: () => AT + 10_000 }).map(grantIdOf), [grantIdOf(late)], 'and still open');
+  // a failing sweep write: the third write of the claim (ticket, the grant, then the swept one)
+  const home2 = tmp();
+  const [, older2] = twoGrants(home2);
+  let writes = 0;
+  const failing = claimT([older2], home2, { io: { writeSync: (fd, text) => { writes += 1; if (writes === 3) throw new Error('ENOSPC'); return writeSync(fd, text); } } });
+  assert.deepEqual([failing.ok, failing.reason], [false, 'spent']);
+  assert.ok(existsSync(join(TICKETS(home2), `${KEY}.1.json`)), 'the ticket stands');
+  assert.deepEqual(open(home2), [], 'every covered grant is spent for new readers');
+});
+
+test('round tickets: a fresh grant after a claim takes ticket n+1 (discard-round, then grant again)', () => {
+  const home = tmp();
+  const records = twoGrants(home);
+  assert.equal(claimT(records, home).ok, true);
+  const fresh = typedAt(home, AT + 5000, 'sess-fresh');
+  assert.deepEqual(open(home, { now: () => AT + 6000 }).map(grantIdOf), [grantIdOf(fresh)], 'a new owner word is open again');
+  const c = claimT([fresh], home, { now: () => AT + 6000 });
+  assert.equal(c.ok, true, JSON.stringify(c));
+  assert.deepEqual(readdirSync(TICKETS(home)).sort(), [`${KEY}.1.json`, `${KEY}.2.json`]);
+  assert.deepEqual(JSON.parse(readFileSync(join(TICKETS(home), `${KEY}.2.json`), 'utf8')).grantIds, [grantIdOf(fresh)]);
+  assert.equal(readGrantMarker(grantIdOf(fresh), { home }).marker.coveredBy, `${KEY}.2`);
+  assert.deepEqual(open(home, { now: () => AT + 7000 }), []);
+});
+
+test('round coverage: equal timestamps cover; another PR, another round, a head the ticket does not start and a ticket made before the answer do not', () => {
+  const home = tmp();
+  const records = twoGrants(home);
+  const old = records.find((r) => r.ts === iso(AT));
+  const young = records.find((r) => r.ts === iso(AT + 1000));
+  assert.equal(roundCoverage(old, { home, repo: REPO, moves: [] }), 'absent', 'no ticket at all');
+  const at = (over, rec = old) => {
+    const h = tmp();
+    twoGrants(h);
+    writeTicket(h, over);
+    return roundCoverage(rec, { home: h, repo: REPO, moves: [] });
+  };
+  assert.equal(at({ consumedAt: iso(AT) }), 'covered', 'equal timestamps');
+  assert.equal(at({ consumedAt: iso(AT) }, young), 'absent', 'a grant answered after the ticket');
+  assert.equal(at({ consumedAt: iso(AT - 1) }), 'absent', 'consumedAt before the answer');
+  assert.equal(at({ pr: 59 }), 'absent');
+  assert.equal(at({ k: 5 }), 'absent');
+  assert.equal(at({ head: 'e'.repeat(40) }), 'absent', 'a head the grant was not for');
+  assert.equal(at({ repo: 'acme/other' }), 'absent');
+  assert.equal(at({ n: 3 }), 'covered', 'any ticket of the round, not only the first');
+  assert.deepEqual(roundCoverageSource(old, { home: (() => { const h = tmp(); writeTicket(h); return h; })(), repo: REPO, moves: [] }), { id: `${KEY}.1`, repo: REPO, pr: 58, k: 4, head: GHEAD, consumedAt: iso(AT + 3000), checkout: null });
+});
+
+test('round coverage: a repository moved AFTER the answer: a ticket under either name covers, only with the moves', () => {
+  const home = tmp();
+  const old = twoGrants(home).find((r) => r.ts === iso(AT));
+  writeTicket(home, { repo: REPO, consumedAt: iso(AT + 3000) }); // claimed under the old name, before the move
+  const cover = (moves) => roundCoverage(old, { home, repo: NEW_NAME, moves });
+  assert.equal(cover(LATER_MOVE), 'covered');
+  assert.equal(cover([]), 'absent', 'without the moves the old name is another repository');
+  assert.equal(cover(EARLIER_MOVE), 'absent', 'a ticket made after the move, under the old name, is another repository\'s');
+  const home2 = tmp();
+  const old2 = twoGrants(home2).find((r) => r.ts === iso(AT));
+  writeTicket(home2, { repo: NEW_NAME, consumedAt: iso(AT + 3_700_000) }); // claimed under the new name, after the move
+  assert.equal(roundCoverage(old2, { home: home2, repo: NEW_NAME, moves: LATER_MOVE }), 'covered');
+  assert.deepEqual(open(home2, { repo: NEW_NAME, now: () => AT + 3_800_000, repoMoves: LATER_MOVE }), []);
+});
+
+test('round coverage: an unsafe folder, a failed listing, a stray name, a linked ticket and an lstat that fails are INDETERMINATE: spent for tolerant reads, a problem for strict ones, `unsafe` for a claim', { skip: process.platform === 'win32' }, () => {
+  const strictProblem = (home) => assert.throws(() => ownerGrantLookups({ repo: REPO, pr: 58, home, now: () => AT + 4000 }).grants(4), /round claims cannot be checked/);
+  const check = (label, home, { io } = {}) => {
+    const records = twoGrants(home);
+    assert.equal(roundCoverage(records[0], { home, repo: REPO, moves: [], io }), 'indeterminate', label);
+    assert.deepEqual(open(home, { io }), [], `${label}: tolerant lookups count the grant as spent`);
+    const c = claimT(records, home, { io });
+    assert.deepEqual([c.ok, c.reason], [false, 'unsafe'], label);
+    assert.equal(existsSync(join(ownerGoDir(home), 'consumed')), false, `${label}: nothing was claimed`);
+    if (io === undefined) strictProblem(home);
+  };
+  const linked = tmp();
+  mkdirSync(ownerGoDir(linked), { recursive: true });
+  symlinkSync(tmp(), TICKETS(linked));
+  check('round-claims is a link', linked);
+  const asFile = tmp();
+  mkdirSync(ownerGoDir(asFile), { recursive: true });
+  writeFileSync(TICKETS(asFile), 'x');
+  check('round-claims is a file', asFile);
+  const stray = tmp();
+  mkdirSync(TICKETS(stray), { recursive: true });
+  writeFileSync(join(TICKETS(stray), '.DS_Store'), '');
+  check('a stray name', stray);
+  const badIndex = tmp();
+  mkdirSync(TICKETS(badIndex), { recursive: true });
+  writeFileSync(join(TICKETS(badIndex), `${KEY}.0.json`), '{}');
+  check('a ticket number that is no number', badIndex);
+  const link = tmp();
+  mkdirSync(TICKETS(link), { recursive: true });
+  const target = join(tmp(), 'victim.json');
+  writeFileSync(target, JSON.stringify(ticketBody()));
+  symlinkSync(target, join(TICKETS(link), `${KEY}.1.json`));
+  check('a linked ticket', link);
+  const dir = tmp();
+  mkdirSync(join(TICKETS(dir), `${KEY}.1.json`), { recursive: true });
+  check('a ticket that is a folder', dir);
+  const listing = tmp();
+  mkdirSync(TICKETS(listing), { recursive: true });
+  check('a listing that fails', listing, { io: { readdirSync: () => { throw Object.assign(new Error('EIO'), { code: 'EIO' }); } } });
+  const lstatFails = tmp();
+  writeTicket(lstatFails);
+  check('an lstat that fails', lstatFails, { io: { lstatSync: (p, ...rest) => { if (String(p).endsWith('.json')) throw Object.assign(new Error('EIO'), { code: 'EIO' }); return lstatSync(p, ...rest); } } });
+  if (process.getuid?.() !== 0) {
+    const closed = tmp();
+    writeTicket(closed);
+    chmodSync(TICKETS(closed), 0o000);
+    try { check('a folder that cannot be listed', closed); } finally { chmodSync(TICKETS(closed), 0o700); }
+  }
+  // the consumed folder is part of coverage too: a stray name there, or a link, is indeterminate
+  const consumed = tmp();
+  const records = twoGrants(consumed);
+  mkdirSync(join(ownerGoDir(consumed), 'consumed'), { recursive: true });
+  writeFileSync(join(ownerGoDir(consumed), 'consumed', 'stray.txt'), '');
+  assert.equal(roundCoverage(records[0], { home: consumed, repo: REPO, moves: [] }), 'indeterminate');
+  const consumedLink = tmp();
+  const recs = twoGrants(consumedLink);
+  mkdirSync(join(ownerGoDir(consumedLink), 'consumed'), { recursive: true });
+  symlinkSync(join(tmp(), 'victim'), join(ownerGoDir(consumedLink), 'consumed', `${'a'.repeat(16)}.json`));
+  assert.equal(roundCoverage(recs[0], { home: consumedLink, repo: REPO, moves: [] }), 'indeterminate');
+});
+
+test('round coverage: an UNPARSEABLE ticket or consumed marker covers by its mtime (any repository, PR, round or head), is never a repair source, and never verifies a grant (F3)', () => {
+  const home = tmp();
+  const records = twoGrants(home);
+  const third = typedAt(home, AT + 2000, 'sess-third');
+  const garbled = join(TICKETS(home), `${KEY}.1.json`);
+  mkdirSync(TICKETS(home), { recursive: true });
+  writeFileSync(garbled, '{"v":1');
+  utimesSync(garbled, new Date(AT + 1500), new Date(AT + 1500));
+  const [young, old] = records;
+  assert.deepEqual(['covered', 'covered', 'absent'], [old, young, third].map((r) => roundCoverage(r, { home, repo: REPO, moves: [] })), 'covers what was answered at or before its mtime');
+  assert.equal(roundCoverageSource(old, { home, repo: REPO, moves: [] }), null, 'no parseable source: nothing to copy');
+  assert.deepEqual(open(home, { now: () => AT + 3000 }).map(grantIdOf), [grantIdOf(third)]);
+  assert.equal(existsSync(join(ownerGoDir(home), 'consumed')), false, 'no marker was written from it');
+  for (const r of [old, young]) {
+    assert.equal(readGrantMarker(grantIdOf(r), { home }).spent, false);
+    assert.equal(verifyOwnerGrant({ repo: REPO, pr: 58, k: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(r), quote: r.prompt } }, { home, now: () => AT + 3000 }).ok, false, 'a grant covered only by an unparseable source is never proven');
+  }
+  const refused = claimT([old], home);
+  assert.deepEqual([refused.ok, refused.reason], [false, 'used']);
+  // an unparseable consumed marker (the partial one a failed claim leaves) of ANOTHER grant covers the same way
+  const home2 = tmp();
+  const recs2 = twoGrants(home2);
+  mkdirSync(join(ownerGoDir(home2), 'consumed'), { recursive: true });
+  const partial = join(ownerGoDir(home2), 'consumed', `${'f'.repeat(16)}.json`);
+  writeFileSync(partial, '');
+  utimesSync(partial, new Date(AT + 500), new Date(AT + 500));
+  assert.deepEqual(recs2.map((r) => roundCoverage(r, { home: home2, repo: REPO, moves: [] })), ['absent', 'covered'], 'newest first: AT + 1000 is after the mtime, AT is not');
+  assert.equal(roundCoverageSource(recs2[1], { home: home2, repo: REPO, moves: [] }), null);
+});
+
+test('a reader REPAIRS a covered grant\'s missing marker (copying the ticket\'s head and consumedAt, never now); settle: false does not; the environment switch does not gate it (F8)', () => {
+  const make = () => {
+    const home = tmp();
+    const records = twoGrants(home);
+    writeTicket(home, { consumedAt: iso(AT + 3000) });
+    return { home, records };
+  };
+  const readOnly = make();
+  assert.deepEqual(open(readOnly.home, { settle: false }), []);
+  assert.equal(existsSync(join(ownerGoDir(readOnly.home), 'consumed')), false, 'settle: false writes nothing');
+  for (const sw of ['off', undefined, 'on']) {
+    const w = make();
+    withEnv(sw, () => assert.deepEqual(open(w.home), [], `switch ${sw}`));
+    for (const r of w.records) {
+      const m = readGrantMarker(grantIdOf(r), { home: w.home });
+      assert.deepEqual([m.spent, m.verifiable, m.marker?.coveredBy, m.marker?.head, m.marker?.consumedAt], [true, true, `${KEY}.1`, GHEAD, iso(AT + 3000)], `switch ${sw}: repaired`);
+    }
+  }
+  // the repair works for ownerGrantGap and a past-round ticket-covered record is left alone (F6): see the next test
+});
+
+test('past rounds are unaffected (F6): a past-round record of the same repository, PR and round under a round ticket is still listed, and no marker is written for it', () => {
+  const home = tmp();
+  const past = recordPastRoundGrant(input(home, 'approve round', [said(pastRoundRequest(58, 4, GHEAD, REPO))], { session_id: 'sess-past' }), { home, now: () => AT });
+  assert.equal(past?.kind, 'past-round');
+  writeTicket(home, { consumedAt: iso(AT + 3000) });
+  const q = { repo: REPO, pr: 58, k: 4, head: GHEAD, home, now: () => AT + 4000 };
+  assert.equal(pastRoundGrantsFor(q).length, 1);
+  assert.equal(ownerPastRoundRecords(q).length, 1);
+  assert.equal(readGrantMarker(grantIdOf(past), { home }).spent, false);
+  assert.equal(existsSync(join(ownerGoDir(home), 'consumed')), false, 'no repair marker');
+  assert.equal(roundCoverage(past, { home, repo: REPO, moves: [] }), 'absent', 'coverage is for extra-round records only');
+});
+
+test('a claim is head-aware (F5): a grant for another head than the last ticket is admitted AND claimed (ticket 2); one for the ticket\'s head answered before it is used at claim and absent from admission', () => {
+  const home = tmp();
+  const H2 = 'b'.repeat(40);
+  const g1 = typedAt(home, AT, 'sess-h1');
+  const g2 = typedAt(home, AT + 500, 'sess-h2', roundRequest(58, 4, H2, REPO));
+  assert.equal(claimGrantMarkers([g1], BODY, { home, now: () => AT + 3000, ticket: true }).ok, true);
+  assert.equal(readGrantMarker(grantIdOf(g2), { home }).spent, false, 'the sweep leaves a grant for another head');
+  assert.equal(roundCoverage(g2, { home, repo: REPO, moves: [] }), 'absent');
+  assert.deepEqual(open(home, { head: H2 }).map(grantIdOf), [grantIdOf(g2)], 'admitted');
+  const c2 = claimGrantMarkers([g2], { ...BODY, head: H2 }, { home, now: () => AT + 4000, ticket: true });
+  assert.equal(c2.ok, true, JSON.stringify(c2));
+  assert.deepEqual(readdirSync(TICKETS(home)).sort(), [`${KEY}.1.json`, `${KEY}.2.json`]);
+  // another word for ticket 1's head, answered before it (recorded late): covered, so used
+  const g1b = typedAt(home, AT + 100, 'sess-h1b');
+  assert.deepEqual(open(home, { now: () => AT + 5000 }), [], 'absent from admission');
+  const used = claimGrantMarkers([g1b], BODY, { home, now: () => AT + 5000, ticket: true });
+  assert.deepEqual([used.ok, used.reason], [false, 'used']);
+});
+
+test('a reader\'s repair BETWEEN the ticket and the grant markers does not burn the claim (F2): the claim succeeds, the round is admitted once, the grant verifies', () => {
+  const home = tmp();
+  const [, older] = twoGrants(home);
+  let seen = 0;
+  const c = claimT([older], home, { io: { afterTicket: () => { seen += 1; open(home); } } });
+  assert.equal(seen, 1);
+  assert.equal(c.ok, true, JSON.stringify(c));
+  assert.deepEqual(c.claimed.map((m) => m.grantId), [grantIdOf(older)]);
+  assert.deepEqual(open(home, { now: () => AT + 5000 }), []);
+  const v = verifyOwnerGrant({ repo: REPO, pr: 58, k: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(older), quote: older.prompt } }, { home, now: () => AT + 5000 });
+  assert.equal(v.ok, true, JSON.stringify(v));
+  // any other marker already there is `used`, as before
+  const home2 = tmp();
+  const [, older2] = twoGrants(home2);
+  const stranger = claimT([older2], home2, { io: { afterTicket: () => { mkdirSync(join(ownerGoDir(home2), 'consumed'), { recursive: true }); writeFileSync(markerPath(grantIdOf(older2), { home: home2 }), JSON.stringify({ v: 1, grantId: grantIdOf(older2), repo: REPO, pr: 58, k: 4, head: GHEAD, consumedAt: iso(AT + 1), checkout: null })); } } });
+  assert.deepEqual([stranger.ok, stranger.reason], [false, 'used']);
+});
+
+test('a grant consumed with a ticket verifies at ANY age: 30 hours later the final gate still proves it (coverage is never applied in verifyOwnerGrant)', () => {
+  const home = tmp();
+  const [rec] = twoGrants(home);
+  assert.equal(claimT([rec], home).ok, true);
+  const q = { repo: REPO, pr: 58, k: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(rec), quote: rec.prompt } };
+  const v = verifyOwnerGrant(q, { home, now: () => AT + 30 * 3600_000 });
+  assert.equal(v.ok, true, JSON.stringify(v));
+});
+
+test('strict lookups: a round-claims folder that cannot be checked throws; a healthy one with tickets does not', () => {
+  const home = tmp();
+  twoGrants(home);
+  writeTicket(home, { consumedAt: iso(AT + 3000) });
+  const lookups = ownerGrantLookups({ repo: REPO, pr: 58, home, now: () => AT + 4000 });
+  assert.deepEqual([lookups.grants(4), lookups.grantGap(4)], [[], 'none'], 'covered grants are spent, not a failure');
 });

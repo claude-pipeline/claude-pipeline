@@ -3,16 +3,20 @@
 // OS account database, so HOME= isolates nothing. Every reader call passes `settle` explicitly, so none of these tests depends on the PIPELINE_CLICK_SETTLE switch.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { spawn, spawnSync } from 'node:child_process';
 import { appendFileSync, chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
-import { MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, ownerGoDir, ownerGrantedRounds, ownerRuled, readApprovals, readRecords, settleEnabled } from '../pipeline/hooks/lib/owner-go.mjs';
+import {
+  MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantLookups, ownerGrantedRounds, ownerRuled, readApprovals, readGrantMarker, readRecords, recordRoundGrant, roundTicketKey,
+  settleEnabled, verifyOwnerGrant,
+} from '../pipeline/hooks/lib/owner-go.mjs';
 import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickProvenance, issueAsk, mergeAsk, readAsk, recordClick, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { OWNER_GO_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
-import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { deferEligibility } from '../pipeline/lib/triage.mjs';
+import { OWNER_ENTRY, cleanupRoundClaims, linesOf, mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 
 const REPO = 'acme/app';
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -650,4 +654,235 @@ test('a typed word after a pending click: both stand', async (t) => {
   assert.ok(appendRecord(w.home, w.session, typed));
   const records = readRecords({ home: w.home, now: w.now, settle: true });
   assert.deepEqual(records.map((r) => r.via ?? 'typed').sort(), ['ask', 'typed']);
+});
+
+// ---- Task 1 (F4): a test that claims a round cleans up exactly what it created --------------------------------------------------------------
+
+test('cleanupRoundClaims refuses a repository name that is not unique to the test, and removes exactly the ticket and markers of its own round', () => {
+  for (const slug of ['acme/widgets', 'acme/app', 'acme/widgets-1234', REPO]) assert.throws(() => cleanupRoundClaims({ slug, pr: 7, k: 3, grantIds: [], home: mkdtempSync(join(tmpdir(), 'owner-go-cleanup-')) }), /not unique to the test/, slug);
+  const home = mkdtempSync(join(tmpdir(), 'owner-go-cleanup-'));
+  const slug = `acme/widgets-${randomUUID()}`;
+  const mine = roundTicketKey(slug, 7, 3);
+  const theirs = roundTicketKey(`acme/widgets-${randomUUID()}`, 7, 3);
+  const dir = join(ownerGoDir(home), 'round-claims');
+  mkdirSync(dir, { recursive: true });
+  mkdirSync(join(ownerGoDir(home), 'consumed'), { recursive: true });
+  const consumed = (id) => join(ownerGoDir(home), 'consumed', `${id}.json`);
+  const ids = { named: 'a'.repeat(16), given: 'b'.repeat(16), other: 'c'.repeat(16) };
+  writeFileSync(join(dir, `${mine}.1.json`), JSON.stringify({ v: 1, grantIds: [ids.named] }));
+  writeFileSync(join(dir, `${mine}.2.json`), '{"v":1'); // an unparseable one of its own: removed, names nothing
+  writeFileSync(join(dir, `${theirs}.1.json`), '{}');
+  for (const id of Object.values(ids)) writeFileSync(consumed(id), '{}');
+  const run = cleanupRoundClaims({ slug, pr: 7, k: 3, grantIds: [ids.given], home });
+  run();
+  assert.deepEqual(readdirSync(dir), [`${theirs}.1.json`], 'only the tickets of its own key');
+  assert.deepEqual(readdirSync(join(ownerGoDir(home), 'consumed')), [`${ids.other}.json`], 'the markers named by its tickets and the ones it was given; nobody else\'s');
+  run(); // twice is harmless
+});
+
+// ---- Task 5: round grants: tickets, sweep, coverage, strict lookups --------------------------------------------------------------------------
+
+const CBODY = { repo: REPO, pr: 58, k: 4, head: GHEAD, checkout: '/work/app' };
+const TICKET_KEY = roundTicketKey(REPO, 58, 4);
+const ticketsOf = (home) => { try { return readdirSync(join(ownerGoDir(home), 'round-claims')).sort(); } catch { return []; } };
+const openGrants = (home, now, over = {}) => ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home, now, settle: false, ...over });
+const allRecords = (home, now) => readRecords({ home, now, settle: false, maxAgeMs: Infinity });
+const isoOf = (ms) => new Date(ms).toISOString();
+const spentVerifiable = (home, record) => { const m = readGrantMarker(grantIdOf(record), { home }); return m.spent && m.verifiable ? m.marker : null; };
+// A round click, captured at the hook and flushed to the transcript, not yet settled.
+const roundClick = async (t, opts = {}) => {
+  const w = pw(t, { kind: 'round', answer: 'Yes, one more round', ...opts });
+  assert.ok((await w.hook()).pending);
+  w.flush();
+  return w;
+};
+// The owner TYPED "extra round" (a record the typed recorder writes) at `atMs`, into the click world's home (a transcript root the checks accept).
+function typedGrant(home, { atMs, session = `typed-${randomUUID().slice(0, 8)}`, head = GHEAD }) {
+  const folder = join(home, '.claude-click-test', 'projects', '-repo');
+  mkdirSync(folder, { recursive: true });
+  const promptId = `pid-${randomUUID()}`;
+  const file = join(folder, `${session}.jsonl`);
+  writeFileSync(file, linesOf([
+    { type: 'user', message: { content: 'go' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
+    { type: 'assistant', message: { content: [{ type: 'text', text: roundRequest(58, 4, head, REPO) }] } },
+    { type: 'user', message: { content: 'extra round' }, promptId, ...OWNER_ENTRY },
+  ]));
+  const rec = recordRoundGrant({ hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: file, cwd: '/work/app', prompt: 'extra round', prompt_id: promptId }, { home, now: () => atMs });
+  assert.ok(rec, 'the typed grant was recorded');
+  return rec;
+}
+
+test('two claimers with disjoint snapshots (deterministic, both orders): claimer A runs inside B\'s filtering; exactly one claim wins, the other is refused used, nothing stays open, every covered grant has its own marker', async (t) => {
+  for (const trigger of ['click', 'typed']) {
+    const w = await roundClick(t);
+    typedGrant(w.home, { atMs: w.answeredAt - 5000 });
+    assert.equal(only(w.settle(), w)[0].outcome, 'recorded');
+    const all = openGrants(w.home, w.now);
+    assert.equal(all.length, 2, 'a typed word and a click, both open');
+    let ran = false;
+    let a = null;
+    const io = {
+      afterSpentCheck: (r) => {
+        if (ran || (r.via === 'ask') !== (trigger === 'click')) return;
+        ran = true;
+        a = claimGrantMarkers(all.filter((x) => grantIdOf(x) !== grantIdOf(r)), CBODY, { home: w.home, now: w.now, ticket: true }); // the OTHER grant: B's snapshot never meets it
+      },
+    };
+    const snapshot = openGrants(w.home, w.now, { io });
+    assert.equal(ran, true, `${trigger}: the seam ran`);
+    assert.ok(snapshot.length >= 1, `${trigger}: B kept the grant it had seen`);
+    const b = claimGrantMarkers(snapshot, CBODY, { home: w.home, now: () => w.t + 1, ticket: true });
+    assert.deepEqual([a.ok, b.ok, b.reason], [true, false, 'used'], `${trigger}: ${JSON.stringify({ a, b })}`);
+    assert.deepEqual(openGrants(w.home, w.now), [], `${trigger}: nothing is open`);
+    assert.deepEqual(ticketsOf(w.home), [`${TICKET_KEY}.1.json`], `${trigger}: one ticket`);
+    for (const r of all) assert.ok(spentVerifiable(w.home, r), `${trigger}: ${r.via ?? 'typed'} grant has its own verifiable marker`);
+  }
+});
+
+// Spawns one click-race.mjs process; `ready` resolves when it printed `ready` (or ended), `mid` when it printed `mid` (a claimer inside its filtering).
+const raceChild = (args) => {
+  const c = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const p = { out: '', err: '' };
+  const seen = (word) => new Promise((resolve) => { c.stdout.on('data', (d) => { p.out += d; if (p.out.includes(word)) resolve(); }); c.on('close', resolve); });
+  p.ready = seen('ready');
+  p.mid = seen('mid');
+  p.done = new Promise((resolve) => { c.on('close', resolve); });
+  c.stderr.on('data', (d) => { p.err += d; });
+  return p;
+};
+
+test('two claimer processes (click-race.mjs role=claim, a barrier inside their filtering) and a settler: exactly one claim wins, nothing stays open, every covered grant has its own marker (20 runs)', async (t) => {
+  const child = fileURLToPath(new URL('./helpers/click-race.mjs', import.meta.url));
+  const libDir = fileURLToPath(new URL('../pipeline/hooks/lib/', import.meta.url));
+  for (let run = 0; run < 20; run++) {
+    const w = await roundClick(t);
+    typedGrant(w.home, { atMs: w.answeredAt - 5000 });
+    const barrier = join(w.home, 'barrier');
+    const claimers = [0, 1].map(() => raceChild([child, 'claim', libDir, w.home, barrier, String(w.t), REPO, '58', '4', GHEAD]));
+    const settler = raceChild([child, 'settle', libDir, w.home, barrier, String(w.t)]);
+    await Promise.all([...claimers, settler].map((p) => p.ready));
+    await Promise.all(claimers.map((p) => p.mid));
+    writeFileSync(barrier, '');
+    const codes = await Promise.all([...claimers, settler].map((p) => p.done));
+    assert.deepEqual(codes, [0, 0, 0], `run ${run}: ${[...claimers, settler].map((p) => p.err).join('|')}`);
+    const claims = claimers.map((p) => JSON.parse(p.out.trim().split('\n').at(-1)));
+    assert.equal(claims.filter((c) => c.ok).length, 1, `run ${run}: exactly one claim wins: ${JSON.stringify(claims)}`);
+    for (const c of claims.filter((x) => !x.ok)) assert.ok(['used', 'none'].includes(c.reason), `run ${run}: ${JSON.stringify(c)}`);
+    assert.deepEqual(openGrants(w.home, w.now), [], `run ${run}: nothing is open`);
+    assert.deepEqual(ticketsOf(w.home), [`${TICKET_KEY}.1.json`], `run ${run}: one ticket`);
+    const records = allRecords(w.home, w.now).filter((r) => r.kind === 'extra-round');
+    assert.equal(records.length, 2, `run ${run}: the click was recorded too`);
+    for (const r of records) assert.ok(spentVerifiable(w.home, r), `run ${run}: ${r.via ?? 'typed'} grant has its own marker (no reader repaired it: settle was false)`);
+  }
+});
+
+test('an old ticket-less claim made while a click was pending, then a re-upgrade (F1): the click is covered by the old claim\'s consumed marker and gets a repair marker copying it; a click answered after the claim is admitted', async (t) => {
+  const w = await roundClick(t);
+  const a = w.answeredAt;
+  const typed = typedGrant(w.home, { atMs: a + 5000 });
+  const claimedAt = a + 10_000;
+  const old = claimGrantMarkers([typed], CBODY, { home: w.home, now: () => claimedAt }); // today's code path: no ticket
+  assert.equal(old.ok, true);
+  assert.deepEqual(ticketsOf(w.home), []);
+  w.t = claimedAt + 1000;
+  assert.equal(only(w.settle(), w)[0].outcome, 'recorded');
+  assert.deepEqual(openGrants(w.home, w.now), [], 'covered by the old claim\'s marker: spent for new readers');
+  const click = w.records().find((r) => r.via === 'ask');
+  const m = spentVerifiable(w.home, click);
+  assert.ok(m, 'the click has its own marker');
+  assert.deepEqual([m.head, m.consumedAt, m.coveredBy, m.repo, m.pr, m.k], [GHEAD, isoOf(claimedAt), grantIdOf(typed), REPO, 58, 4], 'copied from the claim, never now');
+  // a click answered after the claim is a new grant
+  const later = pw(t, { home: w.home, slot: 1, kind: 'round', answer: 'Yes, one more round', shiftMs: 3_600_000 });
+  assert.ok((await later.hook()).pending);
+  later.flush();
+  assert.equal(only(later.settle(), later)[0].outcome, 'recorded');
+  assert.deepEqual(openGrants(w.home, later.now).map((r) => r.via), ['ask'], 'admitted');
+});
+
+test('settle vs claim interleavings: a late click is spent for new readers AND has its own verifiable marker, whichever side goes first', async (t) => {
+  const claimAt = (w) => w.answeredAt + 500;
+  const claim = (w, records, io) => claimGrantMarkers(records, CBODY, { home: w.home, now: () => claimAt(w), ticket: true, io });
+  const variants = {
+    'settled before the snapshot': (w) => { w.settle(); return claim(w, openGrants(w.home, w.now)); },
+    'settled between the snapshot and the claim': (w, typed) => { const snapshot = [typed]; w.settle(); return claim(w, snapshot); },
+    'settled between the ticket and the grant markers': (w, typed) => claim(w, [typed], { afterTicket: () => { w.settle(); } }),
+    'settled after the claim': (w, typed) => { const c = claim(w, [typed]); w.settle(); return c; },
+  };
+  for (const [label, run] of Object.entries(variants)) {
+    const w = await roundClick(t);
+    const typed = typedGrant(w.home, { atMs: w.answeredAt - 5000 });
+    const claimed = run(w, typed);
+    assert.equal(claimed.ok, true, `${label}: ${JSON.stringify(claimed)}`);
+    assert.equal(w.records().filter((r) => r.via === 'ask').length, 1, `${label}: the click was recorded`);
+    assert.deepEqual(openGrants(w.home, w.now), [], `${label}: spent for new readers`);
+    for (const r of allRecords(w.home, w.now)) {
+      const m = spentVerifiable(w.home, r);
+      assert.ok(m, `${label}: ${r.via ?? 'typed'} grant has its own verifiable marker`);
+      assert.deepEqual([m.head, m.coveredBy], [GHEAD, `${TICKET_KEY}.1`], label);
+    }
+  }
+});
+
+test('old-reader compatibility: a covered late click has a spent, verifiable per-grant marker (all the pre-#472 reader checks); with it deleted the next extra-round read repairs it, settle: false does not', async (t) => {
+  const w = await roundClick(t);
+  const typed = typedGrant(w.home, { atMs: w.answeredAt - 5000 });
+  assert.equal(claimGrantMarkers([typed], CBODY, { home: w.home, now: () => w.answeredAt + 500, ticket: true }).ok, true);
+  assert.equal(only(w.settle(), w)[0].outcome, 'recorded');
+  const click = w.records().find((r) => r.via === 'ask');
+  const id = grantIdOf(click);
+  const m = readGrantMarker(id, { home: w.home });
+  assert.equal(m.spent === true && m.verifiable === true, true);
+  const file = join(ownerGoDir(w.home), 'consumed', `${id}.json`);
+  rmSync(file);
+  assert.deepEqual(openGrants(w.home, w.now), [], 'still spent for new readers');
+  assert.equal(existsSync(file), false, 'settle: false repairs nothing');
+  assert.deepEqual(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home: w.home, now: w.now }), [], 'the default read');
+  assert.ok(spentVerifiable(w.home, click), 'repaired by the read');
+  assert.equal(readGrantMarker(id, { home: w.home }).marker.coveredBy, `${TICKET_KEY}.1`);
+});
+
+test('a click grant consumed with a ticket verifies 30 hours later (coverage is never applied in verifyOwnerGrant)', async (t) => {
+  const w = await roundClick(t);
+  assert.equal(only(w.settle(), w)[0].outcome, 'recorded');
+  const [click] = openGrants(w.home, w.now);
+  const claimed = claimGrantMarkers([click], CBODY, { home: w.home, now: w.now, ticket: true });
+  assert.equal(claimed.ok, true, JSON.stringify(claimed));
+  const q = { repo: REPO, pr: 58, k: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(click), quote: click.prompt } };
+  const v = verifyOwnerGrant(q, { home: w.home, now: () => w.t + 30 * 3600_000 });
+  assert.equal(v.ok, true, JSON.stringify(v));
+});
+
+test('strict lookups keep an unresolved round click until its evidence expires (no .settled on time alone): after the grace, after the next settle, with a NEW lookup; another repository or PR never refuses; the switch does not matter', async (t) => {
+  const w = pw(t, { kind: 'round', answer: 'Yes, one more round' });
+  assert.ok((await w.hook()).pending); // never flushed: the transcript has no answer
+  const capturedMs = w.t;
+  const lookups = (ms, over = {}) => ownerGrantLookups({ repo: REPO, pr: 58, home: w.home, now: () => ms, ...over });
+  const state = () => {
+    const item = (id, over = {}) => ({ id, round: 2, bucket: 'SUGGESTION', category: 'docs', title: 'x', file: 'src/a.js', line: 1, detail: 'd', codexReasoning: 'c', testable: false, fingerprint: `fp-${id}`, judge: null, test: { status: 'none', evidence: '' }, arbiter: null, final: { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'r' }, implemented: true, implementedAfterRound: 1, followupIssue: null, ...over });
+    const hash = 'a'.repeat(64);
+    const round = (n, items, over = {}) => ({ n, fromHead: 'f'.repeat(40), toHead: 'e'.repeat(40), contentHashAtToHead: hash, items, ...over });
+    return { pr: 7, maxRounds: 1, currentContentHash: hash, rounds: [round(1, [item('R1-S0', { round: 1, file: 'src/a.js' })]), round(2, [item('R2-S1')], { admission: 'auto-extra' })] };
+  };
+  const config = { risk: { high_risk_paths: [] }, review: { arbiter_always_paths: [] } };
+  const files = [{ oldPath: 'src/a.js', newPath: 'src/a.js', path: 'src/a.js' }];
+  const refusal = (ms, over) => { const l = lookups(ms, over); return deferEligibility(state(), config, files, { grants: l.grants, grantGap: l.grantGap }); };
+  const CLICK = /round ask for #58/;
+  for (const sw of ['off', undefined]) {
+    const run = (fn) => withSwitch(sw, fn);
+    assert.throws(() => run(() => lookups(capturedMs + 1000).grants(3)), CLICK, `fresh (${sw})`);
+    const grace = capturedMs + WAIT_GRACE_MS + 1000;
+    run(() => w.settle({ now: () => grace }));
+    assert.equal(allSettled(w.home).length, 0, 'the grace settles nothing');
+    const refused = run(() => refusal(grace));
+    assert.equal(refused.eligible, false);
+    assert.match(refused.refusals.join(';'), /could not be read[\s\S]*round ask for #58/, `after the grace (${sw})`);
+    assert.deepEqual(run(() => ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home: w.home, now: () => grace })), [], 'and no grant is open');
+    assert.doesNotThrow(() => run(() => lookups(grace, { repo: 'acme/other' }).grants(3)), 'another repository');
+    assert.doesNotThrow(() => run(() => lookups(grace, { pr: 59 }).grants(3)), 'another PR');
+  }
+  const expired = capturedMs + CAPTURE_SKEW_MS + MAX_AGE_MS + 1000;
+  withSwitch('off', () => assert.equal(refusal(expired).eligible, false, 'with the switch off and nothing settled it still refuses until the expiry'));
+  withSwitch(undefined, () => w.settle({ now: () => expired }));
+  assert.deepEqual([settledOf(w)?.outcome, settledOf(w)?.reason], ['refused', 'evidence-expired']);
+  assert.equal(refusal(expired).eligible, true, 'a NEW lookup no longer refuses for it');
 });

@@ -23,7 +23,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { SHARED_FLOOR_DIR, floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
 import { resetFloor } from '../pipeline/lib/model-floor.mjs';
 import { leasesDir } from '../pipeline/lib/review-lease.mjs';
-import { cleanupAtExit, ownerApprovesPast, ownerGrants, ownerRules, pastRoundRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { cleanupAtExit, cleanupRoundClaims, ownerApprovesPast, ownerGrants, ownerRules, pastRoundRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
@@ -4150,6 +4150,8 @@ function ownerGrantsRound(w, t, { pr = 7, k, head, prompt = 'extra round', repo 
   assert.ok(record, 'the recorder wrote the grant');
   cleanupAtExit(markerPath(grantIdOf(record)));
   t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  // #472 (F4): the codex-review that claims the grant also writes a round ticket and sweeps the markers of the round's other grants into the account home: remove exactly those (w.slug is unique to the test).
+  cleanupRoundClaims({ slug: w.slug, pr, k, grantIds: [grantIdOf(record)], t });
   return record;
 }
 const codexThree = (w, from, to, extra = {}) => w.codex(3, findingsOf(), { from, to, ...extra });
@@ -4186,6 +4188,7 @@ test('codex-review owner grant: an "extra round" whose prompt is synthetic or mi
     const record = ownerGrants(t, 'extra round', roundRequest(7, 3, h2, w.slug), undefined, after);
     assert.ok(record, 'the hook could not tell at record time');
     t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+    cleanupRoundClaims({ slug: w.slug, pr: 7, k: 3, grantIds: [grantIdOf(record)], t }); // (the claim below sweeps it: #472 F4)
   }
   const calls = w.captured().length;
   const capped = codexThree(w, h1, h2);
