@@ -196,3 +196,4 @@ full record.
 - 2026-11-16 · #491 · Guard: name walk visits each name once and fails closed; git guard next-command and group restore (#483 #481 #482) · risk high · rounds 8 · arbiter 5 · awaiting-owner-merge · Codex 7d: 12040 runs (11718 high)
 - 2026-11-16 · #488 · test(guard): prove the reading cap refuses early with a virtual clock (Windows timing flake) · risk low · rounds 6 · arbiter 0 · awaiting-owner-merge · Codex 7d: 12307 runs (11974 high)
 - 2026-11-16 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 34 · arbiter 34 (fix-verify 2) · substitute 2 · blocked · Codex 7d: 12501 runs (12165 high)
+- 2026-11-16 · #242 · Queue: refuse pre-switch branches (+ update-branch catch-up), fix queue-guards template, fold #237 #238 #239 and EW #1784 #1785 · risk high · rounds 20 · arbiter 20 (fix-verify 2) · substitute 1 · blocked · Codex 7d: 12765 runs (12416 high)
