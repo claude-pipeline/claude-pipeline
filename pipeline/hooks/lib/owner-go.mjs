@@ -55,6 +55,13 @@ export { accountHome };
 
 export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
 
+// Why (#472): readRecords settles pending clicks (owner-go-click.mjs settlePendingClicks) unless the caller says `settle: false` (the read-only paths: the merge dry run's gate, click replay).
+// `settle: true` forces it. Otherwise the environment switch PIPELINE_CLICK_SETTLE=off, which the test runner and the test helpers set, turns it off, so a test can never settle the owner's real
+// pending clicks. Already recorded clicks still count: the switch only stops pending clicks from becoming records through the readers. Strict lookups still see unresolved round clicks, so
+// setting it never widens what is approved. The environment is the agent's own word (lib/paths.mjs), so it gates NOTHING but this: a consumption write (a spent marker, a round-claim sweep or
+// repair) is never gated by it.
+export const settleEnabled = (settle, env = process.env) => settle === true || (settle !== false && env.PIPELINE_CLICK_SETTLE !== 'off');
+
 // The words that may follow "merge" in an approval besides its targets (#N, N, a head prefix).
 const FILLER = /^(?:and|it|both|all|them|these|those|please|pls|now|go|ok|okay|thanks|thank|you|thx|ty)$/i;
 

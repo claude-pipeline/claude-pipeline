@@ -14,6 +14,10 @@ import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
 import { accountHome, areasBlock, ownerGoDir, recordApproval, recordPastRoundGrant, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
 
+// #472: the owner-go readers settle pending clicks, and this folder is the account's real one. A test that reads through the default home must never settle the owner's real pending clicks, so importing
+// this helper turns settling off for the process (scripts/test.mjs does the same for every test file; this covers a file run on its own). Already recorded clicks still count; a test of settling asks with `settle: true`.
+process.env.PIPELINE_CLICK_SETTLE = 'off';
+
 const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
 // What Claude Code writes on a prompt entry the owner typed (#128): the use-time provenance check accepts a record only for such an entry.
