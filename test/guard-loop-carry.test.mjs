@@ -294,7 +294,14 @@ test('#352 R37-F1: a script / package script that ends in a redirected or condit
     cwd: '/work/other', home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', files),
   });
   const files = (body) => ({ 'reset.sh': `#!/bin/bash\n${body}\n`, 'package.json': JSON.stringify({ name: 'x', scripts: { reset: body, other: 'echo hi' } }) });
-  for (const body of ['git switch agent/x > /missing/f', 'git switch agent/x 2>/dev/null', 'false && git switch agent/x']) {
+  // (#352 R37-F1, same root: a switch that only a branch body made (if / elif / else / case, a function body, a loop over words not named) is as unsettled when the text ends)
+  const bodies = [
+    'git switch agent/x > /missing/f', 'git switch agent/x 2>/dev/null', 'false && git switch agent/x',
+    'if [ -f x ]; then git switch agent/x; fi', 'if [ -f x ]; then :; elif [ -f y ]; then git switch agent/x; fi', 'if [ -f x ]; then :; else git switch agent/x; fi',
+    'case "$1" in a) git switch agent/x;; esac', 'if [ -f x ]; then true && git switch agent/x; fi', 'f() { git switch agent/x; }',
+    'for b in $(ls); do git switch agent/x; done', 'while [ -f x ]; do git switch agent/x; done', 'for b in agent/x agent/x; do [ -f x ] && git switch $b; done',
+  ];
+  for (const body of bodies) {
     for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
       for (const sep of [';', '&&']) {
         const r = at(`${caller} ${sep} ${PB} origin HEAD`, files(body));
@@ -303,11 +310,13 @@ test('#352 R37-F1: a script / package script that ends in a redirected or condit
       }
     }
   }
-  // (twin: the same script with a plain switch hands it over)
-  for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
-    for (const sep of [';', '&&']) {
-      const r = at(`${caller} ${sep} ${PB} origin HEAD`, files('git switch agent/x'));
-      assert.equal(r.decision, 'allow', `twin ${what} ${sep}: ${r.reason}`);
+  // (twins: the same script with a plain switch hands it over, and so does a loop over a literal non-empty list of words (its body surely ran))
+  for (const body of ['git switch agent/x', 'for b in agent/x agent/x; do git switch $b; done']) {
+    for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
+      for (const sep of [';', '&&']) {
+        const r = at(`${caller} ${sep} ${PB} origin HEAD`, files(body));
+        assert.equal(r.decision, 'allow', `twin ${what} ${sep} \`${body}\`: ${r.reason}`);
+      }
     }
   }
 });
