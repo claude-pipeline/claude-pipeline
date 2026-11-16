@@ -5445,7 +5445,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // R4-F2: ~u (and ~$USER) is home, ~+ is each directory the command may be in, ~- and any other ~NAME are only known at run time (a hit: this is asked of commands that are not read-only)
   const couldNameHome = (x) => {
     if (/[$`*?[{~]/.test(x)) return true;
-    const chain = ctx.homePosix.split('/').filter(Boolean).map((s) => (ctx.ci ? s.toLowerCase() : s));
+    const chain = unique([ctx.homePosix, realResolve(ctx.homePosix, ctx.api)]).flatMap((h) => h.split('/').filter(Boolean)).map((s) => (ctx.ci ? s.toLowerCase() : s)); // (the lexical and the resolved home, as homeChain reads them)
     return x.split('/').some((s) => s === '.' || s.includes('..') || chain.includes(ctx.ci ? s.toLowerCase() : s));
   };
   const homeWord = (word, wdirs = dirs, cname = '', unknownWd = false) => {

@@ -205,6 +205,13 @@ describe('#307: a directory only known at run time denies only the words that co
   home('env -C "$X" rm -rf u');
   home('env -C "$X" rm -rf home/u');
   home('env -C "$X" rm -rf "$Y"');
+  // R1-B1: a symlinked home (/home/u -> /data/alice): a word that is a segment of the RESOLVED path names home from a run-time directory too
+  test('symlinked home: a relative word equal to a segment of the resolved home is refused', () => {
+    const real = (p) => (p === HOME ? '/data/alice' : p.startsWith(HOME + '/') ? '/data/alice' + p.slice(HOME.length) : p);
+    const r = evaluateBashForFiles('env -C "$BASE" rm -rf alice', { ...FBASE, realpath: real });
+    assert.equal(r.decision, 'deny', r.reason);
+    assert.match(r.reason, HOMEWHY);
+  });
 });
 
 // Over-denial guard: ordinary work stays allowed after every change above.
