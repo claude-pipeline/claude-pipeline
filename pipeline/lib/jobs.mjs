@@ -235,7 +235,7 @@ function fullOutput(jobDir, exit) {
   }
 }
 
-function snapshot(jobDir, expectRunId, { full = false } = {}) {
+function takeSnapshot(jobDir, expectRunId, { full = false } = {}) {
   const meta = readJson(path.join(jobDir, 'meta.json'));
   if (!meta) return { state: 'missing' };
   if (expectRunId !== undefined && meta.runId !== expectRunId) return { state: 'replaced' };
@@ -261,6 +261,20 @@ function snapshot(jobDir, expectRunId, { full = false } = {}) {
     tail: tailOf(jobDir),
     ...(full ? fullOutput(jobDir, exit) : {}),
   };
+}
+
+// A finished job's directory can be cleared and refilled by a new run (startJob) while we read it by pathname. takeSnapshot checks the run id once, up front, so after its
+// exit / tail / stdout reads the meta.json is read again: another run id, or none, means those reads may belong to a different run. With expectRunId that answers 'replaced';
+// without one the snapshot is retaken once, and a directory that changed again answers 'replaced' too.
+function snapshot(jobDir, expectRunId, opts) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const s = takeSnapshot(jobDir, expectRunId, opts);
+    if (s.runId === undefined) return s; // missing / replaced: nothing was read beyond meta.json
+    const again = readJson(path.join(jobDir, 'meta.json'));
+    if (again && (again.runId ?? null) === s.runId) return s;
+    if (expectRunId !== undefined) return { state: 'replaced' };
+  }
+  return { state: 'replaced' };
 }
 
 export function readJob(name, opts = {}) {
