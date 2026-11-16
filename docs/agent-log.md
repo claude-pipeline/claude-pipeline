@@ -193,3 +193,4 @@ full record.
 - 2026-11-16 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 32 · arbiter 32 (fix-verify 1) · substitute 1 · needs-human · Codex 7d: 11874 runs (11571 high)
 - 2026-11-16 · #489 · Review brakes: fix-scope check, post-limit follow-ups, round trip-wire (#374 PR B) · risk high · rounds 7 · arbiter 5 · awaiting-owner-merge · Codex 7d: 11874 runs (11571 high)
 - 2026-11-16 · #474 · Fewer controller turns per review round: round codex (background) + round publish, job full stdout, review skill split · risk high · rounds 15 · arbiter 11 · substitute 2 · awaiting-owner-merge · Codex 7d: 12008 runs (11696 high)
+- 2026-11-16 · #491 · Guard: name walk visits each name once and fails closed; git guard next-command and group restore (#483 #481 #482) · risk high · rounds 8 · arbiter 5 · awaiting-owner-merge · Codex 7d: 12040 runs (11718 high)
