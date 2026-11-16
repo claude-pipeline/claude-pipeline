@@ -242,8 +242,10 @@ async function raceReadFull(t, extraArgs, runIdOfA = 'run-A') {
   const opening = open(fifo, 'w');
   const writer = await Promise.race([opening, closed.then(() => null)]);
   if (writer === null) {
-    closeSync(openSync(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK)); // frees the blocked open (and its libuv thread)
+    // Frees the blocked open (and its libuv thread). The reader is held until the open settles: closing it at once could leave a worker that has not entered open() yet blocked for good.
+    const reader = openSync(fifo, fsConstants.O_RDONLY | fsConstants.O_NONBLOCK);
     await opening.then((h) => h.close(), () => {});
+    closeSync(reader);
     assert.fail(`the reader child exited before it opened the capture: ${out}`);
   }
   writeFileSync(join(dir, 'meta.json'), meta('run-B'));
