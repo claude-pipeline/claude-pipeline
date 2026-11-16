@@ -779,7 +779,7 @@ const roundsAwaitingFixReview = (rounds) => {
   return out;
 };
 
-const isNewAccept = (item) => item.final?.decision === 'ACCEPT' && item.final.by !== 'cache';
+export const isNewAccept = (item) => item.final?.decision === 'ACCEPT' && item.final.by !== 'cache';
 const isUnimplementedAccept = (item) => item.final?.decision === 'ACCEPT' && !item.implemented;
 const isOpenBlocking = (item) => item.bucket === 'BLOCKING' && (!item.final || isUnimplementedAccept(item));
 

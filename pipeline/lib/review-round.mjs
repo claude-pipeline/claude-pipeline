@@ -190,6 +190,34 @@ export function defaultRoundRange({ root, config, ctx, pr, state }) {
   return { base: requiredBase(state, forkPoint), head };
 }
 
+// Which review base and kind a round would get (the classification admitRound makes; the cap and the written artifacts are not part of it, so the display paths
+// - `codex-review --plan`'s siblings and `triage round-request`'s prediction - call it too). `trusted`: the PR targets the trusted default branch (only then are the base
+// branch's commits left out); `escalated`: a judge PR that now needs Fable (reviews the whole PR); `tryResolution`: the resolution-only proof, run only when the
+// trial merge fell back to whole-PR. Reads git; writes at most the trial merge's objects, no ref and no state.
+// -> { review: {base, kind}, resolution (the proven resolution | null), resolutionIneligible (the proof's refusal, when it was tried and refused) }
+export function classifyReview({ state, wholePr, base, forkPoint, trusted, escalated = false, tryResolution }, o) {
+  let review = { base: forkPoint, kind: 'merge-base' };
+  let resolution = null;
+  let resolutionIneligible;
+  if (state?.rounds.length > 0 && !wholePr) {
+    review = trusted ? effectiveReviewBase({ from: base, forkPoint }, o) : { base, kind: 'previous' };
+    if (review.kind === 'whole-pr') {
+      const found = tryResolution();
+      if (found.ineligible === undefined) {
+        resolution = found;
+        review = { base: found.base, kind: 'resolution' };
+      } else {
+        resolutionIneligible = found.ineligible;
+      }
+    }
+  }
+  if (escalated) {
+    review = { base: forkPoint, kind: 'whole-pr' };
+    resolution = null;
+  }
+  return { review, resolution, resolutionIneligible };
+}
+
 // Phase one. `base` and `head` are full SHAs (head is the checked-out HEAD). Returns the admitted round (opaque to the caller except
 // for these fields): { state, view, slug, ghRepo, forkPoint, level, rated, lane, fable, lightLane, review: {base, kind}, resolution,
 // resolutionOnly, resolutionView, resolutionIneligible, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
@@ -242,29 +270,13 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // two sides had, the range is the resolution alone and the round is free of the cap (resolutionReviewBase has every rule).
   const baseBranchRef = reviewBaseRef(root, config, prBase);
   c.tryResolution = () => resolutionReviewBase({ from: base, forkPoint, head, baseRef: baseBranchRef }, o);
-  let review = { base: forkPoint, kind: 'merge-base' };
-  let resolution = null;
-  if (state?.rounds.length > 0 && !wholePr) {
-    review = prBase === rated.defaultBranch && rated.untrusted === null
-      ? effectiveReviewBase({ from: base, forkPoint }, o)
-      : { base, kind: 'previous' };
-    if (review.kind === 'whole-pr') {
-      const found = c.tryResolution();
-      if (found.ineligible === undefined) {
-        resolution = found;
-        review = { base: found.base, kind: 'resolution' };
-      } else {
-        c.resolutionIneligible = found.ineligible;
-      }
-    }
-  }
   // A PR the judge has been reviewing that now needs Fable (it gained a hit or a sensitive path, or grew past risk.high_lines): this round reviews the
   // WHOLE PR, so the Fable pass sees everything the judge-only rounds covered (never a resolution-only round: that is a slice by definition).
   const escalated = state?.rounds.length > 0 && state.reviewer === 'judge' && lane.reviewer === 'fable';
-  if (escalated) {
-    review = { base: forkPoint, kind: 'whole-pr' };
-    resolution = null;
-  }
+  const { review, resolution, resolutionIneligible } = classifyReview({
+    state, wholePr, base, forkPoint, trusted: prBase === rated.defaultBranch && rated.untrusted === null, escalated, tryResolution: c.tryResolution,
+  }, o);
+  c.resolutionIneligible = resolutionIneligible;
   const resolutionOnly = resolution !== null;
   // Large binary documents would overflow the buffer; they are named at the end of the patch and in the prompt instead.
   const { patch, skipped: largeBinaries } = reviewPatch(review.base, head, o);
@@ -555,7 +567,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
     // maxRisk is read from the state as it was BEFORE this round overwrites state.risk (a legacy state without maxRisk starts it from what it recorded).
     const next = addRound({ ...base0, ...(fresh ? { maxRisk: maxRiskOf(fresh) } : {}), risk: adm.level, lightLane: reviewer === 'fable' ? false : adm.lightLane, reviewer, currentContentHash: adm.hashAtHead }, {
       n: round, fromHead: base, toHead: head, contentHashAtToHead: adm.hashAtHead, items: ruled, risk: adm.level,
-      reviewBase: adm.review.base, reviewBaseKind: adm.review.kind, forkPoint: adm.forkPoint, trustedConfigSha: adm.trustedConfigSha, ...roundFields, ...(adm.baseOnly ? { baseOnly: true } : {}),
+      reviewBase: adm.review.base, reviewBaseKind: adm.review.kind, ...(adm.resolutionIneligible === undefined ? {} : { resolutionIneligible: String(adm.resolutionIneligible).split(':')[0] }), forkPoint: adm.forkPoint, trustedConfigSha: adm.trustedConfigSha, ...roundFields, ...(adm.baseOnly ? { baseOnly: true } : {}),
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => i.id) } : {}),
       ...(adm.wholePr ? { wholePr: true } : {}),

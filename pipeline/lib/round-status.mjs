@@ -1,13 +1,16 @@
 // The review's status as the owner reads it: how many rounds ran, what they cost, which items are open and how serious, why the review is not clean. One gatherer
 // feeds both the extra-round ask (`triage round-request`) and the park comment (`comment --kind needs-human`), so the two cannot drift. Display only: nothing here decides
 // anything. Untrusted text (titles, categories) goes through asciiLine inside round-ask.mjs.
-import { diffFiles, git, revParse } from './git.mjs';
+import { diffFiles, git, mergeBase, resolutionReviewBase, revParse } from './git.mjs';
 import { trustedBase } from './risk.mjs';
 import { diffStats } from './diff.mjs';
 import { costFrom, notCleanReasons, openItems, roundsFrom, statusLines } from './round-ask.mjs';
+const plural = (n, one) => `${n} ${n === 1 ? one : `${one}s`}`;
 import { currentContentHash, refreshBaseRef, reviewBaseRef } from './review-context.mjs';
 import { readSummaryComment } from './summary-comment.mjs';
 import { asciiLine, roundOutcome } from './triage.mjs';
+import { classifyReview, requiredBase } from './review-round.mjs';
+import { wholePrOwed } from './review-route.mjs';
 
 // The config committed at the default branch's fork point (the trusted one rateBranch also reads: risk.mjs#trustedBase, anchored on the remote's default branch, not the
 // working-tree config), for the union of the sensitive-path lists: a PR must not shrink its own list.
@@ -79,6 +82,58 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
   if (diff.problem && open.length > 0) warnings.push(`the reviewed diff could not be read (${diff.problem}): every open item is shown as high`);
   const notClean = notCleanReasons(outcome, since.changed);
   return { outcome, rounds, cost, diff, since, open, notClean, trusted };
+}
+
+// What the next review round would be, so the owner sees what the extra round buys BEFORE asking for it (display only: it decides nothing, `codex-review` decides the real
+// round). It uses the same classification admitRound makes (review-round.mjs#classifyReview: the review base and kind, the resolution-only proof) without the cap, without
+// writing a review artifact and without touching a grant; git writes at most the trial merge's objects. A judge-to-Fable escalation and a PR that targets another branch than the
+// default are not modelled (the real round may be a whole-PR one then).
+// -> { nextRound: { prediction: true, previousClean, sinceReviewed: {merges, ownCommits}, kind, resolutionIneligible?, alternative? }, lines: ['Prediction: ...'] }. Throws on a git failure:
+// the caller turns that into a warning.
+export function predictNextRound({ root, config, state, head }) {
+  const o = { cwd: root };
+  const last = state.rounds.at(-1);
+  if (last === undefined || typeof last.toHead !== 'string' || last.toHead === '') throw new Error('no round to predict from');
+  const anchor = revParse(last.toHead, o);
+  const headFull = revParse(head, o);
+  const previousClean = roundOutcome({ ...state, currentContentHash: last.contentHashAtToHead }).clean;
+  let merges = 0;
+  let ownCommits = 0;
+  for (const line of git(['rev-list', '--first-parent', '--parents', headFull, `^${anchor}`], o).split('\n').filter(Boolean)) {
+    if (line.split(' ').length > 2) merges += 1;
+    else ownCommits += 1;
+  }
+  const baseRef = reviewBaseRef(root, config);
+  const forkPoint = mergeBase(baseRef, headFull, o);
+  const base = requiredBase(state, forkPoint);
+  const { review, resolutionIneligible } = classifyReview({
+    state, wholePr: wholePrOwed(state), base, forkPoint, trusted: true,
+    tryResolution: () => resolutionReviewBase({ from: base, forkPoint, head: headFull, baseRef }, o),
+  }, o);
+  const baseOnly = review.kind === 'synthetic' && git(['diff', '--name-only', `${review.base}..${headFull}`], o) === '';
+  const kind = baseOnly ? 'base-only' : review.kind;
+  const nextRound = { prediction: true, previousClean, sinceReviewed: { merges, ownCommits }, kind };
+  if (resolutionIneligible !== undefined) nextRound.resolutionIneligible = asciiLine(resolutionIneligible, 160);
+  if (previousClean && ownCommits > 0) {
+    nextRound.alternative = merges === 0
+      ? `revert the ${plural(ownCommits, 'own commit')} since the last reviewed head (newest first); that restores the reviewed content and needs no round`
+      : `revert the ${plural(ownCommits, 'own commit')} since the last reviewed head (newest first); a free base-only recording still follows because the default branch was merged in`;
+  }
+  const words = {
+    'base-only': 'base-only: only the default branch was merged in, free, no Codex, not counted',
+    resolution: 'resolution-only: a real review of the conflict resolution, not counted, no owner grant',
+    previous: 'a counted round on the commits since the last reviewed head',
+    synthetic: 'a counted round on the changes since the last reviewed head (the new default branch merged into it)',
+    'merge-base': 'a counted whole-PR round',
+    'whole-pr': 'a counted whole-PR round',
+  }[kind] ?? `a ${kind} round`;
+  const lines = [
+    `Prediction: the previous round was ${previousClean ? '' : 'not '}clean.`,
+    `Prediction: ${plural(merges, 'merge commit')} and ${plural(ownCommits, 'own commit')} since the last reviewed head.`,
+    `Prediction: the next round would be ${words}${nextRound.resolutionIneligible ? `; the conflict resolution could not be reviewed alone (${nextRound.resolutionIneligible})` : ''}.`,
+    ...(nextRound.alternative ? [`Prediction: No-round alternative: ${nextRound.alternative}.`] : []),
+  ];
+  return { nextRound, lines: lines.map((l) => asciiLine(l, 400)) };
 }
 
 const SEVERITY_WARNING = /^(severity could not be judged|the reviewed diff could not be read)/;

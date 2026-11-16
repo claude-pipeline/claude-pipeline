@@ -26,7 +26,7 @@ export const meta = {
   summary: 'run Codex\'s review round (codex) or the publish half of a round (publish) as one command',
   usage: [
     'pipeline round codex --pr N --round R [--base B] [--head H] [--max-minutes M] [--repo DIR]   (M default 60, max 120)   RUN IT IN THE BACKGROUND (Bash run_in_background): it waits for Codex',
-    '  -> exit 0 {ok, codex:{counts, codexPath, baseOnly?, resolutionOnly?, fromState?}, reviewer, arbiter?}   arbiter: the JSON of `arbiter needed --pr N --round R` verbatim, run once when reviewer is fable and the round has no arbiter record',
+    '  -> exit 0 {ok, codex:{counts, codexPath, baseOnly?, resolutionOnly?, reviewKind?, resolutionIneligible?, fromState?}, reviewer, arbiter?}   reviewKind = what the round reviewed (merge-base | previous | synthetic | resolution | whole-pr; synthetic with no change of its own is baseOnly), resolutionIneligible = why the free resolution-only round was refused (the short code, e.g. history-nonmerge), display only   arbiter: the JSON of `arbiter needed --pr N --round R` verbatim, run once when reviewer is fable and the round has no arbiter record',
     '     (with an arbiter record: arbiterState:{recorded, proofOk}; `arbiter needed` is not a read, so it is not called again)',
     '  -> a failed `arbiter needed` (non-zero exit or no JSON): {ok:false, step:"arbiter-needed", error, result:<its JSON>, codex, reviewer} with the step\'s exit code (error copied from the child; same shape as round publish), e.g. stale-terminal with restartRequired',
     '  -> exit 0 {ok, state:"running", next:"rerun round codex"}: still running after M minutes; the same command adopts the same job',
@@ -135,6 +135,7 @@ function reportFromState(root, state, round) {
     codex: {
       counts: countsFromState(r), codexPath: roundDir(root, round), fromState: true,
       ...(r.baseOnly ? { baseOnly: true } : {}), ...(r.resolutionOnly ? { resolutionOnly: true } : {}),
+      ...(typeof r.reviewBaseKind === 'string' ? { reviewKind: r.reviewBaseKind } : {}), ...(typeof r.resolutionIneligible === 'string' ? { resolutionIneligible: r.resolutionIneligible } : {}),
     },
     reviewer: state.reviewer,
   };
@@ -146,6 +147,7 @@ function reportFromOutput(json) {
     codex: {
       counts: json.counts, codexPath: json.path,
       ...(json.baseOnly ? { baseOnly: true } : {}), ...(json.resolutionOnly ? { resolutionOnly: true } : {}),
+      ...(typeof json.reviewKind === 'string' ? { reviewKind: json.reviewKind } : {}), ...(typeof json.resolutionIneligible === 'string' ? { resolutionIneligible: json.resolutionIneligible } : {}),
     },
     reviewer: json.reviewer,
     ...(Array.isArray(json.warnings) && json.warnings.length > 0 ? { warnings: json.warnings } : {}),

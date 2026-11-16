@@ -20,10 +20,10 @@ import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
-import { askSummary, processReviewSummary, roundsFrom } from '../lib/round-ask.mjs';
+import { askSummary, longReviewOf, processReviewSummary, roundsFrom } from '../lib/round-ask.mjs';
 import { postMaxApply, fixRoundScope } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
-import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
+import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
 import { roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
@@ -965,27 +965,44 @@ async function roundRequest(rest, ctx) {
     // Everything below is display only: a failure in it is a warning, never a refusal and never a missing line (Codex R2 P2-4).
     const warnings = [];
     let shown = {};
+    let longReview = null; // counted round 6 or later: the last rounds' findings and the blocking-loop flag (round-ask.mjs#longReviewOf)
+    try {
+      longReview = longReviewOf(state, k);
+    } catch (err) {
+      warnings.push(`the long-review view could not be built (${asciiLine(err?.message, 160)})`);
+    }
     try {
       // The follow-up recommendation uses the STRICT lookups (an unreadable record refuses it, as defer-fixes does); the admission check above stays tolerant.
       const strict = ownerGrantLookups({ repo: slug, pr });
-      shown = roundAskFields({ root, config, state, pr, gh, head, grants: asGrants(strict.grants), grantGap: strict.grantGap, warnings });
+      shown = roundAskFields({ root, config, state, pr, gh, head, grants: asGrants(strict.grants), grantGap: strict.grantGap, warnings, longReview });
     } catch (err) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
+    // What the next round would be (display only; a failure is a warning). Its lines go in the summary the reply pastes, on every path below, the trip-wire's too.
+    let nextRound;
+    let prediction = [];
+    try {
+      ({ nextRound, lines: prediction } = predictNextRound({ root, config, state, head }));
+    } catch (err) {
+      warnings.push(`the next-round prediction could not be computed (${asciiLine(err?.message, 160)})`);
+    }
+    if (prediction.length > 0) shown = { ...shown, summary: [shown.summary, ...prediction].filter(Boolean).join('\n') };
     // The trip-wire (#374 PR B): a prompt before another round, never a refusal of the owner's own words. Tripped without --after-process-review: no line, no ask file.
-    const { wire, processReview } = tripWireOf({ state, config, root, head, k, shown });
+    const tripped = tripWireOf({ state, config, root, head, k, shown, longReview });
+    const { wire } = tripped;
+    const processReview = tripped.processReview === null || prediction.length === 0 ? tripped.processReview : { ...tripped.processReview, summary: [tripped.processReview.summary, ...prediction].join('\n') };
     if (wire.tripped && values['after-process-review'] !== true) {
-      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, warnings } };
+      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, ...(longReview === null ? {} : { longReview }), ...(nextRound === undefined ? {} : { nextRound }), warnings } };
     }
     // (#261) click-to-approve: --ask also writes the dialog's ask file (the question text is exactly the line); it never changes the display fields above.
     const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line }), ctx }) : {};
-    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
+    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, ...(nextRound === undefined ? {} : { nextRound }), warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
   }, pr));
 }
 
 // The round trip-wire (lib/triage.mjs#roundTripWire) with the SMALLER of each setting in the working-tree and the fork-point config (a PR must not loosen its own wire; an unreadable
 // fork-point config leaves the working-tree one). A wire that cannot be computed is not tripped: it is a prompt, and a broken one must never be what blocks the owner's own ask.
-function tripWireOf({ state, config, root, head, k, shown }) {
+function tripWireOf({ state, config, root, head, k, shown, longReview }) {
   try {
     const fork = state.rounds.findLast((r) => typeof r.forkPoint === 'string');
     const read = fork === undefined ? { ok: false } : baseConfigAt(fork.forkPoint, root);
@@ -998,7 +1015,7 @@ function tripWireOf({ state, config, root, head, k, shown }) {
       const last = state.rounds.findLast(countsTowardCap);
       if (last !== undefined) fixScope = fixRoundScope({ files: diffFiles(last.toHead, head, { cwd: root }), configs });
     } catch { /* not measured: the line is left out */ }
-    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k }) };
+    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k, longReview, recommend: shown.recommend }) };
   } catch {
     return { wire: { tripped: false, reviewed: 0, max: null, acceptsByRound: [], reasons: [] }, processReview: null };
   }
@@ -1006,7 +1023,7 @@ function tripWireOf({ state, config, root, head, k, shown }) {
 
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be
 // confirmed as the owner's). A lookup that fails here degrades to a warning and the extra-round recommendation: it never loses the ask (`defer-fixes` itself refuses on it).
-function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings }) {
+function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings, longReview = null }) {
   const { rounds, cost, diff, since, open, notClean, trusted } = gatherRoundStatus({ root, config, state, pr, gh, warnings });
   let follow;
   try {
@@ -1033,8 +1050,8 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, w
   }
   if (follow.eligible && since.anchor === null) follow = { ...follow, eligible: false, refusals: ['the commits since the last review could not be listed'] };
   const discard = { anchor: since.anchor, count: since.count, commits: since.commits };
-  const { summary, why } = askSummary({ rounds, cost, open, notClean, follow, discard });
-  return { rounds, cost, open, notClean, recommend: follow.eligible ? 'follow-up' : 'extra-round', why, discard, summary };
+  const { summary, why, recommended } = askSummary({ rounds, cost, open, notClean, follow, discard, longReview });
+  return { rounds, cost, open, notClean, recommend: follow.eligible ? 'follow-up' : 'extra-round', why, discard, summary, ...(longReview === null ? {} : { longReview: { ...longReview, recommended } }) };
 }
 
 // `defer-fixes`: the safe alternative to an extra round when what is left is only low-severity accepted fixes (plan 2026-11-11-round-discipline-one-implementer.md, Item 1b).
