@@ -420,7 +420,7 @@ export async function recordClick(input, { home = accountHome(), now = Date.now,
     // the dialog-hook check only runs when it can matter: a replay (the marker exists) and a superseded ask never need it, as before
     const spent = readSpent(askId, home);
     if (spent.state === 'bad') return { refused: 'spent' };
-    const hc = spent.state === 'none' && !marked(askId, 'superseded', home) ? await hookCheck({ home, input }) : null;
+    const hc = spent.state === 'none' && !supersededBefore(askId, Date.parse(ev.answeredAt), { home }) ? await hookCheck({ home, input }) : null;
     const { retry: _retry, ...out } = admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home });
     return out;
   } catch {
@@ -453,21 +453,27 @@ function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home
   const spent = readSpent(askId, home);
   if (spent.state === 'bad') return { refused: 'spent', retry: true };
   if (spent.state === 'ok') return finishReplay({ spent: spent.marker, ask, clickId, ev, session, cwd, home, transcriptPath, io });
-  if (marked(askId, 'superseded', home)) return { refused: 'superseded' };
+  if (supersededBefore(askId, Date.parse(ev.answeredAt), { home })) return { refused: 'superseded' };
   if (!hc?.ok) return { refused: hc?.reason ?? 'dialog-hooks' };
   if (ask.hookLayersSha256 !== null && hc.hookLayersSha256 !== ask.hookLayersSha256) return { refused: 'dialog-hooks-changed' };
 
   const mapped = answerText(ask, ev.answer);
   if (mapped.error) return { refused: mapped.error };
   const marker = { v: 1, askId, clickId, toolUseId, answeredAt: ev.answeredAt, dialogSha256: ask.dialogSha256, producerVersion: ev.version, hookLayersSha256: hc.hookLayersSha256 ?? null, session, declined: mapped.declined !== undefined };
+  // The exclusive create decides who consumes the ask. Losing it to the SAME click (a hook retried, a second settler) is a replay: the winner's marker is read back and the click is finished from it.
+  const lost = () => {
+    const again = readSpent(askId, home);
+    return again.state === 'ok' ? finishReplay({ spent: again.marker, ask, clickId, ev, session, cwd, home, transcriptPath, io }) : { refused: 'spent', ...(again.state === 'bad' ? { retry: true } : {}) };
+  };
   if (mapped.declined !== undefined) {
     const made = write(askFile(askId, 'spent', home), marker, home);
-    return made === 'ok' ? { declined: mapped.declined } : { refused: made === 'exists' ? 'spent' : 'write-failed', ...(made === 'exists' ? {} : { retry: true }) };
+    return made === 'ok' ? { declined: mapped.declined } : made === 'exists' ? lost() : { refused: 'write-failed', retry: true };
   }
   const bound = bindAnswer(ask, mapped.text, ev.question);
   if (bound.error) return { refused: bound.error }; // (nothing consumed: the owner can answer the same dialog again, or type)
   const made = write(askFile(askId, 'spent', home), marker, home);
-  if (made !== 'ok') return { refused: made === 'exists' ? 'spent' : 'write-failed', ...(made === 'exists' ? {} : { retry: true }) };
+  if (made === 'exists') return lost();
+  if (made !== 'ok') return { refused: 'write-failed', retry: true };
   const record = append(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: ev.answeredAt, ask: { askId, toolUseId, clickId } }));
   return record === null ? { refused: 'record-write-failed', retry: true } : { recorded: record, kind: ask.kind };
 }
@@ -538,6 +544,136 @@ function capturePending({ ask, askId, session, toolUseId, transcriptPath, cwd, h
   const marker = { v: 1, askId, clickId, session, toolUseId, transcriptPath, cwd, hookLayersSha256: hc.hookLayersSha256 ?? null, capturedAt: new Date(now()).toISOString() };
   const made = writeExclusive(file, marker, home);
   return made === 'ok' || made === 'exists' ? result : { refused: 'write-failed' };
+}
+
+// ---- settling (#472) ------------------------------------------------------------------------------------------------------------------------
+
+// The click hook is installed with `timeout: OWNER_GO_TIMEOUT_S` = 10 s (installer.mjs), and the #472 trace stamps the answer's result and the hook's attachments with the same millisecond, so the
+// hook runs within seconds of the answer: 15 s covers the installed timeout. A test pins it. The check is capturedAt - 15 s <= answeredAt <= capturedAt + 15 s; its upper half is what the
+// evidence expiry (capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS) relies on: no admitted answer is later than that bound minus 24 h, so no grant it could become is usable after the expiry.
+export const CAPTURE_SKEW_MS = 15 * 1000;
+// Scheduling only, never evidence: a unit captured longer ago than this goes to the back of the retry queue. Nothing is refused or settled on time alone but the evidence expiry.
+export const WAIT_GRACE_MS = 10 * 60 * 1000;
+export const SETTLE_SCAN_BUDGET = 32; // transcript scans (clickEvidence calls) one settlePendingClicks call makes
+const SETTLED_OUTCOMES = Object.freeze(['recorded', 'declined', 'refused']);
+
+// Why (#472): whether the ask was superseded BEFORE the answer, which is what the answer is judged by. A click settled long after it was made must not be refused because a newer dry run issued a
+// fresh ask afterwards (the owner had answered the then-current dialog), and must not be admitted because nobody settled it before the supersession. No marker -> false. A marker whose superseding ask
+// was issued at or before the answer, an unreadable marker, or a superseding ask that cannot be read -> true (equal timestamps and unreadable metadata count as superseded: prefer a false refusal).
+export function supersededBefore(askId, answeredAtMs, { home = accountHome() } = {}) {
+  const r = readSmallJson(askFile(askId, 'superseded', home));
+  if (r.state === 'none') return false;
+  const by = r.value?.supersededBy;
+  if (r.state !== 'ok' || r.value?.v !== 1 || r.value.askId !== askId || !ASK_ID_RE.test(String(by)) || !Number.isFinite(answeredAtMs)) return true;
+  const next = readAsk(by, { home });
+  return !next.ok || Date.parse(next.ask.issuedAt) <= answeredAtMs;
+}
+
+// A pending pointer read back and validated: { pending } with `capturedMs` added, or { bad: true }. The clickId must be the hash of the pointer's own fields and the name's (T3), and `capturedAt`
+// a finite UTC time not in the future beyond the skew the readers allow.
+function readPending(name, home, nowMs) {
+  const m = PENDING_RE.exec(name);
+  const r = readSmallJson(path.join(asksDir(home), name));
+  const v = r.value;
+  if (m === null || r.state !== 'ok' || !isObj(v) || v.v !== 1 || v.askId !== m[1] || v.clickId !== m[2] || typeof v.session !== 'string' || !SESSION_RE.test(v.session)
+    || typeof v.toolUseId !== 'string' || !/^[A-Za-z0-9_-]{1,128}$/.test(v.toolUseId) || clickIdOf(v.session, v.toolUseId, v.askId) !== v.clickId || typeof v.transcriptPath !== 'string'
+    || (v.cwd !== null && typeof v.cwd !== 'string') || (v.hookLayersSha256 !== null && typeof v.hookLayersSha256 !== 'string')) return { bad: true };
+  const capturedMs = isoMs(v.capturedAt);
+  return Number.isFinite(capturedMs) && capturedMs <= nowMs + FUTURE_SKEW_MS ? { pending: { ...v, capturedMs } } : { bad: true };
+}
+
+let settling = false;
+
+// Why (#472, the deferred half of the click recorder): verifies pending clicks from the transcript NOW, when a consumer is about to look for owner-go records, and turns each into exactly the record
+// the immediate path writes (the same clickEvidence, evidenceRefusal and admitClick core, with the dialog-hook result the pointer carried), or settles it as declined or refused. Synchronous, never
+// throws, and guarded against re-entry (a reader called from inside a settle returns at once). It writes only through writeExclusive (spent marker, `.settled`) and appendRecord, both replaceable
+// by `io` for fault injection, and reads only through readSmallJson / readAsk / clickEvidence.
+//
+// Scheduling is not evidence. Pointers are grouped into UNITS, one per ask across every session; a unit is included as soon as any member matches the `session` / `askId` filter (the guard's
+// session-scoped read), with all its members. Units captured less than WAIT_GRACE_MS ago are ACTIVE and go first, FIFO; the rest are RETIRED and get what is left of the budget (SETTLE_SCAN_BUDGET
+// transcript scans per call; a unit is started only below it, then looked at whole). A unit's members go in capturedAt order and the walk STOPS at the first one that is not terminal, so a later click is
+// never admitted ahead of an earlier, still-unverified one (Fable F7). Nothing is refused or settled on time alone but the evidence expiry capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS: after that even a
+// verified grant would be past its 24 h use window. A missing or unreadable transcript is `waiting`; an unreadable spent marker, a failed write and the like are `retry` (no `.settled`); every
+// verdict (recorded, declined, refused) writes `<askId>.<clickId>.settled`, and a click that loses that race reports the winner's outcome. Garbled pointers are skipped (`skipped`, no budget).
+// -> { outcomes: [{ askId, clickId, outcome: 'recorded' | 'declined' | 'refused' | 'waiting' | 'retry' | 'skipped', reason? }], problems }.
+export function settlePendingClicks({ home = accountHome(), now = Date.now, askId = null, session = null, io = {} } = {}) {
+  const out = { outcomes: [], problems: [] };
+  if (settling) return out;
+  settling = true;
+  try {
+    const nowMs = now();
+    let names;
+    try {
+      names = readdirSync(asksDir(home));
+    } catch (err) {
+      if (err?.code !== 'ENOENT') out.problems.push(`the asks folder cannot be read (${err?.code ?? 'error'})`);
+      return out;
+    }
+    const have = new Set(names);
+    const byAsk = new Map();
+    for (const name of names) {
+      const m = PENDING_RE.exec(name);
+      if (m === null || have.has(`${m[1]}.${m[2]}.settled`)) continue;
+      const r = readPending(name, home, nowMs);
+      if (r.bad) { out.outcomes.push({ askId: m[1], clickId: m[2], outcome: 'skipped', reason: 'pending-invalid' }); continue; }
+      if (!byAsk.has(m[1])) byAsk.set(m[1], []);
+      byAsk.get(m[1]).push(r.pending);
+    }
+    const filtered = askId !== null || session !== null;
+    const units = [...byAsk.values()]
+      .filter((u) => !filtered || u.some((p) => (session !== null && p.session === session) || (askId !== null && p.askId === askId)))
+      .map((u) => ({ members: u.sort((a, b) => a.capturedMs - b.capturedMs || a.clickId.localeCompare(b.clickId)) }))
+      .map((u) => ({ ...u, oldest: u.members[0].capturedMs, askId: u.members[0].askId }));
+    const fifo = (a, b) => a.oldest - b.oldest || a.askId.localeCompare(b.askId);
+    const active = units.filter((u) => nowMs - u.oldest < WAIT_GRACE_MS).sort(fifo);
+    const retired = units.filter((u) => nowMs - u.oldest >= WAIT_GRACE_MS).sort(fifo);
+    let scans = 0;
+    for (const unit of [...active, ...retired]) {
+      if (scans >= SETTLE_SCAN_BUDGET) break;
+      for (const p of unit.members) {
+        const o = settleOne(p, { home, now, nowMs, io, scanned: () => { scans++; } });
+        out.outcomes.push({ askId: p.askId, clickId: p.clickId, ...o });
+        if (o.outcome === 'waiting' || o.outcome === 'retry') break; // a later click never goes ahead of an earlier one that is not terminal
+      }
+    }
+  } catch {
+    out.problems.push('pending clicks could not be settled');
+  } finally {
+    settling = false;
+  }
+  return out;
+}
+
+// One pointer -> { outcome, reason? }. See settlePendingClicks.
+function settleOne(p, { home, now, nowMs, io, scanned }) {
+  const { askId, clickId } = p;
+  const finish = (outcome, reason = null) => {
+    const file = clickFile(askId, clickId, 'settled', home);
+    const made = (io.writeExclusive ?? writeExclusive)(file, { v: 1, askId, clickId, outcome, reason, settledAt: new Date(now()).toISOString() }, home);
+    if (made === 'ok') return { outcome, ...(reason === null ? {} : { reason }) };
+    if (made !== 'exists') return { outcome: 'retry', reason: 'settled-write-failed' };
+    const won = readSmallJson(file); // the other settler's verdict stands
+    return won.state === 'ok' && SETTLED_OUTCOMES.includes(won.value?.outcome) ? { outcome: won.value.outcome, ...(typeof won.value.reason === 'string' ? { reason: won.value.reason } : {}) } : { outcome: 'retry', reason: 'settled-unreadable' };
+  };
+  const loaded = readAsk(askId, { home });
+  if (!loaded.ok) return finish('refused', loaded.reason === 'none' ? 'ask-gone' : 'ask-invalid');
+  const { ask } = loaded;
+  if (nowMs > p.capturedMs + CAPTURE_SKEW_MS + MAX_AGE_MS) return finish('refused', 'evidence-expired');
+  const taken = readSpent(askId, home);
+  if (taken.state === 'ok' && taken.marker.clickId !== clickId) return finish('refused', 'spent'); // one ask, one use: another click has it, nothing here can change that
+  scanned();
+  const ev = clickEvidence(p.transcriptPath, p.toolUseId, { home });
+  if (!ev.ok) return ev.reason === 'not-in-transcript' || ev.reason === 'transcript-unreadable' ? { outcome: 'waiting', reason: ev.reason } : finish('refused', ev.reason);
+  const answeredAt = Date.parse(ev.answeredAt);
+  const bad = evidenceRefusal({ ask, ev, session: p.session, now }) ?? (nowMs - answeredAt > MAX_AGE_MS ? 'stale' : null) ?? (Math.abs(answeredAt - p.capturedMs) > CAPTURE_SKEW_MS ? 'capture-skew' : null);
+  if (bad !== null) return finish('refused', bad);
+  const r = admitClick({ ask, ev, session: p.session, toolUseId: p.toolUseId, transcriptPath: p.transcriptPath, cwd: p.cwd, hc: { ok: true, hookLayersSha256: p.hookLayersSha256 }, home, io });
+  if (r.recorded) {
+    // TASK 5 SEAM (#472): a recorded EXTRA-ROUND click is where its per-grant consumed marker is written when a round ticket already covers it (roundCoverage, owner-go.mjs), BEFORE the `.settled` below.
+    return finish('recorded');
+  }
+  if (r.declined !== undefined) return finish('declined');
+  return r.retry ? { outcome: 'retry', reason: r.refused } : finish('refused', r.refused);
 }
 
 // ---- the proof every consumer asks (B4) ---------------------------------------------------------------------------------------------------
