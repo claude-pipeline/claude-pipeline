@@ -893,3 +893,20 @@ test('R15 push review: a quoted <# ... #> pair hides a write', () => {
   // an unquoted terminated block comment on a line of reads/plain writes is still cut and allowed (R11-F2)
   assert.equal(psW('cd C:/repo; echo x <# #>; Get-ChildItem sub'), 'allow');
 });
+
+// R16-F1: PowerShell ends a `#` line comment at a lone carriage return too (the guard's parser only at \n), so a `<#` inside a line comment is not a block comment: the cut must not swallow the write that follows the CR.
+test('R16-F1: a <# inside a # line comment, then a CR (lone or CRLF), a write and #>, is a write (refused after a directory change)', () => {
+  const lines = [
+    'cd C:/x; echo hi # <#\rSet-Content ../settings.json x\r#>',
+    'cd C:/x; echo hi #<#\rSet-Content ../settings.json x #>',
+    'cd C:/x; echo hi # <#\r\nSet-Content ../settings.json x\r\n#>',
+    'cd C:/x\necho hi # <#\rSet-Content ../settings.json x\r#>',
+  ];
+  for (const c of lines) {
+    const r = psWhy(c);
+    assert.equal(r.decision, 'deny', JSON.stringify(c));
+    assert.match(r.reason, DENY_CD, r.reason);
+  }
+  // an unquoted terminated block comment with no `#` outside it and no CR is still cut and allowed
+  assert.equal(psW('cd C:/repo; echo x <# #>; Get-ChildItem sub'), 'allow');
+});
