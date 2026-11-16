@@ -122,9 +122,14 @@ describe('#482: a failure group that ends the text is restored when the text end
     const v = gitRun('bash build.sh; git push', { [BUILD]: 'git checkout main || { echo no; git -C /work/repo checkout agent/y; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
-  test('the #482 case with a command in the group that does not change git state is still restored (allowed)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
+  test('the #482 case with a data command in the group (echo, exit) is still restored (allowed)', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
     assert.equal(v.decision, 'allow', v.reason);
+  });
+  // (a git command in the group, read-only looking or not, is not inert any more: the push is denied, exactly as on main -- see the R4 rows below)
+  test('R4: a `git status` in the group is not inert (denied, as on main)', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
+    assert.equal(v.decision, 'deny', v.reason);
   });
   // #491 R3: the inert test is an allow-list of the BARE builtin word (or a system-bin path) and of read-only git subcommands
   const LAST = (x) => gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: `make\ncd dist || { ${x}; exit 1; }\n` });
@@ -149,7 +154,31 @@ describe('#482: a failure group that ends the text is restored when the text end
     const v = gitRun('git config alias.st "checkout main" && git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { git st; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
-  for (const x of ['echo no >&2', 'echo no 2>&1', '/bin/echo no', '/usr/bin/git status', 'git log -1', 'git diff', 'git rev-parse HEAD', 'git branch --show-current', 'git -C /work/repo status', 'true', 'printf x']) {
+  // #491 R4: the git half of the allow-list is gone. A read-only-looking git command can still run a program or write HEAD (`git log --output=.git/HEAD`, a PATH change, a
+  // package-script bin dir, letter case ...), so ANY git command in a text-ending group leaves the names forgotten, exactly as on main (main denies every one of these too).
+  for (const x of ['git status', 'git log -1', 'git diff', 'git rev-parse HEAD', 'git branch --show-current', '/usr/bin/git status', 'git -C /work/repo status', 'echo no; git status', 'git log --output=/work/repo/.git/HEAD']) {
+    test(`R4: ${x} is not inert (denied, as on main)`, () => {
+      const v = LAST(x);
+      assert.equal(v.decision, 'deny', `${x}: ${v.reason}`);
+    });
+  }
+  // the data half: a PATH the group can change, or a redirect target that is not a descriptor duplicate, makes even an echo not inert
+  for (const x of ['PATH=/work/repo/bin echo hi', 'export PATH=/work/repo/bin:$PATH; echo hi', 'echo hi >&/work/repo/x', 'echo hi >& /work/repo/x', 'echo hi 2>&/work/repo/x']) {
+    test(`R4: ${x} is not inert (denied)`, () => {
+      const v = LAST(x);
+      assert.equal(v.decision, 'deny', `${x}: ${v.reason}`);
+    });
+  }
+  test('R4-F1: an earlier line of the group that sets PATH, then an echo on a later line, is not inert', () => {
+    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || {\n  export PATH=/work/repo/bin:$PATH\n  echo hi\n  exit 1\n}\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  test('R4-F1: an echo in a package script (the manager puts node_modules/.bin on its PATH) is not inert', () => {
+    const files = { [resolve('/work/repo/package.json')]: JSON.stringify({ name: 'x', version: '1.0.0', scripts: { build: 'make\ncd dist || { echo no; exit 1; }' } }) };
+    const v = gitRun('git checkout agent/y && npm run build; git push', files);
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  for (const x of ['echo no >&2', 'echo no 2>&1', 'echo no >&-', '/bin/echo no', 'true', 'printf x']) {
     test(`R3: ${x} stays inert (allowed)`, () => {
       const v = LAST(x);
       assert.equal(v.decision, 'allow', `${x}: ${v.reason}`);
