@@ -300,9 +300,9 @@ test('unquoteCPath rejects trailing text and input that is not a quoted token', 
 // Failure caught: the soft `Tests added` line of `pipeline summary` miscounts (a source file read as a test, a non-case line counted as a case), so the owner reads a wrong test-to-source ratio.
 test('testsAdded: counts test files that gained lines, added test-case calls, and changed source lines against test lines', () => {
   const diff = [
-    'diff --git a/src/a.js b/src/a.js', '--- a/src/a.js', '+++ b/src/a.js', '@@ -1,1 +1,3 @@', '-old', '+new1', '+new2', '+it('looks like a case but is source', () => {});',
+    'diff --git a/src/a.js b/src/a.js', '--- a/src/a.js', '+++ b/src/a.js', '@@ -1,1 +1,3 @@', '-old', '+new1', '+new2', "+it('looks like a case but is source', () => {});",
     'diff --git a/test/a.test.mjs b/test/a.test.mjs', '--- a/test/a.test.mjs', '+++ b/test/a.test.mjs', '@@ -5,0 +6,4 @@',
-    '+test('one', () => {});', '+  it.each([1])('two', () => {});', '+  assert.ok(true);', '+// test('a comment')', '',
+    "+test('one', () => {});", "+  it.each([1])('two', () => {});", '+  assert.ok(true);', "+// test('a comment')", '',
   ].join('
 ');
   const r = testsAdded(parseUnifiedDiff(diff), ['test/**']);
