@@ -2019,3 +2019,16 @@ test('#256 R5-F4 a Codex session-log write whose home prefix is only known at ru
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of ['cat "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"', 'echo ".codex is a folder"']) assert.equal(bash(cmd), 'allow', cmd);
 });
+
+// #472 (Task 6): the click state lives INSIDE the protected owner-go folder, so no guard rule had to change; the explicit rows keep it that way.
+test('#472 click state: asks/*.pending, asks/*.settled, consumed/*.json and round-claims/*.json are protected from Write, Edit and every shell write; reading them is open', () => {
+  const R = '/home/u/.claude/pipeline-state/owner-go';
+  const targets = [`${R}/asks/ask-0123456789ab.0123456789abcdef.pending`, `${R}/asks/ask-0123456789ab.0123456789abcdef.settled`, `${R}/consumed/0123456789abcdef.json`, `${R}/round-claims/0123456789abcdef.1.json`];
+  for (const f of targets) {
+    assert.equal(file('Write', { file_path: f, content: '{}' }), 'deny', f);
+    assert.equal(file('Edit', { file_path: f, old_string: 'a', new_string: 'b' }), 'deny', f);
+    for (const cmd of [`echo '{}' > ${f}`, `cp /tmp/x.json ${f}`, `rm -f ${f}`, `touch ${f}`, `tee ${f} < /tmp/x`, `mv /tmp/x.json ${f}`]) assert.equal(bash(cmd), 'deny', cmd);
+    for (const cmd of [`cat ${f}`, `ls -la ${path.dirname(f)}`]) assert.equal(bash(cmd), 'allow', cmd);
+  }
+  assert.equal(file('Write', { file_path: '~/.claude/pipeline-state/owner-go/round-claims/0123456789abcdef.2.json', content: '{}' }), 'deny');
+});
