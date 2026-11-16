@@ -1,17 +1,20 @@
 // Issue #454: git resolves an abbreviated `origin/<b>` through refs/tags and refs/heads BEFORE refs/remotes, so a local branch or tag
-// of that name shadows the remote-tracking ref. Every place that READS the remote's default branch names it fully qualified
-// (refs/remotes/origin/<b>, as lib/git.mjs#reviewBaseRef does). Each test builds a real repo where a branch AND a tag named
-// `origin/<b>` point at a different commit than the remote-tracking ref and proves the remote ref's answer wins.
-// (The base-ref sites of lib/git.mjs are covered by test/remote-ref-shadow.test.mjs; this file covers the remaining readers, issue #454.)
+// of that name shadows the remote-tracking ref. Every place that READS the remote's default branch, and the artifacts publisher that
+// starts from the remote's artifacts branch, names it fully qualified (refs/remotes/origin/<b>, as lib/git.mjs#reviewBaseRef does).
+// Each test builds a real repo where a branch AND a tag named `origin/<b>` point at a different commit than the remote-tracking ref
+// and proves the remote ref's answer wins.
+// (The base-ref sites of lib/git.mjs are covered by test/remote-ref-shadow.test.mjs; this file covers the default-branch readers
+// elsewhere (guard, identity, agent log, verify report) and the artifacts branch, issue #454.)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, readFileSync } from 'node:fs';
+import { copyFileSync, readFileSync, writeFileSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { addOrigin } from './helpers/origin.mjs';
 import { project, scratchDir } from './helpers/project.mjs';
 import { AGENT_LOG } from './helpers/gate-env.mjs';
+import { ARTIFACTS_BRANCH, publishArtifacts } from '../pipeline/commands/artifacts.mjs';
 import { ownerGoWiring } from '../pipeline/hooks/lib/git-wiring.mjs';
 import { headOnMain } from '../pipeline/lib/identity.mjs';
 import { AGENT_LOG_BRANCH, AGENT_LOG_HEADER, originLogLines, publishLines } from '../pipeline/lib/agentlog.mjs';
@@ -141,4 +144,34 @@ test('#454 verify: the report\'s base and mergeBase come from refs/remotes/origi
   const g = JSON.parse(readFileSync(join(repo.dir, '.verify', 'report.json'), 'utf8')).git;
   assert.equal(g.base, remoteBase);
   assert.equal(g.mergeBase, remoteBase);
+});
+
+// ---- e. the artifacts publisher's start point (commands/artifacts.mjs publishArtifacts) -------------------------------------
+
+test('#454 artifacts: the publish starts from the fetched refs/remotes/origin/<artifacts branch>, not a shadow branch or tag', (t) => {
+  const repo = createTmpRepo();
+  repo.write('app.txt', 'v1\n');
+  repo.commit('init');
+  const bare = addOrigin(t, repo);
+  // the remote's artifacts branch: one commit holding pr-1/old.png
+  repo.write('pr-1/old.png', 'old\n');
+  repo.git(['add', '--', 'pr-1']);
+  repo.git(['commit', '-q', '-m', 'remote artifacts']);
+  const remoteTip = repo.git(['rev-parse', 'HEAD']).trim();
+  repo.git(['push', '-q', 'origin', `HEAD:refs/heads/${ARTIFACTS_BRANCH}`]);
+  // a different commit that only the shadow branch and tag point at; it adds shadow.txt
+  repo.write('shadow.txt', 'shadow\n');
+  repo.git(['add', '--', 'shadow.txt']);
+  repo.git(['commit', '-q', '-m', 'shadow']);
+  const shadowSha = repo.git(['rev-parse', 'HEAD']).trim();
+  shadow(repo, ARTIFACTS_BRANCH, shadowSha);
+  repo.git(['reset', '-q', '--hard', 'main']);
+  const img = join(scratchDir(), 'new.png');
+  writeFileSync(img, 'new\n');
+  const r = publishArtifacts({ root: repo.dir, pr: 2, files: [{ abs: img, name: 'new.png' }] });
+  assert.equal(r.pushed, true);
+  assert.equal(repo.git(['--git-dir', bare, 'rev-parse', `${r.commit}^`]).trim(), remoteTip, 'the new commit sits on the remote tip');
+  const files = repo.git(['--git-dir', bare, 'ls-tree', '-r', '--name-only', ARTIFACTS_BRANCH]).split('\n').filter(Boolean);
+  assert.ok(files.includes('pr-1/old.png') && files.includes('pr-2/new.png'), 'the remote\'s file and the new one are published');
+  assert.ok(!files.includes('shadow.txt'), 'the shadow commit\'s file is not on the published branch');
 });
