@@ -147,7 +147,7 @@ function clearOldJobDir(jobDir, name) {
   }
   // meta.json first: the run-id recheck of a reader of the old run (snapshot) reads it, so a directory that is half deleted can never pass it.
   // Renamed, not unlinked: a clear that is interrupted (or whose delete fails) leaves the tombstone, which still names the job, so the next start clears the rest.
-// The tombstone is deleted after every other entry (a recursive delete of the directory removes entries in directory order, tombstone possibly first), then the directory.
+  // The tombstone is deleted after every other entry (a recursive delete of the directory removes entries in directory order, tombstone possibly first), then the directory.
   if (ours) {
     try {
       renameSync(path.join(jobDir, META_FILE), path.join(jobDir, META_TOMBSTONE));
