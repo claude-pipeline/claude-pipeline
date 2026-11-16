@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { contentHash, remoteDefaultBranch, reviewBaseRef } from '../pipeline/lib/git.mjs';
+import { contentHash, remoteDefaultBranch, remoteRefExists, reviewBaseRef } from '../pipeline/lib/git.mjs';
 import * as risk from '../pipeline/lib/risk.mjs';
 import { currentContentHash } from '../pipeline/lib/review-context.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -74,4 +74,39 @@ test('hashBranch(root, null) returns the default branch name in a repo with no o
   repo.commit('base');
   assert.equal(risk.hashBranch(repo.dir, null), 'main');
   assert.equal(risk.hashBranch(repo.dir, { default_branch: 'trunk' }), 'trunk');
+});
+
+// #455: `git rev-parse --verify refs/remotes/origin/<b>` finds the exact ref first, but with the real ref MISSING it falls through to refs/tags/<name> and refs/heads/<name> (and
+// refs/<name>), i.e. a branch or tag literally named `refs/remotes/origin/<b>`. An existence test must therefore be exact (git show-ref --verify).
+// Branch and tag are made with update-ref: `git branch refs/remotes/origin/main` would be refused by git as an ambiguous name.
+const shadowFullName = (repo, name, sha) => {
+  repo.git(['update-ref', `refs/heads/refs/remotes/origin/${name}`, sha]);
+  repo.git(['update-ref', `refs/tags/refs/remotes/origin/${name}`, sha]);
+};
+
+test('#455 reviewBaseRef: with refs/remotes/origin/<b> missing, a branch or tag named refs/remotes/origin/<b> is not the remote ref', (t) => {
+  const { repo, f2 } = world(t);
+  repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+  assert.equal(reviewBaseRef('main', { cwd: repo.dir }), 'refs/heads/main', 'no shadow: the local branch');
+  shadowFullName(repo, 'main', f2);
+  assert.equal(repo.git(['rev-parse', '--verify', 'refs/remotes/origin/main']).trim(), f2, 'precondition: rev-parse is fooled by the shadow');
+  assert.equal(reviewBaseRef('main', { cwd: repo.dir }), 'refs/heads/main');
+});
+
+test('#455 remoteDefaultBranch: a dangling origin/HEAD stays null when a branch or tag named refs/remotes/origin/<old> exists', (t) => {
+  const { repo, f2 } = world(t);
+  repo.git(['update-ref', '--no-deref', '-d', 'refs/remotes/origin/main']); // the rename + prune: origin/HEAD -> a missing origin/main
+  assert.equal(remoteDefaultBranch({ cwd: repo.dir }), null, 'no shadow');
+  shadowFullName(repo, 'main', f2);
+  assert.equal(remoteDefaultBranch({ cwd: repo.dir }), null);
+});
+
+test('#455 remoteRefExists is exact: true for the remote-tracking ref, false when only a shadow of that name exists', (t) => {
+  const { repo, f2 } = world(t);
+  assert.equal(remoteRefExists('main', { cwd: repo.dir }), true);
+  assert.equal(remoteRefExists('nope', { cwd: repo.dir }), false);
+  repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+  shadowFullName(repo, 'main', f2);
+  assert.equal(remoteRefExists('main', { cwd: repo.dir }), false);
+  assert.throws(() => remoteRefExists('main', { cwd: path.join(repo.dir, 'missing-dir') }), 'a real git failure still throws, never "missing"');
 });

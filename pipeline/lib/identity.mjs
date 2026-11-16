@@ -80,8 +80,10 @@ export function fileProvenance(root, files, { requireToplevel = false, scope = n
 }
 
 // Is HEAD contained in the local origin/main? Local ref only (no fetch); no such ref means false. Read fully qualified: an abbreviated `origin/main`
-// resolves through refs/tags and refs/heads first, so a branch or tag of that name would stand in for the remote's (#454).
+// resolves through refs/tags and refs/heads first, so a branch or tag of that name would stand in for the remote's (#454). And the ref's existence is checked by exact
+// name (show-ref --verify): with refs/remotes/origin/main missing, git would resolve a branch or tag named `refs/remotes/origin/main` instead (#455).
 export function headOnMain(root) {
+  if (gitIn(root, ['show-ref', '--verify', '--quiet', 'refs/remotes/origin/main'], { timeoutMs: 10000 }).code !== 0) return false;
   return gitIn(root, ['merge-base', '--is-ancestor', 'HEAD', 'refs/remotes/origin/main'], { timeoutMs: 10000 }).code === 0;
 }
 
