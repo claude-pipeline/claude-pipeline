@@ -8,7 +8,7 @@ import path from 'node:path';
 import { EXIT, UnavailableError } from '../cli.mjs';
 import { Fail } from '../cmd-common.mjs';
 import { loadConfig } from '../config.mjs';
-import { GitError, git, showFile } from '../git.mjs';
+import { GitError, git, refExists, showFile } from '../git.mjs';
 import { createGitHub, guardGh } from '../github.mjs';
 import { listWorktrees } from '../local-branches.mjs';
 import { LockTimeoutError, withLock } from '../locks.mjs';
@@ -61,6 +61,7 @@ function defaultBranchRefs(root) {
 function committedConfig(root) {
   for (const ref of defaultBranchRefs(root)) {
     try {
+      if (!refExists(ref, { cwd: root })) continue; // by exact name: a missing refs/remotes/origin/main must not be answered by a branch or tag of that full name (#455)
       git(['rev-parse', '--verify', '--quiet', `${ref}^{commit}`], { cwd: root });
       const text = showFile(ref, CONFIG_FILE, { cwd: root });
       if (text !== null) return { ref: ref.slice('refs/remotes/'.length), full: ref, text }; // `ref` is the short name, for reports only
