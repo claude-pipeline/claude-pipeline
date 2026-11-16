@@ -212,7 +212,15 @@ test('#352 merge: zsh print is read-only like echo, unless an option binds, feed
     // (R29-F3: zsh's print -f is printf: a numeric conversion reads its operand as arithmetic and runs the substitution in a subscript; any format that converts a number, or one only
     // known at run time, is no read-only call. An option word only known at run time may be any option.)
     'print -f \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -f%d \'a[$(rm -rf .claude; echo 0)]\'', 'print -rf \'%*s\' \'a[$(rm -rf .claude; echo 0)]\' x',
-    'print -f "$FMT" "a $Y"', 'print -f \'%d\' "a $Y"', 'print $O "a $Y"', 'print "$Y" "a $Y"', 'print -r "${O}x" "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+    'print -f "$FMT" "a $Y"', 'print -f \'%d\' "a $Y"', 'print $O "a $Y"', 'print "$Y" "a $Y"', 'print -r "${O}x" "a $Y"',
+    // (R30-B1: a run-time part ANYWHERE in an option word, not only at its start: -"$O" with O=f is -f)
+    'print -"$O" \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -$O \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -x$(echo f) \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -r"$O" x "a $Y"',
+    // (R30-F1: the value word of -C / -x / -X is part of the option area: an unquoted substitution there splits into `-f %d`)
+    'print -C $(echo 1 -f %d) \'a[$(rm -rf .claude; echo 0)]\'', 'print -x $=N \'a[$(rm -rf .claude; echo 0)]\'', 'print -X ${=N} x "a $Y"', 'print -C "$N" "a $Y"', 'print -rC $N "a $Y"',
+    // (R30-F2: a glob-spelled word of the option area becomes any option when a file of that name is there: -?%d -> -f%d)
+    'print -?%d \'a[$(rm -rf .claude; echo 0)]\'', 'print * \'a[$(rm -rf .claude; echo 0)]\'', 'print -l -?%d "a $Y"', 'print -C 2 * "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  // (R30 allow twins: a literal value word, a glob after `--` or after the first operand, a quoted glob, and runtime words that are plain operands)
+  for (const p of ['print -C 2 a b', 'print -l -- *.md "a $Y"', 'print -r -- * "a $Y"', 'print -C 2 -- "$Y" x', 'print x *.md "a $Y"', 'print -l x* "a $Y"', 'print -r \'*\' "a $Y"', 'print -f \'%s\\n\' a b', 'print -rl -- "-$O" x']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
   const script = '#!/bin/zsh\nexport PATH="$HOME/.npm-global/bin:$PATH"\ncd "$X" || exit 1\nprint "starting $(date)"\n';
   const zfs = fakeFs(PROJ, { 'run.sh': script }, DIRS);
   assert.equal(files(`${PROJ}/run.sh`, zfs).decision, 'allow', 'run by zsh: print is a builtin');

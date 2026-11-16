@@ -2751,6 +2751,7 @@ const GLOB_PATTERNS = {
   xxd: [optLit('-r', true)],
   openssl: ['-out', '-sign', '-prverify'].map((o) => optLit(o, false)),
 };
+GLOB_PATTERNS.print = [OPT_ANY]; // (R30-F2: for print only its option area, see globOptionRisky)
 for (const n of ['sort', 'tree', 'jq', 'sed', 'gsed', 'awk', 'gawk', 'mawk', 'nawk']) GLOB_PATTERNS[n] = [OPT_ANY];
 // rsync (R5-B3): the options that delete (at the destination, or the sources); the same engine
 const RSYNC_DELETE_PATTERNS = ['--del', '--delete', '--delete-before', '--delete-during', '--delete-delay', '--delete-after', '--delete-excluded', '--delete-missing-args', '--remove-source-files', '--remove-sent-files'].map((o) => optLit(o, false));
@@ -2834,6 +2835,29 @@ function unquotedGlob(raw) {
   const t = withoutQuotes(raw);
   return t === null || /[*?[(^]|\S[#~]|<[\d-]*>/.test(t.replace(/\\[\s\S]/g, ''));
 }
+// #352 R30: the option area of zsh's print, read once for the format check (readOnlyWith) and the glob check (globOptionRisky). It runs from the first word to the first literal operand (the word that
+// ends it is included: a glob there can still become an option), a lone `-` or `--`. R30-B1 / F1: a word of it that holds a run-time part is bad (the call is not read-only): a word that starts with
+// `$` or a backtick, a word that starts with a dash or a plus and holds one anywhere (`-"$O"`, `-x$(…)`), and the value word of -C / -f / -x / -X, which is read like an option (`-C $(echo 1 -f %d)`
+// splits into `-f %d`). An option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`).
+// R29-F3: -f makes print zsh's printf, which reads the operand of a numeric conversion (or a `*`) as arithmetic: `fmt` is the format (null: not known), `end` the number of words of the area.
+function printScan(ws) {
+  const out = { end: ws.length };
+  for (let i = 0; i < ws.length; i++) {
+    const a = ws[i];
+    if (/^[$`]/.test(a) || (/^[-+]/.test(a) && RUNTIME_PART.test(a))) return { bad: true, end: ws.length };
+    if (a === '-' || a === '--' || !/^[-+]/.test(a)) { out.end = i + 1; break; }
+    for (let k = 1; k < a.length; k++) {
+      if ('vsSzuPp'.includes(a[k])) return { bad: true, end: ws.length };
+      if ('CfxX'.includes(a[k])) {
+        const value = k < a.length - 1 ? a.slice(k + 1) : ws[++i];
+        if (value !== undefined && RUNTIME_PART.test(value)) return { bad: true, end: ws.length };
+        if (a[k] === 'f') out.fmt = out.fmt === undefined ? (value ?? null) : null; // (a second -f: which one wins is not modelled)
+        break;
+      }
+    }
+  }
+  return out;
+}
 // The options end at a lone `--` for the tools that read it so (a pathspec or a file after it is no option)
 const DASHDASH_ENDS = new Set(['git', 'rg', 'sort', 'tree', 'jq', 'xxd', 'sed', 'gsed']);
 function globWordMeets(a, pats) {
@@ -2846,11 +2870,15 @@ function globOptionRisky(name, args, raw, orig = args, lit = undefined) {
   const pats = GLOB_PATTERNS[name];
   if (!pats || !args.some((a) => GLOB_CHARS.test(a))) return false;
   const globs = unquotedGlob(raw);
-  for (let i = 0; i < args.length; i++) {
+  const limit = name === 'print' ? Math.min(args.length, printScan(orig).end) : args.length; // (print: its option area only; a word after the first operand or `--` is no option)
+  for (let i = 0; i < limit; i++) {
     const a = args[i];
     if (a === '--' && DASHDASH_ENDS.has(name)) break;
     if (!GLOB_CHARS.test(a)) continue;
-    if (globs && !(lit !== undefined && orig[i] === a && lit.has(a)) && globWordMeets(a, pats)) return true;
+    // (print: the word that ends the area, the first operand, only counts when it starts with a glob character or holds a `x#` repeat: `print "starting $(date)"` is no option; a group or a qualifier
+    // behind a plain first character cannot make a word that starts with a dash)
+    if (i === limit - 1 && name === 'print' && /^[^-+*?[(^<>~#@!{=]/.test(a) && /^[^-+*?[(^<>~#@!{=]/.test(orig[i] ?? a) && !/\S#/.test(a)) continue;
+    if (globs &&!(lit !== undefined && orig[i] === a && lit.has(a)) && globWordMeets(a, pats)) return true;
     if (orig[i] !== a && a.split(/\s+/).some((piece) => globWordMeets(piece, pats))) return true;
   }
   return false;
@@ -3132,27 +3160,11 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
   // edit buffer (-z), writes to a numbered descriptor (-u, -p) or prompt-expands its words (-P) is not read-only. A word after `-` / `--` or the first operand ends the options.
   // R28-F2: an option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`), and the scan goes on after it.
   // R29-F3: -f makes print zsh's printf, which reads the operand of a numeric conversion (or a `*`) as arithmetic: the format, as written and as expanded, must convert no number
-  // (printfFormatEvaluates, as for printf), and no word may hold a subscript-evaluation form. A word that may still start with `-` at run time (`print "$O" x`) may be any option.)
+  // (printfFormatEvaluates, as for printf), and no word may hold a subscript-evaluation form. A word that may still start with `-` at run time (`print "$O" x`) may be any option.
+  // R30: printScan reads the option area once (a run-time part in any word of it, a value word included, is no read-only call); a glob-spelled word of it is judged by globOptionRisky.)
   if (name === 'print') {
-    const fmtOf = (ws) => {
-      const out = {};
-      for (let i = 0; i < ws.length; i++) {
-        const a = ws[i];
-        if (/^[$`]/.test(a)) return { bad: true };
-        if (a === '-' || a === '--' || !/^[-+]/.test(a)) break;
-        for (let k = 1; k < a.length; k++) {
-          if ('vsSzuPp'.includes(a[k])) return { bad: true };
-          if ('CfxX'.includes(a[k])) {
-            const value = k < a.length - 1 ? a.slice(k + 1) : ws[++i];
-            if (a[k] === 'f') out.fmt = out.fmt === undefined ? (value ?? null) : null; // (a second -f: which one wins is not modelled)
-            break;
-          }
-        }
-      }
-      return out;
-    };
-    const raw = fmtOf(argv.slice(1));
-    const now = fmtOf(args);
+    const raw = printScan(argv.slice(1));
+    const now = printScan(args);
     if (raw.bad || now.bad) return false;
     if (raw.fmt === undefined && now.fmt === undefined) return true;
     if (raw.fmt == null || now.fmt == null || printfFormatEvaluates(raw.fmt) || printfFormatEvaluates(now.fmt)) return false;
