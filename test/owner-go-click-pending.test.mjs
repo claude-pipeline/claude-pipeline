@@ -13,7 +13,7 @@ import {
   MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantLookups, ownerGrantedRounds, ownerRuled, readApprovals, readGrantMarker, readRecords, recordRoundGrant, roundTicketKey,
   settleEnabled, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickProvenance, issueAsk, mergeAsk, readAsk, recordClick, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickNotes, clickProvenance, issueAsk, mergeAsk, readAsk, recordClick, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { OWNER_GO_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
 import { deferEligibility } from '../pipeline/lib/triage.mjs';
 import { OWNER_ENTRY, cleanupRoundClaims, linesOf, mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
@@ -960,4 +960,106 @@ test('a pointer with a clickId that is not the hash of its own fields is skipped
   assert.deepEqual(outcomes.sort(), [['recorded', null], ['refused', 'spent']].sort());
   assert.equal(r.records().length, 1, 'one record, one spent');
   assert.equal(readdirSync(asksDir(r.home)).filter((n) => n.endsWith('.spent')).length, 1);
+});
+
+// ---- Task 8: what the agent and the owner are told when a consumer refuses ------------------------------------------------------------------
+
+const treeOf = (home) => {
+  const out = [];
+  const walk = (d) => {
+    try {
+      for (const e of readdirSync(d, { withFileTypes: true })) {
+        const p = join(d, e.name);
+        if (e.isDirectory()) walk(p);
+        else out.push(`${p}:${statSync(p).mtimeMs}:${statSync(p).size}`);
+      }
+    } catch { /* none */ }
+  };
+  walk(join(home, '.claude'));
+  return out.sort();
+};
+
+test('clickNotes: a click that is waiting, then one still unverified after the grace, then (the evidence expired) nothing; it never writes', async (t) => {
+  const w = pw(t, { kind: 'round', answer: 'Yes, one more round' });
+  assert.ok((await w.hook()).pending); // never flushed
+  const before = treeOf(w.home);
+  const notes = (ms, over = {}) => clickNotes({ home: w.home, repo: REPO, prs: [58], kinds: ['round'], now: () => ms, ...over });
+  const fresh = notes(w.t + 1000);
+  assert.equal(fresh.length, 1);
+  assert.match(fresh[0], /owner click on the round dialog for #58 .*was received and is waiting to be verified/);
+  assert.match(fresh[0], /run the command again/);
+  const late = notes(w.t + WAIT_GRACE_MS + 1000);
+  assert.equal(late.length, 1);
+  assert.match(late[0], /still unverified after 10 minutes/);
+  assert.match(late[0], /type the closing words/);
+  assert.deepEqual(notes(w.t + CAPTURE_SKEW_MS + MAX_AGE_MS + 1000), [], 'the evidence expired: nothing to say');
+  assert.deepEqual(treeOf(w.home), before, 'no write of any kind');
+});
+
+test('clickNotes: a refused click says why and points to the typed words; "Not yet" says nothing is approved; other kinds, PRs and repositories are not mentioned', async (t) => {
+  const bad = pw(t, { fixture: 'pretooluse-hook-answer' });
+  assert.ok((await bad.hook()).pending);
+  bad.flush();
+  bad.settle();
+  const refused = clickNotes({ home: bad.home, repo: REPO, prs: [58], kinds: ['merge', 'merge-many'], now: bad.now });
+  assert.equal(refused.length, 1);
+  assert.match(refused[0], /owner click on the merge dialog for #58 .*could not be verified \(not-a-human-answer\)/);
+  assert.match(refused[0], /type the closing words/);
+  const no = pw(t, { answer: 'Not yet' });
+  assert.ok((await no.hook()).pending);
+  no.flush();
+  no.settle();
+  const declined = clickNotes({ home: no.home, repo: REPO, prs: [58], kinds: ['merge'], now: no.now });
+  assert.equal(declined.length, 1);
+  assert.match(declined[0], /declined|chose "Not yet"/);
+  assert.match(declined[0], /nothing is approved/);
+  assert.deepEqual(clickNotes({ home: no.home, repo: REPO, prs: [59], kinds: ['merge'], now: no.now }), [], 'another PR');
+  assert.deepEqual(clickNotes({ home: no.home, repo: REPO, prs: [58], kinds: ['round'], now: no.now }), [], 'another kind');
+  assert.deepEqual(clickNotes({ home: no.home, repo: 'acme/other', prs: [58], kinds: ['merge'], now: no.now }), [], 'another repository');
+});
+
+test('clickNotes: a recorded round click whose round is already used says so; a recorded merge click says nothing; bad input never throws', async (t) => {
+  const w = await roundClick(t);
+  w.settle();
+  assert.equal(w.records().filter((r) => r.via === 'ask').length, 1);
+  const read = () => clickNotes({ home: w.home, repo: REPO, prs: [58], kinds: ['round'], now: w.now });
+  assert.deepEqual(read(), [], 'recorded and still open: nothing to say');
+  const claimed = claimGrantMarkers(openGrants(w.home, w.now), CBODY, { home: w.home, now: w.now, ticket: true });
+  assert.equal(claimed.ok, true, JSON.stringify(claimed));
+  const used = read();
+  assert.equal(used.length, 1);
+  assert.match(used[0], /recorded, but round 4 of #58 is already used/);
+  const m = pw(t);
+  assert.ok((await m.hook()).pending);
+  m.flush();
+  m.settle();
+  assert.deepEqual(clickNotes({ home: m.home, repo: REPO, prs: [58], kinds: ['merge'], now: m.now }), []);
+  for (const bad of [undefined, {}, { home: m.home }, { home: '/nonexistent-home', repo: REPO, prs: [58] }, { home: m.home, repo: 'not a repo', prs: ['x'] }]) assert.deepEqual(clickNotes(bad), []);
+});
+
+// The refusals that carry the notes (wiring pin; the notes themselves are tested above): merge (--owner-go), the owner-ruling refusal and the round-cap refusal of review-round.
+test('clickNotes is appended by the merge, owner-ruling and round-cap refusals, each with its own kinds', () => {
+  const src = (rel) => readFileSync(new URL(rel, import.meta.url), 'utf8');
+  assert.match(src('../pipeline/commands/merge.mjs'), /clickNotes\(\{ repo, prs: \[pr\], kinds: \['merge', 'merge-many'\] \}\)/);
+  assert.match(src('../pipeline/commands/triage.mjs'), /clickNotes\(\{ repo, prs: \[pr\], kinds: \['ruling'\] \}\)/);
+  assert.match(src('../pipeline/commands/triage.mjs'), /\$\{again\}\$\{clickNotesText\(slug, prNum\)\}/);
+  assert.match(src('../pipeline/lib/review-round.mjs'), /clickNotes\(\{ repo: c\.ghRepo\.slug, prs: \[c\.pr\], kinds: \['round'\] \}\)/);
+  assert.match(src('../pipeline/lib/review-round.mjs'), /unconfirmedGrant\(c, st\) \+ pendingClickNotes\(c\)/);
+});
+
+test('clickNotes: at most 3 notes; a garbled pointer of an ask of this PR is reported, never thrown', async (t) => {
+  const w = pw(t, { kind: 'round', answer: 'Yes, one more round' });
+  assert.ok((await w.hook()).pending);
+  for (let i = 0; i < 4; i++) {
+    const id = `toolu_more_${i}`;
+    w.extra(id);
+    w.t += 1000;
+    assert.ok((await w.hook({}, { tool_use_id: id })).pending);
+  }
+  const read = () => clickNotes({ home: w.home, repo: REPO, prs: [58], kinds: ['round'], now: () => w.t + 1000 });
+  assert.equal(read().length, 3);
+  writeFileSync(w.pendingFile('f'.repeat(16)), '{not json');
+  const withBad = read();
+  assert.equal(withBad.length, 3);
+  assert.ok(withBad.some((n) => /could not be read/.test(n)), 'the garbled pointer is one of them');
 });

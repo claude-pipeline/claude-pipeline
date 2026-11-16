@@ -13,13 +13,18 @@
 // hook starts). Hooks that could still answer the dialog are the dialog-hook check's business (B5, hookCheck below, T2): this file takes it as an injected function.
 // What binds is the question TEXT: it is the typed path's closing block, so the answer goes through the SAME parsers the typed prompt does (approvalBinding, roundBinding, rulingBinding in
 // owner-go.mjs), and the ask file supplies only what a typed prompt cannot: one-time use, supersession, expiry, the dialog hash and the issue-time hook fingerprint.
+// Write order (#472). On 2.1.322 the answer's entry is in the transcript within 100-200 ms of the PostToolUse hook starting, so recordClick finds it by polling and records at once. On 2.1.323 it is written
+// only AFTER the PostToolUse hooks return, so every click fails `not-in-transcript` there. recordClick then keeps the click PENDING: it runs every check that needs no transcript and writes
+// `asks/<askId>.<clickId>.pending`, a pointer that admits nothing. settlePendingClicks (called by the readers in owner-go.mjs, never by the read-only paths) verifies it later, through the same clickEvidence /
+// admitClick core, writes the same spent marker and record plus a `.settled` outcome, and clickNotes tells a refusal what became of a click. The pointer's capture-time fields (the hook fingerprint,
+// `capturedAt`) are believed only because the PostToolUse hook is their sole writer: guard-files refuses tool writes to owner-go/** and refuses running this library by hand (the trusted-writer boundary).
 // Residual (unchanged from the typed path, owner-go.mjs): keystrokes injected into the owner's terminal look human.
 import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { isTranscriptFile } from '../../lib/paths.mjs';
 import {
-  MAX_AGE_MS, SESSION_RE, accountHome, appendRecord, approvalBinding, markCoveredGrant, ownerGoDir, readRecords, realDirChain, repoKey, roundBinding, rulingBinding, rulingsIn, scanBackwards,
+  MAX_AGE_MS, SESSION_RE, accountHome, appendRecord, approvalBinding, grantIdOf, markCoveredGrant, ownerGoDir, readGrantMarker, readRecords, realDirChain, repoKey, roundBinding, rulingBinding, rulingsIn, scanBackwards,
 } from './owner-go.mjs';
 import { readRepoMoves, sameRepo } from './repo-moves.mjs';
 
@@ -721,6 +726,61 @@ export function pendingClickProblems({ home = accountHome(), repo, pr, kinds = [
     out.push('pending owner clicks cannot be checked');
   }
   return out;
+}
+
+// Why (#472): a refusal that comes from "no approval yet" is misleading when the owner HAS clicked and the click is not usable (still waiting for its transcript entry, refused, declined, or a round already
+// used). clickNotes reads the click pointers of a repository (repository moves followed) / PRs / kinds and answers up to three plain notes (newest first) for the merge, owner-ruling and round-cap refusals
+// to append. Only clicks whose evidence could still matter are reported (now <= capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS). A merge or ruling click that was recorded says nothing (the refusal gives its own
+// reason); a recorded ROUND click says so only when its round was already used. Never settles, never writes, never throws; no repo / PR / folder -> [].
+const KIND_WORD = { merge: 'merge', 'merge-many': 'merge', round: 'round', ruling: 'ruling' };
+export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 'merge-many', 'round', 'ruling'], now = Date.now, moves } = {}) {
+  try {
+    const key = repoKey(repo);
+    if (key === null || !Array.isArray(prs) || !prs.every(Number.isInteger) || prs.length === 0) return [];
+    const nowMs = now();
+    const names = readdirSync(asksDir(home));
+    const recorded = moves ?? readRepoMoves({ home }).moves;
+    const found = [];
+    let records = null;
+    for (const name of names) {
+      const m = PENDING_RE.exec(name);
+      if (m === null) continue;
+      const loaded = readAsk(m[1], { home });
+      if (!loaded.ok) continue;
+      const a = loaded.ask;
+      const pr = prs.find((n) => a.prs.includes(n));
+      if (!kinds.includes(a.kind) || pr === undefined || !sameRepo({ recorded: a.repo, recordedAt: a.issuedAt, current: key, moves: recorded })) continue;
+      const r = readPending(name, home, nowMs);
+      let capturedMs = r.pending?.capturedMs;
+      if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
+      if (nowMs > capturedMs + CAPTURE_SKEW_MS + MAX_AGE_MS) continue;
+      const who = `an owner click on the ${KIND_WORD[a.kind]} dialog for #${pr} (${m[1]})`;
+      const typed = 'ask the owner to type the closing words instead';
+      let note = null;
+      if (r.bad) note = `${who} could not be read: ${typed}`;
+      else {
+        const s = readSmallJson(clickFile(m[1], m[2], 'settled', home));
+        if (s.state === 'ok' && isObj(s.value)) {
+          if (s.value.outcome === 'refused') note = `${who} was received but could not be verified (${String(s.value.reason ?? 'unknown')}): ${typed}`;
+          else if (s.value.outcome === 'declined') note = `${who} was declined (the owner chose not now): nothing is approved`;
+          else if (s.value.outcome === 'recorded' && a.kind === 'round') {
+            records ??= readRecords({ home, now, settle: false, maxAgeMs: Infinity });
+            const rec = records.find((x) => x?.via === 'ask' && x.ask?.clickId === m[2] && x.kind === 'extra-round');
+            const id = rec ? grantIdOf(rec) : null;
+            if (id !== null && readGrantMarker(id, { home }).spent) note = `${who} was recorded, but round ${rec.k} of #${rec.pr} is already used: each extra round is used once, ask the owner for another`;
+          }
+        } else if (s.state === 'none') {
+          note = nowMs - capturedMs >= WAIT_GRACE_MS
+            ? `${who} is still unverified after 10 minutes (its transcript entry has not appeared or cannot be read): ${typed}`
+            : `${who} was received and is waiting to be verified (Claude Code writes the answer to the transcript a moment later): run the command again in a moment`;
+        } else note = `${who} could not be read: ${typed}`;
+      }
+      if (note !== null) found.push({ capturedMs, note });
+    }
+    return found.sort((x, y) => y.capturedMs - x.capturedMs).slice(0, 3).map((x) => x.note);
+  } catch {
+    return [];
+  }
 }
 
 // ---- the proof every consumer asks (B4) ---------------------------------------------------------------------------------------------------
