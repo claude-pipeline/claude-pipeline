@@ -217,3 +217,44 @@ test('killing a waiting `job wait --until-done` leaves the job intact; a rerun a
   assert.equal(again.json.output, '1\n');
   assert.ok(existsSync(join(repo.dir, '.review', 'jobs', 'k', 'stdout')));
 });
+
+// R16-B1: a finished run's directory may be cleared and refilled by a new run between snapshot's meta read and its output read.
+// Deterministic race: stdout is a FIFO, so the reader child blocks inside the output read (after the run-id check) until this process opens the write end;
+// we then swap meta.json to run B and delete exit.json (what startJob does) before releasing the writer.
+async function raceReadFull(t, extraArgs, runIdOfA = 'run-A') {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'race');
+  spawnSync('mkdir', ['-p', dir]);
+  const meta = (runId) => JSON.stringify({ name: 'race', command: 'x', cwd, tag: 't', runId, startedAt: new Date(Date.now() - 5000).toISOString(), runnerPid: 2 ** 22 });
+  writeFileSync(join(dir, 'meta.json'), meta(runIdOfA));
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, signal: null, finishedAt: new Date().toISOString(), outputBytes: 8, outputTruncated: false }));
+  writeFileSync(join(dir, 'log'), 'A log\n');
+  assert.equal(spawnSync('mkfifo', [join(dir, 'stdout')]).status, 0);
+  const jobsUrl = new URL('../pipeline/lib/jobs.mjs', import.meta.url).href;
+  const script = `import(${JSON.stringify(jobsUrl)}).then(m=>{process.stdout.write(JSON.stringify(m.readJob('race',{cwd:${JSON.stringify(cwd)},full:true${extraArgs}})))})`;
+  const child = spawn(process.execPath, ['-e', script], { stdio: ['ignore', 'pipe', 'inherit'] });
+  let out = '';
+  child.stdout.on('data', (d) => { out += d; });
+  const closed = new Promise((resolve) => child.on('close', resolve));
+  const { open } = await import('node:fs/promises');
+  const writer = await open(join(dir, 'stdout'), 'w'); // resolves only once the child is reading the capture
+  writeFileSync(join(dir, 'meta.json'), meta('run-B'));
+  rmSync(join(dir, 'exit.json'));
+  await writer.write('B output');
+  await writer.close();
+  await closed;
+  return JSON.parse(out);
+}
+
+test('--run-id A read: a run B that replaces the directory during the output read answers replaced, never A identity + B stdout', { skip: process.platform === 'win32' }, async (t) => {
+  const r = await raceReadFull(t, ',expectRunId:"run-A"');
+  assert.equal(r.state, 'replaced');
+  assert.equal('output' in r, false);
+});
+
+test('no run id: a run B that replaces the directory during the output read is re-read as run B, never A identity + B stdout', { skip: process.platform === 'win32' }, async (t) => {
+  const r = await raceReadFull(t, '');
+  assert.notEqual(r.runId, 'run-A');
+  assert.equal('output' in r, false);
+  assert.notEqual(r.state, 'done');
+});
