@@ -13,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createCommentsGh, createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
-import { decodeFromComment } from '../pipeline/lib/state.mjs';
+import { SUPPORTED_STATE_VERSION, decodeFromComment } from '../pipeline/lib/state.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 import { reviewEligibilityProblems, rulingsDigest } from '../pipeline/lib/triage.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -436,10 +436,10 @@ test('arbiter needed in a dispute round leaves a judgement (low confidence) and 
 test('a state of a newer format is refused by every command that reads it', (t) => {
   const w = world(t);
   assertExit(w.codex(1, findingsOf([], [sugg()])), 0);
-  w.edit((s) => { s.version = 6; });
+  w.edit((s) => { s.version = SUPPORTED_STATE_VERSION + 1; });
   const r = w.cli(['state', 'outcome']);
   assertExit(r, 2, r.stdout + r.stderr);
-  assert.match(r.json.message, /version 6.*supports up to 5/);
+  assert.match(r.json.message, new RegExp(`version ${SUPPORTED_STATE_VERSION + 1}.*supports up to ${SUPPORTED_STATE_VERSION}`));
   const c = w.cli(ruling('R1-S1', 'FOLLOW-UP'));
   assertExit(c, 2, c.stdout);
 });
