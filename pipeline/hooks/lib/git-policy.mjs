@@ -1993,15 +1993,10 @@ const MAX_LOOP_PASSES = 12; // (the passes over one loop's body, from every star
 const MAX_READING_PASSES = 4; // (the passes over all readings of a loop word, each with what the others left)
 // (R7-F3: no input is known to reach MAX_READING_PASSES, so no test names its refusal: the carry holds only what a body leaves whatever state it started from, and the starts are capped at MAX_LOOP_STARTS + 1,
 // so every reading has contributed everything it can by the second pass; the bound is the fail-closed end of the loop, kept in case a later change makes a reading depend on what another left. MAX_LOOP_PASSES is reached: see guard-loop-fixpoint.test.mjs)
-// #352 R35-F2: a redirection that cannot fail: to or from /dev/null, or a copy of stdout / stderr (`2>/dev/null`, `&>/dev/null`, `>&2`, `2>&1`). Any other may fail before the command runs
-// (`< /missing`, `> /missing/f`, an unwritable file), and then the command does not run at all: `cd d < /missing` stays where it was. A here-document or here-string can fail too: zsh writes it to a
-// temporary file first, and `TMPPREFIX=/missing/x` makes that fail ("can't create temp file for here document"; zsh 5.9: the cd does not run).
-const FIRM_NULL_OPS = new Set(['>', '>>', '>|', '&>', '&>>', '<']);
-const redirectsFirm = (rs) => (rs ?? []).every((r) => {
-  const fd = r.fd === null || r.fd === undefined ? null : Number(r.fd);
-  if (r.target === '/dev/null' && FIRM_NULL_OPS.has(r.op)) return fd === null || fd === 0 || fd === 1 || fd === 2;
-  return r.op === '>&' && (r.target === '&1' || r.target === '&2') && (fd === null || fd === 1 || fd === 2);
-});
+// #352 R36 (the final simple rule): NO redirection is firm. Any redirection on a cd / dir changer / state-changing command may keep it from running: `< /missing`, `> /missing/f`, a here-document (zsh writes it to a
+// temporary file first, and `TMPPREFIX=/missing/x` makes that fail), and even the ones that look unable to fail: a copy of a closed descriptor (`exec 2>&-; cd d >&2`: bad descriptor) and a lowered descriptor limit
+// (`ulimit -S -n 3; cd d 2>/dev/null`: too many open files) fail, and then the command does not run at all (`cd d < /missing` stays where it was). So only a command with no redirection is trusted.
+const redirectsFirm = (rs) => (rs ?? []).length === 0;
 // (the closer of a { } group: listed as a command of no words in the group, after its last one, its raw text starting with the `}`; one with no raw text is taken for a closer, the rule only erring toward unknown.
 // A bare `>x` or `A=1 < f` in the group is a command of its own: it fails alone)
 const isCloser = (x) => !x.argv.length && (typeof x.raw !== 'string' || /^\s*\}/.test(x.raw));
@@ -2011,8 +2006,13 @@ const isCloser = (x) => !x.argv.length && (typeof x.raw !== 'string' || /^\s*\}/
 function loopEndDirs(cmds, loop, from, ctx, cdp) {
   let own = Infinity;
   for (let j = loop.start; j < loop.end; j++) own = Math.min(own, cmds[j].grp?.length ?? 0);
-  const ownUp = cmds[loop.start].up ?? [];
-  const ownLoops = cmds[loop.start].loops?.length ?? 0;
+  // (#352 R36-F1: the loop's own level and depth are the shortest over the whole range, not those of its first listed command: a `$( )`, `( )`, `{ }` or loop in the header is listed before the header command, one level deeper)
+  let ownUp = cmds[loop.start].up ?? [];
+  let ownLoops = cmds[loop.start].loops?.length ?? 0;
+  for (let j = loop.start + 1; j < loop.end; j++) {
+    if ((cmds[j].up?.length ?? 0) < ownUp.length) ownUp = cmds[j].up ?? [];
+    ownLoops = Math.min(ownLoops, cmds[j].loops?.length ?? 0);
+  }
   // (a command in a subshell of the body, in a text a new process runs, or one a wrapper started does not move this shell, nor continue its loop: one in a text the loop is itself in does, R10-B1)
   const elsewhere = (x) => (x.grp?.length ?? 0) > own || x.spawn || x.up?.some((u) => u.proc && !ownUp.includes(u));
   // (a level between the loop and the command is surely entered when the command is: a { } group with no redirection that can fail on its closer (listed as a command of no words in the group, after its
@@ -3310,7 +3310,11 @@ function evalString(str, startDir, ctx, level, child = false) {
       const starts = memo?.dirs.get(r.id) ?? [];
       if (memo && !memo.dirs.has(r.id)) memo.dirs.set(r.id, starts);
       if (!starts.includes(dir)) { if (starts.length < MAX_LOOP_STARTS || !starts.length) starts.push(dir); else if (!starts.includes(null)) starts.push(null); }
-      const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), at: snap(), dirs: starts, passDir: dir, judged: new Map(), passes: 1, levels: levels ? levels.map((x) => ({ ...x })) : [] };
+      // (#352 R36-F1: the levels a pass restarts with are those the loop is in, not those its first listed command opens inside its header (`$( )`, `{ }`): one kept would hand the directory it saved at entry back
+      // when the replay leaves it, whatever the body did before. The loop's own level is the shortest `up` over its range.)
+      let ownLen = Infinity;
+      for (let j = r.start; j < r.end; j++) ownLen = Math.min(ownLen, cmds[j].up?.length ?? 0);
+      const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), at: snap(), dirs: starts, passDir: dir, judged: new Map(), passes: 1, levels: levels ? levels.slice(0, ownLen).map((x) => ({ ...x })) : [] };
       if (memo && !memo.carries.has(r.id)) memo.carries.set(r.id, fr.carry);
       if (carrySize(fr.carry)) loopMark(ctx, fr.carry); // (what the other readings of the loop word left: the body is judged from entry + that carry in this one as well)
       fr.judged.set(dir, carrySize(fr.carry));
@@ -3466,10 +3470,11 @@ function evalString(str, startDir, ctx, level, child = false) {
 // background (the whole and-or list a `&` ends), not started by a wrapper (spawn: the child's change), and not behind `||` (nor, with nothing before it but the line, behind anything but ; and &&: `cond`). What follows it
 // in its list is settled by evalString (settle): && keeps it, || forgets it, ; ends a conditional one. Marks not to be trusted: nothing is certain.
 // ('chain': it is in a branch / loop / function body or a trap but otherwise as above: the command chained to it with && sees it (`if x; then cd d && git push; fi`: it runs only when the change did), nothing else does)
-// (#352 R35-F2: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it that can fail (redirectsFirm) means it may not have run at all: not certain)
+// (#352 R35-F2, R36: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it (none is firm, redirectsFirm) means it may not have run at all: only the command chained to it with && sees it ('chain'):
+// a failed redirection makes the command exit non-zero, so what && chains to it runs only when it ran)
 function certainChange(cmds, c, trusted, moves = true) {
   if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
-  if (moves && !redirectsFirm(c.redirects)) return null;
+  if (moves && !redirectsFirm(c.redirects)) return 'chain';
   return Object.values(c.ctl).some(Boolean) ? 'chain' : 'certain';
 }
 

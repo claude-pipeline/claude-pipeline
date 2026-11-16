@@ -222,10 +222,8 @@ test('#352 R35-B1/B2/F1/F2: a cd or state change that may not have run is not tr
   }
   for (const [what, line] of [
     ['straight line: failing redirection on the cd back (R35-F2)', `cd /work/other; cd ${GIT_ROOT} < /missing; ${PB} origin HEAD`],
-    ['straight line: failing redirection on the cd back, after &&', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
     ['straight line: failing redirection on the { } group closer', `cd /work/other; { cd ${GIT_ROOT}; } < /missing; ${PB} origin HEAD`],
     ['straight line: failing redirection on the switch', `cd /work/other; git switch agent/x < /missing; ${PB} origin HEAD`],
-    ['straight line: failing redirection on the checkout', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
     // (zsh writes a here-document to a temporary file first: TMPPREFIX=/missing/x makes it fail, and the cd does not run (zsh 5.9))
     ['straight line: a here-document on the cd back', `TMPPREFIX=/missing/x; cd /work/other; cd ${GIT_ROOT} <<E\nx\nE\n${PB} origin HEAD`],
   ]) {
@@ -271,6 +269,8 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['straight line: switch with 2>/dev/null (R35 allow flipped)', `cd /work/other; git switch agent/x 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with >&2 (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
+    // (|| exit: sound to allow, since a failed redirection makes the cd fail and the exit runs, but the narrowing only knows a command with no redirection: refused, no new machinery)
+    ['straight line: cd back with 2>/dev/null || exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null, then another command, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && true; ${PB} origin HEAD`],
   ]) {
     denies(what, line, {}, DIRS);
@@ -281,7 +281,9 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['cd back with 2>/dev/null && push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
     ['cd back with >&2 && push', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
     ['cd back with &>/dev/null && push (R35 allow kept)', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
-    ['cd back with 2>/dev/null || exit, then push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
+    // (R35 denied these two: with the && chain 'chain' of R36 the push runs only when the cd / checkout ran, so a failing redirection no longer hides anything)
+    ['failing redirection on the cd back, then && push (R35 deny flipped: sound)', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
+    ['failing redirection on the checkout, then && push (R35 deny flipped: sound)', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
   ]) {
     allows(what, line);
     allows(`${what}, in a script`, RUN_SH, script('echo', line));
