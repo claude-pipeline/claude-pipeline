@@ -23,7 +23,7 @@ import { diffFiles } from '../lib/git.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
-  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, codexUsage, testsAdded?}   (testsAdded: "Tests added: N files, M cases; changed source lines : test lines = a : b" from the PR diff and integrity.test_globs; a soft signal, left out when it cannot be computed)   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; both lines end with " · Codex 7d: N runs (H high[, X xhigh])" when the pipeline ran Codex in the last 7 days, any repo: codexUsage {runs, high, xhigh, failed}, from <home>/.claude/pipeline-state/codex-usage.jsonl)',
+  usage: 'pipeline summary --pr N --outcome O [--built TEXT] [--session ID]... [--repo DIR]   -> {ok, url, agentLogLine, pendingLogLine?, cost, codexUsage, testsAdded?}   (testsAdded: "Tests added: N files, M cases; changed source lines : test lines = a : b" from the PR diff and integrity.test_globs; a soft signal, left out when it cannot be computed or the diff has no changed line)   (pendingLogLine: only for --outcome merged, the same line with outcome "merged — prod smoke pending"; both lines end with " · Codex 7d: N runs (H high[, X xhigh])" when the pipeline ran Codex in the last 7 days, any repo: codexUsage {runs, high, xhigh, failed}, from <home>/.claude/pipeline-state/codex-usage.jsonl)',
 };
 
 // These stops never reach a review round (verify red three times, Codex out in round 1) or happen after the run's state
