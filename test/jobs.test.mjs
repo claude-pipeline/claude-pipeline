@@ -202,6 +202,7 @@ test('the tombstone delete retries like the other deletes of the clear (recursiv
   fs.rmSync = real;
   syncBuiltinESMExports();
   assert.deepEqual(opts, [{ recursive: true, force: true, maxRetries: 3 }]);
+  assert.equal((await waitJob('retry', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
 });
 
 test('a policy refusal throws and starts nothing', async (t) => {
