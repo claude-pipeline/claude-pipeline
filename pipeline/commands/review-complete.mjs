@@ -15,7 +15,7 @@ import { git, headSha, isAncestor, mergeBase, remoteRefExists, revParse } from '
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
-import { assessRisk, hashBranch, prBaseBranch, rateBranch, reviewLane } from '../lib/risk.mjs';
+import { assessRisk, hashBranch, prBaseBranch, rateBranch, reviewLane, trustedDefaultBranch } from '../lib/risk.mjs';
 import { routeConfigFor } from '../lib/review-round.mjs';
 import { isSubstituteRound, loadState } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
@@ -48,7 +48,7 @@ export const meta = {
     '  same check as the final gate\'s review check): exit 1 {ok:false, reason: "round n: owner grant cannot be verified on this machine ..."} otherwise',
     '  a proven Fable round recorded with a Fable older than MIN_FABLE (or the lower hold of model-floor reset --hold) that no later whole-PR pass at or above it replaced is refused: exit 1 {ok:false, error:fable-refresh, reason, staleFableRounds:[{round, models}]},',
     '  the reason names the rounds and models and says `run `pipeline state fable-refresh --pr N``; the final gate\'s review check refuses the same PR the same way',
-    '  when GitHub names no base branch and the default branch cannot be anchored on the remote (an origin remote that answered neither origin/HEAD nor ls-remote: the working tree\'s default_branch is the PR\'s to edit), it is refused too: exit 1 {ok:false, reason: "GitHub did not name the PR\'s base branch, and ..."}',
+    '  when the default branch cannot be anchored on the remote (an origin remote that answered neither origin/HEAD nor ls-remote: the working tree\'s default_branch is the PR\'s to edit) it refuses BEFORE hashing, publishing or posting anything: exit 1 {ok:false, error:untrusted-anchor, reason: the sentence naming the fix `git remote set-head origin -a`}; when GitHub also named no base branch the reason starts "GitHub did not name the PR\'s base branch, and ..."',
     '  when a proven Fable round counts as current only because of the owner\'s allowance (model-floor reset --allow-id, an id the parser cannot read) or a hold below MIN_FABLE, the comment gets one line',
     '  "Standing Fable bypass: Fable round 3 counted via owner allowance <id>" (or "... via owner hold <id> (below <MIN_FABLE>)"), the output carries fableBypass:{note, rounds:[{round, via, id}]},',
     '  and the final gate\'s review check detail carries the same note',
@@ -240,6 +240,14 @@ export const run = guarded(async (argv, ctx) => {
           output: { ok: false, reason: `local HEAD ${local} is not the head of PR #${pr} on GitHub (${remote ?? 'unknown'}): push or pull first`, localHead: local, prHead: remote ?? null },
         };
       }
+      // An UNTRUSTED anchor (an origin remote that named no default branch: no refs/remotes/origin/HEAD and `git ls-remote --symref origin HEAD` answered nothing) leaves the working tree's
+      // default_branch, which the PR can edit, as the only source of the branch the hash is measured from. A marker would then vouch for content no round saw: refuse BEFORE anything is
+      // hashed, published or posted (#456, the merge gate refuses the same way). The sentence names the fix. GitHub not naming the PR's base branch keeps its own wording (S1).
+      const { untrusted } = trustedDefaultBranch(root, config);
+      if (untrusted !== null) {
+        const named = typeof view.baseRefName === 'string' && view.baseRefName !== '';
+        return { exitCode: EXIT.FAILED, output: { ok: false, reason: named ? untrusted : `GitHub did not name the PR's base branch, and ${untrusted}`, error: 'untrusted-anchor' } };
+      }
       // The hash is measured from the trusted default branch's origin/<branch> (GitHub's default); after `update-branch` + `git pull --ff-only` that ref is older than the main that
       // was merged in, so refresh it first (best effort: offline keeps the cached ref and the round's own hash is what it is compared to).
       const refresh = refreshBaseRef(root, config);
@@ -278,9 +286,8 @@ export const run = guarded(async (argv, ctx) => {
       }
       if (!grants.ok) return { exitCode: EXIT.FAILED, output: { ok: false, reason: grants.problems.join('; '), currentContentHash: hash } };
       const base = mergeBase(reviewBaseRef(root, config), local, { cwd: root });
-      // GitHub's base branch, else the trusted default branch; when that fallback is the working tree's own (an origin remote that did not answer) the PR chose it: refuse (S1).
-      const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
-      if (prBaseUntrusted !== null) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}`, currentContentHash: hash } };
+      // GitHub's base branch, else the trusted default branch (an untrusted anchor was refused above, before the hash: S1, #456).
+      const { branch: prBase } = prBaseBranch(view, root, config);
       const lane = await laneProblem(state, root, config, base, { prBase });
       if (lane) return { exitCode: EXIT.FAILED, output: { ok: false, reason: lane, currentContentHash: hash } };
       // A Claude stand-in reviewed instead of Codex (plan 2026-11-11-codex-substitute-reviewer): a high-risk PR it covered with Opus alone, or a substitute round whose proof does not hold, is refused.
