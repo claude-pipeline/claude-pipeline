@@ -2981,7 +2981,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
       for (; k < c.grp.length; k++) subs.push({ id: c.grp[k], dir, uncertain });
     }
-    if (hazard) forgetState();
+    if (hazard) forgetState(false); // (R1-B2: the names already recorded are forgotten; a function / trap / alias / shopt in a script marks no unrelated branch unknown)
     // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
     // without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
     if (uncertain && c.sep !== '&&') {

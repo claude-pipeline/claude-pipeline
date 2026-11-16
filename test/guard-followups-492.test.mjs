@@ -154,6 +154,17 @@ describe('R1-B3: a write below .git that cannot move a branch stays allowed', ()
   ]) test(`denied: ${why}`, () => expect('deny', line));
 });
 
+// R1-B2: a function / trap / alias / shopt in a walked script forgets the names already recorded, but marks no unrelated branch unknown
+describe('R1-B2: a state hazard in a child script or sourced file leaves the caller\'s on-disk branch known', () => {
+  const FN = { [resolve('/work/repo/nvm.sh')]: 'nvm() { echo x; }\nnvm\n', [BUILD]: 'build() { make; }\nbuild\n' };
+  test('a sourced file that defines a function, then a push from another directory', () => expect('allow', 'source ./nvm.sh; cd /work/repo/sub; git push', FN));
+  test('a build script that defines a function, then the push', () => expect('allow', 'bash build.sh; git push', FN));
+  for (const [why, body] of [['a trap', 'trap \'rm -f x\' EXIT\nmake\n'], ['an alias', 'alias ll=\'ls -l\'\nmake\n'], ['a shopt', 'shopt -s nullglob\nmake\n']]) {
+    test(`a build script with ${why}, then the push`, () => expect('allow', 'bash build.sh; git push', { [BUILD]: body }));
+  }
+  test('control: a function that switches the branch still denies', () => expect('deny', 'bash build.sh; git push', { [BUILD]: 'build() { git checkout main; }\nbuild\n' }));
+});
+
 // ---- #508 ----
 describe('#508: a PATH set before the failure group makes even an echo not inert', () => {
   // (the clause `assignedNames(ctx)` of inertInFailGroup: the PATH is set BEFORE the group, so the group's own words (`echo`, `exit`) are all plain data commands)
