@@ -88,7 +88,7 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
 // round). It uses the same classification admitRound makes (review-round.mjs#classifyReview: the review base and kind, the resolution-only proof) without the cap, without
 // writing a review artifact and without touching a grant; git writes at most the trial merge's objects. A judge-to-Fable escalation and a PR that targets another branch than the
 // default are not modelled, so the free kinds (base-only, resolution) are worded as conditional (the real round is a counted one then: whole-PR for the escalation).
-// -> { nextRound: { prediction: true, previousClean, sinceReviewed: {merges, ownCommits}, kind, resolutionIneligible?, alternative? }, lines: ['Prediction: ...'] }. Throws on a git failure:
+// -> { nextRound: { prediction: true, previousClean, sinceReviewed: {merges, ownCommits} | {rewritten: true, commits}, kind, resolutionIneligible?, alternative? }, lines: ['Prediction: ...'] }. Throws on a git failure:
 // the caller turns that into a warning.
 export function predictNextRound({ root, config, state, head }) {
   const o = { cwd: root };
@@ -104,6 +104,7 @@ export function predictNextRound({ root, config, state, head }) {
   // The last reviewed head is on HEAD's first-parent chain exactly when the oldest listed commit's first parent is the anchor (the walk resolutionReviewBase's history rule makes,
   // history-not-first-parent). After a rewritten history the list holds the default branch's commits too, so nothing below may be read as "the PR's own commits".
   const anchorOnChain = chain.length > 0 && chain.at(-1).split(' ')[1] === anchor;
+  const rewritten = chain.length > 0 && !anchorOnChain;
   for (const line of chain) {
     const parents = line.split(' ');
     if (parents.length > 2) {
@@ -120,11 +121,18 @@ export function predictNextRound({ root, config, state, head }) {
   }, o);
   const baseOnly = review.kind === 'synthetic' && git(['diff', '--name-only', `${review.base}..${headFull}`], o) === '';
   const kind = baseOnly ? 'base-only' : review.kind;
-  const nextRound = { prediction: true, previousClean, sinceReviewed: { merges, ownCommits }, kind };
+  const nextRound = { prediction: true, previousClean, sinceReviewed: rewritten ? { rewritten: true, commits: chain.length } : { merges, ownCommits }, kind };
   if (resolutionIneligible !== undefined) nextRound.resolutionIneligible = asciiLine(resolutionIneligible, 160);
   // The free kinds are conditional: a judge-to-Fable escalation and a PR that does not target the default branch are not modelled above, and either makes the real round counted (whole-PR for the escalation, the range since the last reviewed head for another base branch).
   const unlessCounted = ' (unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates)';
-  if (previousClean && ownCommits > 0 && anchorOnChain) {
+  // Nothing to revert once the range is already free (base-only), or, with no merge in it, once the content is back to what the last round reviewed (a revert was already made).
+  let contentRestored = false;
+  if (merges === 0 && anchorOnChain) {
+    try {
+      contentRestored = currentContentHash(root, config) === last.contentHashAtToHead;
+    } catch { /* an unreadable hash leaves the hint shown */ }
+  }
+  if (previousClean && ownCommits > 0 && anchorOnChain && kind !== 'base-only' && !contentRestored) {
     const revert = `revert the ${plural(ownCommits, 'own commit')} since the last reviewed head (newest first)`;
     // With a merge in the range, nothing is promised after the revert: the filter below only decides WHICH wording shows, and the owner confirms by running round-request again
     // (the revert's result is the only proof: identical edits on both sides, for one, are removed by the revert but kept by the synthetic base). The filter: a clean trial merge
@@ -156,11 +164,13 @@ export function predictNextRound({ root, config, state, head }) {
   }[kind] ?? `a ${kind} round`;
   const lines = [
     `Prediction: the previous round was ${previousClean ? '' : 'not '}clean.`,
-    `Prediction: ${plural(merges, 'merge commit')} and ${plural(ownCommits, 'own commit')} since the last reviewed head.`,
+    rewritten
+      ? `Prediction: the last reviewed head is not in HEAD's first-parent history (rewritten history); ${plural(chain.length, 'commit')} since it.`
+      : `Prediction: ${plural(merges, 'merge commit')} and ${plural(ownCommits, 'own commit')} since the last reviewed head.`,
     `Prediction: the next round would be ${words}${nextRound.resolutionIneligible ? `; the conflict resolution could not be reviewed alone (${nextRound.resolutionIneligible})` : ''}.`,
     ...(nextRound.alternative ? [`Prediction: No-round alternative: ${nextRound.alternative}.`] : []),
   ];
-  return { nextRound, lines: lines.map((l) => asciiLine(l, 400)) };
+  return { nextRound, lines: lines.map((l) => asciiLine(l, 500)) };
 }
 
 const SEVERITY_WARNING = /^(severity could not be judged|the reviewed diff could not be read)/;

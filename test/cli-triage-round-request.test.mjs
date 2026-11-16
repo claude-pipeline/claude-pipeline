@@ -476,6 +476,49 @@ test('round-request nextRound: a reviewed head that is not on the first-parent c
   assert.equal(r.json.nextRound.previousClean, true);
   assert.equal(r.json.nextRound.alternative, undefined);
   assert.doesNotMatch(r.json.summary, /No-round alternative/);
+  assert.deepEqual(r.json.nextRound.sinceReviewed, { rewritten: true, commits: 1 }, 'no own/merge split: those commits are not known to be the PR\'s own');
+  assert.match(r.json.summary, /^Prediction: the last reviewed head is not in HEAD's first-parent history \(rewritten history\); 1 commit since it\.$/m);
+  assert.doesNotMatch(r.json.summary, /own commit/);
+});
+
+// Failure caught: the confirming run the hint asks for ("run round-request again after the revert") repeated the revert advice, so an agent could revert forever.
+test('round-request nextRound: after the hinted revert the confirming run gives no alternative (with a clean main merge, and with none)', (t) => {
+  const w = atCapWithOwnCommit(t);
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  const own = w.repo.git(['log', '--format=%H', '--grep=^own commit$']).trim();
+  w.repo.git(['revert', '--no-edit', own]);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.nextRound.kind, 'base-only');
+  assert.equal(r.json.nextRound.alternative, undefined);
+  assert.doesNotMatch(r.json.summary, /No-round alternative/);
+
+  const n = roundWorld(t);
+  n.atCap();
+  n.edit((s) => { for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  assert.match(ask(n).json.summary, /No-round alternative: revert the 1 own commit/, 'before the revert the hint shows');
+  n.repo.git(['revert', '--no-edit', 'HEAD']);
+  const back = ask(n);
+  assertExit(back, 0, back.stderr + back.stdout);
+  assert.equal(back.json.nextRound.sinceReviewed.ownCommits, 2);
+  assert.equal(back.json.nextRound.alternative, undefined);
+  assert.doesNotMatch(back.json.summary, /No-round alternative/);
+});
+
+// Failure caught: with 10 or more own commits the alternative's summary line went past the 400-character cap and was cut mid-word.
+test('round-request nextRound: the alternative summary line keeps its full ending with a two-digit own-commit count', (t) => {
+  const w = atCapWithOwnCommit(t);
+  for (let i = 0; i < 11; i += 1) {
+    w.repo.write(`src/n${i}.js`, `export const n = ${i};\n`);
+    w.repo.commit(`more own ${i}`);
+  }
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.nextRound.sinceReviewed.ownCommits, 12);
+  const line = r.json.summary.split('\n').find((l) => l.startsWith('Prediction: No-round alternative'));
+  assert.match(line, /revert the 12 own commits/);
+  assert.ok(line.endsWith('whole-PR when the reviewer escalates).'), line.slice(-80));
 });
 
 // Failure caught: a prediction that throws must never cost the owner the closing line.
