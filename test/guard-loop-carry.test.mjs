@@ -169,3 +169,26 @@ test('#352 R29-B1/F1/F2: a cd or pushd with an option outside -L / -P leaves the
   allows('cd -LP back, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && cd -LP ${GIT_ROOT}; done`);
   allows('cd -P into a subdirectory and back, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd -P sub && cd ..; done`);
 });
+// (#352 R30-F3: options, and the `--` that ends them, count only before the first operand. `cd DIR -P` is zsh's two-word `cd OLD NEW` (bash: "too many arguments") and fails, so it stays where it was;
+// `cd DIR --` fails the same way and is no bare cd (HOME). The R29 rows again with the dash word after the operand.)
+test('#352 R30-F3: a -P / -- after the cd operand makes the cd fail (two operands): the directory is unknown', () => {
+  for (const tail of ['-P', '--', '-L']) {
+    const cd = `cd ${GIT_ROOT} ${tail}`;
+    for (const [what, line] of [
+      ['in a pair', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && ${cd}; done`],
+      ['after ;', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; ${cd}; done`],
+      ['on the straight line, after &&', `cd /work/other && ${cd} && ${PB} origin HEAD`],
+      ['on the straight line, after ;', `cd /work/other; ${cd}; ${PB} origin HEAD`],
+      ['pushd first, then the cd, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other && pushd -n ${GIT_ROOT}; ${cd}; done`],
+      ['pushd -n first on the straight line', `cd /work/other && pushd -n ${GIT_ROOT} && ${cd} && ${PB} origin HEAD`],
+    ]) {
+      denies(`${cd} ${what}`, line, {}, DIRS);
+      denies(`${cd} ${what}, in a script`, RUN_SH, script('echo', line), DIRS);
+    }
+  }
+  // (the options before the operand still move: the allows of R29 stand)
+  allows('cd -P first, then the operand', `cd /work/other && cd -P ${GIT_ROOT} && ${PB} origin HEAD`);
+  allows('cd -L x', `cd /work/other && cd -L ${GIT_ROOT} && ${PB} origin HEAD`);
+  allows('cd -- operand', `cd /work/other && cd -- ${GIT_ROOT} && ${PB} origin HEAD`);
+  allows('cd -P sub && cd .. in a loop', `for i in 1 2; do ${PB} origin HEAD; cd -P sub && cd ..; done`);
+});

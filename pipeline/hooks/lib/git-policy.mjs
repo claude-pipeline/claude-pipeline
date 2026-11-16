@@ -283,11 +283,18 @@ function nextDir(dir, name, argv, ctx, cdpath = false, env = {}) {
   // `pushd +1`, zsh and bash) and zsh's `cd OLD NEW` (OLD replaced by NEW in the current directory; bash refuses it) leave the directory unknown, and so does
   // a word still holding a run-time part (`cd -"$N"` may be a stack entry; Codex review 3 of #50)
   if (args.some((a) => /^[+-]\d+$/.test(a) || DYNAMIC.test(a))) return null;
-  const k = args.indexOf('--');
   // (#352 R29-B1 / R29-F2: an option word the shell refuses (`cd -Q`) fails the cd, which stays where it was, and bash's `pushd -n DIR` succeeds without moving: only cd's -L and -P are known
-  // to move to the operand (zsh's -s refuses a symbolic link, bash's -e / -@ are rare): any other option word, and every pushd option, leaves the directory unknown)
-  if ((k >= 0 ? args.slice(0, k) : args).some((a) => a.length > 1 && a[0] === '-' && !(name === 'cd' && /^-[LP]+$/.test(a)))) return null;
-  const operands = k >= 0 ? args.slice(k + 1) : args.filter((a) => !(a.length > 1 && a[0] === '-'));
+  // to move to the operand (zsh's -s refuses a symbolic link, bash's -e / -@ are rare): any other option word, and every pushd option, leaves the directory unknown.
+  // R30-F3: options, and the `--` that ends them, count only BEFORE the first operand (both shells stop reading options there): `cd DIR -P` is zsh's two-word `cd OLD NEW` / bash's "too many
+  // arguments" and fails, `cd DIR --` the same: a dash word after the first operand is an operand, so these have two operands and leave the directory unknown)
+  let first = 0;
+  for (; first < args.length; first++) {
+    const a = args[first];
+    if (a === '--') { first++; break; }
+    if (!(a.length > 1 && a[0] === '-')) break;
+    if (!(name === 'cd' && /^-[LP]+$/.test(a))) return null;
+  }
+  const operands = args.slice(first);
   if (operands.length > 1) return null;
   // Why: a bare cd goes to the HOME the cd builtin sees: its own prefix (`HOME=d cd`), else the line's (Codex review 3 of #50)
   if (operands.length === 0) {
