@@ -321,7 +321,7 @@ test('R2-F1: a dismiss key sent at or after the tool_use fails EVERY case (the t
     }
   }
   // the failed 2026-11-15 preview-annotations run's key pattern (answered 1.386 s after the tool_use, with DOWN (+0.7 s) and ENTER (+1.4 s) from the dismiss handler),
-  // replayed on the 2026-11-17 full-run recording (answered about 28 s after the tool_use by the case's own keys): any dismiss key after the tool_use fails the case
+  // replayed on the 2026-11-16T13:42Z full-run recording (answered about 28 s after the tool_use by the case's own keys): any dismiss key after the tool_use fails the case
   const preview = load('2.1.323', 'preview-annotations');
   const useAt = Date.parse(preview[1].timestamp);
   const raced = judge(byName('preview-annotations'), preview, { sent: [{ key: DOWN, at: useAt + 700, phase: 'dismiss' }, { key: ENTER, at: useAt + 1400, phase: 'dismiss' }] });

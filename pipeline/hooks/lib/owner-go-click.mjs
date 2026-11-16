@@ -8,7 +8,7 @@
 // model's own `answers` input, or by a non-interactive run lacks that stamp (spikes s07, s08, s10 of 2026-11-11, test/fixtures/click). The stamp is the whole object, not decision + source,
 // because a hook-filled answer could carry source user_temporary and annotations {} like a click, with only its reasonCode (hook:PreToolUse, a person's is unknown) telling them apart. On 2.1.323
 // a dialog that comes with prefilled answers (the model's own `answers`, or a PreToolUse hook answering "ask" or returning only updatedInput) is not submitted by Claude Code: it waits for a
-// person (the owner's 2026-11-17 recordings: open 56-59 s until the recording script cancelled it, an error result with no answer and no stamp). The whole-object check stays as defence in depth, and the
+// person (the owner's 2026-11-16T13:42Z full run: open 56-59 s until the recording script cancelled it, an error result with no answer and no stamp). The whole-object check stays as defence in depth, and the
 // model's own `answers` is refused by the tool-use shape check below. The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for: the entry lands 100-200 ms after the
 // hook starts). Hooks that could still answer the dialog are the dialog-hook check's business (B5, hookCheck below, T2): this file takes it as an injected function.
 // What binds is the question TEXT: it is the typed path's closing block, so the answer goes through the SAME parsers the typed prompt does (approvalBinding, roundBinding, rulingBinding in
