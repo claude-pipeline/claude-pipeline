@@ -17,8 +17,10 @@
 // only AFTER the PostToolUse hooks return, so every click fails `not-in-transcript` there. recordClick then keeps the click PENDING: it runs every check that needs no transcript and writes
 // `asks/<askId>.<clickId>.pending`, a pointer that admits nothing. settlePendingClicks (called by the readers in owner-go.mjs, never by the read-only paths) verifies it later, through the same clickEvidence /
 // admitClick core, writes the same spent marker and record plus a `.settled` outcome, and clickNotes tells a refusal what became of a click. The pointer's capture-time fields (the hook fingerprint,
-// `capturedAt`) are believed only because the PostToolUse hook is their sole writer: guard-files refuses tool writes to owner-go/** and refuses running this library by hand (the trusted-writer boundary).
-// Residual (unchanged from the typed path, owner-go.mjs): keystrokes injected into the owner's terminal look human.
+// `capturedAt`) are taken on the hook's word: guard-files refuses tool writes to owner-go/** and refuses running this library by hand in its direct shapes (a path, program text, a program read from stdin). It is a
+// guard, not a sole-writer guarantee.
+// Residuals: (unchanged from the typed path, owner-go.mjs) keystrokes injected into the owner's terminal look human; and a hand-written script FILE that imports this library is not refused (the test runs are such files), so it can
+// write a pointer with a made-up capture-time hook result. That skips only the dialog-hook check: everything else is re-derived from the protected transcript when the click is settled.
 import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, openSync, readdirSync, readSync, writeSync } from 'node:fs';
 import path from 'node:path';
@@ -509,8 +511,9 @@ const clickFile = (askId, clickId, ext, home) => (ASK_ID_RE.test(String(askId)) 
 // Why (#472, the 2.1.323 write order): the click's tool_result entry is not in the transcript when the PostToolUse hook runs, so the transcript cannot be checked yet. Everything that needs no transcript
 // is checked NOW, while the click is fresh, and then only a POINTER is kept: `asks/<askId>.<clickId>.pending`. The pointer admits nothing: settlePendingClicks re-derives everything from the transcript
 // and the ask file when a consumer reads, through the same clickEvidence and admitClick core. The one thing the pointer carries that the transcript cannot is the dialog-hook check's result
-// (`hookLayersSha256`, taken at the click: hooks that could answer the dialog are checked when the dialog is answered, not when someone reads), plus `capturedAt` for the time rules; both are believed
-// only because the PostToolUse hook is their sole writer (guard-files refuses a tool write to owner-go/**, and a hand-run of the click libraries is refused). What is refused here, no pointer: a tool_input that is
+// (`hookLayersSha256`, taken at the click: hooks that could answer the dialog are checked when the dialog is answered, not when someone reads), plus `capturedAt` for the time rules; both are taken
+// on the PostToolUse hook's word (guard-files refuses a tool write to owner-go/** and a direct hand-run of the click libraries: a path, program text, a stdin program; a script file that imports them is the residual named at the top of this file,
+// and it skips only this dialog-hook result). What is refused here, no pointer: a tool_input that is
 // not one canonical question of this ask (keys beyond questions / metadata, another dialog: only ever an EARLIER refusal, the tool_response is never read), an expired, superseded or already spent ask, and hooks that
 // are unchecked, offending or changed since the ask.
 async function captureClick({ input, ask, askId, session, toolUseId, transcriptPath, cwd, home, now, hookCheck }) {
