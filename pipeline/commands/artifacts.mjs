@@ -76,7 +76,8 @@ export function publishArtifacts({ root, pr, files, gitFn = gitRun, tmpBase = tm
       }
       if (exists) {
         g(['fetch', REMOTE, `+refs/heads/${ARTIFACTS_BRANCH}:refs/remotes/${REMOTE}/${ARTIFACTS_BRANCH}`], root, NETWORK_TIMEOUT_MS);
-        g(['worktree', 'add', '--detach', wt, `${REMOTE}/${ARTIFACTS_BRANCH}`]);
+        // fully qualified: an abbreviated `origin/<b>` resolves through refs/tags and refs/heads before refs/remotes (#454)
+        g(['worktree', 'add', '--detach', wt, `refs/remotes/${REMOTE}/${ARTIFACTS_BRANCH}`]);
       } else {
         g(['worktree', 'add', '--no-checkout', '--detach', wt]);
         g(['checkout', '--orphan', scratch], wt);

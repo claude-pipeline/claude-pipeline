@@ -79,9 +79,10 @@ export function fileProvenance(root, files, { requireToplevel = false, scope = n
   return { head, state: differing.length === 0 ? 'clean' : 'dirty', differing, deleted };
 }
 
-// Is HEAD contained in the local origin/main? Local ref only (no fetch); no such ref means false.
+// Is HEAD contained in the local origin/main? Local ref only (no fetch); no such ref means false. Read fully qualified: an abbreviated `origin/main`
+// resolves through refs/tags and refs/heads first, so a branch or tag of that name would stand in for the remote's (#454).
 export function headOnMain(root) {
-  return gitIn(root, ['merge-base', '--is-ancestor', 'HEAD', 'origin/main'], { timeoutMs: 10000 }).code === 0;
+  return gitIn(root, ['merge-base', '--is-ancestor', 'HEAD', 'refs/remotes/origin/main'], { timeoutMs: 10000 }).code === 0;
 }
 
 // ---- stamps ---------------------------------------------------------------------------------------------------

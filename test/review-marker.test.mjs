@@ -1,7 +1,7 @@
 // Unit tests for lib/review-marker.mjs: the review-complete comment as review-complete writes it and the guards workflow reads it.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { REVIEW_COMPLETE_MARKER, REVIEW_CONTEXT, REVIEW_MARKER_TEXT, latestReviewComment, parseReviewRecord } from '../pipeline/lib/review-marker.mjs';
+import { REVIEW_COMPLETE_MARKER, REVIEW_CONTEXT, REVIEW_MARKER_TEXT, formatSubstituteRounds, latestReviewComment, parseReviewRecord } from '../pipeline/lib/review-marker.mjs';
 import { REVIEW_COMPLETE_MARKER as COMMAND_MARKER, reviewCompleteBody } from '../pipeline/commands/review-complete.mjs';
 import { REVIEW_CHECK } from '../pipeline/lib/config.mjs';
 import { GUARD_CONTEXT_CHECKS } from '../pipeline/lib/guard-provenance.mjs';
@@ -100,4 +100,16 @@ test('an ordinary marker body is byte-identical to what it was before rulings ex
     '',
   ].join('\n');
   assert.equal(reviewCompleteBody(RECORD), expected);
+});
+
+test('formatSubstituteRounds: contiguous runs become ranges, everything else a list (#2163 #405)', () => {
+  assert.equal(formatSubstituteRounds([3]), 'substitute round 3');
+  assert.equal(formatSubstituteRounds([1, 2, 3]), 'substitute rounds 1–3');
+  assert.equal(formatSubstituteRounds([1, 2]), 'substitute rounds 1–2');
+  assert.equal(formatSubstituteRounds([1, 4]), 'substitute rounds 1, 4');
+  assert.equal(formatSubstituteRounds([1, 2, 4]), 'substitute rounds 1–2, 4');
+  assert.equal(formatSubstituteRounds([1, 3, 4, 5, 8]), 'substitute rounds 1, 3–5, 8');
+  assert.equal(formatSubstituteRounds([4, 1, 2, 2, 4]), 'substitute rounds 1–2, 4', 'sorted and de-duplicated');
+  assert.equal(formatSubstituteRounds([2, 2]), 'substitute round 2');
+  assert.equal(formatSubstituteRounds([]), '');
 });
