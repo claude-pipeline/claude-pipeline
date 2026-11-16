@@ -243,6 +243,12 @@ const chain = (twice, depth, words, names = 4) => {
   return out;
 };
 const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
+// The guard's deadline clock for these tests: the slower of CPU time and clock time since it was made, so the 5 s deadline fires only
+// when BOTH have passed it. CPU time alone is inflated on a shared runner (seen on PR #474: 5 s of CPU in 2.9 s of clock, GC/JIT threads
+// across cores, so the deadline fired before the reading cap); the clock alone is on a merely busy machine. (Both start at 0 when the guard
+// builds its budget, so deadline = 0 + 5000; min of two rising clocks rises too. A regression that drops the cap still ends the test:
+// after 5 s of wall time on a normal machine the deadline fires, the reason is not "too many readings" and the match below fails.)
+const slower = () => { const c0 = cpu(); const w0 = Date.now(); return () => Math.min(cpu() - c0, Date.now() - w0); };
 // The timing bound below proves the refusal came well before the guard's 5 s deadline (the reason check proves it was the reading
 // cap). A shared CI runner measured 3480 ms of CPU and 3068 ms of clock for the 20-word chain (main e48f4ae, no code change), so CI
 // gets the headroom guard-t8b's cap got; it stays under the deadline.
@@ -250,7 +256,7 @@ const EARLY_MS = process.env.CI ? 4500 : 3000;
 test('three nested scripts that each assign four names twice and loop over eight words are refused at once, not at the deadline', () => {
   const t0 = cpu();
   const w0 = Date.now();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now: cpu }); // (the guard's 5 s deadline in CPU time too: at load 100+ the clock deadline fired first and the reason was not the reading cap)
+  const r = files('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now: slower() }); // (deadline in the slower of CPU time and clock time: either alone fired first on a loaded machine / on CI and the reason was not the reading cap)
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
@@ -268,7 +274,7 @@ test('loop words alone (names assigned once) also share the allowance across nes
   const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
   const t0 = cpu();
   const w0 = Date.now();
-  const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)), { now: cpu }); // (deadline in CPU time, as above)
+  const r = files('bash F1.sh', fakeFs(PROJ, chain(false, 3, words)), { now: slower() }); // (deadline in the slower of CPU time and clock time, as above)
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /too many readings/, r.reason);
   const ms = cpu() - t0;
