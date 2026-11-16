@@ -61,6 +61,9 @@ function world(t, { withOrigin = true, accept = false } = {}) {
     repo.git(['remote', 'add', 'origin', originDir]);
     repo.git(['push', '-q', 'origin', 'main']);
     repo.git(['fetch', '-q', 'origin']);
+    // A real clone has refs/remotes/origin/HEAD (git clone sets it; git >= 2.48 also creates it on fetch, older git does not): set it so every git version anchors the default branch
+    // on something a PR cannot edit, and the offline tests below keep exercising the cached-ref paths rather than the untrusted-anchor refusal (#456).
+    repo.git(['remote', 'set-head', 'origin', 'main']);
   }
   repo.branch('feat/x');
   repo.write('src/a.js', aFile(true));
@@ -191,12 +194,12 @@ test('origin is unreachable: review-complete still answers from the cached ref, 
   assert.ok(!w.item().implemented);
 });
 
-test('origin is unreachable and the content has no covering round: review-complete says origin/main could not be refreshed; with a covering round it passes', (t) => {
+test('origin is unreachable and the content has no covering round: review-complete says origin/main could not be refreshed; with a covering round it passes; with no origin/HEAD anchor it refuses untrusted-anchor', (t) => {
   const w = world(t);
   w.repo.git(['remote', 'set-url', 'origin', join(w.scratch, 'does-not-exist.git')]);
   w.prHead(w.head);
   // A fixture clone made by hand has no refs/remotes/origin/HEAD, so with the remote unreachable nothing anchors the default branch except the working tree's own config, which a PR can edit (#377, S1):
-  // the base config is untrusted, the PR needs the Fable pass and the substitute is off. That is intended, not a regression of the cached-ref behaviour.
+  // review-complete refuses BEFORE hashing (exit 1, error untrusted-anchor, #456), since a marker would vouch for content measured from a branch the PR chose. That is intended, not a regression of the cached-ref behaviour.
   // git >= 2.48 creates origin/HEAD on fetch (remote.origin.followRemoteHEAD); older git does not. Set it either way, then delete the symref
   // itself (--no-deref: a plain `update-ref -d` follows it and deletes origin/main instead), so every git version reaches the unanchored state.
   w.repo.git(['remote', 'set-head', 'origin', 'main']);
@@ -204,7 +207,8 @@ test('origin is unreachable and the content has no covering round: review-comple
   assert.notEqual(w.repo.git(['rev-parse', '--verify', '-q', 'refs/remotes/origin/main']).trim(), '', 'origin/main must survive');
   const unanchored = w.cli(['review-complete', '--pr', '7']);
   assertExit(unanchored, 1, unanchored.stderr + unanchored.stdout);
-  assert.match(unanchored.json.reason, /needs the Fable review pass.*could not be anchored on the remote/);
+  assert.equal(unanchored.json.error, 'untrusted-anchor');
+  assert.match(unanchored.json.reason, /could not be anchored on the remote/);
   // A real clone has origin/HEAD (git clone sets it): that cached anchor is a source a PR cannot edit, so the cached-ref behaviour below holds offline.
   w.repo.git(['remote', 'set-head', 'origin', 'main']);
   const ok = w.cli(['review-complete', '--pr', '7']);

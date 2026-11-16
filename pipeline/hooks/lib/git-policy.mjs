@@ -2269,6 +2269,25 @@ const UNSURE_OK = new Set([
   ...VAR_BUILTINS, ...VALUE_BINDERS,
 ]);
 const DIR_CHANGERS = ['cd', 'chdir', 'pushd', 'popd']; // (#372: zsh's chdir is cd)
+// #491 R2-F1 / R4: a command of a failure group that cannot change the caller's branch or directory whatever the walk could not see. An ALLOW-LIST of data
+// commands only: the BARE word of echo / printf / : / true / false / exit (or the same under a system bin directory). There is no git half on purpose: a git command
+// that looks read-only can still run a program or write HEAD (`git log --output=.git/HEAD`, a PATH or GIT_* change, a package-script bin directory, a letter-case or
+// alias spelling ...), and the list of ways kept growing. Any git command in the group leaves the names forgotten, exactly as on origin/main (no regression: main forgets
+// them for every such group). A path to a program of the same name (`/work/repo/echo`), a package runner's lookup (viaRunner / binPath), a package script's PATH
+// (scriptBinDir), a PATH the group sets, and a redirection that writes a file are not inert.
+const INERT_DATA = new Set(['echo', 'printf', ':', 'true', 'false', 'exit']);
+const SYSTEM_BIN_PATH = /^\/(?:usr\/)?s?bin\/[^/]+$/;
+const INPUT_REDIRECTS = new Set(['<', '<<', '<<-', '<<<']);
+const FD_DUP_TARGET = /^&(?:\d+|-)$/; // (`>&2`, `2>&1`, `>&-`: a descriptor duplicate or close; `>&file` writes a file)
+const inertInFailGroup = (g, ctx) => {
+  const word = g.argv[0] ?? '';
+  const nm = SYSTEM_BIN_PATH.test(word) ? word.slice(word.lastIndexOf('/') + 1) : word; // (the bare word, or a system bin path: never `./echo`, `/work/repo/echo`)
+  if (!INERT_DATA.has(nm)) return false; // (and never a git command)
+  if (g.viaRunner || g.binPath || typeof ctx.scriptBinDir === 'string') return false;
+  if (Object.keys(g.env ?? {}).some((k) => /^PATH$/i.test(k)) || assignedNames(ctx).some((k) => /^PATH$/i.test(k))) return false; // (a PATH the group or the line set can make `echo` a program)
+  // (a redirection that may write a file: input, a descriptor duplicate and /dev/null are harmless)
+  return !(g.redirects ?? []).some((r) => !INPUT_REDIRECTS.has(r.op) && !FD_DUP_TARGET.test(String(r.target ?? '')) && r.target !== '/dev/null');
+};
 
 // A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
 // an alias, a trap (`trap "cd …" DEBUG` runs before every command) or changes shell options / builtins can change
@@ -2836,6 +2855,15 @@ function evalString(str, startDir, ctx, level, child = false) {
     return after >= 1 ? cmds.indexOf(shapeTop.top[after - 1]) : -1; // (the exit is the construct's last command; a substitution of the command after it is listed after the exit)
   };
   const exitsAsGroup = (i) => exitOfGroup(i) >= 0;
+  // #481: the command `n` places after cmds[i] at the text's own level. The parser lists the commands of a `$( )` before the command that holds them, so cmds[i + 1] can be a substitution's
+  // inner command (`cd d || echo "$(pwd)"; git push`): the next command is read from the top-level list. (A command inside a substitution itself keeps the flat reading.)
+  let topIdx; // (command -> its index in the text's own level, built when first asked)
+  const nextAt = (i, n) => {
+    if (cmds[i].depth > 0) return cmds[i + n];
+    if (!topIdx) { topIdx = new Map(); for (const c of cmds) if (!(c.depth > 0)) topIdx.set(c, topIdx.size); }
+    shapeTop ??= { top: cmds.filter((c) => !(c.depth > 0)), evAt: cmds.shape ? shapeAt(cmds.shape) : null };
+    return shapeTop.top[topIdx.get(cmds[i]) + n];
+  };
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
@@ -2892,6 +2920,16 @@ function evalString(str, startDir, ctx, level, child = false) {
   // #478 R1-B1: the commands of a failure group `cd X || { …; exit 1; }` run only when the cd (or a git checkout / switch) FAILED, in the old directory on the old branch, so they are walked with the state unknown
   // (`to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`: the cd / checkout itself may not have run)
   let failGroup = null;
+  const restoreAfterGroup = () => {
+    dir = failGroup.snap.dir;
+    // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
+    if (failGroup.doubt) forgetState();
+    else {
+      const was = new Map(failGroup.snap.names);
+      for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
+    }
+    failGroup = null;
+  };
   let chdirBase; // (the list's own directory while one command runs in its wrapper's -C / --chdir directory)
   try {
   for (const [i, c] of cmds.entries()) {
@@ -2900,16 +2938,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup && failGroup.snap === null) {
       failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]) };
       forgetState();
-    } else if (failGroup && i > failGroup.to) {
-      dir = failGroup.snap.dir;
-      // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
-      if (failGroup.doubt) forgetState();
-      else {
-        const was = new Map(failGroup.snap.names);
-        for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
-      }
-      failGroup = null;
-    }
+    } else if (failGroup && i > failGroup.to) restoreAfterGroup();
     const argv = c.argv;
     if (subs) {
       // Why: a cd inside a subshell ($( ), ( ), backticks, <( )) moves that subshell only: when it ends, the line goes on in the directory it had when the subshell
@@ -2938,11 +2967,13 @@ function evalString(str, startDir, ctx, level, child = false) {
       // `cd d || exit`: when the cd fails nothing after it runs, so the commands that do run see the change
       // (#427, the same rule as the files guard's cd narrowing: only a plain `exit`, alone or with one number, leaves: not `return` (an error at top level), not an exit with a redirection or extra words, and no
       // redirection on the closer of its group, `{ exit 1; } < f`, which the parser lists as a command of no words right after it)
-      const orExits = cmds[i + 1]?.sep === '||' && plainExit(cmds[i + 1]) && cmds[i + 2]?.sep !== '|' && cmds[i + 2]?.sep !== '&'
-        && !(cmds[i + 2] !== undefined && cmds[i + 2].argv.length === 0 && (cmds[i + 2].redirects ?? []).length > 0)
+      const next = nextAt(i, 1);
+      const after = nextAt(i, 2);
+      const orExits = next?.sep === '||' && plainExit(next) && after?.sep !== '|' && after?.sep !== '&'
+        && !(after !== undefined && after.argv.length === 0 && (after.redirects ?? []).length > 0)
         || (changesState && exitsAsGroup(i));
-      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false };
-      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (cmds[i + 1]?.sep === '||' && !orExits))) uncertain = true;
+      if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false, from: i, byDir: DIR_CHANGERS.includes(nm) };
+      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (next?.sep === '||' && !orExits))) uncertain = true;
       if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
@@ -3058,6 +3089,13 @@ function evalString(str, startDir, ctx, level, child = false) {
       const unsure = unsureVarReachingCommand(cmds.slice(i + 1), ctx);
       if (unsure !== null) return deny(`$${unsure} may be reassigned by the file ${name === '.' ? '.' : 'source'} runs, so its value at run time cannot be verified. Use it before sourcing, or write the value out.`);
     }
+  }
+  // #482: a group whose exit ends the text is restored here too (ctx.branches is shared with the caller of a nested text: it must not keep every branch name forgotten)
+  // (#491 R2-F1: an allow-list: only a group opened by a directory change in which every command is inert, a plain data command or a git command with no state word, so no script, feed, source, eval, shell, gh or package runner
+  // that could switch the caller's branch where the walk cannot see it; R2-B1: otherwise every branch name is forgotten, including one the group itself recorded through an absolute -C directory)
+  if (failGroup?.snap) {
+    if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();
+    else for (const e of ctx.branches.values()) e.name = null;
   }
   return allowed();
   } finally {

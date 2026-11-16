@@ -211,6 +211,8 @@ const OID_RE = /^[0-9a-f]{40}([0-9a-f]{24})?$/;
 // content. `run(args)` is the caller's git (cwd already bound).
 function readRegularFile(run, ref, rel, { strictRef = false } = {}) {
   try {
+    // a ref by exact name first: with it missing, rev-parse would resolve a branch or tag literally named like it (refs/remotes/origin/<b>, #455)
+    if (ref.startsWith('refs/')) run(['show-ref', '--verify', '--quiet', ref]);
     run(['rev-parse', '--verify', '-q', `${ref}^{commit}`]);
   } catch (err) {
     if (err instanceof GitError && !err.abnormal && err.code === 1 && !strictRef) return null; // strictRef: a missing ref is an error, not "no file"
