@@ -3371,7 +3371,10 @@ class Parser {
     this.ctlPL.push(this.pipeLead);
     if (neg) this.ctx.neg++;
     if (CTL_COUNTER[kind]) this.ctx.ctl[CTL_COUNTER[kind]]++;
-    if (kind === 'loop') this.ctx.loops = [...this.ctx.loops, ++this.ctx.loopSeq];
+    if (kind === 'loop') {
+      this.ctx.loops = [...this.ctx.loops, ++this.ctx.loopSeq];
+      this.ctx.loopUps.set(this.ctx.loopSeq, this.ctx.up); // (#352 R37-F2: the level the loop's own commands (header and body) are at; a caller must not infer it from the commands listed, none may sit at it)
+    }
   }
 
   // (#352 R16: the innermost construct of this level is an if / while / until / for ... whose condition is still open: no `then` / `do` seen)
@@ -3972,7 +3975,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, ctlBroken: false, ansiC: false, dqTrans: false, notPlain: false, notWide: false, n0: 0, shapeEvents: [], shapeStack: [], hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, owedClose: null, up: [], upHold: null, neg: 0, grpOps: new Map(), refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, loopUps: new Map(), ctlBroken: false, ansiC: false, dqTrans: false, notPlain: false, notWide: false, n0: 0, shapeEvents: [], shapeStack: [], hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, owedClose: null, up: [], upHold: null, neg: 0, grpOps: new Map(), refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -4030,6 +4033,8 @@ export function simpleCommands(str, opts) {
   Object.defineProperty(ctx.out, 'fns', { value: ctx.fns, enumerable: false });
   // ctlBroken: the loop / branch / function marks (ctl) are not to be trusted (an unmatched closer, a construct finished out of order): callers read the line as before
   Object.defineProperty(ctx.out, 'ctlBroken', { value: ctx.ctlBroken, enumerable: false });
+  // loopUps: for each loop id (cmd.loops) the `up` (levels) its own header and body commands are at (#352 R37-F2)
+  Object.defineProperty(ctx.out, 'loopUps', { value: ctx.loopUps, enumerable: false });
   // ansiC: the text holds a `$'…'` or `$"…"` string anywhere (a caller that wants to fail closed on strings whose quoting rules differ from a plain one)
   Object.defineProperty(ctx.out, 'ansiC', { value: ctx.ansiC, enumerable: false });
   // dqTrans: the text holds a `$"…"` string (locale translation in bash; the shells differ on it, and the parser reads it as a plain double-quoted one). The cd narrowing still fails closed on it; `$'…'` it reads structurally.

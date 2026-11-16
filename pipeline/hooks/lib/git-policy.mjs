@@ -2000,19 +2000,28 @@ const redirectsFirm = (rs) => (rs ?? []).length === 0;
 // (the closer of a { } group: listed as a command of no words in the group, after its last one, its raw text starting with the `}`; one with no raw text is taken for a closer, the rule only erring toward unknown.
 // A bare `>x` or `A=1 < f` in the group is a command of its own: it fails alone)
 const isCloser = (x) => !x.argv.length && (typeof x.raw !== 'string' || /^\s*\}/.test(x.raw));
+// (#352 R37-F2: the level (up) and the depth (the number of loops it is in, itself included) of a loop's own commands. The depth is exact from the id (any command of the range lists it in its loops); the level is the one the
+// parser opened the loop at (cmds.loopUps). Neither is inferred from the shortest command of the range: with no command at the loop's own level (a while / until header that is a group or a loop, the whole body in { } groups
+// or inner loops) that one is too deep, and a cd back that never ran (a failing redirection on its group, a loop that runs zero times) was trusted. Not known (marks not to be trusted): the shortest over the range.)
+function loopOwnLevel(cmds, loop) {
+  const at = cmds[loop.start]?.loops?.indexOf(loop.id) ?? -1;
+  const up = cmds.loopUps?.get(loop.id);
+  if (at >= 0 && up !== undefined) return { up, depth: at + 1 };
+  let low = cmds[loop.start]?.up ?? [];
+  let depth = cmds[loop.start]?.loops?.length ?? 0;
+  for (let j = loop.start + 1; j < loop.end; j++) {
+    if ((cmds[j].up?.length ?? 0) < low.length) low = cmds[j].up ?? [];
+    depth = Math.min(depth, cmds[j].loops?.length ?? 0);
+  }
+  return { up: low, depth };
+}
 // The directories a loop body (commands loop.start .. loop.end) can end in when it starts in `from`: its cd / pushd / popd in order, outside any subshell of its own (a cd there is lost with the subshell). null: a place
 // that cannot be named. #352 R35 (ONE rule, an ALLOWLIST): a cd REPLACES the places the body may be in only when it surely runs whenever the body reaches it (surelyHere); any other ADDS its target to them, and
 // a `continue` that reaches this loop ends an iteration where it stands (its places are ends as well).
 function loopEndDirs(cmds, loop, from, ctx, cdp) {
   let own = Infinity;
   for (let j = loop.start; j < loop.end; j++) own = Math.min(own, cmds[j].grp?.length ?? 0);
-  // (#352 R36-F1: the loop's own level and depth are the shortest over the whole range, not those of its first listed command: a `$( )`, `( )`, `{ }` or loop in the header is listed before the header command, one level deeper)
-  let ownUp = cmds[loop.start].up ?? [];
-  let ownLoops = cmds[loop.start].loops?.length ?? 0;
-  for (let j = loop.start + 1; j < loop.end; j++) {
-    if ((cmds[j].up?.length ?? 0) < ownUp.length) ownUp = cmds[j].up ?? [];
-    ownLoops = Math.min(ownLoops, cmds[j].loops?.length ?? 0);
-  }
+  const { up: ownUp, depth: ownLoops } = loopOwnLevel(cmds, loop);
   // (a command in a subshell of the body, in a text a new process runs, or one a wrapper started does not move this shell, nor continue its loop: one in a text the loop is itself in does, R10-B1)
   const elsewhere = (x) => (x.grp?.length ?? 0) > own || x.spawn || x.up?.some((u) => u.proc && !ownUp.includes(u));
   // (a level between the loop and the command is surely entered when the command is: a { } group with no redirection that can fail on its closer (listed as a command of no words in the group, after its
@@ -3311,9 +3320,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (memo && !memo.dirs.has(r.id)) memo.dirs.set(r.id, starts);
       if (!starts.includes(dir)) { if (starts.length < MAX_LOOP_STARTS || !starts.length) starts.push(dir); else if (!starts.includes(null)) starts.push(null); }
       // (#352 R36-F1: the levels a pass restarts with are those the loop is in, not those its first listed command opens inside its header (`$( )`, `{ }`): one kept would hand the directory it saved at entry back
-      // when the replay leaves it, whatever the body did before. The loop's own level is the shortest `up` over its range.)
-      let ownLen = Infinity;
-      for (let j = r.start; j < r.end; j++) ownLen = Math.min(ownLen, cmds[j].up?.length ?? 0);
+      // when the replay leaves it, whatever the body did before. R37-F2: the loop's own level is the one the parser opened it at, see loopOwnLevel.)
+      const ownLen = loopOwnLevel(cmds, r).up.length;
       const fr = { id: r.id, start: r.start, end: r.end, entry: loopEntry(ctx), carry: memo?.carries.get(r.id) ?? newLoopLeft(), at: snap(), dirs: starts, passDir: dir, judged: new Map(), passes: 1, levels: levels ? levels.slice(0, ownLen).map((x) => ({ ...x })) : [] };
       if (memo && !memo.carries.has(r.id)) memo.carries.set(r.id, fr.carry);
       if (carrySize(fr.carry)) loopMark(ctx, fr.carry); // (what the other readings of the loop word left: the body is judged from entry + that carry in this one as well)
