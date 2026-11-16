@@ -383,29 +383,30 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   };
 
   // The head's checks that nobody requires (not an identity) and that are still running or red, on a PR carrying the e2e label; null
-  // when this does not apply (no label configured, no reader, the label absent, an unreadable read). A check run is judged by its
-  // latest run per app; a status by its latest per context.
+  // when this does not apply (no label configured, no reader, the label absent). A failed label read throws into the poll loop, which
+  // retries it like every other read: it must never look like a PR without the label. A check run is judged by its latest NON-skipped
+  // run per app (every other `labeled` event on the head starts a no-op run whose jobs skip, with a higher id than the real suite's;
+  // a name whose only runs are skipped is not listed); a status by its latest per context. Check runs and commit statuses are
+  // separate producers, so a name seen on one side never hides the other.
   const otherChecks = async (obs, identities) => {
     if (!e2eLabel || !readers.labels) return null;
-    try {
-      if (!(await readers.labels()).includes(e2eLabel)) return null;
-    } catch {
-      return null;
-    }
+    if (!(await readers.labels()).includes(e2eLabel)) return null;
     const known = new Set(identities.map((i) => i.name));
     const out = [];
-    const seen = new Set();
-    for (const name of obs.checkRuns.map((r) => r?.name)) {
-      if (typeof name !== 'string' || known.has(name) || seen.has(name)) continue;
-      seen.add(name);
-      for (const run of latestRuns(obs.checkRuns, name, null)) {
-        if (run.status === 'completed' && (GOOD.has(run.conclusion) || run.conclusion === 'skipped')) continue;
+    const seenRuns = new Set();
+    const judged = obs.checkRuns.filter((r) => !(r?.status === 'completed' && r.conclusion === 'skipped'));
+    for (const name of judged.map((r) => r?.name)) {
+      if (typeof name !== 'string' || known.has(name) || seenRuns.has(name)) continue;
+      seenRuns.add(name);
+      for (const run of latestRuns(judged, name, null)) {
+        if (run.status === 'completed' && GOOD.has(run.conclusion)) continue;
         out.push({ name, status: run.status === 'completed' ? run.conclusion : run.status ?? 'unknown', url: run.html_url ?? null });
       }
     }
+    const seenStatuses = new Set();
     for (const context of obs.statuses.map((x) => x?.context)) {
-      if (typeof context !== 'string' || known.has(context) || seen.has(context)) continue;
-      seen.add(context);
+      if (typeof context !== 'string' || known.has(context) || seenStatuses.has(context)) continue;
+      seenStatuses.add(context);
       const status = latestStatus(obs.statuses, context);
       if (status.state !== 'success') out.push({ name: context, status: status.state, url: status.target_url ?? null });
     }
@@ -505,6 +506,11 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     };
     if (required.length === 0) return unverifiedResult();
 
+    // A merge check is judged only when it reports (pending waits, a failure fails, a draft-era skip is stale). One with no producer
+    // at all is not owed (its workflow is path-filtered and did not run on this PR): it ends the wait neither as `missing` nor as a
+    // pass-blocker, but only once the required set is final and the appear window is over with nothing on the head that could still produce it.
+    const notOwedState = (s) => s.source === 'merge_checks' && s.state === 'missing';
+    let notOwed = [];
     const bad = states.filter((s) => isBad(s.state));
     const waiting = states.filter((s) => isWaiting(s.state));
     const signature = waiting.map((s) => `${s.name}=${s.state}`).join(', ');
@@ -533,43 +539,53 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
           onProgress(note);
         }
       }
-      if (absent.length > 0 && elapsed() >= appearTimeoutMs && holder === null) {
+      const onlyNotOwed = waiting.every(notOwedState);
+      if (absent.length > 0 && elapsed() >= appearTimeoutMs && holder === null && (onlyNotOwed || absent.some((s) => !notOwedState(s)))) {
         // The snapshot was taken before findHolder read the workflow runs: an aggregate created and finished in between (or a lagging
         // check-runs read) would otherwise be reported absent. Look once more before the terminal verdict.
         if (!confirmed) return decide(await reread(), true);
-        const missing = absent.filter((s) => s.state === 'missing');
+        const missing = absent.filter((s) => s.state === 'missing' && !notOwedState(s));
         const stale = absent.filter((s) => s.state === 'stale-skip');
         const staleFails = absent.filter((s) => s.state === 'stale-fail' || s.state === 'superseded');
         const skipNote = stale.length ? `only a draft-era skip for: ${stale.map((s) => s.name).join(', ')}` : '';
-        if (missing.length > 0 || staleFails.length === 0) {
-          // An absence verdict (missing / stale-skipped): is the PR conflicting with its base, so that no workflow ran at all?
-          const m = await getMergeability();
-          if (m.kind === 'unknown' && !mergeRetried && elapsed() < timeoutMs) {
-            mergeRetried = true;
-            return null;
+        if (missing.length === 0 && stale.length === 0 && staleFails.length === 0) {
+          notOwed = absent.map((s) => s.name); // only merge checks with no producer remain: the required set is final
+        }
+        if (notOwed.length === 0) {
+          if (missing.length > 0 || stale.length > 0 || staleFails.some((s) => s.state === 'stale-fail')) {
+            // An absence verdict (missing / stale-skipped / a draft-era failure never replaced: a ready-era run never happened for it,
+            // a `superseded` one did): is the PR conflicting with its base, so that no workflow ran at all?
+            const m = await getMergeability();
+            if (m.kind === 'unknown' && !mergeRetried && elapsed() < timeoutMs) {
+              mergeRetried = true;
+              return null;
+            }
+            if (m.kind === 'conflicting') {
+              return result(EXIT.FAILED, 'conflicting', { message: `merge conflict with ${pr.base ?? 'the base branch'}: merge the base, then run the resolution round`, mergeState: m.mergeState });
+            }
           }
-          if (m.kind === 'conflicting') {
-            return result(EXIT.FAILED, 'conflicting', { message: `merge conflict with ${pr.base ?? 'the base branch'}: merge the base, then run the resolution round`, mergeState: m.mergeState });
+          if (missing.length > 0) {
+            const named = (state) => staleFails.filter((s) => s.state === state).map((s) => s.name).join(', ');
+            const failNote = named('stale-fail') ? `a draft-era failure stands for: ${named('stale-fail')}` : '';
+            const supersededNote = named('superseded') ? `a superseded failure stands for: ${named('superseded')}` : '';
+            const notes = [skipNote, failNote, supersededNote].filter(Boolean);
+            return result(EXIT.FAILED, 'missing', { message: `no result appeared for: ${missing.map((s) => s.name).join(', ')}${notes.length ? `; ${notes.join('; ')}` : ''}` });
           }
+          if (staleFails.length > 0) {
+            // The failure was never replaced by a ready-era result, so it stands (a draft-era skip, if any, is listed with it).
+            const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (${s.state === 'superseded' ? 'superseded by a newer attempt that never reported' : 'result predates ready'})`).join('; ');
+            const rechecked = await confirmStatusFailures(staleFails);
+            if (rechecked !== undefined) return rechecked;
+            return failedResult(`failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, staleFails);
+          }
+          return result(EXIT.FAILED, 'stale-skipped', { message: `only a draft-era skipped result exists for: ${stale.map((s) => s.name).join(', ')}: their workflow did not run on the ready event: re-run it or ask the owner` });
         }
-        if (missing.length > 0) {
-          const named = (state) => staleFails.filter((s) => s.state === state).map((s) => s.name).join(', ');
-          const failNote = named('stale-fail') ? `a draft-era failure stands for: ${named('stale-fail')}` : '';
-          const supersededNote = named('superseded') ? `a superseded failure stands for: ${named('superseded')}` : '';
-          const notes = [skipNote, failNote, supersededNote].filter(Boolean);
-          return result(EXIT.FAILED, 'missing', { message: `no result appeared for: ${missing.map((s) => s.name).join(', ')}${notes.length ? `; ${notes.join('; ')}` : ''}` });
-        }
-        if (staleFails.length > 0) {
-          // The failure was never replaced by a ready-era result, so it stands (a draft-era skip, if any, is listed with it).
-          const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (${s.state === 'superseded' ? 'superseded by a newer attempt that never reported' : 'result predates ready'})`).join('; ');
-          const rechecked = await confirmStatusFailures(staleFails);
-          if (rechecked !== undefined) return rechecked;
-          return failedResult(`failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, staleFails);
-        }
-        return result(EXIT.FAILED, 'stale-skipped', { message: `only a draft-era skipped result exists for: ${stale.map((s) => s.name).join(', ')}: their workflow did not run on the ready event: re-run it or ask the owner` });
       }
-      if (elapsed() >= timeoutMs) return result(EXIT.FAILED, 'timeout', { message: `still waiting after ${Math.round(elapsed() / 1000)}s: ${describe(waiting)}` });
-      return null;
+      if (notOwed.length === 0) {
+        if (elapsed() >= timeoutMs) return result(EXIT.FAILED, 'timeout', { message: `still waiting after ${Math.round(elapsed() / 1000)}s: ${describe(waiting)}` });
+        return null;
+      }
+      last = { ...last, states: states.filter((s) => !notOwedState(s)) }; // reported in `notOwed`, not as a check that is missing
     }
 
     // Everything is terminal-good. Re-read the PR once more: the head must not have moved, and it must not be a draft again.
@@ -579,10 +595,11 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
     const others = await otherChecks(obs, identities);
+    const owedNote = notOwed.length > 0 ? { notOwed } : {};
     if (others !== null && others.length > 0) {
-      return result(EXIT.OK, 'passed', { others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
+      return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
     }
-    return result(EXIT.OK, 'passed', others === null ? {} : { others });
+    return result(EXIT.OK, 'passed', { ...owedNote, ...(others === null ? {} : { others }) });
     };
     return decide({ checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) }, false);
   };
