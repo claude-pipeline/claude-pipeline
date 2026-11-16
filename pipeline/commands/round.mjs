@@ -214,7 +214,7 @@ async function roundCodexRun(rest, ctx, seen) {
   };
   // A round that was already recorded: no Codex run happened in this call, and the output says so.
   const pickedUp = recorded;
-  seen.pickedUp = pickedUp !== undefined;
+  seen.pickedUp = pickedUp;
   const marked = (r) => (pickedUp ? { ...r, output: { ...r.output, pickedUp: true } } : r);
 
   if (recorded) {

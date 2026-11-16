@@ -159,6 +159,7 @@ test('a running job with ANOTHER tag is a job-conflict and nothing is started', 
   assertExit(r, 1, r.stdout + r.stderr);
   assert.equal(r.json.error, 'job-conflict');
   assert.equal(r.json.tag, 'something-else');
+  assert.equal('pickedUp' in r.json, false, 'no round was recorded, so nothing was picked up');
   assert.equal(existsSync(join(w.repo.dir, '.review', 'state.json')), false);
   // let the other job finish: on Windows a running job holds the temp repo open and its removal fails (EPERM)
   emit.release();
