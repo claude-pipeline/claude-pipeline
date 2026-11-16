@@ -228,6 +228,8 @@ test('SKILL.md itself carries the steps a short text must not drop: the e2e labe
   assert.match(skill, /Full text: `reference\/ready-and-handoff\.md`: read it before step 1/);
   assert.match(skill, /`step: "arbiter-needed"` ⇒ the round IS recorded \(never discard or rerun it\)[^\n]*`result\.restartRequired`/);
   assert.match(ref('arbiter-errors'), /`result\.restartRequired`/);
+  assert.match(skill, /book every call made before the PR existed, e\.g\. the build implementer \(`reference\/cost-booking\.md`\)/);
+  assert.match(ref('substitute'), /book the substitute call as role `substitute-opus` \/ `substitute-fable` with `--round R` \(`reference\/cost-booking\.md`\)/);
   assert.ok(Buffer.byteLength(skill) <= 12 * 1024, 'SKILL.md stays within 12 KB');
   // the by-hand Codex step is whole in special-rounds.md: the wait and the non-substitute exits are there, and substitute.md opens on a sentence
   const oneByOne = ref('special-rounds');
