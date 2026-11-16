@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, utimesSync,
 } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
@@ -102,6 +104,29 @@ test('the same name cannot start twice while running; after it finishes it resta
   assert.match(second.tail, /second-run/);
   assert.doesNotMatch(second.tail, /first-run/);
   assert.doesNotMatch(readFileSync(join(jobDirOf(cwd, 'dup'), 'log'), 'utf8'), /first-run/);
+});
+
+// R17-F1: clearOldJobDir deletes the old run's files one at a time (rmSync, in the filesystem's order). A reader holding run A must never find a half-deleted directory whose
+// meta.json still names A, so meta.json goes first. The delete leaves the same files whatever its order, so the order is what is observed: what is in the directory the moment
+// rmSync is called on it (fs.rmSync is wrapped for the call, and the ESM bindings are synced).
+test('startJob unlinks the old run\'s meta.json before the recursive delete starts: a half-deleted directory never names run A', async (t) => {
+  const cwd = scratch(t);
+  start('half', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'half');
+  const seen = [];
+  const real = fs.rmSync;
+  fs.rmSync = (target, ...rest) => {
+    if (target === dir) seen.push({ meta: existsSync(join(dir, 'meta.json')), exit: existsSync(join(dir, 'exit.json')) });
+    return real(target, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.rmSync = real; syncBuiltinESMExports(); });
+  start('half', node("console.log('second-run')"), { cwd });
+  fs.rmSync = real;
+  syncBuiltinESMExports();
+  assert.deepEqual(seen, [{ meta: false, exit: true }], 'the old directory was cleared once, meta.json first');
+  assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
 });
 
 test('a policy refusal throws and starts nothing', async (t) => {

@@ -141,6 +141,8 @@ function clearOldJobDir(jobDir, name) {
   if (!ours && !(isDir && readdirSync(jobDir).length === 0)) {
     throw new Error(`refusing to replace ${jobDir}: it is not a job directory for "${name}"; remove it by hand if it is stale`);
   }
+  // meta.json first: the run-id recheck of a reader of the old run (snapshot) reads it, so a directory that is half deleted can never pass it.
+  if (ours) rmSync(path.join(jobDir, 'meta.json'), { force: true });
   rmSync(jobDir, { recursive: true, force: true, maxRetries: 3 }); // a fresh log, never a mix of two runs
 }
 
