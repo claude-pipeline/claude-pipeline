@@ -2269,6 +2269,15 @@ const UNSURE_OK = new Set([
   ...VAR_BUILTINS, ...VALUE_BINDERS,
 ]);
 const DIR_CHANGERS = ['cd', 'chdir', 'pushd', 'popd']; // (#372: zsh's chdir is cd)
+// #491 R2-F1: a command of a failure group that cannot change the caller's branch or directory whatever the walk could not see: plain data commands, the group's exit, and a git command with no state word
+const INERT_DATA = new Set(['echo', 'printf', ':', 'true', 'false', 'exit']);
+const inertInFailGroup = (g) => {
+  const nm = baseName(g.argv[0] ?? '');
+  if (INERT_DATA.has(nm)) return true;
+  if (nm !== 'git') return false;
+  if (g.argv.some((w) => w === '-c' || w.startsWith('--exec-path') || w.startsWith('--config-env'))) return false; // (a one-off config can name a program to run)
+  return !g.argv.some((w) => STATE_GIT.has(w)) || g.argv.some((w) => w === '--show-current' || w === '--list' || w === '-l');
+};
 
 // A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
 // an alias, a trap (`trap "cd …" DEBUG` runs before every command) or changes shell options / builtins can change
@@ -3072,8 +3081,12 @@ function evalString(str, startDir, ctx, level, child = false) {
     }
   }
   // #482: a group whose exit ends the text is restored here too (ctx.branches is shared with the caller of a nested text: it must not keep every branch name forgotten)
-  // (#491 R1: only a group opened by a directory change, with no git state change inside it: after a checkout that may have failed, or a switch made where the directory is unknown, the caller's branch is not known)
-  if (failGroup?.snap && failGroup.byDir && !cmds.slice(failGroup.from + 1, failGroup.to + 1).some((g) => baseName(g.argv[0] ?? '') === 'git' && g.argv.some((w) => STATE_GIT.has(w)) && !g.argv.some((w) => w === '--show-current' || w === '--list' || w === '-l'))) restoreAfterGroup();
+  // (#491 R2-F1: an allow-list: only a group opened by a directory change in which every command is inert, a plain data command or a git command with no state word, so no script, feed, source, eval, shell, gh or package runner
+  // that could switch the caller's branch where the walk cannot see it; R2-B1: otherwise every branch name is forgotten, including one the group itself recorded through an absolute -C directory)
+  if (failGroup?.snap) {
+    if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every(inertInFailGroup)) restoreAfterGroup();
+    else for (const e of ctx.branches.values()) e.name = null;
+  }
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it
