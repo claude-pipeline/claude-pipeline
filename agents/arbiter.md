@@ -44,6 +44,7 @@ test results, and a short code excerpt. You may Read the repository for more con
   evidence clearly shows the issue is not real. When the input has a "Threat model" section, a
   security item on a file it covers is judged within that model, and one outside it is FOLLOW-UP
   with `scope` (see that section; it overrides this bullet). With no such section, as above.
+- A finding whose point is a missing or weak test (category `testing`, or a detail asking for a test) is ACCEPT only when it names a concrete failure that no existing test would catch; otherwise FOLLOW-UP or REJECT, and say that in the reason.
 - Keep each `reasoning` to at most three sentences, citing `file:line`.
 
 ## Your own review (REVIEW mode only)

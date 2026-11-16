@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { parseUnifiedDiff, diffStats, parseHunkHeader, unquoteCPath } from '../pipeline/lib/diff.mjs';
+import { parseUnifiedDiff, diffStats, parseHunkHeader, testsAdded, unquoteCPath } from '../pipeline/lib/diff.mjs';
 
 // Fixtures are real `git diff -M --unified=0 --no-color --no-ext-diff` output saved as text, so tests never run git.
 const fixture = (name) => readFileSync(new URL(`./fixtures/diffs/${name}.diff`, import.meta.url), 'utf8');
@@ -295,4 +295,18 @@ test('unquoteCPath rejects trailing text and input that is not a quoted token', 
   assert.throws(() => unquoteCPath('"a"x'), /trailing/);
   assert.throws(() => unquoteCPath('abc"'), /not a quoted/);
   assert.throws(() => unquoteCPath(''), /not a quoted/);
+});
+
+// Failure caught: the soft `Tests added` line of `pipeline summary` miscounts (a source file read as a test, a non-case line counted as a case), so the owner reads a wrong test-to-source ratio.
+test('testsAdded: counts test files that gained lines, added test-case calls, and changed source lines against test lines', () => {
+  const diff = [
+    'diff --git a/src/a.js b/src/a.js', '--- a/src/a.js', '+++ b/src/a.js', '@@ -1,1 +1,3 @@', '-old', '+new1', '+new2', '+it('looks like a case but is source', () => {});',
+    'diff --git a/test/a.test.mjs b/test/a.test.mjs', '--- a/test/a.test.mjs', '+++ b/test/a.test.mjs', '@@ -5,0 +6,4 @@',
+    '+test('one', () => {});', '+  it.each([1])('two', () => {});', '+  assert.ok(true);', '+// test('a comment')', '',
+  ].join('
+');
+  const r = testsAdded(parseUnifiedDiff(diff), ['test/**']);
+  assert.deepEqual([r.files, r.cases, r.sourceLines, r.testLines], [1, 2, 4, 4]);
+  assert.equal(r.line, 'Tests added: 1 files, 2 cases; changed source lines : test lines = 4 : 4');
+  assert.equal(testsAdded([], ['test/**']).line, 'Tests added: 0 files, 0 cases; changed source lines : test lines = 0 : 0');
 });
