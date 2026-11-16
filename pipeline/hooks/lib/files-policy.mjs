@@ -4263,22 +4263,36 @@ function isFlatLine(cmds) {
   return cmds.flatSeq === true && !cmds.dynamic && !(cmds.fns?.size > 0)
     && cmds.every((c) => (c.depth ?? 0) === 0 && c.argv.length > 0 && !((c.redirects ?? []).length && c.argv.slice(0, 3).some((w) => baseOf(w) === 'exec')));
 }
+// #472 (R3-F1) A stdin source whose text is not on the line: a file (`< F`, `0< F`, `<> F`) or a descriptor (`<&N`, `<&$fd`). A `{name}` word in front of a redirect (`: {fd}<<< …`) opens a descriptor that stays open after its command.
+const unknownSource = (r) => r.op === '<&' || r.op === '<>' || (r.op === '<' && !/^<\(/.test(r.target ?? ''));
+const namesFd = (c) => (c.redirects ?? []).length > 0 && c.argv.some((w) => /^\{[A-Za-z_]\w*\}$/.test(w));
 // #472 (R1-B1) The text a command's own stdin source hands it, for a FLAT line (isFlatLine): the bodies of the heredocs on the line (the parser's spans; the whole line when they cannot be placed: fail closed), its here-string
 // and `< <(…)` words, and, when it receives a pipe, the words and bodies of the commands feeding it (the run of `|` stages before it). Not for a line with a group, a subshell or nested text: there the pipe or the stdin
-// reaches the runtime through the shell, not through this walk (R2).
+// reaches the runtime through the shell, not through this walk (R2). Returns null when a stdin source of the runtime (or of a stage feeding it) is a file or a descriptor, or any command on the line keeps a descriptor open or
+// duplicates one: the text is then not known and the caller reads the whole line (R3-F1).
 function stdinProgramTexts(cmds, ci, raw) {
+  if (cmds.some((x) => namesFd(x) || (x.redirects ?? []).some((r) => r.op === '<&' || r.op === '<>'))) return null;
   const spans = cmds.heredocSpans;
   const bodies = Array.isArray(spans) && spans.every((sp) => Array.isArray(sp) && sp[1] >= sp[0] && sp[1] <= raw.length) ? spans.map(([a, b]) => raw.slice(a, b)) : [raw];
   const own = (x) => (x.redirects ?? []).flatMap((r) => r.op === '<<' ? bodies : r.op === '<<<' || (r.op === '<' && /^<\(/.test(r.target ?? '')) ? [r.target ?? ''] : []);
   const c = cmds[ci];
+  if ((c.redirects ?? []).some(unknownSource)) return null;
   const texts = own(c);
   let next = c;
   for (let j = ci - 1; j >= 0 && (next.sep === '|' || (cmds[j].depth ?? 0) > (c.depth ?? 0)); j--) {
     const u = cmds[j];
+    if ((u.redirects ?? []).some(unknownSource)) return null;
     texts.push(...u.argv, ...Object.values(u.env ?? {}), ...(u.redirects ?? []).map((r) => r.target ?? ''), ...own(u));
     next = u;
   }
   return texts;
+}
+// #472 (R3-B1) The whole-line reading for a runtime whose stdin is not followed: the raw line, the heredoc bodies, and the DECODED words of every command at every depth (argv, env-assignment values, redirect targets, here-string
+// text): shell quotes that split a name (`owner-"'go-click.mjs'`) are joined in the decoded word, which the raw line does not show.
+function wholeLineTexts(cmds, raw) {
+  const spans = cmds.heredocSpans;
+  const bodies = Array.isArray(spans) ? spans.filter((sp) => Array.isArray(sp) && sp[1] >= sp[0] && sp[1] <= raw.length).map(([a, b]) => raw.slice(a, b)) : [];
+  return [raw, ...bodies, ...cmds.flatMap((u) => [...u.argv, ...Object.values(u.env ?? {}), ...(u.redirects ?? []).map((r) => r.target ?? '')])];
 }
 
 function setsSeamForPipeline(cmds) {
@@ -5083,12 +5097,20 @@ function evaluateBashForFilesFrame(command, opts) {
     // #472 (R1-B1, R2): a runtime that reads its program from stdin (`node --input-type=module <<EOF`, `node - <<< …`, `node /dev/stdin`, `echo … | node`) names no file in its words, so the check above cannot see what it imports.
     // Decided from the command's OWN stdin source, not from the shape of its words (`--input-type module` and `- x` are ordinary words that still run stdin): a heredoc, a here-string or a `< <(…)` on it, or the receiving
     // side of a pipe. When the text that source hands it names an owner-go library, the command is refused. A library named elsewhere on the line (`git add LIB && node --test`) is none of its business.
-    // That reading is trusted ONLY on a flat line (isFlatLine). On any other line (a group, a subshell, a compound command, a function, an `exec` redirect, a command-less redirect, nested text) the stdin a runtime gets cannot be followed
-    // command by command, so it fails closed: a runtime is refused when the whole raw line names an owner-go library.
-    if (RUNTIMES.has(baseOf(c.argv[0])) && (isFlatLine(cmds)
-      ? stdinProgramTexts(cmds, ci, raw).some((t) => OWNER_GO_WORD.test(toPosix(expandRefs(t, ctx))))
-      : OWNER_GO_WORD.test(toPosix(expandRefs(raw, ctx))))) {
-      return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
+    // That reading is trusted ONLY when every stdin source of the runtime is text that is fully known: a flat line (isFlatLine) whose runtime, and every pipe stage before it, takes a heredoc, a here-string, a `< <(…)` or a pipe, with no
+    // `$` or backtick left in that text after expandRefs (R3-F1: a run-time variable), no file or descriptor source and no kept-open descriptor on the line. Anything else (a group, a subshell, a compound command, a function, an `exec`
+    // redirect, a command-less redirect, nested text, a variable, a file, a descriptor) cannot be followed command by command, so it fails closed: a runtime is refused when the whole raw line, or the decoded words of any command on it
+    // (R3-B1: shell quotes can split a name in the raw line), name an owner-go library.
+    if (RUNTIMES.has(baseOf(c.argv[0]))) {
+      const own = isFlatLine(cmds) ? stdinProgramTexts(cmds, ci, raw) : null;
+      const known = own?.map((t) => toPosix(expandRefs(t, ctx)));
+      if (known && !known.some((t) => /[$`]/.test(t))) {
+        if (known.some((t) => OWNER_GO_WORD.test(t))) {
+          return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
+        }
+      } else if (wholeLineTexts(cmds, raw).some((t) => OWNER_GO_WORD.test(toPosix(expandRefs(t, ctx))))) {
+        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file or a descriptor may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
+      }
     }
   }
 

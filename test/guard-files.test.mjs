@@ -1035,6 +1035,26 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `f() { node --input-type=module; }; echo "import('./pipeline/hooks/lib/${lib}')" | f`,
       `echo "import('./pipeline/hooks/lib/${lib}')" | while :; do node -; break; done`,
       `echo "import('./pipeline/hooks/lib/${lib}')" | if true; then node -; fi`,
+      // (R3-B1: the whole-line reading also reads the DECODED words of every command, so a name split by shell quotes cannot hide behind an unrelated `(true)`)
+      `printf '%s\\n' "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')" | node --input-type=module; (true)`,
+      `printf '%s\\n' "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')" | node --input-type=module && (true)`,
+      `node --input-type=module -e "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; (true)`,
+      `P=./pipeline/hooks/lib/owner-"${lib.slice(6)}"; node -e "import('\$P')"; (true)`,
+      `node --input-type=module <<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; (true)`,
+      `node - < <(echo "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"); (true)`,
+      // (R3-F1: stdin that arrives through a run-time variable, a kept-open or duplicated descriptor, or a file is not known text: the whole line is read)
+      `read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `read -r P <<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; node --input-type=module <<< "$P"`,
+      `: {fd}<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&$fd`,
+      `: 10<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&10`,
+      `: 10<<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; node - <&10`,
+      `: 10<> /tmp/p.mjs; echo "import('./pipeline/hooks/lib/${lib}')" >&10; node - <&10`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node - < /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node --input-type=module 0< /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node - <> /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat < /tmp/p.mjs | node -`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat /tmp/p.mjs | tee /dev/null < /tmp/p.mjs | node -`,
     ]) assert.equal(bash(cmd), 'deny', cmd);
     for (const cmd of [
       `cat pipeline/hooks/lib/${lib}`,
@@ -1050,6 +1070,16 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `git diff -- pipeline/hooks/lib/${lib} | grep recordClick`,
       `git diff -- pipeline/hooks/lib/${lib} | grep recordClick || node scripts/test.mjs owner-go-click.test.mjs`,
     ]) assert.equal(bash(cmd), 'allow', cmd);
+  }
+  // (R3-F2: a line that is not flat and names a library next to a runtime is refused as a whole, with a message that names the cause and the way out; a commit message is the deliberate cost)
+  for (const cmd of [
+    "node scripts/test.mjs owner-go-click.test.mjs && git commit -m \"$(cat <<'EOF'\nguard: refuse owner-go-click.mjs read from stdin\nEOF\n)\"",
+    "node scripts/test.mjs owner-go-click-hook.test.mjs; (true); git add pipeline/hooks/lib/owner-go-click-hook.mjs",
+  ]) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /runs a JavaScript runtime and is not a plain command line/, cmd);
+    assert.match(r.reason, /Run the runtime on a line of its own, or keep the library name off that line/, cmd);
   }
   for (const cmd of [
     'node scripts/test.mjs owner-go-click.test.mjs',
