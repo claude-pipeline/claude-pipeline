@@ -41,7 +41,8 @@
 // (EagleWatch "Replay from zero"). Each is one more unpinned identity (listed in `checks` with source: 'merge_checks'); a name that is
 // already required is not doubled. One that reports is judged like a required one (pending waits, a failure fails). One with no
 // producer at all (a path-filtered workflow that did not run) is notOwed: once the appear window is over and nothing on the head could
-// still produce it, it is listed in `notOwed` instead of ending the wait `missing`, and a failed required check still ends `failed`.
+// still produce it, it is listed in `notOwed` (and left out of `checks`) instead of ending the wait `missing`, and a failed required check still ends
+// `failed` (a --wait-all `failed` carries `notOwed` too).
 // They never decide `unverified` / `no-required-checks`: those speak about the policy sources alone.
 // `options.e2eLabel` (config ci.e2e_label): on a PR carrying that label (`readers.labels()`, read once at the end) a `passed` result
 // also reports `others: [{name, status, url}]`, the head's NON-required check runs / statuses that are still running or red, so a
@@ -489,7 +490,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const confirmStatusFailures = async (failures) => (confirmed || !failures.some((f) => statusBasis.has(f)) ? undefined : decide(await reread(), true));
     const failedResult = (message, failures) => {
       const statusEvidence = statusEvidenceOf(failures);
-      return result(EXIT.FAILED, 'failed', { message, failures, ...(statusEvidence.length > 0 ? { statusEvidence } : {}) });
+      return result(EXIT.FAILED, 'failed', { message, failures, ...(notOwed.length > 0 ? { notOwed } : {}), ...(statusEvidence.length > 0 ? { statusEvidence } : {}) });
     };
 
     // Nothing known to wait for (both sources unreadable, or one unreadable and the other absent): report the config's list.
@@ -587,6 +588,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         if (elapsed() >= timeoutMs) return result(EXIT.FAILED, 'timeout', { message: `still waiting after ${Math.round(elapsed() / 1000)}s: ${describe(waiting)}` });
         return null;
       }
+      // reported in `notOwed`, not as a check that is missing (the failed result below and the pass path both use this)
+      last = { ...last, states: states.filter((s) => !notOwedState(s)) };
       if (bad.length > 0) {
         // --wait-all skipped the failure branch above while a merge check was still waiting: now that it is notOwed, a failed required
         // check must still end the wait `failed`, never `passed`.
@@ -594,7 +597,6 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         if (rechecked !== undefined) return rechecked;
         return failedResult(`failed: ${bad.map((s) => `${s.name}=${s.state}${s.url ? ` (${s.url})` : ''}`).join('; ')}`, bad);
       }
-      last = { ...last, states: states.filter((s) => !notOwedState(s)) }; // reported in `notOwed`, not as a check that is missing
     }
 
     // Everything is terminal-good. Re-read the PR once more: the head must not have moved, and it must not be a draft again.

@@ -1433,6 +1433,8 @@ test('merge_checks (R2-B1): --wait-all with a failed required check and a merge 
   assert.equal(r.output.ok, false);
   assert.match(r.output.message, /A=fail/);
   assert.deepEqual(r.output.failures.map((f) => f.name), ['A']);
+  assert.deepEqual(r.output.notOwed, ['Replay from zero'], 'the wait established the merge check is not owed: a failed result says so');
+  assert.deepEqual(r.output.checks.map((c) => c.name), ['A'], 'the not-owed merge check is not listed as a missing check');
 });
 
 test('merge_checks (R1-F3): no notOwed field when every merge check reported', async () => {
