@@ -14,13 +14,15 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
+import { diffFiles, git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { hashBranch } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
-import { askSummary } from '../lib/round-ask.mjs';
+import { askSummary, processReviewSummary, roundsFrom } from '../lib/round-ask.mjs';
+import { postMaxApply, fixRoundScope } from '../lib/fix-verify.mjs';
+import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
@@ -28,13 +30,13 @@ import { roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  countsTowardCap, isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
 } from '../lib/review-context.mjs';
-import { assertCurrentAttempt, finishAttempt, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
-import { headMoved, routeConfigFor } from '../lib/review-round.mjs';
+import { assertCurrentAttempt, finishAttempt, modelRefusalMessage, readRoute, startAttempt, substituteEligibility, superseded, writeFinalRoute } from '../lib/route-record.mjs';
+import { headMoved, modelNoteFor, routeConfigFor } from '../lib/review-round.mjs';
 import { noteCodexAnswered, noteQuotaStop, recordCodexRun } from '../lib/codex-usage.mjs';
 import { floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { PROOF_EFFORT, proveSubstituteRun, refuseTestOnlyFlags } from '../lib/substitute-proof.mjs';
@@ -58,7 +60,11 @@ export const meta = {
     'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]',
     '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
     '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
-    'pipeline triage round-request --pr N [--ask] [--past] [--repo DIR]',
+    'pipeline triage round-request --pr N [--ask] [--past] [--after-process-review] [--repo DIR]',
+    '  -> the TRIP-WIRE (a prompt, not a gate; ON by default, review.trip_wire_extra_rounds / review.trip_wire_not_falling, the smaller of the working-tree and fork-point values): when the PR has reviewed max_rounds + extra counted rounds, or at least not_falling past-limit rounds',
+    '     accepted (more than 0 and) at least as many new items as the round before, the ask does not print a line: exit 1 {ok:false, error:"trip-wire", tripWire: {tripped, reviewed, max, acceptsByRound, reasons}, processReview: {headline, summary}}. Park the PR with the headline',
+    '     (`pipeline comment --kind blocked --reason <headline>`, run-record outcome blocked, detail process-review), paste the summary and ask the owner. Only after the owner chooses one more round, run it again with --after-process-review: the usual answer and line, plus tripWire and processReview.',
+    '     Not tripped: no tripWire field, the answer is unchanged.',
     '  -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
     '     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)',
     '  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, \`cost --round R\`: the newest counted round with a booking, else null) from the PR\'s run record (read-only; null with a warning when it cannot be read);',
@@ -101,7 +107,7 @@ export const meta = {
     '  -> a Codex failure other than a quota stop is exit 3 {unavailable, reason, substitute: {eligible: false, why}}; Codex\'s own usage-limit stop (the quota proof of codex-review) with review.substitute.mode not off is exit 3 with substitute {eligible: true, agent, packetId, attempt, tag, promptHeader, inputPath, digest}:',
     '     agent = substitute-opus (the PR\'s highest risk, ever, is low or medium) or substitute-fable (it was ever high); tag `pipeline-substitute-2nd R<R> <packetId8>` (`... a<k>` for attempt k > 1; two counted invalid attempts: substitute {eligible: false, why: attempts-exhausted}, park);',
     '     packetId = sha256 of the sorted ids, the head, the digest of the asked findings\' text and their finals. Every run first writes .review/round-R/route-2nd-<packetId8>.json (the lifecycle of route.json: pending before Codex runs, final evidence by compare-and-swap under the lock,',
-    '     a newer run for the same packet supersedes the older: exit 2), and a quota stop also writes the blind packet as .review/round-R/second-review-<packetId8>.md (header MODE: SECOND-REVIEW / ROUND: R / INPUT-DIGEST, then the exact Codex prompt and an evidence map; no earlier ruling)',
+    '     a newer run for the same packet supersedes the older: exit 2), and a quota stop or a proven refused model (evidence model, the codex-review proof: session log plus a confirmation run; no reset time; the trusted model must still be the refused one, else route-mismatch; the output carries modelStop and the fix-review.codex_model message; the item records codexModelRefused) also writes the blind packet as .review/round-R/second-review-<packetId8>.md (header MODE: SECOND-REVIEW / ROUND: R / INPUT-DIGEST, then the exact Codex prompt and an evidence map; no earlier ruling)',
     '  -> start the substitute agent with promptHeader + "\\nRead <inputPath> and verify the findings it lists.\\n", pasted exactly, description = tag, no model argument; its answer is {"items":[{id, decision, confidence, reasoning}]} (second-review.schema.json), not the findings format',
     '     substitute also carries reused (as `substitute prepare`): true = the open attempt was handed back, or a transcript anywhere under the account\'s projects folder already carries the tag (a lost session), so an agent may already have run: run `--apply` FIRST (exit 2 not-found = none did: only then start the agent). Only `substitute.eligible: true` is a packet to run; a `substitute` without it is a refusal (`why`).',
     '     One unsettled packet per item (cp #256 R5-F1): `--ids` is the caller\'s, so a packet that shares an item with another packet of the round at the same head that is open (prepared), recorded invalid or exhausted gets no attempt: substitute {eligible: false, why: overlapping-packet, packet: <packetId8 of that one>}. Apply or park that packet first; the same ids again are the same packet and retry normally. Disjoint packets are independent.',
@@ -109,7 +115,7 @@ export const meta = {
     '  -> review.substitute.min_wait_minutes and the readability limit apply to a second review as to a first: a quota reset within the wait is substitute {eligible: false, why: reset-near, waitUntil}; an input the agent cannot read in full (more than 15 Read calls, counted from its lines and its estimated tokens, or one line alone of more than 20000 estimated tokens, or a NUL byte) is substitute {eligible: false, why: packet-unreadable, pages, maxPages, files} (or longLine {rel, line, tokens} / unreadableFile {rel, reason}) (nothing written, no attempt opened). It also may carry `warnings` (output beside `substitute`): the machine-wide Codex record that the PR now waits for Codex could not be written (best effort: it never changes the exit code or the substitute verdict)',
     'pipeline triage second-review --apply --pr N --tag TAG [--repo DIR]   (--projects-dir DIR and --max-age-ms N: test suite only, exit 2 test-only-flag without PIPELINE_TEST_MODE)',
     '  -> proves the transcript tagged TAG exactly as `substitute apply` does (lib/substitute-proof.mjs: exactly ONE transcript, agent type, pinned model per turn, Fable floor, effort high, only Read/Grep/Glob, the first prompt EXACTLY the prepared one, successful Reads that cover EVERY line of the input (coverage is credited from the line numbers and the text each Read RETURNED, not from its offset / limit: a returned row counts only when its text equals the file\'s line, a row cut short ends the credit, and the pages together must leave no gap),',
-    '     the input on disk is still what was written, route-2nd-<packetId8>.json holds evidence quota (budget / governor are accepted kinds; no record or none / pending: refused no-route / no-evidence), and the review state is still the one asked about (HEAD, each finding\'s text, each final, no second review yet on any id:',
+    '     the input on disk is still what was written, route-2nd-<packetId8>.json holds evidence quota (model, budget and governor are accepted kinds; no record or none / pending: refused no-route / no-evidence), and the review state is still the one asked about (HEAD, each finding\'s text, each final, no second review yet on any id:',
     '     head-moved, finding-changed, final-changed, item-changed), then stores each verdict like a Codex one with secondReview.by substitute-opus|substitute-fable (+ evidence, models, proof), version 4; the stricter-of-two rule is unchanged. A first-review transcript proves nothing (tag, mode header, fixed prompt and input digest differ)',
     '  -> unproven or a wrong-schema answer: exit 1 {ok: false, errors, attempt, retry: second-review|park}, the attempt recorded invalid, nothing stored; no transcript with the tag: exit 2 not-found; --round / --ids are not accepted (the tag names them). The Rulings row says claude+codex, claude+substitute-opus or claude+substitute-fable',
     '  -> the Codex run is logged like a review round (kind second-review, <home>/.claude/pipeline-state/codex-usage.jsonl, see codex-review); a ledger that cannot be written adds warnings:[…] to the reply',
@@ -169,7 +175,7 @@ function validate(rest, ctx) {
   return withStateLock(root, ctx, () => validateLocked(values, n, root, ctx));
 }
 
-function validateLocked(values, n, root, ctx) {
+async function validateLocked(values, n, root, ctx) {
   const state = requireState(root);
   const round = findRound(state, n);
   // One reviewer layer after Codex: a Fable round's items are ruled by the Fable pass alone (arbiter needed/apply).
@@ -196,7 +202,8 @@ function validateLocked(values, n, root, ctx) {
   if (!checked.ok) return invalid(checked.errors);
 
   const env = ctx.env ?? process.env;
-  const items = finalizeWithoutArbiter(applyJudge(round.items, json), { lightLane: state.lightLane, force: forceArbiter(env) });
+  // Past review.max_rounds + 1 (the first round past the limit is exempt; later owner-granted rounds are not) a low-severity ACCEPT becomes a FOLLOW-UP when review.post_max_suggestions says 'follow-up' in all three configs (working tree, fork point, trusted default branch) and the severity test passes (#374 PR B; off by default; see applyPostMaxDefault in lib/triage.mjs).
+  const items = await postMaxApply(finalizeWithoutArbiter(applyJudge(round.items, json), { lightLane: state.lightLane, force: forceArbiter(env) }), { state, round, root });
   const next = updateItems(state, n, items);
   const dir = ensureRoundDir(root, n);
   writeJson(path.join(dir, 'triage.json'), { triage: json, judgeProof });
@@ -489,6 +496,16 @@ const packetItem = (i) => ({
 // and its final, and no verdict yet (secondReviewCheck again).
 const askedSnapshot = (items) => ({ digest: rulingContentDigest(items), finals: JSON.stringify(items.map((i) => [i.id, i.final ?? null])) });
 
+// The next step a refused-model second review gives once its packet is prepared (R2-F1). A reused attempt (handed back, or its tag already in a transcript) may already have run, so
+// the proof (--apply) comes FIRST and a new agent only on exit 2 not-found; a fresh one is one agent call and then --apply. Both name the call protocol (see the help text above).
+function substituteNextStep({ substitute, pr }) {
+  const apply = `\`pipeline triage second-review --apply --pr ${pr} --tag "${substitute.tag}"\``;
+  const call = `The call: description = \`${substitute.tag}\`, no model argument; prompt = the \`substitute.promptHeader\` text verbatim, then a new line \`Read ${substitute.inputPath} and verify the findings it lists.\``;
+  return substitute.reused === true
+    ? `run ${apply} FIRST (an agent may already have run under this tag; exit 2 not-found = none did), and only then call ${substitute.agent} once on the prepared packet (${substitute.inputPath}) and run ${apply} again. ${call}`
+    : `call ${substitute.agent} once on the prepared packet (${substitute.inputPath}), then ${apply}. ${call}`;
+}
+
 function secondReviewNext(verdicts) {
   const forced = verdicts.filter((v) => v.decision === 'ACCEPT').map((v) => v.id);
   const high = verdicts.filter((v) => v.decision !== 'ACCEPT' && v.confidence === 'high').map((v) => v.id);
@@ -503,6 +520,8 @@ function secondReviewNext(verdicts) {
 // What a second review's verdict adds when a Claude substitute gave it instead of Codex: who, on what evidence, and the proof (substituteInventory reads by / evidence / models).
 const substituteVerdictFields = ({ agent, route, proof, transcript }) => ({
   by: agent, evidence: route.evidence, models: proof.models, proof: { transcript, models: proof.models, effort: PROOF_EFFORT },
+  // the refused Codex model (the trusted review.codex_model the evidence was recorded for), distinct from `models` (the substitute's own): the published comment names it (render.mjs)
+  ...(route.evidence === 'model' && typeof route.model === 'string' ? { codexModelRefused: route.model } : {}),
 });
 
 // The output of a recorded second review, the same for Codex and for a substitute.
@@ -530,7 +549,7 @@ async function secondReview(rest, ctx) {
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean))].sort();
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
   const root = resolveRepo(values, ctx);
-  const { config } = await requireConfig(root);
+  const { config, path: configPath } = await requireConfig(root);
   const refuse = (reason, extra = {}) => ({ exitCode: EXIT.FAILED, output: { ok: false, round: n, reason, ...extra } });
   if (config.owner_approval !== 'chat') {
     return refuse('a second review is run only with owner_approval: chat in pipeline.yml; in label mode the owner clears needs-human by label');
@@ -539,6 +558,8 @@ async function secondReview(rest, ctx) {
   refreshTrustedDefault(root, config); // the trusted model is read at the fork point from origin/<the remote's default branch>: best effort, a failed fetch keeps the cached ref
   const sub = routeConfigFor(root, config); // the stricter of the working tree's and the trusted base config's review.substitute
   const model = sub.codexModel; // the trusted model (the base config's, else the built-in default), never the working tree's (#389)
+  const dflt = hashBranch(root, config); // the trusted default branch, named in the notes and messages below, never the working-tree value a PR can edit
+  const modelNote = modelNoteFor({ config, configPath, trustedModel: model, codexModelFrom: sub.codexModelFrom, defaultBranch: dflt }); // #445: the working tree names another model than the one that runs
 
   // Check under the lock; the packet is built from the state and git right here.
   const asked = await withStateLock(root, ctx, () => {
@@ -574,7 +595,7 @@ async function secondReview(rest, ctx) {
   try {
     args = buildCodexArgs({ cwd: root, model, effort: SECOND_REVIEW_EFFORT, schemaPath: SECOND_REVIEW_SCHEMA_PATH, outPath });
   } catch (err) {
-    throw new UsageError(err.message);
+    throw new UsageError(`${err.message}; the model comes from review.codex_model of the pipeline.yml at ${dflt}'s fork point: fix it on ${dflt}, then bring that fix into this branch`);
   }
 
   // The attempt (route-2nd-<packetId8>.json, the lifecycle of route.json): pending before Codex runs, so evidence of an earlier attempt for this packet is gone; the final evidence
@@ -597,7 +618,7 @@ async function secondReview(rest, ctx) {
 
   // Codex runs WITHOUT the lock (it can take minutes). The prompt is kept before it starts, so a crashed run still leaves what it was asked.
   writeFileAtomic(path.join(dir, `second-review-${ids[0]}.md`), promptBytes);
-  const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath });
+  const ran = await execCodex({ root, env: ctx.env, args, promptBytes, outPath, requestedModel: model });
   // The weekly Codex figure (codex-usage.mjs): one ledger line per real run; a ledger that cannot be written is only a warning.
   const logged = recordCodexRun({
     kind: 'second-review', repo: asked.repo || repoSlug(), pr, round: n, effort: SECOND_REVIEW_EFFORT, model, ok: ran.ok,
@@ -605,10 +626,17 @@ async function secondReview(rest, ctx) {
   const usageWarnings = logged.ok ? [] : [logged.warning];
   if (!ran.ok) {
     const verdict = substituteEligibility({
-      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
+      reason: ran.reason, timedOut: ran.timedOut === true, quota: ran.quota, modelStop: ran.modelStop, mode: sub.mode, modeOffFrom: sub.modeOffFrom, minWaitMinutes: sub.minWaitMinutes, agent: asked.agent,
     });
     const quotaStop = ran.reason === 'quota' && ran.quota?.eligible === true;
-    await failAttempt(quotaStop
+    // A refused model (cp #431), proven by the session log and a confirmation run: the evidence names the TRUSTED model string, never one from the provider's message.
+    const modelStopProven = ran.reason === 'model' && ran.modelStop?.eligible === true;
+    await failAttempt(modelStopProven
+      ? {
+        evidence: 'model', outcome: 'failed', reason: 'model', model, provider: ran.modelStop.provider,
+        errorEvent: { type: 'turn.failed', message: ran.modelStop.message }, threadId: ran.modelStop.threadId ?? null, promptSha256: inputDigest, proof: ran.modelStop.proof, confirm: ran.modelStop.confirm,
+      }
+      : quotaStop
       ? {
         evidence: 'quota', outcome: 'failed', reason: 'quota', resetAt: ran.quota.resetAt, resetText: ran.quota.resetText,
         errorEvent: { type: 'turn.failed', message: ran.quota.message }, threadId: ran.quota.threadId ?? null, promptSha256: inputDigest, proof: ran.quota.proof,
@@ -622,7 +650,8 @@ async function secondReview(rest, ctx) {
     let substitute = verdict;
     if (verdict.eligible) {
       const prepared = await withStateLock(root, ctx, () => prepareSecondAttempt({
-        root, round: n, packetId, ids, agent: asked.agent, prompt, head: asked.head, evidence: 'quota', resetText: ran.quota.resetText, resetAt: ran.quota.resetAt, minWaitMinutes: sub.minWaitMinutes, env: ctx.env ?? process.env,
+        root, round: n, packetId, ids, agent: asked.agent, prompt, head: asked.head, minWaitMinutes: sub.minWaitMinutes, env: ctx.env ?? process.env,
+        ...(modelStopProven ? { evidence: 'model', model } : { evidence: 'quota', resetText: ran.quota.resetText, resetAt: ran.quota.resetAt }),
       }), pr);
       substitute = prepared.ok
         ? { ...verdict, packetId, attempt: prepared.k, tag: prepared.tag, promptHeader: prepared.header, inputPath: prepared.inputPath, digest: prepared.digest, reused: prepared.reused }
@@ -632,7 +661,9 @@ async function secondReview(rest, ctx) {
     throw new Fail(EXIT.UNAVAILABLE, {
       ok: false, unavailable: true, reason: ran.reason, code: ran.code, timedOut: ran.timedOut, detail: ran.detail,
       ...(ran.retried ? { retried: ran.retried } : {}),
+      ...(modelNote === undefined ? {} : { modelNote }),
       ...(ran.reason === 'quota' && ran.quota ? { quota: { proof: ran.quota.proof, resetAt: ran.quota.resetAt, resetText: ran.quota.resetText } } : {}),
+      ...(ran.reason === 'model' ? { modelStop: { proven: modelStopProven, proof: ran.modelStop?.proof ?? null, model, ...(ran.modelStop?.unproven ? { unproven: ran.modelStop.unproven } : {}) }, message: modelRefusalMessage({ model, verdict: substitute, defaultBranch: dflt, next: substituteNextStep({ substitute, pr }) }) } : {}),
       substitute,
       ...(warnings.length + usageWarnings.length > 0 ? { warnings: [...warnings, ...usageWarnings] } : {}),
     });
@@ -683,7 +714,7 @@ async function secondReview(rest, ctx) {
       return { saved, settled };
     });
     const { next: publishNext, ...published } = publishRuling({ ctx, root, pr, state: saved });
-    return secondReviewOutput({ n, settled, published, publishNext });
+    return secondReviewOutput({ n, settled, published, publishNext, ...(modelNote === undefined ? {} : { extra: { modelNote } }) });
   }, pr);
   // Codex answered: the PR is no longer waiting for it and its last outage is over (best effort, as after a first review).
   if (recorded.exitCode !== EXIT.OK) return recorded;
@@ -722,7 +753,11 @@ async function secondReviewApply(values, ctx) {
       throw fail(EXIT.FAILED, 'route-mismatch', `${file} does not describe a second review of round ${n}`);
     }
     if (!SECOND_EVIDENCE_KINDS.includes(route.evidence)) {
-      throw fail(EXIT.FAILED, 'no-evidence', `${file} holds evidence ${JSON.stringify(route.evidence ?? null)}, not quota | budget | governor: Codex was not refused (or is still being asked): run \`pipeline triage second-review\` again`, { evidence: route.evidence ?? null });
+      throw fail(EXIT.FAILED, 'no-evidence', `${file} holds evidence ${JSON.stringify(route.evidence ?? null)}, not quota | model | budget | governor: Codex was not refused (or is still being asked): run \`pipeline triage second-review\` again`, { evidence: route.evidence ?? null });
+    }
+    // A refused model is evidence about the trusted review.codex_model it was recorded for: when the fork point has moved on (the owner fixed it, or changed it again) it says nothing about the model now trusted (R3-2).
+    if (route.evidence === 'model' && route.model !== gates.codexModel) {
+      throw fail(EXIT.FAILED, 'route-mismatch', `the trusted Codex model is now ${gates.codexModel}, not the refused ${route.model}: run \`pipeline triage second-review\` again`);
     }
     const record = readSecondAttempts(root, n, route.packetId);
     const open = record.attempts.find((a) => a.status === 'prepared');
@@ -898,7 +933,7 @@ function pastRoundRequest({ pr, root, config, ctx }) {
 // The line that ends the reply asking the owner for one more review round: the CLI writes it (counted ordinal k, the checked-out head, the
 // repository gh resolves on github.com), so the agent cannot ask for a round or a head of its own choosing. Chat mode only.
 async function roundRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, past: { type: 'boolean' }, repo: { type: 'string' }, ask: { type: 'boolean' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, past: { type: 'boolean' }, repo: { type: 'string' }, ask: { type: 'boolean' }, 'after-process-review': { type: 'boolean' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
@@ -936,10 +971,36 @@ async function roundRequest(rest, ctx) {
     } catch (err) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
+    // The trip-wire (#374 PR B): a prompt before another round, never a refusal of the owner's own words. Tripped without --after-process-review: no line, no ask file.
+    const { wire, processReview } = tripWireOf({ state, config, root, head, k, shown });
+    if (wire.tripped && values['after-process-review'] !== true) {
+      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, warnings } };
+    }
     // (#261) click-to-approve: --ask also writes the dialog's ask file (the question text is exactly the line); it never changes the display fields above.
     const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line }), ctx }) : {};
-    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings, ...asked } };
+    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
   }, pr));
+}
+
+// The round trip-wire (lib/triage.mjs#roundTripWire) with the SMALLER of each setting in the working-tree and the fork-point config (a PR must not loosen its own wire; an unreadable
+// fork-point config leaves the working-tree one). A wire that cannot be computed is not tripped: it is a prompt, and a broken one must never be what blocks the owner's own ask.
+function tripWireOf({ state, config, root, head, k, shown }) {
+  try {
+    const fork = state.rounds.findLast((r) => typeof r.forkPoint === 'string');
+    const read = fork === undefined ? { ok: false } : baseConfigAt(fork.forkPoint, root);
+    const configs = [config, ...(read.ok ? [read.config] : [])];
+    const smallest = (key) => Math.min(...configs.map((c) => c.review[key]));
+    const wire = roundTripWire(state, { extraRounds: smallest('trip_wire_extra_rounds'), notFalling: smallest('trip_wire_not_falling') });
+    if (!wire.tripped) return { wire, processReview: null };
+    let fixScope = null;
+    try {
+      const last = state.rounds.findLast(countsTowardCap);
+      if (last !== undefined) fixScope = fixRoundScope({ files: diffFiles(last.toHead, head, { cwd: root }), configs });
+    } catch { /* not measured: the line is left out */ }
+    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k }) };
+  } catch {
+    return { wire: { tripped: false, reviewed: 0, max: null, acceptsByRound: [], reasons: [] }, processReview: null };
+  }
 }
 
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be

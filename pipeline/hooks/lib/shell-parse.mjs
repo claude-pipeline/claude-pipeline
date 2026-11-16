@@ -239,6 +239,40 @@ const envLong = (name) => (ENV_LONG.includes(name) ? name : (ENV_LONG.filter((o)
 // and the shell goes on; a redirection on the exit may fail before it runs (the caller reads a redirection on a group's closer); `exit 1 2` is refused ("too many arguments") and a run-time word may split into two.
 // One rule for the files guard (cd narrowing) and the git guard (orExits).
 export const plainExit = (c) => c.argv[0] === 'exit' && (c.redirects ?? []).length === 0 && (c.argv.length === 1 || (c.argv.length === 2 && /^\d+$/.test(c.argv[1])));
+// The shape events of a command list (see simpleCommands), by `at`: Map at -> [event].
+export function shapeAt(shape) {
+  const evAt = new Map();
+  for (const e of shape) { const l = evAt.get(e.at); if (l) l.push(e); else evAt.set(e.at, [e]); }
+  return evAt;
+}
+// #410, #425, #452: `cd DIR || exit 1` (also `|| exit`; not `|| return`): when the cd fails the shell leaves, so whatever runs after the exit command surely follows a cd that succeeded. The exit must be a plain command
+// of its own (not a pipeline stage or a background job: those leave only a subshell), in the same construct as the cd. The same for a brace group, `cd DIR || { echo "no dir"; exit 1; }`: its last command is the exit and
+// every command before it is joined by ; or a newline, so the exit surely runs when the group does. top: the commands of the text's own level, evAt: shapeAt(its shape), k: the index of the cd.
+// Returns the index of the command that surely follows a cd that succeeded, or -1.
+export function exitFollows(top, evAt, k) {
+  const x = top[k + 1];
+  if (x === undefined) return -1;
+  const opens = evAt.get(k + 1);
+  let last = k + 1; // (the command that must be the exit, and the index of the command after the construct)
+  if (opens !== undefined) {
+    if (opens.length !== 1 || opens[0].kind !== '{' || opens[0].sep !== '||') return -1;
+    let j = k + 2;
+    while (j < top.length && !evAt.has(j)) j++;
+    const closes = evAt.get(j);
+    if (closes === undefined || closes.length !== 1 || closes[0].kind !== '}') return -1;
+    for (let m = k + 2; m < j; m++) if (top[m].sep !== ';') return -1;
+    last = j - 1;
+  } else if (x.sep !== '||' || evAt.has(k + 2)) return -1;
+  const e = top[last];
+  // R1-B1 (Codex round 1): only `exit` counts. A top-level `return` is an error and the shell goes on (it leaves only inside a function or a sourced file, and a function is no shape that is narrowed at all).
+  // R1-B2: a redirection on the exit, or on the group's closer (`} < f`, read as a command of no words that holds it), may fail before the exit runs, and then the shell goes on: no narrowing.
+  // (a redirection on a command before the exit, `{ echo no >&2; exit 1; }`, only fails that command)
+  // R1-F1: `exit` alone or with ONE literal number; `exit 1 2` is refused ("too many arguments") and the shell goes on, and a run-time word (`exit $X`) may split into two
+  if (!plainExit(e)) return -1; // (shell-parse's plainExit: the one rule, the git guard's orExits reads it too)
+  if (opens !== undefined && top[last + 1] !== undefined && top[last + 1].argv.length === 0 && (top[last + 1].redirects ?? []).length > 0) return -1;
+  const y = top[last + 1];
+  return y === undefined || y.sep === ';' || y.sep === '&&' ? last + 1 : -1;
+}
 // true: the env wrappers in front of the command removed NAME (and none set it again); null: one may have (an option not understood); false: not removed.
 export function envUnset(env, name) {
   const u = env?.[ENV_UNSET];
@@ -2167,8 +2201,9 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';', afterClose 
   Object.defineProperty(cmd, 'loops', { value: ctx.loops, enumerable: false });
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
-  // lead (#352 R11-F2): of a later stage of a pipeline, the operator before the pipeline's FIRST stage (a later stage may come out before the first: a heredoc waiting, an empty group). Not enumerable
-  if (ctx.lead) Object.defineProperty(cmd, 'lead', { value: ctx.lead, enumerable: false });
+  // pipeLead (#352 R11-F2): of a later stage of a pipeline, the operator before the pipeline's FIRST stage (a later stage may come out before the first: a heredoc waiting, an empty group). Not enumerable.
+  // (Not `lead`: that is #373's keyword the segment starts with (shapeSeg, files-policy cdTarget); one name for both made `x | { …; }` and `x | if …` throw, and the line was given up on)
+  if (ctx.lead) Object.defineProperty(cmd, 'pipeLead', { value: ctx.lead, enumerable: false });
   // afterClose (#352 R7-F2): its `&&` follows the closer of a construct whose body may not have run (`fi &&`, `done &&`, `esac &&`, a group that may skip): it is chained to the construct, not to the body's last command. Not enumerable
   Object.defineProperty(cmd, 'afterClose', { value: afterClose, enumerable: false });
   // binPath: it is part of a script text a package runner runs (node_modules/.bin is on its PATH). Not enumerable

@@ -169,6 +169,23 @@ test('missing verify.full / verify.quick is rejected', () => {
   assert.ok(has(r, 'verify.full') && has(r, 'verify.quick'));
 });
 
+test('review.codex_model must be a model id: a number, a list, spaces, an empty string or 101 characters are rejected (#443); ordinary ids and an absent key pass', () => {
+  const withModel = (codex_model) => validateConfig({ ...minimal(), review: { codex_model } });
+  for (const bad of [5, ['gpt-6-astra'], 'gpt 5', '', 'a'.repeat(101), 'gpt"x', 'gpt-6\nastra', null]) {
+    const r = withModel(bad);
+    assert.equal(r.ok, false, `${JSON.stringify(bad)} must be refused`);
+    assert.ok(has(r, 'review.codex_model must be a model id (letters, digits, . _ -), e.g. gpt-6-astra'), r.errors.join('; '));
+  }
+  for (const good of ['gpt-6-astra', 'o4-mini', 'gpt-5.1-codex', 'a'.repeat(100)]) {
+    const r = withModel(good);
+    assert.equal(r.ok, true, `${good}: ${r.errors.join('; ')}`);
+    assert.equal(r.config.review.codex_model, good);
+  }
+  const absent = validateConfig({ ...minimal(), review: { max_rounds: 2 } });
+  assert.equal(absent.ok, true, absent.errors.join('; '));
+  assert.equal(absent.config.review.codex_model, DEFAULTS.review.codex_model);
+});
+
 test('review.max_rounds outside 1..5 is rejected; effort values validated', () => {
   const r = validateConfig({ ...minimal(), review: { max_rounds: 9 } });
   assert.equal(r.ok, false);
@@ -230,6 +247,24 @@ test('review.fix_verify_after_round: null or an integer 1..10; review.fix_round_
   for (const v of [0, 11, 2.5, '3', true]) assert.ok(has(set('fix_verify_after_round', v), 'review.fix_verify_after_round must be null or an integer 1..10'), String(v));
   assert.equal(set('fix_round_max_lines', 1).ok, true);
   for (const v of [0, -1, 1.5, '150', null]) assert.ok(has(set('fix_round_max_lines', v), 'review.fix_round_max_lines must be a positive integer'), String(v));
+});
+
+test('review.post_max_suggestions / trip_wire_extra_rounds / trip_wire_not_falling: defaults', () => {
+  const r = validateConfig(minimal());
+  assert.equal(r.config.review.post_max_suggestions, 'review');
+  assert.equal(r.config.review.trip_wire_extra_rounds, 3);
+  assert.equal(r.config.review.trip_wire_not_falling, 2);
+  assert.equal(DEFAULTS.review.post_max_suggestions, 'review');
+});
+
+test('review.post_max_suggestions: follow-up|review; trip_wire_extra_rounds 1..10; trip_wire_not_falling 1..5', () => {
+  const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
+  for (const v of ['follow-up', 'review']) assert.equal(set('post_max_suggestions', v).ok, true, v);
+  for (const v of ['off', '', 1, null, true]) assert.ok(has(set('post_max_suggestions', v), 'review.post_max_suggestions must be one of follow-up|review'), String(v));
+  for (const v of [1, 3, 10]) assert.equal(set('trip_wire_extra_rounds', v).ok, true, String(v));
+  for (const v of [0, 11, 2.5, '3', null]) assert.ok(has(set('trip_wire_extra_rounds', v), 'review.trip_wire_extra_rounds must be an integer 1..10'), String(v));
+  for (const v of [1, 2, 5]) assert.equal(set('trip_wire_not_falling', v).ok, true, String(v));
+  for (const v of [0, 6, 1.5, '2', null]) assert.ok(has(set('trip_wire_not_falling', v), 'review.trip_wire_not_falling must be an integer 1..5'), String(v));
 });
 
 test('production without smoke is rejected; production: null is ok', () => {

@@ -5,6 +5,7 @@ import assert from 'node:assert/strict';
 import { resolve } from 'node:path';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
 import { reasonCode } from '../pipeline/hooks/lib/deny-log.mjs';
 
 const HOME = '/home/u';
@@ -334,7 +335,12 @@ describe('#427: only a plain `exit` (alone or with one number) makes the code af
   NOT('cd X || exit 1 & (a background job)', 'cd /other || exit 1 &\ngit push');
   // (#352 merge of main: the git guard tracks levels, so the exit one level down is accepted only where the `||` surely reaches it in this shell)
   NARROWED('cd X || { { exit 1; }; } (nested groups)', 'cd /other || { { exit 1; }; }; git push');
-  NOT('cd X || { echo; exit 1; } (not the first command)', 'cd /other || { echo x; exit 1; }; git push');
+  // (#352 merge of main #478: main's #452 reads the group whose LAST command is the exit (exitFollows), carried into the state-mark walk as a failure group: the state the cd left is put back after it)
+  NARROWED('cd X || { echo; exit 1; } (#452: the exit is the group\'s last command)', 'cd /other || { echo x; exit 1; }; git push');
+  NARROWED('cd X || { git switch main; exit 1; } (#478 R1-B1: the switch ran in the old directory, and the group left)', 'cd /other || { git switch main; exit 1; }; git push');
+  NOT('a push inside the failure group runs in the old directory (#478 R1-B1)', 'cd /other || { git push; exit 1; }');
+  NOT('a cd in a loop body: the failure group puts back one pass\'s state only (doubt)', 'for i in 1 2; do cd /other || { echo; exit 1; }; done; git push');
+  NOT('a cd after &&: the failure group puts back nothing (doubt, main\'s R2-F1 rule: kept conservative)', 'true && cd /other || { echo; exit 1; }; git push');
   NOT('cd X || ( exit 1 ) (a subshell exit)', 'cd /other || ( exit 1 ); git push');
   NOT('cd X || { exit 1; } | cat (a pipeline stage)', 'cd /other || { exit 1; } | cat; git push');
   NOT('cd X || { exit 1; } & (a background job)', 'cd /other || { exit 1; } &\ngit push');
@@ -344,4 +350,16 @@ describe('#427: only a plain `exit` (alone or with one number) makes the code af
   NOT('cd X || g() { exit 1; } (only defines g)', 'cd /other || g() { exit 1; }; git push');
   NOT('cd X || if true; then exit 1; fi (not the first command)', 'cd /other || if true; then exit 1; fi; git push');
   NOT('cd X || for x in $L; do exit 1; done (the body may not run)', 'cd /other || for x in $L; do exit 1; done; git push');
+});
+// (#352 merge of main #478: the parser's `pipeLead` (#352 R11-F2) and #373's keyword `lead` were one property name, so a later pipeline stage that starts with a keyword threw and the whole line was given up on)
+describe('#352: a pipeline stage that is a { } group or an if is parsed, not given up on', () => {
+  for (const line of ['git log | { read x; echo $x; }; git push', 'echo a | if true; then cat; fi; git push', 'cd /other && echo | { cat; } && git push']) {
+    test(`allow: ${line}`, () => assert.equal(gitRun(line).decision, 'allow', `${line} -> ${gitRun(line).reason}`));
+  }
+  test('the stage keeps both marks: the keyword it starts with and the operator before the pipeline', () => {
+    const cmds = simpleCommands('true && echo a | { cat; }');
+    const cat = cmds.find((c) => c.argv[0] === 'cat');
+    assert.equal(cat.lead, '{');
+    assert.equal(cat.pipeLead, '&&');
+  });
 });

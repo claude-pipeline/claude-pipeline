@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { UNDECIDABLE_HEREDOC, plainExit, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
@@ -3055,6 +3055,17 @@ function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
   const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  // #452: the group form `cd d || { echo "no d" >&2; exit 1; }; git push`, read by shell-parse's exitFollows, the files guard's rule (a group entered by ||, its last command a plain exit, no redirection on its closer)
+  let shapeTop; // (the commands of the text's own level and their shape events, built when first asked)
+  // #478 R1-B1: the index in cmds of the group's last command, its `exit` (-1: not this form). The commands after i up to it run only when the cd / checkout FAILED.
+  const exitOfGroup = (i) => {
+    if (!cmds.shape || cmds[i].depth > 0) return -1;
+    shapeTop ??= { top: cmds.filter((c) => !(c.depth > 0)), evAt: shapeAt(cmds.shape) }; // (the commands inside a substitution are listed before the one that holds them; the events count the text's own level only)
+    const k = shapeTop.top.indexOf(cmds[i]);
+    const after = k >= 0 ? exitFollows(shapeTop.top, shapeTop.evAt, k) : -1;
+    return after >= 1 ? cmds.indexOf(shapeTop.top[after - 1]) : -1; // (the exit is the construct's last command; a substitution of the command after it is listed after the exit)
+  };
+  const exitsAsGroup = (i) => exitOfGroup(i) >= 0;
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
@@ -3102,7 +3113,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       const deeper = c.up.length > x.up.length;
       const own = deeper ? c.up[x.up.length] : c;
       // (#352 R11-F2: a later stage of a pipeline takes the operator before the pipeline's FIRST stage (lead): that stage may not have come out before this one)
-      const op = own.sep === '|' ? (own.lead ?? ';') : own.sep;
+      const op = own.sep === '|' ? ((deeper ? own.lead : own.pipeLead) ?? ';') : own.sep; // (a level's entry holds it as `lead`, a command as `pipeLead`: see emit)
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
       if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
@@ -3148,6 +3159,10 @@ function evalString(str, startDir, ctx, level, child = false) {
   ctx.writeFrames.push(frame);
   const levels = trusted ? [] : null; // (the levels open at the command being walked, outermost first, see emit: up in shell-parse.mjs: { e: the level, dir: where this shell was when it opened, lost / state: a change in it that is certain })
   let chdirBase;
+  // #478 R1-B1 (main), carried into the state-mark design: the commands of a failure group `cd X || { …; exit 1; }` (exitOfGroup: also a git checkout / switch) run only when the cd FAILED, in the old
+  // directory on the old branch, so they are walked with the state unknown. `to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`:
+  // the change was not certain (certainChange: it may not have run, or only for a chain), then the state stays unknown (R2-F1). A branch entry first made in the group is unknown after it (R2-B1).
+  let failGroup = null;
   // #352 R6: the loops being walked, outermost first, each a frame: its range, the state at its entry, its carry (what its body may leave for the next iteration), the places its body can start in and
   // the carry each was judged with, and the walk state to start a pass from. A frame is finished when no start is left that was not judged with the carry as it is now.
   const loopsAt = loopRangesOf(cmds);
@@ -3184,6 +3199,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       loopReseed(ctx, fr.entry, fr.carry);
       restore(nextDir === fr.at.dir ? fr.at : { dir: nextDir, trackers: fr.at.trackers });
       chdirBase = undefined;
+      failGroup = null; // (a pass starts before any failure group of the body: one the last pass ended in, its exit the body's last command, is not carried into the next pass)
       if (levels) levels.splice(0, levels.length, ...fr.levels.map((x) => ({ ...x }))); // (the places the levels it is in will give back are those of its entry, not of the pass that started here: R10-B1)
       i = fr.start;
       break;
@@ -3223,6 +3239,21 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
     }
     if (hazard) forgetState();
+    // (#478 R1-B1, see failGroup: here, once the levels this command ends are given back and BEFORE settle, which forgets the cd's tracker at the group's first command (its operator is ||): the snapshot is the
+    // state the cd left, and after the group it is put back over whatever the group's level gave back)
+    if (failGroup && failGroup.snap === null) {
+      failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]) };
+      forgetState();
+    } else if (failGroup && i > failGroup.to) {
+      dir = failGroup.snap.dir;
+      // (#478 R2-F1: when the cd / checkout was itself uncertain, the snapshot is an optimistic state: forgotten, not put back; R2-B1: an entry first made in the group is not in the snapshot: unknown)
+      if (failGroup.doubt) forgetState();
+      else {
+        const was = new Map(failGroup.snap.names);
+        for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
+      }
+      failGroup = null;
+    }
     settle(c, i); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
     if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } });
     // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
@@ -3353,6 +3384,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || stateChanged(ctx, before))) {
       const how = certainChange(cmds, c, trusted);
       const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', scoped: how === 'chain', lost: changesStateWords, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
+      if (changesStateWords && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond };
       if (how) {
         trackers.push(x);
         const top = levels?.[levels.length - 1];
