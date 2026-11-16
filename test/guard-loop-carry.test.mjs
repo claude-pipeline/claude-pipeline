@@ -195,7 +195,7 @@ test('#352 R30-F3: a -P / -- after the cd operand makes the cd fail (two operand
 // (#352 R35-B1, R35-B2, R35-F1, R35-F2: ONE rule. A cd / state change is trusted to have run only when it surely did: in a loop's replay a cd REPLACES the places the body may end in only when it is
 // certain there (after ;, not in a branch, an inner loop, the background or a pipeline stage, not negated, every level between the loop and it entered by ;, no redirection that can fail on it, on the
 // closer of its { } group or on the eval that holds it); any other ADDS its target. A `continue` that reaches the loop ends an iteration where it stands. On the straight line, a change with a
-// redirection that can fail is not certain (the directory / branch after it is unknown). (#352 R36: NO redirection is firm, see the R36 test below.)
+// redirection that can fail is not certain (the directory / branch after it is unknown). (#352 R36: NO redirection is firm, see the R36 test below; R37: no exception for &&, the row "cd back with &>/dev/null after &&" that stood here is a deny there.)
 test('#352 R35-B1/B2/F1/F2: a cd or state change that may not have run is not trusted', () => {
   const loopRows = [
     ['failing redirection on the cd back (R35-B1)', `cd /work/other; cd ${GIT_ROOT} < /missing`],
@@ -236,7 +236,6 @@ test('#352 R35-B1/B2/F1/F2: a cd or state change that may not have run is not tr
     ['break before the cd back (no next iteration from there)', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; if [ -f stop ]; then break; fi; cd ${GIT_ROOT}; done`],
     ['a zero-run inner loop, then the cd back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; while false; do cd /tmp; done; cd ${GIT_ROOT}; done`],
     ['continue after the cd back', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; cd ${GIT_ROOT}; continue; done`],
-    ['straight line: cd back with &>/dev/null, after &&', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
     ['straight line: a bare >x in the { } group is no closer', `cd /work/other; { cd ${GIT_ROOT}; >x; }; ${PB} origin HEAD`],
     ['a bare >x in the { } group is no closer, in a loop', `for i in 1 2; do ${PB} origin HEAD; cd /work/other; { cd ${GIT_ROOT}; >x; }; done`],
     ['straight line: a failing redirection on a command that moves nothing', `cd ${GIT_ROOT}; git branch -a > /missing/f; ${PB} origin HEAD`],

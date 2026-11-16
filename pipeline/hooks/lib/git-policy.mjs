@@ -3445,7 +3445,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const changedState = argv.length > 0 && stateChanged(ctx, before);
     if (argv.length > 0 && (changesStateWords || changedState)) {
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', scoped: how === 'chain', lost: changesStateWords, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', lost: changesStateWords, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       if (changesStateWords && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond };
       if (how) {
@@ -3464,6 +3464,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (unsure !== null) return deny(`$${unsure} may be reassigned by the file ${name === '.' ? '.' : 'source'} runs, so its value at run time cannot be verified. Use it before sourcing, or write the value out.`);
     }
   }
+  // (#352 R37-F1: a change that follows && may not have run, and when the text ends nothing after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text
+  // ends in: as if a command after `;` followed, it is forgotten (`false && git switch b` as the last command of a script). A branch / loop body's change keeps the rule of its level, as for a command that follows)
+  for (const x of trackers) if (x.and) forget(x);
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it
@@ -3478,11 +3481,11 @@ function evalString(str, startDir, ctx, level, child = false) {
 // background (the whole and-or list a `&` ends), not started by a wrapper (spawn: the child's change), and not behind `||` (nor, with nothing before it but the line, behind anything but ; and &&: `cond`). What follows it
 // in its list is settled by evalString (settle): && keeps it, || forgets it, ; ends a conditional one. Marks not to be trusted: nothing is certain.
 // ('chain': it is in a branch / loop / function body or a trap but otherwise as above: the command chained to it with && sees it (`if x; then cd d && git push; fi`: it runs only when the change did), nothing else does)
-// (#352 R35-F2, R36: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it (none is firm, redirectsFirm) means it may not have run at all: only the command chained to it with && sees it ('chain'):
-// a failed redirection makes the command exit non-zero, so what && chains to it runs only when it ran)
+// (#352 R35-F2, R36, R37-F1: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it (none is firm, redirectsFirm) means it may not have run at all: its change is unknown at once, NO exception for
+// && (R36 kept it as 'chain' for the command chained to it, but nothing settled it when the text ended, so a script ending in `git switch b > /missing/f` handed b to its caller, which pushed the branch the failed switch left))
 function certainChange(cmds, c, trusted, moves = true) {
   if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
-  if (moves && !redirectsFirm(c.redirects)) return 'chain';
+  if (moves && !redirectsFirm(c.redirects)) return null;
   return Object.values(c.ctl).some(Boolean) ? 'chain' : 'certain';
 }
 
