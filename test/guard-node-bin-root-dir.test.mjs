@@ -227,8 +227,11 @@ test('#352 R1-B1 control: the same switch run in a directory that is known (no l
     'scripts/start.sh': '#!/bin/bash\nnpm start\n',
     'release.sh': `#!/bin/bash\n${PUSH_BARE}\n`,
   };
+  // #352 R38-F2: a script's change never carries over to its caller (owner decision): the bare push in the next script no longer rests on the switch; one that names the branch does not need it
   const r = run('git', `bash ${GIT_ROOT}/scripts/start.sh; bash ${GIT_ROOT}/release.sh`, files, { currentBranch: () => MAIN });
-  assert.equal(r.decision, 'allow', r.reason);
+  assert.equal(r.decision, 'deny', 'allowed');
+  const named = run('git', `bash ${GIT_ROOT}/scripts/start.sh; bash ${GIT_ROOT}/release.sh`, { ...files, 'release.sh': `#!/bin/bash\n${PUSH_BARE} origin agent/safe\n` }, { currentBranch: () => MAIN });
+  assert.equal(named.decision, 'allow', named.reason);
 });
 
 // Why (#352 R1-F1): selfDirs walked the script path as named; a link to the script (`cd "${0:A:h:h}"` resolves it) was not covered.
@@ -287,12 +290,16 @@ test('#352 R2-F1: a workspace plan whose order differs by candidate directory is
   assert.match(cfg.reason, /changes upstream\/push configuration/, 'push.default: ' + cfg.reason);
   const al = run('git', line, mk('git config alias.ship "' + PUSH + ' origin"', `git ship ${MAIN}`), { currentBranch: () => MAIN });
   assert.equal(al.decision, 'deny', 'alias: ' + al.reason);
-  assert.match(al.reason, /pushing to main is blocked/, 'alias: ' + al.reason);
+  // (#352 R38-F2: the alias run a defines is unknown for run b, so the refusal names that, not the push to main the known alias would have been; still only reached when run a is judged before run b)
+  assert.match(al.reason, /pushing to main is blocked|the git alias "ship" may have been \(re\)defined/, 'alias: ' + al.reason);
   // allow twins: the same two workspace scripts with a harmless configuration / alias are not refused
   const cfgOk = run('git', line, mk('git config user.name x', PUSH_BARE));
   assert.equal(cfgOk.decision, 'allow', 'harmless config: ' + cfgOk.reason);
+  // (#352 R38-F2: an alias a script defines is unknown for what runs after it, a harmless value included (owner decision: a script's change never carries over to its caller); a use of another name is the twin)
   const alOk = run('git', line, mk('git config alias.ship status', `git ship ${MAIN}`), { currentBranch: () => MAIN });
-  assert.equal(alOk.decision, 'allow', 'harmless alias: ' + alOk.reason);
+  assert.equal(alOk.decision, 'deny', 'harmless alias: allowed');
+  const alOther = run('git', line, mk('git config alias.ship status', `git status`), { currentBranch: () => MAIN });
+  assert.equal(alOther.decision, 'allow', 'harmless alias, not used: ' + alOther.reason);
 });
 
 // Why (#352 R3-F1): judgeReadings reset aliasUnsure for every reading and built its union from alias MAP differences only; judgeAlternatives (a lost cd in a script) restores the map and leaves only an unsure mark,

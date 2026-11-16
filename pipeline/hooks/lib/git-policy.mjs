@@ -333,6 +333,7 @@ function setBranch(ctx, dir, name, trackMain = false) {
   if (dir === null) return;
   if (name !== null && DYNAMIC.test(name)) name = null; // still holds `$B` / `$(…)` after expansion: unknown, not a name
   ctx.branches.set(dir, { name: name === null ? null : stripHeads(name), trackMain });
+  (ctx.budget.branchLog ??= []).push(dir); // (every write, for judgeScopedIn: a text that switched and switched back has still changed the branch)
 }
 
 function effectiveBranch(dir, gitDir, ctx) {
@@ -2280,8 +2281,9 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
 // puts the line's old values back and marks the variables it set as uncertain (a later use is also unknown at run time).
 // What a script judged here may change, by ctx field:
 //   vars, tainted, unsureVars     shell-local: die with a child shell (restored), a speculative source taints them (below)
-//   branches                      repository state: a child really switches the branch, so a definite script's change is kept;
-//                                 a speculative candidate may not run, so what it changed becomes an unknown branch
+//   branches                      repository state: a child really switches the branch, but it may have ended before the change (exit, return, set -e, a failing `cd d || exit`) and its caller goes on,
+//                                 so what a text that runs in a child process (or ends early on its own) changed, or may have changed, is an unknown branch for the caller
+//                                 (#352 R38-F2, owner: a script's change never carries over to its caller); a speculative candidate may not run at all: the same rule
 //   cfgDirty, envCfgDirty         repository/global config: only ever set, never restored (a candidate that may not run
 //                                 still leaves them dirty); envCfgDirty is recomputed from vars AND tainted names
 //   gitAliases, ghAliases         config on disk: kept; one a speculative candidate (re)defines is also unsure (aliasUnsure)
@@ -2298,26 +2300,40 @@ function judgeScoped(text, dir, ctx, level, sf, child = false) {
     scopes.pop();
   }
 }
+// #352 R38-F2 (owner decision: a script's change never carries over to its caller): what a text that runs in a CHILD process or can end early on its own (a script file, a package script, a `bash -c` text, a shell fed on stdin,
+// a startup file) changed, or may have changed, is UNKNOWN for its caller afterwards, never the value the walk gave it (an exit, a return, `set -e`, `cd d || exit` before the change; a speculative candidate that may not run at
+// all is the same): a branch it wrote or that differs from before becomes an unknown branch, an alias it (re)defined is unsure. What it did not touch stays as it was. The mark is the state before; every write of a branch is
+// in the log (a text that switched and switched back has still changed it), and a forget changes an entry in place (the mark holds copies).
+function markChildState(ctx) {
+  return {
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { name: e.name, trackMain: e.trackMain }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases },
+    logged: (ctx.budget.branchLog ??= []).length,
+  };
+}
+function forgetChildChanges(ctx, mark) {
+  for (const d of new Set([...mark.branches.keys(), ...ctx.branches.keys()])) {
+    const was = mark.branches.get(d);
+    const now = ctx.branches.get(d);
+    if (was?.name !== now?.name || was?.trackMain !== now?.trackMain) ctx.branches.set(d, { name: null, trackMain: false });
+  }
+  for (const d of ctx.budget.branchLog.slice(mark.logged)) ctx.branches.set(d, { name: null, trackMain: false });
+  for (const n of new Set([...Object.keys(mark.git), ...Object.keys(ctx.gitAliases)])) {
+    if (mark.git[n] !== ctx.gitAliases[n]) ctx.aliasUnsure.add(`git:${n}`);
+  }
+  for (const n of new Set([...Object.keys(mark.gh), ...Object.keys(ctx.ghAliases)])) {
+    if (mark.gh[n] !== ctx.ghAliases[n]) ctx.aliasUnsure.add(`gh:${n}`);
+  }
+}
 function judgeScopedIn(text, dir, ctx, level, sf, child) {
   if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
   const saved = Object.assign(Object.create(null), ctx.vars);
   const savedTaint = new Set(ctx.tainted);
   const savedUnsure = new Set(ctx.unsureVars);
-  const spec = sf.candidate ? { branches: new Map(ctx.branches), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } : null;
+  const spec = markChildState(ctx);
   try {
     return evalString(text, dir, ctx, level + 1, child);
   } finally {
-    if (spec) { // anything added, changed or removed: unknown (it may not have run), never the candidate's value nor the old one
-      for (const d of new Set([...spec.branches.keys(), ...ctx.branches.keys()])) {
-        if (spec.branches.get(d) !== ctx.branches.get(d)) ctx.branches.set(d, { name: null, trackMain: false });
-      }
-      for (const n of new Set([...Object.keys(spec.git), ...Object.keys(ctx.gitAliases)])) {
-        if (spec.git[n] !== ctx.gitAliases[n]) ctx.aliasUnsure.add(`git:${n}`);
-      }
-      for (const n of new Set([...Object.keys(spec.gh), ...Object.keys(ctx.ghAliases)])) {
-        if (spec.gh[n] !== ctx.ghAliases[n]) ctx.aliasUnsure.add(`gh:${n}`);
-      }
-    }
+    if (!sf.inline || sf.candidate) forgetChildChanges(ctx, spec); // (a text that runs inline (eval) keeps today's handling: an exit there ends the caller too)
     const after = Object.assign(Object.create(null), ctx.vars);
     for (const k of Object.keys(ctx.vars)) delete ctx.vars[k];
     Object.assign(ctx.vars, saved);
@@ -3442,6 +3458,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       // out or cut in two by its neighbours in the real text, so it must not change what the other fragments are judged against)
       if (!verdict) {
         const feeds = scriptFeedsOf(c, str, (w) => expandVars(w, ctx));
+        if (name === 'eval') for (const fd of feeds) fd.inline = true; // (#352 R38-F2: eval runs the text in THIS shell: an exit there ends the line too, so what it changed is still handed on, see judgeScopedIn)
         const joined = feeds.some((fd) => fd.joined);
         const ordered = joined ? [...feeds.filter((fd) => fd.joined), ...feeds.filter((fd) => !fd.joined)] : feeds;
         for (const fd of ordered) {
@@ -3452,7 +3469,10 @@ function evalString(str, startDir, ctx, level, child = false) {
         }
       }
       };
+      // (#352 R38-F2: the startup files a shell reads run in that child too: what they changed is the child's, see forgetChildChanges)
+      const childMark = startupList.length > 0 ? markChildState(ctx) : null;
       if (startupList.some((st) => !st.implicit)) withStartupScope(c, ctx, judgeRest); else judgeRest();
+      if (childMark) forgetChildChanges(ctx, childMark);
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     const changedState = argv.length > 0 && stateChanged(ctx, before);

@@ -61,10 +61,16 @@ test('#352 R8-B1: a package script or script file that switches the branch, wher
   denies('false && bash reset.sh ;', 'false && bash ./reset.sh; ' + SHIP, HERE);
   denies('in a script', `bash ${MAIN_DIR}/run.sh`, { ...HERE, [MAIN_DIR + '/run.sh']: '#!/bin/bash\nif false; then npm run reset; fi && ' + SHIP + '\n' });
   // twins: the script runs for sure, or is chained to the push with &&
-  allows('twin: npm run, then push', 'npm run reset; ' + SHIP, HERE);
-  allows('twin: npm run &&', 'npm run reset && ' + SHIP, HERE);
-  allows('twin: true && npm run &&', 'true && npm run reset && ' + SHIP, HERE);
-  allows('twin: bash reset.sh &&', 'bash ./reset.sh && ' + SHIP, HERE);
+  // (#352 R38-F2: a script's change never carries over to its caller (owner decision): the push that names no branch is refused after a script that switched; the one that names it is the twin)
+  const NAMED = 'git ' + PUSH + ' origin agent/x';
+  denies('twin: npm run, then push', 'npm run reset; ' + SHIP, HERE);
+  denies('twin: npm run &&', 'npm run reset && ' + SHIP, HERE);
+  denies('twin: true && npm run &&', 'true && npm run reset && ' + SHIP, HERE);
+  denies('twin: bash reset.sh &&', 'bash ./reset.sh && ' + SHIP, HERE);
+  allows('twin: npm run, then a push naming the branch', 'npm run reset; ' + NAMED, HERE);
+  allows('twin: npm run && a push naming the branch', 'npm run reset && ' + NAMED, HERE);
+  allows('twin: true && npm run && a push naming the branch', 'true && npm run reset && ' + NAMED, HERE);
+  allows('twin: bash reset.sh && a push naming the branch', 'bash ./reset.sh && ' + NAMED, HERE);
   allows('twin: a script that changes nothing, in an if', 'if false; then npm run other; fi && ' + SHIP, { ...HERE, [MAIN_DIR + '/package.json']: JSON.stringify({ name: 'x', scripts: { other: 'echo hi' } }) }, GIT_ROOT);
 });
 

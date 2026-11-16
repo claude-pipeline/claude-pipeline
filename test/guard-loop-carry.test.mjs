@@ -310,12 +310,16 @@ test('#352 R37-F1: a script / package script that ends in a redirected or condit
       }
     }
   }
-  // (twin: the same script with a plain switch hands it over. The loop over literal words that a script may end in is pinned by the t4 control in guard-script-readings.test.mjs)
+  // (twin: the same script with a plain switch hands it over -- #352 R38-F2: a script's change never carries over to its caller (owner decision), so the HEAD push is unknown now; the one that names the branch is allowed.
+  // The loop over literal words that a script may end in is pinned by the t4 control in guard-script-readings.test.mjs)
   for (const body of ['git switch agent/x']) {
     for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
       for (const sep of [';', '&&']) {
         const r = at(`${caller} ${sep} ${PB} origin HEAD`, files(body));
-        assert.equal(r.decision, 'allow', `twin ${what} ${sep} \`${body}\`: ${r.reason}`);
+        assert.equal(r.decision, 'deny', `twin ${what} ${sep} \`${body}\`: allowed`);
+        assert.match(r.reason, DIRS, `twin ${what} ${sep}: ${r.reason}`);
+        const named = at(`${caller} ${sep} ${PB} origin agent/x`, files(body));
+        assert.equal(named.decision, 'allow', `twin ${what} ${sep}, naming the branch: ${named.reason}`);
       }
     }
   }
@@ -352,10 +356,12 @@ test('#352 R38: a script / package script ending in a level that may not have ru
       }
     }
   }
-  // (twin: a switch at the text's own top level is handed over)
+  // (twin: a switch at the text's own top level was handed over; #352 R38-F2: a script's change never carries over to its caller (owner decision), so the HEAD push is unknown and the one that names the branch is the twin)
   for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
     const r = at(`${caller}; ${PB} origin HEAD`, files('git switch agent/x'));
-    assert.equal(r.decision, 'allow', `twin ${what}: ${r.reason}`);
+    assert.equal(r.decision, 'deny', `twin ${what}: allowed`);
+    const named = at(`${caller}; ${PB} origin agent/x`, files('git switch agent/x'));
+    assert.equal(named.decision, 'allow', `twin ${what}, naming the branch: ${named.reason}`);
   }
 });
 // (#352 R38-F2, owner decision "never carry over": a text that runs in a CHILD process or can end early on its own (a script file run by path or by bash / sh / zsh, fed on stdin, a package script, a `bash -c` text, a sourced file:
@@ -386,11 +392,19 @@ test('#352 R38-F2: a script / package script / bash -c text / sourced file never
   assert.deepEqual(allowed, [], 'allowed, though the text may have ended before its change');
   // (twins: a text that changes nothing leaves the caller's state as it was: the push from a feature branch is allowed)
   const quiet = { 'build.sh': '#!/bin/bash\necho hi\n', 'package.json': JSON.stringify({ name: 'x', scripts: { build: 'echo hi', other: 'echo hi' } }) };
-  for (const caller of ['bash ./build.sh', 'sh ./build.sh', './build.sh', 'npm run build', 'bash -c "echo hi"', 'bash < build.sh', 'cat build.sh | bash']) {
+  for (const caller of ['bash ./build.sh', 'sh ./build.sh', './build.sh', 'npm run build', 'bash -c "echo hi"']) { // (a shell fed on stdin is refused whenever the line mentions a push, changed or not)
     for (const sep of [';', '&&']) {
       const r = at(`${caller} ${sep} ${PB} origin HEAD`, quiet, GIT_ROOT);
       assert.equal(r.decision, 'allow', `twin ${caller} ${sep}: ${r.reason}`);
     }
+  }
+  // (the startup file a shell reads runs in that child too: BASH_ENV=rc with `[ -f skip ] && exit 0` before its switch hands nothing on either; one that changes nothing is the twin)
+  const rc = (body) => ({ rc: `${body}\n`, 'noop.sh': '#!/bin/bash\necho hi\n' });
+  for (const sep of [';', '&&']) {
+    const r = at(`BASH_ENV=./rc bash ./noop.sh ${sep} ${PB} origin HEAD`, rc('[ -f skip ] && exit 0\ngit switch agent/x'));
+    assert.equal(r.decision, 'deny', `BASH_ENV file ending early, then ${sep}: allowed`);
+    const ok = at(`BASH_ENV=./rc bash ./noop.sh ${sep} ${PB} origin HEAD`, rc('echo hi'), GIT_ROOT);
+    assert.equal(ok.decision, 'allow', `twin: a BASH_ENV file that changes nothing, then ${sep}: ${ok.reason}`);
   }
   // (a push that names its branch after the switching script does not need the state it changed)
   for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
