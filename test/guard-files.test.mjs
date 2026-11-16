@@ -1008,12 +1008,34 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `node --input-type=module <<< "import('./pipeline/hooks/lib/${lib}')"`,
       `node - <<< "await import('${inst}')"`,
       `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type=module`,
+      // (R1-B1: whether the command reads stdin is decided from its own stdin source, not from the shape of its words)
+      `node --input-type module <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node --input-type=module - x <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node - <<EOF\nawait import('${CHECKOUT}/pipeline/hooks/lib/${lib}')\nEOF`,
+      `node /dev/stdin <<'EOF'\nimport './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node /dev/fd/0 <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node /dev/stdin`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type module`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type=module - x`,
+      `printf '%s' "import('./pipeline/hooks/lib/${lib}')" | bun -`,
+      `cat <<'EOF' | node --input-type module\nimport './pipeline/hooks/lib/${lib}';\nEOF`,
+      `echo x && echo "import('./pipeline/hooks/lib/${lib}')" | cat | node --input-type module`,
+      `node --input-type module <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `bun - <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `node --input-type module < <(echo "import('./pipeline/hooks/lib/${lib}')")`,
     ]) assert.equal(bash(cmd), 'deny', cmd);
     for (const cmd of [
       `cat pipeline/hooks/lib/${lib}`,
       `git add pipeline/hooks/lib/${lib}`,
       `git diff -- pipeline/hooks/lib/${lib}`,
       `grep -n recordClick pipeline/hooks/lib/${lib}`,
+      // (a library named in one command of a line, a runtime that reads no program from stdin in another)
+      `git add pipeline/hooks/lib/${lib} && node scripts/test.mjs owner-go-click.test.mjs`,
+      `git add pipeline/hooks/lib/${lib} && node --test`,
+      `git add pipeline/hooks/lib/${lib} && node --input-type module scripts/x.mjs`,
+      `git add pipeline/hooks/lib/${lib}; echo ok | node scripts/test.mjs owner-go-click.test.mjs`,
+      `cat pipeline/hooks/lib/${lib} && node --test test/owner-go-click.test.mjs`,
+      `git diff -- pipeline/hooks/lib/${lib} | grep recordClick`,
     ]) assert.equal(bash(cmd), 'allow', cmd);
   }
   for (const cmd of [
