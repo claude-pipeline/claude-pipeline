@@ -655,7 +655,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
       .filter(([, entry]) => entry.by === 'arbiter' || isOwnerRuled({ final: entry })));
     const reused = reuseRuled(fresh.map(({ final, ...rest }) => rest), cache, { round: n });
     const findingItems = fresh.map((item, i) => (reused[i].final ? reused[i] : item));
-    // Past review.max_rounds (+ the owner-granted round) a low-severity ACCEPT becomes a FOLLOW-UP when review.post_max_suggestions says so in both configs (#374 PR B; off by default).
+    // Past review.max_rounds + 1 (the first round past the limit is exempt; later owner-granted rounds are not) a low-severity ACCEPT becomes a FOLLOW-UP when review.post_max_suggestions says 'follow-up' in all three configs (working tree, fork point, trusted default branch) and the severity test passes (#374 PR B; off by default; see applyPostMaxDefault in lib/triage.mjs).
     const items = applyPostMaxDefault([...finalizeWithoutArbiter(ruled, { lightLane: state.lightLane, force: forceArbiter(env) }), ...findingItems], postMax);
 
     const dir = ensureRoundDir(root, n);

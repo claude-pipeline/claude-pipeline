@@ -202,7 +202,7 @@ async function validateLocked(values, n, root, ctx) {
   if (!checked.ok) return invalid(checked.errors);
 
   const env = ctx.env ?? process.env;
-  // Past review.max_rounds (+ the owner-granted round) a low-severity ACCEPT becomes a FOLLOW-UP when review.post_max_suggestions says so in both configs (#374 PR B; off by default).
+  // Past review.max_rounds + 1 (the first round past the limit is exempt; later owner-granted rounds are not) a low-severity ACCEPT becomes a FOLLOW-UP when review.post_max_suggestions says 'follow-up' in all three configs (working tree, fork point, trusted default branch) and the severity test passes (#374 PR B; off by default; see applyPostMaxDefault in lib/triage.mjs).
   const items = await postMaxApply(finalizeWithoutArbiter(applyJudge(round.items, json), { lightLane: state.lightLane, force: forceArbiter(env) }), { state, round, root });
   const next = updateItems(state, n, items);
   const dir = ensureRoundDir(root, n);
