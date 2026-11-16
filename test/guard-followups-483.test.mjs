@@ -126,4 +126,33 @@ describe('#482: a failure group that ends the text is restored when the text end
     const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
     assert.equal(v.decision, 'allow', v.reason);
   });
+  // #491 R3: the inert test is an allow-list of the BARE builtin word (or a system-bin path) and of read-only git subcommands
+  const LAST = (x) => gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: `make\ncd dist || { ${x}; exit 1; }\n` });
+  for (const [why, x] of [
+    ['R3-B1: an echo run by an absolute path (any program)', '/work/repo/echo hi'],
+    ['R3-F1: a git run by a relative path (any program)', './git status'],
+    ['R3-F1: an echo a package runner resolves from node_modules/.bin', 'npx echo hi'],
+    ['R3-F1: a git a package runner resolves', 'npm exec git status'],
+    ['R3-F2: an alias on disk or on the line (`git co main`)', 'git config alias.co "checkout"; git co main'],
+    ['R3-F2: git submodule foreach runs a command', "git submodule foreach 'git -C /work/repo checkout main'"],
+    ['R3-F2: git bisect moves HEAD', 'git bisect reset'],
+    ['R3-F2: a config handed in through the prefix environment', "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.st GIT_CONFIG_VALUE_0='!git checkout main' git st"],
+    ['R3: an output redirection of an echo writes a file (.git/HEAD)', 'echo x > /work/repo/.git/HEAD'],
+    ['R3: an appended one', 'echo x >> /work/repo/.git/HEAD'],
+  ]) {
+    test(`${why} is not inert: the push is denied, as on main`, () => {
+      const v = LAST(x);
+      assert.equal(v.decision, 'deny', `${x}: ${v.reason}`);
+    });
+  }
+  test('R3-F2: an alias defined on disk (ctx.gitAliases) is not inert', () => {
+    const v = gitRun('git config alias.st "checkout main" && git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { git st; exit 1; }\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+  });
+  for (const x of ['echo no >&2', 'echo no 2>&1', '/bin/echo no', '/usr/bin/git status', 'git log -1', 'git diff', 'git rev-parse HEAD', 'git branch --show-current', 'git -C /work/repo status', 'true', 'printf x']) {
+    test(`R3: ${x} stays inert (allowed)`, () => {
+      const v = LAST(x);
+      assert.equal(v.decision, 'allow', `${x}: ${v.reason}`);
+    });
+  }
 });
