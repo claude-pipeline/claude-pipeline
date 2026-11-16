@@ -747,7 +747,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     else if (queue.state.entry) add('queueState', `PR #${pr} is already queued at position ${queue.state.entry.position}`);
     // A repo's own merge command runs the branch's code: a branch older than the queue may carry a script that does not know it (the real run refuses; so no merge is asked for).
     if (!isDefaultMergeCommand(config)) {
-      const old = queueCatchUpState({ gh, branch: config.default_branch, head });
+      const old = queueCatchUpState({ gh, branch: hashBranch(root, config), head });
       // The same split as the real run (queue-route): a read that failed is queue-unreadable (try again; the branch may be current), every other verdict is the
       // branch refusal, carrying the branchState the skill reads to choose between a catch-up (predates) and a fix of the base's marker (unknown).
       if (old.needed && old.unreadable) add('queue-unreadable', predatesQueueMessage({ pr, state: old }));

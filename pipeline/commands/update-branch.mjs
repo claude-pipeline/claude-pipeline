@@ -9,6 +9,7 @@ import { createRunRecorder, inFlightSince } from '../lib/run-progress.mjs';
 import { MAX_UPDATE_CYCLES, bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { QueueUnreadable, queueCatchUpBeforeUpdate, queueCatchUpState, queueModeFor } from '../lib/merge-queue.mjs';
 import { isDefaultMergeCommand } from '../lib/queue-route.mjs';
+import { hashBranch } from '../lib/risk.mjs';
 import { holdBeforeUpdate, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
 export const meta = {
@@ -42,10 +43,10 @@ export const run = guarded(async (argv, ctx) => {
         // Only where `P merge` would refuse: a custom merge command (the default one enqueues through gh and runs no branch code, so it never asks), and a PR with
         // no live queue entry (an update moves the head and GitHub drops the entry, so a queued PR keeps the no-op answer even when the marker cannot be read).
         const queued = q.state.inQueue === true || Boolean(q.state.entry);
-        const old = isDefaultMergeCommand(config) || queued ? null : queueCatchUpState({ gh, branch: config.default_branch, head: expectHead });
+        const old = isDefaultMergeCommand(config) || queued ? null : queueCatchUpState({ gh, branch: hashBranch(root, config), head: expectHead });
         if (old !== null && old.needed && old.kind === 'unknown' && old.unreadable) return { exitCode: EXIT.FAILED, output: { ok: false, outcome: 'queue-unreadable', updated: false, message: old.headUnknown === true ? `${old.why} (GitHub does not know the head being updated, so the PR cannot be checked yet); nothing was updated` : `the merge-queue marker could not be checked (${old.why}): try again in a minute; nothing was updated` } };
         if (old === null || old.kind !== 'predates') {
-          const fix = old !== null && old.needed ? `; but ${old.why}, so \`P merge\` will refuse this PR until the marker on ${config.default_branch} is added or fixed (updating the branch does not help)` : '';
+          const fix = old !== null && old.needed ? `; but ${old.why}, so \`P merge\` will refuse this PR until the marker on ${hashBranch(root, config)} is added or fixed (updating the branch does not help)` : '';
           return { exitCode: EXIT.OK, output: { ok: true, outcome: 'queue-mode', updated: false, head: localHead, localHead, pullNeeded: false, message: `the base branch has a merge queue: no catch-up is needed${fix}` } };
         }
         queueCatchUp = old;
@@ -63,7 +64,7 @@ export const run = guarded(async (argv, ctx) => {
     // taken before the first one, so the catch-up CI round cannot be invalidated by another session's merge (lib/merge-hold.mjs).
     // The queue catch-up has no hold; it repeats its queue and marker checks before EVERY update instead (a PR queued meanwhile is never updated, and once one update
     // has cured "predates" the catch-up is done even if the base moved again: lib/merge-queue.mjs queueCatchUpBeforeUpdate).
-    const { beforeUpdate, info } = queueCatchUp !== null ? { beforeUpdate: queueCatchUpBeforeUpdate({ gh, pr, branch: config.default_branch }), info: null } : holdBeforeUpdate({ config, pr, root, env: ctx.env });
+    const { beforeUpdate, info } = queueCatchUp !== null ? { beforeUpdate: queueCatchUpBeforeUpdate({ gh, pr, branch: hashBranch(root, config) }), info: null } : holdBeforeUpdate({ config, pr, root, env: ctx.env });
     try {
       // Every accepted update is written down at once as this worktree's own successor head, hold or no hold: a record is cheap and
       // lets a later hold config keep its turn. A write error is a warning (bringUpToDate lists it), never a failure.

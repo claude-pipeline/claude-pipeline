@@ -377,7 +377,7 @@ export function createQueueRoute({
   let branchChecked = false;
   async function branchPredatesQueue({ closeRecord: ends = true } = {}) {
     if (isDefaultMergeCommand(config)) return null;
-    const state = queueCatchUpState({ gh, branch: config.default_branch, head });
+    const state = queueCatchUpState({ gh, branch: hashBranch(root, config), head });
     if (!state.needed) return null;
     if (state.unreadable) return unreadable('the commit the base names in .claude/merge-queue-aware could not be checked (nothing was enqueued, a queue record and its hold are kept; run `P merge` again, or wait for the next `queue-sweep`)', state.why);
     const holdFields = ends && liveRecord() !== null ? await terminal('blocked') : {};
