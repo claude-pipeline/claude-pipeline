@@ -315,7 +315,7 @@ test('the human stamp is the WHOLE permissionDecision: an extra key, a missing g
   }
 });
 
-test('the model pre-filling `answers` in the tool input is refused (an input key; the 2.1.322 dialog was rejected, the 2.1.323 recording carries the human stamp) (every build)', async (t) => {
+test('the model pre-filling `answers` in the tool input is refused (an input key; the 2.1.322 dialog was rejected, the 2.1.323 recording is a cancelled dialog with no stamp) (every build)', async (t) => {
   for (const build of CLICK_BUILDS) {
     const w = world(t, { fixture: 'model-prefilled-answers', build, mutate: ({ use, result }) => { use.message.content[0].input.answers = { x: 'Merge' }; result.message.content[0].is_error = undefined; result.timestamp = new Date(Date.parse(use.timestamp) + 2500).toISOString(); } });
     assert.deepEqual(await w.click(), { refused: 'tool-use-shape' }, build);

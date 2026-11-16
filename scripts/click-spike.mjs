@@ -46,11 +46,12 @@ const PREVIEW = 'Call the AskUserQuestion tool exactly once with exactly this in
 const MULTI = 'Call the AskUserQuestion tool exactly once with exactly this input JSON: {"questions":[{"question":"Merge which PRs? ask-0123456789ab","header":"Merge all","multiSelect":true,"options":[{"label":"Merge #1","description":"head aaa"},{"label":"Merge #2","description":"head bbb"},{"label":"Merge #3","description":"head ccc"}]}]}. Then reply with only the answer you received.';
 
 // expect: what the recorder must see. human = permissionDecision exactly HUMAN_DECISION and annotations exactly {}; hook = source hook and no annotations;
-// annotated = a human answer whose annotations are NOT empty; prefilled = the tool_use input carries an `answers` key (the recorder refuses that input);
-// waits = a dialog that came with prefilled answers (from a hook) is NOT submitted by Claude Code: it waits for a person. Passes when the dialog stayed open at least WAITS_MIN_MS after the tool_use
-// and was then cancelled by the script's own exit key (an error result, no answer; no case or dismiss key went in), or when it was answered with a stamp that is not exactly HUMAN_DECISION.
-// It fails when it was answered with the exact human stamp or when any non-exit key went into the dialog; a dialog cancelled sooner than WAITS_MIN_MS, or answered after an exit key, is
-// inconclusive (judge returns inconclusive: true, ok false), so a cancel never counts as a hook answer.
+// annotated = a human answer whose annotations are NOT empty; prefilled = the tool_use input carries an `answers` key (the recorder refuses that input) AND the dialog waits (the same rule as 'waits');
+// waits = a dialog that came with prefilled answers (from a hook, or from the model's own input) is NOT submitted by Claude Code: it waits for a person. Passes when the dialog stayed open at least WAITS_MIN_MS
+// after the tool_use and was then cancelled by the script's own exit key: an error result with no answer that carries the user-rejection marker the recordings carry (toolUseResult 'User rejected tool use' and
+// toolDenialKind 'user-rejected'), and, in a live run (a key log), the script's exit key sent at or before the result; no case or dismiss key went in. It also passes when it was answered with a stamp that is not exactly HUMAN_DECISION.
+// It fails when it was answered with the exact human stamp or when any non-exit key went into the dialog; a dialog cancelled sooner than WAITS_MIN_MS, an error without the rejection marker, a cancel
+// with no exit key of the script's before it, or an answer given after an exit key, is inconclusive (judge returns inconclusive: true, ok false), so a cancel never counts as a hook answer.
 // since: the first build the case applies to (the committed fixtures of an older build lack it).
 export const CASES = [
   { name: 'genuine-click', mode: 'none', prompt: SIMPLE, keys: [DOWN, ENTER], expect: 'human', answer: 'Merge' },
@@ -179,14 +180,22 @@ export function judge(c, [, use, result], { sent } = {}) {
   };
   const clean = canonicalInput(input) && keyProblem === null;
   // A "waits" verdict (a dialog that came with prefilled answers): either it was ANSWERED with a stamp that is not the human one (a result with an answer, not an error, not ended by the script's own
-  // exit key), or it stayed open at least WAITS_MIN_MS after the tool_use and was then cancelled (an error result, no answer). A cancel never counts as a hook answer: a dialog cancelled sooner
-  // than that, or an error that carries an answer, or an answer recorded after the script's exit key, says nothing about who answered and is inconclusive (it fails a run).
+  // exit key), or it stayed open at least WAITS_MIN_MS after the tool_use and was then cancelled (an error result with the user-rejection marker, no answer, and in a live run the script's exit key at or before it).
+  // A cancel never counts as a hook answer: a dialog cancelled sooner than that, an error without the marker or without the script's exit key before it, an error that carries an answer, or an answer
+  // recorded after the script's exit key, says nothing about who answered and is inconclusive (it fails a run). The model-prefilled-answers case ('prefilled') is judged by the same rule plus its `answers` input key.
   const errored = blocks(result).some((b) => b?.type === 'tool_result' && b.tool_use_id === use.message.content.find((x) => x?.type === 'tool_use')?.id && b.is_error === true);
   const cancelled = errored && answer === undefined;
+  // What the committed cancelled-dialog recordings carry: a cancel by the user's (here: the script's) rejection, not just any failed tool call.
+  const rejected = res === 'User rejected tool use' && result.toolDenialKind === 'user-rejected';
+  const exitKeyAt = Array.isArray(sent) ? sent.find((k) => k.phase === 'exit' && k.at <= resultAt) : undefined;
   const heldMs = resultAt - useAt;
   let inconclusive = null;
-  if (c.expect === 'waits') {
-    if (cancelled) { if (!(heldMs >= WAITS_MIN_MS)) inconclusive = `the dialog was cancelled ${heldMs} ms after the tool_use, sooner than the ${WAITS_MIN_MS} ms a waiting dialog must stay open`; }
+  if (c.expect === 'waits' || c.expect === 'prefilled') {
+    if (cancelled) {
+      if (!rejected) inconclusive = 'the result is an error without the user-rejection marker (toolUseResult "User rejected tool use", toolDenialKind "user-rejected"): not shown to be a cancel';
+      else if (Array.isArray(sent) && !exitKeyAt) inconclusive = "the key log holds no exit key of the script's at or before the result: the script did not cancel the dialog";
+      else if (!(heldMs >= WAITS_MIN_MS)) inconclusive = `the dialog was cancelled ${heldMs} ms after the tool_use, sooner than the ${WAITS_MIN_MS} ms a waiting dialog must stay open`;
+    }
     else if (errored) inconclusive = 'the result is an error that carries an answer';
     else if (answer === undefined) inconclusive = 'the result carries no answer';
     else if (seen.endedByScriptKey === true) inconclusive = 'the script sent an exit key before the result was recorded';
@@ -196,7 +205,7 @@ export function judge(c, [, use, result], { sent } = {}) {
     human: clean && human && emptyNotes && wanted(answer),
     hook: clean && !human && isObj(pd) && pd.source === 'hook' && !(isObj(res) && Object.hasOwn(res, 'annotations')) && wanted(answer),
     annotated: clean && human && isObj(res?.annotations) && Object.keys(res.annotations).length > 0 && wanted(answer),
-    prefilled: Object.hasOwn(input ?? {}, 'answers'),
+    prefilled: keyProblem === null && !human && !inconclusive && Object.hasOwn(input ?? {}, 'answers'),
     waits: clean && !human && !inconclusive,
   }[c.expect];
   return { ok, seen, ...(inconclusive ? { inconclusive: true } : {}) };
@@ -290,7 +299,7 @@ async function runCase(c, { claude, scratch }) {
     else if (!asked && /Teachautomode/.test(t)) await keys([DOWN, ENTER], 'dismiss');
     else await sleep(500);
   }
-  const waitUntil = Date.now() + (c.keys.length > 0 || c.mode !== 'none' ? HOLD_MS : 4_000);
+  const waitUntil = Date.now() + (c.keys.length > 0 || c.mode !== 'none' || c.expect === 'prefilled' ? HOLD_MS : 4_000);
   while (Date.now() < waitUntil && !answered()) await sleep(500);
   phase = 'exit';
   if (!answered()) { send(ESC); await sleep(3000); } // the declined case (and any dialog the keys missed)
