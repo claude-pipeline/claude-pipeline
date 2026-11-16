@@ -59,30 +59,33 @@ export function fixRoundCandidate(state, round, { scope }) {
 }
 
 // Whether the next review round leaves what the default branch brought in out of its range (review-round.mjs: only when the PR targets the TRUSTED default branch AND that anchor is trusted: a stacked PR, or an
-// anchor the PR could have chosen, reviews the plain previous-head range). -> undefined when it does, else a sentence saying why not. The PR's base branch is read from GitHub (`gh`: the client of the caller),
+// anchor the PR could have chosen, reviews the plain previous-head range). -> undefined when it does, else { reason, exact }: a sentence saying why not, and whether the round-head measure is then exactly what the review round does (a stack, an untrusted anchor) or only a guess that may over-count (GitHub could not be read). The PR's base branch is read from GitHub (`gh`: the client of the caller),
 // as the review round reads it; a base that cannot be read is no reason to leave anything out (the measure then over-counts, never under-counts).
 export function mergeInIneligible({ pr, gh, root, config }) {
   let view;
   try {
     view = gh.prView(pr, ['baseRefName']);
   } catch (err) {
-    return `the PR's base branch could not be read from GitHub (${String(err?.message ?? err).split('\n')[0].slice(0, 160)})`;
+    return { reason: `the PR's base branch could not be read from GitHub (${String(err?.message ?? err).split('\n')[0].slice(0, 160)})`, exact: false };
   }
   const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
   const { branch: defaultBranch, untrusted } = trustedDefaultBranch(root, config);
-  if (prBaseUntrusted !== null || untrusted !== null) return `the default branch could not be anchored on the remote (${prBaseUntrusted ?? untrusted})`;
-  if (prBase !== defaultBranch) return `the PR targets ${prBase}, not the default branch ${defaultBranch}`;
+  if (prBaseUntrusted !== null || untrusted !== null) return { reason: prBaseUntrusted ?? untrusted, exact: true };
+  if (prBase !== defaultBranch) return { reason: `the PR targets ${prBase}, not the default branch ${defaultBranch}`, exact: true };
   return undefined;
 }
 
 // The files the fix commits since round R's reviewed head (`from`) changed, measured against the base the NEXT review round would diff from (git.mjs#effectiveReviewBase): what the
 // default branch brought in with a clean merge since `from` is left out (#490), as the review packet leaves it out. `baseRef`: the default branch's ref (review-context.mjs#reviewBaseRef).
-// `ineligible` (mergeInIneligible's sentence): the review round would leave nothing out for this PR (a stack, an untrusted anchor), so the plain from..head measure is the exact one and is kept, with that sentence as baseNote.
+// `ineligible` (mergeInIneligible's { reason, exact }): the plain from..head measure is kept, with the reason as baseNote; exact (a stack, an untrusted anchor: the review round leaves nothing out either) says so, else (GitHub unreadable) it may over-count.
 // A merge that conflicted, or a base that cannot be worked out, keeps the plain from..head measure and says so in baseNote. A synthetic base is a tree id, which only this caller diffs against (diffFiles' treeBase opt-in).
 // -> { files, baseKind: 'previous' | 'synthetic' | 'round-head', baseNote? }
 export function fixRoundFiles({ from, head, baseRef, ineligible }, o) {
   if (ineligible !== undefined) {
-    return { files: diffFiles(from, head, o), baseKind: 'round-head', baseNote: `${ineligible}: measured from the round's reviewed head, which is what its next review round does too (nothing the default branch brought in is left out)` };
+    const tail = ineligible.exact
+      ? 'which is what its next review round does too (nothing the default branch brought in is left out)'
+      : 'it may over-count (once GitHub answers, the next review round leaves out what the default branch brought in); retry when GitHub answers';
+    return { files: diffFiles(from, head, o), baseKind: 'round-head', baseNote: `${ineligible.reason}: measured from the round's reviewed head, ${tail}` };
   }
   let note;
   try {

@@ -220,6 +220,8 @@ test('state fix-scope R1-B1: a PR whose base branch GitHub cannot name keeps the
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.baseKind, 'round-head');
   assert.match(r.json.baseNote, /base branch could not be read from GitHub/);
+  assert.match(r.json.baseNote, /it may over-count.*retry when GitHub answers/);
+  assert.doesNotMatch(r.json.baseNote, /which is what its next review round does too/);
   assert.equal(r.json.flagged, true);
 });
 
