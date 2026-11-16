@@ -334,7 +334,7 @@ test('round-request nextRound: a main merge with a provable conflict resolution 
   const free = ask(w);
   assertExit(free, 0, free.stderr + free.stdout);
   assert.deepEqual([free.json.nextRound.kind, free.json.nextRound.sinceReviewed, free.json.nextRound.resolutionIneligible], ['resolution', { merges: 1, ownCommits: 0 }, undefined]);
-  assert.match(free.json.summary, /^Prediction: the next round would be resolution-only: a real review of the conflict resolution, not counted, no owner grant\.$/m);
+  assert.match(free.json.summary, /^Prediction: the next round would be resolution-only: a real review of the conflict resolution, not counted, no owner grant \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted whole-PR round\)\.$/m);
 
   w.repo.write('src/c.js', 'export const c = 1;\n');
   w.repo.commit('own commit after the merge');
@@ -345,7 +345,8 @@ test('round-request nextRound: a main merge with a provable conflict resolution 
   assert.match(counted.json.summary, /^Prediction: the next round would be a counted whole-PR round; the conflict resolution could not be reviewed alone \(history-nonmerge/m);
 });
 
-test('round-request nextRound: with a merge in the range the alternative says a base-only recording still follows', (t) => {
+// Failure caught: the alternative promised a free recording after a CONFLICTING merge; the conflict keeps the PR whole-PR and the reverted commits stay in the history, so the round is counted.
+test('round-request nextRound: after a conflicting merge the alternative does not promise a free recording', (t) => {
   const w = roundWorld(t);
   const { h2 } = w.atCap();
   w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
@@ -354,8 +355,26 @@ test('round-request nextRound: with a merge in the range the alternative says a 
   mergeConflictingMain(w);
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.deepEqual([r.json.nextRound.previousClean, r.json.nextRound.sinceReviewed], [true, { merges: 1, ownCommits: 1 }]);
-  assert.match(r.json.nextRound.alternative, /a free base-only recording still follows/);
+  assert.deepEqual([r.json.nextRound.previousClean, r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [true, { merges: 1, ownCommits: 1 }, 'whole-pr']);
+  assert.match(r.json.nextRound.alternative, /that does not make the next round free here: .* a counted round would still follow$/);
+  assert.doesNotMatch(r.json.nextRound.alternative, /free base-only recording/);
+});
+
+test('round-request nextRound: after a clean merge of the default branch the alternative says a free base-only recording would follow', (t) => {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  w.repo.commit('own commit');
+  w.repo.checkout('main');
+  w.repo.write('src/m.js', 'export const m = 1;\n');
+  w.repo.commit('main adds a file');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 1, ownCommits: 1 }, 'synthetic']);
+  assert.match(r.json.nextRound.alternative, /the default branch merges cleanly, so a free base-only recording would then follow$/);
 });
 
 // Failure caught: a prediction that throws must never cost the owner the closing line.
@@ -438,6 +457,9 @@ test('round-request longReview: absent below counted round 6; at round 6 it list
   assert.match(l.json.summary, /^Blocking loop: yes, each of the last two counted rounds accepted a new BLOCKING item \(round 4: R4-B1; round 5: R5-B1\)\.$/m);
   assert.match(l.json.summary, /^Recommended: stop and park or split \(a dependency-aware split plan, never a carve-out of files\)/m);
   assert.ok(['follow-up', 'extra-round'].includes(l.json.recommend), 'the machine value is unchanged');
+  assert.match(l.json.why, /unlikely to settle it: stop and park, or split/, 'the why says what the Recommended line says');
+  assert.doesNotMatch(l.json.why, /Another round is the safe path/);
+  assert.equal(l.json.longReview.recommended, 'stop and park or split');
   assert.match(l.json.line, /^🔁 Extra review round needed #7: round 6 /);
 });
 
@@ -451,4 +473,5 @@ test('round-request longReview: the trip-wire\'s process review shows the same l
   assert.match(r.json.processReview.summary, /^Blocking loop: yes/m);
   assert.match(r.json.processReview.summary, /^Recommended: stop and park or split\. Options: /m);
   assert.equal(r.json.longReview.blockingLoop, true);
+  assert.equal(r.json.longReview.recommended, 'stop and park or split', 'the trip-wire refusal carries the word the normal answer carries');
 });
