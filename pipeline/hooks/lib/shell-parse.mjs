@@ -2149,10 +2149,10 @@ function zshAlternationAt(s, i) {
 }
 
 // Why: the stream rebuild (producePieces) takes echo / printf / cat for the shell's own; a line that can make a name run something else -- an alias, a builtin turned
-// off (enable -n, zsh disable), `hash -p` / `hash name=path` (rebinds a command name), zsh's functions / aliases / builtins tables (`functions[echo]=:`, `read -A aliases`), autoload, a sourced or eval'd text, a trap --
+// off (enable -n, zsh disable), `hash -p` / `hash name=path` (rebinds a command name), zsh's functions / aliases / builtins / commands tables (`functions[echo]=:`, `read -A aliases`, `commands[echo]=path`), autoload, a sourced or eval'd text, a trap --
 // switches the rebuild off for the whole line (as does any function it defines: ctx.fns). Codex review 4 of #50; the owner chose this over chasing each name.
 export const REDEF_CMDS = new Set(['alias', 'unalias', 'enable', 'disable', 'functions', 'unfunction', 'unhash', 'hash', 'autoload', 'source', '.', 'eval', 'emulate', 'zmodload', 'trap']);
-const REDEF_TABLE = /^(?:dis_)?(?:functions|functions_source|aliases|galiases|saliases|builtins|reswords)(?:\[|\+?=|$)/;
+const REDEF_TABLE = /^(?:dis_)?(?:functions|functions_source|aliases|galiases|saliases|builtins|reswords|commands)(?:\[|\+?=|$)/;
 function noteRedef(ctx, argv, env) {
   if (!ctx.defs || ctx.defs.redef) return;
   if (argv.length && REDEF_CMDS.has(base(argv[0]))) ctx.defs.redef = true;
@@ -3734,6 +3734,8 @@ export function simpleCommands(str, opts) {
   // flatSeq: plainSeq widened to the pipe and `||`: the whole text is simple commands joined by && || ; | |& or a newline, and nothing else (the same exclusions: no group, subshell, function, compound command, `!`, `time`, `&`, command-less segment, cut-short parse, doubtful heredoc).
   // A caller that reads what a command's own stdin holds (the owner-go stdin-program guard) trusts its reading of the pipe stages only for such a text; every other shape it reads as a whole.
   Object.defineProperty(ctx.out, 'flatSeq', { value: !ctx.notFlat && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign, enumerable: false });
+  // redef: the text can make a name run something else (noteRedef: REDEF_CMDS, the zsh tables in REDEF_TABLE). The owner-go stdin-program guard reads such a text as a whole (#472).
+  Object.defineProperty(ctx.out, 'redef', { value: ctx.defs.redef === true, enumerable: false });
   // shape: null unless the text is a WIDER whitelist than plainSeq: simple commands joined by && ; a newline || | |& or &, and at the top level only (not inside one another) a subshell `( … )`, a brace group
   // `{ …; }` or `if CMD; then … [else …] fi`, each holding such a sequence; nothing else (no `!`, coproc, always, function, loop, case, `elif`, `[[`, `time`, command-less segment, cut-short parse, heredoc the parser and
   // the shell may read differently). Then an array of the constructs' events, see shapeEvent. The cd narrowing of the files policy reads it: from the commands in order, each one's own join (`sep`) and these events it

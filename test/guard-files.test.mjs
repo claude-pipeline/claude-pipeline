@@ -1067,6 +1067,9 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `command alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
       `hash -p pipeline/hooks/lib/${lib} echo\necho | node --input-type=module`,
       `builtin hash echo=pipeline/hooks/lib/${lib}\necho | node --input-type=module`,
+      // (zsh's command hash table rebinds a name too: `commands[echo]=path`, `read -A commands`)
+      `commands[echo]=pipeline/hooks/lib/${lib}\necho | node --input-type=module`,
+      `read -A commands <<< "echo pipeline/hooks/lib/${lib}"\necho | node --input-type=module`,
       // (R4-F1: a name the line gave a value and then rebinds at run time still reads as its stale value after expansion: the text AS WRITTEN decides)
       `P=x true; read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
       `export P=x; printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,

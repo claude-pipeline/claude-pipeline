@@ -4260,7 +4260,7 @@ const RUNTIMES = new Set(['node', 'nodejs', 'bun', 'deno', 'npx', 'tsx']);
 // process substitution or other nested text), none command-less (a redirect on a group or subshell stands alone), no `exec` carrying a redirect (it rebinds the stdin of every command after it), no group, subshell, compound
 // command or function, and no command that redefines a name (an alias, `eval`, `source`…: the parser's REDEF_CMDS; R5-F1) (the parser's flatSeq, which also fails on a cut-short parse or a heredoc it cannot place). Each of those hands a runtime stdin that the walk below does not follow, so such a line is read as a whole.
 function isFlatLine(cmds) {
-  return cmds.flatSeq === true && !cmds.dynamic && !(cmds.fns?.size > 0)
+  return cmds.flatSeq === true && !cmds.dynamic && !(cmds.fns?.size > 0) && cmds.redef !== true
     && cmds.every((c) => (c.depth ?? 0) === 0 && c.argv.length > 0 && !REDEF_CMDS.has(baseOf(c.argv[0])) && !((c.redirects ?? []).length && c.argv.slice(0, 3).some((w) => baseOf(w) === 'exec')));
 }
 // #472 (R3-F1) A stdin source whose text is not on the line: a file (`< F`, `0< F`, `<> F`) or a descriptor (`<&N`, `<&$fd`). A `{name}` word in front of a redirect (`: {fd}<<< …`) opens a descriptor that stays open after its command.
