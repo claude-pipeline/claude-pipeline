@@ -3125,7 +3125,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     }
   }
   // #482: a group whose exit ends the text is restored here too (ctx.branches is shared with the caller of a nested text: it must not keep every branch name forgotten)
-  // (#491 R2-F1: an allow-list: only a group opened by a directory change in which every command is inert, a plain data command or a git command with no state word, so no script, feed, source, eval, shell, gh or package runner
+  // (#491 R2-F1: an allow-list: only a group opened by a directory change in which every command is inert (a bare data command word: echo / printf / : / true / false / exit; NEVER a git command, whatever its subcommand), so no script, feed, source, eval, shell, gh or package runner
   // that could switch the caller's branch where the walk cannot see it; R2-B1: otherwise every branch name is forgotten, including one the group itself recorded through an absolute -C directory)
   if (failGroup?.snap) {
     if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();

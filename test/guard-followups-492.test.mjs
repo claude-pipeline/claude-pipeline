@@ -136,6 +136,20 @@ describe('#506: a write that may land under a repository\'s .git makes its branc
   ]) test(`not under .git: ${why} stays allowed`, () => expect('allow', line));
 });
 
+// ---- #508 ----
+describe('#508: a PATH set before the failure group makes even an echo not inert', () => {
+  // (the clause `assignedNames(ctx)` of inertInFailGroup: the PATH is set BEFORE the group, so the group's own words (`echo`, `exit`) are all plain data commands)
+  test('the script sets PATH on an earlier line, then a group that only echoes and exits', () => {
+    expect('deny', 'git checkout agent/y && bash build.sh; git push', { [BUILD]: 'export PATH=/work/repo/bin:$PATH\ncd dist || { echo no; exit 1; }\n' });
+  });
+  test('the caller sets PATH on its own line', () => {
+    expect('deny', 'export PATH=/work/repo/bin:$PATH; git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
+  });
+  test('control: no PATH set anywhere, the same group is inert (allowed)', () => {
+    expect('allow', 'git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
+  });
+});
+
 // Over-denial guard: ordinary work stays allowed after every change above.
 describe('ordinary work stays allowed', () => {
   const OK = (name, line, files) => test(`allowed: ${name}`, () => expect('allow', line, files));

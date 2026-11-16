@@ -131,7 +131,7 @@ describe('#482: a failure group that ends the text is restored when the text end
     const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
-  // #491 R3: the inert test is an allow-list of the BARE builtin word (or a system-bin path) and of read-only git subcommands
+  // #491 R3: the inert test is an allow-list of the BARE builtin word (or a system-bin path) only: no git command is inert (see the R4 rows)
   const LAST = (x) => gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: `make\ncd dist || { ${x}; exit 1; }\n` });
   for (const [why, x] of [
     ['R3-B1: an echo run by an absolute path (any program)', '/work/repo/echo hi'],
