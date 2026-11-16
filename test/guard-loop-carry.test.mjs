@@ -339,6 +339,10 @@ test('#352 R38: a script / package script ending in a level that may not have ru
     'for b in agent/x; do break; git switch $b; done', 'for b in agent/x; do continue; git switch $b; done', 'for b in agent/x; do false && git switch $b; done',
     'for b in agent/x; do { git switch $b; } < /missing; done', 'for b in agent/x; do git switch $b 2>/dev/null; done', '! for b in agent/x; do git switch $b; done',
     'for b in agent/x; do git switch $b; done < /missing', 'false && for b in agent/x; do git switch $b; done', 'for b in agent/x; do if false; then git switch $b; fi; done',
+    // (#352 R38-F1: a text with a function / trap hazard hands nothing on: its last command's change is not forgotten by a command after it; the absolute -C form records a branch even under a hazard)
+    `trap 'git -C /work/other switch main' EXIT\ngit -C /work/other switch agent/x`,
+    `cleanup() { git -C /work/other switch main; }; trap cleanup EXIT\ngit -C /work/other switch agent/x`,
+    `git() { :; }\ngit -C /work/other switch agent/x`,
   ];
   for (const body of bodies) {
     for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {

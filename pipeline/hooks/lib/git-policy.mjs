@@ -3482,7 +3482,10 @@ function evalString(str, startDir, ctx, level, child = false) {
   // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). The one kept: a body of loops over literal non-empty word lists only (`ran`), which surely ran)
   // (#352 R38: nor does a level still open at the end hand its changes on: nothing after it gives it back (a closer with no redirection emits no command; `{ git switch b; } < /missing` as the last command), so the
   // levels are closed here as the next command would, and only a change at the text's own top level, or directly in the body of one literal loop (`ran`, one level), is kept)
+  // (#352 R38-F1: a text with a function / trap / state hazard forgets the state before each command (above), so after its last one too: it hands nothing on (an EXIT trap or a function named git
+  // decides what the last `git -C /abs switch b` left))
   if (levels) closeLevels(0, true);
+  if (hazard) forgetState();
   for (const x of trackers) if (x.and || (x.scoped && !x.ran)) forget(x);
   return allowed();
   } finally {
