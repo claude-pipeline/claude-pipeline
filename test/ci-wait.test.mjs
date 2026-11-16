@@ -1425,6 +1425,16 @@ test('merge_checks (R1-F3): a merge check with no producer does not end the wait
   assert.equal((await running.run()).output.verdict, 'timeout', 'a run still going on the head holds the wait to --timeout');
 });
 
+test('merge_checks (R2-B1): --wait-all with a failed required check and a merge check with no producer ends `failed` once the merge check is notOwed, never `passed`', async () => {
+  const s = sim({ classic: present('A'), checkRuns: [cr('A', 'failure', { id: 1 })] }, { mergeChecks: ['Replay from zero'], waitAll: true });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(r.output.ok, false);
+  assert.match(r.output.message, /A=fail/);
+  assert.deepEqual(r.output.failures.map((f) => f.name), ['A']);
+});
+
 test('merge_checks (R1-F3): no notOwed field when every merge check reported', async () => {
   const r = await sim({ classic: present('A'), checkRuns: [cr('A', 'success'), cr('Replay from zero', 'success')] }, { mergeChecks: ['Replay from zero'] }).run();
   assert.equal('notOwed' in r.output, false);

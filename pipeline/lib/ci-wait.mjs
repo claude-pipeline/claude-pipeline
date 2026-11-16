@@ -38,13 +38,15 @@
 // UNKNOWN (GitHub still computing it) is re-read once after one interval inside the wait loop, then the old verdict stands; an
 // absent or throwing reader leaves the old verdict as well (never a guess, never a pass).
 // `options.mergeChecks` (config ci.merge_checks): names the repo's own merge command requires although branch protection does not
-// (EagleWatch "Replay from zero"). Each is one more unpinned identity (listed in `checks` with source: 'merge_checks') waited on and
-// judged exactly like a required one; a name that is already required is not doubled. They never decide `unverified` /
-// `no-required-checks`: those speak about the policy sources alone.
+// (EagleWatch "Replay from zero"). Each is one more unpinned identity (listed in `checks` with source: 'merge_checks'); a name that is
+// already required is not doubled. One that reports is judged like a required one (pending waits, a failure fails). One with no
+// producer at all (a path-filtered workflow that did not run) is notOwed: once the appear window is over and nothing on the head could
+// still produce it, it is listed in `notOwed` instead of ending the wait `missing`, and a failed required check still ends `failed`.
+// They never decide `unverified` / `no-required-checks`: those speak about the policy sources alone.
 // `options.e2eLabel` (config ci.e2e_label): on a PR carrying that label (`readers.labels()`, read once at the end) a `passed` result
 // also reports `others: [{name, status, url}]`, the head's NON-required check runs / statuses that are still running or red, so a
-// green required set never hides a pending or failed e2e suite. Report only: the verdict is not changed. An unreadable label read
-// leaves the plain result.
+// green required set never hides a pending or failed e2e suite. Report only: the verdict is not changed. A failed label read is
+// retried like every other read and ends `github` after repeated failures; it never leaves the plain result.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -584,6 +586,13 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       if (notOwed.length === 0) {
         if (elapsed() >= timeoutMs) return result(EXIT.FAILED, 'timeout', { message: `still waiting after ${Math.round(elapsed() / 1000)}s: ${describe(waiting)}` });
         return null;
+      }
+      if (bad.length > 0) {
+        // --wait-all skipped the failure branch above while a merge check was still waiting: now that it is notOwed, a failed required
+        // check must still end the wait `failed`, never `passed`.
+        const rechecked = await confirmStatusFailures(bad);
+        if (rechecked !== undefined) return rechecked;
+        return failedResult(`failed: ${bad.map((s) => `${s.name}=${s.state}${s.url ? ` (${s.url})` : ''}`).join('; ')}`, bad);
       }
       last = { ...last, states: states.filter((s) => !notOwedState(s)) }; // reported in `notOwed`, not as a check that is missing
     }

@@ -39,8 +39,8 @@ export const run = guarded(async (argv, ctx) => {
   const loaded = await loadConfig(root);
   if (!loaded.ok && existsSync(loaded.path)) throw new Fail(EXIT.USAGE, { ok: false, error: 'config', errors: loaded.errors, path: loaded.path });
   const configChecks = loaded.ok ? [...new Set([...requiredChecks(loaded.config.ci), ...loaded.config.ci.merge_checks])] : [];
-  // ci.merge_checks: waited on like required checks (not part of branch protection). ci.e2e_label: on a PR carrying it, non-required
-  // checks that are still running or red are reported as `others`.
+  // ci.merge_checks: judged like required checks once they report; one with no producer is notOwed (not part of
+  // branch protection). ci.e2e_label: on a PR carrying it, non-required checks that are still running or red are reported as `others`.
   const mergeChecks = loaded.ok ? loaded.config.ci.merge_checks : [];
   const e2eLabel = loaded.ok ? loaded.config.ci.e2e_label : null;
 
