@@ -3221,6 +3221,15 @@ function evalString(str, startDir, ctx, level, child = false) {
   // #352 R6: the loops being walked, outermost first, each a frame: its range, the state at its entry, its carry (what its body may leave for the next iteration), the places its body can start in and
   // the carry each was judged with, and the walk state to start a pass from. A frame is finished when no start is left that was not judged with the carry as it is now.
   const loopsAt = loopRangesOf(cmds);
+  // (#352 R37-F1: the command is in loop bodies only (no branch, function or trap), every loop a `for` over literal words, at least one: the body surely ran)
+  const literalFor = (id) => {
+    for (const rs of loopsAt.values()) {
+      const r = rs.find((x) => x.id === id);
+      if (r) { const h = cmds[r.start]; return h.argv[0] === 'for' && h.argv[2] === 'in' && h.argv.length > 3 && h.argv.slice(3).every((w) => !/[$`*?[{~\\'"()]/.test(w)); }
+    }
+    return false;
+  };
+  const surelyRan = (c) => c.ctl?.loop === true && !c.ctl.cond && !c.ctl.fn && !c.ctl.trap && (c.loops?.length ?? 0) > 0 && c.loops.every(literalFor);
   const frames = [];
   const memo = ctx.readingMemo && ctx.readingMemo.str === str && ctx.readingMemo.level === level ? ctx.readingMemo : null; // (the readings of a loop word share the carry of each loop: judgeReadings)
   try {
@@ -3445,7 +3454,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const changedState = argv.length > 0 && stateChanged(ctx, before);
     if (argv.length > 0 && (changesStateWords || changedState)) {
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', lost: changesStateWords, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', ran: how === 'chain' && surelyRan(c), lost: changesStateWords, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       if (changesStateWords && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond };
       if (how) {
@@ -3464,9 +3473,10 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (unsure !== null) return deny(`$${unsure} may be reassigned by the file ${name === '.' ? '.' : 'source'} runs, so its value at run time cannot be verified. Use it before sourcing, or write the value out.`);
     }
   }
-  // (#352 R37-F1: a change that follows && may not have run, and when the text ends nothing after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text
-  // ends in: as if a command after `;` followed, it is forgotten (`false && git switch b` as the last command of a script). A branch / loop body's change keeps the rule of its level, as for a command that follows)
-  for (const x of trackers) if (x.and) forget(x);
+  // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop whose words are not literal made may not either; when the text ends nothing
+  // after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text ends in: as if a command after `;` followed, it is forgotten
+  // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). The one kept: a body of loops over literal non-empty word lists only (`ran`), which surely ran)
+  for (const x of trackers) if (x.and || (x.scoped && !x.ran)) forget(x);
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it

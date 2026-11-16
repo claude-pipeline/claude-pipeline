@@ -310,8 +310,8 @@ test('#352 R37-F1: a script / package script that ends in a redirected or condit
       }
     }
   }
-  // (twins: the same script with a plain switch hands it over, and so does a loop over a literal non-empty list of words (its body surely ran))
-  for (const body of ['git switch agent/x', 'for b in agent/x agent/x; do git switch $b; done']) {
+  // (twin: the same script with a plain switch hands it over. The loop over literal words that a script may end in is pinned by the t4 control in guard-script-readings.test.mjs)
+  for (const body of ['git switch agent/x']) {
     for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
       for (const sep of [';', '&&']) {
         const r = at(`${caller} ${sep} ${PB} origin HEAD`, files(body));
