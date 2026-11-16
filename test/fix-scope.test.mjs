@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
 import { countedOrdinal, fixRoundScope } from '../pipeline/lib/fix-verify.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { findingsOf, low, roundWorld } from './helpers/round-world.mjs';
+import { aFile, findingsOf, low, roundWorld } from './helpers/round-world.mjs';
 
 const cfg = (over = {}) => {
   const c = structuredClone(DEFAULTS);
@@ -167,4 +167,52 @@ test('state fix-scope: --head limits the range; an unknown round, a head that is
   assert.equal(sideways.json.error, 'not-descendant');
   const missing = w.cli(['state', 'fix-scope']);
   assertExit(missing, 2, missing.stderr + missing.stdout);
+});
+
+// #490: the fix is measured against the base the NEXT review round would use, so what main brought in since round R is not counted as fix lines.
+const mainGains = (w) => {
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/from-main.js', body(300, 'export const m'));
+  w.repo.commit('main gains a big new file');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+};
+
+test('state fix-scope #490: main merged in after round R, then a 5-line fix: only the fix is counted, not flagged', (t) => {
+  const w = reviewed(t);
+  mainGains(w);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  w.repo.write('src/b.js', body(5, 'export const s'));
+  w.repo.commit('small fix');
+  const r = scopeOf(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.flagged, r.json.fixScope.newFiles, r.json.fixScope.nonTestLines], [false, [], 5]);
+  assert.equal(r.json.baseKind, 'synthetic');
+  assert.equal(r.json.baseNote, undefined);
+});
+
+test('state fix-scope #490: no merge since round R keeps the plain round-head measure (base kind previous)', (t) => {
+  const w = reviewed(t);
+  w.repo.write('src/b.js', body(5, 'export const s'));
+  w.repo.commit('small fix');
+  const r = scopeOf(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.flagged, r.json.fixScope.nonTestLines, r.json.baseKind], [false, 5, 'previous']);
+});
+
+test('state fix-scope #490: a merge of main that conflicted cannot give an exact base: today\'s measure is kept and the output says so', (t) => {
+  const w = reviewed(t);
+  // main rewrites src/a.js line 12, which the reviewed head changed too: merging main into that head conflicts, so there is no exact base
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/a.js', aFile(false).replace('export const v12 = 12;', 'export const v12 = 1200;'));
+  w.repo.commit('main edits a');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  assert.throws(() => w.repo.git(['merge', '--no-edit', 'main']));
+  w.repo.write('src/a.js', aFile(true));
+  w.repo.write('src/b.js', body(5, 'export const s'));
+  w.repo.commit('merge main, resolved, plus a small fix');
+  const r = scopeOf(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseKind, 'round-head');
+  assert.match(r.json.baseNote, /conflict.*round's reviewed head/);
+  assert.equal(r.json.warnings.includes(r.json.baseNote), true);
 });

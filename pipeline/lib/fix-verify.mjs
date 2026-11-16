@@ -7,7 +7,7 @@
 // exploration it is asked for. Anything that is not clearly a fix round is `full`.
 import { applyPostMaxDefault, countsTowardCap, postMaxPolicy } from './triage.mjs';
 import { DEFAULTS, baseConfigAt, loadConfig } from './config.mjs';
-import { diffFiles } from './git.mjs';
+import { GitError, diffFiles, effectiveReviewBase, mergeBase } from './git.mjs';
 import { matchAny } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 
@@ -55,6 +55,22 @@ export function fixRoundCandidate(state, round, { scope }) {
   const previous = previousAccepts(state, round.n);
   if (previous === null || previous.accepted.length === 0) return { ok: false, reason: 'no accepted item in the previous counted round' };
   return { ok: true, previous };
+}
+
+// The files the fix commits since round R's reviewed head (`from`) changed, measured against the base the NEXT review round would diff from (git.mjs#effectiveReviewBase): what the
+// default branch brought in with a clean merge since `from` is left out (#490), as the review packet leaves it out. `baseRef`: the default branch's ref (review-context.mjs#reviewBaseRef).
+// A merge that conflicted, or a base that cannot be worked out, keeps the plain from..head measure and says so in baseNote. -> { files, baseKind: 'previous' | 'synthetic' | 'round-head', baseNote? }
+export function fixRoundFiles({ from, head, baseRef }, o) {
+  let note;
+  try {
+    const since = effectiveReviewBase({ from, forkPoint: mergeBase(baseRef, head, o) }, o);
+    if (since.kind === 'previous' || since.kind === 'synthetic') return { files: diffFiles(since.base, head, o), baseKind: since.kind };
+    note = 'the default branch was merged in with a conflict since this round, so what it brought in cannot be told apart from the fix: measured from the round\'s reviewed head, it may over-count';
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    note = `the review base could not be worked out (${String(err.message).split('\n')[0]}): measured from the round's reviewed head, it may over-count`;
+  }
+  return { files: diffFiles(from, head, o), baseKind: 'round-head', baseNote: note };
 }
 
 // ---- #374: the late lane and the fix-round scope ---------------------------------------------------------------------------------------------------------

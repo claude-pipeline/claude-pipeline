@@ -14,14 +14,14 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { diffFiles, git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
+import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { hashBranch } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { askSummary, processReviewSummary, roundsFrom } from '../lib/round-ask.mjs';
-import { postMaxApply, fixRoundScope } from '../lib/fix-verify.mjs';
+import { postMaxApply, fixRoundFiles, fixRoundScope } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -995,7 +995,7 @@ function tripWireOf({ state, config, root, head, k, shown }) {
     let fixScope = null;
     try {
       const last = state.rounds.findLast(countsTowardCap);
-      if (last !== undefined) fixScope = fixRoundScope({ files: diffFiles(last.toHead, head, { cwd: root }), configs });
+      if (last !== undefined) fixScope = fixRoundScope({ files: fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config) }, { cwd: root }).files, configs });
     } catch { /* not measured: the line is left out */ }
     return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k }) };
   } catch {
