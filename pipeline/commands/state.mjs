@@ -6,9 +6,9 @@ import { mkdirSync, existsSync, renameSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
 import { Fail, guarded, requireConfig, resolveRepo, untrustedAnchorRefusal } from '../lib/cmd-common.mjs';
 import { GhError } from '../lib/proc.mjs';
-import { GitError, diffFiles, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { GitError, effectiveReviewBase, git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
-import { fixRoundScope } from '../lib/fix-verify.mjs';
+import { fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantedRounds, ownerPastRoundHistory, ownerPastRoundRecords, verifyOwnerGrant } from '../hooks/lib/owner-go.mjs';
 import { pastRoundsNeedingApproval } from '../lib/owner-grants.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -52,8 +52,10 @@ export const meta = {
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
     '  automatic extra round took, or null',
     'pipeline state fix-scope --round R [--head HEAD] [--repo DIR]',
-    '  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings}: what the fix commits since round R (R\'s reviewed head .. HEAD, or --head) add, read-only and',
-    '     never stored. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);',
+    '  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings, baseKind, baseNote?}: what the fix commits since round R (R\'s reviewed head .. HEAD, or --head) add, measured',
+    '     from the base the next review round would use (#490: what the default branch brought in with a clean merge since R is left out), and never stored. baseKind (\'previous\' | \'synthetic\' | \'round-head\') says which base was used;',
+    '     it falls back to the round head (baseKind \'round-head\', with baseNote saying why) for a stacked PR, an unanchored default branch (both exact: the review round does the same), a conflicting merge, or when GitHub cannot be read (may over-count; retry',
+    '     when GitHub answers). It does a best-effort fetch of origin/<default branch> and one `gh pr view` read, so "read-only" means it writes no review state. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);',
     '     a file counts as a test only when the working-tree, fork-point and trusted configs ALL classify it so (a renamed file is new unless both paths are tests). New exports are advisory text only.',
     '     The review skill runs it before the push and asks the owner (own PR / plan first / push as is) when flagged; it is a prompt, never a gate. Exit 2 {error: no-round | not-descendant | bad-head}',
     'pipeline state mark-implemented --ids a,b [--repo DIR]',
@@ -451,9 +453,17 @@ async function fixScope(rest, ctx) {
       warnings.push(`the ${label} config could not be read (${read.reason}): its limits and test globs are taken as the defaults`);
     }
   }
-  const scope = fixRoundScope({ files: diffFiles(round.toHead, head, o), configs });
+  // Best effort, as `state outcome` and mark-implemented do: after update-branch + a plain pull origin/<default branch> is stale, and a stale base counts what main brought in as fix lines.
+  const refresh = refreshBaseRef(root, config);
+  if (refresh.usesRemoteRef && !refresh.refreshed) {
+    warnings.push(`origin/${hashBranch(root, config)} could not be refreshed${refresh.reason ? ` (${refresh.reason})` : ''}: the cached ref is used, so what the default branch brought in since it was last fetched may be counted as fix lines`);
+  }
+  const ineligible = mergeInIneligible({ pr: state.pr, gh: createGitHub({ cwd: root, env: ctx.env }), root, config });
+  const { files, baseKind, baseNote } = fixRoundFiles({ from: round.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, o);
+  if (baseNote !== undefined) warnings.push(baseNote);
+  const scope = fixRoundScope({ files, configs });
   const advisory = scope.newExports > 2 ? [`${scope.newExports} new exports: check that each is needed by an accepted item (advisory, does not flag by itself)`] : [];
-  return { exitCode: EXIT.OK, output: { ok: true, round: n, from: round.toHead, head, fixScope: scope, flagged: scope.flagged, reasons: scope.reasons, advisory, warnings } };
+  return { exitCode: EXIT.OK, output: { ok: true, round: n, from: round.toHead, head, baseKind, ...(baseNote === undefined ? {} : { baseNote }), fixScope: scope, flagged: scope.flagged, reasons: scope.reasons, advisory, warnings } };
 }
 
 // ---- outcome --------------------------------------------------------------------------------

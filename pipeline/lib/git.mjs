@@ -538,8 +538,16 @@ const excludeSpecs = (changes) => changes.flatMap((c) => [c.oldPath, c.newPath])
 // is not printed: it comes back path-only, in the shape parseUnifiedDiff gives a binary change plus `skippedLargeBinary:
 // true`. The path rules still see its paths; there are simply no lines to read. Everything else keeps --text however big it
 // is, so a NUL byte in a source file cannot be used to hide it.
-export function diffFiles(base, head, o) {
-  const mb = mergeBase(base, head, o);
+// A 'synthetic' review base (effectiveReviewBase) is a tree id, which has no merge base: it is already the exact base. Only a caller that passes `{ treeBase: true }` (the third argument) diffs against
+// it as it is (fix-verify.mjs#fixRoundFiles); every other caller keeps the old behaviour, a throw, which the threat-model and out-of-model-waiver paths read as "no readable range" and fail closed on.
+export function diffFiles(base, head, o, { treeBase = false } = {}) {
+  let mb;
+  try {
+    mb = mergeBase(base, head, o);
+  } catch (err) {
+    if (!treeBase || !(err instanceof GitError) || git(['cat-file', '-t', assertRef(base, ['cat-file', '-t', base])], o).trim() !== 'tree') throw err;
+    mb = base;
+  }
   const range = `${mb}..${assertRef(head, ['diff', head])}`;
   const { skipped, order } = largeBinaryChanges(mb, head, o);
   const exclude = excludeSpecs(skipped);

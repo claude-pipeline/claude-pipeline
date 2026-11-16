@@ -842,8 +842,10 @@ pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures,
   record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the
   automatic extra round took, or null
 pipeline state fix-scope --round R [--head HEAD] [--repo DIR]
-  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings}: what the fix commits since round R (R's reviewed head .. HEAD, or --head) add, read-only and
-     never stored. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);
+  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings, baseKind, baseNote?}: what the fix commits since round R (R's reviewed head .. HEAD, or --head) add, measured
+     from the base the next review round would use (#490: what the default branch brought in with a clean merge since R is left out), and never stored. baseKind ('previous' | 'synthetic' | 'round-head') says which base was used;
+     it falls back to the round head (baseKind 'round-head', with baseNote saying why) for a stacked PR, an unanchored default branch (both exact: the review round does the same), a conflicting merge, or when GitHub cannot be read (may over-count; retry
+     when GitHub answers). It does a best-effort fetch of origin/<default branch> and one `gh pr view` read, so "read-only" means it writes no review state. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);
      a file counts as a test only when the working-tree, fork-point and trusted configs ALL classify it so (a renamed file is new unless both paths are tests). New exports are advisory text only.
      The review skill runs it before the push and asks the owner (own PR / plan first / push as is) when flagged; it is a prompt, never a gate. Exit 2 {error: no-round | not-descendant | bad-head}
 pipeline state mark-implemented --ids a,b [--repo DIR]
