@@ -165,6 +165,31 @@ describe('R1-B2: a state hazard in a child script or sourced file leaves the cal
   test('control: a function that switches the branch still denies', () => expect('deny', 'bash build.sh; git push', { [BUILD]: 'build() { git checkout main; }\nbuild\n' }));
 });
 
+// R1-F1: a git READ (symbolic-ref --short, config --get, branch -r, worktree list) raises no branch doubt, in the line or in a child script; only a command that can move a branch does
+describe('R1-F1: a git read leaves the on-disk branch known (cwd on agent/x, no checkout on the line)', () => {
+  for (const line of [
+    'git push origin "$(git symbolic-ref --short HEAD)"',
+    'git push origin HEAD:$(git symbolic-ref --short HEAD)',
+    'URL=$(git config --get remote.origin.url); git push',
+    'echo "$(git config user.name)"; git push -u origin HEAD',
+    'N=$(git branch -r | wc -l); git push',
+    'W=$(git worktree list | head -1); git push',
+  ]) test(`allowed: ${line}`, () => expect('allow', line));
+  for (const body of [
+    'git config --get user.name || git config user.name ci\nmake\n',
+    'git branch | grep x\nmake\n',
+    'V=$(git config --get x)\nmake\n',
+  ]) test(`allowed: bash build.sh holding ${JSON.stringify(body)}`, () => expect('allow', 'bash build.sh; git push', { [BUILD]: body }));
+  // the moves still count
+  for (const line of [
+    'N=$(git checkout main); git push',
+    'echo "$(git symbolic-ref HEAD refs/heads/main)"; git push',
+    'X=$(git branch -m main); git push',
+    'X=$(git worktree add ../w main); cd ../w; git push',
+  ]) test(`denied: ${line}`, () => expect('deny', line));
+  test('denied: a child script that switches the branch in a substitution', () => expect('deny', 'bash build.sh; git push', { [BUILD]: 'V=$(git checkout main)\nmake\n' }));
+});
+
 // ---- #508 ----
 describe('#508: a PATH set before the failure group makes even an echo not inert', () => {
   // (the clause `assignedNames(ctx)` of inertInFailGroup: the PATH is set BEFORE the group, so the group's own words (`echo`, `exit`) are all plain data commands)

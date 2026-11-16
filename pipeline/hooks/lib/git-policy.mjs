@@ -2177,6 +2177,22 @@ const nextSep = (cmds, i) => {
 const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || nextSep(cmds, i) === '|' || nextSep(cmds, i) === '&';
 const VALUE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select']);
 const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree', 'config']);
+// R1-F1: can this git command move a branch (what trackGit records: checkout / switch, a rebase with two positionals, symbolic-ref HEAD <ref>, branch -m / -M, worktree add)? A read (`symbolic-ref --short HEAD`,
+// `config --get`, `branch -r`, `worktree list`) raises no branch doubt. (the words are the command's own, global options included: an option's value counts as a positional, which only over-doubts)
+const MOVER_SUBS = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree']);
+const movesBranch = (argv) => {
+  const at = argv.findIndex((w) => MOVER_SUBS.has(w));
+  if (at < 0) return false;
+  const rest = argv.slice(at + 1);
+  const pos = rest.filter((w) => !w.startsWith('-'));
+  switch (argv[at]) {
+    case 'rebase': return pos.length >= 2;
+    case 'symbolic-ref': return pos.length >= 2 && pos.includes('HEAD');
+    case 'branch': return rest.some((w) => w === '--move' || /^-[a-zA-Z]*[mM]/.test(w));
+    case 'worktree': return pos[0] === 'add';
+    default: return true; // (checkout / switch)
+  }
+};
 
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
@@ -3005,9 +3021,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (changesState && (inFlow(from, i) || chained)) {
         uncertain = true;
         // (#492: a command of an if / loop body may not run either; while the readings of a loop name are pinned they are the union of that loop's alternatives: see judgeReadings)
-        if (nm === 'git' && (chained || (mayNotRun(cmds, from, i) && !pinsAt(ctx, level)))) gitDoubt = true;
+        if (nm === 'git' && movesBranch(argv) && (chained || (mayNotRun(cmds, from, i) && !pinsAt(ctx, level)))) gitDoubt = true;
       }
-      if (changesState && nm === 'git' && orExits) exitNarrowedGit = true;
+      if (changesState && nm === 'git' && orExits && movesBranch(argv)) exitNarrowedGit = true;
       if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
