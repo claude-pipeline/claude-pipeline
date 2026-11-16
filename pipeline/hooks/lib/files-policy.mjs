@@ -5443,6 +5443,11 @@ function evaluateBashForFilesFrame(command, opts) {
   const NON_PATH_OPTIONS = new Set(['base', 'base-href', 'public-path', 'basename', 'deploy-url']); // (a URL prefix, not a path: `vite build --base=/`)
   const SLASH_NOT_A_PATH = new Set(['expr', 'ssh', 'docker', 'podman', 'kubectl', 'oc', 'scp', 'mosh', 'bc', 'dc', 'curl', 'wget', 'gh']); // (a lone `/` is division, or a path on another machine / in a container)
   // R4-F2: ~u (and ~$USER) is home, ~+ is each directory the command may be in, ~- and any other ~NAME are only known at run time (a hit: this is asked of commands that are not read-only)
+  const couldNameHome = (x) => {
+    if (/[$`*?[{~]/.test(x)) return true;
+    const chain = ctx.homePosix.split('/').filter(Boolean).map((s) => (ctx.ci ? s.toLowerCase() : s));
+    return x.split('/').some((s) => s === '.' || s.includes('..') || chain.includes(ctx.ci ? s.toLowerCase() : s));
+  };
   const homeWord = (word, wdirs = dirs, cname = '', unknownWd = false) => {
     const opt = /^--([\w-]+)=./.exec(word);
     const w = opt ? word.slice(word.indexOf('=') + 1) : word;
@@ -5466,7 +5471,8 @@ function evaluateBashForFilesFrame(command, opts) {
     }
     // a relative word is resolved against the directories the command can run in and normalized (`.`, `..`)
     if (isAbs(x)) return hitPath(x);
-    return unknownWd || hits(wdirs.map((d) => under(d, x))); // (R5-F4: a directory only known at run time: a relative word can reach home from there)
+    // R5-F4: a directory only known at run time: a relative word can reach home from there; #307: only a word that could (`.`, `..`, a word with `..`, a glob, a run-time piece, or a name that is a segment of the home chain)
+    return (unknownWd && couldNameHome(x)) || hits(wdirs.map((d) => under(d, x)));
   };
   // what a command is given as operands: the value of a URL-prefix option is none
   const operandsOf = (c) => {

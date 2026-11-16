@@ -178,6 +178,35 @@ describe('#505 over-denial check: a readable sourced file with no git / .git wri
   });
 });
 
+// ---- #307 ----
+describe('#307: a directory only known at run time denies only the words that could name home', () => {
+  const HOMEWHY = /home directory or a directory above it|home directory/;
+  const notHome = (line) => test(`not refused for home: ${line}`, () => {
+    const r = fileRun(line);
+    assert.ok(r.decision === 'allow' || !HOMEWHY.test(r.reason ?? ''), `${line} -> ${r.decision}: ${r.reason}`);
+  });
+  const home = (line) => test(`still refused for home: ${line}`, () => {
+    const r = fileRun(line);
+    assert.equal(r.decision, 'deny', line);
+    assert.match(r.reason, HOMEWHY, line);
+  });
+  notHome('git -C "$(git rev-parse --show-toplevel)" push origin main');
+  notHome('git -C "$(git rev-parse --show-toplevel)" checkout main');
+  notHome('git -C "$(git rev-parse --show-toplevel)" add file.txt');
+  notHome('env -C "$X" npm run build');
+  notHome('git -C "$(git rev-parse --show-toplevel)" add src/app.js');
+  notHome('env -C "$X" make build');
+  notHome('env -C "$X" rm -rf dist');
+  // (a git write command is no home hit on its own; the env wrapper's commands are)
+  home('env -C "$X" rm -rf .');
+  home('env -C "$X" rm -rf ..');
+  home('env -C "$X" rm -rf ../x');
+  home('env -C "$X" rm -rf *');
+  home('env -C "$X" rm -rf u');
+  home('env -C "$X" rm -rf home/u');
+  home('env -C "$X" rm -rf "$Y"');
+});
+
 // Over-denial guard: ordinary work stays allowed after every change above.
 describe('ordinary work stays allowed', () => {
   const OK = (name, line, files) => test(`allowed: ${name}`, () => expect('allow', line, files));
