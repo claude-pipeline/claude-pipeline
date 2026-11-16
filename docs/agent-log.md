@@ -191,3 +191,4 @@ full record.
 - 2026-11-16 · #495 · Substitute rounds listed, not a range; full remote refs at the last short sites; exemption wording (#454 #480, EW #2163) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 11819 runs (11526 high)
 - 2026-11-16 · #489 · Review brakes: fix-scope check, post-limit follow-ups, round trip-wire (#374 PR B) · risk high · rounds 6 · arbiter 5 · awaiting-owner-merge · Codex 7d: 11828 runs (11530 high)
 - 2026-11-16 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 32 · arbiter 32 (fix-verify 1) · substitute 1 · needs-human · Codex 7d: 11874 runs (11571 high)
+- 2026-11-16 · #489 · Review brakes: fix-scope check, post-limit follow-ups, round trip-wire (#374 PR B) · risk high · rounds 7 · arbiter 5 · awaiting-owner-merge · Codex 7d: 11874 runs (11571 high)
