@@ -136,7 +136,8 @@ test('#454 verify: the report\'s base and mergeBase come from refs/remotes/origi
   shadow(repo, 'main', featureSha); // a shadow claiming the feature tip is the base
   const { runVerify } = await import(pathToFileURL(join(repo.dir, 'scripts', 'verify.mjs')).href);
   const sink = { write: () => true };
-  await runVerify({ argv: [], cwd: repo.dir, steps: [{ name: 'a', cmd: 'node -e "process.exit(0)"', quick: false }], lockDir: scratchDir(), out: sink, err: sink });
+  // a stand-in step that succeeds: this test asserts the report's git base, not what the step does
+  await runVerify({ argv: [], cwd: repo.dir, steps: [{ name: 'a', cmd: 'node --version', quick: false }], lockDir: scratchDir(), out: sink, err: sink });
   const g = JSON.parse(readFileSync(join(repo.dir, '.verify', 'report.json'), 'utf8')).git;
   assert.equal(g.base, remoteBase);
   assert.equal(g.mergeBase, remoteBase);
