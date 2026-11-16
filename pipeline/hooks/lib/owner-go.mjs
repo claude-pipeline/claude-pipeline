@@ -33,7 +33,7 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { REPO_NAME, readRepoMoves, sameRepo } from './repo-moves.mjs';
-import { clickProvenance } from './owner-go-click.mjs';
+import { clickProvenance, settlePendingClicks } from './owner-go-click.mjs';
 import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
@@ -806,11 +806,22 @@ export function readApprovals(opts = {}) {
 // Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
 // `problems` (an array; the strict lookup ownerGrantLookups passes one): each read that was skipped is described in it (the folder or a file that cannot be read, a
 // file that is not a regular file or is over maxBytes); an absent folder or a file that vanished is no problem. Without it a skipped read is silent, as before.
-export function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES, problems = null } = {}) {
+// Why (#472) `settle`: on Claude Code 2.1.323 a click is only a PENDING pointer when its hook runs (the answer's transcript entry is written after the hooks return), so the readers verify pending
+// clicks first (settlePendingClicks, with the caller's `session`) and then read the records. `settle: false` is for the read-only paths (the merge dry run's gate, click replay), which must write
+// nothing; `settle: true` forces it; otherwise settleEnabled decides (the test switch PIPELINE_CLICK_SETTLE=off). A settle that fails never breaks the read: the fault is a problem, the records already
+// written still count, and strict lookups report it.
+export function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES, problems = null, settle } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
   const note = (why) => { if (Array.isArray(problems)) problems.push(why); };
+  if (settleEnabled(settle)) {
+    try {
+      for (const why of settlePendingClicks({ home, now, session }).problems) note(why);
+    } catch {
+      note('pending clicks could not be settled');
+    }
+  }
   try {
     if (!lstatSync(dir).isDirectory()) {
       note(`${dir} is not a real folder`);

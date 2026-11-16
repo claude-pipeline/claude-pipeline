@@ -483,7 +483,7 @@ function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home
 function finishReplay({ spent, ask, clickId, ev, session, cwd, home, transcriptPath, io = {} }) {
   if (spent.clickId !== clickId || spent.answeredAt !== ev.answeredAt || spent.dialogSha256 !== ask.dialogSha256) return { refused: 'spent' };
   if (spent.declined === true) return { declined: ev.answer, replay: true };
-  const existing = readRecords({ home, session, maxAgeMs: Infinity }).find((r) => r.via === 'ask' && r.ask?.clickId === clickId);
+  const existing = readRecords({ home, session, maxAgeMs: Infinity, settle: false }).find((r) => r.via === 'ask' && r.ask?.clickId === clickId);
   if (existing) return { recorded: existing, kind: ask.kind, replay: true };
   const mapped = answerText(ask, ev.answer);
   if (mapped.error) return { refused: mapped.error };
