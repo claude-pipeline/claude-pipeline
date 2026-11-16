@@ -187,3 +187,4 @@ full record.
 - 2026-11-14 · #476 · Codex model config: shape check, retired-model stand-in, say where effort/model come from (#443 #431 #445) · risk high · rounds 4 · arbiter 3 · awaiting-owner-merge · Codex 7d: 10377 runs (10124 high)
 - 2026-11-14 · #478 · Guard follow-ups: cp/install -T, rsync -R and abbreviated options, cd-or-exit group for git, test Codex home (#452 #457 #460 #464 #465 #438) · risk high · rounds 5 · arbiter 3 · awaiting-owner-merge · Codex 7d: 10665 runs (10405 high)
 - 2026-11-14 · #476 · Codex model config: shape check, retired-model stand-in, say where effort/model come from (#443 #431 #445) · risk high · rounds 7 · arbiter 4 · awaiting-owner-merge · Codex 7d: 11113 runs (10841 high)
+- 2026-11-16 · #476 · Codex model config: shape check, retired-model stand-in, say where effort/model come from (#443 #431 #445) · risk high · rounds 7 · arbiter 4 · merged · Codex 7d: 11389 runs (11117 high)
