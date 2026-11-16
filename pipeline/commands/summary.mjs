@@ -99,11 +99,15 @@ export const run = guarded(async (argv, ctx) => {
     detail = outcome === 'blocked' ? await verifyDetail(root) : null;
   }
 
-  // A soft signal for the owner's report (never a gate): how many tests the PR adds against how much source it changes. Any failure leaves the line out.
+  // A soft signal for the owner's report (never a gate): how many tests the PR adds against how much source it changes. Any failure, or a diff with no changed line, leaves the line out.
   let testsAddedLine;
   try {
     const loaded = await loadConfig(root);
-    if (loaded.ok) testsAddedLine = testsAdded(diffFiles(reviewBaseRef(root, loaded.config), 'HEAD', { cwd: root }), loaded.config.integrity.test_globs).line;
+    if (loaded.ok) {
+      const added = testsAdded(diffFiles(reviewBaseRef(root, loaded.config), 'HEAD', { cwd: root }), loaded.config.integrity.test_globs);
+      // An empty diff (HEAD already inside the base ref, e.g. after a merge-commit merge) says nothing about the PR: no line rather than a line of zeros.
+      if (added.sourceLines + added.testLines > 0) testsAddedLine = added.line;
+    }
   } catch { /* the line is left out */ }
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
