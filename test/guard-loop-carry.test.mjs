@@ -358,6 +358,46 @@ test('#352 R38: a script / package script ending in a level that may not have ru
     assert.equal(r.decision, 'allow', `twin ${what}: ${r.reason}`);
   }
 });
+// (#352 R38-F2, owner decision "never carry over": a text that runs in a CHILD process or can end early on its own (a script file run by path or by bash / sh / zsh, fed on stdin, a package script, a `bash -c` text, a sourced file:
+// `return` ends it early and the caller goes on) never hands a state change to its caller. `[ -f skip ] && exit 0` before the switch, `exit 0; git switch`, `cd /x || exit 1; git switch`, `set -e` with a failing command: the walk
+// reads the switch as reached and the caller goes on on main. What the text changed, or may have changed, is unknown for the caller afterwards; a text that changed nothing leaves it as it was)
+test('#352 R38-F2: a script / package script / bash -c text / sourced file never hands a state change to its caller (it may have ended before it)', () => {
+  const at = (cmd, files, cwd = '/work/other') => evaluateGitCommand(cmd, {
+    cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(cwd, files),
+  });
+  const files = (body) => ({ 'reset.sh': `#!/bin/bash\n${body}\n`, 'package.json': JSON.stringify({ name: 'x', scripts: { reset: body, other: 'echo hi' } }) });
+  const bodies = [
+    '[ -f skip ] && exit 0\ngit switch agent/x', 'exit 0; git switch agent/x', 'cd /x || exit 1; git switch agent/x', 'set -e; false; git switch agent/x', 'return 0 2>/dev/null; git switch agent/x', 'git switch agent/x',
+  ];
+  const callers = (body) => [
+    ['bash script', 'bash ./reset.sh'], ['sh script', 'sh ./reset.sh'], ['zsh script', 'zsh ./reset.sh'], ['script run by path', './reset.sh'], ['package script', 'npm run reset'],
+    ['bash -c', `bash -c "${body}"`], ['sh -c', `sh -c "${body}"`], ['sourced file', '. ./reset.sh'], ['source', 'source ./reset.sh'],
+    ['bash < file', 'bash < reset.sh'], ['cat file | bash', 'cat reset.sh | bash'], ['bash <(cat file)', 'bash <(cat reset.sh)'],
+  ];
+  const allowed = [];
+  for (const body of bodies) {
+    for (const [what, caller] of callers(body)) {
+      for (const sep of [';', '&&']) {
+        const r = at(`${caller} ${sep} ${PB} origin HEAD`, files(body));
+        if (r.decision !== 'deny') allowed.push(`${what} (${caller}) running ${JSON.stringify(body)}, then ${sep}`);
+      }
+    }
+  }
+  assert.deepEqual(allowed, [], 'allowed, though the text may have ended before its change');
+  // (twins: a text that changes nothing leaves the caller's state as it was: the push from a feature branch is allowed)
+  const quiet = { 'build.sh': '#!/bin/bash\necho hi\n', 'package.json': JSON.stringify({ name: 'x', scripts: { build: 'echo hi', other: 'echo hi' } }) };
+  for (const caller of ['bash ./build.sh', 'sh ./build.sh', './build.sh', 'npm run build', 'bash -c "echo hi"', 'bash < build.sh', 'cat build.sh | bash']) {
+    for (const sep of [';', '&&']) {
+      const r = at(`${caller} ${sep} ${PB} origin HEAD`, quiet, GIT_ROOT);
+      assert.equal(r.decision, 'allow', `twin ${caller} ${sep}: ${r.reason}`);
+    }
+  }
+  // (a push that names its branch after the switching script does not need the state it changed)
+  for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
+    const r = at(`${caller}; ${PB} origin agent/x`, files('git switch agent/x'));
+    assert.equal(r.decision, 'allow', `named push after ${what}: ${r.reason}`);
+  }
+});
 // (#352 R36-F1: a loop's own level and depth come from the whole of its range, not from its first listed command, which is a command of a substitution / group / loop in its header)
 test('#352 R36-F1: a loop whose header holds a substitution, a group or a loop is judged at its own level', () => {
   const body = (inner) => `${PB} origin HEAD; cd /work/other; ${inner}`;
