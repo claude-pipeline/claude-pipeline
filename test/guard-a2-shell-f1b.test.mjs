@@ -228,6 +228,24 @@ test('#352 merge: zsh print is read-only like echo, unless an option binds, feed
   assert.equal(files('bash run.sh', zfs).decision, 'deny', 'run by bash: print may be a program on the moved PATH');
 });
 
+// (R31: one class rule: print's option area ends only at a lone `-` / `--` or at a word certain to reach print as exactly one word that does not start with a dash or a plus (no unquoted glob
+// character, group or qualifier, no unquoted expansion; a quoted run-time part is fine). Any other word before it may vanish (`(N)`, a glob with no match) or ADD option words (`(P:-f%d:)`,
+// `(e:...:)`), so what follows it may be options: not read-only.)
+test('#352 R31: print option area ends only at a word certain to be exactly one non-option word', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  const SUB = '\'a[$(rm -rf .claude; echo 1)]\'';
+  for (const p of [`a=(0); cd "$X" || exit 1; print zzz_no_match*(N) -f%d ${SUB}`, // (R31-B1)
+    `cd "$X" || exit 1; print p*(P:-f%d:) ${SUB}`, 'cd "$X" || exit 1; print x*(P[-P]) "a $Y"', `cd "$X" || exit 1; print p*(e:'reply=(-f%d y)':) ${SUB}`, // (R31-F1)
+    `cd "$X" || exit 1; print x* -f%d ${SUB}`, `cd "$X" || exit 1; print x$Y -f%d ${SUB}`, `cd "$X" || exit 1; print x$(echo) -f%d ${SUB}`,
+    `cd "$X" || exit 1; print x[a] -f%d ${SUB}`, `cd "$X" || exit 1; print -l x* -f%d ${SUB}`, 'cd "$X" || exit 1; print -r ?x "a $Y"', 'cd "$X" || exit 1; print x* x*(N) "a $Y"', 'cd "$X" || exit 1; print x#-f%d "a $Y"',
+    'cd "$X" || exit 1; print x~y "a $Y"', 'cd "$X" || exit 1; print ~ "a $Y"', 'cd "$X" || exit 1; print x* -s "a $Y"']) assert.equal(files(p, fs).decision, 'deny', p);
+  for (const p of ['print "a $Y"', 'print "starting $(date)"', 'print -l -- *.md', 'print -- x*(N) "a $Y"', 'print hello world', 'print -r -- x* "a $Y"', 'print -l \'x*\' "a $Y"', 'print -l - x* "a $Y"',
+    // (a glob word that starts with a plain literal character and holds only * ? [..] is transparent: it can only vanish or become names starting with that character, so the scan goes on past it)
+    'print -l x* "a $Y"', 'print x*', 'print x[a] "a $Y"', 'print x* "a $Y" -f%d', 'print x? x* -C2 "a $Y"', 'print x* -r "a $Y"']) {
+    assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
+  }
+});
+
 // ---- the second pass of a stale line spends what the first one left ------------------------------------------------------------------------------------------
 
 // main.sh runs n scripts; the first through "${BASH:-bash}" (rewritten), the last one binds BASH (judged after the rewrite, so the verdict is stale and the line is judged again)

@@ -2835,17 +2835,30 @@ function unquotedGlob(raw) {
   const t = withoutQuotes(raw);
   return t === null || /[*?[(^]|\S[#~]|<[\d-]*>/.test(t.replace(/\\[\s\S]/g, ''));
 }
-// #352 R30: the option area of zsh's print, read once for the format check (readOnlyWith) and the glob check (globOptionRisky). It runs from the first word to the first literal operand (the word that
-// ends it is included: a glob there can still become an option), a lone `-` or `--`. R30-B1 / F1: a word of it that holds a run-time part is bad (the call is not read-only): a word that starts with
+// #352 R30 / R31: the option area of zsh's print, read once for the format check (readOnlyWith) and the glob check (globOptionRisky). It runs from the first word to the word that ends it, which is
+// included. R31 (one class rule): the area ends ONLY at a lone `-` or `--`, or at a word that is certain to reach print as exactly one word that does not start with a dash or a plus: `fixed(w)`, a word
+// with no unquoted glob character / group / qualifier and no unquoted expansion (a quoted run-time part, `"a $Y"`, is fine). Any other word that does not start with a dash (`x*`, `x*(N)`, `p*(P:-f%d:)`,
+// `$X`, `x$Y`) may vanish, split or turn into option words at run time (a qualifier can ADD words: `(P:-f%d:)`, `(e:...:)`), so what follows it may be options: the call is bad.
+// A third kind, `transparent(w)`: an unquoted glob word that starts with a literal character (not `-` / `+` / a glob character) and holds no group, qualifier or expansion (only `*`, `?`, `[..]`) can only
+// vanish or become names that start with that same character: it neither ends the area nor makes the call bad, the scan goes on past it (`print -l x* "a $Y"`; `print x* -f%d …` reads the -f%d).
+// (`fixed` absent: the text of the word is judged, no glob character and no `$` / backtick.) R30-B1 / F1: a word of it that holds a run-time part is bad (the call is not read-only): a word that starts with
 // `$` or a backtick, a word that starts with a dash or a plus and holds one anywhere (`-"$O"`, `-x$(…)`), and the value word of -C / -f / -x / -X, which is read like an option (`-C $(echo 1 -f %d)`
 // splits into `-f %d`). An option that takes a value (-C -f -u -v -x -X) takes the rest of its cluster (`-C2`), or the next word when it ends the cluster (`-C 1`).
 // R29-F3: -f makes print zsh's printf, which reads the operand of a numeric conversion (or a `*`) as arithmetic: `fmt` is the format (null: not known), `end` the number of words of the area.
-function printScan(ws) {
+function printScan(ws, fixed = null, transparent = null) {
   const out = { end: ws.length };
   for (let i = 0; i < ws.length; i++) {
     const a = ws[i];
     if (/^[$`]/.test(a) || (/^[-+]/.test(a) && RUNTIME_PART.test(a))) return { bad: true, end: ws.length };
-    if (a === '-' || a === '--' || !/^[-+]/.test(a)) { out.end = i + 1; break; }
+    if (a === '-' || a === '--') { out.end = i + 1; break; }
+    if (!/^[-+]/.test(a)) {
+      if (fixed !== null && !fixed(a)) {
+        if (transparent !== null && transparent(a)) continue;
+        return { bad: true, end: ws.length };
+      }
+      out.end = i + 1;
+      break;
+    }
     for (let k = 1; k < a.length; k++) {
       if ('vsSzuPp'.includes(a[k])) return { bad: true, end: ws.length };
       if ('CfxX'.includes(a[k])) {
@@ -2866,18 +2879,18 @@ function globWordMeets(a, pats) {
 // `orig`: the words as written. R6-B1: a word that expansion changed (`D="--[d]elete"; find DIR $D`) is matched against the files after the expansion, so each blank-split piece of it is tested, whatever the raw text says.
 // #312: `lit` is the parser's own list of the words with no unquoted glob character and no expansion in them (cmd.litWords, read from the lexer's per-word quoting): `rg '^(a|b)' DIR/*.md` has an unquoted
 // glob, but the quoted program is no glob. Absent (a command the parser did not build): the line-wide reading, as before. A word that is both quoted and unquoted on the command is not listed (the text is the key).
-function globOptionRisky(name, args, raw, orig = args, lit = undefined) {
+function globOptionRisky(name, args, raw, orig = args, lit = undefined, fixed = null) {
   const pats = GLOB_PATTERNS[name];
   if (!pats || !args.some((a) => GLOB_CHARS.test(a))) return false;
   const globs = unquotedGlob(raw);
-  const limit = name === 'print' ? Math.min(args.length, printScan(orig).end) : args.length; // (print: its option area only; a word after the first operand or `--` is no option)
+  const limit = name === 'print' ? Math.min(args.length, printScan(orig, fixed, PRINT_TRANSPARENT).end) : args.length; // (print: its option area only; a word after the first operand or `--` is no option)
   for (let i = 0; i < limit; i++) {
     const a = args[i];
     if (a === '--' && DASHDASH_ENDS.has(name)) break;
     if (!GLOB_CHARS.test(a)) continue;
-    // (print: the word that ends the area, the first operand, only counts when it starts with a glob character or holds a `x#` repeat: `print "starting $(date)"` is no option; a group or a qualifier
-    // behind a plain first character cannot make a word that starts with a dash)
-    if (i === limit - 1 && name === 'print' && /^[^-+*?[(^<>~#@!{=]/.test(a) && /^[^-+*?[(^<>~#@!{=]/.test(orig[i] ?? a) && !/\S#/.test(a)) continue;
+    // (print: a word that is fixed, quoted or literal with no unquoted glob character, is no glob whatever its text holds: `print "starting $(date)"`. R31: a word that ends the area and is not fixed
+    // makes the call bad in printScan, so none is left here to exempt: a glob qualifier (`p*(P:-f%d:)`) can add option words, a glob that matches no file (`(N)`) vanishes)
+    if (name === 'print' && orig[i] === a && fixed !== null && fixed(a)) continue;
     if (globs &&!(lit !== undefined && orig[i] === a && lit.has(a)) && globWordMeets(a, pats)) return true;
     if (orig[i] !== a && a.split(/\s+/).some((piece) => globWordMeets(piece, pats))) return true;
   }
@@ -3149,9 +3162,14 @@ function isReadOnly(cmd, ctx) {
   if (PROGRAM_TOOLS.has(name) && !(name === 'sed' || name === 'gsed' ? sedReadOnly(argv.slice(1)) : awkReadOnly(argv.slice(1), cmd.env))) return false;
   return readOnlyWith(name, judged.args, cmd, ctx, argv);
 }
+// R31: is the word certain to reach print as exactly one word (cmd.plainWords, the parser's reading of its quoting; a command it did not build: the text holds no glob character and no run-time part)
+const printFixed = (cmd) => (w) => (cmd.plainWords ? cmd.plainWords.has(w) : !GLOB_CHARS.test(w) && !RUNTIME_PART.test(w));
+// (R31: a glob word that starts with a plain literal character and holds only `*`, `?` and `[..]` after it: no group, qualifier, extended-glob character (`# ~ ^ @ ! < > |`), `{`, `=` or run-time part)
+const PRINT_TRANSPARENT = (w) => /^[^-+*?[(^<>~#@!{=$`|\s]/.test(w) && !/[()^<>~#@!|{$`]/.test(w.slice(1));
 function readOnlyWith(name, args, cmd, ctx, argv) {
   if (CD_CMDS.has(name)) return true; // its effect (later relative paths) is tracked through the directory list
-  if (globOptionRisky(name, args, cmd.raw, argv.slice(1), cmd.litWords)) return false; // (R4-F3 / R5-B2: a glob-spelled option; #312: a quoted word is no glob)
+  const fixed = printFixed(cmd);
+  if (globOptionRisky(name, args, cmd.raw, argv.slice(1), cmd.litWords, fixed)) return false; // (R4-F3 / R5-B2: a glob-spelled option; #312: a quoted word is no glob)
   if (READ_ONLY.has(name)) {
     if (name === 'rg' && args.some((a) => a === '--pre' || a.startsWith('--pre='))) return false;
     return !(['less', 'more', 'bat', 'rg'].includes(name) && toolEnvTouched(cmd, ctx, GIT_TOOL_ENV));
@@ -3163,7 +3181,7 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
   // (printfFormatEvaluates, as for printf), and no word may hold a subscript-evaluation form. A word that may still start with `-` at run time (`print "$O" x`) may be any option.
   // R30: printScan reads the option area once (a run-time part in any word of it, a value word included, is no read-only call); a glob-spelled word of it is judged by globOptionRisky.)
   if (name === 'print') {
-    const raw = printScan(argv.slice(1));
+    const raw = printScan(argv.slice(1), fixed, PRINT_TRANSPARENT);
     const now = printScan(args);
     if (raw.bad || now.bad) return false;
     if (raw.fmt === undefined && now.fmt === undefined) return true;

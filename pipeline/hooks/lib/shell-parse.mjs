@@ -2634,6 +2634,7 @@ class Parser {
     let lastCur = null; // the word as it stood after the last plain character was added, and that character: `endsWith` flattens a long word each time (200 kB of `{` took 4 s)
     let lastCh = '';
     let wdyn = false; // the word contains an expansion that is only known at run time
+    let wudyn = false; // (R31) and one of them is not inside double quotes: the shell splits and globs its result, so the word may become any number of words
     let wpat = false; // the word holds an UNQUOTED glob / pattern character (`*?[^#~`, or a glued group): the shell may expand it to file names
     let wsubs = []; // segments run by substitutions inside the word
     // Why (#81): where each command substitution sits in the word, [from, to) in `cur` ([-1, -1]: a double-quoted text that holds one amid other text). A word is "one substitution"
@@ -2691,6 +2692,7 @@ class Parser {
       const q = qa;
       const marks = bm;
       const dyn = wdyn;
+      const udyn = wudyn;
       const pat = wpat;
       const subs = wsubs;
       const one = wspans.length > 0 && wspans[0][0] === 0 && wspans[0][1] === text.length; // (the first span covers the whole text: no other can follow it)
@@ -2704,6 +2706,7 @@ class Parser {
       qa = -1;
       bm = [];
       wdyn = false;
+      wudyn = false;
       wpat = false;
       wsubs = [];
       wspans = [];
@@ -2844,7 +2847,7 @@ class Parser {
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
-      seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: fdw }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
+      seg.words.push({ text, qa: q, bm: marks, dyn, udyn, subs, win, pat, one, fdRedir: fdw }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
     };
     const endSeg = (idx) => {
       flushWord();
@@ -2929,7 +2932,7 @@ class Parser {
         if (this.lastDqSubs) wspans.push(this.lastDqSubs === 1 ? [at, cur.length] : [-1, -1]);
         takeSubs();
       } else if (c === '`') {
-        startSeg(); inWord = true; wdyn = true;
+        startSeg(); inWord = true; wdyn = wudyn = true;
         const n0 = this.subAcc.length;
         const at = cur.length;
         cur += this.backtick(depth);
@@ -2939,8 +2942,8 @@ class Parser {
       } else if (c === '$') {
         startSeg();
         const nx = s[this.i + 1];
-        if (nx === '(') { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.substitution(depth); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
-        else if (isFunsubAt(s, this.i)) { inWord = true; wdyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.funsub(); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
+        if (nx === '(') { inWord = true; wdyn = wudyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.substitution(depth); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
+        else if (isFunsubAt(s, this.i)) { inWord = true; wdyn = wudyn = true; const n0 = this.subAcc.length; const at = cur.length; cur += this.funsub(); wspans.push([at, cur.length]); for (const x of this.subAcc.slice(n0)) x.split = true; takeSubs(); }
         else if (nx === "'") {
           mark(); ctx.ansiC = true;
           // (#269 R19-F1) in arithmetic `$'` is no quote either: `$` then a quote that is an ordinary character, so `$'$(cmd)'` runs cmd. Refused, not read.
@@ -2953,7 +2956,7 @@ class Parser {
         else if (nx === '{' && this.paramSpan(this.i) > 0) {
           // `${f%%(*}`, `${x:-a b;c}`: one word; the ( ) ; | & and blanks inside the braces are not shell syntax
           const end = this.paramSpan(this.i);
-          inWord = true; wdyn = true;
+          inWord = true; wdyn = wudyn = true;
           const body = s.slice(this.i, end);
           // `${x:-(bash f.sh)}` is no command, but no body between parentheses is ever dropped: each balanced group is also judged
           // One pass with a stack of open positions (a rescan from every `(` is quadratic: 150,000 of them outlast the hook timeout, which reads as allow);
@@ -2974,7 +2977,7 @@ class Parser {
           this.i = end;
         } else if (nx === '[') {
           // $[ expr ] is old-style arithmetic: its << is a shift, never a heredoc
-          inWord = true; wdyn = true;
+          inWord = true; wdyn = wudyn = true;
           let d = 0;
           let j = this.i + 1;
           for (; j < n; j++) { if (s[j] === '[') d++; else if (s[j] === ']' && --d === 0) break; }
@@ -2984,8 +2987,8 @@ class Parser {
           this.i = Math.min(j + 1, n);
         } else if (nx === '{') {
           // (#269 R21-F1) paramSpan declined this `${…}` (it holds code, a newline or never closes): lexed on as words, but tracked until its closing brace (see dbrace)
-          inWord = true; wdyn = true; cur += '${'; lastCur = cur; lastCh = '{'; this.i += 2; this.dbrace++;
-        } else { inWord = true; if (nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) wdyn = true; cur += '$'; lastCur = cur; lastCh = '$'; this.i++; }
+          inWord = true; wdyn = wudyn = true; cur += '${'; lastCur = cur; lastCh = '{'; this.i += 2; this.dbrace++;
+        } else { inWord = true; if (nx !== undefined && DYN_AFTER_DOLLAR.test(nx)) wdyn = wudyn = true; cur += '$'; lastCur = cur; lastCh = '$'; this.i++; }
       } else if (c === ';') {
         endSeg(this.i);
         lastSep = ';';
@@ -3026,7 +3029,7 @@ class Parser {
         } else {
           // an all-digit unquoted word glued to the operator is the fd number (2>&1), not an argument
           rfd = null;
-          if (inWord && qa < 0 && /^[0-9]+$/.test(cur)) { rfd = Number(cur); cur = ''; inWord = false; bm = []; wdyn = false; wpat = false; wsubs = []; wspans = []; } else flushWord();
+          if (inWord && qa < 0 && /^[0-9]+$/.test(cur)) { rfd = Number(cur); cur = ''; inWord = false; bm = []; wdyn = false; wudyn = false; wpat = false; wsubs = []; wspans = []; } else flushWord();
           startSeg();
           let j = this.i + 1;
           if (c === '>') {
@@ -3441,6 +3444,7 @@ class Parser {
     if (group.length) groups.push(group);
     for (const w of seg.words) {
       if (w.pat) seg.pat.add(w.text);
+      if (w.udyn) (seg.udyn ??= new Set()).add(w.text);
       if (w.qa < 0) (seg.bare ??= new Set()).add(w.text); // (#380: the texts of the words that have no quoting at all, and of those with some)
       else (seg.quo ??= new Set()).add(w.text);
       if (w.win !== undefined) seg.win.set(w.text, w.win);
@@ -3540,6 +3544,7 @@ class Parser {
         if (r.over) this.ctx.truncated = true;
         this.ctx.braceWork += r.list.length + w.bm.length;
         if (w.pat) for (const x of r.list) seg.pat.add(x);
+        if (w.udyn) for (const x of r.list) (seg.udyn ??= new Set()).add(x);
         argv.push(...r.list);
       } else {
         if (w.bm.length >= 3) this.ctx.truncated = true; // budget spent: left as written
@@ -3618,6 +3623,8 @@ class Parser {
     if (cmd) Object.defineProperty(cmd, 'quotedWords', { value: new Set(a.filter((w) => seg.quo?.has(w) && !seg.bare?.has(w))), enumerable: false });
     // (#425 R1-F3: of those, the ones the parser marks as a pattern: `""*.nomatch` has quoting but its glob part may still expand to no word (nullglob), so the caller keeps the raw-text test for them)
     if (cmd) Object.defineProperty(cmd, 'quotedPatternWords', { value: new Set(a.filter((w) => seg.quo?.has(w) && !seg.bare?.has(w) && seg.pat.has(w))), enumerable: false });
+    // (R31: the words that are certain to reach the command as exactly one word, however the shell expands it: no unquoted glob / pattern character and no unquoted expansion; a quoted expansion (`"a $Y"`) is fine. Keyed by text, like litWords)
+    if (cmd) Object.defineProperty(cmd, 'plainWords', { value: new Set(a.filter((w) => !seg.pat.has(w) && !seg.udyn?.has(w))), enumerable: false });
     if (cmd) Object.defineProperty(cmd, 'litWords', { value: new Set(a.filter((w) => !seg.meta.get(w)?.dyn && !seg.pat.has(w))), enumerable: false });
     if (!isExec) { seg.final = { argv: a }; seg.cmd = cmd; }
     // what the command prints and what it reads on stdin, for callers that ask which text a write of its output holds (see line-writes.mjs); lazy, most commands never need it
