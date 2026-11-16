@@ -11,7 +11,7 @@
 import { createHash } from 'node:crypto';
 import { EXIT, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { git, headSha, isAncestor, mergeBase, revParse } from '../lib/git.mjs';
+import { git, headSha, isAncestor, mergeBase, remoteRefExists, revParse } from '../lib/git.mjs';
 import { behindFreshEnough, lazyDiff } from '../lib/finalgate.mjs';
 import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -173,6 +173,8 @@ export function draftBehindBase({ root, config, gh, pr, view, refresh }) {
   const o = { cwd: root };
   let baseSha;
   try {
+    // exact existence first: with refs/remotes/origin/<b> missing, rev-parse would resolve a branch or tag literally named like it (#455)
+    if (!remoteRefExists(branch, o)) return { warning: `behind-base check skipped: there is no refs/remotes/origin/${branch} to compare HEAD with` };
     baseSha = revParse(`refs/remotes/origin/${branch}^{commit}`, o);
     if (isAncestor(baseSha, 'HEAD', o)) return {};
   } catch (err) {
