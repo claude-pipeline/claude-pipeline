@@ -370,6 +370,30 @@ test('reviewer fable with no arbiter record: arbiter needed runs once and its JS
   assert.equal(typeof r.json.arbiter.promptHeader, 'string');
 });
 
+test('a recorded round picked up from its finished job says so (pickedUp: true); a fresh round does not carry the marker', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const first = rc(w, [], ok(w));
+  assertExit(first, 0, first.stdout + first.stderr);
+  assert.equal('pickedUp' in first.json, false, 'a fresh round ran Codex: nothing was picked up');
+  const again = rc(w, []);
+  assertExit(again, 0, again.stdout + again.stderr);
+  assert.equal(again.json.pickedUp, true);
+});
+
+test('a recorded round is not picked up once HEAD moved past its toHead: head-moved-since-round, exit 1, nothing reported or run', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  assertExit(rc(w, [], ok(w)), 0);
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  const h2 = w.repo.commit('fix');
+  w.prHead(h2);
+  const before = w.stateText();
+  const r = rc(w, []);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'head-moved-since-round');
+  assert.equal('codex' in r.json, false, 'the old result was not reported');
+  assert.equal(w.stateText(), before);
+});
+
 test('reviewer fable WITH an arbiter record: arbiter needed is not called (the record is untouched) and the state is reported', (t) => {
   const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
   assertExit(rc(w, [], ok(w)), 0);

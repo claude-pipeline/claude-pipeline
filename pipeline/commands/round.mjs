@@ -192,6 +192,9 @@ async function roundCodex(rest, ctx) {
   const { state: before, recorded } = checkIdentity(root, pr, round, { mayBeRecorded: true });
   const existing = readJob(name, { cwd: root });
   let runId;
+  // A round that was already recorded: no Codex run happened in this call, and the output says so.
+  const pickedUp = recorded;
+  const marked = (r) => (pickedUp ? { ...r, output: { ...r.output, pickedUp: true } } : r);
 
   if (recorded) {
     // The round is in the state: only a finished or running job of THIS round is picked up (a rerun after the waiter was lost); nothing is started.
@@ -203,6 +206,11 @@ async function roundCodex(rest, ctx) {
       if (values[flag] !== undefined && fullSha(values[flag], root) !== existing.tag.split(':')[at]) {
         throw new Fail(EXIT.FAILED, { ok: false, error: 'job-conflict', message: `job ${name} ran with another --${flag} (tag ${existing.tag})`, tag: existing.tag, runId: existing.runId });
       }
+    }
+    // The recorded round is the one reviewed at its toHead: a checked-out HEAD past it holds a commit no review has seen (an explicit --head is compared above).
+    const recordedTo = existing.tag.split(':')[3];
+    if (values.head === undefined && fullSha('HEAD', root) !== recordedTo) {
+      throw new Fail(EXIT.FAILED, { ok: false, error: 'head-moved-since-round', message: `round ${round} was recorded at ${recordedTo} but HEAD is another commit: that result is not a review of HEAD; run round ${round + 1} instead`, recordedHead: recordedTo, tag: existing.tag, runId: existing.runId });
     }
     runId = existing.runId;
   } else {
@@ -261,17 +269,17 @@ async function roundCodex(rest, ctx) {
   const jobInfo = { name, runId, ...(snap.tag === undefined ? {} : { tag: snap.tag }) };
   if (snap.state === 'running') {
     if (snap.stopped) {
-      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'parent-gone', state: 'running', ...jobInfo, next: 'rerun round codex' } };
+      return marked({ exitCode: EXIT.FAILED, output: { ok: false, error: 'parent-gone', state: 'running', ...jobInfo, next: 'rerun round codex' } });
     }
-    return { exitCode: EXIT.OK, output: { ok: true, state: 'running', ...jobInfo, elapsedMs: snap.elapsedMs, next: 'rerun round codex' } };
+    return marked({ exitCode: EXIT.OK, output: { ok: true, state: 'running', ...jobInfo, elapsedMs: snap.elapsedMs, next: 'rerun round codex' } });
   }
   if (snap.state === 'replaced') {
-    return { exitCode: EXIT.FAILED, output: { ok: false, state: 'replaced', ...jobInfo, next: 'reconcile', doc: SPECIAL, message: `job ${name} now belongs to another run: another session may own this round; reconcile, never discard the round on this alone` } };
+    return marked({ exitCode: EXIT.FAILED, output: { ok: false, state: 'replaced', ...jobInfo, next: 'reconcile', doc: SPECIAL, message: `job ${name} now belongs to another run: another session may own this round; reconcile, never discard the round on this alone` } });
   }
   if (snap.state === 'lost' || snap.state === 'missing') {
-    return { exitCode: snap.state === 'missing' ? EXIT.USAGE : EXIT.FAILED, output: { ok: false, ...jobInfo, ...snap, doc: SPECIAL } };
+    return marked({ exitCode: snap.state === 'missing' ? EXIT.USAGE : EXIT.FAILED, output: { ok: false, ...jobInfo, ...snap, doc: SPECIAL } });
   }
-  return finish({ root, ctx, pr, round, snap, jobInfo });
+  return marked(await finish({ root, ctx, pr, round, snap, jobInfo }));
 }
 
 // A step that did not succeed: its own JSON and exit code, unchanged (what the controller's table of exits keys on). No JSON at all is said so.
