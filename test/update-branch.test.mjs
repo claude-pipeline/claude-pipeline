@@ -716,16 +716,23 @@ test('update-branch, queue ON, the PR is ALREADY QUEUED (a failed marker read wo
 // ---- the queue catch-up repeats its queue and marker checks before EVERY update (R17-B1, R17-F1) ------------------------------------------
 // A queue-aware fake over the stateful world: the queue state, the marker file and the marker-vs-head ancestry are scripted per read, so a second update cycle
 // can be put in front of a PR that was queued, or whose queue state cannot be read, in the meantime, or whose branch the first update already cured.
-function queueWorld({ behind = [1, 1, 0], queueStates = [], predating = () => true } = {}) {
+// `markers`: what each successive marker read (gh.fileAt) answers (the last one repeats): 'found' (default), 'missing' (no file), 'error' (GitHub cannot answer).
+function queueWorld({ behind = [1, 1, 0], queueStates = [], predating = () => true, markers = [] } = {}) {
   const w = world({ behind });
   const plain = w.gh.compare;
   w.queueReads = 0;
+  w.markerReads = 0;
   w.gh.compare = (a, b) => {
     if (a !== QUEUE_AWARE_SHA) return plain(a, b);
     if (b === 'main') return { status: 'ahead' }; // the base holds its own marker commit
     return { status: predating(b) ? 'diverged' : 'ahead' };
   };
-  w.gh.fileAt = () => ({ found: true, text: `${QUEUE_AWARE_SHA}\n` });
+  w.gh.fileAt = () => {
+    const m = markers[Math.min(w.markerReads, markers.length - 1)] ?? 'found';
+    w.markerReads += 1;
+    if (m === 'error') throw new GhError({ code: 1, stderr: 'gh: Server Error (HTTP 502)', args: ['api', 'contents'] });
+    return m === 'missing' ? { found: false } : { found: true, text: `${QUEUE_AWARE_SHA}\n` };
+  };
   w.gh.queueState = () => {
     const q = queueStates[Math.min(w.queueReads, queueStates.length - 1)] ?? { enabled: true, inQueue: false, entry: null };
     w.queueReads += 1;
@@ -736,6 +743,7 @@ function queueWorld({ behind = [1, 1, 0], queueStates = [], predating = () => tr
 }
 const IDLE = { enabled: true, inQueue: false, entry: null };
 const QUEUED = { enabled: true, inQueue: true, entry: ENTRY };
+const OFF = { enabled: false, inQueue: false, entry: null };
 const catchUp = (w, extra = {}) => {
   const hook = queueCatchUpBeforeUpdate({ gh: w.gh, pr: PR, branch: 'main' });
   return run(w, { expectHead: A, waitChecks: false, beforeUpdate: hook, checkBeforeCap: true, ...extra });
@@ -784,4 +792,63 @@ test('queue catch-up: a branch that keeps predating (the marker moved on the bas
   assert.equal(r.outcome, 'up-to-date');
   assert.equal(r.cycles, 2);
   assert.equal(w.updates.length, 2);
+});
+
+test('queue catch-up: the queue was switched off between cycles: the hook steps aside (no marker read) and the plain catch-up carries on, a second PUT', async () => {
+  const w = queueWorld({ queueStates: [IDLE, OFF], predating: () => true, behind: [1, 1, 0] });
+  const r = await catchUp(w);
+  assert.equal(r.outcome, 'up-to-date');
+  assert.equal(r.cycles, 2);
+  assert.equal(w.updates.length, 2);
+  assert.equal(w.markerReads, 1, 'the second check stops at "the queue is off" and reads no marker');
+});
+
+test('queue catch-up: the marker cannot be read between cycles (a GitHub blip): refused (queue-unreadable) with the first update kept, no second PUT', async () => {
+  const w = queueWorld({ queueStates: [IDLE], markers: ['found', 'error'] });
+  const r = await catchUp(w);
+  assert.equal(r.ok, false);
+  assert.equal(r.outcome, 'queue-unreadable');
+  assert.equal(r.updated, true);
+  assert.equal(w.updates.length, 1);
+  assert.match(r.message, /could not be checked.*nothing more was updated/);
+});
+
+test('queue catch-up: the marker gives no verdict any more between cycles (the file is gone): queue-mode, ok, no further PUT', async () => {
+  const w = queueWorld({ queueStates: [IDLE], markers: ['found', 'missing'] });
+  const r = await catchUp(w);
+  assert.equal(r.ok, true);
+  assert.equal(r.outcome, 'queue-mode');
+  assert.equal(r.updated, true);
+  assert.equal(w.updates.length, 1);
+  assert.match(r.message, /no further catch-up; nothing more was updated/);
+});
+
+// The same through the command: update-branch.mjs must hand the hook (and checkBeforeCap) to bringUpToDate, or none of the lib cases above reaches a user.
+test('update-branch, queue catch-up: after the first PUT the PR is still behind and has been QUEUED meanwhile: exit 1, queue-entry-live, exactly one PUT (a second would drop the entry)', () => {
+  const s = scenario({ yml: holdYml(), baseFiles: holdFiles, gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: false } });
+  const newHead = 'd'.repeat(40);
+  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 1, queue: true, queueEntry: ENTRY, ...QA, queueAwareIn: false, commitParents: { [newHead]: [s.head, BASE_SHA] } }));
+  const r = updateCli(s, [], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
+  assertExit(r, 1, r.stdout);
+  assert.equal(r.json.ok, false);
+  assert.equal(r.json.outcome, 'queue-entry-live');
+  assert.equal(r.json.updated, true);
+  assert.equal(r.json.queueCatchUp, true);
+  assert.equal(r.json.head, newHead);
+  assert.equal(r.json.pullNeeded, true);
+  assert.equal(puts(s).length, 1);
+});
+
+test('update-branch, queue catch-up: after the first PUT the PR is still behind but now holds the marker commit, --max-cycles 1: exit 0 up-to-date (not cycle-cap), exactly one PUT', () => {
+  const s = scenario({ yml: holdYml(), baseFiles: holdFiles, gh: { behindBy: 2, queue: true, ...QA, queueAwareIn: false } });
+  const newHead = 'd'.repeat(40);
+  const swap = swapOnUpdate(s, ghEntries({ prHead: newHead, behindBy: 1, queue: true, ...QA, commitParents: { [newHead]: [s.head, BASE_SHA] } }));
+  const r = updateCli(s, ['--max-cycles', '1'], { PIPELINE_UPDATE_WAIT_MS: '2000', ...swap });
+  assertExit(r, 0, r.stdout);
+  assert.equal(r.json.ok, true);
+  assert.equal(r.json.outcome, 'up-to-date');
+  assert.equal(r.json.updated, true);
+  assert.equal(r.json.queueCatchUp, true);
+  assert.equal(r.json.head, newHead);
+  assert.equal(puts(s).length, 1);
 });
