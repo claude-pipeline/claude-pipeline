@@ -171,7 +171,7 @@ function expandVars(text, ctx) {
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
 // (and the writes of the line that count for the command: a script the line wrote is judged on what was written)
-const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.branchesUnknown === true, ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
 
 // What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
 // `$n` when it is unsure or tainted (the callers read that as "run-time value").
@@ -319,8 +319,15 @@ function branchOf(dir, gitDir, ctx) {
 
 // A command earlier on the line may have switched this directory's branch: that, not the real checkout, is what a
 // later bare/HEAD push acts on. `name === null` records "switched to something we cannot name".
+// #505: `ctx.branchesUnknown` is the mark "every branch is unknown": a directory with no entry in ctx.branches is read from disk only while the mark is off. It is set wherever the names are forgotten
+// (forgetBranches) or a branch is changed in a directory that is not known (a switch there may have hit any repository, and recording nothing would leave the on-disk branch trusted); an entry
+// recorded after that (a switch in a known directory) is known again.
+function forgetBranches(ctx) {
+  ctx.branchesUnknown = true;
+  for (const e of ctx.branches.values()) e.name = null;
+}
 function setBranch(ctx, dir, name, trackMain = false) {
-  if (dir === null) return;
+  if (dir === null) { ctx.branchesUnknown = true; return; }
   if (name !== null && DYNAMIC.test(name)) name = null; // still holds `$B` / `$(…)` after expansion: unknown, not a name
   ctx.branches.set(dir, { name: name === null ? null : stripHeads(name), trackMain });
 }
@@ -330,6 +337,7 @@ function effectiveBranch(dir, gitDir, ctx) {
     const o = ctx.branches.get(dir);
     return { branch: o.name, overridden: true, trackMain: o.trackMain };
   }
+  if (ctx.branchesUnknown === true) return { branch: null, overridden: true, trackMain: false }; // (#505)
   return { branch: branchOf(dir, gitDir, ctx), overridden: false, trackMain: false };
 }
 
@@ -1814,7 +1822,7 @@ function lineState(ctx) {
   return {
     vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
     gitAliases: Object.assign(Object.create(null), ctx.gitAliases), ghAliases: Object.assign(Object.create(null), ctx.ghAliases),
-    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), branchesUnknown: ctx.branchesUnknown === true, cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
   };
 }
 function restoreLineState(ctx, saved) {
@@ -1822,6 +1830,7 @@ function restoreLineState(ctx, saved) {
   for (const k of ['unsureVars', 'tainted', 'aliasUnsure']) { ctx[k].clear(); for (const n of saved[k]) ctx[k].add(n); }
   ctx.branches.clear();
   for (const [d, e] of saved.branches) ctx.branches.set(d, { ...e });
+  ctx.branchesUnknown = saved.branchesUnknown;
   ctx.cfgDirty = saved.cfgDirty;
   ctx.envCfgDirty = saved.envCfgDirty;
 }
@@ -1829,7 +1838,7 @@ function isolatedState(ctx, fn) {
   const saved = {
     vars: Object.assign(Object.create(null), ctx.vars), unsureVars: new Set(ctx.unsureVars), tainted: new Set(ctx.tainted), aliasUnsure: new Set(ctx.aliasUnsure),
     gitAliases: Object.assign(Object.create(null), ctx.gitAliases), ghAliases: Object.assign(Object.create(null), ctx.ghAliases),
-    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
+    branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), branchesUnknown: ctx.branchesUnknown === true, cfgDirty: ctx.cfgDirty, envCfgDirty: ctx.envCfgDirty,
   };
   try {
     return fn();
@@ -1838,6 +1847,7 @@ function isolatedState(ctx, fn) {
     for (const k of ['unsureVars', 'tainted', 'aliasUnsure']) { ctx[k].clear(); for (const n of saved[k]) ctx[k].add(n); }
     ctx.branches.clear();
     for (const [d, e] of saved.branches) ctx.branches.set(d, e);
+    ctx.branchesUnknown = saved.branchesUnknown;
     ctx.cfgDirty = saved.cfgDirty;
     ctx.envCfgDirty = saved.envCfgDirty;
   }
@@ -1986,6 +1996,7 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   // judgement changed in its copy is carried back into the line's state (the memo keeps it with the verdict: same state in, same state out).
   const carry = (r) => {
     for (const [d, e] of r.branches) if (ctx.branches.get(d) !== e) ctx.branches.set(d, e);
+    if (r.branchesUnknown) ctx.branchesUnknown = true;
     if (r.cfgDirty) ctx.cfgDirty = true;
     if (r.ghRepoDirty) ctx.ghRepoDirty = true;
     Object.assign(ctx.gitAliases, r.git);
@@ -1998,13 +2009,13 @@ function implicitStartupVerdict(st, ctx, cmd, dir) {
   const known = memo.get(key);
   if (known && (!known.sens || known.flag === flag)) return carry(known);
   const seen0 = ctx.budget.unmodelledSeen ?? 0;
-  const pending = { verdict: null, branches: new Map(), cfgDirty: false, git: {}, gh: {}, unsure: [], sens: false, flag };
+  const pending = { verdict: null, branches: new Map(), branchesUnknown: false, cfgDirty: false, git: {}, gh: {}, unsure: [], sens: false, flag };
   memo.set(key, pending); // marked first: a startup file that starts shells itself finds this entry, not itself again
   const text = ctx.readText(path.resolve(ctx.home, st.file.replace(/^~\/?/, '')));
   fresh.fullText = typeof text === 'string' ? text : '';
   const v = checkScriptFile(rec, dir, fresh, 0);
   const done = {
-    verdict: v, branches: new Map(fresh.branches), cfgDirty: fresh.cfgDirty, ghRepoDirty: fresh.ghRepoDirty === true, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
+    verdict: v, branches: new Map(fresh.branches), branchesUnknown: fresh.branchesUnknown === true, cfgDirty: fresh.cfgDirty, ghRepoDirty: fresh.ghRepoDirty === true, git: { ...fresh.gitAliases }, gh: { ...fresh.ghAliases }, unsure: [...fresh.aliasUnsure],
     sens: (ctx.budget.unmodelledSeen ?? 0) !== seen0, flag,
   };
   memo.set(key, done);
@@ -2801,6 +2812,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
   const outer = [ctx.pins, ctx.pinsLevel];
   let dirty = false;
   let envDirty = false;
+  let unknownAny = false; // (#505: some reading left the every-branch-unknown mark on)
   const moved = new Set(); // (directories whose branch some reading left different from the start; alias keys likewise: see below)
   const redefined = new Set();
   try {
@@ -2821,6 +2833,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
       if (v.decision === 'deny') return v;
       dirty ||= ctx.cfgDirty;
       envDirty ||= ctx.envCfgDirty;
+      unknownAny ||= ctx.branchesUnknown === true;
       // (t4 state-union, security review: the end state of EVERY reading is compared with the start, not only the last one's: a branch or alias an earlier reading changed
       // and the last did not would stay known. The readings are alternatives, so whatever any of them changed is unknown afterwards.)
       for (const d of new Set([...saved.branches.keys(), ...ctx.branches.keys()])) {
@@ -2839,6 +2852,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
       ctx.cfgDirty = dirty;
       ctx.envCfgDirty = envDirty;
       for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });
+      if (unknownAny) ctx.branchesUnknown = true;
       for (const a of redefined) ctx.aliasUnsure.add(a);
     }
     return allowed();
@@ -2898,7 +2912,8 @@ function evalString(str, startDir, ctx, level, child = false) {
   // #492: doubt about a branch change this text made that its caller must keep (an exit only ends THIS text; a pending conditional change may not have run): see the end of the text
   let gitDoubt = false; // (the pending `uncertain` came from a git command)
   let exitNarrowedGit = false; // (a git state change narrowed by `|| exit` / a failure group that exits: the text's later commands saw it, its caller may not)
-  const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
+  // (a directory change that may not have run moves no branch: it forgets the names of the directories already known, and only a doubtful git change (or an unmodelled effect) marks every other one unknown too)
+  const forgetState = (everyBranch = true) => { dir = null; if (everyBranch) forgetBranches(ctx); else for (const e of ctx.branches.values()) e.name = null; };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
@@ -2937,6 +2952,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     else {
       const was = new Map(failGroup.snap.names);
       for (const [k, e] of ctx.branches) e.name = was.has(k) ? was.get(k) : null;
+      ctx.branchesUnknown = failGroup.snap.unknown;
     }
     failGroup = null;
   };
@@ -2946,7 +2962,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     checkDeadline(ctx.budget); // a lookup (branch, labels) can take seconds; the evaluation as a whole may not
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
     if (failGroup && failGroup.snap === null) {
-      failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]) };
+      failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]), unknown: ctx.branchesUnknown === true };
       forgetState();
     } else if (failGroup && i > failGroup.to) restoreAfterGroup();
     const argv = c.argv;
@@ -2957,7 +2973,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       let k = 0;
       while (k < subs.length && k < c.grp.length && subs[k].id === c.grp[k]) k++;
       if (k < subs.length) {
-        if (uncertain) for (const e of ctx.branches.values()) e.name = null;
+        if (uncertain) { if (gitDoubt) forgetBranches(ctx); else for (const e of ctx.branches.values()) e.name = null; }
         dir = subs[k].dir;
         uncertain = subs[k].uncertain;
         subs.length = k;
@@ -2968,7 +2984,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     // Only commands chained with && after it are certain to see the change (`cd d && git push`); anything else may run
     // without it (`false && cd d; git push`, `cd d &`, `(cd d)`, `cd d || git push`), so the state is unknown.
     if (uncertain && c.sep !== '&&') {
-      forgetState();
+      forgetState(gitDoubt);
       uncertain = false;
       gitDoubt = false;
     }
@@ -3112,10 +3128,10 @@ function evalString(str, startDir, ctx, level, child = false) {
   // that could switch the caller's branch where the walk cannot see it; R2-B1: otherwise every branch name is forgotten, including one the group itself recorded through an absolute -C directory)
   if (failGroup?.snap) {
     if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();
-    else for (const e of ctx.branches.values()) e.name = null;
+    else forgetBranches(ctx);
   }
   // #492: what a nested text hands back to its caller is not its own optimistic state: an `exit` only ends the text, and a branch change that may not have run (a pending `uncertain`) is unknown
-  if (level > 0 && (exitNarrowedGit || (uncertain && gitDoubt))) for (const e of ctx.branches.values()) e.name = null;
+  if (level > 0 && (exitNarrowedGit || (uncertain && gitDoubt))) forgetBranches(ctx);
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it
@@ -3163,7 +3179,7 @@ function evaluateGitOnce(command, {
   const ctx = {
     cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
-    branches: new Map(), cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
+    branches: new Map(), branchesUnknown: false, cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
   if (bashState) bashState.budget = ctx.budget;
   // Why: a hook that throws or times out is allowed by Claude Code, so a limit hit (GuardLimit) and ANY other exception (a

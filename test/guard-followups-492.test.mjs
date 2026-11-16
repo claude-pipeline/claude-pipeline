@@ -78,6 +78,27 @@ describe('#492: doubt carried out of a nested text', () => {
   });
 });
 
+// ---- #505 ----
+const CLEAN = resolve('/work/repo/cleanup.sh');
+describe('#505: every branch is unknown, also the ones no entry was made for', () => {
+  const FILES = { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' };
+  test('the issue example: the caller is on agent/x (no checkout earlier on the line), the failure group runs a script that switches to main: denied', () => {
+    expect('deny', 'bash build.sh; git push', FILES);
+  });
+  test('the same with a source in the group', () => {
+    expect('deny', 'bash build.sh; git push', { ...FILES, [BUILD]: 'make\ncd dist || { source /work/repo/cleanup.sh; exit 1; }\n' });
+  });
+  test('a git checkout in an unknown directory (after a source) marks every branch unknown, even a directory entered later', () => {
+    expect('deny', 'source env.sh; cd /work/repo; git checkout agent/y; cd /other; git push', { [resolve('env.sh')]: 'X=1\n' });
+  });
+  test('a branch recorded after the mark is known again (a checkout of the directory the push runs in)', () => {
+    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y; git push', { [resolve('env.sh')]: 'X=1\n' });
+  });
+  test('reference: a build script whose failure group is a plain echo keeps the caller branch (allowed)', () => {
+    expect('allow', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
+  });
+});
+
 // Over-denial guard: ordinary work stays allowed after every change above.
 describe('ordinary work stays allowed', () => {
   const OK = (name, line, files) => test(`allowed: ${name}`, () => expect('allow', line, files));
