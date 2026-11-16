@@ -496,7 +496,8 @@ test('R2-B2: a fragment that switches the branch does not change the state the j
   // and what the fragments changed does not leak to the commands AFTER the feed: the real text `#git switch agent/x` switches nothing, so the later push is from main
   const leak = () => fakeFs(GIT_ROOT, { 'a.sh': '#', 'b.sh': 'git switch agent/x\n', 'p.sh': 'git push\n' }, ['sub', 'd']);
   for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, leak()).decision, 'deny', c);
-  assert.equal(gitOnMain('bash < b.sh; bash p.sh', leak()).decision, 'allow'); // b alone IS the switch (a single file carries)
+  for (const c of ['eval "$(cat b.sh)"; bash p.sh', 'bash b.sh; bash p.sh']) assert.equal(gitOnMain(c, leak()).decision, 'allow', c); // b alone IS the switch (a single file carries)
+  assert.equal(gitOnMain('bash < b.sh; bash p.sh', leak()).decision, 'deny'); // (#352 R35: a `<` redirection can fail before bash runs: the switch may not have happened)
   assert.equal(gitOnMain('cat b.sh | bash; bash p.sh', leak()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   // c alone pushes from main too (the baseline); the rewriting producer's files are scanned, never carried
   assert.equal(gitOnMain('cat c.sh | bash', fs()).decision, 'deny');
@@ -517,7 +518,8 @@ test('R2-B2: the joined program is the real one: its own branch switch carries o
 
 test('R2-B2: a feed with ONE file keeps carrying that file\'s real state changes', () => {
   const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
-  for (const c of ['bash < sw.sh; bash p.sh', 'eval "$(cat sw.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c); // the switch is real
+  for (const c of ['bash sw.sh; bash p.sh', 'eval "$(cat sw.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c); // the switch is real
+  assert.equal(gitOnMain('bash < sw.sh; bash p.sh', fs()).decision, 'deny'); // (#352 R35: a `<` redirection can fail before bash runs: the switch may not have happened)
   assert.equal(gitOnMain('cat sw.sh | bash; bash p.sh', fs()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   assert.equal(gitOnMain('cat st.sh | bash; bash p.sh', fs()).decision, 'deny'); // nothing switched: still main
 });

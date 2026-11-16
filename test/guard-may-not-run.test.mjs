@@ -296,7 +296,9 @@ test('#352 R11-F3: a backtick text lexed while an earlier command still waits fo
   ANY_DENY('cd <<EOF | echo `push`', `cd ${MAIN_DIR} <<EOF | echo \`${SHIP}\`\nEOF`, {}, GIT_ROOT);
   allows('twin: the backtick first', `echo \`date\`; cat <<EOF\nx\nEOF`, {}, GIT_ROOT);
   allows('twin: a backtick in a later line', `cat <<EOF\nx\nEOF\necho \`date\``, {}, GIT_ROOT);
-  allows('twin: a $( ) after the heredoc command keeps its order', `cd /work/other2 <<EOF; echo $(${SHIP})\nEOF`, {}, GIT_ROOT);
+  allows('twin: a $( ) after the heredoc command keeps its order', `cd /work/other2; cat <<EOF; echo $(${SHIP})\nEOF`, {}, GIT_ROOT);
+  // (#352 R35: a heredoc on the cd itself can fail before the cd runs (zsh writes it to a temp file first: TMPPREFIX=/missing/x), so the directory after it is unknown)
+  refuses('a cd carrying a heredoc may not have run', `cd /work/other2 <<EOF; echo $(${SHIP})\nEOF`, {}, GIT_ROOT);
 });
 
 // (#352 R12: a ( ) stage of a pipeline keeps its own commands' certainty; a text scanned out of a heredoc body / $[ ] is not emitted before an earlier command still waiting in the queue; a redirect after
