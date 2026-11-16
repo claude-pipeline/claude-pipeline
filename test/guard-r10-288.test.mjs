@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { cpuTimed } from './helpers/timing.mjs';
+import { cpuTime, cpuTimed, assertLinear } from './helpers/timing.mjs';
 
 const HOME = '/home/u';
 const BASE = { home: HOME, env: {}, platform: 'linux', cwd: HOME, realpath: (p) => p, existsSync: () => false, readText: () => null };
@@ -41,12 +41,15 @@ const gitVerdict = (command) => evaluateGitCommand(command, {
 });
 
 describe('R10-B1: keyword words are checked with a running flag', () => {
-  test('#288 R10 B1: `:` + 90,000 ` !` answers well under a second (parser and files policy)', () => {
-    const line = ':' + ' !'.repeat(90000);
-    const p = cpuTimed(() => simpleCommands(line));
-    assert.ok(p.ms < 1000, `simpleCommands took ${p.ms} ms`);
-    const f = cpuTimed(() => run(line));
-    assert.ok(f.ms < 1000, `evaluateBashForFiles took ${f.ms} ms`);
+  // "Not quadratic", not "fast on this machine": a CPU-time bound flaked on loaded runners (1.09 s against 1 s), so the work at a quarter of the words is compared with the work at all 90,000
+  // (linear 4x, quadratic 16x; ratio 8 is 2x from each; best-of samples, see helpers/timing.mjs).
+  test('#288 R10 B1: `:` + 90,000 ` !` stays linear (parser and files policy)', () => {
+    const line = (n) => ':' + ' !'.repeat(n);
+    const small = 22500;
+    const large = 90000;
+    const opts = { ratio: 8, factor: 4 };
+    assertLinear(() => cpuTime(() => simpleCommands(line(small))), () => cpuTime(() => simpleCommands(line(large))), { label: 'simpleCommands', ...opts });
+    assertLinear(() => cpuTime(() => run(line(small))), () => cpuTime(() => run(line(large))), { label: 'evaluateBashForFiles', ...opts });
   });
   test('#288 R10 B1: keyword prefix reading is unchanged (plainSeq)', () => {
     const plain = (line) => simpleCommands(line).plainSeq;

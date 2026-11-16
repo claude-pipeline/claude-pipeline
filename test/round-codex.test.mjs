@@ -17,10 +17,19 @@ const ok = (w, findings = findingsOf([], [low()]), name = 'f.json') => ({ FAKE_C
 const rc = (w, extra = [], env = {}, round = '1') => w.cli(['round', 'codex', '--pr', '7', '--round', round, ...extra], { ...FAST, ...env });
 const jobsDir = (w) => join(w.repo.dir, '.review', 'jobs');
 const tagOf = (w, base, head, round = 1) => `7:${round}:${base}:${head}`;
-// A job that prints `json` and exits `code` after `ms`, standing in for a codex-review run (the file is a plain script: no quotes for the guard to read).
+// A job that prints `json` and exits `code`, standing in for a codex-review run (the file is a plain script: no quotes for the guard to read).
+// Gated (`emit(code, json, true)`): it stays running until `emit.release()` creates its release file, never for a fixed time: a timer is a race with a loaded machine that is slow to start the
+// round command (the job would be done, and unrecorded, by the time the command reads it).
 function emitter(w) {
-  const file = w.file('emit.mjs', 'const [code, json, ms] = process.argv.slice(2);\nsetTimeout(() => { if (json) console.log(json); process.exit(Number(code)); }, Number(ms || 0));\n');
-  return (code, json, ms = 0) => ['node', file, String(code), json, String(ms)];
+  const file = w.file('emit.mjs', "import { existsSync } from 'node:fs';\nconst [code, json, gate] = process.argv.slice(2);\nconst finish = () => { if (json) console.log(json); process.exit(Number(code)); };\nconst poll = () => (!gate || existsSync(gate) ? finish() : setTimeout(poll, 25));\npoll();\n");
+  let gate = '';
+  let n = 0;
+  const emit = (code, json, gated = false) => {
+    gate = gated ? join(w.scratch, `emit-release-${n++}`) : '';
+    return ['node', file, String(code), json, gate];
+  };
+  emit.release = () => writeFileSync(gate, 'go\n');
+  return emit;
 }
 const startJob = (w, tag, cmd, env = {}) => assertExit(w.cli(['job', 'start', '--tag', tag, 'codex-r1', '--', ...cmd], env), 0);
 // generous: a loaded machine (shared dev Mac, load 80+) needs well over 15 s to start a detached job
@@ -31,6 +40,16 @@ const untilExists = async (file, ms = 60_000) => {
     await sleep(50);
   }
 };
+// Run `round codex` against the gated job already started (emit(..., true)): the job stays running until the command stands at its hold before the wait (it has read the job), then is released.
+let holds = 0;
+async function adopt(w, emit, extra = []) {
+  const hold = join(w.scratch, `adopt-hold-${holds++}`);
+  const run = startRound(w, extra, { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  await untilExists(`${hold}.reached`);
+  emit.release();
+  writeFileSync(hold, 'go\n');
+  return run.done;
+}
 // Run `round codex` in the background of the test: -> { done: Promise<{code, json}> }.
 function startRound(w, extra = [], env = {}) {
   const merged = { ...process.env, ...w.fake.env, PIPELINE_CODEX: `node "${join(here, 'fixtures', 'fake-codex.mjs')}"`, PIPELINE_LOCK_DIR: join(w.scratch, 'locks'), ...FAST, ...env };
@@ -135,13 +154,15 @@ test('a running job with the SAME tag is adopted: Codex runs once', (t) => {
 test('a running job with ANOTHER tag is a job-conflict and nothing is started', (t) => {
   const w = roundWorld(t, { max: 3 });
   const emit = emitter(w);
-  startJob(w, 'something-else', emit(0, '{}', 2500));
+  startJob(w, 'something-else', emit(0, '{}', true));
   const r = rc(w, [], ok(w));
   assertExit(r, 1, r.stdout + r.stderr);
   assert.equal(r.json.error, 'job-conflict');
   assert.equal(r.json.tag, 'something-else');
+  assert.equal('pickedUp' in r.json, false, 'no round was recorded, so nothing was picked up');
   assert.equal(existsSync(join(w.repo.dir, '.review', 'state.json')), false);
   // let the other job finish: on Windows a running job holds the temp repo open and its removal fails (EPERM)
+  emit.release();
   assert.equal(w.cli(['job', 'wait', 'codex-r1', '--timeout', '60']).json.state, 'done');
 });
 
@@ -179,22 +200,22 @@ test('empty-range from the plan step is codex-review\'s JSON unchanged (exit 2) 
   assert.equal(existsSync(jobsDir(w)), false);
 });
 
-test('exit-2 variants of the job are keyed on the JSON error: update-in-progress reruns, the rest stop unchanged, no JSON is codex-no-json', (t) => {
+test('exit-2 variants of the job are keyed on the JSON error: update-in-progress reruns, the rest stop unchanged, no JSON is codex-no-json', async (t) => {
   const w = roundWorld(t, { max: 3 });
   const emit = emitter(w);
   const tag = tagOf(w, w.base, w.head);
-  const via = (code, json) => { startJob(w, tag, emit(code, json, 400)); return rc(w, []); };
-  const upd = via(2, '{"ok":false,"error":"update-in-progress","message":"an update is running"}');
-  assertExit(upd, 2, upd.stdout);
+  const via = (code, json) => { startJob(w, tag, emit(code, json, true)); return adopt(w, emit); };
+  const upd = await via(2, '{"ok":false,"error":"update-in-progress","message":"an update is running"}');
+  assert.equal(upd.code, 2, upd.out);
   assert.deepEqual([upd.json.error, upd.json.next], ['update-in-progress', 'rerun in a minute']);
   for (const error of ['already-applied', 'not-found', 'usage']) {
-    const r = via(2, `{"ok":false,"error":"${error}","message":"m"}`);
-    assertExit(r, 2, r.stdout);
+    const r = await via(2, `{"ok":false,"error":"${error}","message":"m"}`);
+    assert.equal(r.code, 2, r.out);
     assert.equal(r.json.error, error);
     assert.equal('next' in r.json, false);
   }
-  const crash = via(2, '');
-  assertExit(crash, 2, crash.stdout);
+  const crash = await via(2, '');
+  assert.equal(crash.code, 2, crash.out);
   assert.deepEqual([crash.json.error, crash.json.next], ['codex-no-json', 'job read']);
 });
 
@@ -277,7 +298,7 @@ test('a failed job (exit 3) while the state already records round R (the substit
   const w = roundWorld(t, { max: 3 });
   const emit = emitter(w);
   assertExit(w.codex(1, findingsOf([], [low()])), 0); // round 1 recorded another way, same range
-  startJob(w, tagOf(w, w.base, w.head), emit(3, '{"ok":false,"unavailable":true,"error":"codex-unavailable","substitute":{"eligible":true}}', 0));
+  startJob(w, tagOf(w, w.base, w.head), emit(3, '{"ok":false,"unavailable":true,"error":"codex-unavailable","substitute":{"eligible":true}}'));
   const r = rc(w, []);
   assertExit(r, 0, r.stdout + r.stderr);
   assert.equal(r.json.ok, true);
@@ -289,7 +310,7 @@ test('a failed job (exit 3) while the state already records round R (the substit
 test('a failed job (head-moved for head A) while another writer recorded round R at head B during the wait: the job failure JSON, and arbiter needed is NOT called', { skip: process.platform === 'win32' }, async (t) => {
   const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
   const emit = emitter(w);
-  startJob(w, tagOf(w, w.base, w.head), emit(2, '{"ok":false,"error":"head-moved","message":"the head moved"}', 3000));
+  startJob(w, tagOf(w, w.base, w.head), emit(2, '{"ok":false,"error":"head-moved","message":"the head moved"}', true));
   const hold = join(w.scratch, 'hold');
   const run = startRound(w, ['--base', w.base, '--head', w.head], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
   await untilExists(`${hold}.reached`);
@@ -297,6 +318,7 @@ test('a failed job (head-moved for head A) while another writer recorded round R
   const h2 = w.repo.commit('fix');
   w.prHead(h2);
   assertExit(w.codex(1, findingsOf([], [low()]), { from: w.base, to: h2 }), 0); // round 1 recorded at head B by another writer
+  emit.release();
   writeFileSync(hold, 'go\n');
   const r = await run.done;
   assert.equal(r.code, 2, r.out);
@@ -310,7 +332,7 @@ test('a job that exits 0 for head A while round R was discarded and recorded at 
   const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
   const emit = emitter(w);
   const okJson = JSON.stringify({ ok: true, counts: { blocking: 0, suggestions: 1, worth_considering: 0 }, reviewer: 'judge', codexPath: 'x/round-1' });
-  startJob(w, tagOf(w, w.base, w.head), emit(0, okJson, 3000));
+  startJob(w, tagOf(w, w.base, w.head), emit(0, okJson, true));
   const hold = join(w.scratch, 'hold');
   const run = startRound(w, ['--base', w.base, '--head', w.head], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
   await untilExists(`${hold}.reached`);
@@ -320,6 +342,7 @@ test('a job that exits 0 for head A while round R was discarded and recorded at 
   const h2 = w.repo.commit('fix');
   w.prHead(h2);
   assertExit(w.codex(1, findingsOf([], [low()]), { from: w.base, to: h2 }), 0); // ... and recorded again at head B
+  emit.release();
   writeFileSync(hold, 'go\n');
   const r = await run.done;
   assert.equal(r.code, 1, r.out);
@@ -348,12 +371,12 @@ test('a failed arbiter needed is ok:false, step arbiter-needed, the child\'s err
   assert.equal('arbiter' in r.json, false);
 });
 
-test('exit 0 with no usable output and no recorded round: result-unavailable, next job read', (t) => {
+test('exit 0 with no usable output and no recorded round: result-unavailable, next job read', async (t) => {
   const w = roundWorld(t, { max: 3 });
   const emit = emitter(w);
-  startJob(w, tagOf(w, w.base, w.head), emit(0, '', 500));
-  const r = rc(w, []);
-  assertExit(r, 1, r.stdout + r.stderr);
+  startJob(w, tagOf(w, w.base, w.head), emit(0, '', true));
+  const r = await adopt(w, emit);
+  assert.equal(r.code, 1, r.out);
   assert.deepEqual([r.json.error, r.json.next], ['result-unavailable', 'job read']);
 });
 
@@ -368,6 +391,74 @@ test('reviewer fable with no arbiter record: arbiter needed runs once and its JS
   assert.equal(r.json.arbiter.tag, direct.json.tag);
   assert.equal(r.json.arbiter.inputPath, direct.json.inputPath);
   assert.equal(typeof r.json.arbiter.promptHeader, 'string');
+});
+
+test('a recorded round picked up from its finished job says so (pickedUp: true); a fresh round does not carry the marker', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const first = rc(w, [], ok(w));
+  assertExit(first, 0, first.stdout + first.stderr);
+  assert.equal('pickedUp' in first.json, false, 'a fresh round ran Codex: nothing was picked up');
+  const again = rc(w, []);
+  assertExit(again, 0, again.stdout + again.stderr);
+  assert.equal(again.json.pickedUp, true);
+});
+
+test('a recorded round is not picked up once HEAD moved past its toHead: head-moved-since-round, exit 1, nothing reported or run', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  assertExit(rc(w, [], ok(w)), 0);
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  const h2 = w.repo.commit('fix');
+  w.prHead(h2);
+  const before = w.stateText();
+  const r = rc(w, []);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'head-moved-since-round');
+  assert.equal(r.json.pickedUp, true);
+  assert.equal('codex' in r.json, false, 'the old result was not reported');
+  assert.equal(w.stateText(), before);
+});
+
+// R1-B1 / R1-B2: round 1 is recorded at A and its job is still running when the command reads it (HEAD is A: adopted); the state or HEAD then changes during the wait.
+test('a recorded round whose HEAD moved DURING the wait is refused too: head-moved-since-round with pickedUp: true, the finished job is not reported', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const emit = emitter(w);
+  assertExit(w.codex(1, findingsOf([], [low()])), 0); // round 1 recorded at A (HEAD)
+  const okJson = JSON.stringify({ ok: true, counts: { blocking: 0, suggestions: 1, worth_considering: 0 }, reviewer: 'judge', codexPath: 'x/round-1' });
+  startJob(w, tagOf(w, w.base, w.head), emit(0, okJson, true));
+  const hold = join(w.scratch, 'hold');
+  const run = startRound(w, [], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  await untilExists(`${hold}.reached`); // the check before the wait passed: HEAD is still A
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  w.repo.commit('fix'); // HEAD moves to B during the wait
+  emit.release();
+  writeFileSync(hold, 'go\n');
+  const r = await run.done;
+  assert.equal(r.code, 1, r.out);
+  assert.equal(r.json.error, 'head-moved-since-round');
+  assert.equal(r.json.pickedUp, true);
+  assert.equal('codex' in r.json, false, 'the old result was not reported');
+});
+
+test('every JSON of a call for an already recorded round carries pickedUp: true, a refusal after the wait too (identity-mismatch)', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const emit = emitter(w);
+  assertExit(w.codex(1, findingsOf([], [low()])), 0);
+  const okJson = JSON.stringify({ ok: true, counts: { blocking: 0, suggestions: 1, worth_considering: 0 }, reviewer: 'judge', codexPath: 'x/round-1' });
+  startJob(w, tagOf(w, w.base, w.head), emit(0, okJson, true));
+  const hold = join(w.scratch, 'hold');
+  const run = startRound(w, ['--base', w.base, '--head', w.head], { PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  await untilExists(`${hold}.reached`);
+  assertExit(w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']), 0);
+  w.repo.write('src/fix.js', 'export const fix = 1;\n');
+  const h2 = w.repo.commit('fix');
+  w.prHead(h2);
+  assertExit(w.codex(1, findingsOf([], [low()]), { from: w.base, to: h2 }), 0); // recorded again at another head during the wait
+  emit.release();
+  writeFileSync(hold, 'go\n');
+  const r = await run.done;
+  assert.equal(r.code, 1, r.out);
+  assert.equal(r.json.error, 'identity-mismatch');
+  assert.equal(r.json.pickedUp, true);
 });
 
 test('reviewer fable WITH an arbiter record: arbiter needed is not called (the record is untouched) and the state is reported', (t) => {
