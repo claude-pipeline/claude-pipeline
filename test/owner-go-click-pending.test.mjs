@@ -253,7 +253,7 @@ test('flush then settle = the record the immediate path writes: same record, pro
   twin.flush();
   const immediate = await twin.hook({ hookCheck: check });
   assert.equal(immediate.recorded?.via, 'ask', JSON.stringify(immediate));
-  const norm = (rec, x) => JSON.parse(JSON.stringify(rec).replaceAll(x.askId, 'ASK').replaceAll(x.clickId, 'CLICK').replaceAll(x.file, 'FILE'));
+  const norm = (rec, x) => JSON.parse(JSON.stringify(rec).replaceAll(x.askId, 'ASK').replaceAll(x.clickId, 'CLICK').replaceAll(JSON.stringify(x.file).slice(1, -1), 'FILE')); // the path as JSON writes it (Windows backslashes are escaped)
   assert.deepEqual(norm(w.records()[0], w), norm(immediate.recorded, twin), 'the deferred record is the immediate one');
   assert.equal(w.records().length, 1);
   assert.equal(clickProvenance(w.records()[0], { home: w.home }), 'owner');
