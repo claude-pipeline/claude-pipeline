@@ -3,8 +3,10 @@ import assert from 'node:assert/strict';
 import {
   chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, utimesSync,
 } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { startJob, waitJob, readJob, jobMayBeRunning, acquireStartLock } from '../pipeline/lib/jobs.mjs';
@@ -102,6 +104,84 @@ test('the same name cannot start twice while running; after it finishes it resta
   assert.match(second.tail, /second-run/);
   assert.doesNotMatch(second.tail, /first-run/);
   assert.doesNotMatch(readFileSync(join(jobDirOf(cwd, 'dup'), 'log'), 'utf8'), /first-run/);
+});
+
+// R17-F1: clearOldJobDir deletes the old run's files one at a time (rmSync, in the filesystem's order). A reader holding run A must never find a half-deleted directory whose
+// meta.json still names A, so meta.json goes first. The delete leaves the same files whatever its order, so the order is what is observed: what is in the directory the moment
+// rmSync is first called on it or on a file in it (fs.rmSync is wrapped for the call, and the ESM bindings are synced).
+test('startJob moves the old run\'s meta.json aside before the recursive delete starts: a half-deleted directory never names run A', async (t) => {
+  const cwd = scratch(t);
+  start('half', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'half');
+  const seen = [];
+  const real = fs.rmSync;
+  fs.rmSync = (target, ...rest) => {
+    if (target === dir || String(target).startsWith(dir + sep)) seen.push({ meta: existsSync(join(dir, 'meta.json')), exit: existsSync(join(dir, 'exit.json')) });
+    return real(target, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.rmSync = real; syncBuiltinESMExports(); });
+  start('half', node("console.log('second-run')"), { cwd });
+  fs.rmSync = real;
+  syncBuiltinESMExports();
+  assert.deepEqual(seen[0], { meta: false, exit: true }, 'the old directory was cleared, meta.json first: it is gone before the first delete of anything in it');
+  assert.ok(seen.every((s) => s.meta === false), 'meta.json never came back');
+  assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+});
+
+// R1-F1: an interrupted clear (killed between the rename and the delete, or the delete failed) leaves the tombstone and the old run's other files; the next start of the SAME job heals it.
+test('a leftover job directory holding only the tombstone (meta.cleared.json) and old files is cleared by the next start of that job', async (t) => {
+  const cwd = scratch(t);
+  start('healed', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('healed', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'healed');
+  fs.renameSync(join(dir, 'meta.json'), join(dir, 'meta.cleared.json'));
+  assert.equal(existsSync(join(dir, 'meta.json')), false);
+  assert.equal(readJob('healed', { cwd }).state, 'missing', 'a reader sees no job in the half-cleared directory');
+  start('healed', node("console.log('second-run')"), { cwd });
+  const r = await waitJob('healed', { cwd, timeoutMs: 20_000, ...FAST });
+  assert.equal(r.state, 'done');
+  assert.match(r.tail, /second-run/);
+  assert.doesNotMatch(r.tail, /first-run/);
+  assert.equal(existsSync(join(dir, 'meta.cleared.json')), false, 'the tombstone is gone');
+  // A tombstone naming another job is not ours: the directory is refused, not deleted.
+  start('other', node("console.log('x')"), { cwd });
+  await waitJob('other', { cwd, timeoutMs: 20_000, ...FAST });
+  const odir = jobDirOf(cwd, 'other');
+  fs.renameSync(join(odir, 'meta.json'), join(odir, 'meta.cleared.json'));
+  const meta = readJson(join(odir, 'meta.cleared.json'));
+  writeFileSync(join(odir, 'meta.cleared.json'), JSON.stringify({ ...meta, name: 'not-other' }));
+  assert.throws(() => start('other', node("console.log('y')"), { cwd }), /refusing to replace/);
+});
+
+// R2-B2: the tombstone must outlive every other file of the old run: a delete that fails part way (the real one removes entries in directory order) may not leave a directory with neither meta file.
+test('a clear whose delete fails on another file keeps the tombstone; the next start of that job heals it', async (t) => {
+  const cwd = scratch(t);
+  start('partial', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('partial', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'partial');
+  const tomb = join(dir, 'meta.cleared.json');
+  const real = fs.rmSync;
+  // Fails on any file of the old run except the tombstone; a recursive delete of the whole directory removes the tombstone first (its worst directory order), then fails.
+  fs.rmSync = (target, ...rest) => {
+    if (target === dir) { real(tomb, { force: true }); throw new Error('simulated delete failure'); }
+    if (typeof target === 'string' && target.startsWith(dir + sep) && target !== tomb) throw new Error('simulated delete failure');
+    return real(target, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.rmSync = real; syncBuiltinESMExports(); });
+  assert.throws(() => start('partial', node("console.log('second-run')"), { cwd }), /simulated delete failure/);
+  fs.rmSync = real;
+  syncBuiltinESMExports();
+  assert.equal(existsSync(tomb), true, 'the tombstone is still there');
+  assert.equal(existsSync(join(dir, 'meta.json')), false);
+  start('partial', node("console.log('second-run')"), { cwd });
+  const r = await waitJob('partial', { cwd, timeoutMs: 20_000, ...FAST });
+  assert.equal(r.state, 'done');
+  assert.match(r.tail, /second-run/);
+  assert.doesNotMatch(r.tail, /first-run/);
+  assert.equal(existsSync(tomb), false, 'the tombstone is gone');
 });
 
 test('a policy refusal throws and starts nothing', async (t) => {

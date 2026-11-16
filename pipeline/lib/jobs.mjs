@@ -126,7 +126,10 @@ export function acquireStartLock(lock, ops = lockOps) {
   throw new Error('job already starting');
 }
 
-// Only a directory that is demonstrably this job's (its meta.json names it) or an empty leftover may
+const META_FILE = 'meta.json';
+const META_TOMBSTONE = 'meta.cleared.json';
+
+// Only a directory that is demonstrably this job's (its meta.json or tombstone names it) or an empty leftover may
 // be deleted; anything else (e.g. dir '.' with a project folder called like the job) is refused.
 function clearOldJobDir(jobDir, name) {
   let st;
@@ -137,10 +140,25 @@ function clearOldJobDir(jobDir, name) {
     throw err;
   }
   const isDir = st.isDirectory();
-  const ours = isDir && readJson(path.join(jobDir, 'meta.json'))?.name === name;
+  // meta.cleared.json is the tombstone of an earlier, interrupted clear (see below): it names this job just as meta.json does, so the next start heals it.
+  const ours = isDir && [META_FILE, META_TOMBSTONE].some((file) => readJson(path.join(jobDir, file))?.name === name);
   if (!ours && !(isDir && readdirSync(jobDir).length === 0)) {
     throw new Error(`refusing to replace ${jobDir}: it is not a job directory for "${name}"; remove it by hand if it is stale`);
   }
+  // meta.json first: the run-id recheck of a reader of the old run (snapshot) reads it, so a directory that is half deleted can never pass it.
+  // Renamed, not unlinked: a clear that is interrupted (or whose delete fails) leaves the tombstone, which still names the job, so the next start clears the rest.
+  // The tombstone is deleted after every other entry (a recursive delete of the directory removes entries in directory order, tombstone possibly first), then the directory.
+  if (ours) {
+    try {
+      renameSync(path.join(jobDir, META_FILE), path.join(jobDir, META_TOMBSTONE));
+    } catch (err) {
+      if (err.code !== 'ENOENT') throw err; // already gone: only the tombstone is left
+    }
+  }
+  for (const entry of readdirSync(jobDir)) {
+    if (entry !== META_TOMBSTONE) rmSync(path.join(jobDir, entry), { recursive: true, force: true, maxRetries: 3 });
+  }
+  rmSync(path.join(jobDir, META_TOMBSTONE), { force: true });
   rmSync(jobDir, { recursive: true, force: true, maxRetries: 3 }); // a fresh log, never a mix of two runs
 }
 
