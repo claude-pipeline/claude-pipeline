@@ -2269,30 +2269,24 @@ const UNSURE_OK = new Set([
   ...VAR_BUILTINS, ...VALUE_BINDERS,
 ]);
 const DIR_CHANGERS = ['cd', 'chdir', 'pushd', 'popd']; // (#372: zsh's chdir is cd)
-// #491 R2-F1 / R3: a command of a failure group that cannot change the caller's branch or directory whatever the walk could not see. An ALLOW-LIST:
-// the BARE word of a data command (or the same under a system bin directory), and a git command whose subcommand is read-only. A path to a program of the
-// same name (`/work/repo/echo`, `./git`), a package runner's lookup (viaRunner / binPath) and a redirection that writes a file are not inert.
+// #491 R2-F1 / R4: a command of a failure group that cannot change the caller's branch or directory whatever the walk could not see. An ALLOW-LIST of data
+// commands only: the BARE word of echo / printf / : / true / false / exit (or the same under a system bin directory). There is no git half on purpose: a git command
+// that looks read-only can still run a program or write HEAD (`git log --output=.git/HEAD`, a PATH or GIT_* change, a package-script bin directory, a letter-case or
+// alias spelling ...), and the list of ways kept growing. Any git command in the group leaves the names forgotten, exactly as on origin/main (no regression: main forgets
+// them for every such group). A path to a program of the same name (`/work/repo/echo`), a package runner's lookup (viaRunner / binPath), a package script's PATH
+// (scriptBinDir), a PATH the group sets, and a redirection that writes a file are not inert.
 const INERT_DATA = new Set(['echo', 'printf', ':', 'true', 'false', 'exit']);
-const INERT_GIT = new Set(['status', 'diff', 'log', 'show', 'rev-parse', 'ls-files', 'describe']);
 const SYSTEM_BIN_PATH = /^\/(?:usr\/)?s?bin\/[^/]+$/;
 const INPUT_REDIRECTS = new Set(['<', '<<', '<<-', '<<<']);
-const inertInFailGroup = (g, ctx, dir) => {
+const FD_DUP_TARGET = /^&(?:\d+|-)$/; // (`>&2`, `2>&1`, `>&-`: a descriptor duplicate or close; `>&file` writes a file)
+const inertInFailGroup = (g, ctx) => {
   const word = g.argv[0] ?? '';
-  const nm = SYSTEM_BIN_PATH.test(word) ? word.slice(word.lastIndexOf('/') + 1) : word; // (the bare word, or a system bin path: never `./git`, `/work/repo/echo`)
-  if (g.viaRunner || g.binPath) return false;
-  // (a redirection that may write a file: input, a descriptor duplicate (`>&2`, `2>&1`) and /dev/null are harmless)
-  if ((g.redirects ?? []).some((r) => !INPUT_REDIRECTS.has(r.op) && !String(r.target ?? '').startsWith('&') && r.target !== '/dev/null')) return false;
-  if (INERT_DATA.has(nm)) return true;
-  if (nm !== 'git') return false;
-  if (Object.keys(g.env ?? {}).some((k) => /^GIT_/i.test(k)) || assignedNames(ctx).some((k) => /^GIT_/i.test(k))) return false; // (GIT_CONFIG_* can define an alias or name a program)
-  const p = parseGitGlobal(g.argv, dir, g.env ?? {}, ctx);
-  if (p.configs.length) return false; // (-c: a one-off config can name a program to run)
-  if (g.argv.some((w) => w.startsWith('--exec-path') || w.startsWith('--config-env'))) return false;
-  const sub = p.sub?.toLowerCase();
-  if (sub === undefined || DYNAMIC.test(p.sub)) return false;
-  if (sub in ctx.gitAliases || ctx.aliasUnsure.has(`git:${sub}`)) return false;
-  if (sub === 'branch') return p.args.length === 1 && p.args[0] === '--show-current';
-  return INERT_GIT.has(sub);
+  const nm = SYSTEM_BIN_PATH.test(word) ? word.slice(word.lastIndexOf('/') + 1) : word; // (the bare word, or a system bin path: never `./echo`, `/work/repo/echo`)
+  if (!INERT_DATA.has(nm)) return false; // (and never a git command)
+  if (g.viaRunner || g.binPath || typeof ctx.scriptBinDir === 'string') return false;
+  if (Object.keys(g.env ?? {}).some((k) => /^PATH$/i.test(k)) || assignedNames(ctx).some((k) => /^PATH$/i.test(k))) return false; // (a PATH the group or the line set can make `echo` a program)
+  // (a redirection that may write a file: input, a descriptor duplicate and /dev/null are harmless)
+  return !(g.redirects ?? []).some((r) => !INPUT_REDIRECTS.has(r.op) && !FD_DUP_TARGET.test(String(r.target ?? '')) && r.target !== '/dev/null');
 };
 
 // A line that defines a function (its body is parsed as if it ran — `f(){ cd /safe; }; git push` never runs the cd),
@@ -3100,7 +3094,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   // (#491 R2-F1: an allow-list: only a group opened by a directory change in which every command is inert, a plain data command or a git command with no state word, so no script, feed, source, eval, shell, gh or package runner
   // that could switch the caller's branch where the walk cannot see it; R2-B1: otherwise every branch name is forgotten, including one the group itself recorded through an absolute -C directory)
   if (failGroup?.snap) {
-    if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx, dir))) restoreAfterGroup();
+    if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();
     else for (const e of ctx.branches.values()) e.name = null;
   }
   return allowed();
