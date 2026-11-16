@@ -55,6 +55,8 @@ export function realGitWiring() {
 // otherwise stand in for the remote's copy and hide a chat config, #454)
 const COMMITTED_REFS = ['HEAD', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'];
 const defaultGitShow = (root, ref) => {
+  // a missing remote-tracking ref must read as missing: `git show` would fall through to a branch or tag literally named `refs/remotes/origin/<b>` (#455)
+  if (ref.startsWith('refs/') && run('git', ['-C', root, 'show-ref', '--verify', '--quiet', ref], { timeoutMs: LOOKUP_TIMEOUT_MS }).code !== 0) return null;
   const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: LOOKUP_TIMEOUT_MS });
   return r.code === 0 ? r.stdout : null;
 };
