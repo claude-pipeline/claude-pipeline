@@ -283,6 +283,29 @@ test('ci-wait: ci.merge_checks is waited on as well, and on a ci.e2e_label PR a 
   assert.ok(calls.includes('labels'));
 });
 
+test('ci-wait (R1-B2): a pipeline.yml that exists but is invalid is a config error (exit 2), never a silent pass without ci.merge_checks / ci.e2e_label; a missing file is still allowed', async () => {
+  const gh = {
+    prView: () => pr(),
+    protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'ci', app_id: 15368 }] } } }),
+    branchRules: () => [],
+    checkRunsOf: () => [run(1, 'ci', 'success'), run(2, 'Replay from zero', 'failure')],
+    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
+  };
+  const go = (repo) => ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock: { now: () => 0, sleep: async () => {} }, onProgress: () => {} } });
+  const bad = createTmpRepo();
+  bad.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}  merge_checks: [Replay from zero]\nverify_oops: 1\nverify:\n  stop_queue_wait_minutes: -1\n`);
+  bad.commit('init');
+  const r = await go(bad);
+  assert.equal(r.exitCode, 2, JSON.stringify(r.output));
+  assert.equal(r.output.error, 'config');
+  assert.ok(Array.isArray(r.output.errors) && r.output.errors.length > 0);
+  const none = createTmpRepo();
+  none.write('README.md', 'x');
+  none.commit('init');
+  const ok = await go(none);
+  assert.equal(ok.output.verdict, 'passed', JSON.stringify(ok.output));
+});
+
 test('meta: the usage names the new output fields and verdict', () => {
-  for (const word of ['conflicting', 'others']) assert.ok(meta.usage.includes(word), word);
+  for (const word of ['conflicting', 'others', 'notOwed']) assert.ok(meta.usage.includes(word), word);
 });

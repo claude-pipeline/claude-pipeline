@@ -58,8 +58,9 @@ export const DEFAULTS = deepFreeze({
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
   // merge_checks: check names the repo's own merge command also requires although branch protection does not (EagleWatch: "Replay
-  // from zero"). Only `pipeline ci-wait` reads them: it waits for each and judges it like a required check (a check that never
-  // appears ends `missing`, so list only checks that always report). They are NOT part of the protected set (requiredChecks).
+  // from zero", a path-filtered workflow). Only `pipeline ci-wait` reads them: a merge check is judged only when it reports (pending
+  // waits, a failure fails, a draft-era skip is stale); one with no producer at all once the required set is final is not owed and
+  // is listed as `notOwed`, never `missing`. They are NOT part of the protected set (requiredChecks).
   // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
   // which only exists for user-owned repos: an org-owned repo MUST list its approvers. The same logins (or the owner) are the
   // authors whose review-complete comment counts for review_check.

@@ -3,8 +3,9 @@
 // the draft-era SKIPPED run of a required check (Phase 6, EW #1631). The decisions live in lib/ci-wait.mjs (a pure state
 // machine); this file wires GitHub, the clock and stderr progress into it. Run it through `P job start` (it can outlast a
 // tool call).
-import { intOption, parseCommandArgs } from '../lib/cli.mjs';
-import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
+import { existsSync } from 'node:fs';
+import { EXIT, intOption, parseCommandArgs } from '../lib/cli.mjs';
+import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { loadConfig, requiredChecks } from '../lib/config.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { waitForCi } from '../lib/ci-wait.mjs';
@@ -12,7 +13,7 @@ import { readClassicRequired } from '../lib/protection.mjs';
 
 export const meta = {
   summary: 'wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict',
-  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, on a PR with ci.e2e_label: [{name, status, url}] non-required checks still running or red)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
+  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, on a PR with ci.e2e_label: [{name, status, url}] non-required checks still running or red), notOwed? (passed: ci.merge_checks names with no producer at all, not owed)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
 };
 
 export const DEFAULT_APPEAR_SECONDS = 300;
@@ -33,8 +34,10 @@ export const run = guarded(async (argv, ctx) => {
   const root = resolveRepo(values, ctx);
 
   // The check names the pipeline itself requires (config + the implicit guard / review contexts): diagnostics only, for a
-  // verdict `unverified`. A config that does not load is not an error here.
+  // verdict `unverified`. A missing pipeline.yml is allowed (nothing configured); one that exists but does not load is an error: the
+  // config decides what is waited on (ci.merge_checks, ci.e2e_label), so a typo must not silently switch those waits off.
   const loaded = await loadConfig(root);
+  if (!loaded.ok && existsSync(loaded.path)) throw new Fail(EXIT.USAGE, { ok: false, error: 'config', errors: loaded.errors, path: loaded.path });
   const configChecks = loaded.ok ? [...new Set([...requiredChecks(loaded.config.ci), ...loaded.config.ci.merge_checks])] : [];
   // ci.merge_checks: waited on like required checks (not part of branch protection). ci.e2e_label: on a PR carrying it, non-required
   // checks that are still running or red are reported as `others`.

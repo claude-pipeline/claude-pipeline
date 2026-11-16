@@ -389,7 +389,7 @@ head you did not review (the receipt names the head the event carried).
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
 violations no longer fail CI, the review skill stops before the merge, lists them in a PR comment and merges when you say
 "merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
-required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.merge_checks` (optional list: checks your own merge command also requires although branch protection does not; `pipeline ci-wait` waits for them like required checks, `protect` ignores them), `ci.review_check`
+required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.merge_checks` (optional list: checks your own merge command also requires although branch protection does not; `pipeline ci-wait` waits for them when they report, like required checks, and reports one that never reports as `notOwed`; `protect` ignores them), `ci.review_check`
 (default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
 names the head's content hash, and every required-check list includes it; turn it on together with branch protection), `ci.draft_while_iterating` (default `false`; `true` makes `pipeline redraft` turn a ready PR back to draft before a fix push, so
 the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts, lists
