@@ -276,17 +276,40 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     denies(what, line, {}, DIRS);
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
   }
-  // (the && chain stays sound and is not over-refused: a failed redirection makes the cd exit non-zero, so what is chained to it with && runs only when the cd ran)
+  // (#352 R37-F1: no exception for &&: a redirected change is unknown at once, so a script ending in a redirected switch cannot hand it to its caller. R36 allowed these rows through a 'chain' tracker nothing settled at the end of a text)
   for (const [what, line] of [
-    ['cd back with 2>/dev/null && push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
-    ['cd back with >&2 && push', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
-    ['cd back with &>/dev/null && push (R35 allow kept)', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
-    // (R35 denied these two: with the && chain 'chain' of R36 the push runs only when the cd / checkout ran, so a failing redirection no longer hides anything)
-    ['failing redirection on the cd back, then && push (R35 deny flipped: sound)', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
-    ['failing redirection on the checkout, then && push (R35 deny flipped: sound)', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null && push (R36 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
+    ['cd back with >&2 && push (R36 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
+    ['cd back with &>/dev/null && push (R36 allow flipped)', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
+    ['failing redirection on the cd back, then && push', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
+    ['failing redirection on the checkout, then && push', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
   ]) {
-    allows(what, line);
-    allows(`${what}, in a script`, RUN_SH, script('echo', line));
+    denies(what, line, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
+  }
+});
+// (#352 R37-F1: the caller trusts the branch a definite script ends on, so a script whose LAST command is a switch that may not have run (a redirection that can fail, a && after a failing command) must not hand it over:
+// cwd a repository on main, reset.sh = `git switch agent/x > /missing/f`, the line `bash ./reset.sh; <push>` sends main when the redirection fails)
+test('#352 R37-F1: a script / package script that ends in a redirected or conditional switch does not hand the switched branch to its caller', () => {
+  const at = (cmd, files) => evaluateGitCommand(cmd, {
+    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', files),
+  });
+  const files = (body) => ({ 'reset.sh': `#!/bin/bash\n${body}\n`, 'package.json': JSON.stringify({ name: 'x', scripts: { reset: body, other: 'echo hi' } }) });
+  for (const body of ['git switch agent/x > /missing/f', 'git switch agent/x 2>/dev/null', 'false && git switch agent/x']) {
+    for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
+      for (const sep of [';', '&&']) {
+        const r = at(`${caller} ${sep} ${PB} origin HEAD`, files(body));
+        assert.equal(r.decision, 'deny', `${what} ending in \`${body}\`, then ${sep}: allowed`);
+        assert.match(r.reason, DIRS, `${what} \`${body}\` ${sep}: ${r.reason}`);
+      }
+    }
+  }
+  // (twin: the same script with a plain switch hands it over)
+  for (const [what, caller] of [['bash script', 'bash ./reset.sh'], ['package script', 'npm run reset']]) {
+    for (const sep of [';', '&&']) {
+      const r = at(`${caller} ${sep} ${PB} origin HEAD`, files('git switch agent/x'));
+      assert.equal(r.decision, 'allow', `twin ${what} ${sep}: ${r.reason}`);
+    }
   }
 });
 // (#352 R36-F1: a loop's own level and depth come from the whole of its range, not from its first listed command, which is a command of a substitution / group / loop in its header)
@@ -317,4 +340,23 @@ test('#352 R36-F1: a loop whose header holds a substitution, a group or a loop i
     allows(`${hw}: a plain cd back, in a script`, RUN_SH, script('echo', loop));
   }
   allows('for over a substitution: stays in the repository', `for i in $(echo 1 2); do cd sub && ${PB} origin HEAD; cd ..; done`);
+});
+
+// (#352 R37-F2: a loop's own level and depth are not inferred from the commands listed in its range: with no command at its own level (a while / until header that is a group or a loop, the whole body in { } groups or inner loops) the
+// shortest one is one level too deep, and the cd back that never ran (a failing redirection on its group, an inner loop that runs zero times) was trusted)
+test('#352 R37-F2: a loop with no command at its own level keeps its own level and depth', () => {
+  const rows = [
+    ['while on a { } group, the body all in { } groups: a failing redirection on the cd back',
+      `while { true; }; do { ${PB} origin HEAD; }; { cd /work/other; }; { cd ${GIT_ROOT}; } < /missing; done`,
+      `while { true; }; do { ${PB} origin HEAD; }; { cd /work/other; }; { cd ${GIT_ROOT}; }; done`],
+    ['while on a loop, the body all in inner loops: a cd back in a loop that runs zero times',
+      `while for j in a; do true; done; do for k in 1; do ${PB} origin HEAD; done; for k in 1; do cd /work/other; done; while false; do cd ${GIT_ROOT}; done; done`,
+      `while for j in a; do true; done; do for k in 1; do ${PB} origin HEAD; done; for k in 1; do cd /work/other; done; cd ${GIT_ROOT}; done`],
+  ];
+  for (const [what, deny, twin] of rows) {
+    denies(what, deny, {}, DIRS);
+    denies(`${what}, in a script`, RUN_SH, script('echo', deny), DIRS);
+    allows(`${what}: plain cd back`, twin);
+    allows(`${what}: plain cd back, in a script`, RUN_SH, script('echo', twin));
+  }
 });
