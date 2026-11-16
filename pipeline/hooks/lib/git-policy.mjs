@@ -2895,6 +2895,9 @@ function evalString(str, startDir, ctx, level, child = false) {
   const cdp = cdpathMaybe(cmds, ctx);
   const from = flowStart(cmds);
   let uncertain = false; // an earlier cd / branch change may not have taken effect for the commands that follow
+  // #492: doubt about a branch change this text made that its caller must keep (an exit only ends THIS text; a pending conditional change may not have run): see the end of the text
+  let gitDoubt = false; // (the pending `uncertain` came from a git command)
+  let exitNarrowedGit = false; // (a git state change narrowed by `|| exit` / a failure group that exits: the text's later commands saw it, its caller may not)
   const forgetState = () => { dir = null; for (const e of ctx.branches.values()) e.name = null; };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
@@ -2967,6 +2970,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (uncertain && c.sep !== '&&') {
       forgetState();
       uncertain = false;
+      gitDoubt = false;
     }
     if (argv.length) {
       const nm = baseName(argv[0]);
@@ -2980,7 +2984,13 @@ function evalString(str, startDir, ctx, level, child = false) {
         && !(after !== undefined && after.argv.length === 0 && (after.redirects ?? []).length > 0)
         || (changesState && exitsAsGroup(i));
       if (changesState && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: false, from: i, byDir: DIR_CHANGERS.includes(nm) };
-      if (changesState && (inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (next?.sep === '||' && !orExits))) uncertain = true;
+      const chained = c.depth > 0 || c.sep === '&&' || c.sep === '||' || ranInSubshell(cmds, i) || (next?.sep === '||' && !orExits);
+      if (changesState && (inFlow(from, i) || chained)) {
+        uncertain = true;
+        // (#492: a command of an if / loop body may not run either; while the readings of a loop name are pinned they are the union of that loop's alternatives: see judgeReadings)
+        if (nm === 'git' && (chained || (mayNotRun(cmds, from, i) && !pinsAt(ctx, level)))) gitDoubt = true;
+      }
+      if (changesState && nm === 'git' && orExits) exitNarrowedGit = true;
       if (failGroup && failGroup.snap === null) failGroup.doubt = uncertain; // (the doubt about this cd / checkout, carried or new: it is consumed inside the group)
     }
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
@@ -3104,6 +3114,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();
     else for (const e of ctx.branches.values()) e.name = null;
   }
+  // #492: what a nested text hands back to its caller is not its own optimistic state: an `exit` only ends the text, and a branch change that may not have run (a pending `uncertain`) is unknown
+  if (level > 0 && (exitNarrowedGit || (uncertain && gitDoubt))) for (const e of ctx.branches.values()) e.name = null;
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it

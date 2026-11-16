@@ -51,6 +51,33 @@ describe('#493: a substitution after a cd / assignment that is a pipe stage or b
   });
 });
 
+// ---- #492 ----
+const S = resolve('/work/repo/s.sh');
+const MAIN = { [resolve('/work/repo')]: 'main' }; // the repository really is on main when the line starts
+describe('#492: doubt carried out of a nested text', () => {
+  const SHAPES = [
+    ['(1) a plain exit after a checkout that may fail', 'git checkout agent/missing || exit 1\n'],
+    ['(2) a failure group that exits, then another line', 'git checkout agent/missing || { echo no; exit 1; }\nmake\n'],
+    ['(3) a checkout that may not run on the last line', '[ -n "$CI" ] && git checkout agent/y\n'],
+  ];
+  for (const [why, body] of SHAPES) {
+    test(`${why}: the caller's push is denied (the real branch is main), bash s.sh`, () => expect('deny', 'bash s.sh; git push', { [S]: body }, MAIN));
+    test(`${why}: the same with source`, () => expect('deny', 'source s.sh; git push', { [S]: body }, MAIN));
+  }
+  // the top level (level 0) keeps today's verdicts: an exit there ends the whole line, a conditional checkout is judged by the next command
+  test('level 0: (1) and (2) narrowed by the exit stay allowed, (3) stays denied', () => {
+    expect('allow', 'git checkout agent/missing || exit 1\ngit push', {}, MAIN);
+    expect('allow', 'git checkout agent/missing || { echo no; exit 1; }\nmake\ngit push', {}, MAIN);
+    expect('deny', '[ -n "$CI" ] && git checkout agent/y\ngit push', {}, MAIN);
+  });
+  test('inside the child itself the exit narrowing still holds (the script pushes the branch it switched to: allowed)', () => {
+    expect('allow', 'bash s.sh', { [S]: 'git checkout agent/y || exit 1\ngit push\n' }, MAIN);
+  });
+  test('a child that switches with certainty hands the caller the branch it switched to (allowed)', () => {
+    expect('allow', 'bash s.sh; git push', { [S]: 'git checkout agent/y\nmake\n' }, MAIN);
+  });
+});
+
 // Over-denial guard: ordinary work stays allowed after every change above.
 describe('ordinary work stays allowed', () => {
   const OK = (name, line, files) => test(`allowed: ${name}`, () => expect('allow', line, files));
