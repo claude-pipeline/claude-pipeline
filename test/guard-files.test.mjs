@@ -1023,6 +1023,18 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `node --input-type module <<< "import('./pipeline/hooks/lib/${lib}')"`,
       `bun - <<< "import('./pipeline/hooks/lib/${lib}')"`,
       `node --input-type module < <(echo "import('./pipeline/hooks/lib/${lib}')")`,
+      // (R2: a line that is not flat (a group, a subshell, a compound command, a function, an exec redirect, nested text) is read as a whole: the stdin a runtime gets there is not followed command by command)
+      `printf '%s\\n' "import('./pipeline/hooks/lib/${lib}')" | (node --input-type=module)`,
+      `(echo "import('./pipeline/hooks/lib/${lib}')"; true) | node --input-type=module`,
+      `{ echo "import('./pipeline/hooks/lib/${lib}')"; true; } | node --input-type=module`,
+      `(node --input-type=module) <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `{ node -; } <<'EOF'\nimport('./pipeline/hooks/lib/${lib}')\nEOF`,
+      `bash -c 'node --input-type=module' <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `exec <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module`,
+      `exec 3<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&3`,
+      `f() { node --input-type=module; }; echo "import('./pipeline/hooks/lib/${lib}')" | f`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | while :; do node -; break; done`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | if true; then node -; fi`,
     ]) assert.equal(bash(cmd), 'deny', cmd);
     for (const cmd of [
       `cat pipeline/hooks/lib/${lib}`,
@@ -1036,6 +1048,7 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
       `git add pipeline/hooks/lib/${lib}; echo ok | node scripts/test.mjs owner-go-click.test.mjs`,
       `cat pipeline/hooks/lib/${lib} && node --test test/owner-go-click.test.mjs`,
       `git diff -- pipeline/hooks/lib/${lib} | grep recordClick`,
+      `git diff -- pipeline/hooks/lib/${lib} | grep recordClick || node scripts/test.mjs owner-go-click.test.mjs`,
     ]) assert.equal(bash(cmd), 'allow', cmd);
   }
   for (const cmd of [

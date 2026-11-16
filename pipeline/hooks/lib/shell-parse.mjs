@@ -2874,7 +2874,7 @@ class Parser {
       } else if (c === '&') {
         const nx = s[this.i + 1];
         if (nx === '&') { endSeg(this.i); lastSep = '&&'; this.i += 2; }
-        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; if (depth === 0) ctx.notPlain = true; } // a background job: the command before it ran in a subshell
+        else if (nx !== '>' || noRedir) { flushWord(); const closed = seg?.closesFrom; endSeg(this.i); this.markClosedOut(closed); lastSep = '&'; this.i++; if (depth === 0) ctx.notPlain = ctx.notFlat = true; } // a background job: the command before it ran in a subshell
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
@@ -2939,7 +2939,7 @@ class Parser {
           // (a subshell after && / || runs only when that holds, and one that is a pipeline stage runs apart: its commands may not run, as for a { } group (cbrace).
           // `{ cat a; true || (cat x); cat c; } | bash` runs a+c, which the join a+x+c hid)
           const cond = !body && !(seg && seg.words.length) && ['&&', '||', '|'].includes(lastSep);
-          if (depth === 0) ctx.notPlain = true; // (a subshell, a function body, `((`)
+          if (depth === 0) ctx.notPlain = ctx.notFlat = true; // (a subshell, a function body, `((`)
           const hadWords = !!(seg && seg.words.length); // (`f ()`, `! (`, `if (`: the words before it make it no plain subshell)
           const sepBefore = lastSep;
           endSeg(this.i);
@@ -2969,7 +2969,7 @@ class Parser {
         }
       } else if (c === ')') {
         if (this.dbrace > 0) this.markRefused(REFUSED_PARAM); // (#269 R21-F1: the shell reads a `)` inside ${…} as text; here it would end the construct early)
-        if (depth === 0) ctx.notPlain = true;
+        if (depth === 0) ctx.notPlain = ctx.notFlat = true;
         endSeg(this.i);
         if (depth === 0) { if (!stopAtParen || this.queue.length) ctx.notWide = true; else this.shapeEvent(')', ';'); }
         lastSep = ';';
@@ -3231,7 +3231,7 @@ class Parser {
         if (w.text === '{' || w.text === '}' || w.text === '[[' || (headOnly && NOT_PLAIN_HEAD.has(w.text))) { plain = false; break; }
         headOnly = headOnly && NOT_PLAIN_HEAD.has(w.text);
       }
-      if (!plain) this.ctx.notPlain = true;
+      if (!plain) this.ctx.notPlain = this.ctx.notFlat = true;
     }
     if (seg.outSubs.length || seg.words.some((w) => w.subs.length && w.text.includes('>('))) this.feedOutSubs(seg);
     // Redirections belong to the command they were written on; a redirect with no command of its own
@@ -3666,7 +3666,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, dqTrans: false, notPlain: false, notWide: false, n0: 0, shapeEvents: [], shapeStack: [], hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, ctlBroken: false, ansiC: false, dqTrans: false, notPlain: false, notFlat: false, notWide: false, n0: 0, shapeEvents: [], shapeStack: [], hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -3731,6 +3731,9 @@ export function simpleCommands(str, opts) {
   // a heredoc whose body the parser cannot locate or whose delimiter spelling or terminator line the shell may read differently. A caller that needs to know a command surely ran after the one before it
   // (the cd narrowing of the files policy) trusts the order of the commands only for such a text. Only the text's own level counts: what a substitution or a `-c` string holds runs in another shell.
   Object.defineProperty(ctx.out, 'plainSeq', { value: !ctx.notPlain && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign, enumerable: false });
+  // flatSeq: plainSeq widened to the pipe and `||`: the whole text is simple commands joined by && || ; | |& or a newline, and nothing else (the same exclusions: no group, subshell, function, compound command, `!`, `time`, `&`, command-less segment, cut-short parse, doubtful heredoc).
+  // A caller that reads what a command's own stdin holds (the owner-go stdin-program guard) trusts its reading of the pipe stages only for such a text; every other shape it reads as a whole.
+  Object.defineProperty(ctx.out, 'flatSeq', { value: !ctx.notFlat && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign, enumerable: false });
   // shape: null unless the text is a WIDER whitelist than plainSeq: simple commands joined by && ; a newline || | |& or &, and at the top level only (not inside one another) a subshell `( … )`, a brace group
   // `{ …; }` or `if CMD; then … [else …] fi`, each holding such a sequence; nothing else (no `!`, coproc, always, function, loop, case, `elif`, `[[`, `time`, command-less segment, cut-short parse, heredoc the parser and
   // the shell may read differently). Then an array of the constructs' events, see shapeEvent. The cd narrowing of the files policy reads it: from the commands in order, each one's own join (`sep`) and these events it
