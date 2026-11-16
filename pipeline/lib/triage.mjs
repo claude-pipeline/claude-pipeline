@@ -1183,6 +1183,10 @@ const locationProblem = (file) => {
 };
 const entryPaths = (f) => [...new Set([f?.oldPath, f?.newPath, f?.path].filter((p) => typeof p === 'string' && p !== ''))];
 
+// An unsettled BLOCKING / security item may still end up accepted, so the same-file test counts it as accepted: no final yet (the arbiter is still owed it), a final that waits for a human, or a
+// judge dismissal a settle test can still overturn (final by the judge, not ACCEPT, disputedBug and settleTest.possible, no test result yet: `triage settle` may make it an ACCEPT by test).
+const settleTestable = (i) => i.final.by === 'judge' && i.final.decision !== 'ACCEPT' && i.judge?.disputedBug === true && i.judge.settleTest?.possible === true && (i.test?.status ?? 'none') === 'none';
+const unsettledHold = (i) => isObject(i) && (!isObject(i.final) || i.final.needsHuman === true || settleTestable(i));
 // -> { level: 'low' | 'high', reasons: [why it is high] }. `files` = the PR's reviewed diff (git.mjs#diffFiles entries); null/undefined = unknown, so high.
 export function itemSeverity(item, { state, config, files, baseConfig } = {}) {
   const high = (reason) => ({ level: 'high', reasons: [reason] });
@@ -1199,7 +1203,7 @@ export function itemSeverity(item, { state, config, files, baseConfig } = {}) {
   if (hits.length > 1) return high(`${asciiLine(item.file, 60)} is ambiguous in the reviewed diff`);
   // The same file under either side of a rename: the entry resolved above names both paths, and a finding at the other one is in this file too.
   const sameFile = entryPaths(hits[0]);
-  if (allItems(state).some((i) => i.final?.decision === 'ACCEPT' && sameFile.includes(i.file) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)))) {
+  if (allItems(state).some((i) => (i.final?.decision === 'ACCEPT' || unsettledHold(i)) && sameFile.includes(i.file) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)))) {
     return high(`${asciiLine(item.file, 60)} also holds an accepted BLOCKING or security finding`);
   }
   // The union of the working-tree and the default branch's committed sensitive lists (callers pass baseConfig; a PR must not shrink its own list).
@@ -1316,13 +1320,8 @@ export function applyPostMaxDefault(items, { policy, ordinal, max, severity } = 
   let view = null;
   if (isObject(severity) && isObject(severity.state)) {
     const ids = new Set(items.map((i) => i?.id));
-    // An unsettled BLOCKING / security item may still end up accepted, so it counts as accepted for the same-file test: no final yet (the arbiter is still owed it), a final that waits for a human, or a
-    // judge dismissal a settle test can still overturn (final by the judge, not ACCEPT, disputedBug and settleTest.possible, no test result yet: `triage settle` may make it an ACCEPT by test).
-    // Only items already in the state at this point: a BLOCKING accepted in a LATER round on the same file is not caught (a suggestion already turned into a FOLLOW-UP is not revisited).
-    const settleTestable = (i) => i.final.by === 'judge' && i.final.decision !== 'ACCEPT' && i.judge?.disputedBug === true && i.judge.settleTest?.possible === true && (i.test?.status ?? 'none') === 'none';
-    const holds = (i) => isObject(i) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)) && (!isObject(i.final) || i.final.needsHuman === true || settleTestable(i));
-    const asAccepted = (i) => (holds(i) ? { ...i, final: { decision: 'ACCEPT', by: 'pending', needsHuman: false } } : i);
-    view = { ...severity.state, rounds: (severity.state.rounds ?? []).map((r) => ({ ...r, items: (r?.n === severity.round ? [...(r.items ?? []).filter((i) => !ids.has(i?.id)), ...items] : (r?.items ?? [])).map(asAccepted) })) };
+    // The unsettled-item hold is itemSeverity's own (unsettledHold). Only items already in the state at this point: a BLOCKING accepted in a LATER round on the same file is not caught (a suggestion already turned into a FOLLOW-UP is not revisited).
+    view = { ...severity.state, rounds: (severity.state.rounds ?? []).map((r) => ({ ...r, items: r?.n === severity.round ? [...(r.items ?? []).filter((i) => !ids.has(i?.id)), ...items] : (r?.items ?? []) })) };
   }
   const lowSeverity = (item) => {
     if (view === null || !isObject(severity.config) || !isObject(severity.baseConfig)) return false;
