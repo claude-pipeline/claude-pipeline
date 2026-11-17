@@ -253,3 +253,4 @@ full record.
 - 2026-11-17 · #592 · Click-to-approve works on 2.1.323 (harness-added answers), a re-shown request with a hold binds, honest merge-line wording (#585) · risk high · rounds 6 · arbiter 2 · awaiting-owner-merge · Codex 7d: 491 runs (128 high)
 - 2026-11-17 · #606 · Guard fixes #554–#558 and the #563 quoted-word fan-out refusal · risk high · rounds 6 · arbiter 5 · awaiting-owner-merge · Codex 7d: 491 runs (128 high)
 - 2026-11-17 · #623 · Follow-ups from #536/#596: honest Tests-added count, escalation stats, revert and queue advice, no fake Codex usage rows · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 491 runs (128 high)
+- 2026-11-17 · #611 · Round discipline 2, PR B1: the pipeline understands the recommended-first round dialog and a checked Follow up click (issues none yet) · risk high · rounds 7 · arbiter 6 (fix-verify 2) · substitute 1 · awaiting-owner-merge · Codex 7d: 491 runs (128 high)
