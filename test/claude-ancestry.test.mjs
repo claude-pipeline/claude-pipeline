@@ -344,7 +344,8 @@ test('win32: an injected lookup wins over table (the table is never queried); no
 });
 
 test('processTable on a real Windows host lists this process with its parent and creation time', { skip: process.platform !== 'win32' }, () => {
-  const t = processTable();
+  // #348: on a busy shared runner the one PowerShell query can hit its 12 s timeout (read as null, which production answers with the per-hop fallback). Retry once; a table that IS read is asserted in full.
+  const t = processTable() ?? processTable();
   assert.ok(t instanceof Map, 'the table could be read');
   const me = t.get(process.pid);
   assert.ok(me, 'this process is in the table');
