@@ -26,7 +26,7 @@ import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
-import { roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
+import { clickNotes, roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
@@ -394,7 +394,7 @@ async function ownerRuling(rest, ctx) {
       if (gap === 'provenance') return refuse(`an answer is recorded for ${slug} #${prNum} ${id}, but it cannot be confirmed as typed by the owner (its prompt is not in the transcript as the owner's, or came from a notice, another session or a scheduled turn, or was typed while the agent was still working${rulingConfigDirHint(asked) ? `; or ${rulingConfigDirHint(asked)}` : ''}), so it approves nothing; ${again}, and ask the owner to answer again (an answer typed while the agent was still working never counts: show the FRESH closing line \`ruling-request\` prints and ask once more after the reply ends)`);
       if (gap === 'no-content') return refuse(`the owner's ruling for ${slug} #${prNum} ${id} was asked with the old ruling line, which has no content digest, so it approves nothing; ${again}`);
       if (gap === 'changed') return refuse(`the finding text of ${id} (or of another item asked in the same request, or an item is gone) changed since the owner was asked, so the recorded ruling no longer applies; ${again}`);
-      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): ${again}`);
+      return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): ${again}${clickNotesText(slug, prNum)}`);
     }
     seedBaseline({ ctx, root, pr: prNum, state }); // the `comment --kind triage` that publishes this ruling needs the baseline too
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
@@ -865,6 +865,12 @@ function itemsFor(state, ids) {
   const found = ids.map((id) => all.find((i) => String(i.id).toUpperCase() === String(id).toUpperCase()));
   return found.every(Boolean) ? found : null;
 }
+// Why (#472): an owner click on the ruling dialog that is waiting, refused or declined is said in the "no owner ruling is recorded" refusal, so the agent does not ask again for a click that is only
+// waiting to be verified. '' when there is nothing to say; never throws.
+const clickNotesText = (repo, pr) => {
+  const notes = clickNotes({ repo, prs: [pr], kinds: ['ruling'] });
+  return notes.length > 0 ? `; ${notes.join('; ')}` : '';
+};
 const contentOfState = (state) => (ids) => {
   const items = itemsFor(state, ids);
   return items ? rulingContentDigest(items) : null;

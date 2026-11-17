@@ -679,7 +679,8 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   const exemptNote = exempt ? `; docs-only exemption (review.docs_exempt_paths): ${exempt.files.join(', ')} added after the reviewed head ${exempt.reviewedHead.slice(0, 12)}` : '';
   // A round past review.max_rounds must carry the owner's extra-round grant, re-proved here from the owner's record and its marker (never
   // from the state alone). A grant lets a round run; it is no merge authority, so it is shown but never an owner-merge item.
-  const grants = verifyOwnerGrants(state, { repo, pr, maxRounds: config?.review?.max_rounds, ...ownerGo });
+  // #472: the merge dry run (readOnly) writes nothing, and settling a pending click writes: `settle: false` overrides a caller's opt-in (it also turns off the marker repair of extra-round reads).
+  const grants = verifyOwnerGrants(state, { repo, pr, maxRounds: config?.review?.max_rounds, ...ownerGo, ...(readOnly ? { settle: false } : {}) });
   if (!grants.ok) return check('review', false, grants.problems.join('; '));
   const grantNote = grants.granted.map((g) => `; ${g.past ? 'owner-approved past round' : 'owner-granted round'} ${g.k}: "${clip(g.quote.replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('');
   // A Claude stand-in reviewed instead of Codex (plan 2026-11-11-codex-substitute-reviewer R4-1): a high-risk PR it only covered with Opus is refused (substitute-escalation); any other
