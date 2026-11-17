@@ -246,3 +246,4 @@ full record.
 - 2026-11-17 · #575 · Trip-wire baseNote, vendor --check skip, Windows shard rebalance, one CPU clock (#549, #550, #562) · risk high · rounds 7 · arbiter 6 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 1891 runs (1553 high)
 - 2026-11-17 · #592 · Click-to-approve works on 2.1.323 (harness-added answers), a re-shown request with a hold binds, honest merge-line wording (#585) · risk high · rounds 4 · arbiter 2 · awaiting-owner-merge · Codex 7d: 1904 runs (1559 high)
 - 2026-11-17 · #601 · Review: owner deferral of an arbiter ACCEPT, exact finding categories, --plan base (#559 A1, #475, #587) · risk high · rounds 4 · arbiter 2 · awaiting-owner-merge · Codex 7d: 2370 runs (2020 high)
+- 2026-11-17 · #596 · Housekeeping: tests never write the real Codex usage log, Windows process-table retry, behind_base disjoint · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge · Codex 7d: 2372 runs (2020 high)
