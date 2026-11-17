@@ -8,7 +8,8 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore } from './owner-go.mjs';
-import { readDbRefs, targetOf } from './db-refs.mjs';
+import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
+import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock } from './live-db-go.mjs';
 
@@ -137,3 +138,103 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
   return deny(`${name} is not allowed on the live database ${where}; the owner does this in the dashboard`);
 }
 
+
+// ---- Task 5 (B1a): agent-run supabase CLI lines and Management API calls that can reach a non-local database ----
+// findLiveDbCli(cmds, raw, state) -> reason | null (null = nothing to refuse). A line passes only when the line itself proves a LOCAL target (or the owner's `dev` project); everything the guard does
+// not know is refused ("the owner runs it"). The psql family (psql, pg_dump…, usql, the pg utilities, PG* env) ships in B1b.
+const OWNER_RUNS = 'the owner runs this; hand them the exact line';
+const SB_WORD = /^supabase(?:@[^/\\]*)?$/;
+const LAUNCHERS = new Set(['npx', 'bunx', 'pnpx', 'pnpm', 'yarn', 'npm', 'bun', 'corepack', 'xargs', 'env', 'nice', 'time', 'command', 'exec', 'nohup', 'sudo', 'timeout', 'watch']);
+// subcommand prefixes (the words before the first flag): LOCAL_ONLY lines pass with no target flag or with `--local`; REMOTE_CAPABLE ones only with a local or `dev` target proof
+const LOCAL_ONLY = [['start'], ['stop'], ['status'], ['init'], ['link'], ['unlink'], ['login'], ['logout'], ['db', 'reset'], ['db', 'diff'], ['db', 'lint'], ['migration', 'new'], ['migration', 'list'], ['migration', 'up'], ['test', 'db'], ['functions', 'serve'], ['functions', 'new'], ['projects', 'list'], ['orgs', 'list'], ['help']];
+const REMOTE_CAPABLE = [['db', 'push'], ['db', 'pull'], ['db', 'dump'], ['migration', 'repair'], ['migration', 'squash'], ['migration', 'fetch'], ['functions', 'deploy'], ['functions', 'delete'], ['functions', 'download'], ['secrets'], ['storage'], ['branches'], ['config', 'push'], ['postgres-config'], ['sso'], ['domains'], ['vanity-subdomains'], ['ssl-enforcement'], ['inspect', 'db'], ['gen', 'types'], ['seed', 'buckets'], ['backups'], ['encryption'], ['snippets']];
+const startsWith = (tokens, prefix) => prefix.every((w, i) => tokens[i] === w);
+const NON_LITERAL = /[\s$`*?[\]{}()~\\<>|;&'"!#]/;
+const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
+
+// a literal postgres URI whose host (after WHATWG parsing) is exactly localhost / 127.0.0.1 / ::1, with no query string
+function localDbUrl(v) {
+  if (v.includes('?') || (v.match(/@/g) ?? []).length > 1) return false;
+  let u;
+  try { u = new URL(v); } catch { return false; }
+  return (u.protocol === 'postgresql:' || u.protocol === 'postgres:') && LOCAL_HOSTS.has(u.hostname) && u.search === '' && u.hash === '';
+}
+
+// -> { rest } (the argv after the supabase word) | { refuse } | null (not a supabase line)
+function supabaseCall(argv) {
+  const head = commandName(argv[0]);
+  if (SB_WORD.test(head)) return { rest: argv.slice(1) };
+  if (!LAUNCHERS.has(head)) return null;
+  if (head === 'npx' || head === 'bunx' || head === 'pnpx') {
+    const i = argv.findIndex((w, k) => k > 0 && !w.startsWith('-'));
+    if (i > 0 && SB_WORD.test(commandName(argv[i]))) return { rest: argv.slice(i + 1) };
+  } else if (['pnpm', 'yarn', 'npm'].includes(head) && (argv[1] === 'dlx' || argv[1] === 'exec') && argv[2] !== undefined && SB_WORD.test(commandName(argv[2]))) {
+    return { rest: argv.slice(3) };
+  }
+  if (argv.slice(1).some((w) => SB_WORD.test(commandName(w)))) return { refuse: `\`${argv[0]}\` runs supabase in a shape the guard does not read (only \`supabase\`, \`npx\`, \`pnpm dlx|exec\`, \`bunx\`, \`yarn dlx|exec\` are)` };
+  return null;
+}
+
+function supabaseRefusal(rest, state) {
+  const first = rest[0];
+  if (first === undefined) return null; // bare `supabase` prints help
+  const sub = [];
+  for (const w of rest) { if (w.startsWith('-')) break; sub.push(w); }
+  if (!sub.length) return ['--version', '--help', '-h', '-v'].includes(first) ? null : `\`supabase ${first}\` leads with a flag, which is not a shape the guard knows`;
+  const local = LOCAL_ONLY.some((p) => startsWith(sub, p));
+  const remote = REMOTE_CAPABLE.some((p) => startsWith(sub, p)) || /^network-/.test(sub[0]);
+  if (!local && !remote) return `\`supabase ${sub.join(' ')}\` is not a subcommand the guard knows`;
+  // flag hygiene: each target flag once, in one form, with a literal value
+  const seen = { 'db-url': [], 'project-ref': [], linked: [], local: [], 'dry-run': [] };
+  for (let i = sub.length; i < rest.length; i += 1) {
+    const w = rest[i];
+    const m = /^--([a-z-]+)(=(.*))?$/s.exec(w);
+    if (!m || !(m[1] in seen)) continue;
+    if (m[1] === 'linked' || m[1] === 'local' || m[1] === 'dry-run') {
+      if (m[2] !== undefined) return `\`${w}\` is not the bare \`--${m[1]}\` flag`;
+      seen[m[1]].push(true);
+      continue;
+    }
+    let value = m[3];
+    if (m[2] === undefined) { value = rest[i + 1]; i += 1; }
+    if (value === undefined) return `\`--${m[1]}\` has no value`;
+    seen[m[1]].push(value);
+  }
+  for (const [name, list] of Object.entries(seen)) if (list.length > 1) return `\`--${name}\` is given more than once`;
+  const [dbUrl] = seen['db-url'];
+  const [projectRef] = seen['project-ref'];
+  const isLocal = seen.local.length === 1;
+  const linked = seen.linked.length === 1;
+  if (isLocal && (linked || dbUrl !== undefined || projectRef !== undefined)) return '`--local` is combined with a remote target flag';
+  if (linked && (dbUrl !== undefined || projectRef !== undefined)) return '`--linked` is combined with another target flag';
+  if (dbUrl !== undefined && projectRef !== undefined) return '`--db-url` is combined with `--project-ref`';
+  for (const v of [dbUrl, projectRef]) if (v !== undefined && NON_LITERAL.test(v.replace('@[::1]:', '@:'))) return `the target value \`${v}\` is not a literal`;
+  const hasTarget = linked || dbUrl !== undefined || projectRef !== undefined;
+  if (local && !hasTarget) return null;
+  if (isLocal) return null;
+  if (dbUrl !== undefined && localDbUrl(dbUrl)) return null;
+  if (projectRef !== undefined && isDevRef(projectRef, state)) return null;
+  if (sub[0] === 'db' && sub[1] === 'push' && seen['dry-run'].length === 1) return null;
+  const what = dbUrl !== undefined ? 'a `--db-url` that is not a plain localhost URI'
+    : projectRef !== undefined ? `\`--project-ref ${projectRef}\`, which the owner has not declared dev`
+      : linked ? '`--linked`' : 'no `--local` or other target flag (it defaults to the linked project)';
+  return `\`supabase ${sub.join(' ')}\` can reach a non-local database: ${what}`;
+}
+
+export function findLiveDbCli(cmds, raw, state) {
+  const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
+  for (const c of cmds) {
+    if (!c.argv?.length) continue;
+    const call = supabaseCall(c.argv);
+    if (!call) continue;
+    const why = call.refuse ?? supabaseRefusal(call.rest, state);
+    if (why) return refuse(why);
+  }
+  // the Management API: every mention on the RAW line (a variable holding the URL is caught too) must name a dev project's own routes
+  const text = String(raw ?? '');
+  for (const m of text.matchAll(/api\.supabase\.com/gi)) {
+    const ref = /^\/v1\/projects\/([a-z0-9]{20})\//.exec(text.slice(m.index + m[0].length))?.[1];
+    if (!ref || !isDevRef(ref, state)) return refuse('the line names the Supabase Management API (api.supabase.com) for something other than a dev project\'s own routes');
+  }
+  return null;
+}
