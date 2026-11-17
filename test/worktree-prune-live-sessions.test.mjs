@@ -429,6 +429,18 @@ test('psStarts: exit 1 with nothing printed = none running; procps exit 1 WITH r
   assert.deepEqual(args, ['-o', 'pid=,lstart=', '-p', '4,5']);
 });
 
+// The real ps can be starved on a machine under heavy load until the scan's own 30 s ps timeout kills it; the scan then says "ps failed"
+// (unplaced) and places nobody, which is the machine's answer, not the rule's. Ask again (up to 3 times) only on that answer: every other
+// result, including a wrong one, is returned at once and asserted on unchanged.
+function scanRealPs(opts) {
+  let scan;
+  for (let i = 0; i < 3; i++) {
+    scan = scanLiveSessions(opts);
+    if (!scan.unplaced?.some((u) => u.startsWith('ps failed'))) break;
+  }
+  return scan;
+}
+
 // The real ps, asked about this very test process. procStart is UTC; the machine's own zone is set to something else for the
 // duration, so a scan that forgot to give ps TZ=UTC would see a local time and call this live session a reused pid.
 test('the real ps: this process is alive, its UTC start time matches procStart, and it is placed by its transcript', { skip: WIN && 'no ps on Windows' }, () => {
@@ -443,7 +455,7 @@ test('the real ps: this process is alive, its UTC start time matches procStart, 
   const zone = process.env.TZ;
   process.env.TZ = 'Asia/Manila';
   try {
-    const scan = scanLiveSessions({ home: w.home, env: {}, platform: process.platform });
+    const scan = scanRealPs({ home: w.home, env: {}, platform: process.platform });
     assert.deepEqual(scan.unplaced, []);
     assert.deepEqual(scan.sessions, [{ id: 'eeeeeeee', pid: process.pid, cwd: w.wt }]);
     assert.deepEqual(liveSessionsIn(scan, pathSpellings(w.wt)).hits, [{ id: 'eeeeeeee', pid: process.pid }]);
@@ -454,7 +466,7 @@ test('the real ps: this process is alive, its UTC start time matches procStart, 
   // and a start time that differs by a second is a reused pid
   const other = world();
   other.addSession({ pid: process.pid, sid: 'eeeeeeee-5555', procStart: procStart.replace(/:(\d\d) (\d{4})$/, (_, s, y) => `:${String((Number(s) + 7) % 60).padStart(2, '0')} ${y}`), lines: [other.wt] });
-  assert.deepEqual(scanLiveSessions({ home: other.home, env: {}, platform: process.platform }), { available: true, sessions: [], unplaced: [] });
+  assert.deepEqual(scanRealPs({ home: other.home, env: {}, platform: process.platform }), { available: true, sessions: [], unplaced: [] });
 });
 
 // ---- rules ----
@@ -615,7 +627,7 @@ test('deadline: the real ps still runs with its fixed environment under a deadli
   const zone = process.env.TZ;
   process.env.TZ = 'Asia/Manila';
   try {
-    const r = scanLiveSessions({ home: w.home, env: {}, platform: process.platform, deadlineAt: Date.now() + 60_000 });
+    const r = scanRealPs({ home: w.home, env: {}, platform: process.platform, get deadlineAt() { return Date.now() + 60_000; } });
     assert.deepEqual(r.unplaced, []);
     assert.deepEqual(r.sessions, [{ id: 'eeeeeeee', pid: process.pid, cwd: w.wt }]);
   } finally {
