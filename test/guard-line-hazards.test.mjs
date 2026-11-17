@@ -13,6 +13,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { assigningDefaults } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { cpuTime } from './helpers/timing.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -185,7 +186,6 @@ test('B5 a name nothing on the line sets is no looser than before: the reading o
 
 // ---- B6. crafted long inputs finish quickly in both guards (a hook past its deadline is ALLOWED by the host) -------------------------------------------------------
 test('B6 adversarial 200 kB lines are answered quickly by the reading itself, and shorter ones by both guards', () => {
-  const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; }; // (CPU time, not the clock: a busy machine must not fail the test)
   const globs = [
     'F=' + 'a'.repeat(5000) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
     'F=' + 'a'.repeat(300) + '.sh; G=${F#*a*a*a*a*a*a*a*a*a*b}; bash $G',
@@ -198,16 +198,12 @@ test('B6 adversarial 200 kB lines are answered quickly by the reading itself, an
     '${U:-' + 'x'.repeat(n * 9) + '}', 'G="' + '${U:-"'.repeat(n * 3),
   ];
   for (const c of [...globs, ...big(20000)]) {
-    const t0 = cpu();
-    assigningDefaults(c);
-    const own = cpu() - t0;
+    const own = cpuTime(() => assigningDefaults(c));
     assert.ok(own < 500, `${own} ms in assigningDefaults for ${c.slice(0, 40)}...`);
   }
   // (the parser alone takes seconds on a full-size one, on main too: the guards get the shorter ones)
   for (const c of [...globs, ...big(1500)]) {
-    const t0 = cpu();
-    both(c, SPEC);
-    const ms = cpu() - t0;
+    const ms = cpuTime(() => both(c, SPEC));
     assert.ok(ms < 8000, `${ms} ms for ${c.slice(0, 40)}...`);
   }
 });

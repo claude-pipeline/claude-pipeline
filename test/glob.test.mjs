@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { globToRegExp, matchGlob, matchAny } from '../pipeline/lib/glob.mjs';
+import { cpuTimed } from './helpers/timing.mjs';
 
 // [path, glob, expected]
 const TABLE = [
@@ -338,10 +339,8 @@ test('complexity cap: brace expansion above 256 alternatives throws, 256 is allo
 // failure being pinned is exponential (seconds to hours), so a 250 ms CPU budget still catches it.
 const BUDGET_MS = 250;
 function timed(fn) {
-  const t0 = process.cpuUsage();
-  const value = fn();
-  const d = process.cpuUsage(t0);
-  return { value, ms: (d.user + d.system) / 1000 };
+  const { r, ms } = cpuTimed(fn);
+  return { value: r, ms };
 }
 
 test('star chains do not backtrack catastrophically against a long path', () => {
