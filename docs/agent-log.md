@@ -235,3 +235,4 @@ full record.
 - 2026-11-17 · #242 · Queue: refuse pre-switch branches (+ update-branch catch-up), fix queue-guards template, fold #237 #238 #239 and EW #1784 #1785 · risk high · rounds 28 · arbiter 24 (fix-verify 3) · substitute 3 · awaiting-owner-merge · Codex 7d: 16367 runs (15843 high)
 - 2026-11-17 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 44 · arbiter 43 (fix-verify 2) · substitute 3 · awaiting-owner-merge · Codex 7d: 16367 runs (15843 high)
 - 2026-11-17 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 5 · arbiter 4 (fix-verify 1) · awaiting-review · Codex 7d: 16377 runs (15845 high)
+- 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 13 · arbiter 10 · substitute 1 · awaiting-owner-merge · Codex 7d: 16431 runs (15893 high)
