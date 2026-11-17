@@ -360,7 +360,8 @@ test('processTable and realLookup on a real Windows host return a CJK command-li
   const child = spawnChild(process.execPath, ['-e', 'setTimeout(()=>{},30000)', cjk], { windowsHide: true, stdio: 'ignore' });
   t.after(() => { child.kill(); });
   assert.ok(Number.isInteger(child.pid), 'the child started');
-  const row = processTable()?.get(child.pid);
+  // #348: same one retry as the test above (a busy runner can time the one PowerShell query out).
+  const row = (processTable() ?? processTable())?.get(child.pid);
   assert.ok(row, 'the child is in the process table');
   assert.ok(row.args.includes(cjk), `processTable args=${JSON.stringify(row.args)}`);
   const one = realLookup(child.pid);
