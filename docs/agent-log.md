@@ -215,3 +215,4 @@ full record.
 - 2026-11-16 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 38 · arbiter 38 (fix-verify 2) · substitute 2 · blocked · Codex 7d: 16125 runs (15662 high)
 - 2026-11-16 · #548 · head-moved-since-round names the next round; tombstone delete retries on Windows locks · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 16126 runs (15663 high)
 - 2026-11-16 · #553 · Guard follow-ups: unknown branch after nested exits, .git writes and unseen-directory switches; run-time directory over-denial (#492 #493 #505 #506 #508 #307) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 16129 runs (15663 high)
+- 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 6 · arbiter 6 · blocked · Codex 7d: 16129 runs (15663 high)
