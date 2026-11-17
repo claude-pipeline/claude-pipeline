@@ -28,6 +28,7 @@ import { isTranscriptFile } from '../../lib/paths.mjs';
 import {
   MAX_AGE_MS, SESSION_RE, accountHome, appendRecord, approvalBinding, grantIdOf, markCoveredGrant, ownerGoDir, readGrantMarker, readRecords, realDirChain, repoKey, roundBinding, rulingBinding, rulingsIn, scanBackwards,
 } from './owner-go.mjs';
+import { LIVE_DB_KIND, parseGo, verifyBlock } from './live-db-go.mjs';
 import { readRepoMoves, sameRepo } from './repo-moves.mjs';
 
 // The Claude Code builds whose click transcripts were recorded and checked. Each build needs its fixture set under test/fixtures/click/<build>/, recorded by scripts/click-spike.mjs (the tests
@@ -43,7 +44,7 @@ export const MIN_ANSWER_MS = 2000; // F3: an answer sooner than this after the d
 const FUTURE_SKEW_MS = 5 * 60 * 1000;
 const POLL_STEP_MS = 100;
 const SMALL_FILE_BYTES = 64 * 1024;
-const KINDS = Object.freeze(['merge', 'merge-many', 'round', 'ruling']);
+const KINDS = Object.freeze(['merge', 'merge-many', 'round', 'ruling', 'live-db']);
 const SCAN = { chunkBytes: 4 * 1024 * 1024, capBytes: 64 * 1024 * 1024 };
 const OPEN_EXCL = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
 
@@ -108,6 +109,24 @@ export function rulingAsk({ repo, pr, ids, line }) {
     actions: { 'Not now': null, 'Accept all': all('accept'), 'Follow-up all': all('follow-up'), 'Reject all': all('reject') },
   };
 }
+// live-db (#262): the owner's go for ONE live Supabase change, the click twin of the typed `go migration <name>` / `go data <sha12>`. `block` is the block `live-db present` printed (verifyBlock rebuilds it
+// byte for byte); `label` / `ref` name the project as that block's first line does; `pr` is the migration's PR (a data fix has none: prs is []). The first option is the go, the second declines.
+export function liveDbAsk({ repo, pr = null, block, op, arg, label, ref }) {
+  const migration = op === 'migration';
+  if (!migration && op !== 'data') return null;
+  if (migration && !Number.isInteger(pr)) return null;
+  const where = `${label} (${ref})`;
+  const yes = migration ? `Yes, apply ${arg}` : `Yes, run ${arg}`;
+  const go = `go ${op} ${arg}`;
+  return {
+    kind: 'live-db', repo, prs: migration ? [pr] : [], header: 'Live DB', title: migration ? `Apply migration ${arg} (#${pr}) to ${where}?` : `Run data SQL ${arg} on ${where}?`, block,
+    options: [
+      { label: yes, description: `Apply exactly the SQL shown above to ${where}${migration ? ` for #${pr}` : ''}, the same as typing "${go}". One go, used once.` },
+      { label: 'Not yet', description: 'Do not apply now. Nothing is recorded; I will ask again when it is ready.' },
+    ],
+    actions: { [yes]: go, 'Not yet': null },
+  };
+}
 // merge-many (fold-in): `entries` = [{ pr, lines: [that PR's Areas / Head lines, '#N'-prefixed] }] for 2-4 PRs; `ready` = the ONE `🔀 Ready to merge #a, #b — say "merge"` line.
 // multiSelect: the owner ticks the PRs to merge; there is no decline option (a dialog dismissed records nothing). Null when the count is out of range.
 export function mergeManyAsk({ repo, entries, ready }) {
@@ -122,7 +141,7 @@ export function mergeManyAsk({ repo, entries, ready }) {
 
 // (R1-F4, Rev 6 B1: the ask file never supplies binding fields.) The dialog an ask MUST show is a function of installed code: the kind, the PR(s) / item ids the question itself names, and the
 // builders above. -> the parts a builder returns for this ask, or null when the ask's question is not a dialog one of them would build (an unknown title, a PR or ids the text does not carry).
-function installedParts(ask) {
+function installedParts(ask, home) {
   const q = ask.dialog.question;
   const cut = q.indexOf('\n\n');
   if (cut < 0) return null;
@@ -139,6 +158,16 @@ function installedParts(ask) {
     const asked = pr === null ? null : rulingBinding('x', q);
     return asked === null || asked.pr !== pr ? null : rulingAsk({ repo: ask.repo, pr, ids: asked.ids, line: block });
   }
+  if (ask.kind === 'live-db') {
+    const mig = /^Apply migration ([A-Za-z0-9_.-]{1,120}) \(#(\d{1,6})\) to (.+) \(([a-z0-9]{20})\)\?$/.exec(title);
+    const dat = mig ? null : /^Run data SQL ([0-9a-f]{12}) on (.+) \(([a-z0-9]{20})\)\?$/.exec(title);
+    const [op, arg, pr, label, ref] = mig ? ['migration', mig[1], Number(mig[2]), mig[3], mig[4]] : dat ? ['data', dat[1], null, dat[2], dat[3]] : [];
+    if (op === undefined) return null;
+    const v = verifyBlock(block, { home });
+    const f = v.fields;
+    if (!v.ok || f.op !== op || f.label !== label || f.ref !== ref || (op === 'migration' ? f.name : f.sqlSha256.slice(0, 12)) !== arg || repoKey(f.repo) !== ask.repo) return null;
+    return liveDbAsk({ repo: ask.repo, pr, block, op, arg, label, ref });
+  }
   const ready = /^🔀 Ready to merge (#\d{1,6}(?:, #\d{1,6}){1,3}) — say "merge"$/.exec(block.split('\n').at(-1));
   if (ready === null) return null;
   const entries = ready[1].split(', ').map((p) => ({ pr: Number(p.slice(1)), lines: [] }));
@@ -146,9 +175,9 @@ function installedParts(ask) {
   return parts === null || title !== parts.title ? null : parts;
 }
 // True when the ask's dialog (header, multiSelect, options with their descriptions), its label -> answer map and its PRs are exactly what the installed builders make from its kind and question.
-export function matchesInstalledDialog(ask) {
+export function matchesInstalledDialog(ask, home = accountHome()) {
   try {
-    const parts = installedParts(ask);
+    const parts = installedParts(ask, home);
     if (parts === null || parts.kind !== ask.kind) return false;
     const want = canonicalDialog({ question: ask.dialog.question, header: parts.header, multiSelect: parts.multiSelect ?? false, options: parts.options });
     return want !== null && sortedJson(want) === sortedJson(ask.dialog) && sortedJson(parts.actions) === sortedJson(ask.actions)
@@ -216,7 +245,7 @@ export function readAsk(askId, { home = accountHome() } = {}) {
   const a = r.value;
   if (r.state !== 'ok' || a?.v !== 1 || a.askId !== askId || !KINDS.includes(a.kind) || typeof a.repo !== 'string' || !Array.isArray(a.prs) || !isObj(a.actions) || !isObj(a.dialog)
     || typeof a.dialogSha256 !== 'string' || a.dialogSha256 !== dialogSha256(a.dialog) || typeof a.issuedAt !== 'string' || !Number.isFinite(Date.parse(a.issuedAt))
-    || (a.hookLayersSha256 !== null && typeof a.hookLayersSha256 !== 'string') || !matchesInstalledDialog(a)) return { ok: false, reason: 'invalid' };
+    || (a.hookLayersSha256 !== null && typeof a.hookLayersSha256 !== 'string') || !matchesInstalledDialog(a, home)) return { ok: false, reason: 'invalid' };
   return { ok: true, ask: a };
 }
 
@@ -237,7 +266,7 @@ function readSpent(askId, home) {
 export function issueAsk({ kind, repo, prs, header, title, block, options, actions, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
   try {
     const key = repoKey(repo);
-    if (!KINDS.includes(kind) || key === null || !Array.isArray(prs) || prs.length === 0 || !prs.every(Number.isInteger) || typeof title !== 'string' || typeof block !== 'string' || !isObj(actions)) return { error: 'invalid' };
+    if (!KINDS.includes(kind) || key === null || !Array.isArray(prs) || (prs.length === 0 && kind !== 'live-db') || !prs.every(Number.isInteger) || typeof title !== 'string' || typeof block !== 'string' || !isObj(actions)) return { error: 'invalid' };
     const labels = (options ?? []).map((o) => o?.label);
     if (labels.length === 0 || new Set(labels).size !== labels.length || !Object.keys(actions).every((l) => labels.includes(l)) || !labels.every((l) => Object.hasOwn(actions, l))) return { error: 'invalid-options' };
     if (!realDirChain(home, ASKS_REL)) return { error: 'unsafe-folder' };
@@ -253,10 +282,10 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
     // every approving answer must bind exactly this repository and these PRs, or the ask is useless (a typo in the block, a closing line of another PR)
     for (const label of labels) {
       if (actions[label] === null) continue;
-      const bound = bindAnswer(ask, actions[label], dialog.question);
+      const bound = bindAnswer(ask, actions[label], dialog.question, home);
       if (bound.error) return { error: `unbindable: ${bound.error}` };
     }
-    if (!matchesInstalledDialog(ask)) return { error: 'unknown-dialog' }; // (R1-F4: readers refuse an ask the installed builders would not make, so never write one)
+    if (!matchesInstalledDialog(ask, home)) return { error: 'unknown-dialog' }; // (R1-F4: readers refuse an ask the installed builders would not make, so never write one)
     const file = askFile(askId, 'json', home);
     if (writeExclusive(file, ask, home) !== 'ok') return { error: 'write-failed' };
     supersedeOlder(ask, home);
@@ -298,7 +327,7 @@ function answerText(ask, raw) {
 }
 
 // The record body (without the click fields) a text answers a question with, using the typed recorders' cores: { kind, body } | { error }. `kind` is the record kind ('approval' has none on disk).
-function bindAnswer(ask, text, question) {
+function bindAnswer(ask, text, question, home = accountHome()) {
   if (ask.kind === 'merge' || ask.kind === 'merge-many') {
     const b = approvalBinding(text, question);
     if (b === null || b.requests.length === 0) return { error: 'nothing-bound' };
@@ -313,6 +342,17 @@ function bindAnswer(ask, text, question) {
     if (b === null) return { error: 'nothing-bound' };
     if (b.repo !== ask.repo || sortedJson([b.pr]) !== sortedJson(ask.prs)) return { error: 'other-pr-or-repo' };
     return { body: { kind: 'extra-round', repo: b.repo, pr: b.pr, k: b.k, head: b.head } };
+  }
+  if (ask.kind === 'live-db') {
+    // the typed go, bound by the SAME rebuild the typed recorder runs (verifyBlock) on the block in the question
+    const go = parseGo(text);
+    const cut = question.indexOf('\n\n');
+    const v = go !== null && cut >= 0 ? verifyBlock(question.slice(cut + 2), { home }) : null;
+    if (!v?.ok) return { error: 'nothing-bound' };
+    const f = v.fields;
+    if (go.op !== f.op || go.arg !== (f.op === 'migration' ? f.name : f.sqlSha256.slice(0, 12))) return { error: 'nothing-bound' };
+    if (repoKey(f.repo) !== ask.repo) return { error: 'other-pr-or-repo' };
+    return { body: { kind: LIVE_DB_KIND, op: f.op, projectRef: f.ref, sqlSha256: f.sqlSha256, name: f.name, head: f.head, file: f.file, repo: f.repo } };
   }
   const b = rulingBinding(text, question);
   if (b === null) return { error: 'nothing-bound' };
@@ -477,7 +517,7 @@ function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home
     const made = write(askFile(askId, 'spent', home), marker, home);
     return made === 'ok' ? { declined: mapped.declined } : made === 'exists' ? lost() : { refused: 'write-failed', retry: true };
   }
-  const bound = bindAnswer(ask, mapped.text, ev.question);
+  const bound = bindAnswer(ask, mapped.text, ev.question, home);
   if (bound.error) return { refused: bound.error }; // (nothing consumed: the owner can answer the same dialog again, or type)
   const made = write(askFile(askId, 'spent', home), marker, home);
   if (made === 'exists') return lost();
@@ -495,7 +535,7 @@ function finishReplay({ spent, ask, clickId, ev, session, cwd, home, transcriptP
   if (existing) return { recorded: existing, kind: ask.kind, replay: true };
   const mapped = answerText(ask, ev.answer);
   if (mapped.error) return { refused: mapped.error };
-  const bound = bindAnswer(ask, mapped.text, ev.question);
+  const bound = bindAnswer(ask, mapped.text, ev.question, home);
   if (bound.error) return { refused: bound.error };
   const record = (io.appendRecord ?? appendRecord)(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: spent.answeredAt, ask: { askId: ask.askId, toolUseId: spent.toolUseId, clickId } }));
   return record === null ? { refused: 'record-write-failed', retry: true } : { recorded: record, kind: ask.kind, replay: true };
@@ -793,7 +833,7 @@ export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 
 // ---- the proof every consumer asks (B4) ---------------------------------------------------------------------------------------------------
 
 // 'kind' is compared for every kind (absent for a merge click, so a merge click's record cannot be relabelled as a round grant or ruling): R26-F2.
-const BINDING_KEYS = { approval: ['prs', 'requests'], 'extra-round': ['kind', 'repo', 'pr', 'k', 'head'], ruling: ['kind', 'repo', 'pr', 'ids', 'content'] };
+const BINDING_KEYS = { approval: ['prs', 'requests'], 'extra-round': ['kind', 'repo', 'pr', 'k', 'head'], ruling: ['kind', 'repo', 'pr', 'ids', 'content'], 'live-db-go': ['kind', 'op', 'projectRef', 'sqlSha256', 'name', 'head', 'file', 'repo'] };
 // 'owner' | 'synthetic' | 'missing' for a record with `via: 'ask'`, read at ANY age (a consumed extra-round grant is read by the final gate days later): the transcript entries are found again by the tool
 // use id and must still pass the entry checks, the ask file and spent marker must agree with the record, and the record's binding must be what the question and answer in the transcript say. Not
 // re-checked, by design (R4b): the build allowlist, supersession, today's hook configuration, the ask's expiry against now. A transcript entry that is gone is 'missing', like a typed prompt's.
@@ -818,7 +858,7 @@ export function clickProvenance(record, { home = accountHome() } = {}) {
     if (ev.session !== record.session || ev.dialogSha256 !== ask.dialogSha256 || m.answeredAt !== ev.answeredAt || Date.parse(record.ts) !== answeredAt || answeredAt < issuedAt || answeredAt > issuedAt + MAX_AGE_MS) return 'synthetic';
     const mapped = answerText(ask, ev.answer);
     if (mapped.error || mapped.declined !== undefined) return 'synthetic';
-    const bound = bindAnswer(ask, mapped.text, ev.question);
+    const bound = bindAnswer(ask, mapped.text, ev.question, home);
     if (bound.error) return 'synthetic';
     const expected = clickRecordOf({ body: bound.body, session: record.session, text: mapped.text, cwd: null, transcriptPath: file, answeredAt: ev.answeredAt, ask: a });
     const keys = ['ts', 'session', 'prompt', 'via', 'ask', 'kind', ...BINDING_KEYS[expected.kind ?? 'approval']];
