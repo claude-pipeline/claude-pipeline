@@ -217,3 +217,4 @@ full record.
 - 2026-11-16 · #553 · Guard follow-ups: unknown branch after nested exits, .git writes and unseen-directory switches; run-time directory over-denial (#492 #493 #505 #506 #508 #307) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 16129 runs (15663 high)
 - 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 6 · arbiter 6 · blocked · Codex 7d: 16129 runs (15663 high)
 - 2026-11-17 · #242 · Queue: refuse pre-switch branches (+ update-branch catch-up), fix queue-guards template, fold #237 #238 #239 and EW #1784 #1785 · risk high · rounds 24 · arbiter 22 (fix-verify 3) · substitute 2 · blocked · Codex 7d: 16147 runs (15676 high)
+- 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 7 · arbiter 7 · blocked · Codex 7d: 16286 runs (15812 high)
