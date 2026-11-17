@@ -137,6 +137,8 @@ test('catalog templates need no go; other SQL does; unknown targets, untrusted s
   assert.equal(evaluateSupabaseMcp('mcp__db__list_tables', { project_id: REF }, s.ctx).decision, 'allow');
   assert.equal(isSupabaseTool('mcp__db__apply_migration'), true);
   assert.equal(isSupabaseTool('mcp__notes__create_note'), false);
+  for (const tool of ['mcp__github__create_branch', 'mcp__sentry__create_project', 'mcp__linear__create_project', 'mcp__neon__delete_branch', 'mcp__jupyter__run_notebook', 'mcp__gitlab__merge_branch']) assert.equal(isSupabaseTool(tool), false, tool);
+  for (const tool of ['mcp__db__execute_sql', 'mcp__db__deploy_edge_function', 'mcp__my_supabase_x__create_branch', 'mcp__supabase__pause_project']) assert.equal(isSupabaseTool(tool), true, tool);
   for (const n of ['merge_branch', 'deploy_edge_function', 'run_notebook', 'pause_project']) assert.equal(evaluateSupabaseMcp(`${TOOL}${n}`, { project_id: REF }, s.ctx).decision, 'deny', n);
   assert.equal(evaluateSupabaseMcp(`${TOOL}query_logs`, { project_id: REF }, s.ctx).decision, 'allow');
   assert.equal(evaluateSupabaseMcp('mcp__supabase__apply_migration', { project_id: REF, name: NAME, query: SQL }, s.ctx).decision, 'allow', 'the bare `supabase` server is trusted too');
@@ -148,6 +150,25 @@ test('dev refs are exempt only on a server the owner listed', async (t) => {
   assert.equal(call(`${TOOL}apply_migration`), 'deny');
   await runDbRefs(['server', 'add', 'mine'], { home: s.home, env: {}, hasClaudeCodeAncestor: () => false });
   assert.equal(call('mcp__mine__apply_migration'), 'allow');
+});
+
+test('a declared-dev project on a server the owner has not listed is told to list the server, not to ask for a go', async (t) => {
+  const s = await scene(t);
+  for (const name of ['apply_migration', 'execute_sql', 'pause_project']) {
+    const v = evaluateSupabaseMcp(`${TOOL}${name}`, { project_id: DEV, name: 'x', query: 'drop table t' }, s.ctx);
+    assert.equal(v.decision, 'deny', name);
+    assert.match(v.reason, /declared dev/);
+    assert.match(v.reason, /db-refs server add plugin_supabase_supabase/);
+    assert.doesNotMatch(v.reason, /live-db present/);
+  }
+});
+
+test('through the real guard entry: another server\'s create_branch / create_project is not a Supabase write', async (t) => {
+  const s = await scene(t);
+  const file = (tool_name, tool_input) => evaluateFileTool({ tool_name, tool_input, cwd: s.repo.dir, session_id: s.session, transcript_path: s.transcript }, { home: s.home, env: {}, platform: process.platform, now: () => NOW }).decision;
+  assert.equal(file('mcp__github__create_branch', { branch: 'x' }), 'allow');
+  assert.equal(file('mcp__sentry__create_project', { name: 'x' }), 'allow');
+  assert.equal(file('mcp__supabase__create_branch', { name: 'x' }), 'deny');
 });
 
 test('a registry that cannot be read denies every write and still allows reads', async (t) => {

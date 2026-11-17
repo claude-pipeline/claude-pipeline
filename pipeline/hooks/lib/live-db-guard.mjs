@@ -24,8 +24,9 @@ export const SUPABASE_READ_NAMES = ['list_tables', 'list_extensions', 'list_migr
 const parts = (tool) => String(tool).split('__');
 export const lastSegment = (tool) => parts(tool).pop();
 export const serverSegment = (tool) => parts(tool)[1] ?? '';
-// a server whose name has `supabase` in it, or ANY server's tool with a Supabase write name (a renamed server in an unprotected .mcp.json: Fable F2)
-export const isSupabaseTool = (tool) => typeof tool === 'string' && tool.startsWith('mcp__') && (/supabase/i.test(serverSegment(tool)) || SUPABASE_WRITE_NAMES.includes(lastSegment(tool)));
+// the write names only a Supabase server has: any server's tool with one of them is judged (a renamed server in an unprotected .mcp.json: Fable F2). The generic names (create_branch, create_project, run_notebook …) are judged only on a server whose name has `supabase` in it, so another vendor's tool of that name is untouched.
+const SUPABASE_ONLY_NAMES = ['apply_migration', 'execute_sql', 'deploy_edge_function', 'create_edge_function_secret'];
+export const isSupabaseTool = (tool) => typeof tool === 'string' && tool.startsWith('mcp__') && (/supabase/i.test(serverSegment(tool)) || SUPABASE_ONLY_NAMES.includes(lastSegment(tool)));
 
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });
@@ -120,6 +121,7 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
   if (target.kind === 'unknown') return deny(`${name} has no well-formed project_id, so its target is unknown (treated as live and unbindable); use an account-scoped Supabase MCP server, or the owner applies it`);
   if (!target.trusted) return deny(`the MCP server "${seg}" is not one the owner trusts for Supabase; the owner adds it with \`pipeline db-refs server add ${seg}\` in their own terminal`);
   if (target.kind === 'dev') return allow();
+  if (isDevRef(target.ref, state)) return deny(`${name} targets ${target.label} (${target.ref}), which the owner declared dev, but the MCP server "${seg}" is not one the owner listed for dev projects, so it counts as live and no go can be recorded for it; the owner lists the server with \`pipeline db-refs server add ${seg}\` in their own terminal`);
   const where = `${target.label} (${target.ref})`;
   const query = typeof ti?.query === 'string' ? ti.query : null;
   if (name === 'execute_sql' || name === 'apply_migration') {
