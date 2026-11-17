@@ -6,6 +6,7 @@ import { defuseMarkdown } from '../lib/codex.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
+import { isOwnerDeferral } from '../lib/triage.mjs';
 import { createHash } from 'node:crypto';
 import { allItems, findRound, oneLine, requireState, withStateLock } from '../lib/review-context.mjs';
 
@@ -62,7 +63,7 @@ export function followupMarker(pr, item) {
 export function issueBody(item, pr) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : null;
   const deferral = item.roundCapDeferral;
-  const decidedBy = item.final?.by === 'owner' ? 'Owner' : deferral ? 'Claude (round limit)' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
+  const decidedBy = item.final?.by === 'owner' || isOwnerDeferral(item) ? 'Owner' : deferral ? 'Claude (round limit)' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
   const lines = [
     String(item.detail ?? '').trim(),
     '',
@@ -73,6 +74,10 @@ export function issueBody(item, pr) {
     `**${decidedBy} (why this is a follow-up, not part of the PR):** ${String(item.final?.reason ?? item.judge?.reason ?? '').trim()}`,
     '',
   ];
+  // An ACCEPT the owner deferred (also a cached copy of it): a fix was accepted, and it is left out of this PR by the owner's typed ruling.
+  if (isOwnerDeferral(item)) {
+    lines.push(`The ${item.final.ownerDeferral.accepted === 'judge' ? 'judge' : item.final.ownerDeferral.accepted === 'cache' ? 'review' : 'arbiter'} ACCEPTED a fix for this finding and the owner deferred it to this issue (typed ruling); it is NOT in PR #${pr}.`, '');
+  }
   if (where) lines.push(`Location: \`${oneLine(where)}\``, '');
   // A fix deferred past the round limit (triage defer-fixes) was written and taken out again: say where it is. No cherry-pick claim: the fix head may hold other work.
   if (deferral && typeof deferral.fixHead === 'string' && typeof deferral.reviewedHead === 'string') {

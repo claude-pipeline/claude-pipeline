@@ -215,3 +215,17 @@ test('R2/F7 trusted-anchor mismatch: a PR that moves default_branch in its pipel
   assert.doesNotMatch(w.input(), /Attackers are other repo users/);
   assert.equal(w.state().rounds[0].arbiter.threatModels, undefined);
 });
+
+test('#475: the arbiter review input lists the exact categories; a spelling variant in its own findings is accepted and recorded under the canonical name with a warning, an unknown one is refused', (t) => {
+  const list = 'bug, security, auth, permissions, data-integrity, data-loss, broken-behaviour, performance, maintainability, testing, design, docs, other';
+  const w = world(t);
+  const needed = w.round1();
+  assert.ok(w.input().includes(`Each finding's \`category\` must be exactly one of: ${list}.`));
+  const bad = w.apply(needed, { rulings: [], findings: [finding({ bucket: 'SUGGESTION', category: 'nonsense', scope: undefined, ruling: 'ACCEPT' })] });
+  assert.equal(bad.code, 1, bad.stdout);
+  assert.match(JSON.stringify(bad.json), /findings\[0\]\.category must be one of bug\|security/);
+  const ok = w.apply(needed, { rulings: [], findings: [finding({ bucket: 'SUGGESTION', category: 'Tests', scope: undefined, ruling: 'ACCEPT' })] });
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.equal(w.state().rounds[0].items.find((i) => i.id === 'R1-F1').category, 'testing');
+  assert.match(ok.json.warnings.join('\n'), /findings\[0\]: category "Tests" read as "testing"/);
+});

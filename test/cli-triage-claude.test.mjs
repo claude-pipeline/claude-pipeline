@@ -15,7 +15,7 @@ import { createCommentsGh, createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } f
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { SUPPORTED_STATE_VERSION, decodeFromComment } from '../pipeline/lib/state.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
-import { reviewEligibilityProblems, rulingsDigest } from '../pipeline/lib/triage.mjs';
+import { reviewEligibilityProblems, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
 import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
@@ -1034,4 +1034,142 @@ test('codex-review: a base-only round does not consume a pending confirm; the ne
   assertExit(w.codex(3, findingsOf(), { from: merged, to: fix }), 0);
   assert.deepEqual(w.state().rounds[2].confirmFixed, ['R1-B1']);
   assert.match(roundPrompt(w, 3), /## Confirm fixed/);
+});
+
+// ---- owner deferral of an unimplemented arbiter ACCEPT (#559; plan 2026-11-17 PR A1) ------------------------------------------------------------------------------------
+
+// What an arbiter / judge ACCEPT leaves behind (the fix is owed, nothing implemented).
+const arbiterAccepts = (w, id, by = 'arbiter') => w.edit((s) => {
+  const it = s.rounds.flatMap((r) => r.items).find((i) => i.id === id);
+  it.final = { decision: 'ACCEPT', by, needsHuman: false, reason: `${by} accepted it` };
+});
+// The owner's typed answer to a ruling request for `ids` (one prompt that names every id), then the owner-ruling call for `id`.
+function typedFor(t, w, ids, quote) {
+  const asked = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ids.join(',')]);
+  ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
+  return (id, decision) => w.cli(['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', 'owner confirmed', '--owner-quote', quote, '--pr', '7']);
+}
+const dWorld = (t) => world(t, { comments: true, slug: `acme/widgets-${randomUUID()}` });
+
+test('owner-ruling: the owner defers an unimplemented arbiter ACCEPT of a BLOCKING security finding (FOLLOW-UP): final, version 7, Rulings row, clean outcome, the issue still owed', (t) => {
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  arbiterAccepts(w, 'R1-B1');
+  arbiterAccepts(w, 'R1-S1', 'judge');
+  assert.equal(w.cli(['state', 'outcome']).json.unimplemented.length, 2, 'both are owed a fix before the ruling');
+  const accepted = w.item('R1-B1').final;
+  const typed = typedFor(t, w, ['R1-B1'], 'R1-B1: follow-up');
+  const r = typed('R1-B1', 'FOLLOW-UP');
+  assertExit(r, 0, r.stdout + r.stderr);
+  const { final } = w.item('R1-B1');
+  assert.equal(final.by, 'owner');
+  assert.equal(final.decision, 'FOLLOW-UP');
+  assert.equal(final.needsHuman, false);
+  assert.equal(final.ownerQuote, 'R1-B1: follow-up');
+  assert.equal(final.ownerDeferral.accepted, 'arbiter');
+  assert.ok(!Number.isNaN(Date.parse(final.ownerDeferral.ruledAt)));
+  assert.deepEqual(final.overruled, accepted, 'the ACCEPT it deferred is kept');
+  assert.equal(w.state().version, 7);
+  assert.match(r.json.next, /followups create --round 1/);
+  assert.match(r.json.next, /pipeline comment --pr 7 --kind triage/);
+  assert.deepEqual(w.cli(['state', 'outcome']).json.unimplemented, ['R1-S1'], 'the deferred item no longer waits for a fix');
+
+  // the Rulings block lists it (a BLOCKING security row) and review-complete refuses until its issue is filed
+  const rows = rulingsInventory(w.state()).rows;
+  assert.equal(rows.length, 1);
+  assert.match(rows[0], /^R1-B1 · FOLLOW-UP · BLOCKING · security · by owner deferral \(accepted by arbiter\) · content [0-9a-f]{12} · "Missing null check" · why: owner deferral of arbiter ACCEPT; NOT fixed in this merge; issue not filed yet$/);
+  w.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-S1').final = { decision: 'REJECT', by: 'judge', needsHuman: false, reason: 'not now' }; });
+  const blocked = w.cli(['review-complete', '--pr', '7']);
+  assertExit(blocked, 1, blocked.stdout + blocked.stderr);
+  assert.match(blocked.json.reason, /owner-deferred follow-up\(s\) without a filed issue: R1-B1/);
+  assertExit(w.cli(['state', 'record-followup', '--id', 'R1-B1', '--url', 'https://github.com/acme/widgets/issues/9']), 0);
+  assert.match(rulingsInventory(w.state()).rows[0], /issue #9$/);
+});
+
+test('owner-ruling: a typed REJECT or ACCEPT of an arbiter ACCEPT is refused (the deferral is FOLLOW-UP only), and so is anything the owner did not type', (t) => {
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' }), finding({ title: 'Second', line: 14 })], [sugg(), sugg({ title: 'Other', line: 4 })])), 0);
+  for (const id of ['R1-B1', 'R1-B2', 'R1-S1']) arbiterAccepts(w, id);
+  arbiterAccepts(w, 'R1-S2', 'test');
+  w.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-B2').implemented = true; });
+  const before = w.stateText();
+  for (const [id, decision, re] of [['R1-B1', 'REJECT', /may only be deferred/], ['R1-B1', 'ACCEPT', /may only be deferred/], ['R1-B2', 'FOLLOW-UP', /already implemented|does not need a human/], ['R1-S2', 'FOLLOW-UP', /does not need a human/]]) {
+    const typed = typedFor(t, w, [id], `${id}: ${decision.toLowerCase()}`);
+    const r = typed(id, decision);
+    assertExit(r, 1, `${id} ${decision} ${r.stdout}`);
+    assert.match(r.json.reason, re, `${id} ${decision}`);
+    assert.equal(w.stateText(), before, `${id} ${decision}: state untouched`);
+  }
+  // untyped: no record at all; forged: a quote that is not the recorded whole answer
+  const none = w.cli(['triage', 'owner-ruling', '--round', '1', '--id', 'R1-S1', '--decision', 'FOLLOW-UP', '--reason', 'r', '--owner-quote', 'R1-S1: follow-up', '--pr', '7']);
+  assertExit(none, 1, none.stdout);
+  assert.match(none.json.reason, /no owner ruling is recorded/);
+  const typed = typedFor(t, w, ['R1-S1'], 'R1-S1: follow-up');
+  const forged = w.cli(['triage', 'owner-ruling', '--round', '1', '--id', 'R1-S1', '--decision', 'FOLLOW-UP', '--reason', 'r', '--owner-quote', 'yes do it', '--pr', '7']);
+  assertExit(forged, 1, forged.stdout);
+  assert.equal(w.stateText(), before);
+  // claude-ruling never touches it either
+  const c = w.cli(ruling('R1-S1', 'FOLLOW-UP'));
+  assertExit(c, 1, c.stdout);
+  assert.equal(w.stateText(), before);
+  assertExit(typed('R1-S1', 'FOLLOW-UP'), 0); // control: the typed one still works
+});
+
+test('F1: an answer recorded while the item waited for a human cannot defer it after it became an ACCEPT; a multi-id request still applies its second id', (t) => {
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  w.wait('R1-B1');
+  const typed = typedFor(t, w, ['R1-B1'], 'R1-B1: follow-up');
+  arbiterAccepts(w, 'R1-B1'); // the arbiter was re-run and accepted it after the owner was asked
+  const before = w.stateText();
+  const r = typed('R1-B1', 'FOLLOW-UP');
+  assertExit(r, 1, r.stdout);
+  assert.match(r.json.reason, /changed since the owner was asked/);
+  assert.equal(w.stateText(), before);
+
+  const v = dWorld(t);
+  assertExit(v.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  arbiterAccepts(v, 'R1-B1');
+  arbiterAccepts(v, 'R1-S1', 'judge');
+  const both = typedFor(t, v, ['R1-B1', 'R1-S1'], 'R1-B1: follow-up, R1-S1: follow-up');
+  assertExit(both('R1-B1', 'FOLLOW-UP'), 0);
+  const second = both('R1-S1', 'FOLLOW-UP');
+  assertExit(second, 0, second.stdout + second.stderr);
+  assert.equal(v.item('R1-S1').final.ownerDeferral.accepted, 'judge');
+});
+
+test('ruling-request: an ACCEPT the owner may defer is said to be accepted and not fixed (output notes and the --ask row); the closing line keeps its shape', (t) => {
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding()], [sugg()])), 0);
+  arbiterAccepts(w, 'R1-B1');
+  w.wait('R1-S1');
+  const r = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', 'R1-B1,R1-S1']);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.match(r.json.line, /^⚖️ Owner ruling needed #7: R1-B1, R1-S1 · content [0-9a-f]{12} · repo acme\/widgets-/);
+  assert.equal(r.json.notes.length, 1);
+  assert.match(r.json.notes[0], /^R1-B1: ACCEPTED by arbiter, NOT fixed; follow-up = defer the fix to an issue; only when it is not a regression vs the default branch$/);
+  const plain = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', 'R1-S1']);
+  assert.equal('notes' in plain.json, false, 'an ordinary request is unchanged');
+  const ask = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', 'R1-B1', '--ask']);
+  assertExit(ask, 0, ask.stdout + ask.stderr);
+  const question = JSON.stringify(ask.json.ask ?? ask.json);
+  assert.match(question, /ACCEPTED by arbiter, NOT fixed/);
+});
+
+test('state show: a local owner deferral over a published arbiter ACCEPT is kept (local-ahead), publishes later, and stays version 7', (t) => {
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })])), 0);
+  arbiterAccepts(w, 'R1-B1');
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  const typed = typedFor(t, w, ['R1-B1'], 'R1-B1: follow-up');
+  assertExit(typed('R1-B1', 'FOLLOW-UP'), 0);
+  const ahead = w.stateText();
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stdout + show.stderr);
+  assert.equal(show.json.source, 'local-ahead');
+  assert.equal(w.stateText(), ahead, 'the local state is untouched');
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  assert.equal(publishedState(w).rounds[0].items[0].final.ownerDeferral.accepted, 'arbiter');
+  assert.equal(publishedState(w).version, 7);
+  assert.equal(w.cli(['state', 'show', '--pr', '7']).json.source, 'local');
 });

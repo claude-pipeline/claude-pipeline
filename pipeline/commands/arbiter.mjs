@@ -12,7 +12,7 @@
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
-import { fingerprint, largeBinaryNote, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
+import { CATEGORIES, categoryNotes, fingerprint, largeBinaryNote, normalizeFindingCategories, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
 import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
@@ -226,6 +226,7 @@ function reviewSection(state, round, diff, fix = null) {
     `Diff to review (${diff.scope === 'whole-pr' ? 'the whole pull request' : `only what changed in round ${round.n}`}): ${diff.diffPath}`,
     `Diff sha256: ${diff.diffDigest}`,
     `Range: ${diff.from}..${round.toHead}`,
+    `Each finding's \`category\` must be exactly one of: ${CATEGORIES.join(', ')}.`,
   ];
   // A FIX ROUND (chooseBrief): the narrow brief. Same mode, same diff, same JSON contract: only what to spend the effort on changes.
   if (fix) {
@@ -620,10 +621,16 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
   if (review) errors.push(...checkDiffFile(stored));
 
   let rulings = null;
+  let categoryWarnings = [];
   try {
     const json = extractJsonBlock(proof.finalAssistantText);
-    const checked = validateRulings(json, stored.items, { review });
-    if (checked.ok) rulings = json;
+    // the arbiter's own findings: a spelling variant of a category is read as the canonical name (#475), noted in the output
+    const normalized = review ? normalizeFindingCategories(json, ['findings']) : { json, mapped: [] };
+    const checked = validateRulings(normalized.json, stored.items, { review });
+    if (checked.ok) {
+      rulings = normalized.json;
+      categoryWarnings = categoryNotes(normalized.mapped);
+    }
     else errors.push(...checked.errors.map((e) => `rulings: ${e}`));
   } catch {
     errors.push('rulings: no JSON found in the arbiter\'s final message');
@@ -695,6 +702,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
         claudeCodeVersions,
         errors,
         ...floorOutput(judged),
+        ...(categoryWarnings.length > 0 ? { warnings: categoryWarnings } : {}),
         ...(ignoredExpectations ? { note: `--expect-model / --expect-effort ignored: the proof is pinned to claude-fable- at effort ${expectation.brief === BRIEF_FIX_VERIFY ? 'medium or higher (fix-verify)' : expectation.effort}` } : {}),
         items: stored.items.map((id) => ({
           id, ruling: byId.get(id)?.final?.decision ?? null, needsHuman: byId.get(id)?.final?.needsHuman ?? null,

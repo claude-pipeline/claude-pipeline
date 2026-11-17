@@ -19,6 +19,8 @@ import {
   STATE_VERSION_OUT_OF_MODEL,
   STATE_VERSION_CLICK_DIALOG,
   STATE_VERSION_POST_MAX,
+  STATE_VERSION_OWNER_DEFERRAL,
+  stateNeedsOwnerDeferralVersion,
   stateNeedsPostMaxVersion,
   maxRiskOf,
   stateNeedsOutOfModelVersion,
@@ -575,7 +577,7 @@ test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOf
   assert.equal(stateNeedsOutOfModelVersion(marked), true);
   const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
   assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
-  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CLICK_DIALOG); // (7 is reserved by open PR #601)
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CLICK_DIALOG);
   assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
   assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
   assert.equal(stateNeedsOutOfModelVersion(null), false);
@@ -653,6 +655,43 @@ test('F4 (PR B): the state version is bumped to 6 ONLY when a final carries post
   }
 });
 
+test('F11 (owner deferral): version 7 ONLY when a final carries ownerDeferral (also on a cached copy, whose by is cache); every other state keeps its version; the highest version any feature needs wins', () => {
+  const plain = sampleState();
+  assert.equal(stateNeedsOwnerDeferralVersion(plain), false);
+  const deferral = { accepted: 'arbiter', ruledAt: '2026-11-17T10:00:00.000Z' };
+  const deferred = (by, extra = {}) => ({ decision: 'FOLLOW-UP', by, needsHuman: false, reason: 'r', ownerQuote: 'q', ownerDeferral: deferral, ...extra });
+  const owner = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: deferred('owner') })]);
+  assert.equal(stateNeedsOwnerDeferralVersion(owner), true);
+  assert.equal(owner.version, STATE_VERSION_OWNER_DEFERRAL, 'updateItems writes the version the state needs');
+  const cached = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: deferred('cache') })]);
+  assert.equal(cached.version, STATE_VERSION_OWNER_DEFERRAL, 'a cached copy is lifted too (keyed on the mark, not on by owner)');
+  assert.equal(stateNeedsOwnerDeferralVersion({ rounds: [{ items: [{ final: { ownerDeferral: null } }] }] }), false);
+  assert.equal(stateNeedsOwnerDeferralVersion({ rounds: [{ items: [{ final: { ownerDeferral: 'arbiter' } }] }] }), false);
+  assert.equal(stateNeedsOwnerDeferralVersion(null), false);
+  assert.ok(STATE_VERSION_OWNER_DEFERRAL > STATE_VERSION_POST_MAX);
+  // other features keep their own versions; both together: the highest wins
+  const postMax = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r', postMax: { from: 'ACCEPT', by: 'arbiter', ordinal: 5, max: 3 } } })]);
+  assert.equal(postMax.version, STATE_VERSION_POST_MAX);
+  const both = updateItems(postMax, 1, [postMax.rounds[0].items[0], it('R1-S2', { bucket: 'SUGGESTION', final: deferred('owner') })]);
+  assert.equal(both.version, STATE_VERSION_OWNER_DEFERRAL);
+  assert.equal(plain.version, 1, 'a state without a deferral stays at its old version (round-trips through an old CLI)');
+  // an old reader (the version-6 rule of the installed CLI) refuses the deferral and reads the rest
+  const refusesAt6 = (state) => Number.isFinite(state.version) && state.version > 6;
+  assert.equal(refusesAt6(owner), true);
+  assert.equal(refusesAt6(postMax), false);
+  assert.equal(refusesAt6(plain), false);
+  const dir = tmp();
+  try {
+    saveState(dir, plain);
+    assert.deepEqual(loadState(dir), plain, 'a plain state round-trips unchanged');
+    saveState(dir, { ...owner, version: 1 });
+    assert.equal(loadState(dir).version, STATE_VERSION_OWNER_DEFERRAL, 'a stale writer is lifted back');
+    assert.equal(decodeFromComment(encodeForComment({ ...owner, version: 1 })).version, STATE_VERSION_OWNER_DEFERRAL);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 // Failure caught: a round that carries the new `resolutionIneligible` key (or an older one without it) fails to load or loses the key when the state is saved again.
 test('resolutionIneligible: addRound keeps the short code only when given; a state round written before the key existed loads and round-trips unchanged', () => {
   const base = emptyState({ repo: 'a/b', pr: 1, branch: 'x', risk: 'low' });
@@ -696,7 +735,7 @@ test('askVariant survives save, load, publish and decode at version 8; a state r
   }
 });
 
-test('requiredStateVersion returns the HIGHEST version any feature needs: 8 click grant, 6 post-max, 5 out-of-model, 4 substitute, else 1', () => {
+test('requiredStateVersion returns the HIGHEST version any feature needs: 8 click grant, 7 owner deferral, 6 post-max, 5 out-of-model, 4 substitute, else 1', () => {
   // failure caught: a state holding several features written at the lowest of them, so the oldest install that still reads it misreads the rest
   const withFinal = (final) => ({ ...addRound(emptyState({ repo: 'o/r', pr: 3, branch: 'b' }), { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [it('R1-B1', { final })] }) });
   const base = { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r' };
@@ -704,6 +743,9 @@ test('requiredStateVersion returns the HIGHEST version any feature needs: 8 clic
   const withSub = { ...all, rounds: all.rounds.map((r) => ({ ...r, firstReviewer: 'substitute' })) };
   assert.equal(requiredStateVersion(grantOn(withSub, clickGrant)), 8);
   assert.equal(requiredStateVersion(withSub), STATE_VERSION_POST_MAX);
+  const deferred = withFinal({ ...base, by: 'owner', ownerQuote: 'q', ownerDeferral: { accepted: 'arbiter', ruledAt: '2026-11-17T10:00:00.000Z' }, postMax: { at: '2026-11-17T10:00:00.000Z' } });
+  assert.equal(requiredStateVersion(deferred), STATE_VERSION_OWNER_DEFERRAL, 'an owner deferral (with a post-max mark) alone is 7');
+  assert.equal(requiredStateVersion(grantOn(deferred, clickGrant)), STATE_VERSION_CLICK_DIALOG, 'an owner deferral and a click-dialog grant together: the highest, 8');
   assert.equal(requiredStateVersion(withFinal({ ...base, outOfModel: 'a model' })), STATE_VERSION_OUT_OF_MODEL);
   assert.equal(requiredStateVersion({ ...withFinal(base), rounds: withFinal(base).rounds.map((r) => ({ ...r, firstReviewer: 'substitute' })) }), STATE_VERSION_SUBSTITUTE);
   assert.equal(requiredStateVersion(withFinal(base)), 1);

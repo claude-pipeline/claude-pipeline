@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import {
   CATEGORIES,
+  CATEGORY_ALIASES,
+  normalizeFindingCategories,
   FINDINGS_SCHEMA_PATH,
   buildCodexArgs,
   buildReviewPrompt,
@@ -1093,4 +1095,45 @@ test('buildCodexArgs refuses a model id of 101 characters or with a space (the s
   assert.throws(() => buildCodexArgs({ ...ok, model: 'a'.repeat(101) }), /invalid model/);
   assert.throws(() => buildCodexArgs({ ...ok, model: 'gpt 5' }), /invalid model/);
   assert.throws(() => buildCodexArgs({ ...ok, model: '' }), /invalid model/);
+});
+
+// ---------- category spelling variants (#475) ----------
+
+test('normalizeFindingCategories: a spelling variant of ONE canonical category is read as it; anything else stays and is refused; the input is not changed', () => {
+  const f = (category) => ({ title: 't', file: 'a.js', line: 1, category, detail: 'd', reasoning: 'r', testable: false });
+  const input = { summary: 's', blocking: [f('Data Integrity'), f('bug')], suggestions: [f('tests'), f('broken_behavior'), f('perf')], worth_considering: [f('Documentation'), f('data loss')] };
+  const before = JSON.stringify(input);
+  const { json, mapped } = normalizeFindingCategories(input);
+  assert.equal(JSON.stringify(input), before, 'a copy is returned');
+  assert.deepEqual([json.blocking[0].category, json.blocking[1].category], ['data-integrity', 'bug']);
+  assert.deepEqual(json.suggestions.map((x) => x.category), ['testing', 'broken-behaviour', 'performance']);
+  assert.deepEqual(json.worth_considering.map((x) => x.category), ['docs', 'data-loss']);
+  assert.deepEqual(mapped.map((m) => [m.where, m.from, m.to]), [
+    ['blocking[0]', 'Data Integrity', 'data-integrity'], ['suggestions[0]', 'tests', 'testing'], ['suggestions[1]', 'broken_behavior', 'broken-behaviour'],
+    ['suggestions[2]', 'perf', 'performance'], ['worth_considering[0]', 'Documentation', 'docs'], ['worth_considering[1]', 'data loss', 'data-loss'],
+  ]);
+  assert.deepEqual(validateFindings(json), { ok: true, errors: [] });
+  // unknown stays unknown and is refused with the list; a non-string and a missing category are untouched
+  const odd = normalizeFindingCategories({ summary: 's', blocking: [f('nonsense'), f(7), { title: 'x' }, null], suggestions: [], worth_considering: [] });
+  assert.deepEqual(odd.mapped, []);
+  assert.equal(odd.json.blocking[0].category, 'nonsense');
+  assert.match(validateFindings(odd.json).errors.join('\n'), /"nonsense" is not one of bug, security/);
+  assert.deepEqual(normalizeFindingCategories('x'), { json: 'x', mapped: [] });
+});
+
+test('F8: every alias is a spelling variant of one canonical name: its target is a category, no key is a canonical name, and none moves a word out of the security class', () => {
+  for (const [alias, target] of Object.entries(CATEGORY_ALIASES)) {
+    assert.ok(CATEGORIES.includes(target), `${alias} -> ${target} is a category`);
+    assert.ok(!CATEGORIES.includes(alias), `${alias} is not itself a category`);
+    assert.equal(alias, alias.toLowerCase());
+    assert.ok(!/\s/.test(alias), `${alias} is in folded form`);
+  }
+  // a security-class word never becomes another category, and nothing becomes a security-class one by alias
+  const SECURITY_CLASS = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
+  for (const [alias, target] of Object.entries(CATEGORY_ALIASES)) {
+    assert.ok(!SECURITY_CLASS.includes(target), `${alias} does not make a finding security-class`);
+    assert.ok(!/secur|auth|permission|integrity|loss/.test(alias), `${alias} sounds like a security-class word`);
+  }
+  // the folded forms of the security-class names stay themselves
+  for (const name of SECURITY_CLASS) assert.equal(normalizeFindingCategories({ blocking: [{ category: name.toUpperCase().replace('-', ' ') }] }).json.blocking[0].category, name);
 });
