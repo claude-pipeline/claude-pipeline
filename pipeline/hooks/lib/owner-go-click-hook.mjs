@@ -4,8 +4,31 @@ import { recordClick } from './owner-go-click.mjs';
 
 const HEAD = '[claude-pipeline owner-go]';
 
+// Why (#472): on Claude Code 2.1.323 the answer's transcript entry is written after the PostToolUse hooks return, so the click is only kept PENDING here (recordClick `{ pending }`) and is verified by
+// the consumer that looks for it (`P merge --owner-go` and the others settle first, in the same turn). The line says exactly that: the click is RECEIVED, it is verified when used, and which command to
+// run now, one line per kind. It never says "is recorded" (nothing is yet) or "could not be verified" (nothing was tried), and it never says which label the owner chose (that is in the tool_response,
+// which is never read), so each command line is conditional in words: the agent runs it only if the answer the dialog returned approves: a ruling lists the `--owner-quote` of each deciding label, the consumer takes the one that matches the transcript.
+function pendingLine(p) {
+  const prs = Array.isArray(p?.prs) ? p.prs.filter(Number.isInteger) : [];
+  const said = `${HEAD} the owner's click is received and is verified when it is used`;
+  const where = p?.repo && prs.length ? `${p.repo} #${prs[0]}` : null;
+  if (p?.kind === 'merge-many') {
+    const runs = prs.map((n) => `P merge --pr ${n} --owner-go`);
+    const all = runs.length > 1 ? `${runs.slice(0, -1).join(', ')} and ${runs[runs.length - 1]}` : runs[0];
+    return all ? `${said}: if the owner chose to approve, run ${all} now (one per PR the owner ticked; a PR that was not ticked is refused); if they chose not to, stop: nothing is approved` : said;
+  }
+  if (p?.kind === 'merge') return prs.length ? `${said}: if the owner chose to approve, run P merge --pr ${prs[0]} --owner-go now; if they chose not to, stop: nothing is approved` : said;
+  if (p?.kind === 'round') return where ? `${said} (extra round for ${where}): if the owner chose to approve, run P codex-review --pr ${prs[0]} --round <the n from round-request> now; if they chose not to, stop: nothing is approved` : said;
+  if (p?.kind === 'ruling') {
+    const quotes = Object.entries(p.quotes ?? {}).filter(([, v]) => typeof v === 'string').map(([label, text]) => `${JSON.stringify(label)} -> --owner-quote ${JSON.stringify(text)}`);
+    return `${said}${where ? ` (ruling for ${where})` : ''}: if the owner chose to approve a ruling, run P triage owner-ruling now${quotes.length ? ` with the --owner-quote of the label the owner chose: ${quotes.join('; ')}` : ''}; if they chose not to, stop: nothing is approved`;
+  }
+  return said;
+}
+
 // The line for one click result, in the style of the typed lines (hooks/owner-go.mjs). null prints nothing.
 export function clickLine(result) {
+  if (result?.pending) return pendingLine(result.pending);
   if (result?.recorded) {
     const r = result.recorded;
     if (r.kind === 'ruling') return `${HEAD} the owner's click is recorded: ruling recorded for ${r.repo} #${r.pr}: ${(r.ids ?? []).join(', ')} (pass --owner-quote ${JSON.stringify(String(r.prompt ?? ''))})`;

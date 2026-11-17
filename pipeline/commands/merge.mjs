@@ -19,7 +19,7 @@ import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
 import { substituteInventory } from '../lib/triage.mjs';
 import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, holdDigest, readyLine } from '../hooks/lib/owner-go.mjs';
-import { mergeAsk, mergeManyAsk } from '../hooks/lib/owner-go-click.mjs';
+import { clickNotes, mergeAsk, mergeManyAsk } from '../hooks/lib/owner-go-click.mjs';
 import { askFields, clickConfigRefusal, clickGate } from '../lib/click-ask.mjs';
 import { listWorktrees } from '../lib/local-branches.mjs';
 import { RESTORE_NOTE, findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
@@ -542,7 +542,8 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
   if (gap !== 'ok') {
     const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas, hold, rulings: live.rulings });
     const reason = missingApproval(gap, `${repo} #${pr} head ${head.slice(0, 12)} items ${live.ownerItems}${live.areas.length > 0 ? ` areas ${live.areas.join(' ')}` : ''}${hold ? ` hold ${hold.id}` : ''}${live.rulingCount > 0 ? ` rulings ${live.rulingsDigest.slice(0, 12)}` : ''}`, `end the reply with ${lines.map((l) => `\`${l}\``).join(' and ')} (from \`P merge --pr ${pr} --dry-run --owner-go\`) and \`${readyLine([pr], { lift: hold !== null })}\`, and wait for the owner to type "merge"`, asked);
-    return refuse('owner-go', [reason], { reason, head });
+    const noted = [reason, ...clickNotes({ repo, prs: [pr], kinds: ['merge', 'merge-many'] })].join('; '); // (#472: a click that is waiting, refused or declined is said here, not hidden behind "no approval")
+    return refuse('owner-go', [noted], { reason: noted, head });
   }
 
   // A.4: the scan was of GitHub's base and head as read by evaluateOwnerGo; the last look re-reads both and refuses if either moved since.
