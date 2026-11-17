@@ -46,13 +46,17 @@ const right = (l) => l.replace(/\s+$/, '');
 
 // ---- the byte contract ------------------------------------------------------------------------------------------------------------
 
+// control characters (other than tab and newline) and bidirectional-text controls: they can hide or reorder what the owner is shown
+const HIDING_CHARS = /[\u0000-\u0008\u000b-\u001f\u007f-\u009f\u202a-\u202e\u2066-\u2069]/;
+
 // The SQL of a migration file as the guard hashes it: the text unchanged. Refused (a reason) when it is not valid UTF-8 (U+FFFD from the decode), holds \r or NUL, has a line starting
-// with three backticks (it would close the block's fence early), is empty or is longer than MIGRATION_MAX_LINES lines (the owner sees every line).
+// with three backticks, indented or not (it would close the block's fence early), is empty or is longer than MIGRATION_MAX_LINES lines (the owner sees every line).
 export function migrationSqlProblem(sql) {
   if (typeof sql !== 'string' || sql.trim() === '') return 'the file is empty';
   if (sql.includes('�')) return 'the file is not valid UTF-8';
   if (/[\r\u0000]/.test(sql)) return 'the file holds a carriage return or NUL (CRLF line ends): the owner applies it';
-  if (sql.split('\n').some((l) => l.startsWith('```'))) return 'a line of the file starts with three backticks';
+  if (sql.split('\n').some((l) => /^\s*```/.test(l))) return 'a line of the file starts with three backticks (indented or not)';
+  if (HIDING_CHARS.test(sql)) return 'the file holds a control or bidirectional-text character (it could hide lines on screen): the owner applies it';
   if (displayLines(sql).length > MIGRATION_MAX_LINES) return `the file is over ${MIGRATION_MAX_LINES} lines: too long to show in full; the owner applies it`;
   return null;
 }
@@ -66,7 +70,8 @@ export function canonicalDataSql(text) {
   if (sql === '') return { problem: 'the SQL is empty' };
   if (/[\r\u0000]/.test(sql)) return { problem: 'the SQL holds a carriage return or NUL' };
   const lines = sql.split('\n');
-  if (lines.some((l) => l.startsWith('```'))) return { problem: 'a line of the SQL starts with three backticks' };
+  if (lines.some((l) => /^\s*```/.test(l))) return { problem: 'a line of the SQL starts with three backticks (indented or not)' };
+  if (HIDING_CHARS.test(sql)) return { problem: 'the SQL holds a control or bidirectional-text character (it could hide lines on screen)' };
   if (lines.some((l) => /\s$/.test(l))) return { problem: 'a line of the SQL ends with whitespace (it could not be copied byte for byte): remove it' };
   if (lines.length > DATA_MAX_LINES || sql.length > DATA_MAX_CHARS) return { problem: `a data fix is at most ${DATA_MAX_LINES} lines and ${DATA_MAX_CHARS} characters: make it a migration` };
   return { sql };

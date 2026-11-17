@@ -12,7 +12,7 @@ import { OWNER_ENTRY, linesOf, runHook } from './helpers/owner-go.mjs';
 import { run } from '../pipeline/commands/live-db.mjs';
 import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
-import { buildBlock, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
+import { buildBlock, canonicalDataSql, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { matchCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
@@ -195,6 +195,18 @@ test('present: refuses a dirty file, a CRLF file, a 61-line data fix, trailing w
   assert.match((await data('select 1;\r\nselect 2;')).output.message, /carriage return/);
   assert.match((await data('select 1;\n```\nselect 2;')).output.message, /three backticks/);
   await assert.rejects(() => run(['present', '--op', 'data', '--project', REF, '--summary', 'a\nb', '--sql-file', sqlFile], ctx()), UsageError);
+});
+
+test('SQL the block could not show in full is refused: an indented closing fence, control characters, bidi controls', () => {
+  const bad = ['a;\n  ```\n[x]: <> (hidden)\nb;', 'a;\n```\nb;', 'a;\n\t```sql\nb;', 'a;\u001b[2Kb;', 'a;\u0008b;', 'a;\u007fb;', 'a;\u0085b;', 'a;\u009bb;', 'a;\u202eb;', 'a;\u2066b;', 'a;\u2069b;', 'a;\u000cb;'];
+  for (const q of bad) {
+    assert.ok(migrationSqlProblem(q), `migration: ${JSON.stringify(q)}`);
+    assert.ok(canonicalDataSql(q).problem, `data: ${JSON.stringify(q)}`);
+  }
+  for (const q of ['select 1;\n\tfrom t;\n', 'select \'``` in a string\';\nselect 2;', 'select 1; -- ünï ✓']) {
+    assert.equal(migrationSqlProblem(q), null, q);
+    assert.ok(canonicalDataSql(q).sql, q);
+  }
 });
 
 test('catalog prints the template; an argument with a quote or semicolon is a usage error', async () => {
