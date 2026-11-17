@@ -23,7 +23,7 @@ import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRu
 import os from 'node:os';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -57,7 +57,7 @@ const PROTECTED_REL = [
   // local settings file (where a hook can be declared) are held like settings.json. Every OTHER account config dir (~/.claude-<name>, $CLAUDE_CONFIG_DIR) gets the same three, see configRoots.
   '.claude/hooks',
   '.claude/settings.local.json',
-  // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it, P merge and the guard read it
+  // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it (typed words, and clicks: a pending click, its settled outcome, round tickets; #472), P merge and the guard read it. The guard refuses running the recorder or the click libraries by hand (OWNER_GO_RECORDER)
   '.claude/pipeline-state/owner-go',
   // cp #256: the machine-wide Codex outage record (status.json: the last quota stop and the PRs waiting for Codex; only pipeline commands write it) and Codex's own session
   // logs (the weekly-usage figure is read from them, so an agent may not write them)
@@ -872,7 +872,9 @@ function physicalTargets(target, ctx) {
 }
 
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
-const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go\.mjs$/i;
+// #472: and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs): run by hand with an injected check they would write a pending click with a made-up capture-time hook result.
+const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go(?:-click(?:-hook)?)?\.mjs$/i;
+const OWNER_GO_WORD = /owner-go(?:-click(?:-hook)?)?\.mjs/i;
 
 const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
@@ -4272,6 +4274,52 @@ function changesClaudeCode(cmds, scanRaw) {
 // would let a fake satisfy the merge gate. (The installed CLI also ignores them; this is the hook side.)
 const SEAM_VARS = /^PIPELINE_(?:GH|CODEX|VERCEL|TEST_MODE|UPDATE_REMOTE|INSTALL_RETIRED_SKILLS)$/i;
 const RUNTIMES = new Set(['node', 'nodejs', 'bun', 'deno', 'npx', 'tsx']);
+// #472 (R2-B1 R2-F1 R2-F2) Whether the line is flat enough to trust a reading of one command's OWN stdin source: simple commands joined by && || ; | |& or a newline, every one at depth 0 (so no `$(…)`, backticks, `bash -c`,
+// process substitution or other nested text), none command-less (a redirect on a group or subshell stands alone), no `exec` carrying a redirect (it rebinds the stdin of every command after it), no group, subshell, compound
+// command or function, and no command that redefines a name (an alias, `eval`, `source`…: the parser's REDEF_CMDS; R5-F1) (the parser's flatSeq, which also fails on a cut-short parse or a heredoc it cannot place). Each of those hands a runtime stdin that the walk below does not follow, so such a line is read as a whole.
+function isFlatLine(cmds) {
+  return cmds.flatSeq === true && !cmds.dynamic && !(cmds.fns?.size > 0) && cmds.redef !== true
+    && cmds.every((c) => (c.depth ?? 0) === 0 && c.argv.length > 0 && !REDEF_CMDS.has(baseOf(c.argv[0])) && !((c.redirects ?? []).length && c.argv.slice(0, 3).some((w) => baseOf(w) === 'exec')));
+}
+// #472 (R3-F1) A stdin source whose text is not on the line: a file (`< F`, `0< F`, `<> F`) or a descriptor (`<&N`, `<&$fd`). A `{name}` word in front of a redirect (`: {fd}<<< …`) opens a descriptor that stays open after its command.
+const unknownSource = (r) => r.op === '<&' || r.op === '<>' || (r.op === '<' && !/^<\(/.test(r.target ?? ''));
+const namesFd = (c) => (c.redirects ?? []).length > 0 && c.argv.some((w) => /^\{[A-Za-z_]\w*\}$/.test(w));
+// #472 (R4-B1) A pipe stage whose output is the text on the line: `echo`, `printf` without `-v`, or `cat` with no file operand (its stdin is then the stage before it, or a heredoc or here-string it carries). Any other stage (a file
+// operand, a decoder, a filter, `tee`, a function) makes what the runtime receives unknown, so the caller reads the whole line.
+function literalPrinter(u) {
+  const name = baseOf(u.argv[0] ?? '');
+  const ops = u.argv.slice(1);
+  return name === 'echo' || (name === 'printf' && !ops.some((w) => /^-[A-Za-z]*v/.test(w))) || (name === 'cat' && ops.every((w) => /^-[A-Za-z]+$/.test(w)));
+}
+// #472 (R1-B1) The text a command's own stdin source hands it, for a FLAT line (isFlatLine): the bodies of the heredocs on the line (the parser's spans; the whole line when they cannot be placed: fail closed), its here-string
+// and `< <(…)` words, and, when it receives a pipe, the words and bodies of the commands feeding it (the run of `|` stages before it). Not for a line with a group, a subshell or nested text: there the pipe or the stdin
+// reaches the runtime through the shell, not through this walk (R2). Returns null when a stdin source of the runtime (or of a stage feeding it) is a file or a descriptor, or a stage feeding it is not a literal printer (R4-B1), or any command on the line keeps a descriptor open or
+// duplicates one: the text is then not known and the caller reads the whole line (R3-F1).
+function stdinProgramTexts(cmds, ci, raw) {
+  if (cmds.some((x) => namesFd(x) || (x.redirects ?? []).some((r) => r.op === '<&' || r.op === '<>'))) return null;
+  const spans = cmds.heredocSpans;
+  const bodies = Array.isArray(spans) && spans.every((sp) => Array.isArray(sp) && sp[1] >= sp[0] && sp[1] <= raw.length) ? spans.map(([a, b]) => raw.slice(a, b)) : [raw];
+  const own = (x) => (x.redirects ?? []).flatMap((r) => r.op === '<<' ? bodies : r.op === '<<<' || (r.op === '<' && /^<\(/.test(r.target ?? '')) ? [r.target ?? ''] : []);
+  const c = cmds[ci];
+  if ((c.redirects ?? []).some(unknownSource)) return null;
+  const texts = own(c);
+  let next = c;
+  for (let j = ci - 1; j >= 0 && (next.sep === '|' || (cmds[j].depth ?? 0) > (c.depth ?? 0)); j--) {
+    const u = cmds[j];
+    if ((u.redirects ?? []).some(unknownSource) || !literalPrinter(u)) return null;
+    texts.push(...u.argv, ...Object.values(u.env ?? {}), ...(u.redirects ?? []).map((r) => r.target ?? ''), ...own(u));
+    next = u;
+  }
+  return texts;
+}
+// #472 (R3-B1) The whole-line reading for a runtime whose stdin is not followed: the raw line, the heredoc bodies, and the DECODED words of every command at every depth (argv, env-assignment values, redirect targets, here-string
+// text): shell quotes that split a name (`owner-"'go-click.mjs'`) are joined in the decoded word, which the raw line does not show.
+function wholeLineTexts(cmds, raw) {
+  const spans = cmds.heredocSpans;
+  const bodies = Array.isArray(spans) ? spans.filter((sp) => Array.isArray(sp) && sp[1] >= sp[0] && sp[1] <= raw.length).map(([a, b]) => raw.slice(a, b)) : [];
+  // (the shell joins a backslash-newline inside an unquoted heredoc body, so a name split across it reads whole there: the raw line is also read with every backslash-newline, and the tabs after it, removed)
+  return [raw, raw.replace(/\\\r?\n\t*/g, ''), ...bodies, ...cmds.flatMap((u) => [...u.argv, ...Object.values(u.env ?? {}), ...(u.redirects ?? []).map((r) => r.target ?? '')])];
+}
 
 function setsSeamForPipeline(cmds) {
   const seam = cmds.some((c) => Object.keys(c.env ?? {}).some((k) => SEAM_VARS.test(k))
@@ -5065,12 +5113,34 @@ function evaluateBashForFilesFrame(command, opts) {
 
   // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
   // on the owner's prompt. Reading, diffing or committing the file stays allowed: only a runtime (or the file run by path) is refused.
-  for (const c of cmds) {
+  for (const [ci, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // (the evaluation deadline)
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
-    if (runs && c.argv.some((w) => /owner-go\.mjs/i.test(toPosix(expandRefs(w, ctx))))) {
+    if (runs && c.argv.some((w) => OWNER_GO_WORD.test(toPosix(expandRefs(w, ctx))))) {
       return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
+    }
+    // #472 (R1-B1, R2): a runtime that reads its program from stdin (`node --input-type=module <<EOF`, `node - <<< …`, `node /dev/stdin`, `echo … | node`) names no file in its words, so the check above cannot see what it imports.
+    // Decided from the command's OWN stdin source, not from the shape of its words (`--input-type module` and `- x` are ordinary words that still run stdin): a heredoc, a here-string or a `< <(…)` on it, or the receiving
+    // side of a pipe. When the text that source hands it names an owner-go library, the command is refused. A library named elsewhere on the line (`git add LIB && node --test`) is none of its business.
+    // That reading is trusted ONLY when every stdin source of the runtime is text that is fully known: a flat line (isFlatLine) whose runtime, and every pipe stage before it, takes a heredoc, a here-string, a `< <(…)` or a pipe, with no
+    // `$` or backtick in that text, as written or after expandRefs (R3-F1, R4-F1: a run-time variable), no pipe stage that is not a literal printer (R4-B1), no file or descriptor source and no kept-open descriptor on the line. Anything else (a group, a subshell, a compound command, a function, an `exec`
+    // redirect, a command-less redirect, nested text, a variable, a file, a descriptor) cannot be followed command by command, so it fails closed: a runtime is refused when the whole raw line, or the decoded words of any command on it
+    // (R3-B1: shell quotes can split a name in the raw line), name an owner-go library.
+    // What this refuses is a library name that appears AS WRITTEN: in a decoded word, a heredoc body (joined over a backslash-newline) or the raw line. It is a text scan, so a name built, split or encoded at run time
+    // (`printf 'owner-\x2dgo…'`, two printf words, a string joined inside the program) or a program staged in a file earlier (`node /tmp/p.mjs`) is the documented residual (files-policy.mjs, RESIDUALS at the top;
+    // owner-go-click.mjs header), not a hole in this rule.
+    if (RUNTIMES.has(baseOf(c.argv[0]))) {
+      const own = isFlatLine(cmds) ? stdinProgramTexts(cmds, ci, raw) : null;
+      const known = own?.map((t) => toPosix(expandRefs(t, ctx)));
+      // (R4-F1: the text AS WRITTEN decides: a name the line gave a value and then rebinds at run time (`P=x true; read -r P …`) expands to its stale value and would hide the `$`)
+      if (known && !own.some((t) => /[$`]/.test(t)) && !known.some((t) => /[$`]/.test(t))) {
+        if (known.some((t) => OWNER_GO_WORD.test(t))) {
+          return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
+        }
+      } else if (wholeLineTexts(cmds, raw).some((t) => OWNER_GO_WORD.test(toPosix(expandRefs(t, ctx))))) {
+        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor or the output of another command may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
+      }
     }
   }
 

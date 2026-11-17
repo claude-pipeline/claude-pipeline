@@ -54,6 +54,9 @@ const env = {
   ...process.env,
   PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
   PIPELINE_CODEX_USAGE_FILE: join(usageDir, 'codex-usage.jsonl'),
+  // #472: the owner-go readers settle pending clicks (writes under the account's owner-go folder). A test must never settle the owner's real ones, so every test file runs with the switch off;
+  // a test of settling asks for it with `settle: true`. Already recorded clicks still count: the switch only stops pending clicks becoming records through the readers.
+  PIPELINE_CLICK_SETTLE: 'off',
 };
 const timesOut = process.env.CP_TEST_TIMES;
 const nodeArgs = timesOut ? ['--import', pathToFileURL(join(libDir, 'file-times-preload.mjs')).href] : [];
