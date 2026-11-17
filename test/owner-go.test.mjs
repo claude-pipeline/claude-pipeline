@@ -1154,6 +1154,26 @@ test('#128 hook: a notice, a peer message and a scheduled "merge" are not record
   assert.equal(ok.record.prompt, 'merge');
 });
 
+// #585: the typed "merge" line says "is recorded" only when the record is usable (a request with a repo: the only kind `P merge --owner-go` accepts); otherwise it says it binds nothing and how to continue.
+test('#585 hook: a typed "merge" that bound nothing says so (no request shown, or only repo-less ones); one repo request keeps the "is recorded" line; a mixed reply too', (t) => {
+  const AGAIN = 'run the dry run again (P merge --pr N --dry-run --owner-go) and end a reply with its closing lines, then ask the owner to type "merge"';
+  const none = runHook(t, { entries: [promptEntry('go'), said('Nothing to merge yet.')], prompt: 'merge' });
+  assert.equal(none.stdout, `[claude-pipeline owner-go] the owner's "merge" binds nothing: no merge request was shown in the last reply: ${AGAIN}\n`);
+  assert.deepEqual(none.record?.requests, []);
+  const noRepo = runHook(t, { entries: [promptEntry('go'), said(REQUEST.replace(` · repo ${REPO}`, ''))], prompt: 'merge' });
+  assert.equal(noRepo.stdout, `[claude-pipeline owner-go] the owner's "merge" binds nothing: no Head/items/repo request was bound in the last reply (PRs #58): ${AGAIN}\n`);
+  assert.equal(noRepo.record?.requests.length, 1, 'the stored record is unchanged: the repo-less request is kept');
+  const normal = runHook(t, { entries: [promptEntry('go'), said(REQUEST)], prompt: 'merge' });
+  assert.equal(normal.stdout, `[claude-pipeline owner-go] the owner's "merge" is recorded: ${REPO} #58 head ${HEAD.slice(0, 12)} items ${ITEMS}; PRs #58.\n`);
+  const mixedText = `#58 head ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}\n#59 head ${HEAD.slice(0, 12)} · items ${ITEMS}\n🔀 Ready to merge #58, #59 — say "merge"`;
+  const mixed = runHook(t, { entries: [promptEntry('go'), said(mixedText)], prompt: 'merge' });
+  assert.equal(mixed.stdout, `[claude-pipeline owner-go] the owner's "merge" is recorded: ${REPO} #58 head ${HEAD.slice(0, 12)} items ${ITEMS}; (no repo: approves nothing) #59 head ${HEAD.slice(0, 12)} items ${ITEMS}; PRs #58, #59.\n`);
+  // a request that binds nothing (a different earlier Hold line voids the reply) but names its PR
+  const holdText = `Hold LE_abc by someone at 2026-11-05T08:30:00Z\nSome text.\nHead ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}\n🔀 Ready to merge #58 — say "merge"`;
+  const voided = runHook(t, { entries: [promptEntry('go'), said(holdText)], prompt: 'merge' });
+  assert.equal(voided.stdout, `[claude-pipeline owner-go] the owner's "merge" binds nothing: no Head/items/repo request was bound in the last reply (PRs #58): ${AGAIN}\n`);
+});
+
 // ---- owner-granted extra review round ------------------------------------------------------------------------------------
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const RASK = roundRequest(58, 4, GHEAD, REPO);
