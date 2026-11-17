@@ -78,3 +78,48 @@ test("cpuTimed returns fn's value; CPU burn counts, a sleep does not (so machine
   assert.ok(sleep.ms < 25, `a 50 ms sleep read ${sleep.ms} ms of CPU`);
   assert.ok(sleep.ms < burn.ms);
 });
+
+// ---- rounds: a burst of load that slows a whole round is absorbed by a fresh round; a real quadratic is slow in every round ----
+// Each fake below is a script of numbers, one per call: no real timing.
+const script = (xs, fallback) => () => (xs.length > 0 ? xs.shift() : fallback);
+
+test('assertLinear rounds: a round that is slow throughout (load) is followed by a fresh, linear round, which passes', () => {
+  // round 1: warm-up 50, baselines 50 x3, then 5 slow large samples; round 2: warm-up, baselines 50 x3, a linear large sample
+  const smalls = script([50, 50, 50, 50, 50, 50, 50, 50], 50);
+  const larges = script([900, 900, 900, 900, 900, 100], 100);
+  const out = assertLinear(smalls, larges);
+  assert.deepEqual(out, { lo: 50, hi: 100 });
+});
+
+test('assertLinear rounds: the baseline is re-measured in a fresh round (a baseline that was noisy-slow in round 1 does not stay)', () => {
+  // round 1: baseline 50, every large sample 900 (fails); round 2: warm-up 50, then baselines of 20 and a large of 30
+  const smalls = script([50, 50, 50, 50, /* round 2 */ 50, 20, 20, 20], 20);
+  const larges = script([900, 900, 900, 900, 900, /* round 2 */ 30], 30);
+  const out = assertLinear(smalls, larges);
+  assert.equal(out.lo, 20); // round 2's own baseline, not round 1's 50
+});
+
+test('assertLinear rounds: a quadratic cost fails every round, and the message lists each round', () => {
+  let calls = 0;
+  const small = () => { calls++; return 50; };
+  const large = () => { calls++; return 200; }; // 4x for double the input
+  assert.throws(
+    () => assertLinear(small, large, { label: 'fake' }),
+    (e) => /fake: 50ms at n\/2 -> 200ms at n \(best of 5\): not linear in all 3 rounds/.test(e.message) && /\(lo\/hi ms per round: 50\/200, 50\/200, 50\/200\)/.test(e.message),
+  );
+  assert.equal(calls, 3 * (1 + 3 + 5)); // three rounds, each: warm-up + 3 baselines + 5 large samples
+});
+
+test('assertLinear rounds: the option sets the count (rounds: 1 is the old single measure; rounds: 2 stops after two)', () => {
+  let rounds = 0;
+  const small = () => { rounds++; return 50; };
+  assert.throws(() => assertLinear(small, () => 200, { rounds: 1 }), /not linear in all 1 rounds/);
+  assert.equal(rounds, 1 + 3);
+  rounds = 0;
+  assert.throws(() => assertLinear(small, () => 200, { rounds: 2 }), /not linear in all 2 rounds \(lo\/hi ms per round: 50\/200, 50\/200\)/);
+  assert.equal(rounds, 2 * (1 + 3));
+});
+
+test('assertLinear rounds: each round keeps the ratio / factor / slack semantics (factor 4 reports n/4, a quadratic still fails)', () => {
+  assert.throws(() => assertLinear(() => 50, () => 800, { factor: 4, ratio: 8, label: 'fake' }), /fake: 50ms at n\/4 -> 800ms at n .*not linear in all 3 rounds/);
+});
