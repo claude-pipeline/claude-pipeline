@@ -9,7 +9,7 @@
 // because a hook-filled answer could carry source user_temporary and annotations {} like a click, with only its reasonCode (hook:PreToolUse, a person's is unknown) telling them apart. On 2.1.323
 // a dialog that comes with prefilled answers (the model's own `answers`, or a PreToolUse hook answering "ask" or returning only updatedInput) is not submitted by Claude Code: it waits for a
 // person (the owner's 2026-11-16T13:42Z full run: open 56-59 s until the recording script cancelled it, an error result with no answer and no stamp). The whole-object check stays as defence in depth, and the
-// model's own `answers` is refused by the tool-use shape check below. The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for: the entry lands 100-200 ms after the
+// model's own `answers` is refused by the tool-use shape check below. The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for, and whose `answers` / `annotations` / `afkTimeoutMs` Claude Code adds itself on 2.1.323 and are never read: the entry lands 100-200 ms after the
 // hook starts). Hooks that could still answer the dialog are the dialog-hook check's business (B5, hookCheck below, T2): this file takes it as an injected function.
 // What binds is the question TEXT: it is the typed path's closing block, so the answer goes through the SAME parsers the typed prompt does (approvalBinding, roundBinding, rulingBinding in
 // owner-go.mjs), and the ask file supplies only what a typed prompt cannot: one-time use, supersession, expiry, the dialog hash and the issue-time hook fingerprint.
@@ -514,11 +514,15 @@ const clickFile = (askId, clickId, ext, home) => (ASK_ID_RE.test(String(askId)) 
 // (`hookLayersSha256`, taken at the click: hooks that could answer the dialog are checked when the dialog is answered, not when someone reads), plus `capturedAt` for the time rules; both are taken
 // on the PostToolUse hook's word (guard-files refuses a tool write to owner-go/** and a direct hand-run of the click libraries: a path, program text, a stdin program; a script file that imports them is the residual named at the top of this file,
 // and it skips only this dialog-hook result). What is refused here, no pointer: a tool_input that is
-// not one canonical question of this ask (keys beyond questions / metadata, another dialog: only ever an EARLIER refusal, the tool_response is never read), an expired, superseded or already spent ask, and hooks that
+// not one canonical question of this ask (a key beyond questions / metadata / the three Claude Code adds itself, another dialog: only ever an EARLIER refusal, the tool_response is never read), an expired, superseded or already spent ask, and hooks that
 // are unchecked, offending or changed since the ask.
+// On 2.1.323 the PostToolUse tool_input of AskUserQuestion is the permission dialog's updatedInput, { ...input, answers, annotations, ...(afkTimeoutMs && { afkTimeoutMs }) }: a genuine click always carries
+// `answers` and `annotations` there. Their VALUES are never read (the transcript is the evidence); the transcript's own tool_use input stays questions / metadata only (clickEvidence), which is what
+// refuses the model's prefilled `answers`.
+const HOOK_INPUT_KEYS = new Set(['questions', 'metadata', 'answers', 'annotations', 'afkTimeoutMs']);
 async function captureClick({ input, ask, askId, session, toolUseId, transcriptPath, cwd, home, now, hookCheck }) {
   const shown = input.tool_input;
-  if (!isObj(shown) || !Object.keys(shown).every((k) => k === 'questions' || k === 'metadata') || !Array.isArray(shown.questions) || shown.questions.length !== 1) return { refused: 'tool-use-shape' };
+  if (!isObj(shown) || !Object.keys(shown).every((k) => HOOK_INPUT_KEYS.has(k)) || !Array.isArray(shown.questions) || shown.questions.length !== 1) return { refused: 'tool-use-shape' };
   const dialog = canonicalDialog(shown.questions[0]);
   if (dialog === null) return { refused: 'dialog-not-canonical' };
   if (sha256(JSON.stringify(dialog)) !== ask.dialogSha256) return { refused: 'dialog-differs' };
