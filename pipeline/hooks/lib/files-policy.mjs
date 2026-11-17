@@ -3288,6 +3288,12 @@ function rsyncFlags(argv, ctx, raw) {
 // #478 R1-F1: is every name that the words of this rsync command hold given its value once, by a command that surely runs before it? (`N=-n; rsync -a --delete $N SRC ~/`: yes. `[ -n "$DRY" ] && N=-n`, an
 // if / loop / group / subshell / pipe stage / background job, a second assignment, a prefix of the rsync command itself (the shell expands the word first), a function or a sourced file that may set it: no.)
 // A word that holds a substitution, a backtick or an expansion form other than `$NAME` / `${NAME}` is not read. A name the line never gives is no value the line made.
+// #493: the next command at the text's own level (the parser lists a substitution's inner commands before the command that holds them: cmds[site + 1] can be one of them)
+const nextTopSep = (cmds, i) => {
+  if (cmds[i]?.depth > 0) return cmds[i + 1]?.sep;
+  for (let j = i + 1; j < cmds.length; j++) if (!(cmds[j].depth > 0)) return cmds[j].sep;
+  return undefined;
+};
 const SURE_BINDERS = new Set(['export', 'declare', 'typeset', 'readonly']);
 function rsyncNamesSure(cmds, idx, ctx) {
   // the names a text refers to (null: a form that is not read: a substitution, a backtick, an expansion other than $NAME / ${NAME})
@@ -3335,7 +3341,7 @@ function rsyncNamesSure(cmds, idx, ctx) {
     const [site] = sites;
     const c = cmds[site];
     const sure = site < limit && (c.argv.length === 0 || SURE_BINDERS.has(baseOf(c.argv[0]))) && c.depth === 0
-      && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && cmds[site + 1]?.sep !== '|' && cmds[site + 1]?.sep !== '&'
+      && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && !['|', '&'].includes(nextTopSep(cmds, site))
       && !mayNotRun(cmds, from, site);
     if (!sure) return false;
     // (#478 R2-B2: a value that holds a name is only as sure as that name was before this site: `[ -n "$DRY" ] && N=-n; OPTS="-a --delete $N"`)
@@ -5437,6 +5443,11 @@ function evaluateBashForFilesFrame(command, opts) {
   const NON_PATH_OPTIONS = new Set(['base', 'base-href', 'public-path', 'basename', 'deploy-url']); // (a URL prefix, not a path: `vite build --base=/`)
   const SLASH_NOT_A_PATH = new Set(['expr', 'ssh', 'docker', 'podman', 'kubectl', 'oc', 'scp', 'mosh', 'bc', 'dc', 'curl', 'wget', 'gh']); // (a lone `/` is division, or a path on another machine / in a container)
   // R4-F2: ~u (and ~$USER) is home, ~+ is each directory the command may be in, ~- and any other ~NAME are only known at run time (a hit: this is asked of commands that are not read-only)
+  const couldNameHome = (x) => {
+    if (/[$`*?[{~]/.test(x)) return true;
+    const chain = unique([ctx.homePosix, realResolve(ctx.homePosix, ctx.api)]).flatMap((h) => h.split('/').filter(Boolean)).map((s) => (ctx.ci ? s.toLowerCase() : s)); // (the lexical and the resolved home, as homeChain reads them)
+    return x.split('/').some((s) => s === '.' || s.includes('..') || chain.includes(ctx.ci ? s.toLowerCase() : s));
+  };
   const homeWord = (word, wdirs = dirs, cname = '', unknownWd = false) => {
     const opt = /^--([\w-]+)=./.exec(word);
     const w = opt ? word.slice(word.indexOf('=') + 1) : word;
@@ -5460,7 +5471,8 @@ function evaluateBashForFilesFrame(command, opts) {
     }
     // a relative word is resolved against the directories the command can run in and normalized (`.`, `..`)
     if (isAbs(x)) return hitPath(x);
-    return unknownWd || hits(wdirs.map((d) => under(d, x))); // (R5-F4: a directory only known at run time: a relative word can reach home from there)
+    // R5-F4: a directory only known at run time: a relative word can reach home from there; #307: only a word that could (`.`, `..`, a word with `..`, a glob, a run-time piece, or a name that is a segment of the home chain)
+    return (unknownWd && couldNameHome(x)) || hits(wdirs.map((d) => under(d, x)));
   };
   // what a command is given as operands: the value of a URL-prefix option is none
   const operandsOf = (c) => {
