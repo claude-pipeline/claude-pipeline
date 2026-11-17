@@ -240,3 +240,4 @@ full record.
 - 2026-11-17 · #574 · Click/merge follow-ups from #527: clean-status merge retry, newest-first clicks, wording · risk high · rounds 6 · arbiter 4 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 17027 runs (16482 high)
 - 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 14 · arbiter 11 · substitute 1 · awaiting-owner-merge · Codex 7d: 17073 runs (16526 high)
 - 2026-11-17 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 7 · arbiter 6 (fix-verify 2) · blocked · Codex 7d: 17528 runs (16973 high)
+- 2026-11-17 · #592 · Click-to-approve works on 2.1.323 (harness-added answers), a re-shown request with a hold binds, honest merge-line wording (#585) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 794 runs (465 high)
