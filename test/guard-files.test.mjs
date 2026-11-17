@@ -1104,6 +1104,20 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
     assert.match(r.reason, /Run the runtime on a line of its own, or keep the library name off that line/, cmd);
     assert.match(r.reason, /or the output of another command/, cmd);
   }
+  // (#533: a line with a command that can rename another (REDEF_CMDS) or a bare `commands` word is not flat either; the message names that cause too)
+  for (const cmd of [
+    'source ~/.nvm/nvm.sh && git add pipeline/hooks/lib/owner-go-click.mjs && node scripts/test.mjs x.test.mjs',
+    "trap 'rm -f \"$t\"' EXIT; git add pipeline/hooks/lib/owner-go.mjs; node scripts/x.mjs",
+    'hash -r; git add pipeline/hooks/lib/owner-go-click.mjs; node scripts/x.mjs',
+    'ls commands && git add pipeline/hooks/lib/owner-go-click.mjs && node scripts/x.mjs',
+  ]) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /not a plain command line/, cmd);
+    assert.match(r.reason, /a command that can rename another \(alias, hash, source, eval, trap\)/, cmd);
+    assert.match(r.reason, /anything else that cannot be followed command by command/, cmd);
+    assert.match(r.reason, /Run the runtime on a line of its own/, cmd);
+  }
   for (const cmd of [
     'node scripts/test.mjs owner-go-click.test.mjs',
     'node scripts/test.mjs owner-go-click-hook.test.mjs owner-go-click-pending.test.mjs',

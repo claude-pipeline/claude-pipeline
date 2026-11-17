@@ -5130,6 +5130,7 @@ function evaluateBashForFilesFrame(command, opts) {
     // What this refuses is a library name that appears AS WRITTEN: in a decoded word, a heredoc body (joined over a backslash-newline) or the raw line. It is a text scan, so a name built, split or encoded at run time
     // (`printf 'owner-\x2dgo…'`, two printf words, a string joined inside the program) or a program staged in a file earlier (`node /tmp/p.mjs`) is the documented residual (files-policy.mjs, RESIDUALS at the top;
     // owner-go-click.mjs header), not a hole in this rule.
+    // #532: a redefinition the parser's REDEF lists do not know (zsh `${aliases[x]::=…}`, bash `BASH_ALIASES[…]=` or `BASH_CMDS`) is part of the same documented residual. Those lists are frozen by the owner's standing decision (11-13); the redesign is #359.
     if (RUNTIMES.has(baseOf(c.argv[0]))) {
       const own = isFlatLine(cmds) ? stdinProgramTexts(cmds, ci, raw) : null;
       const known = own?.map((t) => toPosix(expandRefs(t, ctx)));
@@ -5139,7 +5140,7 @@ function evaluateBashForFilesFrame(command, opts) {
           return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
         }
       } else if (wholeLineTexts(cmds, raw).some((t) => OWNER_GO_WORD.test(toPosix(expandRefs(t, ctx))))) {
-        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor or the output of another command may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
+        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor, a command that can rename another (alias, hash, source, eval, trap), anything else that cannot be followed command by command, or the output of another command may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
       }
     }
   }
