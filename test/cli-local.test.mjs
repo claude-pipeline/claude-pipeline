@@ -502,13 +502,14 @@ test('job: a failing command is done with its exit code and CLI exit 1', (t) => 
 
 test('job: a job that is still running is exit 0 state running, then done', async (t) => {
   const repo = project();
-  // The job holds until the test drops a release file (or 60 s pass), not for a fixed time: under machine load each CLI
-  // call can take seconds, and a timed job could finish before the "still running" checks below.
+  // The job holds until the test drops a release file (or its folder is gone, or 5 minutes pass), not for a fixed time: under machine load
+  // (load 60-100) each CLI call can take 10 s or more, and a 60 s job could finish before the "still running" checks below. The folder check
+  // ends it once the test's cleanup removed the release file with the folder, so it is never left polling.
   const release = join(repo.dir, 'release-slow');
   t.after(() => { writeFileSync(release, ''); repo.cleanup(); });
-  const hold = "const fs = require('fs'); const end = Date.now() + 60000; "
+  const hold = "const fs = require('fs'); const end = Date.now() + 300000; "
     // (no `>` in the program: `job start` also judges the unquoted reading of the command, where a `>` is a redirect and the file guard refuses a redirect it cannot place)
-    + 'const t = setInterval(function () { if (fs.existsSync(process.argv[1]) || end < Date.now()) clearInterval(t); }, 50);';
+    + "const t = setInterval(function () { if (fs.existsSync(process.argv[1]) || !fs.existsSync(require('path').dirname(process.argv[1])) || end < Date.now()) clearInterval(t); }, 50);";
   assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', '-e', hold, release]), 0);
   const early = cli(repo.dir, ['job', 'read', 'slow']);
   assertExit(early, 0);

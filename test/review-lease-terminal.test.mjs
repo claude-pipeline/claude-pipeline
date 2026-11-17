@@ -93,9 +93,11 @@ const run = (t, repo, args, env = {}) => {
 };
 // How long a wait may cover a CLI start. On Windows a start can take many seconds (the Claude-ancestor walk starts PowerShell per hop, once per command), so
 // every wait that covers a spawned CLI's lease gets a long budget there; the held command's lock wait stays well above it so it does not give up first.
+// Everywhere else a start can take 15 s or more on a machine under load (60-100 on a shared Mac, a busy CI runner), so the budget is 60 s there too:
+// it is only ever spent when the start is slow, never on a passing run.
 const WIN = process.platform === 'win32';
-const CLI_START_MS = WIN ? 60_000 : 15_000;
-const LOCK_WAIT_MS = WIN ? '90000' : '30000';
+const CLI_START_MS = 60_000;
+const LOCK_WAIT_MS = WIN ? '90000' : '120000';
 async function until(cond, what, ms = CLI_START_MS) {
   const end = Date.now() + ms;
   while (!cond()) {
@@ -280,7 +282,7 @@ function spawnFixture(tc, t, repo, script, mode, extraArgs = []) {
   return {
     child, done,
     ready: () => until(() => stdout.includes('ready') || /\S/.test(stderr), 'the fixture to hold its lease'),
-    saw: (text, what) => until(() => stdout.includes(text) || /\S/.test(stderr), what, WIN ? CLI_START_MS : 10_000).then(() => assert.ok(stdout.includes(text), `${what}: ${stdout} ${stderr}`)),
+    saw: (text, what) => until(() => stdout.includes(text) || /\S/.test(stderr), what, CLI_START_MS).then(() => assert.ok(stdout.includes(text), `${what}: ${stdout} ${stderr}`)),
   };
 }
 
