@@ -31,6 +31,7 @@ import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } fro
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
+import { clickNotes } from '../hooks/lib/owner-go-click.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, refreshTrustedDefault, reviewBaseRef, roundDir, withReviewLock, withRouteLock, writeFileAtomic, writeJson,
@@ -128,6 +129,17 @@ const reviewedAdmission = ({ baseOnly, resolutionOnly }) => (baseOnly || resolut
 const admit = (c, st, flags) => (st
   ? roundAdmission(st, c.round, { ...flags, head: c.head, grants: (k) => ownerRecords(c, k) })
   : { admission: reviewedAdmission(flags), problem: null });
+// Why (#472): the round-cap refusal also says what became of an owner click on the extra-round dialog (waiting for its transcript entry, refused, or recorded for a round already used), so the agent
+// neither asks again for a click that is only waiting nor reads "no grant" over it. '' when there is nothing to say; never throws.
+const pendingClickNotes = (c) => {
+  try {
+    if (c.config.owner_approval !== 'chat' || c.ghRepo?.host !== 'github.com') return '';
+    const notes = clickNotes({ repo: c.ghRepo.slug, prs: [c.pr], kinds: ['round'] });
+    return notes.length > 0 ? `; ${notes.join('; ')}` : '';
+  } catch {
+    return '';
+  }
+};
 // #128: an extra round recorded for this PR whose prompt cannot be confirmed as the owner's grants nothing; the refusal says so (and, R2-F3, says the config dir must be a .claude* folder under the home when that may be the reason).
 const unconfirmedGrant = (c, st) => {
   try {
@@ -147,7 +159,7 @@ export const checkCap = (c, st, flags, { already = false } = {}) => {
   if (problem) {
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'round-cap',
-      message: (already ? `the owner's extra round was already used (grant already used): ${problem}` : problem) + unconfirmedGrant(c, st),
+      message: (already ? `the owner's extra round was already used (grant already used): ${problem}` : problem) + unconfirmedGrant(c, st) + pendingClickNotes(c),
       ...(c.resolutionIneligible === undefined ? {} : { resolutionIneligible: c.resolutionIneligible }),
     });
   }
@@ -549,7 +561,8 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
       // discard-round); the first claimer on the machine wins. A failed claim discards the reviewer's answer.
       claimGrant = () => {
-        const claim = claimGrantMarkers(records, { repo: adm.ghRepo.slug, pr, k, head, checkout: root });
+        // #472: an extra-round claim takes a round ticket first, so claims of one round are totally ordered (owner-go.mjs claimGrantMarkers); `used` covers a grant a ticket already covers.
+        const claim = claimGrantMarkers(records, { repo: adm.ghRepo.slug, pr, k, head, checkout: root }, { ticket: true });
         if (!claim.ok) {
           throw new Fail(EXIT.USAGE, {
             ok: false, error: 'round-cap',

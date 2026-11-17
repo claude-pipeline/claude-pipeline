@@ -2,17 +2,18 @@
 // gh) is covered in cli-gate.test.mjs; here every branch of the small decision functions is pinned directly.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, readdirSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { join } from 'node:path';
 import {
   BLOCKING_LABELS, CANONICAL_CHECKS, GATE_MAX_AGE_MS, abandonMerge, blockingLabelsOf, expectedCheckNames, gateRefusals,
   isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, reviewCheck, waitForMerge,
 } from '../pipeline/lib/finalgate.mjs';
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
-import { claimGrantMarkers, grantIdOf, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
-import { OWNER_ENTRY, linesOf } from './helpers/owner-go.mjs';
+import { claimGrantMarkers, grantIdOf, ownerGoDir, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
+import { asksDir, issueAsk, mergeAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { OWNER_ENTRY, linesOf, mergeRequest } from './helpers/owner-go.mjs';
 import { assertOnlyFails, named, scenario } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
@@ -520,6 +521,48 @@ test('final gate review: a genuine owner grant passes and shows the owner\'s wor
   assert.match(r.detail, /review valid for content h; owner-granted round 4: "extra round #12"/);
   assert.equal(r.ownerMerge, undefined, 'a round grants no merge authority');
   assert.equal(r.ownerItems, undefined);
+});
+
+// #472: a click captured at the hook whose result entry has landed since (the 2.1.323 write order), as the merge dry run's gate would find it next to a review grant. The transcript is shifted to
+// "now" so the typed grant (written at the real time) and the click share one clock; the pointer is written by hand (the hook is the only real writer). It lives in the temp account home's config
+// folder, like the grant transcripts of ownerWorld.
+function flushedPendingClick(home) {
+  const [prompt, use, result] = readFileSync(new URL('./fixtures/click/2.1.323/genuine-click.jsonl', import.meta.url), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+  const shift = Date.now() - 5000 - Date.parse(result.timestamp);
+  for (const e of [prompt, use, result]) e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
+  const parts = mergeAsk({ repo: REPO, pr: 77, closing: mergeRequest(77, head('1'), 'abcdef012345', REPO) });
+  const issued = issueAsk({ ...parts, home, now: () => Date.parse(use.timestamp) - 10000 });
+  assert.ok(issued.askId, JSON.stringify(issued));
+  const dialog = issued.questions[0];
+  const block = use.message.content.find((b) => b.type === 'tool_use');
+  block.input = { questions: [dialog] };
+  result.toolUseResult = { ...result.toolUseResult, questions: [structuredClone(dialog)], answers: { [dialog.question]: 'Merge' } };
+  result.message.content[0].content = `Your questions have been answered: "${dialog.question}"="Merge". You can now continue with these answers in mind.`;
+  mkdirSync(join(home, '.claude', 'projects', '-repo'), { recursive: true });
+  const file = join(home, '.claude', 'projects', '-repo', 'click.jsonl');
+  writeFileSync(file, `${[prompt, use, result].map((e) => JSON.stringify(e)).join('\n')}\n`);
+  const clickId = createHash('sha256').update(`${use.sessionId}|${block.id}|${issued.askId}`).digest('hex').slice(0, 16);
+  const pending = { v: 1, askId: issued.askId, clickId, session: use.sessionId, toolUseId: block.id, transcriptPath: file, cwd: '/work/app', hookLayersSha256: null, capturedAt: result.timestamp };
+  writeFileSync(join(asksDir(home), `${issued.askId}.${clickId}.pending`), `${JSON.stringify(pending)}\n`);
+  return { askId: issued.askId, clickId };
+}
+const snapshotOf = (dir) => Object.fromEntries(readdirSync(dir, { recursive: true }).sort().map((n) => { try { return [n, readFileSync(join(dir, n), 'utf8')]; } catch { return [n, null]; } }));
+
+test('the merge dry run\'s gate path writes nothing: reviewCheck readOnly leaves the whole owner-go folder as it was (bytes and listing) and the grant still verifies; the same call without readOnly settles', () => {
+  const w = ownerWorld();
+  const g = w.grant({ k: 4, at: head('4'), prompt: 'extra round #12' });
+  const click = flushedPendingClick(w.home);
+  const state = granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'auto-extra' }, { head: head('4'), ownerGrant: g.ownerGrant }]);
+  const before = snapshotOf(ownerGoDir(w.home));
+  const dry = reviewOf(state, w, { readOnly: true, ownerGo: { home: w.home, settle: true } });
+  assert.equal(dry.ok, true, dry.detail);
+  assert.match(dry.detail, /owner-granted round 4/);
+  assert.deepEqual(snapshotOf(ownerGoDir(w.home)), before, 'nothing under owner-go changed');
+  const settled = join(asksDir(w.home), `${click.askId}.${click.clickId}.settled`);
+  assert.equal(existsSync(settled), false);
+  const live = reviewOf(state, w, { readOnly: false, ownerGo: { home: w.home, settle: true } });
+  assert.equal(live.ok, true, live.detail);
+  assert.equal(existsSync(settled), true, 'the control settles the pending click');
 });
 
 test('final gate review: the quote in the detail is clipped to 100 characters', () => {
