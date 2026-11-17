@@ -148,7 +148,11 @@ const LAUNCHERS = new Set(['npx', 'bunx', 'pnpx', 'pnpm', 'yarn', 'npm', 'bun', 
 // subcommand prefixes (the words before the first flag): LOCAL_ONLY lines pass with no target flag or with `--local`; REMOTE_CAPABLE ones only with a local or `dev` target proof
 const LOCAL_ONLY = [['start'], ['stop'], ['status'], ['init'], ['link'], ['unlink'], ['login'], ['logout'], ['db', 'reset'], ['db', 'diff'], ['db', 'lint'], ['migration', 'new'], ['migration', 'list'], ['migration', 'up'], ['test', 'db'], ['functions', 'serve'], ['functions', 'new'], ['projects', 'list'], ['orgs', 'list'], ['help']];
 const REMOTE_CAPABLE = [['db', 'push'], ['db', 'pull'], ['db', 'dump'], ['migration', 'repair'], ['migration', 'squash'], ['migration', 'fetch'], ['functions', 'deploy'], ['functions', 'delete'], ['functions', 'download'], ['secrets'], ['storage'], ['branches'], ['config', 'push'], ['postgres-config'], ['sso'], ['domains'], ['vanity-subdomains'], ['ssl-enforcement'], ['inspect', 'db'], ['gen', 'types'], ['seed', 'buckets'], ['backups'], ['encryption'], ['snippets']];
+// package-manager verbs that only name the package (they do not run a binary), and `command -v|-V`
+const PM_HEADS = new Set(['pnpm', 'yarn', 'npm', 'bun', 'corepack']);
+const NON_RUN_VERBS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'upgrade', 'ls', 'list', 'why', 'view', 'info', 'outdated']);
 const startsWith = (tokens, prefix) => prefix.every((w, i) => tokens[i] === w);
+const BOOL_FLAGS = new Set(['yes', 'debug', 'help', 'experimental', 'include-all', 'include-roles', 'include-seed', 'data-only', 'role-only', 'use-copy', 'keep-comments']);
 const NON_LITERAL = /[\s$`*?[\]{}()~\\<>|;&'"!#]/;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
@@ -171,6 +175,8 @@ function supabaseCall(argv) {
   } else if (['pnpm', 'yarn', 'npm'].includes(head) && (argv[1] === 'dlx' || argv[1] === 'exec') && argv[2] !== undefined && SB_WORD.test(commandName(argv[2]))) {
     return { rest: argv.slice(3) };
   }
+  if (PM_HEADS.has(head) && NON_RUN_VERBS.has(argv[1])) return null;
+  if (head === 'command' && (argv[1] === '-v' || argv[1] === '-V')) return null;
   if (argv.slice(1).some((w) => SB_WORD.test(commandName(w)))) return { refuse: `\`${argv[0]}\` runs supabase in a shape the guard does not read (only \`supabase\`, \`npx\`, \`pnpm dlx|exec\`, \`bunx\`, \`yarn dlx|exec\` are)` };
   return null;
 }
@@ -185,14 +191,26 @@ function supabaseRefusal(rest, state) {
   const remote = REMOTE_CAPABLE.some((p) => startsWith(sub, p)) || /^network-/.test(sub[0]);
   if (!local && !remote) return `\`supabase ${sub.join(' ')}\` is not a subcommand the guard knows`;
   // flag hygiene: each target flag once, in one form, with a literal value
+  // `--local` / `--dry-run` exempt a line only when they are real flags: before a `--`, and not the value of another option (an option the guard does not know may take the next word as its value)
   const seen = { 'db-url': [], 'project-ref': [], linked: [], local: [], 'dry-run': [] };
+  const real = { local: 0, 'dry-run': 0 };
+  let terminated = false;
+  let swallowed = false;
   for (let i = sub.length; i < rest.length; i += 1) {
     const w = rest[i];
+    if (w === '--') { terminated = true; continue; }
+    const isValue = swallowed;
+    swallowed = false;
     const m = /^--([a-z-]+)(=(.*))?$/s.exec(w);
-    if (!m || !(m[1] in seen)) continue;
+    if (m?.[1] === 'remote') return '`--remote` selects a remote database';
+    if (!m || !(m[1] in seen)) {
+      if (w.startsWith('-') && !w.includes('=') && !(m && BOOL_FLAGS.has(m[1]))) swallowed = true;
+      continue;
+    }
     if (m[1] === 'linked' || m[1] === 'local' || m[1] === 'dry-run') {
       if (m[2] !== undefined) return `\`${w}\` is not the bare \`--${m[1]}\` flag`;
       seen[m[1]].push(true);
+      if (m[1] !== 'linked' && !terminated && !isValue) real[m[1]] += 1;
       continue;
     }
     let value = m[3];
@@ -203,7 +221,7 @@ function supabaseRefusal(rest, state) {
   for (const [name, list] of Object.entries(seen)) if (list.length > 1) return `\`--${name}\` is given more than once`;
   const [dbUrl] = seen['db-url'];
   const [projectRef] = seen['project-ref'];
-  const isLocal = seen.local.length === 1;
+  const isLocal = seen.local.length === 1 && real.local === 1;
   const linked = seen.linked.length === 1;
   if (isLocal && (linked || dbUrl !== undefined || projectRef !== undefined)) return '`--local` is combined with a remote target flag';
   if (linked && (dbUrl !== undefined || projectRef !== undefined)) return '`--linked` is combined with another target flag';
@@ -214,14 +232,24 @@ function supabaseRefusal(rest, state) {
   if (isLocal) return null;
   if (dbUrl !== undefined && localDbUrl(dbUrl)) return null;
   if (projectRef !== undefined && isDevRef(projectRef, state)) return null;
-  if (sub[0] === 'db' && sub[1] === 'push' && seen['dry-run'].length === 1) return null;
+  if (sub[0] === 'db' && sub[1] === 'push' && seen['dry-run'].length === 1 && real['dry-run'] === 1) return null;
   const what = dbUrl !== undefined ? 'a `--db-url` that is not a plain localhost URI'
     : projectRef !== undefined ? `\`--project-ref ${projectRef}\`, which the owner has not declared dev`
       : linked ? '`--linked`' : 'no `--local` or other target flag (it defaults to the linked project)';
   return `\`supabase ${sub.join(' ')}\` can reach a non-local database: ${what}`;
 }
 
-export function findLiveDbCli(cmds, raw, state) {
+// the path of the URL that starts `after` (the text after the host) names only its own project: no dot segment, encoded slash, backslash or second project ref (curl resolves `/../` before it sends)
+function cleanApiPath(after) {
+  const p = (/^[^\s'"?#]*/.exec(after) ?? [''])[0];
+  if (/%2f|%5c|\\/i.test(p)) return false;
+  const segs = p.split('/').slice(1);
+  if (segs.some((g) => /^(?:\.|%2e){1,2}$/i.test(g))) return false;
+  return !segs.slice(3).some((g) => /^[a-z0-9]{20}$/i.test(g));
+}
+
+// `scanRaw` is the line with the prose flags (commit message, PR body) masked; `wordsOf(cmd)` the words of one command without those prose values (a command inside `$(…)` or backticks in a prose value is its own command, so its words are still read)
+export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv) {
   const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
   for (const c of cmds) {
     if (!c.argv?.length) continue;
@@ -230,11 +258,12 @@ export function findLiveDbCli(cmds, raw, state) {
     const why = call.refuse ?? supabaseRefusal(call.rest, state);
     if (why) return refuse(why);
   }
-  // the Management API: every mention on the RAW line (a variable holding the URL is caught too) must name a dev project's own routes
-  const text = String(raw ?? '');
-  for (const m of text.matchAll(/api\.supabase\.com/gi)) {
-    const ref = /^\/v1\/projects\/([a-z0-9]{20})\//.exec(text.slice(m.index + m[0].length))?.[1];
-    if (!ref || !isDevRef(ref, state)) return refuse('the line names the Supabase Management API (api.supabase.com) for something other than a dev project\'s own routes');
+  // the Management API: every mention on the line (prose flags of a commit or PR already masked; a variable holding the URL is still caught) must name a dev project's own routes, by a clean path
+  const texts = [String(scanRaw ?? ''), ...cmds.map((c) => [...wordsOf(c), ...Object.values(c.env ?? {})].join(' '))];
+  for (const text of texts) for (const m of text.matchAll(/api\.supabase\.com/gi)) {
+    const after = text.slice(m.index + m[0].length);
+    const ref = /^\/v1\/projects\/([a-z0-9]{20})\//.exec(after)?.[1];
+    if (!ref || !isDevRef(ref, state) || !cleanApiPath(after)) return refuse('the line names the Supabase Management API (api.supabase.com) for something other than a dev project\'s own routes');
   }
   return null;
 }
