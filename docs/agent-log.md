@@ -251,3 +251,4 @@ full record.
 - 2026-11-17 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 10 · arbiter 9 (fix-verify 4) · blocked · Codex 7d: 485 runs (126 high)
 - 2026-11-17 · #616 · test(cli-local): give the guard a short line in the still-running job test (#614) · risk low · rounds 2 · arbiter 0 · awaiting-owner-merge · Codex 7d: 486 runs (126 high)
 - 2026-11-17 · #592 · Click-to-approve works on 2.1.323 (harness-added answers), a re-shown request with a hold binds, honest merge-line wording (#585) · risk high · rounds 6 · arbiter 2 · awaiting-owner-merge · Codex 7d: 491 runs (128 high)
+- 2026-11-17 · #606 · Guard fixes #554–#558 and the #563 quoted-word fan-out refusal · risk high · rounds 6 · arbiter 5 · awaiting-owner-merge · Codex 7d: 491 runs (128 high)
