@@ -429,8 +429,16 @@ test('followUpClickState: an older unreadable ask with a click stays unverified 
     assert.equal(followUpClickState({ repo: REPO, pr: 58, home: w.home, now: w.now }).state, 'unverified', `${badSpent}: no newer click yet`);
     const next = issueAsk({ ...parts('round-v2-follow-up'), home: w.home, now: () => w.answeredAt + 5000 });
     assert.equal(followUpClickState({ repo: REPO, pr: 58, home: w.home, now: w.now }).state, 'unverified', `${badSpent}: the newer ask has no click`);
+    // a verified click on the newer ask that is not AFTER the unreadable ask's click (earlier, or equal in time) cannot stand in for it
+    const marker = (ms) => writeFileSync(join(asksDir(w.home), `${next.askId}.spent`), `${JSON.stringify({ v: 1, askId: next.askId, clickId: 'c0ffee0000000000', toolUseId: 'toolu_next', dialogSha256: sha('next'), answeredAt: new Date(ms).toISOString(), declined: true, instruction: 'follow-up' })}\n`);
+    const readState = () => followUpClickState({ repo: REPO, pr: 58, home: w.home, now: () => w.answeredAt + 5000 });
+    for (const [label, ms] of [['earlier', w.answeredAt - 1000], ...(badSpent ? [] : [['equal', w.answeredAt]])]) {
+      marker(ms);
+      const old = readState();
+      assert.deepEqual([old.state, old.askId], ['unverified', w.askId], `${badSpent}: a verified click ${label} (vs the unreadable ask's click) does not override it`);
+    }
     const later = (badSpent ? Date.now() : w.answeredAt) + 60000; // a marker that cannot be read is dated by its mtime (real time)
-    writeFileSync(join(asksDir(w.home), `${next.askId}.spent`), `${JSON.stringify({ v: 1, askId: next.askId, clickId: 'c0ffee0000000000', toolUseId: 'toolu_next', dialogSha256: sha('next'), answeredAt: new Date(later).toISOString(), declined: true, instruction: 'follow-up' })}\n`);
+    marker(later);
     const s = followUpClickState({ repo: REPO, pr: 58, home: w.home, now: () => later + 1000 });
     assert.deepEqual([s.state, s.askId], ['instructed', next.askId], `${badSpent}: the newer verified click wins`);
   }
