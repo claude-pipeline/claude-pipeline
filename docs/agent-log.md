@@ -220,3 +220,4 @@ full record.
 - 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 7 · arbiter 7 · blocked · Codex 7d: 16286 runs (15812 high)
 - 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 8 · arbiter 8 · blocked · Codex 7d: 16293 runs (15816 high)
 - 2026-11-17 · #540 · ci-wait: 'conflicting' verdict, ci.merge_checks, e2e 'others'; merge-commit-alone vs pre-push hook · risk high · rounds 5 · arbiter 4 · awaiting-owner-merge · Codex 7d: 16293 runs (15816 high)
+- 2026-11-17 · #527 · Click-to-approve on 2.1.323: pending clicks verified when used, round tickets (#472) · risk high · rounds 12 · arbiter 9 · substitute 1 · awaiting-owner-merge · Codex 7d: 16294 runs (15817 high)
