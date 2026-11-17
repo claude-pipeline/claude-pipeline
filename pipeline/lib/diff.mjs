@@ -5,6 +5,7 @@
 // Added lines carry NEW-file numbers, removed lines OLD-file numbers. Line text is kept exactly (a CRLF stays in `text`).
 // Anything unexpected throws rather than guessing (truncated or overflowing hunks, non-a/ b/ prefixes): a guess
 // could let a deleted test slip through unnoticed. Trailing \r is stripped from header lines only, never from content.
+import { matchAny } from './glob.mjs';
 
 const HUNK_HEADER = /^@@ -(\d+)(?:,(\d+))? \+(\d+)(?:,(\d+))? @@/;
 const SIMPLE_ESCAPES = { a: 7, b: 8, f: 12, n: 10, r: 13, t: 9, v: 11, '"': 34, '\\': 92 };
@@ -215,6 +216,26 @@ export function parseUnifiedDiff(text) {
   if (hunk) throw new Error('malformed diff: truncated inside a hunk');
   if (cur) done.push(finishFile(cur));
   return done;
+}
+
+// A soft "tests added" signal for `pipeline summary` (never a gate): of the files of a parsed diff, how many TEST files (`testGlobs`: integrity.test_globs) gained lines, how many test-case
+// calls (`it(`, `test(`, `it.each(` ...) those added lines hold, and the changed (added + removed) lines in source files versus test files.
+// -> { files, cases, sourceLines, testLines, line: 'Tests added: N files, M cases; changed source lines : test lines = a : b' }
+const TEST_CASE_CALL = /^\s*(?:it|test|specify)(?:\.\w+)*\s*\(/;
+export function testsAdded(files, testGlobs) {
+  const out = { files: 0, cases: 0, sourceLines: 0, testLines: 0 };
+  for (const f of files) {
+    const p = f.newPath ?? f.path;
+    const changed = f.added.length + f.removed.length;
+    if (typeof p === 'string' && matchAny(p, testGlobs)) {
+      out.testLines += changed;
+      if (f.added.length > 0) out.files += 1;
+      out.cases += f.added.filter((a) => TEST_CASE_CALL.test(typeof a === 'string' ? a : a?.text ?? '')).length;
+    } else {
+      out.sourceLines += changed;
+    }
+  }
+  return { ...out, line: `Tests added: ${out.files} files, ${out.cases} cases; changed source lines : test lines = ${out.sourceLines} : ${out.testLines}` };
 }
 
 export function diffStats(files) {

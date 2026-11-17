@@ -70,6 +70,7 @@ test('round 1 with no state runs plan, job and wait and reports counts, path and
   assert.deepEqual(r.json.codex.counts, { blocking: 0, suggestions: 1, worth_considering: 0 });
   assert.match(r.json.codex.codexPath, /round-1$/);
   assert.equal(r.json.reviewer, 'judge');
+  assert.equal(r.json.codex.reviewKind, 'merge-base', 'round codex passes the round kind through (display only)');
   assert.equal('arbiter' in r.json, false, 'a judge round asks nothing of the arbiter');
   assert.equal(w.state().rounds.length, 1);
   assert.equal(w.state().rounds[0].fromHead, w.base);
@@ -267,6 +268,7 @@ test('a finished job with no stdout capture (an older runner) or a cut one: the 
   const fromOld = rc(w, [], ok(w));
   assertExit(fromOld, 0, fromOld.stdout + fromOld.stderr);
   assert.equal(fromOld.json.codex.fromState, true);
+  assert.equal(fromOld.json.codex.reviewKind, 'merge-base', 'a report built from the state carries the recorded kind too');
   assert.deepEqual(fromOld.json.codex.counts, { blocking: 0, suggestions: 1, worth_considering: 0 });
   assert.equal(fromOld.json.reviewer, 'judge');
   // 2. a cut capture
