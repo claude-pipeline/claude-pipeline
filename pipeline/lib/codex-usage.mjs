@@ -409,7 +409,9 @@ export function usageFile({ file, home, env } = {}) {
   // Under node's test runner (it sets NODE_TEST_CONTEXT in every test process, and children inherit it) a checkout never writes the account's real ledger: a run that bypassed
   // scripts/test.mjs (`node --test test/x.test.mjs`) and forgot the override above filled it with fake rows. A test that names its `home` keeps it. An installed copy is never diverted.
   if (!home && (env?.NODE_TEST_CONTEXT ?? process.env.NODE_TEST_CONTEXT) && !isInstalledCopy()) {
-    return path.join(os.tmpdir(), `cp-codex-usage-under-test-${os.userInfo().username}`, 'codex-usage.jsonl');
+    let who = 'user';
+    try { who = os.userInfo().username; } catch { who = String(process.getuid?.() ?? 'user'); } // no passwd entry: usageFile() must never throw
+    return path.join(os.tmpdir(), `cp-codex-usage-under-test-${who}`, 'codex-usage.jsonl');
   }
   return path.join(home ?? accountHome(), ...USAGE_FILE_REL);
 }
