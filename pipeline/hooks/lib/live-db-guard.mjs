@@ -26,7 +26,8 @@ export const lastSegment = (tool) => parts(tool).pop();
 export const serverSegment = (tool) => parts(tool)[1] ?? '';
 // the write names only a Supabase server has: any server's tool with one of them is judged (a renamed server in an unprotected .mcp.json: Fable F2). The generic names (create_branch, create_project, run_notebook …) are judged only on a server whose name has `supabase` in it, so another vendor's tool of that name is untouched.
 const SUPABASE_ONLY_NAMES = ['apply_migration', 'execute_sql', 'deploy_edge_function', 'create_edge_function_secret'];
-export const isSupabaseTool = (tool) => typeof tool === 'string' && tool.startsWith('mcp__') && (/supabase/i.test(serverSegment(tool)) || SUPABASE_ONLY_NAMES.includes(lastSegment(tool)));
+// `state` (the owner's db-refs registry): a server the owner listed there is a Supabase server for every tool name.
+export const isSupabaseTool = (tool, state) => typeof tool === 'string' && tool.startsWith('mcp__') && (/supabase/i.test(serverSegment(tool)) || SUPABASE_ONLY_NAMES.includes(lastSegment(tool)) || (state?.servers ?? []).includes(serverSegment(tool)));
 
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });
@@ -193,9 +194,9 @@ function supabaseRefusal(rest, state) {
   const remote = REMOTE_CAPABLE.some((p) => startsWith(sub, p)) || /^network-/.test(sub[0]);
   if (!local && !remote) return `\`supabase ${sub.join(' ')}\` is not a subcommand the guard knows`;
   // flag hygiene: each target flag once, in one form, with a literal value
-  // `--local` / `--dry-run` exempt a line only when they are real flags: before a `--`, and not the value of another option (an option the guard does not know may take the next word as its value)
+  // `--local` / `--dry-run` / `--db-url` / `--project-ref` prove a safe target only when they are real flags: before a `--`, and not the value of another option (an option the guard does not know may take the next word as its value)
   const seen = { 'db-url': [], 'project-ref': [], linked: [], local: [], 'dry-run': [] };
-  const real = { local: 0, 'dry-run': 0 };
+  const real = { local: 0, 'dry-run': 0, 'db-url': 0, 'project-ref': 0 };
   let terminated = false;
   let swallowed = false;
   for (let i = sub.length; i < rest.length; i += 1) {
@@ -219,6 +220,7 @@ function supabaseRefusal(rest, state) {
     if (m[2] === undefined) { value = rest[i + 1]; i += 1; }
     if (value === undefined) return `\`--${m[1]}\` has no value`;
     seen[m[1]].push(value);
+    if (!terminated && !isValue) real[m[1]] += 1;
   }
   for (const [name, list] of Object.entries(seen)) if (list.length > 1) return `\`--${name}\` is given more than once`;
   const [dbUrl] = seen['db-url'];
@@ -232,8 +234,8 @@ function supabaseRefusal(rest, state) {
   const hasTarget = linked || dbUrl !== undefined || projectRef !== undefined;
   if (local && !hasTarget) return null;
   if (isLocal) return null;
-  if (dbUrl !== undefined && localDbUrl(dbUrl)) return null;
-  if (projectRef !== undefined && isDevRef(projectRef, state)) return null;
+  if (dbUrl !== undefined && real['db-url'] === 1 && localDbUrl(dbUrl)) return null;
+  if (projectRef !== undefined && real['project-ref'] === 1 && isDevRef(projectRef, state)) return null;
   if (sub[0] === 'db' && sub[1] === 'push' && seen['dry-run'].length === 1 && real['dry-run'] === 1) return null;
   const what = dbUrl !== undefined ? 'a `--db-url` that is not a plain localhost URI'
     : projectRef !== undefined ? `\`--project-ref ${projectRef}\`, which the owner has not declared dev`

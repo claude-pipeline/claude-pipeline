@@ -117,7 +117,7 @@ export function liveLabel(ref, state) {
   return state.refs.find((e) => e.ref === ref)?.name ?? `unregistered project ${ref}`;
 }
 
-export const summaryProblem = (s) => (typeof s !== 'string' || s.trim() === '' ? 'the summary is empty' : /[\r\n\u0000-\u001f]/.test(s) ? 'the summary must be one line without control characters' : s.length > SUMMARY_MAX ? `the summary is over ${SUMMARY_MAX} characters` : s !== s.trim() ? 'the summary has leading or trailing spaces' : null);
+export const summaryProblem = (s) => (typeof s !== 'string' || s.trim() === '' ? 'the summary is empty' : /[\r\n\u0000-\u001f]/.test(s) || HIDING_CHARS.test(s) ? 'the summary must be one line without control characters' : s.length > SUMMARY_MAX ? `the summary is over ${SUMMARY_MAX} characters` : s !== s.trim() ? 'the summary has leading or trailing spaces' : null);
 
 // ---- git, only in the block's dir --------------------------------------------------------------------------------------------------
 

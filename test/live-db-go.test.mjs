@@ -12,7 +12,7 @@ import { OWNER_ENTRY, linesOf, runHook } from './helpers/owner-go.mjs';
 import { run } from '../pipeline/commands/live-db.mjs';
 import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
-import { buildBlock, canonicalDataSql, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
+import { buildBlock, canonicalDataSql, summaryProblem, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { matchCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
@@ -207,6 +207,11 @@ test('SQL the block could not show in full is refused: an indented closing fence
     assert.equal(migrationSqlProblem(q), null, q);
     assert.ok(canonicalDataSql(q).sql, q);
   }
+});
+
+test('a summary that could hide or reorder text on screen is refused: DEL, C1 controls, bidi controls', () => {
+  for (const s of ['a\u007fb', 'a\u0085b', 'a\u009b3A\u009bJ', 'a\u202eb', 'a\u2066b', 'a\u2069b', 'a\u001b[2Kb', 'a\nb']) assert.ok(summaryProblem(s), JSON.stringify(s));
+  for (const s of ['adds column c', 'ünï ✓ fix']) assert.equal(summaryProblem(s), null, s);
 });
 
 test('catalog prints the template; an argument with a quote or semicolon is a usage error', async () => {

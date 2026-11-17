@@ -925,10 +925,12 @@ function mcpFields(ti) {
 // rule may deny the same call after it (a go is spent at the attempt).
 function evaluateMcp(tool, ti, input, opts) {
   const generic = evaluateMcpGeneric(tool, ti, input, opts);
-  if (generic.decision === 'deny' || !isSupabaseTool(tool)) return generic;
+  if (generic.decision === 'deny' || !tool.startsWith('mcp__')) return generic;
+  const home = opts.home || os.homedir();
+  if (!isSupabaseTool(tool, readDbRefs(home))) return generic;
   if ((opts.env ?? process.env).PIPELINE_ADMIN === '1') return allow();
   return evaluateSupabaseMcp(tool, ti, {
-    home: opts.home || os.homedir(), sessionId: input?.session_id, transcriptPath: input?.transcript_path, now: opts.now, io: opts.liveDbIo,
+    home, sessionId: input?.session_id, transcriptPath: input?.transcript_path, now: opts.now, io: opts.liveDbIo,
   });
 }
 

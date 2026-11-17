@@ -152,6 +152,19 @@ test('dev refs are exempt only on a server the owner listed', async (t) => {
   assert.equal(call('mcp__mine__apply_migration'), 'allow');
 });
 
+test('a server the owner listed is a Supabase server for every tool name; another vendor\'s tools stay untouched', async (t) => {
+  const s = await scene(t);
+  await runDbRefs(['server', 'add', 'mine'], { home: s.home, env: {}, hasClaudeCodeAncestor: () => false });
+  const state = { servers: ['mine'] };
+  assert.equal(isSupabaseTool('mcp__mine__merge_branch', state), true);
+  assert.equal(isSupabaseTool('mcp__mine__merge_branch'), false);
+  assert.equal(isSupabaseTool('mcp__github__create_branch', state), false);
+  const file = (tool_name, tool_input) => evaluateFileTool({ tool_name, tool_input, cwd: s.repo.dir, session_id: s.session, transcript_path: s.transcript }, { home: s.home, env: {}, platform: process.platform, now: () => NOW }).decision;
+  assert.equal(file('mcp__mine__merge_branch', { project_id: REF, branch_id: 'x' }), 'deny');
+  assert.equal(file('mcp__mine__pause_project', { project_id: REF }), 'deny');
+  assert.equal(file('mcp__github__create_branch', { branch: 'x' }), 'allow');
+});
+
 test('a declared-dev project on a server the owner has not listed is told to list the server, not to ask for a go', async (t) => {
   const s = await scene(t);
   for (const name of ['apply_migration', 'execute_sql', 'pause_project']) {
