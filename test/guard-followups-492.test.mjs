@@ -334,3 +334,21 @@ describe('#558: movesBranch takes the subcommand, not the first mover word (a gl
   test('denied: --git-dir with a value spelled like a subcommand', () => expect('deny', '(git --git-dir branch checkout main); git push'));
   test('reference: the same checkout without the odd -C value was already denied', () => expect('deny', '(git -C sub checkout main); git push'));
 });
+
+// #557: production failure: a child script ending with a git READ and an exit (`git config --get user.email >/dev/null || exit 1`) opened a failure group, which at the end of the text marked every branch
+// unknown, so the caller's `git push` on agent/x was refused although nothing moved a branch
+describe('#557: a git read that ends a nested text with an exit opens no failure group', () => {
+  for (const body of [
+    'make\ngit config --get user.email >/dev/null || exit 1\n',
+    'make\ngit symbolic-ref -q HEAD || { echo detached; exit 1; }\n',
+    'make\ngit branch -r | grep -q origin/main || exit 1\n',
+  ]) {
+    test(`allowed: bash build.sh ending ${JSON.stringify(body.split('\n')[1])}`, () => expect('allow', 'bash build.sh; git push', { [BUILD]: body }));
+  }
+  test('denied (a mover still opens the group): a script ending with a checkout that may fail and an exit, a branch it may have switched', () => {
+    expect('deny', 'bash build.sh; git push', { [BUILD]: 'make\ngit checkout agent/missing || { echo no; exit 1; }\n' }, MAIN);
+  });
+  test('denied (a directory change still opens the group): the #505 shape at the end of the text', () => {
+    expect('deny', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' });
+  });
+});
