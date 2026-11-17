@@ -38,6 +38,8 @@ ci:
 merge:
   command: gh pr merge {pr} --squash --auto --delete-branch --match-head-commit {sha}
   wait_minutes: 15
+  behind_base: disjoint         # owner 2026-11-17: a PR may merge while behind main when main's new commits touch none of its files
+  behind_base_stale_paths: [package.json, scripts/test.mjs, 'scripts/lib/**', 'test/helpers/**', 'test/fixtures/**']  # the test runner and shared helpers: a change to them on main always forces the update
 
 preview: null
 production: null

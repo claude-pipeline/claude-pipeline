@@ -508,9 +508,14 @@ test('job: a job that is still running is exit 0 state running, then done', asyn
   const release = join(repo.dir, 'release-slow');
   t.after(() => { writeFileSync(release, ''); repo.cleanup(); });
   const hold = "const fs = require('fs'); const end = Date.now() + 300000; "
-    // (no `>` in the program: `job start` also judges the unquoted reading of the command, where a `>` is a redirect and the file guard refuses a redirect it cannot place)
-    + "const t = setInterval(function () { if (fs.existsSync(process.argv[1]) || !fs.existsSync(require('path').dirname(process.argv[1])) || end < Date.now()) clearInterval(t); }, 50);";
-  assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', '-e', hold, release]), 0);
+    // (argv[2]: a script file's argv[1] is the file itself; no `>` in the program: `job start` also judges the unquoted reading of the command, where a `>` is a redirect and the file guard refuses a redirect it cannot place)
+    + "const t = setInterval(function () { if (fs.existsSync(process.argv[2]) || !fs.existsSync(require('path').dirname(process.argv[2])) || end < Date.now()) clearInterval(t); }, 50);";
+  // The program is a file, not a `node -e <program>` argument: `job start` judges the quoted line and the unquoted one, and the unquoted one splits a program into one
+  // word per token, each probed on disk as a possible script (about 160 ms here for this program against 2 ms for the short line, many times that on a slow Windows runner),
+  // so a long program ran into the guard's 5 s check deadline and was refused (#614).
+  const holdFile = join(repo.dir, 'hold.cjs');
+  writeFileSync(holdFile, hold);
+  assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', holdFile, release]), 0);
   const early = cli(repo.dir, ['job', 'read', 'slow']);
   assertExit(early, 0);
   assert.equal(early.json.state, 'running');

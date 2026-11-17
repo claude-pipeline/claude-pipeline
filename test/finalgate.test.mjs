@@ -654,3 +654,20 @@ test('P final-gate: queue on does not change the other checks (a red CI still fa
   assert.equal(r.code, 1, r.stdout);
   assert.deepEqual(r.json.failed, ['ci']);
 });
+
+test('final gate review: an owner deferral of an accepted fix is an owner-merge item whose line names who accepted it', () => {
+  const w = ownerWorld();
+  const deferred = (id, accepted) => ({
+    id, source: 'codex', fingerprint: `fp-${id}`, bucket: 'BLOCKING', category: 'security', title: `T ${id}`, file: 'src/a.js', line: 1, detail: 'd', implemented: false,
+    followupIssue: `https://github.com/acme/widgets/issues/${id.slice(-1)}`,
+    final: { decision: 'FOLLOW-UP', by: accepted === 'cache' ? 'cache' : 'owner', needsHuman: false, reason: 'later', ownerQuote: `${id}: follow-up`, ruledAt: 'now', overruled: { decision: 'ACCEPT', by: accepted, needsHuman: false, reason: 'r' }, ownerDeferral: { accepted, ruledAt: 'now' } },
+  });
+  const state = granted([{ items: [deferred('R1-B1', 'judge'), deferred('R1-B2', 'arbiter'), deferred('R1-B3', 'cache')] }]);
+  const r = reviewOf(state, w);
+  assert.equal(r.ok, true, r.detail);
+  assert.match(r.detail, /3 owner-ruled item\(s\), owner-merge: /);
+  assert.match(r.detail, /R1-B1 "R1-B1: follow-up" \(defers judge ACCEPT, not fixed\)/);
+  assert.match(r.detail, /R1-B2 "R1-B2: follow-up" \(defers arbiter ACCEPT, not fixed\)/);
+  assert.match(r.detail, /R1-B3 "R1-B3: follow-up" \(defers cache ACCEPT, not fixed\)/);
+  assert.equal(r.ownerMerge, 3, 'each deferral is an owner-merge item');
+});

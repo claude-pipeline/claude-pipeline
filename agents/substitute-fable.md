@@ -56,6 +56,7 @@ else, no text after the block:
 
 Every finding needs `title`, `file` (repository-relative), `line` (0 if none), `category`, `detail`,
 `reasoning` and `testable`. Empty buckets are `[]`.
+`category` must be exactly one of: bug, security, auth, permissions, data-integrity, data-loss, broken-behaviour, performance, maintainability, testing, design, docs, other.
 
 ## Mode SECOND-REVIEW (a different task, a different answer)
 

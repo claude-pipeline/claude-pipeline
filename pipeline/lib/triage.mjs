@@ -614,12 +614,15 @@ export function settleSecondReview(item, verdict) {
 export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }) {
   if (!DECISIONS.includes(decision)) throw new Error(`decision must be one of ${DECISIONS.join('|')}`);
   // The owner may rule on an item waiting for a human, and (E6) on a Claude or forced final that is not implemented yet: the typed
-  // override is the one path that may loosen what Claude settled.
-  if (item.final?.needsHuman !== true && !(isProtectedFinal(item) && item.implemented !== true)) {
+  // override is the one path that may loosen what Claude settled. A third case (#559): an UNIMPLEMENTED ACCEPT of the arbiter, the judge or the cache may be
+  // deferred, FOLLOW-UP only (the fix goes to an issue and the item is bound to the owner's merge); the owner cannot reject or re-accept it here.
+  const deferrable = decision === 'FOLLOW-UP' && isDeferrableAccept(item);
+  if (!deferrable && item.final?.needsHuman !== true && !(isProtectedFinal(item) && item.implemented !== true)) {
     throw new Error(isProtectedFinal(item) ? `${item.id} is already implemented; an owner ruling cannot reopen it` : `${item.id} needs no human decision`);
   }
   const next = structuredClone(item);
   next.final = { decision, by: 'owner', needsHuman: false, reason, ownerQuote, ruledAt, overruled: structuredClone(item.final) };
+  if (deferrable) next.final.ownerDeferral = { accepted: item.final.by, ruledAt };
   return next;
 }
 
@@ -628,9 +631,13 @@ export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }
 // else cannot reuse the ruling. Only the finding text is hashed (the fields of codex.mjs assignIds and of fableFindingItems, whose
 // reasoning is item.arbiter.reasoning), never a decision field (final, owner-ruling results, implemented), so applying one ruling of
 // a request leaves the digest of the others alone. First 12 hex of sha256 over one tuple per item, sorted by id.
+const DEFERS_ACCEPTED_FIX = 'defers-accepted-fix';
 export function rulingContentDigest(items) {
   const tuples = [...items]
-    .map((i) => [String(i.id).toUpperCase(), i.source, i.bucket, i.category, i.title, i.file, i.line, i.detail, i.codexReasoning, i.arbiter?.reasoning].map((v) => v ?? null))
+    .map((i) => [String(i.id).toUpperCase(), i.source, i.bucket, i.category, i.title, i.file, i.line, i.detail, i.codexReasoning, i.arbiter?.reasoning].map((v) => v ?? null)
+      // An ACCEPTED fix the owner is asked to defer (or already deferred) is a different question from the same text waiting for a human: an answer recorded for the one cannot
+      // rule the other. Only these items carry the marker, so every other digest is byte-identical, and it holds once one id of a multi-id request is applied.
+      .concat(isDeferrableAccept(i) || isOwnerDeferral(i) ? [DEFERS_ACCEPTED_FIX] : []))
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return createHash('sha256').update(JSON.stringify(tuples)).digest('hex').slice(0, 12);
 }
@@ -639,6 +646,18 @@ export function rulingContentDigest(items) {
 export const isOwnerRuled = (item) => typeof item.final?.ownerQuote === 'string' && item.final.ownerQuote !== '';
 
 export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
+
+// ---- owner deferral of an accepted fix (#559) -----------------------------------------------
+// An ACCEPT nobody implemented may leave the merge by the owner's typed word: FOLLOW-UP only (a REJECT of an arbiter ACCEPT stays refused). The final keeps the ACCEPT as `overruled`
+// and carries `ownerDeferral`; the mark, not `by`, is the key everywhere, because the result cache rewrites `by` to 'cache'.
+export const DEFERRABLE_ACCEPT_BY = Object.freeze(['arbiter', 'judge', 'cache']);
+// An open ACCEPT the owner may defer: made by the arbiter, the judge or a cached copy of theirs; not a test result (the cache keeps that as final.evidence 'test'), not Claude's or a
+// forced final, not the owner's own, not a round-limit deferral; and not fixed.
+// A cached test ACCEPT written before the cache kept `evidence` has only the reason prefix applyTestResult wrote (same pattern as LEGACY_CAUSES): read as test evidence.
+const isTestAccept = (final) => final.evidence === 'test' || (final.by === 'cache' && typeof final.reason === 'string' && final.reason.startsWith('test confirmed: '));
+export const isDeferrableAccept = (item) => item?.final?.decision === 'ACCEPT' && item.final.needsHuman !== true && item.implemented !== true
+  && DEFERRABLE_ACCEPT_BY.includes(item.final.by) && !isTestAccept(item.final) && !isOwnerRuled(item) && !isProtectedFinal(item) && !isRoundCapDeferral(item);
+export const isOwnerDeferral = (item) => isObject(item?.final?.ownerDeferral);
 
 // ---- cache and light lane -------------------------------------------------------------------
 
@@ -712,6 +731,8 @@ export function ruledCacheFrom(items) {
       cache[item.fingerprint] = {
         ...structuredClone(item.final), bucket: item.bucket, category: item.category, ...(issue ? { followupIssue: issue } : {}),
         ...(fixed ? { implemented: true } : {}),
+        // A test result stays a test result through the cache (it is not an ACCEPT the owner may defer).
+        ...(item.final.by === 'test' || isTestAccept(item.final) ? { evidence: 'test' } : {}),
       };
     }
   }
@@ -927,6 +948,10 @@ const issueNumber = (issue) => /\/issues\/(\d{1,9})$/.exec(typeof issue === 'str
 // The "why" of a row. A deferral Claude's CLI wrote says what happened in the CLI's own words (never the agent's reason, which stays in the state and the triage
 // comment): who accepted the fix, that it is out of this merge, and the issue. Anything else, and a deferral the owner re-ruled, shows the final's reason.
 function rowWhy(item) {
+  if (isOwnerDeferral(item)) {
+    const issue = issueNumber(item.followupIssue);
+    return `owner deferral of ${deferredBy(item)} ACCEPT; NOT fixed in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
+  }
   if (isPostMaxFinal(item)) {
     const pmx = item.final.postMax;
     const issue = issueNumber(item.followupIssue);
@@ -937,8 +962,11 @@ function rowWhy(item) {
   const issue = issueNumber(item.followupIssue);
   return `deferred past the round limit; accepted by ${accepted === 'arbiter' ? 'arbiter' : 'judge'}; fix ${String(item.roundCapDeferral.fixHead ?? '').slice(0, 12)} removed, NOT in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
 }
+// Who made the ACCEPT the owner deferred (a fixed word, never the final's free text).
+const deferredBy = (item) => (DEFERRABLE_ACCEPT_BY.includes(item.final?.ownerDeferral?.accepted) ? item.final.ownerDeferral.accepted : 'unknown');
 const byLabel = (item) => {
   const by = item.final?.by;
+  if (isOwnerDeferral(item)) return `owner deferral (accepted by ${deferredBy(item)})`;
   if (by === 'claude' && isRoundCapDeferral(item)) return 'claude (round limit)';
   // who reviewed it second is part of the bound Rulings row (R5-5): claude+codex | claude+substitute-opus | claude+substitute-fable
   if (by === 'claude') return item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude';
@@ -952,7 +980,7 @@ const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 // that was carried into later rounds is one dismissal, not several).
 function inventoryEntries(state) {
   const dismissed = allItems(state)
-    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i) || isPostMaxFinal(i)))
+    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i) || isPostMaxFinal(i) || isOwnerDeferral(i)))
     .map((i) => ({ item: i, id: String(i.id) }))
     .sort(byIdAsc);
   const listed = new Set();
@@ -963,8 +991,8 @@ function inventoryEntries(state) {
     if (fp !== null) listed.add(fp);
     kept.push(entry);
   }
-  // Deferral rows (a fix taken out at the round limit, an ACCEPT turned into a FOLLOW-UP past it) are their own group, after the critical rows; within a group by id.
-  const group = (item) => (isRoundCapDeferral(item) || isPostMaxFinal(item) ? 1 : 0);
+  // Deferral rows (a fix taken out at the round limit, an ACCEPT turned into a FOLLOW-UP past it, an ACCEPT the owner deferred) are their own group, after the critical rows; within a group by id.
+  const group = (item) => (isRoundCapDeferral(item) || isPostMaxFinal(item) || isOwnerDeferral(item) ? 1 : 0);
   return kept.sort((a, b) => group(a.item) - group(b.item) || byIdAsc(a, b)).map(({ item, id }) => ({ item, id, row: [
     id, item.final.decision, item.bucket, asciiLine(item.category, 40) || '-', `by ${byLabel(item)}`, `content ${rulingContentDigest([item])}`,
     `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(rowWhy(item), WHY_MAX)}`,
@@ -1159,6 +1187,9 @@ export function reviewEligibilityProblems(state) {
   // A post-limit FOLLOW-UP (final.postMax: an ACCEPT the judge or arbiter made, turned into a follow-up by review.post_max_suggestions) leaves the merge only through its issue. Only here: roundOutcome is untouched.
   const noPostMaxIssue = allItems(state).filter((i) => isPostMaxFinal(i) && !i.followupIssue).map((i) => i.id);
   if (noPostMaxIssue.length > 0) problems.push(`post-limit follow-up(s) without a filed issue: ${noPostMaxIssue.join(', ')} (run followups create)`);
+  // An ACCEPT the owner deferred (final.ownerDeferral, also on a cached copy) leaves the merge only through its issue.
+  const noDeferralIssue = allItems(state).filter((i) => isOwnerDeferral(i) && i.final?.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
+  if (noDeferralIssue.length > 0) problems.push(`owner-deferred follow-up(s) without a filed issue: ${noDeferralIssue.join(', ')} (run followups create)`);
   const unconfirmed = rounds.flatMap((r) => (r.items ?? [])
     .filter((i) => i.implementedVia === 'other-files' && !rounds.some((later) => later.n > r.n && Array.isArray(later.confirmFixed) && later.confirmFixed.includes(i.id)))
     .map((i) => i.id));

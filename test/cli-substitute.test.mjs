@@ -1,7 +1,7 @@
 // `pipeline substitute prepare|apply` (cp issue #256, plan 2026-11-11-codex-substitute-reviewer: "How a substitute round works", R4-6, R5-3, R5-8): the real CLI against a throwaway
 // repo, a fake gh and a scripted fake Codex that ends in a quota stop (the evidence is the real route.json that codex-review leaves). The substitute's transcript is a fixture
 // written the way Claude Code writes one (test/cli-stale-terminal.test.mjs). One test per refusal path.
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, renameSync, rmSync, symlinkSync, utimesSync, writeFileSync } from 'node:fs';
@@ -1120,4 +1120,30 @@ test('a refused model may send a PROTECTED round (a confirm-fixed one) to a subs
   const prep = w.prepare(2);
   assertExit(prep, 0, prep.stdout + prep.stderr);
   assert.equal(prep.json.evidence, 'model');
+});
+
+// ---- #475: category spellings ----------------------------------------------------------------------------------------------------------------------------------
+
+test('#475 / F9: the Evidence map lists the exact categories (so the packet digest changes but promptSha256, the Codex prompt, does not); a spelling variant is accepted with a note, an unknown category is refused with the list', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const input = readFileSync(prep.inputPath, 'utf8');
+  const list = 'bug, security, auth, permissions, data-integrity, data-loss, broken-behaviour, performance, maintainability, testing, design, docs, other';
+  assert.ok(input.includes(`- Every finding's \`category\` must be exactly one of: ${list}.`), 'the list is in the packet');
+  const prompt = readFileSync(join(w.dir(), 'prompt.md'), 'utf8');
+  assert.ok(!prompt.includes('must be exactly one of'), 'the Codex prompt itself is untouched');
+  const inputDigest = /INPUT-DIGEST: ([0-9a-f]{64})/.exec(input)[1];
+  assert.notEqual(inputDigest, createHash('sha256').update(prompt).digest('hex'), 'the digest covers the evidence map');
+
+  const bad = w.apply(install(w, prep, { answer: findingsOf([], [low({ category: 'nonsense' })]) }));
+  assertExit(bad, 1, bad.stdout + bad.stderr);
+  assert.match(bad.json.errors.join('\n'), new RegExp(`"nonsense" is not one of ${list}`));
+  assert.equal(existsSync(join(w.dir(), '..', 'state.json')), false, 'nothing recorded');
+
+  const next = w.prepare().json;
+  const ok = w.apply(install(w, next, { answer: findingsOf([], [low({ category: 'tests' })]), agentId: 'a2' }));
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+  assert.equal(w.state().rounds[0].items[0].category, 'testing', 'recorded under the canonical name');
+  assert.equal(w.state().rounds[0].promptSha256, createHash('sha256').update(prompt).digest('hex'), 'promptSha256 is the Codex prompt, unchanged');
+  assert.match(ok.json.warnings.join('\n'), /suggestions\[0\]: category "tests" read as "testing"/);
 });
