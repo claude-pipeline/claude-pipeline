@@ -20,6 +20,17 @@ The old, still valid way to run a round one command at a time (what `P round cod
    `resolutionOnly: true` (a main conflict resolved by choosing lines): a real review of just the resolution, triaged as usual
    (an ACCEPT still needs its fix round) but not counted; `resolutionIneligible: "<reason>"` ⇒ a normal counted round.
 
+## Conflict with the base (merge commit alone, a pre-push hook that refuses it)
+
+In a repo whose base branch has a merge queue, main is merged into a PR branch only when GitHub reports the PR as CONFLICTING (`P ci-wait` ends `conflicting`; `gh pr view N --json mergeable`), as ONE hand-made merge commit with nothing else in it, pushed and reviewed in its own round BEFORE any other commit: that is what lets the round be `resolutionOnly` (free, uncounted). The code enforces the shape: `resolutionReviewBase` (`lib/git.mjs`) accepts a range only when every first-parent commit between the last reviewed head and the head is a merge of the base (`history-nonmerge` otherwise), and a round reviews the checked-out HEAD (`head-moved` if it is not).
+
+**A repo hook can refuse the lone merge.** EagleWatch's `.githooks/pre-push` runs `check-migration-versions`: when main brought a migration whose version stamp clashes with one of the branch's, the hook refuses the push of the merge commit, and the fix (renaming the branch's migration) is a SECOND commit. The pipeline does NOT support "merge commit, then fix commit" pushed together as a resolution-only round: that range fails `history-nonmerge`, so it is an ordinary counted whole-PR round (`resolutionIneligible: "history-nonmerge: ..."`). Not changed in code on purpose: reviewing an intermediate commit would break the rule that a round reviews the pushed, checked-out HEAD (`head-moved`, the round state, the Fable proof and `review-complete` all key on it). So, when the hook refuses the lone merge:
+
+1. Make the merge commit alone, locally; do not add the fix yet. `P redraft --pr N` (Rule 8) before anything is pushed.
+2. The session NEVER bypasses a hook; the bypass is the owner's. Ask the owner (AskUserQuestion, one click), first option: the owner pushes the lone merge commit with the hook's documented bypass (`git push` with its no-verify flag), so the round stays free; second option: push the merge and the migration rename together and accept a counted whole-PR round. The question names the PR, the clash and what each costs (correctness before the free round).
+3. First answer: the owner pushes the merge commit from the PR's worktree with the bypass. Run the resolution round on that head (`resolutionOnly`, free). Then commit the rename and push it normally (the hook passes: the clash is gone); the next round is an ordinary fix check of just that commit (its base is the merge head, which already contains main, so `reviewBaseKind` is `previous`). The PR stays a draft until the rename is pushed, so no ready-era CI runs on the clashing head.
+4. Second answer: one push of both commits, a normal whole-PR round, nothing special.
+
 ## Old 2.5 and 2.6 (publish, fix, outcome)
 
 5. **Publish and fix.** `P comment --pr N --kind triage` FIRST, then `P followups create --round R` for FOLLOW-UP items, then the triage comment again
