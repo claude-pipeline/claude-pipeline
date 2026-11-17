@@ -171,6 +171,26 @@ describe('R1-B3: a write below .git that cannot move a branch stays allowed', ()
   ]) test(`denied: ${why}`, () => expect('deny', line));
 });
 
+// #556: production failure: `cp backup/HEAD .git/worktrees/w/; git -C /work/w push` switched the linked worktree to main (the copy lands on HEAD) and was allowed, because only a destination spelled `.../HEAD` was matched;
+// a spelling of the same file that the text does not show (`.git//HEAD`, `.git/./HEAD`, `.git/refs/../HEAD`, and on a case-insensitive filesystem `.git/head`) was allowed too
+describe('#556: a directory destination under .git/worktrees, and a differently spelled HEAD, make the branches unknown', () => {
+  const CI = process.platform === 'win32' || process.platform === 'darwin'; // (the guard matches case-insensitively only where the filesystem is)
+  for (const [why, line] of [
+    ['a copy into a linked worktree directory (trailing slash)', 'cp backup/HEAD .git/worktrees/w/; git push'],
+    ['a copy into a linked worktree directory', 'cp backup/HEAD .git/worktrees/w; git push'],
+    ['tar into a linked worktree directory', 'tar -xf a.tar -C .git/worktrees/w; git push'],
+    ['a doubled slash', 'echo ref > .git//HEAD; git push'],
+    ['a dot segment', 'echo ref > .git/./HEAD; git push'],
+    ['a dot-dot segment', 'echo ref > .git/refs/../HEAD; git push'],
+    ['a linked worktree HEAD with a dot-dot', 'echo ref > .git/worktrees/w/x/../HEAD; git push'],
+  ]) test(`denied: ${why}`, () => expect('deny', line));
+  test(`${CI ? 'denied' : 'allowed'}: a lower-case .git/head (${CI ? 'case-insensitive' : 'case-sensitive'} filesystem)`, () => expect(CI ? 'deny' : 'allow', 'echo ref > .git/head; git push'));
+  for (const [why, line] of [
+    ['a file in a worktree directory that cannot move a branch is not a directory destination of a copy', 'echo x > .git/worktrees/w/gitdir; git push'],
+    ['a dot segment elsewhere', 'echo x > .git/./info/exclude; git push'],
+  ]) test(`allowed: ${why}`, () => expect('allow', line));
+});
+
 // R1-B2: a function / trap / alias / shopt in a walked script forgets the names already recorded, but marks no unrelated branch unknown
 describe('R1-B2: a state hazard in a child script or sourced file leaves the caller\'s on-disk branch known', () => {
   const FN = { [resolve('/work/repo/nvm.sh')]: 'nvm() { echo x; }\nnvm\n', [BUILD]: 'build() { make; }\nbuild\n' };
