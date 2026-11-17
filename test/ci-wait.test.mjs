@@ -23,7 +23,7 @@ const at = (v, t, n) => (typeof v === 'function' ? v(t, n) : v);
 function sim(world, options = {}) {
   let t = 0;
   const calls = [];
-  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [], markers: 0, runs: [] }; // the base each policy read asked for
+  const reads = { classic: [], rules: [], statuses: 0, checkRuns: 0, headRuns: [], markers: 0, runs: [], mergeable: 0, labels: 0 }; // the base each policy read asked for
   const readers = {
     pr: async () => at(world.pr ?? PR, t / 1000),
     classic: async (base) => {
@@ -57,6 +57,18 @@ function sim(world, options = {}) {
       workflowRun: async (id) => {
         reads.runs.push(id);
         return at(world.workflowRun, t / 1000, id);
+      },
+    }),
+    ...(world.mergeable === undefined ? {} : {
+      mergeable: async () => {
+        reads.mergeable += 1;
+        return at(world.mergeable, t / 1000, reads.mergeable);
+      },
+    }),
+    ...(world.labels === undefined ? {} : {
+      labels: async () => {
+        reads.labels += 1;
+        return at(world.labels, t / 1000, reads.labels);
       },
     }),
     suiteRuns: async (id) => {
@@ -1290,4 +1302,264 @@ test('R1-F1: the run is read once per poll (memoised), not once per status evalu
   // 8 polls (0..105 s) read the run once each with the memo; without it each poll reads twice (16)
   assert.deepEqual([...new Set(s.reads.runs)], ['555']);
   assert.equal(s.reads.runs.length, 8, String(s.reads.runs.length));
+});
+
+// ---- a conflicting PR runs no pull_request workflow: say so instead of `missing` (#471) ----------------------------------------
+
+const MERGEABLE = (name) => fx(`pr-mergeable-${name}.json`); // gh pr view --json mergeable,mergeStateStatus, captured shapes
+
+test('#471: required checks that never appeared on a CONFLICTING PR end as `conflicting` with the remedy, not `missing`', async () => {
+  const s = sim({ classic: present('A', 'B'), checkRuns: [cr('A', 'success')], mergeable: MERGEABLE('conflicting') });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.verdict, 'conflicting');
+  assert.equal(s.elapsed(), 300_000, 'only after the appear window, like missing');
+  assert.equal(r.output.message, 'merge conflict with main: merge the base, then run the resolution round');
+  assert.deepEqual(r.output.mergeState, { mergeable: 'CONFLICTING', state: 'DIRTY' });
+  assert.equal(r.output.checks.find((c) => c.name === 'B').state, 'missing');
+});
+
+test('#471: a draft-era-skipped required check on a DIRTY PR is `conflicting` too (stale-skipped is the other absence verdict)', async () => {
+  const s = sim({ ...lateAggregate({ appearAt: 99999, shardDoneAt: 0 }), mergeable: { mergeable: null, mergeStateStatus: 'DIRTY' } });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'conflicting');
+  assert.equal(s.elapsed(), 300_000);
+  assert.match(r.output.message, /^merge conflict with main: merge the base/);
+});
+
+test('#471: mergeable still being computed is re-read once after one interval inside the wait loop: CONFLICTING then => conflicting', async () => {
+  const s = sim({ classic: present('A'), mergeable: (t, n) => (n === 1 ? MERGEABLE('unknown') : MERGEABLE('conflicting')) });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'conflicting');
+  assert.equal(s.reads.mergeable, 2);
+  assert.equal(s.elapsed(), 315_000, 'one extra interval, no more');
+});
+
+test('#471: mergeable that stays unknown is never waited on forever: the second read falls back to `missing`', async () => {
+  const s = sim({ classic: present('A'), mergeable: MERGEABLE('unknown') });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'missing');
+  assert.equal(s.reads.mergeable, 2);
+  assert.equal(s.elapsed(), 315_000);
+});
+
+test('#471: a mergeable PR, an unreadable mergeability, and a command without the reader all keep `missing` (never a guess)', async () => {
+  const clean = sim({ classic: present('A'), mergeable: MERGEABLE('clean') });
+  assert.equal((await clean.run()).output.verdict, 'missing');
+  assert.equal(clean.reads.mergeable, 1);
+  const broken = sim({ classic: present('A'), mergeable: () => { throw new Error('HTTP 502'); } });
+  assert.equal((await broken.run()).output.verdict, 'missing');
+  const none = sim({ classic: present('A') });
+  assert.equal((await none.run()).output.verdict, 'missing');
+});
+
+test('#471: mergeability is only read for an absence verdict: a pass and a failure never read it', async () => {
+  const pass = sim({ classic: present('A'), checkRuns: [cr('A', 'success')], mergeable: MERGEABLE('conflicting') });
+  assert.equal((await pass.run()).output.verdict, 'passed');
+  const fail = sim({ classic: present('A'), checkRuns: [cr('A', 'failure')], mergeable: MERGEABLE('conflicting') });
+  assert.equal((await fail.run()).output.verdict, 'failed');
+  assert.equal(pass.reads.mergeable + fail.reads.mergeable, 0);
+});
+
+test('#471 R1-F2: a draft-era failure that no ready-era run replaced, on a CONFLICTING PR, is `conflicting` (no workflow ran), not `failed`', async () => {
+  const world = (mergeable) => ({
+    classic: present('A'), timeline: readyTimeline, mergeable,
+    checkRuns: [cr('A', 'failure', { id: 1, check_suite: { id: 9 } })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T11:00:00Z', run_started_at: '2026-01-01T11:00:00Z' }],
+  });
+  const s = sim(world(MERGEABLE('conflicting')));
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'conflicting', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 300_000);
+  assert.equal(s.reads.mergeable, 1);
+  // a mergeable PR keeps the stale failure: failed, as before
+  const clean = await sim(world(MERGEABLE('clean'))).run();
+  assert.equal(clean.output.verdict, 'failed');
+  assert.match(clean.output.message, /result predates ready/);
+});
+
+// ---- ci.merge_checks: checks the repo's own merge command requires although protection does not (#471, item 27) ----------------
+
+test('merge_checks: a pending merge check holds the wait like a required one, then passes; it is listed in checks with its source', async () => {
+  const s = sim({
+    classic: present('A'),
+    checkRuns: (t) => [cr('A', 'success', { id: 1 }), cr('Replay from zero', t < 45 ? null : 'success', { id: 2 })],
+  }, { mergeChecks: ['Replay from zero'] });
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 45_000, 'not at the first poll, where only the required check had passed');
+  assert.deepEqual(r.output.checks.map((c) => [c.name, c.state, c.source]), [['A', 'pass', undefined], ['Replay from zero', 'pass', 'merge_checks']]);
+  assert.ok(s.progress.some((l) => /Replay from zero=pending/.test(l)), s.progress.join(' | '));
+});
+
+test('merge_checks: a failing merge check fails the wait at once, naming it; without the option the same head passes', async () => {
+  const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Replay from zero', 'failure')] };
+  const withIt = await sim(world, { mergeChecks: ['Replay from zero'] }).run();
+  assert.equal(withIt.exitCode, 1);
+  assert.equal(withIt.output.verdict, 'failed');
+  assert.match(withIt.output.message, /Replay from zero=fail/);
+  assert.equal((await sim(world).run()).output.verdict, 'passed');
+});
+
+test('merge_checks (R1-F3): a merge check with no producer at all (a path-filtered workflow that did not run) is not owed: passed at the appear deadline with notOwed, never `missing`', async () => {
+  const s = sim({ classic: present('A'), checkRuns: [cr('A', 'success')] }, { mergeChecks: ['Replay from zero'] });
+  const r = await s.run();
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(s.elapsed(), 300_000, 'not before the appear window: its workflow may still be starting');
+  assert.deepEqual(r.output.notOwed, ['Replay from zero']);
+  assert.deepEqual(r.output.checks.map((c) => c.name), ['A'], 'not listed among the checks');
+});
+
+test('merge_checks (R1-F3): a merge check with no producer does not end the wait while a required check is still pending, or a run on the head could still produce it', async () => {
+  const pending = sim({ classic: present('A'), checkRuns: (t) => [cr('A', t < 400 ? null : 'success', { id: 1 })] }, { mergeChecks: ['Replay from zero'] });
+  const r = await pending.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(pending.elapsed(), 405_000);
+  assert.deepEqual(r.output.notOwed, ['Replay from zero']);
+  const running = sim({
+    classic: present('A'), checkRuns: [cr('A', 'success')],
+    headRuns: () => [{ id: 7, name: 'Replay', status: 'in_progress', created_at: '2026-01-01T00:05:00Z', html_url: 'https://github.example/w/7' }],
+  }, { mergeChecks: ['Replay from zero'] });
+  assert.equal((await running.run()).output.verdict, 'timeout', 'a run still going on the head holds the wait to --timeout');
+});
+
+test('merge_checks (R2-B1): --wait-all with a failed required check and a merge check with no producer ends `failed` once the merge check is notOwed, never `passed`', async () => {
+  const s = sim({ classic: present('A'), checkRuns: [cr('A', 'failure', { id: 1 })] }, { mergeChecks: ['Replay from zero'], waitAll: true });
+  const r = await s.run();
+  assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'failed');
+  assert.equal(r.output.ok, false);
+  assert.match(r.output.message, /A=fail/);
+  assert.deepEqual(r.output.failures.map((f) => f.name), ['A']);
+  assert.deepEqual(r.output.notOwed, ['Replay from zero'], 'the wait established the merge check is not owed: a failed result says so');
+  assert.deepEqual(r.output.checks.map((c) => c.name), ['A'], 'the not-owed merge check is not listed as a missing check');
+});
+
+test('merge_checks (R1-F3): no notOwed field when every merge check reported', async () => {
+  const r = await sim({ classic: present('A'), checkRuns: [cr('A', 'success'), cr('Replay from zero', 'success')] }, { mergeChecks: ['Replay from zero'] }).run();
+  assert.equal('notOwed' in r.output, false);
+});
+
+test('merge_checks: skipped semantics match required checks: a draft-era skip waits (stale-skipped at the deadline), a ready-era skip is done', async () => {
+  const world = (suiteCreated) => ({
+    classic: present('A'), timeline: readyTimeline,
+    checkRuns: [cr('A', 'success', { id: 1 }), cr('Replay from zero', 'skipped', { id: 2, check_suite: { id: 9 } })],
+    suiteRuns: () => () => [{ created_at: suiteCreated }],
+  });
+  const stale = sim(world('2026-01-01T11:00:00Z'), { mergeChecks: ['Replay from zero'] });
+  const a = await stale.run();
+  assert.equal(a.output.verdict, 'stale-skipped');
+  assert.equal(stale.elapsed(), 300_000);
+  const fresh = await sim(world('2026-01-01T12:00:05Z'), { mergeChecks: ['Replay from zero'] }).run();
+  assert.equal(fresh.output.verdict, 'passed', JSON.stringify(fresh.output));
+  assert.equal(fresh.output.checks.find((c) => c.name === 'Replay from zero').state, 'fresh-skip');
+});
+
+test('merge_checks: a name that is already required is not waited on twice; an unreadable policy is still `unverified` straight away', async () => {
+  const dup = await sim({ classic: present('A'), checkRuns: [cr('A', 'success')] }, { mergeChecks: ['A'] }).run();
+  assert.deepEqual(dup.output.checks.map((c) => c.name), ['A']);
+  const s = sim({ classic: { kind: 'unreadable', reason: 'HTTP 403' }, rules: () => { throw new Error('HTTP 403'); }, checkRuns: [cr('A', 'success')] }, { configChecks: ['A', 'Replay from zero'], mergeChecks: ['Replay from zero'] });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'unverified');
+  assert.equal(s.elapsed(), 0);
+});
+
+test('merge_checks: they never turn `no-required-checks` into a wait (protection absent stays its own verdict)', async () => {
+  const r = await sim({ classic: { kind: 'absent' }, rules: [], checkRuns: [cr('Replay from zero', 'success')] }, { mergeChecks: ['Replay from zero'] }).run();
+  assert.equal(r.output.verdict, 'no-required-checks');
+});
+
+// ---- run-e2e PRs: a non-required check still running or red on the head is reported, so `passed` never hides it (#471) ----------------
+
+const E2E = { e2eLabel: 'run-e2e' };
+const e2ePr = (labels) => ({ ...PR, labels });
+
+test('e2e label: `passed` lists a still-running non-required check as others [{name, status, url}]; required and green ones are left out', async () => {
+  const s = sim({
+    pr: PR, classic: present('A'), labels: ['run-e2e', 'x'],
+    checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', null, { id: 2, html_url: 'https://github.example/runs/pw' }), cr('Vercel preview', 'success', { id: 3 })],
+  }, E2E);
+  const r = await s.run();
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output.verdict, 'passed');
+  assert.deepEqual(r.output.others, [{ name: 'Playwright suite', status: 'in_progress', url: 'https://github.example/runs/pw' }]);
+  assert.match(r.output.message, /Playwright suite/);
+  assert.equal(s.reads.labels, 1);
+});
+
+test('e2e label: a failed non-required check (check run or commit status) is listed with its conclusion / state; the verdict stays passed', async () => {
+  const s = sim({
+    classic: present('A'), labels: ['run-e2e'],
+    checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', 'failure', { id: 2, html_url: 'https://github.example/runs/pw' })],
+    statuses: [st('deploy/e2e', 'pending', 'x', { target_url: 'https://github.example/s/1' })],
+  }, E2E);
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.deepEqual(r.output.others, [
+    { name: 'Playwright suite', status: 'failure', url: 'https://github.example/runs/pw' },
+    { name: 'deploy/e2e', status: 'pending', url: 'https://github.example/s/1' },
+  ]);
+});
+
+test('e2e label: a re-run decides (highest id): a green re-run of a red suite is not listed; an empty `others` is still reported on a labelled PR', async () => {
+  const s = sim({
+    classic: present('A'), labels: ['run-e2e'],
+    checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', 'failure', { id: 2 }), cr('Playwright suite', 'success', { id: 3 })],
+  }, E2E);
+  const r = await s.run();
+  assert.deepEqual(r.output.others, []);
+  assert.equal(r.output.message, undefined);
+});
+
+test('e2e label (R1-B1): a green check run and a pending / failed commit status of the same name are separate producers: the status is still listed', async () => {
+  for (const state of ['pending', 'failure']) {
+    const s = sim({
+      classic: present('A'), labels: ['run-e2e'],
+      checkRuns: [cr('A', 'success', { id: 1 }), cr('deploy/e2e', 'success', { id: 2 })],
+      statuses: [st('deploy/e2e', state, 'x', { target_url: 'https://github.example/s/9' })],
+    }, E2E);
+    const r = await s.run();
+    assert.equal(r.output.verdict, 'passed');
+    assert.deepEqual(r.output.others, [{ name: 'deploy/e2e', status: state, url: 'https://github.example/s/9' }], state);
+  }
+});
+
+test('e2e label (R1-F1): a newer skipped no-op run of the suite does not hide the older run that is still running or failed; a name with only skipped runs stays unlisted', async () => {
+  for (const [conclusion, status] of [[null, 'in_progress'], ['failure', 'failure']]) {
+    const r = await sim({
+      classic: present('A'), labels: ['run-e2e'],
+      checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', conclusion, { id: 2, html_url: 'https://github.example/runs/real' }), cr('Playwright suite', 'skipped', { id: 3 })],
+    }, E2E).run();
+    assert.deepEqual(r.output.others, [{ name: 'Playwright suite', status, url: 'https://github.example/runs/real' }], status);
+  }
+  const onlySkipped = await sim({ classic: present('A'), labels: ['run-e2e'], checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', 'skipped', { id: 2 })] }, E2E).run();
+  assert.deepEqual(onlySkipped.output.others, []);
+});
+
+test('e2e label: no label on the PR, or no ci.e2e_label configured, leaves the output unchanged (no `others`, no label read without the option)', async () => {
+  const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Playwright suite', null)] };
+  const unlabelled = sim({ ...world, labels: ['bug'] }, E2E);
+  const a = await unlabelled.run();
+  assert.equal(a.output.verdict, 'passed');
+  assert.equal('others' in a.output, false);
+  const unconfigured = sim({ ...world, labels: ['run-e2e'] });
+  const b = await unconfigured.run();
+  assert.equal('others' in b.output, false);
+  assert.equal(unconfigured.reads.labels, 0);
+});
+
+test('e2e label (R1-F4): a failed label read is retried on the next poll like every other read (never a plain pass that looks unlabelled); it ends as github after MAX_READ_FAILURES', async () => {
+  const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Playwright suite', null)] };
+  const flaky = sim({ ...world, labels: (t, n) => { if (n === 1) throw new Error('HTTP 502'); return ['run-e2e']; } }, E2E);
+  const a = await flaky.run();
+  assert.equal(a.output.verdict, 'passed');
+  assert.deepEqual(a.output.others.map((o) => o.name), ['Playwright suite']);
+  assert.equal(flaky.reads.labels, 2);
+  assert.equal(flaky.elapsed(), 15_000, 'one interval for the retry');
+  const broken = sim({ ...world, labels: () => { throw new Error('HTTP 502'); } }, E2E);
+  const b = await broken.run();
+  assert.equal(b.output.verdict, 'github');
+  assert.equal(broken.reads.labels, MAX_READ_FAILURES);
 });
