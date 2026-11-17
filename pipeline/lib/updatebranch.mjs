@@ -82,15 +82,17 @@ async function waitForNewHead({ gh, pr, from, waitMs, pollMs, now, sleep }) {
 // successor (an external push that raced the update) is `head-moved` and nothing more is written. Waiting for the new head's
 // checks is opt-in (`waitChecks: true`): the review flow marks the PR ready and labels it AFTER updating, and checks that only
 // start then (draft-skipped workflows, label-gated e2e) would otherwise be waited on forever. Merge needs no check wait either.
-// `beforeUpdate` (optional, may be async) is called immediately before EVERY update PUT: a non-null return is a refusal object
+// `beforeUpdate` (optional, may be async; called with { head, cycles }) is called immediately before EVERY update PUT: a non-null return is a refusal object
 // ({error, …extra}) that ends the loop with outcome = its `error` and its fields on the result, keeping `updated` (= cycles > 0),
-// `cycles`, `head` and `startHead`. Without it nothing changes. The read and the PUT are not atomic: it narrows the window, no more.
+// `cycles`, `head` and `startHead` ({error: 'up-to-date'} is a success: the caller says nothing more is needed). Without it nothing changes.
+// `checkBeforeCap` (default off): after an accepted update, call `beforeUpdate` as soon as a later cycle finds the branch still behind, BEFORE the cycle cap is
+// judged (once per cycle: the PUT does not ask again), so a hook that ends the loop with success is not turned into `cycle-cap`. The read and the PUT are not atomic: it narrows the window, no more.
 // `onSuccessor` (optional, SYNC) is called with { from, to, baseSha } for every accepted cycle, immediately after the parents check
 // proves the new head is the merge of baseSha into from: before any checks read and before the next cycle reads anything, so a
 // failure there cannot lose the proof. A throw is caught and listed in `successorWarnings`; it never changes the outcome. The result
 // carries `successors` (every accepted cycle, in order) whatever the outcome, and `successorWarnings` when there are any.
 export async function bringUpToDate({
-  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false, beforeUpdate = null, onSuccessor = null,
+  gh, pr, expectHead = null, maxCycles = MAX_UPDATE_CYCLES, waitChecks = false, beforeUpdate = null, checkBeforeCap = false, onSuccessor = null,
   headWaitMs = HEAD_WAIT_MS, checksWaitMs = CHECKS_WAIT_MS, pollMs = POLL_MS, now = Date.now, sleep = defaultSleep,
 }) {
   let cycles = 0;
@@ -115,12 +117,18 @@ export async function bringUpToDate({
     }
     const cmp = gh.compare(base, head);
     if (cmp.behindBy === 0) return out('up-to-date', { head, behindBy: 0 });
+    let asked = false;
+    if (checkBeforeCap && cycles > 0 && beforeUpdate !== null) {
+      asked = true;
+      const refusal = await beforeUpdate({ head, cycles });
+      if (refusal) return out(refusal.error, { head, ...refusal });
+    }
     if (cycles >= maxCycles) {
       return out('cycle-cap', { head, behindBy: cmp.behindBy, message: `${base} kept moving: still ${cmp.behindBy} commit(s) behind after ${cycles} update(s)` });
     }
 
-    if (beforeUpdate !== null) {
-      const refusal = await beforeUpdate();
+    if (beforeUpdate !== null && !asked) {
+      const refusal = await beforeUpdate({ head, cycles });
       if (refusal) {
         return out(refusal.error, { head, ...refusal });
       }

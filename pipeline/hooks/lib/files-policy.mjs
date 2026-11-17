@@ -22,7 +22,7 @@ import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import path from 'node:path';
-import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
+import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
@@ -289,7 +289,7 @@ function makeCtx(opts) {
   // (one evaluation asks about the same words again and again: the answers are kept, bounded)
   const memo = (fn) => { const seen = new Map(); return (p) => { const k = String(p); let v = seen.get(k); if (v === undefined) { v = fn(k); if (seen.size < 4096) seen.set(k, v); } return v; }; };
   const pipelineHit = memo((p) => { const q = unFirm(p); return roots.some((r) => isInside(q, r, platform)); });
-  const pipelineAncestor = memo((p) => { const q = unFirm(p); return ancestors.some((a) => samePath(q, a, platform)); });
+  const pipelineAncestor = memo((p) => { const q = unFirm(p); return ancestors.some((a) => sameSpelling(q, a, platform)); });
   let rootIds = null;
   // #111: a symlink (or any other spelling) of the cwd's review folder. dev:ino of <cwd>/.review and of each existing
   // <cwd>/.review/round-*; none when the folder is missing (no error). NOT added to rootIds: hitInode walks the ancestors of a
@@ -414,6 +414,7 @@ function makeCtx(opts) {
   };
   return {
     platform, homeNative, homePosix, cwd, api, roots, lexRoots, ancestors, lexAncestors, ci,
+    shell: opts._depth ? 'bash' : opts.shell === 'powershell' ? 'powershell' : 'bash', // the tool's shell (PowerShell only at the top level, see pipelineToolInRaw)
     // (R2-B2) the plugin folders outside a .claude*/plugins folder, from the real installed_plugins.json of each account config dir (read once, when a path is first judged)
     surfaceDirs: (() => {
       let memo = null;
@@ -1835,7 +1836,10 @@ function loopNameRefused(cmds) {
 const READ_ONLY = new Set(['echo', 'printf', 'cat', 'head', 'tail', 'less', 'more', 'ls', 'stat', 'wc', 'grep', 'rg', 'diff', 'cmp', 'shasum', 'sha256sum', 'sha1sum', 'md5', 'md5sum', 'file', 'readlink', 'realpath', 'test', '[', 'cut', 'du', 'hexdump', 'bat']);
 const PS_READ_ONLY = new Set(['get-content', 'get-childitem', 'gc', 'gci']);
 const GIT_READ_ONLY = new Set(['log', 'show', 'diff', 'status', 'ls-files', 'blame']);
-const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'chdir', 'set-location', 'sl']); // (R18-F2: zsh's chdir is cd under another name, with the same target whitelist)
+// (R12-F2: `chdir` is a zsh builtin and a PowerShell alias, Push-Location / Pop-Location are pushd / popd, and `cd..` is the one-word PowerShell function for `cd ..`)
+const CD_CMDS = new Set(['cd', 'pushd', 'popd', 'chdir', 'set-location', 'sl', 'push-location', 'pop-location', 'cd..']); // (R18-F2: zsh's chdir is cd under another name, with the same target whitelist)
+// The directory a cd command names (its first operand; `cd..` carries it in its name), undefined when it has none
+const cdOperand = (argv) => (baseOf(argv[0] ?? '') === 'cd..' ? '..' : argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d'));
 // R19-B1: the name a cd command is judged under: chdir is read as cd ONCE, here, so a bare `chdir` goes home, narrows and is a cd for every check below that asks `=== 'cd'`
 const cdNameOf = (w) => { const n = baseOf(w ?? ''); return n === 'chdir' ? 'cd' : n; };
 // R5-F1 (#288): the builtin cd, written as the command itself (after only NAME=value words): not behind `env`, `sudo`, `time`, `builtin`, `command`
@@ -2103,16 +2107,21 @@ function runsInlineCode(c, ctx) {
   });
 }
 // Why: a cd whose target cannot be named from its words: `cd -` (OLDPWD), `popd`, a bare `pushd`, `pushd +1`, several operands (a brace list the parser split; zsh `cd old new`),
-// `~-` / `~+` / `~name` (OLDPWD, PWD, another user's home).
-function cdUnknownShape(argv) {
+// `~-` / `~+` / `~name` (OLDPWD, PWD, another user's home). R13-F2: under the PowerShell tool a location command with any parameter (`-Path:X`, `-LiteralPath X`, `-StackName s X`, an abbreviation
+// like `-Pa`) is read by PowerShell's own binder, which the first-non-dash-word reading below gets wrong (`-Path:X` hides the target, `-StackName s X` names `s`), so only `-PassThru` (no value) is harmless there.
+// (Bash's `cd -P` / `-L` and cmd's `/d` keep their reading on their routes.)
+function cdUnknownShape(argv, ctx, cmd) {
   const cn = cdNameOf(argv[0]);
   const args = argv.slice(1);
-  if (cn === 'popd' || args.includes('-')) return true;
+  if (cn === 'popd' || cn === 'pop-location' || args.includes('-')) return true;
+  if (ctx?.shell === 'powershell' && args.some((a) => a.startsWith('-') && !/^-passthru$/i.test(a))) return true;
   // R10-F3: zsh reads `cd +N` / `cd -N` as entry N of the directory stack (entry 0 is the current directory), not as a directory name
   if (cn === 'cd' && args.some((a) => /^[+-]\d+$/.test(a))) return true;
-  const t = args.find((a) => !a.startsWith('-') && a !== '/d');
+  const t = cdOperand(argv);
+  // R13-F3: under PowerShell a location command takes its target from the pipeline when it is a pipe stage (`echo C:/x | Set-Location`) and has none to read when it has no operand: unknown either way
+  if (ctx?.shell === 'powershell' && (t === undefined || cmd?.sep === '|')) return true;
   if (cn === 'pushd' && (t === undefined || args.some((a) => /^[+-]\d+$/.test(a)))) return true;
-  if (cn === 'cd' && args.filter((x) => !x.startsWith('-')).length > 1) return true;
+  if ((cn === 'cd' || cn === 'chdir') && args.filter((x) => !x.startsWith('-')).length > 1) return true;
   return t !== undefined && /^~(?:[-+]|[A-Za-z_])/.test(t);
 }
 // R12: a word is provably literal when nothing in it is settled at run time. R13: a POSITIVE shape (letters, digits and `_ . , : / = @ % + -`), not a list of bad characters: zsh's `^ # ~ < > !`
@@ -2212,6 +2221,15 @@ function dirLikeWord(cmds, ci, ctx, bases, fromFile = false) {
   if (w.length > MAX_DIR_WORD) return false;
   // (a sourced file is judged on its own text: the line's variables are not what its assignments leave, R18-F6)
   const e = fromFile ? w : expandRefs(w, ctx);
+  // (#352 merge of main: `exec {k}>f` / `{a[0]}>f`, an unquoted named-descriptor word right before `<` / `>`, opens a descriptor in zsh and bash >= 4.1 and is the command `{k}` in sh /
+  // bash 3.2, which have no AUTO_CD. Only zsh with IGNORE_BRACES reads it as a plain word (a `[N]` subscript then a glob): it runs a cd only when a directory named `{name…}` is there or
+  // made on the line. The brace is no run-time part here; the shell-parse side marks the line ctlBroken, so no cd on it is believed either)
+  const fdWord = /^\{([A-Za-z_]\w*)(?:\[\d+\])?\}$/.exec(w);
+  if (fdWord && typeof unq === 'string' && new RegExp(`(?:^|[\\s;&|(){}])${escapeRe(w)}(?=[<>])`).test(unq)) {
+    const like = (n) => typeof n === 'string' && n.startsWith(`{${fdWord[1]}`) && n.endsWith('}');
+    if (bases.some((d) => (ctx.readDir(d) ?? []).some((n) => like(n) && Array.isArray(ctx.readDir(pathsFor().join(d, n)))))) return true;
+    return makerOps(cmds).some((ops, k) => k !== ci && ops !== null && ops.some((q) => like(String(q).replace(/^(?:\.\/)+/, '').split('/')[0])));
+  }
   // (d) a run-time word, and a double-quoted word with no reference in it is literal text (`"a[@]"`)
   const rawWord = (c.raw ?? '').trim();
   const quotedLiteral = /^"[^"$`\\]*"$/.test(rawWord) || /^'[^']*'$/.test(rawWord);
@@ -2435,13 +2453,19 @@ function modelZshSelfDirs(cmds, raw, ctx) {
   }
 }
 
-function impliesCwdWrite(c) {
+const PS_FILE_WRITERS = new Set(['set-content', 'add-content', 'clear-content', 'out-file', 'new-item', 'remove-item', 'copy-item', 'move-item', 'rename-item', 'set-item', 'tee-object', 'export-csv', 'export-clixml', 'sc', 'ac', 'ni', 'ri', 'cpi', 'mi', 'ren', 'rni', 'del', 'erase']);
+function impliesCwdWrite(c, ctx) {
   const name = baseOf(c.argv[0] ?? '');
   const args = c.argv.slice(1);
+  // R14-F1/F2: on the PowerShell route a directory only known at run time makes EVERY command that is not read-only a possible write there (deny by default: a parameter spelled `-Path:..\x` or `-OutFile`, an unlisted
+  // writer such as iwr / Expand-Archive / Start-Transcript, an alias, all write relative to the unknown folder). PS_FILE_WRITERS below is only the narrower reading for the other routes.
+  if (ctx?.shell === 'powershell') return c.argv.length > 0 && !isReadOnly(c, ctx);
   if (['tar', 'bsdtar', 'gtar', 'unzip', '7z', '7za', '7zz', 'cpio', 'bsdcpio', 'pax', 'ar', 'jar', 'unrar', 'unar', 'unxz', 'unzstd', 'bunzip2', 'gunzip', 'patch', 'ditto', 'wget', 'svn', 'hg'].includes(name)) return true;
   if (['gzip', 'xz', 'bzip2', 'zstd', 'lz4'].includes(name)) return true; // (compress or decompress, in place)
   const relOperand = args.some((a) => !a.startsWith('-') && !/^(?:\/|~)/.test(a.replace(/^\w+=/, '')));
   if (['touch', 'mkdir', 'tee', 'truncate', 'rm', 'rmdir', 'mkfifo', 'mknod', 'chmod', 'chown', 'dd'].includes(name)) return relOperand;
+  // (PowerShell's file writers, and their aliases, write a relative operand into the directory they run in too)
+  if (PS_FILE_WRITERS.has(name)) return args.some((a) => !a.startsWith('-') && !/^(?:\/|~|[A-Za-z]:[\\/])/.test(a));
   if (['sed', 'gsed'].includes(name) && args.some((a) => inPlaceFlag(a))) return relOperand;
   if (['perl', 'ruby'].includes(name) && args.some((a) => /^-[A-Za-z]*i/.test(a))) return relOperand; // (in-place edit)
   if (name === 'find') return args.some((a) => FIND_UNSAFE.test(a)); // (-delete, -exec, -fprint ...: a write in the directory it runs in)
@@ -2511,19 +2535,63 @@ function gitReadOnly(args) {
 // (not the owner-go recorder: run by hand with made-up input it would write an owner "merge" -- Codex design review of #58)
 function isPipelineTool(arg, ctx) {
   if (typeof arg !== 'string') return false;
+  // Under the PowerShell tool the shell-text parser is not PowerShell: it reads a typographic quote (U+2018-U+201E, quote characters to PowerShell) as a name character, so a quoted `‘..’` segment
+  // looks like a plain folder there. Trust no non-ASCII operand for that tool (a home path with such a character is simply not auto-trusted).
+  if (ctx.shell === 'powershell' && /[^\x00-\x7F]/.test(arg)) return false;
+  // R13-F3: ... and none that starts with a tilde: PowerShell's cmdlets read `~` as the home, but a native command (node, git) receives it LITERALLY, so `node ~/.claude/.../pipeline.mjs` can run
+  // <cwd>/~/.claude/..., a file the agent can write. Under PowerShell only an absolute path is a trusted tool path (Bash / zsh expand the tilde before the command starts).
+  if (ctx.shell === 'powershell' && arg.startsWith('~')) return false;
+  // A backslash left in a shell-parsed word (quoted: `"hooks/\.\./x"`) is a name character off Windows, but expandRefs would read it as a separator: refuse (fail closed).
+  if (ctx.platform !== 'win32' && (arg.includes('\\') || expandKeepingBackslash(arg, ctx).includes('\\'))) return false; // (also one a same-line variable brings in: `D='a\b'; node .../hooks/$D/../../x.mjs`, R8-F2)
   const e = expandRefs(arg, ctx);
   if (!isAbs(e)) return false;
+  // A trusted tool path never needs a part that is only known at run time. One left in the expanded operand (`$U`, `${U}`, `$(..)`, a backtick, `%U%` on Windows, a `~`) can be an EMPTY segment
+  // there, so `hooks/$U/$U/$U/../../../repo/x.mjs` climbs out of hooks although it normalises inside (R9-F2). (A `~` inside the home folder's own spelling, a Windows 8.3 name, is not one.)
+  const home = String(ctx.homePosix ?? '');
+  const tail = home && e.toLowerCase().startsWith(home.toLowerCase()) ? e.slice(home.length) : e;
+  // A glob is such a part too (zsh `**/` matches zero folders, so `hooks/**/**/**/../../../tmp/x.mjs` normalises inside hooks and expands outside, R10-F2): refused with the other shell-special characters.
+  if (/[$`~*?[\](){}#^]/.test(tail) || (ctx.platform === 'win32' && /%[^%/\\]*%/.test(tail))) return false;
   if (OWNER_GO_RECORDER.test(e)) return false;
-  return samePath(e, `${ctx.homePosix}/.claude/pipeline/bin/pipeline.mjs`, ctx.platform)
-    || isInside(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
+  // An ALLOW check, so a false match fails open: ask the disk, not the case-folded spelling. On a case-sensitive volume a differently-cased
+  // pipeline directory is another, agent-writable one. When the disk cannot answer (a stat error, a missing file) only the EXACT spelling matches,
+  // never a fold (sameFileStrict / insideStrict). (The protect checks stay on sameSpelling: a false match there denies.)
+  return sameFileStrict(e, `${ctx.homePosix}/.claude/pipeline/bin/pipeline.mjs`, ctx.platform)
+    || insideStrict(e, `${ctx.homePosix}/.claude/pipeline/hooks`, ctx.platform);
 }
 
-// A Windows `node C:\...\pipeline.mjs` loses its backslashes in argv, so look at the raw text too.
+// The PowerShell tool only: there a backslash is a path separator, but the shell-text parser below reads it as an escape and drops it from argv (`node C:\Users\u\x.mjs` arrives as
+// `C:Usersux.mjs`), so the raw text is looked at too. NEVER for Bash text, on any platform: Git Bash drops those backslashes for real and runs the drive-relative file, and off Windows a
+// backslash is an escape (`hooks/a\ ../..` is one word), so there only the shell-parsed argv word decides (R8-B1 / R8-F1 / R8-F2: one root cause, the raw text standing in for the operand).
+// The decision is on the WHOLE first operand as PowerShell reads it, not on a regex capture that can stop mid-word: a bare word of plain path characters, or an ASCII quote pair around such,
+// that ends at a word boundary. The characters are an ALLOWLIST (a drive, then segments of ASCII letters, digits, `.`, `_`, `-` joined by `\` or `/`; no space, so a home path with one is not trusted
+// here): a denylist missed the typographic quotes U+2018-U+201E, which PowerShell reads as quote characters (`‘..’` is `..`). Anything else, every non-ASCII character included, refuses. A `.` / `..`
+// segment is refused outright (a trusted tool path never needs one), and the path then goes through isPipelineTool like an argv word does (disk identity, exact spelling when the disk
+// cannot answer). Only the top-level command qualifies: a script or text read from a file (depth > 0) is judged as Bash.
+const PS_NODE_PREFIX = /^\s*(?:&\s*)?(?:[^\s"'`$%~]*[\\/])?node(?:\.exe)?\s+/i;
+const PS_PLAIN_PATH = /^[A-Za-z]:[\\/](?:[A-Za-z0-9._-]+[\\/])*[A-Za-z0-9._-]+$/; // (no trailing separator: a folder, not a file)
+const PS_BLANK = /[ \t\r\n]/; // (PowerShell's word break as far as the guard trusts it: a no-break space or any other Unicode blank is NOT one, so it stays inside the word and fails the allowlist)
+function psOperand(raw) {
+  const m = PS_NODE_PREFIX.exec(raw);
+  if (m === null) return null;
+  const rest = raw.slice(m[0].length);
+  const q = rest[0];
+  if (q === '"' || q === "'") {
+    const end = rest.indexOf(q, 1);
+    if (end < 0) return null;
+    const after = rest[end + 1];
+    if (after !== undefined && !PS_BLANK.test(after)) return null; // text glued to the closing quote (`''` doubling, `"x"y`) is the same word
+    return rest.slice(1, end);
+  }
+  const word = /^[^ \t\r\n]+/.exec(rest);
+  return word === null ? null : word[0];
+}
 function pipelineToolInRaw(raw, ctx) {
-  const t = expandRefs(raw, ctx);
-  const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
-  if (/owner-go/i.test(t)) return false;
-  return new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*)(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').test(t);
+  if (ctx.platform !== 'win32' || ctx.shell !== 'powershell') return false;
+  if (/owner-go/i.test(raw)) return false;
+  const operand = psOperand(raw);
+  if (operand === null || !PS_PLAIN_PATH.test(operand)) return false;
+  if (/(?:^|[\\/])\.{1,2}(?:[\\/]|$)/.test(operand)) return false;
+  return isPipelineTool(operand, ctx);
 }
 
 function pwshReadOnly(argv) {
@@ -2570,6 +2638,134 @@ function ghReadOnly(args, cmd, ctx) {
   if (words[0] === 'api') return !args.some((a) => /^(?:-o|--output|--cache)/.test(a));
   return Object.hasOwn(GH_PRINTERS, words[0] ?? '') && GH_PRINTERS[words[0]].includes(words[1]);
 }
+// The PowerShell tool only: the Bash parser cuts the line into commands, and there a backslash ESCAPES the next character, so a backslash before `;` `|` `&` a quote or a backtick, or at a line end, is
+// literal text to it, while PowerShell reads the backslash as an ordinary character and the next one as syntax (`node hook.mjs \; Set-Content settings.json x` looks like ONE node command, R9-F3).
+// The commands the parser saw are not those PowerShell runs, so on such a line NO command is read-only. (Decided once per line, in isReadOnly, which every judgement of a command passes through: the final
+// protected-file check then sees node / echo as an ordinary command that names a protected file and refuses it. A line without the sequence is judged as before.)
+// Deny by default: a backslash followed by anything but a plain path character [A-Za-z0-9._-], or by the end of the text, is a hazard. A denylist of escaped characters missed `\$(`, `\@(`, `\{`, `\<` and the rest.
+// That includes `\\` (UNC or a doubled separator) and `\/`: no trusted tool path or ordinary path in the tests needs them, and either can hide the same split, so they are refused too.
+const PS_ESCAPED_SYNTAX = /\\(?![A-Za-z0-9._-])/;
+// ... and the same decision for the whole line (R10-B1 / F1 / F3, R11-F1, R12-F3), deny by default: PLAIN text is a CHARACTER ALLOWLIST: letters, digits, space, tab, newline (CRLF counts as one) and `. _ - : / \ | ; = , " '`
+// (the backslash only when it passes PS_ESCAPED_SYNTAX). Everything else is not plain: `{ } # $ ( ) @ < > & ! ? * [ ] ~ % ^ +` (a script block glued to a read-only command, a `}#` comment the guard's lexer misses, a
+// subexpression, a redirection, a call operator ...), another character (a typographic quote, a no-break space, a lone CR or other control character), a backtick (PowerShell's escape), a here-string `@"` / `@'`,
+// a block comment `<#` / `#>`, the stop-parsing token `--%`, or a backslash escape (PS_ESCAPED_SYNTAX). Used with a protected-path reference (step 5 of evaluateBashForFilesFrame), never alone.
+// The exceptions (R12-F3, so the trusted pipeline CLI keeps working): a bare variable name (`$DEST`, `$_`; never `${`, `$(`, `$$`), which the trusted `cd $DEST; node <CLI>` line of R9-B1 needs; a word-initial `~/` or
+// `~\` (not after a quote, where it is literal; PowerShell gives `~` no lexical meaning there, a cmdlet reads it as the home and the guard does too, the stricter reading; but a NATIVE command such as node gets it
+// literally, so isPipelineTool never trusts a tilde operand under PowerShell, R13-F3); and the forms PowerShell and Bash read the same: `2>&1`, `>` / `>>` / `2>` / `2>>` followed by a plain
+// target word (the target is judged like any other word; R13-F1: not one holding a backslash, which the Bash parser drops from an unquoted word while PowerShell reads it as a separator, so that line stays not plain),
+// and `&&` as a separator (`||` is plain already). A lone `&` stays not plain (PowerShell's call operator).
+const PS_NOT_PLAIN_CHARS = /[^A-Za-z0-9 \t\n._:/\\|;=,"'-]/;
+const PS_NOT_PLAIN_SYNTAX = /@["']|<#|#>|`|--%/;
+const psPlainView = (text) => text
+  .replace(/(?<![^\s;|])~(?=[/\\])/g, '')
+  .replace(/(?<![^\s;|])[12]>&[12](?![^\s;|])/g, ' ')
+  .replace(/(?<![^\s;|])[12]?>>?(?=[ \t]*["']?[A-Za-z0-9._:/-][A-Za-z0-9._:/-]*(?![A-Za-z0-9._:/\\-]))/g, ' ')
+  .replace(/(?<!&)&&(?!&)/g, ';')
+  .replace(/\$[A-Za-z_][A-Za-z0-9_]*/g, '');
+const psUnparsed = (raw) => {
+  const text = raw.replace(/\r\n/g, '\n');
+  return PS_NOT_PLAIN_CHARS.test(psPlainView(text)) || PS_NOT_PLAIN_SYNTAX.test(text) || PS_ESCAPED_SYNTAX.test(text);
+};
+// The first thing that makes a line not plain, named for the deny message: the character (`(`, or U+2018 for one that is not printable ASCII), a here-string, block comment, stop-parsing token, backtick or backslash escape.
+const psOffender = (raw) => {
+  const text = raw.replace(/\r\n/g, '\n');
+  const view = psPlainView(text);
+  const found = [];
+  const ch = PS_NOT_PLAIN_CHARS.exec(view);
+  if (ch) found.push([ch.index, /^[\x21-\x7E]$/.test(ch[0]) ? `the character \`${ch[0]}\`` : `a character that is not plain ASCII text (U+${ch[0].codePointAt(0).toString(16).toUpperCase().padStart(4, '0')})`]);
+  const sy = PS_NOT_PLAIN_SYNTAX.exec(text);
+  if (sy) found.push([sy.index, sy[0] === '`' ? 'a backtick' : `\`${sy[0]}\``]);
+  const es = PS_ESCAPED_SYNTAX.exec(text);
+  if (es) found.push([es.index, `a backslash before ${text[es.index + 1] === undefined ? 'the end of the text' : `\`${text[es.index + 1]}\``}`]);
+  found.sort((a, b) => a[0] - b[0]);
+  return found[0]?.[1] ?? 'text PowerShell reads differently';
+};
+// R12-F1 / R13-F1: the words that change PowerShell's directory (`cd..` and `cd\` are one word each; case-insensitive, not part of a longer name), found ANYWHERE in the text: a module-qualified spelling
+// (`Microsoft.PowerShell.Management\Set-Location`) is one, and so are the .NET ways (`[IO.Directory]::SetCurrentDirectory`, `[Environment]::CurrentDirectory = ...`). On a not-plain line the Bash parse may read
+// a quote or a comment differently from PowerShell, so a directory change it did not read as a command can still run, and a count of the cd commands the parse found can be matched by a decoy: the line is
+// refused unless every such word sits in its plain leading part (psPlainPrefixEnd) and the parse of that part reads each one as a cd command (psCdUnreadable).
+// R14-F3: the same scan runs on a PLAIN line too: there the parse is trusted for what it read, but a cd word it did not read as a cd command (a module-qualified `Microsoft.PowerShell.Management\Set-Location`, one inside a
+// quoted string that is run, `iex 'cd X'`) makes the directory unknown, and the line is judged in each assumed protected folder (every command that is not read-only is then a possible write there, impliesCwdWrite).
+// (R14-F3: not the tail or head of a file name: `cd.txt`, `out.cd`, `a.sl` are names, not commands)
+// (R13-F4: and a drive function, `C:`, as a command word: PowerShell defines one per drive letter, each a Set-Location)
+const PS_DRIVE_WORD = /^[A-Za-z]:$/;
+const PS_CD_WORD = /(?:(?<![A-Za-z0-9_.-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]))|(?<=(?:^|[;|&\n])[ \t]*)[A-Za-z]:(?![^\s;|&]))/gi;
+const PS_CD_DOTNET = /CurrentDirectory/i; // (SetCurrentDirectory too)
+// R14-B1 / F1 / F2 / F3 (round-14 review; the owner chose ONE fail-closed rule over four point patches). On the PowerShell route the guard cannot always tell which folder a directory change lands in (a trailing
+// switch or redirection after the operand, a drive function run through iex or dot-sourcing, a quote inside a backslash word that PowerShell joins and the Bash parse drops), so it stops trying on a line that can write:
+//  1. a line that changes the directory (a cd word ANYWHERE in the text, quoted or run from a string, the .NET ways, or a drive word `C:`) and also holds a command that is not read-only, or a redirection, is refused, whatever the target;
+//  2. a whitespace-delimited word holding both a backslash and a quote character (unless it is one fully quoted run) on a line with such a command or a redirection is refused.
+// A line of read-only commands and a lone directory change are not touched (the next call reads the real cwd). A drive word is a whole token: bounded by the start / end, a blank, a quote or `; | & ( )` on both sides, so
+// `C:/repo`, `C:\x` and `c:x` are paths, not drive functions.
+const PS_DRIVE_TOKEN = /(?<![^\s'";|&()])[A-Za-z]:(?![^\s'";|&()])/;
+const PS_CD_TEXT = /(?<![A-Za-z0-9_.-])(?:cd\.\.|cd\\|(?:set-location|push-location|pop-location|chdir|pushd|popd|cd|sl)(?![A-Za-z0-9_-]|\.[A-Za-z0-9_]))/i; // (the location words of PS_CD_WORD, without its command-start drive branch)
+const psChangesDirectory = (texts) => texts.some((t) => PS_CD_DOTNET.test(t) || PS_CD_TEXT.test(t) || PS_DRIVE_TOKEN.test(t));
+const psRedirects = (text) => />/.test(text.replace(/(?<![^\s;|])[12]>&[12](?![^\s;|])/g, ' ').replace(/#>/g, ' ')); // (`2>&1` and the end of a block comment `#>` are not a write; a `>` inside a comment still counts, the stricter reading)
+const PS_WHOLE_QUOTED = /^(?:"[^"]*"|'[^']*')$/;
+// the whitespace-delimited words of the text; quote-aware (a blank inside quotes does not end a word) unless the text holds a backtick, whose escapes it does not model: then a plain split, the stricter reading
+function psWords(text) {
+  if (text.includes('`')) return text.split(/\s+/).filter(Boolean);
+  const words = [];
+  let cur = '';
+  let q = '';
+  for (const ch of text) {
+    if (q) { cur += ch; if (ch === q) q = ''; continue; }
+    if (/\s/.test(ch)) { if (cur) words.push(cur); cur = ''; continue; }
+    if (ch === '"' || ch === "'") q = ch;
+    cur += ch;
+  }
+  if (cur) words.push(cur);
+  return words;
+}
+const psMixedWord = (text) => psWords(text).find((w) => w.includes('\\') && /["']/.test(w) && !PS_WHOLE_QUOTED.test(w));
+// R15-B1 / F1: on a line PowerShell reads differently from the guard's parser (psUnparsed) the parsed command list says nothing sure (a backslash folds the rest of the line into the cd operand, a `#` inside a
+// typographic-quoted string drops it as a comment), so whether the line writes is judged from the RAW text, fail closed: read-only only when the text (its terminated block comments cut out) holds none of `< > $ { } ( ) @` or a backtick, and every
+// statement (cut at `; | &` and any line break, also inside quotes: the stricter reading) starts with a directory change, a drive word or a command from this short list of pure readers. Anything else writes.
+const PS_RAW_READERS = new Set(['echo', 'write-output', 'write-host', 'get-childitem', 'gci', 'ls', 'dir', 'get-content', 'gc', 'cat', 'type', 'get-location', 'gl', 'pwd', 'get-item', 'test-path', 'get-date', 'select-string', 'sls']);
+function psRawReadOnly(text) {
+  if (/[<>$@{}()`]/.test(text)) return false;
+  return text.split(/[;|&]|[^\S \t]/).every((seg) => {
+    const word = seg.trim().split(/\s+/)[0] ?? '';
+    return word === '' || PS_RAW_READERS.has(word.toLowerCase()) || PS_DRIVE_WORD.test(word) || CD_CMDS.has(baseOf(word));
+  });
+}
+const PS_PREFIX_STOP = /[^A-Za-z0-9 \t\n._:/\\|;=,-]|@["']|<#|#>|`|--%|\\(?![A-Za-z0-9._-])/;
+// The end of the text's leading run that PowerShell and the guard's parser read the same: plain characters only, NO quote (one opened there can swallow what follows), no escape, comment, here-string or backtick.
+const psPlainPrefixEnd = (text) => { const i = text.search(PS_PREFIX_STOP); return i < 0 ? text.length : i; };
+function psCdUnreadable(texts) {
+  const norm = texts.map((t) => t.replace(/\r\n/g, '\n'));
+  const cut = psPlainPrefixEnd(norm[0]);
+  let inPrefix = 0;
+  for (const [i, t] of norm.entries()) {
+    if (PS_CD_DOTNET.test(t)) return true;
+    for (const m of t.matchAll(PS_CD_WORD)) {
+      if (m.index + m[0].length > cut) return true; // (a word past the plain part, or one that runs into its end: `cd\;`)
+      if (i === 0) inPrefix++;
+    }
+  }
+  if (inPrefix === 0) return false;
+  const inner = simpleCommands(norm[0].slice(0, cut));
+  return inner.truncated || inPrefix > inner.filter((c) => CD_CMDS.has(baseOf(c.argv[0] ?? '')) || PS_DRIVE_WORD.test(c.argv[0] ?? '')).length;
+}
+// The text PowerShell sees once it has read its backtick escapes (R10 security review): `u{hex1-6} is that code point, `0 `a `b `e `f `n `r `t `v are control characters, a backtick before a line break
+// continues the line (nothing), a backtick before any other character is that character. Returns null when a `u{ is malformed (no closing brace, no or non-hex digits, more than six, past U+10FFFF):
+// PowerShell would refuse it, and the caller fails closed.
+const PS_CONTROL_ESCAPES = { 0: '\0', a: '\x07', b: '\b', e: '\x1B', f: '\f', n: '\n', r: '\r', t: '\t', v: '\v' };
+const psDecodeBackticks = (raw) => {
+  let bad = false;
+  const out = raw.replace(/`(u\{([^}\n]*)\}?|\r\n|[\s\S]|$)/gi, (all, rest) => {
+    if (rest === '') return ''; // a trailing backtick
+    if (rest === '\r\n' || rest === '\n') return '';
+    if (/^u\{/i.test(rest)) {
+      const hex = /^u\{([0-9A-Fa-f]{1,6})\}$/i.exec(rest)?.[1];
+      const cp = hex === undefined ? NaN : parseInt(hex, 16);
+      if (!(cp <= 0x10FFFF)) { bad = true; return all; }
+      return String.fromCodePoint(cp);
+    }
+    return Object.hasOwn(PS_CONTROL_ESCAPES, rest) ? PS_CONTROL_ESCAPES[rest] : rest;
+  });
+  return bad ? null : out;
+};
 // #190 case 4 (T1.1, narrowed by the Fable plan pass F1 / F3): a plain `NAME=value` command is not itself a risk, only what later reads NAME is, and the redirect and writer rules already expand
 // NAME. So an assignment that names a protected path is harmless exactly when nothing on the line can hand the value to a program or change how it is read:
 //   - top level only: a sourced or startup file, a script and a `bash -c` string are judged as before (their later consumers are not visible to the evaluation);
@@ -3098,10 +3294,33 @@ function evaluatesSubscript(name, args, ctx, raw) {
   if (!operands.some((a) => SUBSCRIPT_EVAL.test(a) || SUBSCRIPT_EVAL.test(expand(a)))) return false;
   return printfFormatEvaluates(args[fmt]) || printfFormatEvaluates(expand(args[fmt])); // (the format as written and as expanded)
 }
+// The deny reason of the PowerShell fail-closed rule below (R14-B1 / F1 / F2 / F3), or null. A function so the hook-surface check, which runs earlier, can name this more specific rule first (a directory change plus a write on one line).
+function psWriteRefusal(cmds, raw, ctx) {
+  const psDecoded = raw.includes('`') ? psDecodeBackticks(raw) : raw;
+  // (the Bash parse reads a block comment `<# ... #>` as a line comment and drops the rest of the line, so the commands are also read from the text with its block comments cut out; an unterminated `<#` counts as a write)
+  // (the cut ignores quotes, so a quoted `<#` and `#>` could swallow a write between them: block comments are cut only from text with no quote character at all, else the raw text is judged as it stands, where `<` and `>` already count as a write)
+  // (R16-F1: nor does the cut know a `#` line comment, which PowerShell ends at a lone carriage return and the guard's parser does not, so a `<#` inside one is no block comment: cut only when the text holds no CR and no `#` outside the matched pairs)
+  const stripped = /['"`‘-‟\r]/.test(raw) || raw.replace(/<#[\s\S]*?#>/g, ' ').includes('#') ? raw : raw.replace(/<#[\s\S]*?#>/g, ' ');
+  const nonReadOnly = (c) => c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !PS_DRIVE_WORD.test(c.argv[0]) && !isReadOnly(c, ctx);
+  // R15-B1 / F1: on a line PowerShell reads differently from the guard's parser (psUnparsed: a backslash escape, a typographic quote, any not-plain text) the parsed list is not trusted: it writes unless provably read-only from the raw text
+  const writes = cmds.some(nonReadOnly) || psRedirects(stripped) || stripped.includes('<#') || (stripped !== raw && simpleCommands(stripped).some(nonReadOnly)) || ((ctx.psHazard || psUnparsed(raw)) && !psRawReadOnly(stripped));
+  if (writes) {
+    const texts = [raw, ...(psDecoded !== null && psDecoded !== raw ? [psDecoded] : []), ...(raw.includes('`') ? [raw.replace(/`/g, '')] : [])];
+    if (psChangesDirectory(texts)) {
+      return `On PowerShell a directory change and a write cannot share one command line (the folder the write lands in cannot be read safely from the text): run the directory change (cd / Set-Location / a drive like C:) as its own command, then the write (${PROTECTED_MSG})`;
+    }
+    const mixed = psMixedWord(raw);
+    if (mixed !== undefined) {
+      return `On PowerShell a word that mixes a backslash and a quote cannot be read safely (${mixed.length > 60 ? `${mixed.slice(0, 60)}...` : mixed}): write the path with forward slashes or quote the whole word (${PROTECTED_MSG})`;
+    }
+  }
+  return null;
+}
 function isReadOnly(cmd, ctx) {
   if (ctx?.budget) checkDeadline(ctx.budget); // (the shared deadline: every read-only judgement is a checkpoint)
   const argv = cmd.argv;
   if (!argv.length) return false;
+  if (ctx.psHazard) return false;
   const name = baseOf(argv[0]);
   const shadow = ctx.shadowed?.get(cmd);
   if (shadow !== undefined && (shadow === 'all' ? !CD_CMDS.has(name) : !PATH_BUILTINS.has(name))) return false; // (#265 e)
@@ -3134,7 +3353,12 @@ function readOnlyWith(name, args, cmd, ctx, argv) {
   if ((name === 'python' || name === 'python3') && args[0] === '-m' && args[1] === 'json.tool') return positional(args.slice(2)).length <= 1;
   // (T1.7 f: the trusted CLI runs foreign code when NODE_OPTIONS / NODE_PATH make node load it)
   if (isPipelineTool(argv[0], ctx)) return !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
-  if (name === 'node') return (isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx))) && !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
+  if (name === 'node') {
+    // Under the PowerShell tool a backslash is a path separator, but the Bash parser dropped it from argv[1] (`hooks/x\..\..\repo\evil.mjs` arrives as one plain name inside hooks): when the text holds a
+    // backslash the argv word is NEVER the operand, only the raw text decides (R9-F1; pipelineToolInRaw refuses `..`). Without one, argv[1] is the word PowerShell reads too; a tilde form is NOT trusted there (R13-F3, isPipelineTool: a native command gets `~` literally).
+    if (ctx.shell === 'powershell' && cmd.raw.includes('\\')) return pipelineToolInRaw(cmd.raw, ctx) && !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
+    return (isPipelineTool(argv[1], ctx) || (cmd.raw.includes('\\') && pipelineToolInRaw(cmd.raw, ctx))) && !toolEnvTouched(cmd, ctx, NODE_TOOL_ENV);
+  }
   if (name === 'pwsh' || name === 'powershell') return pwshReadOnly(argv);
   return PS_READ_ONLY.has(name);
 }
@@ -3435,6 +3659,9 @@ function collectVars(cmds, ctx) {
     if (k !== '*' && ws.includes(UNKNOWN_WORD) && raw !== undefined && !/\$\(|`/.test(raw) && (raw.startsWith('(') || /\$\{[^}]*[^\w}]/.test(raw))) unknown.add(name);
   }
   // Defensive (mutation check): with more assignments than the scan follows, the target is still judged by rawHit / pathHit on the expanded values (expandRefs) as on main.
+  // (#352 R23-F2: a line whose shape the parser cannot follow (cmds.ctlBroken: a bare { or } argument splits the word groups, so `echo { F=x }` reads as an assignment that never runs; a zsh form,
+  // a {fd} word) may or may not run what it assigns: every name it gives is only known at run time)
+  if (cmds.ctlBroken) for (const k of given.keys()) unknown.add(k);
   if (ctx.assigned?.has('*')) for (const k of given.keys()) unknown.add(k); // (more assignments than the scan follows: every name the line gives is only known at run time)
   if (aPins === null) for (const [k, r] of raws) if (r.size > 1) unknown.add(k);
   // Why (#76 / #81 t7 and the security follow-up): a name an arithmetic assigns (or appends to) holds a value the text does not give (see arithAssignedNames), whether or not the line gave it one
@@ -3512,15 +3739,20 @@ function collectDirs(cmds, ctx, cdOnly = false) {
     if (!cdOnly && typeof c.chdir === 'string') addDir(expandRefs(c.chdir, ctx));
     const cdName = cdNameOf(c.argv[0]);
     if (!CD_CMDS.has(cdName)) continue;
-    let t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
-    if (!t && (cdName === 'cd' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
+    let t = cdOperand(c.argv);
+    if (!t && (cdName === 'cd' || cdName === 'chdir' || cdName === 'pushd')) t = '~'; // a bare `cd` goes home
+    // Why: the Bash parser drops an unquoted backslash, but PowerShell reads it as a separator (`cd C:\Users\u\.claude\plugins`): the raw text is read as well, AFTER any option words (-P, -L, --, -PassThru),
+    // and only where a backslash is a separator (the PowerShell tool; a quoted word on win32). R13-B1 / F2: it is a second reading beside the parsed operand, never a replacement (off Windows a backslash
+    // escapes the next character, and the parsed operand already has it applied).
+    const readings = t ? [t] : [];
     if (c.raw.includes('\\')) {
-      const m = /^\s*(?:cd|chdir|pushd|set-location|sl)\s+(?:\/d\s+)?["']?([^"';&|\n]+)/i.exec(c.raw);
-      if (m) t = m[1].trim();
+      const m = /^\s*(?:cd|chdir|pushd|push-location|set-location|sl)\s+(?:(?:\/d|-{1,2}[A-Za-z]*)\s+)*(["']?)([^"';&|\n]+)/i.exec(c.raw);
+      if (m && (ctx.shell === 'powershell' || (ctx.platform === 'win32' && m[1] !== '')) && m[2].trim() && !readings.includes(m[2].trim())) readings.push(m[2].trim());
     }
-    if (!t) continue;
-    const mc = modelledCd(t, cmds, ci, ctx);
-    addDir(mc !== null ? mc : expandRefs(t, ctx), mc === null ? ci : -1);
+    for (const r of readings) {
+      const mc = modelledCd(r, cmds, ci, ctx);
+      addDir(mc !== null ? mc : expandRefs(r, ctx), mc === null ? ci : -1);
+    }
   }
   return dirs;
 }
@@ -4436,7 +4668,10 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
-  if (cmds.truncated || cmds.dynamic) out.all = true;
+  // (#352 R23-F2: a script line whose shape the parser cannot follow (ctlBroken: a bare { or } argument that splits the word groups, `echo { F=x }`, a zsh condition-then-body form, a {fd} word) may or may
+  // not run the commands read from it: what it binds, and the directory it ends in, are unknown)
+  if (cmds.truncated || cmds.dynamic || cmds.ctlBroken) out.all = true;
+  if (cmds.ctlBroken) out.unknownCd = true; // (`echo { cd d }`: the cd may not run either)
   if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd], true))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
   const from = flowStart(cmds);
   const seen = new Map();
@@ -4452,7 +4687,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
   };
   for (const [i, c] of cmds.entries()) {
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
-    if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); continue; }
+    if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); for (const k of implicitBindsOf(c)) set(k, null, false); continue; } // (#352 R21-F1: a lone `{k}>f` binds k)
     const name = baseOf(c.argv[0]);
     const again = rep || repeats(cmds, i); // (R18: this command can run again: from a loop / function / trap of the line, or of the file itself)
     // Why: a function or alias the LINE defines may stand behind a name that looks harmless (`ls() { read F; }`), and a nameref (`declare -n r=F`) binds F through another name
@@ -4467,11 +4702,11 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
     } else if (CD_CMDS.has(name)) {
       // (a target that stays a run-time value, a pattern or a brace list, `cd -`, popd, several operands: the directory is unknown from here on, not a literal. R17: so is any target that is not
       // `.` / `..` / a `/`, `./` or `../` prefix or a home form: a bare name may be read through CDPATH or as a variable)
-      const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+      const t = cdOperand(c.argv);
       const v = t === undefined ? t : substVars(t, local, ctx.budget);
       const homeForm = v === undefined || v === '~' || v.startsWith('~/');
-      const bare = v !== undefined && !homeForm && !/[`$*?[{]/.test(v) && !cdUnknownShape(c.argv) && !cdTargetLiteral(toPosix(v), cdpNow());
-      if (cdUnknownShape(c.argv) || (v !== undefined && /[`$*?[{]/.test(v)) || bare) { out.unknownCd = true; if (bare) out.bareCd = true; }
+      const bare = v !== undefined && !homeForm && !/[`$*?[{]/.test(v) && !cdUnknownShape(c.argv, ctx, c) && !cdTargetLiteral(toPosix(v), cdpNow());
+      if (cdUnknownShape(c.argv, ctx, c) || (v !== undefined && /[`$*?[{]/.test(v)) || bare) { out.unknownCd = true; if (bare) out.bareCd = true; }
       else {
         out.cds.push(t ?? '~');
         if (again && !homeForm && cdClimbs(toPosix(v)) && !cdInSubshell(c, cmds, rep)) out.unknownCd = true; // (R18: a relative cd that repeats climbs one level per run; R19-F1: only a `..` target outside a subshell)
@@ -4621,7 +4856,23 @@ function snapshotShell(ctx) {
 
 // ---- Bash --------------------------------------------------------------------------------------------
 
-export const evaluateBashForFiles = failClosed(evaluateBashForFilesUnchecked);
+const evaluateBashForFilesChecked = failClosed(evaluateBashForFilesUnchecked);
+// The `shell` option names the TOOL's shell and belongs to the outermost call only. Every re-entry that judges TEXT FROM ANOTHER SOURCE (a script, a startup file, a sourced file, a `bash -c` string ...) is a
+// call made while another is running, so it is forced to Bash here, once, instead of at each call site (one of which, the implicit startup file, spreads the caller's options with `_depth: 0`).
+// Synchronous code, so a plain counter is exact. A re-run of the SAME top-level text with another working directory (the unknown-cd run) is no such source: it goes through evaluateSameText
+// below, which keeps the tool's shell (R9-B1); the retries in evaluateBashForFilesUnchecked call it directly and keep it too.
+let evalNesting = 0;
+export const evaluateBashForFiles = (command, opts = {}) => {
+  const nested = evalNesting > 0;
+  evalNesting++;
+  try { return evaluateBashForFilesChecked(command, nested && opts.shell !== 'bash' ? { ...opts, shell: 'bash' } : opts); } finally { evalNesting--; }
+};
+// The same text judged again with other options (a cwd assumed, writes only): what the tool's shell reads is unchanged, so `opts.shell` stays as the caller has it (the outermost call's tool shell, or
+// 'bash' already inside a nested one). Every nested call this makes still goes through evaluateBashForFiles and is forced to Bash.
+function evaluateSameText(command, opts) {
+  evalNesting++;
+  try { return evaluateBashForFilesChecked(command, opts); } finally { evalNesting--; }
+}
 // Why: see evaluateGitCommand: the first (outermost) call owns the BASH rewrite record; a text that binds BASH after another was rewritten makes the verdict stale, so the line is judged again with the rewrite off.
 function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._bashState) {
@@ -4711,6 +4962,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (opts._assignPins && opts._assignPins.text === command) ctx.assignPins = opts._assignPins.pins; // (this text's assignment readings, see assignReadings)
   if (opts._loopPins && opts._loopPins.text === command) ctx.loopPins = opts._loopPins.pins; // (this text's loop readings; see evaluateBashForFilesUnchecked)
   ctx.lineDefs = definedNames(typeof command === 'string' ? command : '');
+  ctx.psHazard = ctx.shell === 'powershell' && typeof command === 'string' && PS_ESCAPED_SYNTAX.test(command); // (see PS_ESCAPED_SYNTAX)
   ctx.ghLine = typeof command === 'string' ? command : ''; // (ghReadOnly: what the line says about gh's variables and configuration)
   ctx.assigned = assigningDefaults(typeof command === 'string' ? command : ''); // (and those of the line this text was made from: `: ${X:=w}; G=bash; $G $X`)
   for (const [n, ws] of opts._assigned ?? []) ctx.assigned.set(n, [...(ctx.assigned.get(n) ?? []), ...ws]);
@@ -4827,7 +5079,7 @@ function evaluateBashForFilesFrame(command, opts) {
   ctx.frames.push(frame);
   {
     const why = hookSurfaceBashReason(cmds, frame, ctx, { wordsOf, dirs });
-    if (why !== null) return deny(`${why} (${HOOKS_MSG})`);
+    if (why !== null) return deny((ctx.shell === 'powershell' ? psWriteRefusal(cmds, raw, ctx) : null) ?? `${why} (${HOOKS_MSG})`);
   }
   // BASH_ENV / ENV / ZDOTDIR / HOME values this line (and the scripts that run it) assign: shells started by the scripts it runs see them
   const startupEnv = opts.env ?? process.env;
@@ -4861,13 +5113,14 @@ function evaluateBashForFilesFrame(command, opts) {
   // (a name the line never set, after a source nothing could follow: it may have come from that file)
   const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
   const snaps = []; // per command: the names a sourced file may have changed / set at run time as that command runs (the checks after the loop would otherwise see the end state)
+  const psCdHidden = ctx.shell === 'powershell' && !psUnparsed(raw) && psCdUnreadable([raw]); // (R14-F3: a plain PowerShell line holding a directory change the parse did not read as one; a not-plain line is refused below)
   // Is the directory the line works in only known at run time? (a `cd` into an unset / substituted / maybe-changed name, `cd -`, `popd`; or the frame was started in one)
   let dirWordsAt = -1;
   let dirWordsVal = false;
   const dirWords = () => { if (dirWordsAt !== dirs.length) { dirWordsVal = cmds.some((_, i) => dirLikeWord(cmds, i, ctx, dirs)); dirWordsAt = dirs.length; } return dirWordsVal; }; // (once per frame, again when a sourced cd added directories)
   const unknownCwd = () => {
     if (assumedCwd) return false; // (a rerun that already assumes a directory: the unknown cd is what it stands for)
-    if (opts._unknownCwd === true || ctx.sourcedCdUnknown) return true;
+    if (opts._unknownCwd === true || ctx.sourcedCdUnknown || psCdHidden) return true;
     const KNOWN = new Set(['HOME', 'USER', 'LOGNAME']);
     const closures = new Map();
     // (the state when the cd ran, or by the end of the line: a later plain assignment does not clean an earlier cd)
@@ -4889,11 +5142,12 @@ function evaluateBashForFilesFrame(command, opts) {
     const homeMoved = ctx.unknownAll || ctx.homeSourced === true || moved('HOME') || cmds.some((c) => Object.hasOwn(c.env ?? {}, 'HOME') || c.argv.some((a) => /^HOME(?:=|\[|$)/.test(a)));
     return cmds.some((c, ci) => {
       const cn = cdNameOf(c.argv[0]);
-      if (dirWords()) return true; // (R17: AUTO_CD, whether or not an option is set: a command word that could be a directory)
+      if (ctx.shell === 'powershell' && PS_DRIVE_WORD.test(c.argv[0] ?? '')) return true; // (R13-F4: a drive function, `D:`, is a Set-Location to where that drive was last left)
+      if (ctx.shell !== 'powershell' && dirWords()) return true; // (R17: AUTO_CD, whether or not an option is set: a command word that could be a directory. A zsh / bash feature: PowerShell has none, and its backtick is an escape the Bash parse reads as a substitution, so its words are no directory names; PowerShell's directory changes are the cd words above)
       if (!CD_CMDS.has(cn)) return false;
       const { unknownName } = stateAt(ci);
-      if (cdUnknownShape(c.argv)) return true;
-      const t = c.argv.slice(1).find((a) => !a.startsWith('-') && a !== '/d');
+      if (cdUnknownShape(c.argv, ctx, c)) return true;
+      const t = cdOperand(c.argv);
       if (t !== undefined) { const mc = modelledCd(t, cmds, ci, ctx); if (mc !== null) return repeats(cmds, ci) && cdClimbs(mc) && !cdInSubshell(c, cmds); } // (R18: a modelled target that climbs moves again on each run; R19-F1)
       if (t === undefined || /^~(?:\/|$)|^\$\{?HOME\b/.test(t)) { if (homeMoved) return true; if (t === undefined) return false; } // (a bare cd goes home)
       const e = expandRefs(t, ctx);
@@ -4959,7 +5213,8 @@ function evaluateBashForFilesFrame(command, opts) {
   const markBound = (c) => {
     // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
     if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
-    if (!c.argv.length) return;
+    // (#352 R21-F1: a lone `{k}>f` redirect has no argv and still binds k)
+    if (!c.argv.length) { for (const k of implicitBindsOf(c)) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); } return; }
     const cn = baseOf(c.argv[0]);
     const names = [];
     // Why (#56, a live bypass on main): `F=/tmp/x; printf -v $N ~/.claude/settings.json; cp a $F` and `declare "$N=~/.claude"; cp a $HOME/settings.json`
@@ -5111,6 +5366,41 @@ function evaluateBashForFilesFrame(command, opts) {
   // A gate about a name resolved at RUN TIME ($_ / ${_} carry the last word of the previous command, which may be that prose value; a scan cut short) reads the UNMASKED line too: protectedAnywhere.
   const protectedAnywhere = protectedInRaw || m.rawHit(raw, dirs);
 
+  // The PowerShell tool only, decided once for the whole line (R10-B1 / F1 / F3): the commands the Bash parser cut the line into are not what PowerShell runs when the text holds anything PowerShell reads
+  // differently, so neither a command's read-only judgement nor the destination-only filter of cp / rsync / install (which never asks it) can be relied on. A line that names a protected path (in the raw text,
+  // unmasked; also with PowerShell's backticks removed, `.c`laude` is `.claude`; or runs inside a protected directory) and is not plain text is refused outright. See psUnparsed.
+  // PowerShell reads a backtick escape as the character it spells (`u{2E} is '.'), so the text is also judged decoded (psDecodeBackticks); a `u{ that does not decode is refused (fail closed).
+  const psDecoded = ctx.shell === 'powershell' && raw.includes('`') ? psDecodeBackticks(raw) : raw;
+  // R11-F2: the raw text need not spell the protected path: a directory in play (cwd or a `cd` target) anywhere in the protected tree makes a relative word (`../settings.json`) reach it, so such a line is
+  // refused too, and so is one whose path-like words (split as aliasInText splits them; raw, decoded and backtick-stripped) land in a protected file from any directory in play (pathHit). Over the word cap: refused.
+  const psWordHit = () => {
+    const texts = [raw, ...(psDecoded !== null && psDecoded !== raw ? [psDecoded] : []), ...(raw.includes('`') ? [raw.replace(/`/g, '')] : [])];
+    const words = new Set();
+    for (const t of texts) for (const w of [...t.split(/[\s'"`;|&<>(){}[\]$\u2018-\u201F]+/), ...t.split(/[\s'"`;|&<>(){}[\],=*?$\u2018-\u201F]+/)]) if (w) { words.add(w); if (w.includes('\\')) words.add(w.replace(/\\/g, '/')); }
+    if (words.size * dirs.length > 20000) return true;
+    for (const w of words) if (m.pathHit(w, dirs, true)) return true;
+    return false;
+  };
+  if (ctx.shell === 'powershell' && psUnparsed(raw)) {
+    // R12-F1: on a not-plain line the cd list parsed above is not the one PowerShell runs (a quote the Bash parse opens can swallow a real `cd`: `echo ‘ " ’ ; cd ~/.claude/plugins ; Set-Content ../settings.json x`),
+    // R13-F1: and a count of them can be matched by a decoy, so a directory-changing word anywhere in the text (also decoded and backtick-stripped) outside its plain leading part refuses the line, whatever it names.
+    const cdTexts = [raw, ...(psDecoded !== null && psDecoded !== raw ? [psDecoded] : []), ...(raw.includes('`') ? [raw.replace(/`/g, '')] : [])];
+    if (psCdUnreadable(cdTexts)) {
+      return deny(`the PowerShell command holds a directory change the guard could not read (a cd, chdir, Set-Location, Push-Location, pushd, popd or the like, in text that PowerShell reads differently from the guard's parser: it holds ${psOffender(raw)}), so the folder the rest of the line runs in cannot be checked; write the directory change as its own plain command (${PROTECTED_MSG})`);
+    }
+    const namesFile = psDecoded === null || m.rawHit(raw, dirs) || psWordHit() || (raw.includes('`') && (m.rawHit(psDecoded, dirs) || m.rawHit(raw.replace(/`/g, ''), dirs)));
+    const inTree = insideRoot || dirs.some((d) => ctx.hitTree(d));
+    if (namesFile || inTree) {
+      return deny(`the PowerShell command ${namesFile ? 'refers to a protected pipeline file (or the directory that holds it)' : 'runs in a folder below ~/.claude'} and holds ${psDecoded === null ? 'a backtick `u{ escape that does not decode' : psOffender(raw)}, which PowerShell may read differently from the guard's parser, so what it runs cannot be checked; on such a line only letters, digits, blanks and . _ - : / \\ | ; = , " ' , a bare $NAME, a leading ~/ and the redirections 2>&1, > FILE, >> FILE and 2> FILE are accepted (${PROTECTED_MSG})`);
+    }
+  }
+
+  // R14-B1 / F1 / F2 / F3: the one fail-closed rule for a PowerShell line that can write (see psChangesDirectory). Placed after the not-plain refusals above so their more specific messages keep winning.
+  if (ctx.shell === 'powershell') {
+    const why = psWriteRefusal(cmds, raw, ctx);
+    if (why !== null) return deny(why);
+  }
+
   // #58: running the owner-go recorder (any copy) by hand would write an owner "merge" the owner never typed. Only Claude Code runs it,
   // on the owner's prompt. Reading, diffing or committing the file stays allowed: only a runtime (or the file run by path) is refused.
   for (const [ci, c] of cmds.entries()) {
@@ -5206,7 +5496,7 @@ function evaluateBashForFilesFrame(command, opts) {
         if (/[`$]/.test(e) && !isAbs(toPosix(e)) && !/^~(?:\/|$)/.test(e) && !FD_DUP.test(e)) return deny('the command redirects output to a relative path with a part only known at run time after a cd into a directory known only at run time, so the file it reaches cannot be checked; write the path out');
       }
       if (!c.argv.length) continue;
-      if (CD_CMDS.has(baseOf(c.argv[0]))) cdUps += Math.max(0, ...c.argv.slice(1).flatMap(ups));
+      if (CD_CMDS.has(baseOf(c.argv[0]))) cdUps += Math.max(baseOf(c.argv[0]) === 'cd..' ? 1 : 0, ...c.argv.slice(1).flatMap(ups));
       else if (!isReadOnly(c, ctx)) writeUps = Math.max(writeUps, ...c.argv.slice(1).flatMap((w) => ups(w.replace(/^-{0,2}[\w-]+=/, ''))));
     }
     const depth = writeUps > 0 || cdUps > 0 ? writeUps + cdUps : 0;
@@ -5232,7 +5522,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const at = ctx.frames.indexOf(frame);
     for (const d of unique([...assumedCwds(ctx), ...below])) {
       countCdRun(ctx.budget);
-      const r = evaluateBashForFiles(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
+      const r = evaluateSameText(command, { ...opts, cwd: d, _assumedCwd: true, _writesOnly: true, _unknownCwd: false, _frames: ctx.frames.slice(0, at).map((f) => ({ ...f, recs: [...f.recs] })) });
       if (r.decision === 'deny') return deny(`after a cd into a directory known only at run time, ${r.reason} (judged as if the directory were ${d})${ctx.bareCd ? BARE_CD_HINT : ''}`);
     }
   }
@@ -5693,7 +5983,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const name = baseOf(c.argv[0] ?? '');
     if (insideRoot) return true;
     // (inline interpreter code that writes can build any name there)
-    if (opts._writesOnly === true && (impliesCwdWrite(c) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
+    if (opts._writesOnly === true && (impliesCwdWrite(c, ctx) || (runsInlineCode(c, ctx) && WRITE_HINT.test(c.raw ?? c.argv.join(' '))))) return true;
     // (a destination word is never filtered: a writer may create a protected name that does not exist yet)
     if (DEST_ONLY.has(name)) {
       if (usesLast(c)) return true; // (T1.7 b)
