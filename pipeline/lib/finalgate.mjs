@@ -24,7 +24,7 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { claudeRulingRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
+import { claudeRulingRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
 import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
@@ -693,17 +693,19 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   // owner_approval: chat: an item the owner ruled in chat (an original or a later round's cached copy) never clears the merge by
   // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
   const ruled = ownerRuledItems(state);
+  // an item the owner DEFERRED (an accepted fix left out of this merge) says so next to its quote
+  const shownRuled = (i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"${isOwnerDeferral(i) ? ' (defers arbiter ACCEPT, not fixed)' : ''}`;
   // E3: a dismissal CLAUDE made (not the arbiter, the judge or a test) is an owner item too: the owner's "merge" is bound to its inventory row, so a changed ruling needs a new word.
   const claudeRulings = claudeRulingRows(state);
   if (claudeRulings.length > 0) {
     const claudeItems = claudeRulings.map(({ id, row }) => `review-ruling ${id} ${createHash('sha256').update(row).digest('hex').slice(0, 12)}`);
-    const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`);
+    const shown = ruled.slice(0, OWNER_RULED_SHOWN).map(shownRuled);
     const ruledNote = ruled.length > 0 ? `; ${ruled.length} owner-ruled item(s), owner-merge: ${shown.join('; ')}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}` : '';
     return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${ruledNote}; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${claudeRulings.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${claudeRulings.length > OWNER_RULED_SHOWN ? ', ...' : ''}${subNote}${grantNote}`,
       ruled.length + claudeRulings.length + subItems.length, [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...claudeItems, ...subItems]);
   }
   if (ruled.length > 0) {
-    const shown = ruled.slice(0, OWNER_RULED_SHOWN).map((i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"`).join('; ');
+    const shown = ruled.slice(0, OWNER_RULED_SHOWN).map(shownRuled).join('; ');
     return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}; ${ruled.length} owner-ruled item(s), owner-merge: ${shown}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}${subNote}${grantNote}`, ruled.length + subItems.length,
       [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...subItems]);
   }

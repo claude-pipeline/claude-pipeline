@@ -4,6 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
+import { issueBody } from '../pipeline/commands/followups.mjs';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -454,4 +455,16 @@ test('the Rulings block lists an owner deferral (BLOCKING or not), once for a ca
   const ordinary = applyOwnerRuling(waiting('low-confidence', { bucket: 'SUGGESTION' }), DEFER);
   assert.equal(rulingsInventory({ rounds: [{ items: [ordinary] }] }).count, 0);
   assert.deepEqual(reviewEligibilityProblems({ rounds: [{ items: [ordinary] }] }), []);
+});
+
+test('F7: the follow-up issue of an owner deferral says a fix was ACCEPTED and deferred by the owner (also for a cached copy); an ordinary owner follow-up reads as before', () => {
+  const deferred = applyOwnerRuling(accepted('arbiter', { bucket: 'SUGGESTION', category: 'maintainability', file: 'src/b.js' }), DEFER);
+  const body = issueBody(deferred, 7);
+  assert.match(body, /\*\*Owner \(why this is a follow-up, not part of the PR\):\*\*/);
+  assert.match(body, /The arbiter ACCEPTED a fix for this finding and the owner deferred it to this issue \(typed ruling\); it is NOT in PR #7/);
+  const copy = { ...deferred, final: { ...deferred.final, by: 'cache' } };
+  assert.match(issueBody(copy, 7), /\*\*Owner \(why/);
+  assert.match(issueBody(copy, 7), /ACCEPTED a fix/);
+  const ordinary = applyOwnerRuling(waiting('low-confidence', { bucket: 'SUGGESTION' }), DEFER);
+  assert.doesNotMatch(issueBody(ordinary, 7), /ACCEPTED a fix/);
 });

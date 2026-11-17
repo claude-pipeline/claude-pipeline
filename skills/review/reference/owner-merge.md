@@ -6,6 +6,7 @@ Read by the `review` skill (`skills/review/SKILL.md`) at the points it names: Ow
 
 Only for an owner who says they want to dismiss what Claude or Codex would not (an item Claude or Codex's second review made ACCEPT): never offer or ask for it. By default you decide
 (`P triage claude-ruling`, SKILL.md Rulings). This path is the only one that loosens an ACCEPT or clears an item Claude may not rule on.
+One more case (#559), only when the OWNER raised it: an arbiter or judge ACCEPT that is not fixed yet may be **deferred** (`--decision FOLLOW-UP` only; a typed reject or accept of it is refused). The request line for such an item says it is ACCEPTED, NOT fixed (`notes`), and you show that to the owner. The ruling is bound to the owner's merge, listed in the Rulings block as `by owner deferral (accepted by arbiter)`, and `review-complete` waits for its issue (`followups create --round R`); it cannot be undone through the CLI. Never request it on your own.
 Run `P triage ruling-request --pr N --ids R1-B1,R2-S3`. Your reply says "answer with only `<id>: accept | follow-up | reject`; reasons in another
 message" and **ends with the exact `line` it printed**, nothing after it. The owner-go hook records the owner's next prompt against that line. Per
 item: `P triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason "<why>" --owner-quote "<the owner's whole answer, copied, never paraphrased>" --pr N`.
