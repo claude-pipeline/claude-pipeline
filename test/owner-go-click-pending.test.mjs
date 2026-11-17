@@ -497,6 +497,33 @@ test('garbled pending skipped: unreadable JSON, a clickId that is not the hash o
   assert.equal(settlePendingClicks({ home: 42 }).problems.length, 1, 'a settle that cannot run reports a problem and does not throw');
 });
 
+// #528: the RETIRED list goes newest first, so the click the owner just made is reached before old stuck ones. Residual (stateless, no rotation): an old valid click behind 32 NEWER unverifiable ones is the mirror case;
+// the 24 h evidence expiry still retires those without a scan.
+test('retired units go newest first: a valid click made after 32 old unverifiable ones is still reached once all 33 are retired', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'owner-go-click-pending-'));
+  const old = [];
+  for (let i = 0; i < SETTLE_SCAN_BUDGET; i++) {
+    const x = pw(t, { home, slot: i, pr: 100 + i });
+    x.t += i; // distinct capture times; never flushed, so every one is `waiting`
+    assert.ok((await x.hook()).pending, `unit ${i}`);
+    old.push(x);
+  }
+  const A0 = old[0].answeredAt;
+  const ready = pw(t, { home, slot: 40, pr: 140, shiftMs: 100000 });
+  assert.ok((await ready.hook()).pending);
+  ready.flush();
+  const nowMs = A0 + 100000 + WAIT_GRACE_MS + 60000; // all 33 are past the grace (retired)
+  const one = settlePendingClicks({ home, now: () => nowMs });
+  assert.deepEqual(one.outcomes[0], { askId: ready.askId, clickId: ready.clickId, outcome: 'recorded' }, 'the newest retired unit goes first');
+  assert.deepEqual(allSettled(home), [`${ready.askId}.${ready.clickId}.settled`], 'only the valid one is settled');
+  assert.equal(one.outcomes.length, SETTLE_SCAN_BUDGET);
+  assert.ok(one.outcomes.slice(1).every((o) => o.outcome === 'waiting'));
+  const two = settlePendingClicks({ home, now: () => nowMs });
+  assert.equal(two.outcomes.length, SETTLE_SCAN_BUDGET, 'a second settle still scans only the budget');
+  assert.ok(two.outcomes.every((o) => o.outcome === 'waiting'), 'the 32 old units are still pending');
+  assert.equal(allSettled(home).length, 1);
+});
+
 test('fair progress across retryable units: 40 retryable units ahead of 1 ready unit (15 missing transcripts, 15 half-written .spent, 10 failing record writes); a unit is never split by the budget', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'owner-go-click-pending-'));
   const worlds = [];

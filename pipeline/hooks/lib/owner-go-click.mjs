@@ -561,7 +561,7 @@ function capturePending({ ask, askId, session, toolUseId, transcriptPath, cwd, h
 // hook runs within seconds of the answer: 15 s covers the installed timeout. A test pins it. The check is capturedAt - 15 s <= answeredAt <= capturedAt + 15 s; its upper half is what the
 // evidence expiry (capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS) relies on: no admitted answer is later than that bound minus 24 h, so no grant it could become is usable after the expiry.
 export const CAPTURE_SKEW_MS = 15 * 1000;
-// Scheduling only, never evidence: a unit captured longer ago than this goes to the back of the retry queue. Nothing is refused or settled on time alone but the evidence expiry.
+// Scheduling only, never evidence: a unit captured longer ago than this is RETIRED: it is scanned after the active ones, newest first (#528), so the click the owner just made is reached before old stuck ones. Nothing is refused or settled on time alone but the evidence expiry.
 export const WAIT_GRACE_MS = 10 * 60 * 1000;
 export const SETTLE_SCAN_BUDGET = 32; // transcript scans (clickEvidence calls) one settlePendingClicks call makes
 const SETTLED_OUTCOMES = Object.freeze(['recorded', 'declined', 'refused']);
@@ -599,7 +599,7 @@ let settling = false;
 // by `io` for fault injection, and reads only through readSmallJson / readAsk / clickEvidence.
 //
 // Scheduling is not evidence. Pointers are grouped into UNITS, one per ask across every session; a unit is included as soon as any member matches the `session` / `askId` filter (the guard's
-// session-scoped read), with all its members. Units captured less than WAIT_GRACE_MS ago are ACTIVE and go first, FIFO; the rest are RETIRED and get what is left of the budget (SETTLE_SCAN_BUDGET
+// session-scoped read), with all its members. Units captured less than WAIT_GRACE_MS ago are ACTIVE and go first, FIFO; the rest are RETIRED, go NEWEST first (#528: the click the owner just made is reached before old stuck ones; the mirror case, an old valid click behind 32 newer unverifiable ones, is left to the 24 h evidence expiry) and get what is left of the budget (SETTLE_SCAN_BUDGET
 // transcript scans per call; a unit is started only below it, then looked at whole). A unit's members go in capturedAt order and the walk STOPS at the first one that is not terminal, so a later click is
 // never admitted ahead of an earlier, still-unverified one (Fable F7). Nothing is refused or settled on time alone but the evidence expiry capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS: after that even a
 // verified grant would be past its 24 h use window. A missing or unreadable transcript is `waiting`; an unreadable spent marker, a failed write and the like are `retry` (no `.settled`); every
@@ -635,7 +635,7 @@ export function settlePendingClicks({ home = accountHome(), now = Date.now, askI
       .map((u) => ({ ...u, oldest: u.members[0].capturedMs, askId: u.members[0].askId }));
     const fifo = (a, b) => a.oldest - b.oldest || a.askId.localeCompare(b.askId);
     const active = units.filter((u) => nowMs - u.oldest < WAIT_GRACE_MS).sort(fifo);
-    const retired = units.filter((u) => nowMs - u.oldest >= WAIT_GRACE_MS).sort(fifo);
+    const retired = units.filter((u) => nowMs - u.oldest >= WAIT_GRACE_MS).sort((a, b) => fifo(b, a));
     let scans = 0;
     for (const unit of [...active, ...retired]) {
       if (scans >= SETTLE_SCAN_BUDGET) break;
