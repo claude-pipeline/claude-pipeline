@@ -197,14 +197,7 @@ function localDbUrl(v) {
 // commands that only read or print their arguments: a Management API hostname mentioned on a line made of these alone (a search, an echo) makes no request
 const NO_REQUEST = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls']);
 const NO_REQUEST_GIT = new Set(['grep', 'log', 'diff', 'show', 'blame', 'status', 'ls-files', 'shortlog', 'rev-list', 'describe']);
-// (a bare command word only: `/tmp/x/rg` and `./rg` are scripts that may be named anything; and a line that writes a file, `echo '…' > run.sh`, is not a mention that goes nowhere)
-const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
-const writesFile = (c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && r.target !== '/dev/null' && !/^&(?:\d+|-)$/.test(r.target ?? ''));
-const makesNoRequest = (c) => {
-  if (c.argv[0].includes('/') || writesFile(c)) return false;
-  const n = commandName(c.argv[0]);
-  return NO_REQUEST.has(n) || (n === 'git' && NO_REQUEST_GIT.has(c.argv[1]));
-};
+const makesNoRequest = (c) => { const n = commandName(c.argv[0]); return NO_REQUEST.has(n) || (n === 'git' && NO_REQUEST_GIT.has(c.argv[1])); };
 
 // does a launcher line run the supabase binary? Only a word in command position counts (a path or directory argument named supabase, like `lib/supabase`, does not).
 // A word after an option may be that option's value (`sudo -u root supabase`), so the next word is read too; a package-manager `run`/`exec` verb makes the next word the script.
@@ -219,8 +212,6 @@ function launcherRunsSupabase(argv) {
     if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^\d+(?:\.\d+)?[smhd]?$/.test(w)) continue;
     if (SB_WORD.test(commandName(w))) return true;
     if (LAUNCHERS.has(commandName(w))) return Boolean(supabaseCall(argv.slice(i)));
-    if (pm && !afterRun && w === 'workspace') { i += 1; afterFlag = false; continue; } // `yarn workspace NAME …`: NAME is not the command
-    if (pm && !afterRun && (w === 'workspaces' || w === 'foreach' || w === 'recursive')) continue;
     if (pm && !afterRun && RUN_VERBS.has(w)) { afterRun = true; afterFlag = false; continue; }
     if (afterRun) return false;
     if (afterFlag) { afterFlag = false; continue; }
