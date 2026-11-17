@@ -90,10 +90,10 @@ describe('#505: every branch is unknown, also the ones no entry was made for', (
     expect('deny', 'bash build.sh; git push', { ...FILES, [BUILD]: 'make\ncd dist || { source /work/repo/cleanup.sh; exit 1; }\n' });
   });
   test('a git checkout in an unknown directory (after a source) marks every branch unknown, even a directory entered later', () => {
-    expect('deny', 'source env.sh; cd /work/repo; git checkout agent/y; cd /other; git push', { [resolve('env.sh')]: 'X=1\n' });
+    expect('deny', 'source env.sh; git checkout agent/y; cd /other; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('a branch recorded after the mark is known again (a checkout of the directory the push runs in)', () => {
-    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y; git push', { [resolve('env.sh')]: 'X=1\n' });
+    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('reference: a build script whose failure group is a plain echo keeps the caller branch (allowed)', () => {
     expect('allow', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
@@ -240,8 +240,15 @@ describe('#505 over-denial check: a readable sourced file with no git / .git wri
   KEPT('source venv/bin/activate && git push');
   KEPT('. ./env.sh; git push');
   OK('source env.sh; cd /work/repo/sub; git push');
-  test('a sourced file that is never read (missing) marks every branch unknown: a directory entered afterwards is denied', () => {
-    expect('deny', 'source nothere.sh; cd /work/repo/sub; git push', FILES);
+  // #555: production failure: `[ -f .env.local ] && source .env.local; cd /work/repo/sub; git push` was allowed when the optional file existed and denied when it did not (a missing file runs nothing)
+  test('a sourced file that does not exist runs nothing: it marks no branch, a directory entered afterwards is judged on its own branch (allowed)', () => {
+    expect('allow', 'source nothere.sh; cd /work/repo/sub; git push', FILES);
+    expect('allow', '[ -f .env.local ] && source .env.local; cd /work/repo/sub; git push', FILES);
+    expect('allow', 'source ~/.cargo/env 2>/dev/null; git -C /work/repo/sub push', FILES);
+  });
+  test('a sourced file whose name is only known at run time still marks every branch unknown (denied)', () => {
+    expect('deny', 'source "$(mktemp)"; cd /work/repo/sub; git push', FILES);
+    expect('deny', 'source ~/.cache/*.sh; cd /work/repo/sub; git push', FILES);
   });
   OK('bash build.sh; git push');
   test('but a sourced file that does switch the branch still denies', () => {

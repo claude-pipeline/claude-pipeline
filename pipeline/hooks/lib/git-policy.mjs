@@ -3465,6 +3465,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const name = baseName(argv[0]);
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
+    let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist: nothing runs)
     if (VAR_BUILTINS.includes(name)) {
       const d = declAttrs(argv);
       for (const [k, v] of d.assigns) {
@@ -3523,7 +3524,11 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
       if (!verdict && splicesOptions(argv)) verdict = checkSplices(c, dir, ctx, level);
       const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
-      if (sf && (name === 'source' || name === '.')) sf.sourced = true;
+      if (sf && (name === 'source' || name === '.')) {
+        sf.sourced = true;
+        const word = sf.candidate || sf.ambiguous || sf.joined ? '' : expandVars(sf.file, ctx);
+        sourceGone = /^[\w./~@+-]+$/.test(word) && !word.startsWith('/dev/') && (dir !== null || path.isAbsolute(word) || /^~(?:\/|$)/.test(word)) && !ctx.pathExists(path.resolve(dir ?? ctx.cwd, /^~(?:\/|$)/.test(word) ? ctx.home + word.slice(1) : word));
+      }
       const withPath = (rec) => { if (sourcePathSearch(rec, c.argv, cmds)) { rec.ambiguous = true; rec.words ??= [rec.file]; rec.pathSearch = true; } if (rec.words?.some(isEqualsWord) || rec.pathSearch) rec.pathValues = pathValuesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n) }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
@@ -3582,7 +3587,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (SOURCING.includes(name)) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
       // (#505: a file that was read and walked (a git change in it, or a write below .git, was recorded or marked unknown by that walk) leaves the branches as they are; only one never walked -- missing, a name known at run time -- marks every branch unknown)
-      forgetState((ctx.judgedTexts ?? 0) <= judged0);
+      forgetState((ctx.judgedTexts ?? 0) <= judged0 && !sourceGone); // (#555: a missing file marks no branch; a name known at run time, or a file that exists but was not walked, still does)
       for (const k of Object.keys(ctx.vars)) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
       // the check above ran before these became unsure: run it again for what follows (`F=run.sh; source env.sh; bash "$F"`)
       const unsure = unsureVarReachingCommand(cmds.slice(i + 1), ctx);
