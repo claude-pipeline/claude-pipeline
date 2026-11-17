@@ -1153,7 +1153,9 @@ copy the CI-side scripts into a project (scripts/pipeline/); --check reports dri
 pipeline vendor --repo DIR [--check]
 ```
 
-Exit: 0 copied / no drift · 1 drift found (`--check`) · 2 usage.
+Exit: 0 copied / no drift / skipped · 1 drift found (`--check`) · 2 usage.
+
+`--check` in a repo whose `.claude/pipeline.yml` sets `ci.guard_checks: false` (it runs none of the vendored CI guards, as this repo itself does) compares nothing: exit 0 with `{ok: true, skipped: <reason>}` instead of listing every file as missing. A missing or invalid config does not skip. Plain vendor is unchanged.
 
 Vendoring removes a leftover `scripts/pipeline/stop-verify.mjs` from an earlier vendor (the Stop hook was retired; output `removed` lists it, and only that file is ever deleted); `--check` reports it as drift with reason `retired`. If `.claude/settings.json` or `.claude/settings.local.json` still has a hook that runs `stop-verify`, both modes add a `warnings` entry telling the owner to remove that Stop hook entry; the settings files are never edited. Vendoring also appends `scripts/pipeline/** -text` and `scripts/verify text eol=lf` to the project's `.gitattributes` (idempotent; output `gitattributes` lists what was added), so a Windows autocrlf checkout cannot make the byte comparison drift. `--check` warns when the entries are missing. The vendored libs include `lib/review-marker.mjs` (the review-complete marker and its parser, used by the guards for `Cross-model review`).
 

@@ -6,6 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
+import { pipelineYml } from './helpers/fakegh-env.mjs';
 import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mjs';
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
@@ -216,6 +217,26 @@ test('vendor --check on a never-vendored repo lists everything as missing', asyn
   const r = await vendorInto(repo.dir, ['--check']);
   assert.equal(r.exitCode, 1);
   assert.equal(r.output.drift.length, ENTRIES.length + LIBS.length + 2);
+  assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
+});
+
+// #550: a repo that runs no vendored CI guards (ci.guard_checks: false, as this repo's own config) has nothing to compare, so --check is not a drift alarm there.
+test('vendor --check on a repo with ci.guard_checks: false skips (exit 0, skipped names the setting) instead of listing every file as missing', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output.ok, true);
+  assert.match(r.output.skipped, /ci\.guard_checks is false/);
+  assert.equal(r.output.drift, undefined);
+});
+
+test('vendor --check with ci.guard_checks: true still reports a never-vendored repo as drift (only an explicit false skips)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: true }));
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
   assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
 });
 
