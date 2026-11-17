@@ -125,8 +125,10 @@ const replacedBy = (final) => (isOwnerRuled({ final }) ? final.overruled : isPro
 const continuesPublished = (mine, theirs) => {
   const published = theirs.final;
   if (mine.final === undefined || published === undefined || canonicalJson(mine.final) === canonicalJson(published)) return false;
-  if (!isProtectedFinal(theirs) && published.needsHuman !== true && !(isDeferrableAccept(theirs) && isOwnerDeferral(mine))) return false;
   const target = canonicalJson(published);
+  // A published final that is neither protected nor waiting for a human (a plain ACCEPT) is continued only by the owner's deferral as the single step onto it.
+  if (!isProtectedFinal(theirs) && published.needsHuman !== true
+    && !(isDeferrableAccept(theirs) && isOwnerDeferral(mine) && isOwnerRuled(mine) && canonicalJson(mine.final.overruled) === target)) return false;
   let cur = mine.final;
   for (;;) {
     const prev = replacedBy(cur);
@@ -165,6 +167,8 @@ function itemIsAhead(i, before) {
   if (savedRulingIsAhead(i, before)) return true;
   const addImplemented = Boolean(i.implemented) && before.implemented === undefined;
   const addFollowup = Boolean(i.followupIssue) && before.followupIssue === undefined;
+  // An owner deferral of the published ACCEPT whose follow-up issue was filed before the ruling was published: the deferral is saved work, the new issue link rides with it.
+  if (addFollowup && !addImplemented && isOwnerDeferral(i) && savedRulingIsAhead({ ...i, followupIssue: undefined }, before)) return true;
   if (!addImplemented && !addFollowup) return false;
   return itemKey({ ...i, ...(addImplemented ? { implemented: undefined } : {}), ...(addFollowup ? { followupIssue: undefined } : {}) }) === itemKey(before);
 }

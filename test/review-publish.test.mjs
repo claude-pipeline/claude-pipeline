@@ -1069,4 +1069,30 @@ test('state show (F5): a local owner step over a published arbiter ACCEPT is kep
   assert.equal(show('no mark', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { ownerDeferral: undefined }) })), 'quarantined', 'a FOLLOW-UP over an ACCEPT without the mark');
   const forNeedsHuman = waiting();
   assert.equal(show('control', it('R1-B1', { final: forNeedsHuman }), (s) => change(s, 'R1-B1', { final: { decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'ok', ownerQuote: 'R1-B1: accept', overruled: forNeedsHuman } })), 'local-ahead', 'control: the old owner path');
+  // R1-F1: a final that merely carries an (empty) ownerDeferral object is not the deferral of the published ACCEPT: a Claude REJECT, or an owner step over a Claude final, walks around the checks above
+  const claudeOverArb = claudeFinal({ ownerDeferral: {}, claude: { ruledAt: 'now', cause: 'unknown', critical: false, overruled: arb } });
+  assert.equal(show('claude + empty mark', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: claudeOverArb })), 'quarantined', 'a Claude REJECT over an arbiter ACCEPT carrying ownerDeferral {}');
+  const ownerOverClaude = ownerOver(claudeOverArb, { decision: 'REJECT', ownerDeferral: {} });
+  assert.equal(show('owner over claude', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOverClaude })), 'quarantined', 'an owner REJECT over that Claude final, two steps above the arbiter ACCEPT');
+});
+
+// R1-B1 (#559): the owner defers an arbiter ACCEPT and files its follow-up issue before the ruling is published: both are saved work, kept (not quarantined).
+test('state show (R1-B1): an owner deferral plus the follow-up issue filed before publication stays local-ahead; the issue added to a REJECT over the same ACCEPT is quarantined', (t) => {
+  const arb = decided({ by: 'arbiter' });
+  const deferral = { decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'owner defers', ownerQuote: 'R1-B1: follow-up', ruledAt: 'later', ownerDeferral: { accepted: 'arbiter', ruledAt: 'later' }, overruled: arb };
+  const show = (final) => {
+    const w = world(t);
+    const s0 = mk([it('R1-B1', { final: arb })]);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    const local = change(s0, 'R1-B1', { final, followupIssue: 'https://github.com/acme/widgets/issues/9' });
+    saveState(w.A, local);
+    const r = w.show(w.A);
+    assertExit(r, 0, r.stdout + r.stderr);
+    return { source: r.json.source, kept: w.state(w.A) };
+  };
+  const kept = show(deferral);
+  assert.equal(kept.source, 'local-ahead');
+  assert.equal(kept.kept.rounds[0].items[0].followupIssue, 'https://github.com/acme/widgets/issues/9', 'the issue link is kept');
+  assert.equal(show({ ...deferral, decision: 'REJECT' }).source, 'quarantined', 'no other combination');
 });
