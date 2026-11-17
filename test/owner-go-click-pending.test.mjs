@@ -196,8 +196,14 @@ test('a retried hook leaves one pending; a 9th UNSETTLED pending is refused too-
   assert.deepEqual(await w2.hook(), { pending: w2.expectedPending });
 });
 
-test('capture refuses a tool_input with keys beyond questions/metadata (answers, annotations, anything else): no pending; metadata alone is fine', async (t) => {
-  for (const extra of [{ answers: { x: 'Merge' } }, { annotations: {} }, { anything: 1 }]) {
+test('capture takes the keys Claude Code 2.1.323 adds to the PostToolUse tool_input (answers, annotations, afkTimeoutMs) but still refuses any other extra key; metadata alone is fine; one question only', async (t) => {
+  // the real shape: the permission dialog's updatedInput = { ...input, answers, annotations, ...(afkTimeoutMs && { afkTimeoutMs }) }
+  for (const extra of [{ answers: {}, annotations: {} }, { answers: { x: 'Merge' }, annotations: {} }, { answers: {}, annotations: {}, afkTimeoutMs: 30000 }, { annotations: {} }]) {
+    const w = pw(t);
+    assert.deepEqual(await w.hook({}, { tool_input: { questions: [w.dialog], ...extra } }), { pending: w.expectedPending }, JSON.stringify(extra));
+    assert.equal(w.pendings().length, 1);
+  }
+  for (const extra of [{ anything: 1 }, { preview: 'x' }, { answers: {}, annotations: {}, foo: 1 }]) {
     const w = pw(t);
     assert.deepEqual(await w.hook({}, { tool_input: { questions: [w.dialog], ...extra } }), { refused: 'tool-use-shape' }, JSON.stringify(extra));
     assert.deepEqual(w.pendings(), []);
@@ -206,6 +212,25 @@ test('capture refuses a tool_input with keys beyond questions/metadata (answers,
   assert.deepEqual(await two.hook({}, { tool_input: { questions: [two.dialog, two.dialog] } }), { refused: 'tool-use-shape' }, 'one question only');
   const ok = pw(t);
   assert.deepEqual(await ok.hook({}, { tool_input: { questions: [ok.dialog], metadata: { source: 'x' } } }), { pending: ok.expectedPending });
+});
+
+test('end to end on 2.1.323: a click captured with the real-shaped hook input settles to a record; the same capture against a transcript whose tool_use carries the model\'s own answers is refused tool-use-shape at settle', async (t) => {
+  const w = pw(t);
+  const real = { questions: [w.dialog], answers: { [w.dialog.question]: 'Merge' }, annotations: {} };
+  assert.deepEqual(await w.hook({}, { tool_input: real }), { pending: w.expectedPending });
+  w.flush();
+  assert.deepEqual(w.settle({ io: {} }), { outcomes: [{ askId: w.askId, clickId: w.clickId, outcome: 'recorded' }], problems: [] });
+  assert.equal(w.records().length, 1);
+  assert.equal(clickProvenance(w.records()[0], { home: w.home }), 'owner');
+  // the model's own prefilled answers sit in the transcript's tool_use input: refused at settle, whatever the hook input looked like
+  const bad = pw(t);
+  const use = structuredClone(bad.use);
+  use.message.content.find((b) => b.type === 'tool_use').input = { questions: [bad.dialog], answers: { [bad.dialog.question]: 'Merge' } };
+  writeFileSync(bad.file, bad.text([bad.prompt, use]));
+  assert.deepEqual(await bad.hook({}, { tool_input: { questions: [bad.dialog], answers: { [bad.dialog.question]: 'Merge' }, annotations: {} } }), { pending: bad.expectedPending });
+  bad.flush();
+  assert.deepEqual(bad.settle({ io: {} }).outcomes, [{ askId: bad.askId, clickId: bad.clickId, outcome: 'refused', reason: 'tool-use-shape' }]);
+  assert.equal(bad.records().length, 0);
 });
 
 test('the hook never reads tool_response: it neither decides nor admits anything', async (t) => {
