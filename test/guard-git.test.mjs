@@ -1249,6 +1249,12 @@ test('the installed matchers cover Monitor and MCP tools for guard-git', async (
   }
 });
 
+test('the installed guard-files matcher covers the Supabase MCP apply_migration tool (#262)', async () => {
+  const { GUARD_FILES_MATCHER } = await import('../pipeline/lib/installer.mjs');
+  const re = new RegExp(`^(?:${GUARD_FILES_MATCHER})$`);
+  for (const tool of ['mcp__plugin_supabase_supabase__apply_migration', 'mcp__plugin_supabase_supabase__execute_sql']) assert.ok(re.test(tool), `${GUARD_FILES_MATCHER} must match ${tool}`);
+});
+
 // ---- time budget (review finding 12) ----------------------------------------------------------------------
 
 test('an oversized command line is not parsed: denied whatever it says (#84)', () => {

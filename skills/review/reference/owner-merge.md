@@ -93,3 +93,17 @@ The owner's "merge", "extra round" and rulings can be a click on a choice dialog
    - Declined (Not yet / No / Not now) ⇒ stop; say in plain English what stays open and that you will ask again when it is ready.
    - A line starting `[claude-pipeline owner-go] the click could not be verified (` (the reason follows in the brackets, then `): ask the owner to type the closing words instead`) or no line at all ⇒ nothing is recorded: show the closing lines again in a fresh reply (a fresh `--ask` or the typed request) and ask the owner to type.
 5. Never answer the dialog for the owner or simulate a click, and the merge hand-off marker rules (`Head …` line directly above the `🔀 Ready to merge …` last line) are unchanged: the typed block is still part of the reply.
+
+## Live-database go (typed)
+
+A write to a LIVE Supabase project (every hosted project the owner has not declared `dev` with `P db-refs`) is not a merge, but it uses the same typed-go idea. The guard refuses `apply_migration` and every `execute_sql` that is not a `live-db catalog` template until the owner has typed a go for exactly that SQL.
+
+1. Run `P live-db present` (`--op migration --pr N --file supabase/migrations/<file>.sql --project <ref> --summary "…"`, or `--op data --sql-file <path> --project <ref> --summary "…"`). It refuses a dirty or unpushed file, a PR head that is not HEAD, a dev ref and SQL it cannot show in full.
+2. End the reply with its `block` exactly as printed: nothing after it. Wait for the owner's typed go (`go migration <name>` / `go data <sha12>`); a go the owner has not typed is never recorded, and a click is not accepted.
+3. Call `apply_migration` with the file bytes unchanged as `query` and `name` = the file's basename WITHOUT `.sql`. One byte different (a trailing newline, CRLF, a BOM) is a different go.
+4. **One go per migration file**: two migrations = two block/go cycles. A go is consumed at the attempt and expires after 2 hours; after a failed or interrupted apply, look at the live state read-only (`list_migrations` or a `live-db catalog` query) before asking for a new go.
+5. **Data changes** (`execute_sql`): pass the `sql` that `present` printed verbatim as `query`.
+6. **Schema look-ups** go through `P live-db catalog <kind> …` (go-free): pass its `sql` verbatim to `execute_sql`.
+7. A migration file containing a literal `\uXXXX` cannot pass (the tool's JSON layer decodes it, so the bytes differ): the owner applies it.
+
+Details of the guard: `docs/cli.md` section "Live database guard".

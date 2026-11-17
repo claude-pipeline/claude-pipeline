@@ -36,3 +36,5 @@ The full section 3.
    (`P job start merge -- …`), never `gh pr merge` yourself. The block order is Rulings (when present), Areas, Hold, Head, 🔀; copy it from the dry run, never type the digest. Read the dry run whole: grep or a single-key `jq` drops the Rulings block. The closing lines look like:
    `Head <sha12> · items <digest> · repo <owner/name>`
    `🔀 Ready to merge #N — say "merge"`
+
+A migration that must reach a LIVE database is applied only with the owner's typed go: `reference/owner-merge.md` section "Live-database go (typed)".
