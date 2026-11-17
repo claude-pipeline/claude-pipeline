@@ -17,6 +17,7 @@ import {
   STATE_VERSION_DEFERRAL,
   STATE_VERSION_SUBSTITUTE,
   STATE_VERSION_OUT_OF_MODEL,
+  STATE_VERSION_CLICK_DIALOG,
   STATE_VERSION_POST_MAX,
   stateNeedsPostMaxVersion,
   maxRiskOf,
@@ -514,7 +515,7 @@ test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForCom
     assert.equal(loadState(dir).version, 4);
     assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
     saveState(dir, { ...s, version: SUPPORTED_STATE_VERSION + 1 });
-    assert.throws(() => loadState(dir), /version 7.*supports.*6/);
+    assert.throws(() => loadState(dir), /version 9.*supports.*8/);
     assert.equal(decodeFromComment(encodeForComment({ ...s, version: SUPPORTED_STATE_VERSION + 1 })), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -572,7 +573,7 @@ test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOf
   assert.equal(stateNeedsOutOfModelVersion(marked), true);
   const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
   assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
-  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_POST_MAX);
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CLICK_DIALOG); // (7 is reserved by open PR #601)
   assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
   assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
   assert.equal(stateNeedsOutOfModelVersion(null), false);

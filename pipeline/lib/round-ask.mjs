@@ -11,6 +11,15 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const BUCKET_WORDS = { BLOCKING: 'BLOCKING', SUGGESTION: 'SUGGESTIONS', WORTH_CONSIDERING: 'WORTH CONSIDERING' };
 const SHOWN = 6;
+// The round dialog variant `round-request --ask` issues. B1 (verifier first): ALWAYS the legacy dialog, so every ask issued after B1 is byte-identical to before; B2 wires roundDialogVariant(recommend, longReview) here.
+// The lever `PIPELINE_ROUND_DIALOG=legacy` (the exact string; anything else does nothing) can only narrow to the legacy dialog and is read at ISSUE time only: verification never reads it.
+export const ROUND_DIALOG_LEGACY = 'round-v1';
+export const roundDialogLever = (env) => env?.PIPELINE_ROUND_DIALOG === 'legacy';
+export function issuedRoundVariant({ env } = {}) {
+  if (roundDialogLever(env)) return ROUND_DIALOG_LEGACY;
+  return ROUND_DIALOG_LEGACY;
+}
+
 // The counted round (k) from which the ask also shows how the last rounds went (4-5 rounds in, the review is usually a loop the owner should see, not just pay for).
 export const LONG_REVIEW_FROM = 6;
 

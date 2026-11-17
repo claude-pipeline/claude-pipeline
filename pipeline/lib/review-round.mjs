@@ -557,7 +557,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       const k = reviewedRoundCount(fresh) + 1;
       const records = ownerGrantedRounds({ repo: adm.ghRepo.slug, pr, k, head });
       const newest = records[0];
-      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts };
+      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts, ...(typeof newest.ask?.variant === 'string' ? { askVariant: newest.ask.variant } : {}) }; // askVariant: a click on a new-variant dialog (state version 8, lib/state.mjs); a compat marker, never evidence
       // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
       // discard-round); the first claimer on the machine wins. A failed claim discards the reviewer's answer.
       claimGrant = () => {

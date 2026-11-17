@@ -11,6 +11,10 @@ import { claimGrantMarkers, grantIdOf, ownerGrantLookups, ownerGrantedRounds, ve
 import { CAPTURE_SKEW_MS, HUMAN_DECISION, ROUND_VARIANT_IDS, asksDir, clickNotes, clickProvenance, dialogSha256, followUpClickState, issueAsk, mergeAsk, mergeManyAsk, readAsk, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { HEAD, ITEMS, REPO, world } from './helpers/click-world.mjs';
+import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
+import { STATE_VERSION_CLICK_DIALOG, SUPPORTED_STATE_VERSION, requiredStateVersion, withStateVersion } from '../pipeline/lib/state.mjs';
+import { clickLine } from '../pipeline/hooks/lib/owner-go-click-hook.mjs';
+import { issuedRoundVariant } from '../pipeline/lib/round-ask.mjs';
 
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const LINE = roundRequest(58, 4, GHEAD, REPO);
@@ -357,4 +361,60 @@ test('followUpClickState: every state of the newest round ask, read-only (instru
   unlinkSync(join(asksDir(out.home), `${out.askId}.spent`));
   writeFileSync(join(asksDir(out.home), `${out.askId}.${clickIdOf(out)}.settled`), '{"outcome":"made-up"}');
   assert.equal(out.state().state, 'unverified');
+});
+
+// ---- 6 the grant sees a v2 Yes click; 7 / 8 the state version and the askVariant cross-check ------------------------------------------------------------
+
+test('a Yes click on any variant is a grant the defer-fixes / codex-review lookups see; the state it lands in is version 8 and its askVariant is cross-checked', async (t) => {
+  // failure caught: a new-variant grant invisible to the grant lookups (a deferral would go past it), or a saved round whose grant an older pipeline would misread because the state kept its old version
+  assert.equal(SUPPORTED_STATE_VERSION, 8);
+  assert.equal(STATE_VERSION_CLICK_DIALOG, 8);
+  for (const id of V2) {
+    const w = world(t, { parts: parts(id), answer: YES[id] });
+    const r = await w.click();
+    const q = { repo: REPO, pr: 58, k: 4, head: GHEAD, home: w.home, now: w.now };
+    assert.equal(ownerGrantedRounds(q).length, 1, `${id}: the grant is visible`);
+    assert.equal(claimGrantMarkers(ownerGrantedRounds(q), { repo: REPO, pr: 58, k: 4, head: GHEAD, checkout: '/work/app' }, { home: w.home, now: w.now }).ok, true);
+    const grant = { grantId: grantIdOf(r.recorded), k: 4, quote: 'extra round', ownerTs: r.recorded.ts };
+    const round = (ownerGrant) => ({ n: 4, toHead: GHEAD, ...(ownerGrant ? { ownerGrant } : {}) });
+    const state = (ownerGrant) => ({ maxRounds: 3, rounds: [{ n: 1, toHead: HEAD }, { n: 2, toHead: HEAD }, { n: 3, toHead: HEAD }, round(ownerGrant)] });
+    const later = { repo: REPO, pr: 58, maxRounds: 3, home: w.home, now: () => w.answeredAt + 30 * 3600 * 1000 };
+    const withVariant = state({ ...grant, askVariant: id });
+    assert.equal(verifyOwnerGrants(withVariant, later).ok, true, id);
+    assert.equal(requiredStateVersion(withVariant), 8, `${id}: the marker lifts the state to 8`);
+    assert.equal(withStateVersion({ ...withVariant, version: 8 }, 3).version, 8, 'a writer never lowers it');
+    for (const bad of [grant, { ...grant, askVariant: V2.find((x) => x !== id) }, { ...grant, askVariant: 7 }]) {
+      const v = verifyOwnerGrants(state(bad), later);
+      assert.equal(v.ok, false, `${id}: ${JSON.stringify(bad.askVariant)}`);
+      assert.match(v.problems.join(' '), /its grant came from a click dialog variant the state does not record/);
+    }
+  }
+  // a legacy click and a typed grant need no marker and keep their version
+  const w = world(t, { parts: parts('round-v1'), answer: 'Yes, one more round' });
+  const r = await w.click();
+  claimGrantMarkers(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home: w.home, now: w.now }), { repo: REPO, pr: 58, k: 4, head: GHEAD, checkout: '/work/app' }, { home: w.home, now: w.now });
+  const legacy = { maxRounds: 3, rounds: [{ n: 1, toHead: HEAD }, { n: 2, toHead: HEAD }, { n: 3, toHead: HEAD }, { n: 4, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(r.recorded), k: 4, quote: 'extra round' } }] };
+  assert.equal(verifyOwnerGrants(legacy, { repo: REPO, pr: 58, maxRounds: 3, home: w.home, now: w.now }).ok, true);
+  assert.equal(requiredStateVersion(legacy), 1);
+});
+
+// ---- 9 hook text, 10 the lever ---------------------------------------------------------------------------------------------------------------------
+
+test('hook lines: a Follow-up instruction says it is no grant and names defer-fixes, its replay says not to redo steps; the pending line per variant carries the probe clause only for round-v2-follow-up', () => {
+  // failure caught: a session told "recorded: run codex-review" for a Follow-up click (paying for a round the owner did not grant), or told to revert before the click was checked
+  const line = clickLine({ instruction: 'follow-up', kind: 'round', repo: REPO, prs: [58] });
+  assert.match(line, /follow up for acme\/app #58\. This is an instruction, not a grant: it admits no round and approves no merge.*P triage defer-fixes --pr 58 --ids/s);
+  assert.doesNotMatch(line, /codex-review --pr/);
+  assert.match(clickLine({ instruction: 'follow-up', kind: 'round', repo: REPO, prs: [58], replay: true }), /already received.*do not redo steps already done/);
+  const pend = (variant) => clickLine({ pending: { askId: 'ask-000000000000', clickId: 'c', kind: 'round', repo: REPO, prs: [58], ...(variant ? { variant } : {}) } });
+  assert.match(pend('round-v2-follow-up'), /FIRST run P triage defer-fixes once \(before reverting anything\).*followUpClick\.state is "instructed"/);
+  assert.doesNotMatch(pend('round-v2-extra-round'), /defer-fixes/);
+  assert.doesNotMatch(pend('round-v2-park'), /defer-fixes/);
+  assert.match(pend('round-v2-park'), /No, stop and park \(Recommended\)/);
+  assert.equal(pend(undefined), pend('round-v2-extra-round'), 'legacy and the extra-round variant keep today\'s wording');
+});
+
+test('the lever and the issued variant: B1 issues the legacy dialog whatever the environment says; only the exact value "legacy" is read at all', () => {
+  // failure caught: B1 issuing a dialog the installed verifier on another machine cannot read yet (every ask stays round-v1 until B2)
+  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'legacy' }, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env }), 'round-v1');
 });
