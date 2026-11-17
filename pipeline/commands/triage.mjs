@@ -1021,14 +1021,17 @@ function tripWireOf({ state, config, root, head, k, shown, gh, longReview }) {
     const wire = roundTripWire(state, { extraRounds: smallest('trip_wire_extra_rounds'), notFalling: smallest('trip_wire_not_falling') });
     if (!wire.tripped) return { wire, processReview: null };
     let fixScope = null;
+    let baseNote;
     try {
       const last = state.rounds.findLast(countsTowardCap);
       if (last !== undefined) {
         const ineligible = mergeInIneligible({ pr: state.pr, gh, root, config });
-        fixScope = fixRoundScope({ files: fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, { cwd: root }).files, configs });
+        const measured = fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, { cwd: root });
+        baseNote = measured.baseNote;
+        fixScope = fixRoundScope({ files: measured.files, configs });
       }
     } catch { /* not measured: the line is left out */ }
-    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k, longReview, recommend: shown.recommend }) };
+    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, baseNote, nextRound: k, longReview, recommend: shown.recommend }) };
   } catch {
     return { wire: { tripped: false, reviewed: 0, max: null, acceptsByRound: [], reasons: [] }, processReview: null };
   }

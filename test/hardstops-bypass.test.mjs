@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { classifyHardStops, collectHardStops, scanEnvLine, parsePythonDeps, enclosingStatements } from '../pipeline/lib/hardstops.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { MIG, pkg, cfg, file, rulesOf, classify, run } from './helpers/hardstops.mjs';
-import { assertLinear, bestOf } from './helpers/timing.mjs';
+import { assertLinear, bestOf, cpuTimed } from './helpers/timing.mjs';
 
 const A = (path, ...added) => file(path, { status: 'A', added });
 const flags = (files, opts) => rulesOf(run(files, opts));
@@ -13,10 +13,8 @@ const details = (hits) => hits.map((h) => h.detail);
 // CPU time (user + system) a call burns, in ms. The ReDoS guards below are about work done, not wall-clock: under machine load
 // a wall-clock budget flakes, while CPU time stays put (a quadratic regex still blows it).
 function cpuMs(fn) {
-  const t0 = process.cpuUsage();
-  const value = fn();
-  const d = process.cpuUsage(t0);
-  return { value, ms: (d.user + d.system) / 1000 };
+  const { r, ms } = cpuTimed(fn);
+  return { value: r, ms };
 }
 
 // A repo with `base` files on main and a `feat` branch checked out; `collect(repo)` classifies feat against main.

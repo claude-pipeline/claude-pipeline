@@ -112,6 +112,17 @@ test('a genuine click on Merge records the typed record plus via/ask, ts = the a
   });
 });
 
+// #567: a merge that failed (the clean-status refusal) must leave the owner's click usable for the same head: the merge route never consumes a click-derived record, so a fresh `P merge --owner-go` run finds it again.
+test('a click-derived record is not consumed by lookups: repeated approval reads for the same head and items stay ok', async (t) => {
+  const w = world(t);
+  assert.equal((await w.click()).recorded?.via, 'ask');
+  for (let run = 0; run < 3; run++) {
+    assert.equal(w.gap(), 'ok', `read ${run}`);
+    assert.equal(approvedPr({ repo: REPO, pr: 58, head: HEAD, session: w.session, home: w.home, now: w.now }), true, `read ${run}`);
+  }
+  assert.equal(w.records().filter((r) => r.via === 'ask').length, 1, 'still one record, none added or removed by the reads');
+});
+
 test('the head moved after the click: the approval covers the old head only (approvalGap none)', async (t) => {
   const w = world(t);
   assert.equal((await w.click()).recorded?.via, 'ask');

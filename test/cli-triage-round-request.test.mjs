@@ -11,6 +11,7 @@ import { emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { presentedRoundRequest } from '../pipeline/hooks/lib/owner-go.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { aFile, findingsOf, low, roundWorld } from './helpers/round-world.mjs';
+import { REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const usdTotals = (usd, calls = 1) => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd, calls });
 const summaryComment = (cost) => ({ id: 77, user: { login: 'me' }, body: `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), ...(cost ? { cost } : {}) })}` });
@@ -248,6 +249,60 @@ test('round-request trip-wire: not tripped (the default settings, a falling or z
   assert.equal(r.json.tripWire, undefined);
   assert.equal(r.json.processReview, undefined);
   assert.match(r.json.line, /^🔁 Extra review round needed #7: round 3/);
+});
+
+// #549: the fix-scope line of the process review says when the measure fell back to the round head (the same baseNote `state fix-scope` shows), instead of a bare number.
+const scopeLine = (r) => r.json.processReview.summary.split('\n').find((l) => l.startsWith('Fix scope since the last review'));
+
+test('round-request trip-wire #549: a stacked PR (base is not the default branch) keeps the exact round-head measure and the fix-scope line says so', (t) => {
+  const w = roundWorld(t, WIRE_NOT_FALLING);
+  const { h2 } = w.atCap();
+  w.fake.setScript([
+    { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'parent', headRefOid: h2 } },
+    { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: w.slug, url: `https://github.com/${w.slug}` } },
+  ]);
+  const r = ask(w);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.match(scopeLine(r), /targets parent, not the default branch main: measured from the round's reviewed head, which is what its next review round does too/);
+});
+
+test('round-request trip-wire #549: a base branch GitHub cannot name is shown as a measure that may over-count', (t) => {
+  const w = roundWorld(t, WIRE_NOT_FALLING);
+  w.atCap();
+  w.fake.setScript([
+    { match: '^pr view 7 --json baseRefName$', code: 1, stderr: 'GraphQL: could not resolve' },
+    { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: w.repo.git(['rev-parse', 'HEAD']).trim() } },
+    { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: w.slug, url: `https://github.com/${w.slug}` } },
+  ]);
+  const r = ask(w);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.match(scopeLine(r), /base branch could not be read from GitHub/);
+  assert.match(scopeLine(r), /it may over-count.*retry when GitHub answers/);
+});
+
+test('round-request trip-wire #549: a merge of the default branch that conflicted is shown as a round-head measure that may over-count', (t) => {
+  const w = roundWorld(t, WIRE_NOT_FALLING);
+  w.atCap();
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/a.js', aFile(false).replace('export const v12 = 12;', 'export const v12 = 1200;'));
+  w.repo.commit('main edits a');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  assert.throws(() => w.repo.git(['merge', '--no-edit', 'main']));
+  w.repo.write('src/a.js', aFile(true));
+  const merged = w.repo.commit('merge main, resolved');
+  w.prHead(merged);
+  const r = ask(w);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.match(scopeLine(r), /conflict.*round's reviewed head, it may over-count/);
+});
+
+test('round-request trip-wire #549: a clean measure adds no note to the fix-scope line', (t) => {
+  const w = roundWorld(t, WIRE_NOT_FALLING);
+  w.atCap();
+  const r = ask(w);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.match(scopeLine(r), /^Fix scope since the last review: (not flagged \(\d+ non-test added lines\)|flagged \(.*\))\.$/);
+  assert.doesNotMatch(scopeLine(r), /measured from/);
 });
 
 // ---- review.post_max_suggestions wired into `triage validate` (#374 PR B). maxRounds is edited to -1 so the first round counts as "past max + 1" without owner grants. ----
