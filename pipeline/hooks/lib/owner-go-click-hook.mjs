@@ -21,7 +21,9 @@ function pendingLine(p) {
   if (p?.kind === 'round') return where ? `${said} (extra round for ${where}): if the owner chose to approve, run P codex-review --pr ${prs[0]} --round <the n from round-request> now; if they chose not to, stop: nothing is approved` : said;
   if (p?.kind === 'ruling') {
     const quotes = Object.entries(p.quotes ?? {}).filter(([, v]) => typeof v === 'string').map(([label, text]) => `${JSON.stringify(label)} -> --owner-quote ${JSON.stringify(text)}`);
-    return `${said}${where ? ` (ruling for ${where})` : ''}: if the owner chose to approve a ruling, run P triage owner-ruling now${quotes.length ? ` with the --owner-quote of the label the owner chose: ${quotes.join('; ')}` : ''}; if they chose not to, stop: nothing is approved`;
+    // #541: only the declining label (rulingAsk's null action, "Not now") stops; Reject all and Follow-up all are rulings too and run the command, so the line is worded by label, never approve / not approve
+    const run = quotes.length ? `if the owner chose one of these labels, run P triage owner-ruling now with its --owner-quote: ${quotes.join('; ')}` : 'if the owner chose any label other than Not now, run P triage owner-ruling now';
+    return `${said}${where ? ` (ruling for ${where})` : ''}: ${run}; if they chose Not now, stop: nothing is ruled`;
   }
   return said;
 }
