@@ -14,14 +14,14 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo, untrustedAnchorRefusal } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { diffFiles, git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
+import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { hashBranch } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { askSummary, longReviewOf, processReviewSummary, recommendedWords, roundsFrom } from '../lib/round-ask.mjs';
-import { postMaxApply, fixRoundScope } from '../lib/fix-verify.mjs';
+import { postMaxApply, fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
@@ -992,7 +992,7 @@ async function roundRequest(rest, ctx) {
     }
     if (prediction.length > 0) shown = { ...shown, summary: [shown.summary, ...prediction].filter(Boolean).join('\n') };
     // The trip-wire (#374 PR B): a prompt before another round, never a refusal of the owner's own words. Tripped without --after-process-review: no line, no ask file.
-    const tripped = tripWireOf({ state, config, root, head, k, shown, longReview });
+    const tripped = tripWireOf({ state, config, root, head, k, shown, gh, longReview });
     const { wire } = tripped;
     const processReview = tripped.processReview === null || prediction.length === 0 ? tripped.processReview : { ...tripped.processReview, summary: [tripped.processReview.summary, ...prediction].join('\n') };
     if (wire.tripped && values['after-process-review'] !== true) {
@@ -1006,7 +1006,7 @@ async function roundRequest(rest, ctx) {
 
 // The round trip-wire (lib/triage.mjs#roundTripWire) with the SMALLER of each setting in the working-tree and the fork-point config (a PR must not loosen its own wire; an unreadable
 // fork-point config leaves the working-tree one). A wire that cannot be computed is not tripped: it is a prompt, and a broken one must never be what blocks the owner's own ask.
-function tripWireOf({ state, config, root, head, k, shown, longReview }) {
+function tripWireOf({ state, config, root, head, k, shown, gh, longReview }) {
   try {
     const fork = state.rounds.findLast((r) => typeof r.forkPoint === 'string');
     const read = fork === undefined ? { ok: false } : baseConfigAt(fork.forkPoint, root);
@@ -1017,7 +1017,10 @@ function tripWireOf({ state, config, root, head, k, shown, longReview }) {
     let fixScope = null;
     try {
       const last = state.rounds.findLast(countsTowardCap);
-      if (last !== undefined) fixScope = fixRoundScope({ files: diffFiles(last.toHead, head, { cwd: root }), configs });
+      if (last !== undefined) {
+        const ineligible = mergeInIneligible({ pr: state.pr, gh, root, config });
+        fixScope = fixRoundScope({ files: fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, { cwd: root }).files, configs });
+      }
     } catch { /* not measured: the line is left out */ }
     return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k, longReview, recommend: shown.recommend }) };
   } catch {

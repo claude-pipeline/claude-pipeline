@@ -92,6 +92,19 @@ test('diffFiles uses the merge-base: unrelated commits that landed on main are n
   assert.match(twoDot, /D\tunrelated\.txt/);
 });
 
+test('diffFiles: a tree base is an explicit opt-in (treeBase); without it a tree id still throws, so the fail-closed callers behave as before; a commit with no common ancestor throws either way', () => {
+  const { repo, o } = baseRepo();
+  repo.branch('feat');
+  repo.write('src/feature.js', 'feature\n');
+  repo.commit('feature');
+  const tree = repo.git(['rev-parse', 'main^{tree}']).trim();
+  assert.throws(() => diffFiles(tree, 'feat', o), GitError);
+  assert.deepEqual(diffFiles(tree, 'feat', o, { treeBase: true }).map((f) => f.path), ['src/feature.js']);
+  const unrelated = repo.git(['commit-tree', tree, '-m', 'unrelated root']).trim();
+  assert.throws(() => diffFiles(unrelated, 'feat', o), GitError);
+  assert.throws(() => diffFiles(unrelated, 'feat', o, { treeBase: true }), GitError);
+});
+
 test('diffFiles ignores replace refs: a replacement commit cannot hide the real change (GIT_NO_REPLACE_OBJECTS)', () => {
   const { repo, base, o } = baseRepo();
   repo.branch('feat');

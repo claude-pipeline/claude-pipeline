@@ -38,6 +38,7 @@ export const meta = {
     '  the Codex run is the job codex-rR tagged <pr>:<R>:<base>:<head>: the same tag running is adopted (no second start), another tag running is exit 1 job-conflict',
     '  the result is read from the job\'s whole stdout; when that is missing (an older runner) or was cut, and the state records round R, the report is built from the state, else {next:"job read"}',
     '  a round already recorded picks up a job codex-rR only when its tag\'s base:head are the recorded round\'s fromHead:toHead (a job left by a discarded round is never used: exit 1 identity-mismatch);',
+    '  a round that is ALREADY recorded in the state is only picked up from its finished or running job (no Codex run in this call): every JSON of that call carries pickedUp:true; the checked-out HEAD must still be the recorded toHead (an explicit --head is compared with the job\'s instead), else exit 1 head-moved-since-round {next:"round codex --pr N --round R+1"}: do not rerun round R, run round R+1',
     '     a job that ended non-zero while the state already records round R at the job tag base:head (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON; a round recorded at another base:head (another writer, during the wait) leaves the job failure JSON as it is: never ok:true, never `arbiter needed`',
     '     a job that exited 0 while the state records round R at another base:head (round discarded and recorded again during the wait) is exit 1 identity-mismatch with next `state show --pr N`: nothing reported, never `arbiter needed`',
     '  the command exits early when the process that started it is gone (the job keeps running; rerun it)',
@@ -175,7 +176,18 @@ function roundOfJob(tag, state, pr, round) {
 
 const fullSha = (ref, root) => revParse(`${ref}^{commit}`, { cwd: root });
 
+// A refusal that is thrown after the round is known to be recorded carries pickedUp:true too (every JSON of that call does).
 async function roundCodex(rest, ctx) {
+  const seen = { pickedUp: false };
+  try {
+    return await roundCodexRun(rest, ctx, seen);
+  } catch (err) {
+    if (seen.pickedUp && err instanceof Fail && err.output !== null && typeof err.output === 'object') err.output = { ...err.output, pickedUp: true };
+    throw err;
+  }
+}
+
+async function roundCodexRun(rest, ctx, seen) {
   const { values } = parseCommandArgs(rest, {
     pr: { type: 'string' }, round: { type: 'string' }, base: { type: 'string' }, head: { type: 'string' },
     'max-minutes': { type: 'string' }, repo: { type: 'string' },
@@ -194,6 +206,18 @@ async function roundCodex(rest, ctx) {
   const { state: before, recorded } = checkIdentity(root, pr, round, { mayBeRecorded: true });
   const existing = readJob(name, { cwd: root });
   let runId;
+  // The recorded round is the one reviewed at its toHead: a checked-out HEAD past it holds a commit no review has seen (an explicit --head is compared with the job's instead).
+  // Checked before the wait and again after it: HEAD can move while the job runs.
+  const checkHeadAtRecorded = () => {
+    const recordedTo = existing.tag.split(':')[3];
+    if (values.head === undefined && fullSha('HEAD', root) !== recordedTo) {
+      throw new Fail(EXIT.FAILED, { ok: false, error: 'head-moved-since-round', message: `round ${round} was recorded at ${recordedTo} but HEAD is another commit: that result is not a review of HEAD; run round ${round + 1} instead`, next: `round codex --pr ${pr} --round ${round + 1}`, recordedHead: recordedTo, tag: existing.tag, runId: existing.runId });
+    }
+  };
+  // A round that was already recorded: no Codex run happened in this call, and the output says so.
+  const pickedUp = recorded;
+  seen.pickedUp = pickedUp;
+  const marked = (r) => (pickedUp ? { ...r, output: { ...r.output, pickedUp: true } } : r);
 
   if (recorded) {
     // The round is in the state: only a finished or running job of THIS round is picked up (a rerun after the waiter was lost); nothing is started.
@@ -206,6 +230,7 @@ async function roundCodex(rest, ctx) {
         throw new Fail(EXIT.FAILED, { ok: false, error: 'job-conflict', message: `job ${name} ran with another --${flag} (tag ${existing.tag})`, tag: existing.tag, runId: existing.runId });
       }
     }
+    checkHeadAtRecorded();
     runId = existing.runId;
   } else {
     let base = values.base;
@@ -263,17 +288,18 @@ async function roundCodex(rest, ctx) {
   const jobInfo = { name, runId, ...(snap.tag === undefined ? {} : { tag: snap.tag }) };
   if (snap.state === 'running') {
     if (snap.stopped) {
-      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'parent-gone', state: 'running', ...jobInfo, next: 'rerun round codex' } };
+      return marked({ exitCode: EXIT.FAILED, output: { ok: false, error: 'parent-gone', state: 'running', ...jobInfo, next: 'rerun round codex' } });
     }
-    return { exitCode: EXIT.OK, output: { ok: true, state: 'running', ...jobInfo, elapsedMs: snap.elapsedMs, next: 'rerun round codex' } };
+    return marked({ exitCode: EXIT.OK, output: { ok: true, state: 'running', ...jobInfo, elapsedMs: snap.elapsedMs, next: 'rerun round codex' } });
   }
   if (snap.state === 'replaced') {
-    return { exitCode: EXIT.FAILED, output: { ok: false, state: 'replaced', ...jobInfo, next: 'reconcile', doc: SPECIAL, message: `job ${name} now belongs to another run: another session may own this round; reconcile, never discard the round on this alone` } };
+    return marked({ exitCode: EXIT.FAILED, output: { ok: false, state: 'replaced', ...jobInfo, next: 'reconcile', doc: SPECIAL, message: `job ${name} now belongs to another run: another session may own this round; reconcile, never discard the round on this alone` } });
   }
   if (snap.state === 'lost' || snap.state === 'missing') {
-    return { exitCode: snap.state === 'missing' ? EXIT.USAGE : EXIT.FAILED, output: { ok: false, ...jobInfo, ...snap, doc: SPECIAL } };
+    return marked({ exitCode: snap.state === 'missing' ? EXIT.USAGE : EXIT.FAILED, output: { ok: false, ...jobInfo, ...snap, doc: SPECIAL } });
   }
-  return finish({ root, ctx, pr, round, snap, jobInfo });
+  if (recorded) checkHeadAtRecorded(); // a HEAD that moved during the wait: the finished job is not a review of it
+  return marked(await finish({ root, ctx, pr, round, snap, jobInfo }));
 }
 
 // A step that did not succeed: its own JSON and exit code, unchanged (what the controller's table of exits keys on). No JSON at all is said so.

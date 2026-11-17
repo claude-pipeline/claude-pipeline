@@ -772,6 +772,7 @@ pipeline round codex --pr N --round R [--base B] [--head H] [--max-minutes M] [-
   the Codex run is the job codex-rR tagged <pr>:<R>:<base>:<head>: the same tag running is adopted (no second start), another tag running is exit 1 job-conflict
   the result is read from the job's whole stdout; when that is missing (an older runner) or was cut, and the state records round R, the report is built from the state, else {next:"job read"}
   a round already recorded picks up a job codex-rR only when its tag's base:head are the recorded round's fromHead:toHead (a job left by a discarded round is never used: exit 1 identity-mismatch);
+  a round that is ALREADY recorded in the state is only picked up from its finished or running job (no Codex run in this call): every JSON of that call carries pickedUp:true; the checked-out HEAD must still be the recorded toHead (an explicit --head is compared with the job's instead), else exit 1 head-moved-since-round {next:"round codex --pr N --round R+1"}: do not rerun round R, run round R+1
      a job that ended non-zero while the state already records round R at the job tag base:head (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON; a round recorded at another base:head (another writer, during the wait) leaves the job failure JSON as it is: never ok:true, never `arbiter needed`
      a job that exited 0 while the state records round R at another base:head (round discarded and recorded again during the wait) is exit 1 identity-mismatch with next `state show --pr N`: nothing reported, never `arbiter needed`
   the command exits early when the process that started it is gone (the job keeps running; rerun it)
@@ -837,8 +838,10 @@ pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures,
   record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the
   automatic extra round took, or null
 pipeline state fix-scope --round R [--head HEAD] [--repo DIR]
-  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings}: what the fix commits since round R (R's reviewed head .. HEAD, or --head) add, read-only and
-     never stored. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);
+  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings, baseKind, baseNote?}: what the fix commits since round R (R's reviewed head .. HEAD, or --head) add, measured
+     from the base the next review round would use (#490: what the default branch brought in with a clean merge since R is left out), and never stored. baseKind ('previous' | 'synthetic' | 'round-head') says which base was used;
+     it falls back to the round head (baseKind 'round-head', with baseNote saying why) for a stacked PR, an unanchored default branch (both exact: the review round does the same), a conflicting merge, or when GitHub cannot be read (may over-count; retry
+     when GitHub answers). It does a best-effort fetch of origin/<default branch> and one `gh pr view` read, so "read-only" means it writes no review state. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);
      a file counts as a test only when the working-tree, fork-point and trusted configs ALL classify it so (a renamed file is new unless both paths are tests). New exports are advisory text only.
      The review skill runs it before the push and asks the owner (own PR / plan first / push as is) when flagged; it is a prompt, never a gate. Exit 2 {error: no-round | not-descendant | bad-head}
 pipeline state mark-implemented --ids a,b [--repo DIR]

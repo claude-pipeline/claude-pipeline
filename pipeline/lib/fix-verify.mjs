@@ -7,9 +7,10 @@
 // exploration it is asked for. Anything that is not clearly a fix round is `full`.
 import { applyPostMaxDefault, countsTowardCap, postMaxPolicy } from './triage.mjs';
 import { DEFAULTS, baseConfigAt, loadConfig } from './config.mjs';
-import { diffFiles } from './git.mjs';
+import { GitError, diffFiles, effectiveReviewBase, mergeBase } from './git.mjs';
 import { matchAny } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
+import { prBaseBranch, trustedDefaultBranch } from './risk.mjs';
 
 export const BRIEF_FULL = 'full';
 export const BRIEF_FIX_VERIFY = 'fix-verify';
@@ -45,7 +46,7 @@ export function fixRoundCandidate(state, round, { scope }) {
   if (scope !== 'round') return { ok: false, reason: 'whole-pr scope' };
   // The scope label only says an earlier proven pass exists; what the round was diffed against is its review base kind. Allow-list: 'previous'
   // (the plain from..head slice) and a round stored before the kind existed. 'whole-pr' (a conflicting base merge: the whole PR against the new
-  // base) is a broad review; 'synthetic' is a tree id (the base branch was merged in cleanly) that merge-base-driven hard-stop scanning cannot take;
+  // base) is a broad review; 'synthetic' is a tree id (the base branch was merged in cleanly): a hard-stop scan, which walks a commit range, cannot take it;
   // 'resolution' and anything unknown are not a plain fix slice either.
   const kind = round.reviewBaseKind;
   if (kind === 'synthetic') return { ok: false, reason: 'synthetic review base (the base branch was merged in since the previous round: its range cannot be hard-stop scanned against a tree)' };
@@ -55,6 +56,47 @@ export function fixRoundCandidate(state, round, { scope }) {
   const previous = previousAccepts(state, round.n);
   if (previous === null || previous.accepted.length === 0) return { ok: false, reason: 'no accepted item in the previous counted round' };
   return { ok: true, previous };
+}
+
+// Whether the next review round leaves what the default branch brought in out of its range (review-round.mjs: only when the PR targets the TRUSTED default branch AND that anchor is trusted: a stacked PR, or an
+// anchor the PR could have chosen, reviews the plain previous-head range). -> undefined when it does, else { reason, exact }: a sentence saying why not, and whether the round-head measure is then exactly what the review round does (a stack, an untrusted anchor) or only a guess that may over-count (GitHub could not be read). The PR's base branch is read from GitHub (`gh`: the client of the caller),
+// as the review round reads it; a base that cannot be read is no reason to leave anything out (the measure then over-counts, never under-counts).
+export function mergeInIneligible({ pr, gh, root, config }) {
+  let view;
+  try {
+    view = gh.prView(pr, ['baseRefName']);
+  } catch (err) {
+    return { reason: `the PR's base branch could not be read from GitHub (${String(err?.message ?? err).split('\n')[0].slice(0, 160)})`, exact: false };
+  }
+  const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
+  const { branch: defaultBranch, untrusted } = trustedDefaultBranch(root, config);
+  if (prBaseUntrusted !== null || untrusted !== null) return { reason: prBaseUntrusted ?? untrusted, exact: true };
+  if (prBase !== defaultBranch) return { reason: `the PR targets ${prBase}, not the default branch ${defaultBranch}`, exact: true };
+  return undefined;
+}
+
+// The files the fix commits since round R's reviewed head (`from`) changed, measured against the base the NEXT review round would diff from (git.mjs#effectiveReviewBase): what the
+// default branch brought in with a clean merge since `from` is left out (#490), as the review packet leaves it out. `baseRef`: the default branch's ref (review-context.mjs#reviewBaseRef).
+// `ineligible` (mergeInIneligible's { reason, exact }): the plain from..head measure is kept, with the reason as baseNote; exact (a stack, an untrusted anchor: the review round leaves nothing out either) says so, else (GitHub unreadable) it may over-count.
+// A merge that conflicted, or a base that cannot be worked out, keeps the plain from..head measure and says so in baseNote. A synthetic base is a tree id, which only this caller diffs against (diffFiles' treeBase opt-in).
+// -> { files, baseKind: 'previous' | 'synthetic' | 'round-head', baseNote? }
+export function fixRoundFiles({ from, head, baseRef, ineligible }, o) {
+  if (ineligible !== undefined) {
+    const tail = ineligible.exact
+      ? 'which is what its next review round does too (nothing the default branch brought in is left out)'
+      : 'it may over-count (once GitHub answers, the next review round leaves out what the default branch brought in); retry when GitHub answers';
+    return { files: diffFiles(from, head, o), baseKind: 'round-head', baseNote: `${ineligible.reason}: measured from the round's reviewed head, ${tail}` };
+  }
+  let note;
+  try {
+    const since = effectiveReviewBase({ from, forkPoint: mergeBase(baseRef, head, o) }, o);
+    if (since.kind === 'previous' || since.kind === 'synthetic') return { files: diffFiles(since.base, head, o, { treeBase: true }), baseKind: since.kind };
+    note = 'the default branch was merged in with a conflict since this round, so what it brought in cannot be told apart from the fix: measured from the round\'s reviewed head, it may over-count';
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    note = `the review base could not be worked out (${String(err.message).split('\n')[0]}): measured from the round's reviewed head, it may over-count`;
+  }
+  return { files: diffFiles(from, head, o), baseKind: 'round-head', baseNote: note };
 }
 
 // ---- #374: the late lane and the fix-round scope ---------------------------------------------------------------------------------------------------------
