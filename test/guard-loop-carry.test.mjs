@@ -485,3 +485,33 @@ test('#352 R37-F2: a loop with no command at its own level keeps its own level a
     allows(`${what}: plain cd back, in a script`, RUN_SH, script('echo', twin));
   }
 });
+
+// #362 R39: an alias a text wrote is unknown to its caller afterwards even when the text put the old value back (an exit / return between): the alias writes are logged like the branch writes.
+// B1: a script file. F1: a sourced file with a return. F2: a ( ) subshell and a `bash -c` text.
+test('#362 R39-B1 / F1 / F2: an alias written and put back by a text that may end early (exit / return) is unsure for its caller', () => {
+  const SET_STATUS = 'git config alias.ship status';
+  const body = `${SHIP}\n__END__\n${SET_STATUS}`;
+  const rows = [
+    ['B1: script file with an exit between', `${SET_STATUS}; bash ./reset.sh; git ship`, { 'reset.sh': `#!/bin/bash\n${body.replace('__END__', 'exit 0')}\n` }],
+    ['B1: script file, the alias only put back to its value', `${SET_STATUS}; bash ./reset.sh; git ship`, { 'reset.sh': `#!/bin/bash\n${SET_STATUS}\n` }],
+    ['F1: sourced file with a return between', `${SET_STATUS}; . ./reset.sh; git ship`, { 'reset.sh': `${body.replace('__END__', 'return 0')}\n` }],
+    ['F1: sourced with `source`', `${SET_STATUS}; source ./reset.sh; git ship`, { 'reset.sh': `${body.replace('__END__', 'return 0')}\n` }],
+    ['F2: ( ) subshell with an exit between', `${SET_STATUS}; ( ${SHIP}; exit 0; ${SET_STATUS} ); git ship`, {}],
+    ['F2: bash -c text with an exit between', `${SET_STATUS}; bash -c '${SHIP.replaceAll('"', '\\"')}; exit 0; ${SET_STATUS}'; git ship`, {}],
+    ['F2: command substitution with an exit between', `${SET_STATUS}; x=$( ${SHIP}; exit 0; ${SET_STATUS} ); git ship`, {}],
+  ];
+  for (const [what, cmd, files] of rows) denies(what, cmd, files, ALIAS);
+  // (allow twins: a child that writes no alias leaves a known one alone)
+  allows('a script that writes no alias', `${SET_STATUS}; bash ./noop.sh; git ship`, { 'noop.sh': '#!/bin/bash\necho hi\n' });
+  allows('a sourced file that writes no alias', `${SET_STATUS}; . ./noop.sh; git ship`, { 'noop.sh': 'echo hi\n' });
+  allows('a subshell that writes no alias', `${SET_STATUS}; ( echo hi; exit 0 ); git ship`);
+});
+
+// R39-F3 / F4 (the arbiter's reading: a memo hit replays an end state without the writes of the first judgement): the same text run a second time in the same state is still unknown afterwards
+test('#362 R39-F3 / F4: a startup file or a line-written script judged once in a state is still unknown to its caller the second time', () => {
+  const rc = { rc: `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`, 'noop.sh': 'echo hi\n' };
+  denies('F3: BASH_ENV startup file, twice', `git switch agent/x; BASH_ENV=./rc bash ./noop.sh; git switch agent/x; BASH_ENV=./rc bash ./noop.sh; ${PB} origin HEAD`, rc, BRANCH);
+  const n = `echo '${SWITCH_MAIN}' > n.sh`;
+  denies('F4: a script written on the line, run twice, push on the line', `${n}; git switch agent/x; bash n.sh; git switch agent/x; bash n.sh; ${PB} origin HEAD`, {}, /may have been written by an earlier command on the line/);
+  denies('F4: the same, the push in a named script', `${n}; git switch agent/x; bash n.sh; git switch agent/x; bash n.sh; bash p.sh`, { 'p.sh': `${PB} origin HEAD\n` }, BRANCH);
+});
