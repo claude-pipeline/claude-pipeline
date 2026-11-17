@@ -220,15 +220,37 @@ test('vendor --check on a never-vendored repo lists everything as missing', asyn
   assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
 });
 
-// #550: a repo that runs no vendored CI guards (ci.guard_checks: false, as this repo's own config) has nothing to compare, so --check is not a drift alarm there.
-test('vendor --check on a repo with ci.guard_checks: false skips (exit 0, skipped names the setting) instead of listing every file as missing', async () => {
+// #550: the pipeline's own source repo (ci.guard_checks: false, no scripts/pipeline/, and the vendored files' sources at their own paths under it) is not a consumer: --check has nothing to compare there.
+// R2-B1: guard_checks: false alone, or with scripts/pipeline/ merely absent, is not enough: a consumer that deleted the folder must still see every file missing.
+test('vendor --check skips (exit 0, skipped says so) only for the pipeline source repo: guard_checks false, no scripts/pipeline/, the sources under pipeline/', async () => {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  cpSync(join(root, 'pipeline'), join(repo.dir, 'pipeline'), { recursive: true });
   const r = await vendorInto(repo.dir, ['--check']);
   assert.equal(r.exitCode, 0);
   assert.equal(r.output.ok, true);
-  assert.match(r.output.skipped, /ci\.guard_checks is false/);
+  assert.match(r.output.skipped, /pipeline source repo/);
   assert.equal(r.output.drift, undefined);
+});
+
+test('vendor --check with ci.guard_checks: false in a consumer repo whose scripts/pipeline/ was deleted still reports every file missing (R2-B1)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  await vendorInto(repo.dir);
+  rmSync(sp(repo.dir), { recursive: true });
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+  assert.equal(r.output.drift.length, ENTRIES.length + LIBS.length + 2);
+  assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
+});
+
+test('vendor --check with ci.guard_checks: false in a consumer repo that was never vendored into is still drift (only the pipeline source repo skips)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
 });
 
 test('vendor --check with ci.guard_checks: false still compares a repo that has scripts/pipeline/ (R1-B1: the flag does not govern the other vendored scripts)', async () => {
