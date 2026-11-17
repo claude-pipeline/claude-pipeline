@@ -207,3 +207,21 @@ test('live-db present --ask: prints the block as before plus ask = title + blank
   const data = await runLiveDb(['present', '--op', 'data', '--project', REF, '--sql-file', 'fix.sql', '--summary', 'fix', '--ask'], ctx);
   assert.equal(data.output.ask?.questions[0].question.split('\n\n')[0], `Run data SQL ${sha256Of(w.dataSql).slice(0, 12)} on ${LABEL} (${REF})? (${data.output.ask.askId})`, JSON.stringify(data.output));
 });
+
+test('live-db present --ask: a migration whose ask file would be over the 64 KB readers accept gets no ask (askSkipped names the size), so the owner types the go (R6-F2)', async (t) => {
+  const w = await world(t);
+  mkdirSync(join(w.repo.dir, '.claude'), { recursive: true });
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), `${ymlFor()}owner_approval: chat\n`);
+  const bigName = '20261117000002_big';
+  const bigFile = `supabase/migrations/${bigName}.sql`;
+  w.repo.write(bigFile, `${Array.from({ length: 250 }, (_, i) => `-- ${i} ${'x'.repeat(280)}`).join('\n')}\nalter table t add column d int;\n`);
+  const head = w.repo.commit('big');
+  const ctx = { home: w.home, cwd: w.repo.dir, env: {}, gh: { prView: () => ({ headRefOid: head }) }, managedPaths: [] };
+  const before = readdirSync(asksDir(w.home)).length;
+  const r = await runLiveDb(['present', '--op', 'migration', '--pr', '7', '--file', bigFile, '--project', REF, '--summary', 'big', '--ask'], ctx);
+  assert.equal(r.output.ok, true, JSON.stringify(r.output));
+  assert.ok(r.output.block.includes(bigName), 'the block is still printed for the typed go');
+  assert.equal(r.output.ask, null);
+  assert.match(r.output.askSkipped, /too-large: \d+ bytes/);
+  assert.equal(readdirSync(asksDir(w.home)).length, before, 'no ask file written');
+});

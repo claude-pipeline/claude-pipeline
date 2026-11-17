@@ -286,6 +286,9 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
       if (bound.error) return { error: `unbindable: ${bound.error}` };
     }
     if (!matchesInstalledDialog(ask, home)) return { error: 'unknown-dialog' }; // (R1-F4: readers refuse an ask the installed builders would not make, so never write one)
+    // R6-F2: every reader goes through readSmallJson, which refuses a file over SMALL_FILE_BYTES: an ask that big could never be answered, so it is never issued (the owner types the go).
+    const bytes = Buffer.byteLength(`${JSON.stringify(ask)}\n`, 'utf8');
+    if (bytes > SMALL_FILE_BYTES) return { error: `too-large: ${bytes} bytes, over the ${SMALL_FILE_BYTES} an ask file may hold` };
     const file = askFile(askId, 'json', home);
     if (writeExclusive(file, ask, home) !== 'ok') return { error: 'write-failed' };
     supersedeOlder(ask, home);
