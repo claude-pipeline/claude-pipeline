@@ -85,14 +85,43 @@ export function mergeAsk({ repo, pr, closing }) {
     actions: { 'Not yet': null, Merge: 'merge' },
   };
 }
-export function roundAsk({ repo, pr, line }) {
+// The round dialog's fixed variant set. Each variant is a frozen { options, actions } pair, immutable once shipped: a text change is a NEW id, never an edit (a test pins the sha256 of each). The ask
+// file names its variant, the verifier REBUILDS the dialog from this table (never from the file's own words), and a variant it does not know is an invalid ask. `round-v1` is the legacy
+// dialog, exactly as it always was (no recommendation); the `round-v2-*` ids put the recommended choice first, labelled "(Recommended)". An action is null (a decline), a string (the answer text the typed
+// parsers read) or { instruction: 'follow-up' }: a click that grants and approves nothing (admitClick). Only round-v2-follow-up has a Follow up option (the park variant deliberately has none).
+const NO_ROUND = { label: 'No', description: 'No more rounds now. Nothing is recorded.' };
+const YES_ROUND = { label: 'Yes, one more round', description: 'Grant exactly the one extra counted round shown above, the same as typing "extra round".' };
+const recommended = (o) => ({ label: `${o.label} (Recommended)`, description: o.description });
+const ROUND_VARIANTS = Object.freeze({
+  'round-v1': { options: [NO_ROUND, YES_ROUND], actions: { No: null, 'Yes, one more round': 'extra round' } },
+  'round-v2-follow-up': {
+    options: [
+      { label: 'Follow up (Recommended)', description: 'Take the unreviewed fixes out and file them as follow-up issues. No review round is granted and nothing is merged.' },
+      YES_ROUND, NO_ROUND,
+    ],
+    actions: { 'Follow up (Recommended)': { instruction: 'follow-up' }, 'Yes, one more round': 'extra round', No: null },
+  },
+  'round-v2-extra-round': { options: [recommended(YES_ROUND), NO_ROUND], actions: { 'Yes, one more round (Recommended)': 'extra round', No: null } },
+  'round-v2-park': {
+    options: [
+      { label: 'No, stop and park (Recommended)', description: 'No more rounds now. Park the PR for a person to decide what stays open. Nothing is recorded.' },
+      YES_ROUND,
+    ],
+    actions: { 'No, stop and park (Recommended)': null, 'Yes, one more round': 'extra round' },
+  },
+});
+export const ROUND_VARIANT_IDS = Object.freeze(Object.keys(ROUND_VARIANTS));
+export const ROUND_VARIANT_LEGACY = 'round-v1';
+// The ids an ask file may name (never the legacy one: a legacy ask is `v: 1` with no `variant` key, its one canonical encoding).
+const ROUND_V2_IDS = Object.freeze(ROUND_VARIANT_IDS.filter((id) => id !== ROUND_VARIANT_LEGACY));
+// `variant` omitted = the legacy dialog; an id outside the table (or any non-string) -> null. The parts of a legacy dialog carry no `variant` key, so an ask built from them is byte-identical to today's.
+export function roundAsk({ repo, pr, line, variant = ROUND_VARIANT_LEGACY }) {
+  if (typeof variant !== 'string' || !Object.hasOwn(ROUND_VARIANTS, variant)) return null;
+  const v = ROUND_VARIANTS[variant];
   return {
     kind: 'round', repo, prs: [pr], header: 'Extra round', title: `One more review round for #${pr}?`, block: line,
-    options: [
-      { label: 'No', description: 'No more rounds now. Nothing is recorded.' },
-      { label: 'Yes, one more round', description: 'Grant exactly the one extra counted round shown above, the same as typing "extra round".' },
-    ],
-    actions: { No: null, 'Yes, one more round': 'extra round' },
+    ...structuredClone({ options: v.options, actions: v.actions }), // (a copy: nothing a caller does to the parts may reach the table)
+    ...(variant === ROUND_VARIANT_LEGACY ? {} : { variant }),
   };
 }
 export function rulingAsk({ repo, pr, ids, line }) {
@@ -133,7 +162,7 @@ function installedParts(ask) {
   const block = q.slice(cut + 2);
   const one = (re) => { const m = re.exec(title); return m ? Number(m[1]) : null; };
   if (ask.kind === 'merge') { const pr = one(/^Merge #(\d{1,6})\?$/); return pr === null ? null : mergeAsk({ repo: ask.repo, pr, closing: block }); }
-  if (ask.kind === 'round') { const pr = one(/^One more review round for #(\d{1,6})\?$/); return pr === null ? null : roundAsk({ repo: ask.repo, pr, line: block }); }
+  if (ask.kind === 'round') { const pr = one(/^One more review round for #(\d{1,6})\?$/); return pr === null ? null : roundAsk({ repo: ask.repo, pr, line: block, variant: ask.variant ?? ROUND_VARIANT_LEGACY }); }
   if (ask.kind === 'ruling') {
     const pr = one(/^Your ruling on #(\d{1,6})\?$/);
     const asked = pr === null ? null : rulingBinding('x', q);
@@ -149,7 +178,7 @@ function installedParts(ask) {
 export function matchesInstalledDialog(ask) {
   try {
     const parts = installedParts(ask);
-    if (parts === null || parts.kind !== ask.kind) return false;
+    if (parts === null || parts.kind !== ask.kind || (parts.variant ?? null) !== (ask.variant ?? null)) return false;
     const want = canonicalDialog({ question: ask.dialog.question, header: parts.header, multiSelect: parts.multiSelect ?? false, options: parts.options });
     return want !== null && sortedJson(want) === sortedJson(ask.dialog) && sortedJson(parts.actions) === sortedJson(ask.actions)
       && sortedJson([...parts.prs].sort((x, y) => x - y)) === sortedJson([...ask.prs].sort((x, y) => x - y));
@@ -209,12 +238,15 @@ function readSmallJson(file) {
 }
 const marked = (askId, ext, home) => { const f = askFile(askId, ext, home); try { lstatSync(f); return true; } catch (err) { return err?.code !== 'ENOENT'; } }; // (any error but "absent" counts as present: fail closed)
 
+// An ask file's version rule: `v: 1` with NO `variant` key (the legacy encoding; `variant: null` is invalid), or `v: 2` on a round ask naming one of the round-v2 ids.
+const askVersionOk = (a) => isObj(a) && ((a.v === 1 && !Object.hasOwn(a, 'variant')) || (a.v === 2 && a.kind === 'round' && Object.hasOwn(a, 'variant') && ROUND_V2_IDS.includes(a.variant)));
+
 // The issued ask on disk, validated (its dialog and answer map must be the installed builders' own, R1-F4): { ok: true, ask } | { ok: false, reason: 'none' | 'invalid' }.
 export function readAsk(askId, { home = accountHome() } = {}) {
   const r = readSmallJson(askFile(askId, 'json', home));
   if (r.state === 'none') return { ok: false, reason: 'none' };
   const a = r.value;
-  if (r.state !== 'ok' || a?.v !== 1 || a.askId !== askId || !KINDS.includes(a.kind) || typeof a.repo !== 'string' || !Array.isArray(a.prs) || !isObj(a.actions) || !isObj(a.dialog)
+  if (r.state !== 'ok' || !askVersionOk(a) || a.askId !== askId || !KINDS.includes(a.kind) || typeof a.repo !== 'string' || !Array.isArray(a.prs) || !isObj(a.actions) || !isObj(a.dialog)
     || typeof a.dialogSha256 !== 'string' || a.dialogSha256 !== dialogSha256(a.dialog) || typeof a.issuedAt !== 'string' || !Number.isFinite(Date.parse(a.issuedAt))
     || (a.hookLayersSha256 !== null && typeof a.hookLayersSha256 !== 'string') || !matchesInstalledDialog(a)) return { ok: false, reason: 'invalid' };
   return { ok: true, ask: a };
@@ -234,10 +266,13 @@ function readSpent(askId, home) {
 // Writes `asks/<askId>.json` and returns { askId, questions: [dialog] } (the dialog the agent passes to AskUserQuestion VERBATIM), or { error } when the dialog could not bind or be written. The question
 // text is `<title> (<askId>)` + blank line + `block`; before writing, the SAME binding cores the recorder uses are run on it with every option's answer, so an ask whose closing lines would bind
 // nothing (or another PR / repository than `prs` / `repo`) is never issued. An older ask of the same kind, repository and PRs that is neither spent nor superseded is marked superseded.
-export function issueAsk({ kind, repo, prs, header, title, block, options, actions, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
+export function issueAsk({ kind, repo, prs, header, title, block, options, actions, variant, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
   try {
     const key = repoKey(repo);
     if (!KINDS.includes(kind) || key === null || !Array.isArray(prs) || prs.length === 0 || !prs.every(Number.isInteger) || typeof title !== 'string' || typeof block !== 'string' || !isObj(actions)) return { error: 'invalid' };
+    if (variant !== undefined && (kind !== 'round' || !ROUND_V2_IDS.includes(variant))) return { error: 'invalid' };
+    // an action is a decline (null), the answer text a typed parser reads (a string) or a follow-up instruction (round asks only)
+    if (!Object.values(actions).every((a) => a === null || typeof a === 'string' || (kind === 'round' && isInstruction(a)))) return { error: 'invalid-actions' };
     const labels = (options ?? []).map((o) => o?.label);
     if (labels.length === 0 || new Set(labels).size !== labels.length || !Object.keys(actions).every((l) => labels.includes(l)) || !labels.every((l) => Object.hasOwn(actions, l))) return { error: 'invalid-options' };
     if (!realDirChain(home, ASKS_REL)) return { error: 'unsafe-folder' };
@@ -249,10 +284,10 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
     if (askId === null) return { error: 'no-id' };
     const dialog = canonicalDialog({ question: `${title} (${askId})\n\n${block}`, header: header ?? 'Merge', multiSelect, options });
     if (dialog === null) return { error: 'invalid-dialog' };
-    const ask = { v: 1, askId, kind, repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
+    const ask = { v: variant === undefined ? 1 : 2, askId, kind, ...(variant === undefined ? {} : { variant }), repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
     // every approving answer must bind exactly this repository and these PRs, or the ask is useless (a typo in the block, a closing line of another PR)
     for (const label of labels) {
-      if (actions[label] === null) continue;
+      if (actions[label] === null || isInstruction(actions[label])) continue; // (a decline and an instruction bind nothing: neither can reach a record)
       const bound = bindAnswer(ask, actions[label], dialog.question);
       if (bound.error) return { error: `unbindable: ${bound.error}` };
     }
@@ -265,6 +300,8 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
     return { error: 'failed' };
   }
 }
+
+const isInstruction = (a) => isObj(a) && Object.keys(a).length === 1 && a.instruction === 'follow-up';
 
 // An older ask of the same kind + repository + PRs that is still answerable no longer is (a fresh dry run's ask replaces the one before it).
 function supersedeOlder(ask, home) {
@@ -330,6 +367,8 @@ function clickRecordOf({ body, session, text, cwd, transcriptPath, answeredAt, a
     prompt_id: null, transcript_path: transcriptPath, prompt: text, via: 'ask', ask, ...rest,
   };
 }
+// The record's pointer to its click. `variant` only when the ask is not the legacy dialog: a legacy click's record is byte-identical to what the code before the variants wrote.
+const askRefOf = (ask, toolUseId, clickId) => ({ askId: ask.askId, toolUseId, clickId, ...(ask.variant === undefined ? {} : { variant: ask.variant }) });
 const clickIdOf = (session, toolUseId, askId) => sha256(`${session}|${toolUseId}|${askId}`).slice(0, 16);
 
 // ---- the transcript evidence (B3 entry checks) --------------------------------------------------------------------------------------------
@@ -482,7 +521,7 @@ function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home
   const made = write(askFile(askId, 'spent', home), marker, home);
   if (made === 'exists') return lost();
   if (made !== 'ok') return { refused: 'write-failed', retry: true };
-  const record = append(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: ev.answeredAt, ask: { askId, toolUseId, clickId } }));
+  const record = append(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: ev.answeredAt, ask: askRefOf(ask, toolUseId, clickId) }));
   return record === null ? { refused: 'record-write-failed', retry: true } : { recorded: record, kind: ask.kind };
 }
 
@@ -497,7 +536,7 @@ function finishReplay({ spent, ask, clickId, ev, session, cwd, home, transcriptP
   if (mapped.error) return { refused: mapped.error };
   const bound = bindAnswer(ask, mapped.text, ev.question);
   if (bound.error) return { refused: bound.error };
-  const record = (io.appendRecord ?? appendRecord)(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: spent.answeredAt, ask: { askId: ask.askId, toolUseId: spent.toolUseId, clickId } }));
+  const record = (io.appendRecord ?? appendRecord)(home, session, clickRecordOf({ body: bound.body, session, text: mapped.text, cwd, transcriptPath, answeredAt: spent.answeredAt, ask: askRefOf(ask, spent.toolUseId, clickId) }));
   return record === null ? { refused: 'record-write-failed', retry: true } : { recorded: record, kind: ask.kind, replay: true };
 }
 
@@ -813,6 +852,7 @@ export function clickProvenance(record, { home = accountHome() } = {}) {
     const loaded = readAsk(a.askId, { home });
     if (!loaded.ok) return loaded.reason === 'none' ? 'missing' : 'synthetic';
     const { ask } = loaded;
+    if ((Object.hasOwn(a, 'variant') ? a.variant : undefined) !== ask.variant) return 'synthetic'; // (the record names the dialog variant the ask file names, absent = legacy: a record cannot be re-pointed at another dialog)
     const spent = readSpent(a.askId, home);
     if (spent.state === 'none') return 'missing';
     if (spent.state !== 'ok') return 'synthetic';
