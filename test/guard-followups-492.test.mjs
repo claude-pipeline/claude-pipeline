@@ -270,6 +270,12 @@ describe('#505 over-denial check: a readable sourced file with no git / .git wri
     expect('deny', 'source "$(mktemp)"; cd /work/repo/sub; git push', FILES);
     expect('deny', 'source ~/.cache/*.sh; cd /work/repo/sub; git push', FILES);
   });
+  // (R1-B1: `~+` is $PWD, `~-` is $OLDPWD, `~user` a home directory: the shell sources a real file, so only a leading `~/` (or `~`) is spelled as a path the guard knows)
+  for (const w of ['~+/env.sh', '~-/env.sh', '~user/env.sh']) {
+    test(`a sourced ${w} is not a missing file: every branch stays unknown (denied)`, () => {
+      expect('deny', `source ${w}; cd /work/repo/sub; git push`, FILES);
+    });
+  }
   OK('bash build.sh; git push');
   test('but a sourced file that does switch the branch still denies', () => {
     expect('deny', 'source env.sh; git push', { [resolve('/work/repo/env.sh')]: 'git checkout main\n' });
