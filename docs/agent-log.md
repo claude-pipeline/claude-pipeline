@@ -239,3 +239,4 @@ full record.
 - 2026-11-17 · #590 · test: load-proof the remaining flaky tests (#362 follow-ups) · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge · Codex 7d: 16911 runs (16367 high)
 - 2026-11-17 · #574 · Click/merge follow-ups from #527: clean-status merge retry, newest-first clicks, wording · risk high · rounds 6 · arbiter 4 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 17027 runs (16482 high)
 - 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 14 · arbiter 11 · substitute 1 · awaiting-owner-merge · Codex 7d: 17073 runs (16526 high)
+- 2026-11-17 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 7 · arbiter 6 (fix-verify 2) · blocked · Codex 7d: 17528 runs (16973 high)
