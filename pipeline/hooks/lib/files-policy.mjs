@@ -6012,9 +6012,9 @@ function evaluateBashForFilesFrame(command, opts) {
 
   // A read-only command can still feed a writer further down the pipe (find ... | xargs rm, ls ... | sh).
   // (#563: the word `parallel` / `xargs` in a quoted prose argument (a PR title in `pipeline summary --built "…"`) is data: quoted text of a plain data command is blanked)
-  // (R1-B2 / R2-F1: only a plain data command is blanked; quoted text stays when it may run: inline code, a wrapper (WRAPPER_CMDS), find -exec, a shell named in argv, or a written first word that is not argv[0] (the parser unwrapped it or it cannot be read))
+  // (R1-B2 / R2-F1: only a plain data command is blanked; quoted text stays when it may run: inline code, a wrapper (WRAPPER_CMDS), find -exec, a shell or another interpreter (INTERPRETERS) named in argv, or a written first word that is not argv[0] (the parser unwrapped it or it cannot be read))
   const rawHead = (c) => baseOf((c.raw ?? '').trim().split(/\s+/).find((w) => !/^[A-Za-z_]\w*=/.test(w)) ?? ''); // (the parser unwraps `env -S 'nice xargs rm'` to argv [rm]: the written first word is the wrapper)
-  const runsText = (c) => runsInlineCode(c, ctx) || WRAPPER_CMDS.has(rawHead(c)) || c.argv.some((w) => WRAPPER_CMDS.has(baseOf(w))) || rawHead(c) !== baseOf(c.argv[0] ?? '') || c.argv.some((w) => SHELL_NAMES.has(baseOf(w))) || (baseOf(c.argv[0] ?? '') === 'find' && c.argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
+  const runsText = (c) => runsInlineCode(c, ctx) || WRAPPER_CMDS.has(rawHead(c)) || c.argv.some((w) => WRAPPER_CMDS.has(baseOf(w))) || rawHead(c) !== baseOf(c.argv[0] ?? '') || c.argv.some((w) => SHELL_NAMES.has(baseOf(w))) || c.argv.some((w) => INTERPRETERS.test(baseOf(w)) && !INLINE_RUNNERS.test(baseOf(w))) || (baseOf(c.argv[0] ?? '') === 'find' && c.argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
   const fansOut = (c) => FAN_OUT_RE.test(runsText(c) ? c.raw : (withoutLiteralText(c.raw, { dqData: true }) ?? c.raw));
   if (cmds.some((c) => fansOut(c) || (SHELL_NAMES.has(baseOf(c.argv[0] ?? '')) && !isReadOnly(c, ctx)))) return deny('the command refers to a protected pipeline file and hands work to xargs or a shell, which could modify it');
 

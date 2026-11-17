@@ -221,6 +221,9 @@ const BASH_DENY = [
   // (#563 R2-F1: a head the parser unwraps but WRAPPER_CMDS lacks, and a shell named behind an unlisted runner, keep their quoted text too)
   ['noglob env -S runs a quoted string that fans out', "find ~/.claude/pipeline -type f | noglob env -S 'nice xargs rm'"],
   ['gtimeout runs sh -c with a fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 sh -c 'cat | xargs rm'"],
+  // (#563 R3-F1: every INTERPRETERS name keeps its quoted text, not only the SHELL_NAMES list)
+  ['ash -c runs a quoted fan-out', "find ~/.claude/pipeline -type f | ash -c 'cat | xargs rm'"],
+  ['mksh behind gtimeout runs a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 mksh -c 'cat | xargs rm'"],
   ['xargs inside a substitution in a quoted argument (#563: quoted prose is blanked, a substitution is not)', 'echo "$(find ~/.claude/pipeline -type f | xargs rm)"'],
   ['sh fed by a read-only listing', "find ~/.claude/pipeline -type f -printf 'rm %p\\n' | sh"],
   ['eval of a substitution', 'eval "$(cat ~/.claude/pipeline/VERSION)"'],
