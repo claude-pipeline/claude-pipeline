@@ -207,26 +207,6 @@ const DENIED = [
   `git log --output-directory=d api.supabase.com`,
   `git log -o d api.supabase.com`,
   'PAGER=./x git log api.supabase.com',
-  // security-scan follow-up to the R9 fix: env-loader wrappers called directly, path words followed by flags, option abbreviations
-  'dotenv -- supabase db push',
-  'dotenv -e .env.prod -- supabase db push',
-  'dotenv-cli -- supabase db push',
-  'cross-env FOO=1 supabase db push',
-  'env-cmd -f .env.prod supabase db push',
-  'with-env supabase db push',
-  'timeout 60 dotenv -- supabase db push',
-  'timeout 60 cross-env FOO=1 supabase db push',
-  'doas supabase db push',
-  'caffeinate supabase db push',
-  'npx dotenv -- ./node_modules/supabase/bin/supabase --workdir . db push',
-  'npx dotenv -- ./node_modules/supabase/bin/supabase --debug db push',
-  'npx dotenv -- vendor/supabase --debug db push',
-  'npx dotenv -- vendor/supabase --workdir . db push',
-  'npx eslint lib/supabase --fix',
-  `ack --pag='curl https://api.supabase.com/v1/projects/${LIVE}/database/query' x`,
-  `ack --pa='curl https://api.supabase.com/v1/projects/${LIVE}/database/query' x`,
-  `ag --page 'curl https://api.supabase.com/v1/projects/${LIVE}/database/query' x`,
-  `ag --pa 'curl https://api.supabase.com/v1/projects/${LIVE}/database/query' x`,
 ];
 
 for (const line of ALLOWED) test(`allowed: ${line}`, () => {

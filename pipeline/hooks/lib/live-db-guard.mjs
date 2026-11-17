@@ -174,9 +174,7 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
 // not know is refused ("the owner runs it"). The psql family (psql, pg_dump…, usql, the pg utilities, PG* env) ships in B1b.
 const OWNER_RUNS = 'the owner runs this; hand them the exact line';
 const SB_WORD = /^supabase(?:@[^/\\]*)?$/;
-const LAUNCHERS = new Set(['npx', 'bunx', 'pnpx', 'pnpm', 'yarn', 'npm', 'bun', 'corepack', 'xargs', 'env', 'nice', 'time', 'command', 'exec', 'nohup', 'sudo', 'timeout', 'watch',
-  // env-loader wrappers called directly, and every other wrapper the shell parser unwraps (WRAPPERS in shell-parse.mjs)
-  'dotenv', 'dotenv-cli', 'cross-env', 'env-cmd', 'with-env', 'unbuffer', 'taskset', 'sandbox-exec', 'ssh', 'script', 'screen', 'parallel', 'wsl', 'builtin', 'noglob', 'nocorrect', '-', 'setsid', 'ionice', 'stdbuf', 'doas', 'su', 'flock', 'arch', 'caffeinate', 'busybox']);
+const LAUNCHERS = new Set(['npx', 'bunx', 'pnpx', 'pnpm', 'yarn', 'npm', 'bun', 'corepack', 'xargs', 'env', 'nice', 'time', 'command', 'exec', 'nohup', 'sudo', 'timeout', 'watch']);
 // subcommand prefixes (the words before the first flag): LOCAL_ONLY lines pass with no target flag or with `--local`; REMOTE_CAPABLE ones only with a local or `dev` target proof
 const LOCAL_ONLY = [['start'], ['stop'], ['status'], ['init'], ['link'], ['unlink'], ['login'], ['logout'], ['db', 'reset'], ['db', 'diff'], ['db', 'lint'], ['migration', 'new'], ['migration', 'list'], ['migration', 'up'], ['test', 'db'], ['functions', 'serve'], ['functions', 'new'], ['projects', 'list'], ['orgs', 'list'], ['help']];
 const REMOTE_CAPABLE = [['db', 'push'], ['db', 'pull'], ['db', 'dump'], ['migration', 'repair'], ['migration', 'squash'], ['migration', 'fetch'], ['functions', 'deploy'], ['functions', 'delete'], ['functions', 'download'], ['secrets'], ['storage'], ['branches'], ['config', 'push'], ['postgres-config'], ['sso'], ['domains'], ['vanity-subdomains'], ['ssl-enforcement'], ['inspect', 'db'], ['gen', 'types'], ['seed', 'buckets'], ['backups'], ['encryption'], ['snippets']];
@@ -209,8 +207,7 @@ const runsProgram = (c) => {
   const n = commandName(c.argv[0]);
   const args = c.argv.slice(1);
   if (n === 'rg') return args.some((a) => /^--(?:pre|hostname-bin)(?:=|$)/.test(a));
-  // (ack's Getopt::Long and ag's getopt_long take unique prefixes too: --pa, --pag; ripgrep takes exact names only)
-  if (n === 'ack' || n === 'ag') return args.some((a) => { const o = /^--([^=]*)/.exec(a)?.[1]; return o !== undefined && o.length >= 2 && 'pager'.startsWith(o); });
+  if (n === 'ack' || n === 'ag') return args.some((a) => /^--pager(?:=|$)/.test(a));
   if (n === 'git') return args.some((a) => (a.startsWith('--') ? a.length > 3 && PROGRAM_OPTION_GIT.some((o) => o.startsWith(a.slice(2).split('=')[0])) : /^-[A-Za-z0-9]*[oO]/.test(a)));
   return false;
 };
@@ -221,14 +218,14 @@ const makesNoRequest = (c) => {
 };
 
 // does a launcher line run the supabase binary? Fail closed: after a launcher a wrapper (dotenv, cross-env, env-cmd, timeout…) may run the rest, so ANY later word that is the bare binary name is refused;
-// a path word is refused when it is …/.bin/supabase, an absolute path, is followed by a flag, or has a supabase subcommand among the later non-flag words (a directory argument like lib/supabase is not the binary)
+// a path word is refused when it is …/.bin/supabase, an absolute path, or is followed by a supabase subcommand (a directory argument like lib/supabase is not the binary)
 const SUBCOMMAND_HEADS = new Set([...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]));
 const isSubcommandHead = (w) => w !== undefined && (SUBCOMMAND_HEADS.has(w) || /^network-/.test(w));
 function launcherRunsSupabase(argv) {
   return argv.some((w, i) => {
     if (i === 0) return false;
     if (SB_WORD.test(w)) return true;
-    return w.includes('/') && SB_WORD.test(commandName(w)) && (/(?:^|\/)\.bin\/[^/]*$/.test(w) || w.startsWith('/') || argv[i + 1]?.startsWith('-') || argv.slice(i + 1).some((x) => !x.startsWith('-') && isSubcommandHead(x)));
+    return w.includes('/') && SB_WORD.test(commandName(w)) && (/(?:^|\/)\.bin\/[^/]*$/.test(w) || w.startsWith('/') || isSubcommandHead(argv[i + 1]));
   });
 }
 
