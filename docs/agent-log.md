@@ -249,3 +249,4 @@ full record.
 - 2026-11-17 · #596 · Housekeeping: tests never write the real Codex usage log, Windows process-table retry, behind_base disjoint · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge · Codex 7d: 2372 runs (2020 high)
 - 2026-11-17 · #611 · Round discipline 2, PR B1: the pipeline understands the recommended-first round dialog and a checked Follow up click (issues none yet) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · substitute 1 · awaiting-owner-merge · Codex 7d: 2372 runs (2020 high)
 - 2026-11-17 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 10 · arbiter 9 (fix-verify 4) · blocked · Codex 7d: 485 runs (126 high)
+- 2026-11-17 · #616 · test(cli-local): give the guard a short line in the still-running job test (#614) · risk low · rounds 2 · arbiter 0 · awaiting-owner-merge · Codex 7d: 486 runs (126 high)
