@@ -65,6 +65,9 @@ passed (bug not real) with the one-line output. The controller records the resul
 - Never apply migrations to a remote database, never call deployment or database MCP tools.
 - If the pipeline guard blocks a command, stop and report BLOCKED with the command; never work
   around it (no wrappers or alternate spellings).
+- A test file that quotes a dangerous command (a push to main, an approval label) is written with the Write
+  tool, or builds the string at run time; never inside a `node -e` / `python -c` program text, which the
+  guard scans on purpose and refuses.
 - Stay in scope. If the task needs a decision the controller didn't make (two valid designs,
   touching an unrelated module, a hard-stop area like auth/RLS/payroll), stop and report
   `NEEDS_CONTEXT` instead of guessing.
