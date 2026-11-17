@@ -100,6 +100,22 @@ describe('#505: every branch is unknown, also the ones no entry was made for', (
   });
 });
 
+describe('#554: a mark set inside a failure group survives when the nested text goes on after the group', () => {
+  // production failure: `bash build.sh; git push` on agent/x was allowed although the group's script switched the repository to main (the next line of the text restored the mark to false)
+  // (a plain trailing line: the issue's `npm run build` is denied for a package-script reason of its own)
+  const GROUP = 'cd dist || { bash /work/repo/cleanup.sh; exit 1; }\n';
+  const FILES = { [CLEAN]: 'git checkout main\n' };
+  test('a line after the group in the script (the #505 fixture plus a trailing line): denied', () => {
+    expect('deny', 'bash build.sh; git push', { ...FILES, [BUILD]: `make\n${GROUP}echo built\n` });
+  });
+  test('#506 shape: a failure group that writes .git/HEAD, then any line: denied', () => {
+    expect('deny', 'bash build.sh; git push', { [BUILD]: "cd dist || { echo 'ref: refs/heads/main' > /work/repo/.git/HEAD; exit 1; }\nmake\n" });
+  });
+  test('reference: an inert group followed by a line keeps the caller branch (allowed)', () => {
+    expect('allow', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\necho built\n' });
+  });
+});
+
 // ---- #506 ----
 describe('#506: a write that may land under a repository\'s .git makes its branch unknown', () => {
   const GIT_HEAD = '/work/repo/.git/HEAD';

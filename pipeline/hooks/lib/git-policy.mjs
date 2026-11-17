@@ -3421,7 +3421,12 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup && failGroup.snap === null) {
       failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]), unknown: ctx.branchesUnknown === true };
       forgetState();
-    } else if (failGroup && i > failGroup.to) restoreAfterGroup();
+    } else if (failGroup && i > failGroup.to) {
+      // (#554: in a nested text the group's exit ends only that text, so the group may have run when the caller goes on: unless the group is inert (the end-of-text test below) the branches stay unknown)
+      const inert = level === 0 || cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx));
+      restoreAfterGroup();
+      if (!inert) forgetBranches(ctx);
+    }
     settle(c, i); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
     if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, mover: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
     // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
