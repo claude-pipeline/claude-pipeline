@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
 import path from 'node:path';
-import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore, settleEnabled } from './owner-go.mjs';
+import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore } from './owner-go.mjs';
 import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.mjs';
 import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
@@ -77,7 +77,7 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
   if (typeof sessionId !== 'string' || sessionId === '') return { status: 'none', reason: 'the call carries no session id' };
   // A click the owner has just made may still be a pending pointer (Claude Code 2.1.323 writes the answer to the transcript only after the PostToolUse hook returns): verify it now, before the read below.
   // `waiting`: a live-database click of this session that could not be settled yet.
-  const settled = settleEnabled() ? settlePendingClicks({ home, now, session: sessionId }) : { outcomes: [] };
+  const settled = settlePendingClicks({ home, now, session: sessionId });
   const waiting = settled.outcomes.some((o) => (o.outcome === 'waiting' || o.outcome === 'retry') && readAsk(o.askId, { home }).ask?.kind === 'live-db');
   const records = liveDbRecords({ home, session: sessionId, now })
     .filter((r) => r.op === op && r.projectRef === projectRef && r.sqlSha256 === sqlSha256 && (op !== 'migration' || r.name === name))
