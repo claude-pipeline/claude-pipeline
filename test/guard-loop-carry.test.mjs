@@ -7,6 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
+// (Windows: the guard resolves a directory to D:\\work\\repo; the fake repositories are named by their POSIX path)
+const unwin = (d) => String(d).replace(/^[A-Za-z]:/, '').replaceAll('\\', '/');
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 
 const PUSH = 'pu' + 'sh';
@@ -35,7 +37,7 @@ function fakeFs(root, files) {
 }
 // (the repository at GIT_ROOT is on agent/x; any other directory, /work/other for one, is a repository on main)
 const run = (cmd, files = {}) => evaluateGitCommand(cmd, {
-  cwd: GIT_ROOT, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
+  cwd: GIT_ROOT, home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
 });
 // package.json whose `setup` script is `setup`; `other` is harmless
 const pkg = (setup) => ({ 'package.json': JSON.stringify({ name: 'x', scripts: { setup, other: 'echo hi' } }) });
@@ -291,7 +293,7 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
 // cwd a repository on main, reset.sh = `git switch agent/x > /missing/f`, the line `bash ./reset.sh; <push>` sends main when the redirection fails)
 test('#352 R37-F1: a script / package script that ends in a redirected or conditional switch does not hand the switched branch to its caller', () => {
   const at = (cmd, files) => evaluateGitCommand(cmd, {
-    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', files),
+    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', files),
   });
   const files = (body) => ({ 'reset.sh': `#!/bin/bash\n${body}\n`, 'package.json': JSON.stringify({ name: 'x', scripts: { reset: body, other: 'echo hi' } }) });
   // (#352 R37-F1, same root: a switch that only a branch body made (if / elif / else / case, a function body, a loop over words not named) is as unsettled when the text ends)
@@ -329,7 +331,7 @@ test('#352 R37-F1: a script / package script that ends in a redirected or condit
 // `bash ./reset.sh; <push>` from main sends main when the redirection fails)
 test('#352 R38: a script / package script ending in a level that may not have run does not hand its switched branch to its caller', () => {
   const at = (cmd, files) => evaluateGitCommand(cmd, {
-    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', files),
+    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', files),
   });
   const files = (body) => ({ 'reset.sh': `#!/bin/bash\n${body}\n`, 'package.json': JSON.stringify({ name: 'x', scripts: { reset: body, other: 'echo hi' } }) });
   const bodies = [
@@ -369,7 +371,7 @@ test('#352 R38: a script / package script ending in a level that may not have ru
 // reads the switch as reached and the caller goes on on main. What the text changed, or may have changed, is unknown for the caller afterwards; a text that changed nothing leaves it as it was)
 test('#352 R38-F2: a script / package script / bash -c text / sourced file never hands a state change to its caller (it may have ended before it)', () => {
   const at = (cmd, files, cwd = '/work/other') => evaluateGitCommand(cmd, {
-    cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(cwd, files),
+    cwd, home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(cwd, files),
   });
   const files = (body) => ({ 'reset.sh': `#!/bin/bash\n${body}\n`, 'package.json': JSON.stringify({ name: 'x', scripts: { reset: body, other: 'echo hi' } }) });
   const bodies = [
@@ -416,7 +418,7 @@ test('#352 R38-F2: a script / package script / bash -c text / sourced file never
 // Held already by the level close (a change in a sub level makes the branches unknown); pinned here, in a line and in a script run by bash, with the twins that change nothing)
 test('#352 R38-F2: a subshell / command substitution never hands a state change to the commands after it (it may have exited before it)', () => {
   const at = (cmd, files, cwd) => evaluateGitCommand(cmd, {
-    cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(cwd, files),
+    cwd, home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(cwd, files),
   });
   const levels = [
     '( exit 0; git switch agent/x ); PUSH', '( [ -f s ] && exit 0; git switch agent/x ) && PUSH', 'x=$(exit 0; git switch agent/x); PUSH', 'echo "$( [ -f s ] && exit 0; git switch agent/x )"; PUSH',

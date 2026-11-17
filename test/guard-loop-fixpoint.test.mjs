@@ -7,6 +7,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
+// (Windows: the guard resolves a directory to D:\\work\\repo; the fake repositories are named by their POSIX path)
+const unwin = (d) => String(d).replace(/^[A-Za-z]:/, '').replaceAll('\\', '/');
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 
 const PUSH = 'pu' + 'sh';
@@ -36,7 +38,7 @@ function fakeFs(root, files) {
 }
 // (the repository at GIT_ROOT is on agent/x, so is /work/other2; any other directory is a repository on main, /work/main for one)
 const run = (cmd, files = {}, cwd = GIT_ROOT) => evaluateGitCommand(cmd, {
-  cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) || String(d).startsWith('/work/other2') ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
+  cwd, home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) || unwin(d).startsWith('/work/other2') ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files),
 });
 const pkgOf = (scripts) => ({ 'package.json': JSON.stringify({ name: 'x', scripts }) });
 const SCRIPTS = pkgOf({ setup: SWITCH_MAIN, reset: RESET, ship: SHIP, other: 'echo hi' });

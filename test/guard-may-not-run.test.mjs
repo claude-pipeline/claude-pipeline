@@ -5,6 +5,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
+// (Windows: the guard resolves a directory to D:\\work\\repo; the fake repositories are named by their POSIX path)
+const unwin = (d) => String(d).replace(/^[A-Za-z]:/, '').replaceAll('\\', '/');
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 
 const PUSH = 'pu' + 'sh';
@@ -33,7 +35,7 @@ function fakeFs(files) {
 }
 // (the repository at GIT_ROOT is on agent/x, so is /work/other2; any other directory (/work/main, /safe) is a repository on main)
 const run = (cmd, files = {}, cwd = MAIN_DIR) => evaluateGitCommand(cmd, {
-  cwd, home: '/home/u', currentBranch: (d) => (String(d).startsWith(GIT_ROOT) || String(d).startsWith('/work/other2') ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(files),
+  cwd, home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) || unwin(d).startsWith('/work/other2') ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(files),
 });
 const denies = (what, cmd, files = {}, cwd = MAIN_DIR) => { const r = run(cmd, files, cwd); assert.equal(r.decision, 'deny', `${what}: allowed`); assert.match(r.reason, BAD, `${what}: ${r.reason}`); };
 // (a line the parser gives up on, truncated: denied whatever the reason)

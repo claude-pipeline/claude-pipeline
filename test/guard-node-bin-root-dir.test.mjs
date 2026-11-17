@@ -238,7 +238,8 @@ test('#352 R1-B1 control: the same switch run in a directory that is known (no l
 test('#352 R1-F1: a script run through a link in another directory is refused like the real path', () => {
   const bad = (g) => `#!/bin/sh\n${BAD[g]}\n`;
   const files = { ...project('git', { start: 'evil' }, bad), 'node_modules/.bin/evil': bad('git'), 'scripts/serve.sh': '#!/bin/zsh\ncd "${0:A:h:h}" || exit 1\nexec npm start\n', '/home/u/bin/serve': '#!/bin/zsh\ncd "${0:A:h:h}" || exit 1\nexec npm start\n' };
-  const linkReal = (p) => (p === '/home/u/bin/serve' ? `${GIT_ROOT}/scripts/serve.sh` : p);
+  // (Windows: the guard asks for D:\home\u\bin\serve; the link is named by its POSIX path)
+  const linkReal = (p) => (String(p).replace(/^[A-Za-z]:/, '').replaceAll('\\', '/') === '/home/u/bin/serve' ? `${GIT_ROOT}/scripts/serve.sh` : p);
   assert.equal(run('git', `${GIT_ROOT}/scripts/serve.sh`, files).decision, 'deny', 'real path');
   const r = run('git', '/home/u/bin/serve', files, { realpath: linkReal });
   assert.equal(r.decision, 'deny', r.reason);
