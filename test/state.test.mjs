@@ -22,8 +22,10 @@ import {
   stateNeedsPostMaxVersion,
   maxRiskOf,
   stateNeedsOutOfModelVersion,
+  requiredStateVersion,
   withStateVersion,
 } from '../pipeline/lib/state.mjs';
+import { adoptPublishedGrants } from '../pipeline/lib/review-context.mjs';
 
 function tmp() {
   return mkdtempSync(join(tmpdir(), 'cp-state-'));
@@ -659,4 +661,50 @@ test('resolutionIneligible: addRound keeps the short code only when given; a sta
   const plain = addRound(base, round);
   assert.equal('resolutionIneligible' in plain.rounds[0], false, 'no key when none was given: older rounds stay as they were');
   assert.equal(plain.version, 1, 'the key needs no state version bump');
+});
+
+// ---- version 8: a round whose owner grant carries askVariant (round discipline 2, PR B1) -------------------------------------------------------------------
+
+const clickGrant = { grantId: 'g'.repeat(16), k: 1, quote: 'extra round', ownerTs: '2026-11-17T10:00:00.000Z', askVariant: 'round-v2-follow-up' };
+const grantOn = (state, ownerGrant) => ({ ...state, rounds: state.rounds.map((r) => ({ ...r, ownerGrant })) });
+
+test('askVariant survives save, load, publish and decode at version 8; a state restore that adopts the PR\'s click grant lifts a version-1 copy to 8; replacing the grant with a typed one never lowers it', () => {
+  // failure caught: a click-variant grant written into a state that still says version 1 (an older pipeline would read the grant as one it can verify), or a marker lost on its way through the comment or a restore
+  const dir = tmp();
+  try {
+    const plain = addRound(emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' }), { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [] });
+    const marked = grantOn(plain, clickGrant);
+    saveState(dir, marked); // a writer that never set the version
+    const loaded = loadState(dir);
+    assert.deepEqual([loaded.version, loaded.rounds[0].ownerGrant.askVariant], [STATE_VERSION_CLICK_DIALOG, 'round-v2-follow-up']);
+    const published = decodeFromComment(encodeForComment(marked));
+    assert.deepEqual([published.version, published.rounds[0].ownerGrant], [STATE_VERSION_CLICK_DIALOG, clickGrant]);
+    // `state show` restore: the local copy (no grant, version 1) takes the PR's grant and is saved
+    const restored = adoptPublishedGrants(plain, published);
+    assert.deepEqual(restored.restored, [1]);
+    saveState(dir, restored.state);
+    assert.deepEqual([loadState(dir).version, loadState(dir).rounds[0].ownerGrant.askVariant], [STATE_VERSION_CLICK_DIALOG, 'round-v2-follow-up']);
+    // past-round re-approval: the replacing grant is typed (no askVariant); the state keeps 8
+    const typed = { grantId: 't'.repeat(16), k: 1, quote: 'approve round', ownerTs: '2026-11-17T11:00:00.000Z', past: true };
+    saveState(dir, grantOn(loaded, typed));
+    assert.equal(loadState(dir).version, STATE_VERSION_CLICK_DIALOG);
+    assert.equal(decodeFromComment(encodeForComment(grantOn(loaded, typed))).version, STATE_VERSION_CLICK_DIALOG);
+    // a typed or legacy-click grant alone needs no lift
+    assert.equal(requiredStateVersion(grantOn(plain, { ...typed, past: undefined })), 1);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('requiredStateVersion returns the HIGHEST version any feature needs: 8 click grant, 6 post-max, 5 out-of-model, 4 substitute, else 1', () => {
+  // failure caught: a state holding several features written at the lowest of them, so the oldest install that still reads it misreads the rest
+  const withFinal = (final) => ({ ...addRound(emptyState({ repo: 'o/r', pr: 3, branch: 'b' }), { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [it('R1-B1', { final })] }) });
+  const base = { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r' };
+  const all = withFinal({ ...base, outOfModel: 'a model', postMax: { at: '2026-11-17T10:00:00.000Z' } });
+  const withSub = { ...all, rounds: all.rounds.map((r) => ({ ...r, firstReviewer: 'substitute' })) };
+  assert.equal(requiredStateVersion(grantOn(withSub, clickGrant)), 8);
+  assert.equal(requiredStateVersion(withSub), STATE_VERSION_POST_MAX);
+  assert.equal(requiredStateVersion(withFinal({ ...base, outOfModel: 'a model' })), STATE_VERSION_OUT_OF_MODEL);
+  assert.equal(requiredStateVersion({ ...withFinal(base), rounds: withFinal(base).rounds.map((r) => ({ ...r, firstReviewer: 'substitute' })) }), STATE_VERSION_SUBSTITUTE);
+  assert.equal(requiredStateVersion(withFinal(base)), 1);
 });
