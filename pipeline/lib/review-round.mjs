@@ -99,6 +99,9 @@ export const requiredBase = (st, forkPoint) => {
   const last = st?.rounds.at(-1);
   return last && !wholePrOwed(st) ? last.toHead : forkPoint;
 };
+// What `codex-review --plan` prints: `base` is the base the NEXT admitted round must use (requiredBase, the one rule checkBase enforces, so `--base <plan.base>` is admitted); `reviewBase` / `reviewBaseKind` are the
+// start and kind of the range the round actually REVIEWS (a merge from main can make that the fork point or a synthetic merge-tree id: never a value `--base` takes).
+export const planRange = (adm) => ({ base: requiredBase(adm.state, adm.forkPoint), reviewBase: adm.review.base, reviewBaseKind: adm.review.kind });
 export const checkBase = (st, { round, base, forkPoint }) => {
   const last = st?.rounds.at(-1);
   const owed = last !== undefined && wholePrOwed(st);
@@ -480,7 +483,7 @@ export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
     }
   }
   return {
-    ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom,
+    ...decision, round, ...planRange(adm), wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom,
     ...(effortNote === undefined ? {} : { effortNote }), codexModel: route.codexModel, codexModelFrom: route.codexModelFrom,
   };
 }

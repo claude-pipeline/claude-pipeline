@@ -27,7 +27,7 @@ import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs
 import { DEFAULTS } from '../lib/config.mjs';
 import { headSha, revParse } from '../lib/git.mjs';
 import { hashBranch } from '../lib/risk.mjs';
-import { admitRound, baseOnlyFindings, effortNoteText, headMoved, modelNoteFor, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
+import { admitRound, baseOnlyFindings, effortNoteText, headMoved, modelNoteFor, planRange, planRound, recordRound, roundPrompt, routeConfigFor, unavailable } from '../lib/review-round.mjs';
 import { roundDir, writeFileAtomic } from '../lib/review-context.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { noteCodexAnswered, noteQuotaStop, recordCodexRun } from '../lib/codex-usage.mjs';
@@ -47,7 +47,7 @@ export const meta = {
     '    except that a small fix-check (the reviewed range is at most review.effort.small_fix_lines changed lines, adds no new file and touches no risk.high_risk_paths / review.arbiter_always_paths path) and, while the weekly Codex quota used is',
     '    at least review.codex_budget.soft, every other round that is not protected use review.effort.small_fix. Protected rounds always keep the normal effort: round 1, the first round after a maxRisk rise (or one that sees the rise),',
     '    a round with confirmFixed items, a resolution-only round, a whole-PR round that is owed. The round records effort; a round the governor lowered also records governor:{usedPct, threshold, observedAt} (state version 4)',
-    '  --plan prints what the round would do and runs nothing, writes no route.json and no round: {ok, plan:{route: codex|substitute, evidence: none|budget|governor, effort, why, round, base, wholePrOwed, protected, small, lowered?, budget:{used, budget},',
+    '  --plan prints what the round would do and runs nothing, writes no route.json and no round: {ok, plan:{route: codex|substitute, evidence: none|budget|governor, effort, why, round, base (the base to pass as --base: the previous round toHead, else the fork point), reviewBase + reviewBaseKind (the range the round reviews), wholePrOwed, protected, small, lowered?, budget:{used, budget},',
     '    governor:{usedPct, soft, hard, observedAt}|null, facts:{changedLines, newFile, sensitive}}, expectedEffort}; the skill passes expectedEffort as --effort (--effort is optional with --plan)',
     '  a small fix-check (not protected, see above) goes to the substitute instead of Codex when the PR has used review.codex_round_budget Codex runs (recorded Codex rounds and recorded Codex second reviews in the state; a killed or retried run',
     '    does not count) or the weekly Codex quota used is at least review.codex_budget.hard (P codex-status; an unreadable figure turns the governor off). Codex is not run: exit 3 {ok:false, unavailable:true, reason:withheld, message,',
@@ -110,7 +110,7 @@ export { CODEX_TIMEOUT_MS };
 
 // The plan as the command prints it (an unbounded line count, binary, is null).
 const planOutput = (p) => ({
-  route: p.route, evidence: p.evidence, effort: p.effort, why: p.why, round: p.round, base: p.base, wholePrOwed: p.wholePr, protected: p.protected, small: p.small,
+  route: p.route, evidence: p.evidence, effort: p.effort, why: p.why, round: p.round, base: p.base, reviewBase: p.reviewBase, reviewBaseKind: p.reviewBaseKind, wholePrOwed: p.wholePr, protected: p.protected, small: p.small,
   ...(p.lowered === undefined ? {} : { lowered: p.lowered }),
   ...(p.effortNote === undefined ? {} : { effortNote: p.effortNote }),
   ...(p.why.startsWith('mode-off') && p.modeOffFrom ? { modeOffFrom: p.modeOffFrom } : {}),
@@ -187,7 +187,7 @@ export const run = guarded(async (argv, ctx) => {
     return {
       exitCode: EXIT.OK,
       output: {
-        ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? sub.effort.followup,
+        ok: true, plan: plan === null ? { baseOnly: true, round, ...planRange(adm) } : planOutput(plan), expectedEffort: plan?.effort ?? sub.effort.followup,
         ...(modelNote !== undefined && plan?.route !== 'substitute' ? { modelNote } : {}),
       },
     };
