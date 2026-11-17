@@ -10,7 +10,7 @@ import path from 'node:path';
 import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore, replyBeforeToolUse } from './owner-go.mjs';
 import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.mjs';
 import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
-import { commandName } from './shell-parse.mjs';
+import { commandName, splitArgs } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock } from './live-db-go.mjs';
 
@@ -200,33 +200,33 @@ const NO_REQUEST_GIT = new Set(['grep', 'log', 'diff', 'show', 'blame', 'status'
 // (a bare command word only: `/tmp/x/rg` and `./rg` are scripts that may be named anything; and a line that writes a file, `echo '…' > run.sh`, is not a mention that goes nowhere)
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
 const writesFile = (c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && r.target !== '/dev/null' && !/^&(?:\d+|-)$/.test(r.target ?? ''));
+// a search or git read that runs a program (rg --pre, ack/ag --pager, git --ext-diff / --textconv / --output / -o / -O / --open-files-in-pager) or that runs under an env assignment (GIT_EXTERNAL_DIFF, PAGER…) can make a request
+// (git takes any unambiguous abbreviation of a long option, so a two-letter prefix of one is refused too)
+const PROGRAM_OPTION_GIT = ['output', 'output-directory', 'ext-diff', 'textconv', 'open-files-in-pager'];
+const runsProgram = (c) => {
+  const n = commandName(c.argv[0]);
+  const args = c.argv.slice(1);
+  if (n === 'rg') return args.some((a) => /^--(?:pre|hostname-bin)(?:=|$)/.test(a));
+  if (n === 'ack' || n === 'ag') return args.some((a) => /^--pager(?:=|$)/.test(a));
+  if (n === 'git') return args.some((a) => (a.startsWith('--') ? a.length > 3 && PROGRAM_OPTION_GIT.some((o) => o.startsWith(a.slice(2).split('=')[0])) : /^-[A-Za-z0-9]*[oO]/.test(a)));
+  return false;
+};
 const makesNoRequest = (c) => {
-  if (c.argv[0].includes('/') || writesFile(c)) return false;
+  if (c.argv[0].includes('/') || writesFile(c) || Object.keys(c.env ?? {}).length || runsProgram(c)) return false;
   const n = commandName(c.argv[0]);
   return NO_REQUEST.has(n) || (n === 'git' && NO_REQUEST_GIT.has(c.argv[1]));
 };
 
-// does a launcher line run the supabase binary? Only a word in command position counts (a path or directory argument named supabase, like `lib/supabase`, does not).
-// A word after an option may be that option's value (`sudo -u root supabase`), so the next word is read too; a package-manager `run`/`exec` verb makes the next word the script.
-const RUN_VERBS = new Set(['run', 'run-script', 'exec', 'x', 'dlx']);
+// does a launcher line run the supabase binary? Fail closed: after a launcher a wrapper (dotenv, cross-env, env-cmd, timeout…) may run the rest, so ANY later word that is the bare binary name is refused;
+// a path word is refused when it is …/.bin/supabase, an absolute path, or is followed by a supabase subcommand (a directory argument like lib/supabase is not the binary)
+const SUBCOMMAND_HEADS = new Set([...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]));
+const isSubcommandHead = (w) => w !== undefined && (SUBCOMMAND_HEADS.has(w) || /^network-/.test(w));
 function launcherRunsSupabase(argv) {
-  const pm = PM_HEADS.has(commandName(argv[0]));
-  let afterFlag = false;
-  let afterRun = false;
-  for (let i = 1; i < argv.length; i += 1) {
-    const w = argv[i];
-    if (w.startsWith('-')) { afterFlag = true; continue; }
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^\d+(?:\.\d+)?[smhd]?$/.test(w)) continue;
-    if (SB_WORD.test(commandName(w))) return true;
-    if (LAUNCHERS.has(commandName(w))) return Boolean(supabaseCall(argv.slice(i)));
-    if (pm && !afterRun && w === 'workspace') { i += 1; afterFlag = false; continue; } // `yarn workspace NAME …`: NAME is not the command
-    if (pm && !afterRun && (w === 'workspaces' || w === 'foreach' || w === 'recursive')) continue;
-    if (pm && !afterRun && RUN_VERBS.has(w)) { afterRun = true; afterFlag = false; continue; }
-    if (afterRun) return false;
-    if (afterFlag) { afterFlag = false; continue; }
-    return false;
-  }
-  return false;
+  return argv.some((w, i) => {
+    if (i === 0) return false;
+    if (SB_WORD.test(w)) return true;
+    return w.includes('/') && SB_WORD.test(commandName(w)) && (/(?:^|\/)\.bin\/[^/]*$/.test(w) || w.startsWith('/') || isSubcommandHead(argv[i + 1]));
+  });
 }
 
 // -> { rest } (the argv after the supabase word) | { refuse } | null (not a supabase line)
@@ -331,7 +331,8 @@ export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv) {
   const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
   for (const c of cmds) {
     if (!c.argv?.length) continue;
-    const call = supabaseCall(c.argv);
+    // the parser drops the launchers (`timeout 5 npx dotenv -- supabase …` parses as `dotenv -- supabase …`), so the words the line was typed with are read too
+    const call = supabaseCall(c.argv) ?? supabaseCall(splitArgs(c.raw ?? '').filter((w, i, all) => !(/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) && all.slice(0, i).every((p) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(p)))));
     if (!call) continue;
     const why = call.refuse ?? supabaseRefusal(call.rest, state);
     if (why) return refuse(why);
