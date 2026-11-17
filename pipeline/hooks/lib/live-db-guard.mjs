@@ -7,7 +7,7 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
 import path from 'node:path';
-import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore } from './owner-go.mjs';
+import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore, replyBeforeToolUse } from './owner-go.mjs';
 import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.mjs';
 import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
@@ -96,6 +96,14 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
       click = true;
       if (clickProvenance(r, { home }) !== 'owner') { skip('unverified', 'the owner\'s click on the live-database dialog cannot be verified from the transcript: ask the owner to type the go instead'); continue; }
       if (r.transcript_path !== transcriptPath) { skip('unverified', 'the recorded click is from another transcript than this call\'s'); continue; }
+      // R6-F1: as for the typed go, the owner must have been shown the whole block in the reply: the text right before the AskUserQuestion call ends with the block the dialog carries.
+      const shown = replyBeforeToolUse(transcriptPath, r.ask.toolUseId);
+      const sv = shown.text === undefined ? null : verifyBlock(shown.text, { home, io });
+      const sf = sv?.fields;
+      if (!sv?.ok || sf.op !== r.op || sf.ref !== r.projectRef || sf.sqlSha256 !== r.sqlSha256 || sf.head !== r.head || sf.file !== r.file || sf.repo !== r.repo || sf.name !== r.name) {
+        skip('unverified', `the owner's click is not claimed: the reply right before the dialog does not end with the block the dialog carries (${shown.reason ?? sv.reason ?? 'a different block'}); run live-db present again and paste its block as the last thing in the reply, right before showing the dialog`);
+        continue;
+      }
       at = Date.parse(r.ts);
     } else {
       if (typeof r.prompt_id !== 'string' || r.prompt_id === '') { skip('unverified', 'the recorded go has no prompt id, so it cannot be tied to the owner\'s prompt'); continue; }

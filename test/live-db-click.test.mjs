@@ -27,7 +27,9 @@ const fixture = () => readFileSync(new URL('./fixtures/click/2.1.323/genuine-cli
 const text = (es) => `${es.map((e) => JSON.stringify(e)).join('\n')}\n`;
 
 // One world: registry, a repo with the migration, the block `present` prints, the issued ask and a 2.1.323 transcript (prompt + tool_use; the answer's entry is appended by w.flush()).
-async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false } = {}) {
+// `reply`: the assistant texts printed before the dialog, one transcript entry each, or a function (block, dir) -> texts (default: the block `present` printed, pasted last).
+const dir0 = (repo) => repo.dir;
+async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null } = {}) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'cp-live-db-click-')));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   mkdirSync(join(home, '.claude'), { recursive: true });
@@ -56,7 +58,10 @@ async function world(t, { op = 'migration', answer = null, flush = false, modelA
   result.message.content[0].content = `Your questions have been answered: "${dialog.question}"="${chosen}". You can now continue with these answers in mind.`;
   mkdirSync(join(home, '.claude-t', 'projects', '-repo'), { recursive: true });
   const file = join(home, '.claude-t', 'projects', '-repo', `${use.sessionId}.jsonl`);
-  writeFileSync(file, text(flush ? [prompt, use, result] : [prompt, use]));
+  const said = (typeof reply === 'function' ? reply(block, dir0(repo)) : reply ?? [block]).map((txt, i) => ({ ...structuredClone(use), uuid: `11111111-0000-4000-8000-00000000000${i}`, message: { role: 'assistant', content: [{ type: 'text', text: txt }] }, timestamp: new Date(Date.parse(use.timestamp) - 5000 + i).toISOString() }));
+  said.forEach((e, i) => { e.parentUuid = i === 0 ? prompt.uuid : said[i - 1].uuid; });
+  use.parentUuid = said.length ? said[said.length - 1].uuid : prompt.uuid;
+  writeFileSync(file, text(flush ? [prompt, ...said, use, result] : [prompt, ...said, use]));
   const answeredAt = Date.parse(result.timestamp);
   const w = {
     home, repo, head, file, session: use.sessionId, dialog, parts, askId: issued.askId, issued, answeredAt, block, dataSql, op, arg,
@@ -86,6 +91,28 @@ test('a click on the dialog records the typed go\'s record plus via ask, and the
   assert.equal(again.decision, 'deny');
   assert.match(again.reason, /already used/);
   assert.equal(readdirSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')).length, 1);
+});
+
+test('a click counts only when the reply right before the dialog ends with the block the dialog carries (R6-F1): no block, an abridged or another block, or text after it is not claimed', async (t) => {
+  const other = (dir) => buildBlock({ op: 'data', ref: REF, label: LABEL, repo: 'acme/widgets', dir, sql: 'update t set a = 2 where id = 7', summary: 'fix' }).join('\n');
+  const cases = [
+    ['no block in the reply', () => ['I will now ask you.']],
+    ['no text at all', () => []],
+    ['an abridged block', (b) => ['Apply the migration?', b.split('\n').slice(-4).join('\n')]],
+    ['another valid block', (b, dir) => [other(dir)]],
+    ['text after the block', (b) => [b, 'Here is the dialog.']],
+  ];
+  for (const [what, reply] of cases) {
+    const w = await world(t, { flush: true, reply });
+    assert.ok((await w.hook()).recorded, what);
+    const c = w.claim();
+    assert.equal(c.status, 'unverified', what);
+    assert.match(c.reason, /paste its block as the last thing/, what);
+    assert.equal(w.apply().decision, 'deny', what);
+  }
+  const ok = await world(t, { flush: true, reply: (b) => ['Some narrative first.', b] });
+  assert.ok((await ok.hook()).recorded);
+  assert.equal(ok.claim().status, 'claimed', 'the exact block pasted last');
 });
 
 test('the click binds only the exact block: another query, name or project is not claimed; an expired click (2 h after the answer) is refused', async (t) => {

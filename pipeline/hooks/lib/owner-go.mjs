@@ -595,6 +595,41 @@ export function replyBefore(transcriptPath, promptId, { tailBytes = REPLY_BEFORE
   return { text: replyOf(entries.slice(0, at[0] + 1), { prompt: promptTextOf(entries[at[0]]), skipSynthetic: true }).text };
 }
 
+// #262 (R6-F1): what the owner could read right BEFORE an AskUserQuestion call: the assistant text of the call's own turn (the entries that chain to the same prompt as the tool_use entry, in transcript
+// order, plus the text blocks of the tool_use entry itself that come before the tool_use block). The live-database click claim requires it to end with the block the dialog carries, as the typed
+// go does. A text another turn printed between that text and the call (an interleaved process the owner may have seen) is a refusal, never skipped. { text } | { reason }.
+export function replyBeforeToolUse(transcriptPath, toolUseId, { tailBytes = REPLY_BEFORE_TAIL_BYTES } = {}) {
+  if (typeof toolUseId !== 'string' || toolUseId === '') return { reason: 'the click has no tool use id' };
+  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  const blocksOf = (e) => (Array.isArray(e?.message?.content) ? e.message.content : []);
+  const at = [];
+  entries.forEach((e, i) => { if (e?.type === 'assistant' && blocksOf(e).some((b) => b?.type === 'tool_use' && b.id === toolUseId)) at.push(i); });
+  if (at.length === 0) return { reason: 'the AskUserQuestion call is not in the transcript window' };
+  if (at.length > 1) return { reason: 'two entries carry that tool use id' };
+  const { origin } = originsOf(entries);
+  const useAt = at[0];
+  if (origin[useAt] < 0) return { reason: 'the AskUserQuestion call does not chain to a prompt in the transcript window' };
+  const textOf = (e, until = Infinity) => {
+    let t = '';
+    for (const b of blocksOf(e).slice(0, until)) if (b?.type === 'text' && typeof b.text === 'string') t += `${b.text}\n`;
+    return t;
+  };
+  let text = '';
+  let lastTextAt = -1;
+  for (let i = origin[useAt] + 1; i <= useAt; i++) {
+    const e = entries[i];
+    if (e?.type !== 'assistant' || origin[i] !== origin[useAt]) continue;
+    const t = i === useAt ? textOf(e, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : textOf(e);
+    if (showsText(t)) lastTextAt = i;
+    text += t;
+  }
+  for (let i = Math.max(lastTextAt, origin[useAt]) + 1; i < useAt; i++) {
+    const e = entries[i];
+    if (e?.type === 'assistant' && origin[i] !== origin[useAt] && showsText(textOf(e))) return { reason: 'another turn printed text between the reply and the dialog' };
+  }
+  return { text };
+}
+
 // ---- #128: is this prompt the owner's words? --------------------------------------------------------------------------------------
 
 // The openings of a prompt the harness (or another model) writes: a background-task notice, a system reminder, another session's or
