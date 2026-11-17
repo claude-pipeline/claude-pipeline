@@ -4872,3 +4872,23 @@ test('state fable-refresh: an untrusted anchor refuses (exit 3 untrusted-anchor)
   assert.deepEqual(w.state(), before, 'nothing recorded');
   assert.equal(w.state().rounds.length, 1);
 });
+
+// ---- `--plan` prints the base the next round must use (Item 3, F10) ----------------------------------------------------------------------------------
+
+test('codex-review --plan after a non-free merge of main: plan.base is the base --base admits (round 1\'s toHead, = state outcome nextRound.base), plan.reviewBase is the reviewed range and is refused as --base', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' }, { evil: { 'src/extra.js': 'export const extra = 1;\n' } });
+  const planOf = (from) => w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', from, '--head', merged, '--plan']);
+  const outcome = w.cli(['state', 'outcome']);
+  assertExit(outcome, 0);
+  assert.equal(outcome.json.nextRound.base, w.head, 'the next round starts at round 1\'s toHead');
+  const p = planOf(w.head);
+  assertExit(p, 0, p.stderr + p.stdout);
+  assert.equal(p.json.plan.base, outcome.json.nextRound.base, 'plan.base is nextRound.base (F10)');
+  assert.notEqual(p.json.plan.reviewBase, p.json.plan.base, 'the reviewed range starts elsewhere after the merge');
+  assert.ok(['whole-pr', 'synthetic'].includes(p.json.plan.reviewBaseKind), p.json.plan.reviewBaseKind);
+  const refused = planOf(p.json.plan.reviewBase);
+  assert.notEqual(refused.code, 0, 'the reviewed range\'s start is not a base --base admits');
+  assert.equal(refused.json.ok, false);
+});
