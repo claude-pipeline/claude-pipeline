@@ -772,3 +772,10 @@ test('triageComment / summaryComment: the deferral text names the actual accepte
   assert.match(outliers, /deferral of the judge's ACCEPT/);
   assert.match(outliers, /deferral of the cache's ACCEPT/);
 });
+
+// Failure caught: the owner reads the PR comment, not the JSON, so a soft "Tests added" line that is only in the output never reaches them (and one that is absent must leave no stray text).
+test('summaryComment: the soft Tests added line sits under What was built, and is absent when not given', () => {
+  const withLine = summaryComment(richState(), { ...richOpts(), testsAdded: 'Tests added: 2 files, 5 cases; changed source lines : test lines = 40 : 90' });
+  assert.ok(section(withLine, '### What was built').includes('\n\nTests added: 2 files, 5 cases; changed source lines : test lines = 40 : 90'));
+  assert.doesNotMatch(section(summaryComment(richState(), richOpts()), '### What was built'), /Tests added/);
+});

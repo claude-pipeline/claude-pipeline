@@ -223,11 +223,14 @@ export function decodeFromComment(body) {
 // risk assessment (the state's maxRisk is the highest of them). governor / budget: the Codex-spend decision that sent the round to the substitute, or (governor)
 // that lowered a Codex round's effort. effort: the effort a Codex round ran at.
 // Any of substitute / governor / budget makes the saved state version 4 (STATE_VERSION_SUBSTITUTE).
+// resolutionIneligible: the short code (history-nonmerge, extra-files, ...) of why a conflict resolution was tried and refused, so the round reviewed the whole PR (a counted
+// round); telemetry for `stats rounds` only. An older installation ignores an unknown round key (no per-round validation, rounds are copied as they are), so no version bump.
+// A round recorded before this field existed has none: stats reads a whole-PR round without it as `unknown`, never as "no failure".
 // trustedConfigSha: the commit whose committed .claude/pipeline.yml is the TRUSTED config of this round (the default branch's fork point, risk.mjs#trustedBase), which
 // review.threat_models are read from; null = pinned as unavailable (no model applies). Absent only on a round written before it existed (arbiter needed then pins it once).
 export function addRound(state, {
   n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
-  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort, trustedConfigSha,
+  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort, trustedConfigSha, resolutionIneligible,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
@@ -252,6 +255,7 @@ export function addRound(state, {
       ...(governor === undefined ? {} : { governor: structuredClone(governor) }),
       ...(budget === undefined ? {} : { budget: structuredClone(budget) }),
       ...(trustedConfigSha === undefined ? {} : { trustedConfigSha }),
+      ...(typeof resolutionIneligible === 'string' && resolutionIneligible !== '' ? { resolutionIneligible } : {}),
       ...(baseOnly === true ? { baseOnly: true } : {}),
       ...(fableRefresh === true ? { fableRefresh: true } : {}),
       ...(Array.isArray(confirmFixed) && confirmFixed.length > 0 ? { confirmFixed: [...confirmFixed] } : {}),

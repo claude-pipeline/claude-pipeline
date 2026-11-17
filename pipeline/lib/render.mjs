@@ -246,7 +246,7 @@ function followupsSection(entries, followups) {
 
 // The body of the summary comment without its marker (the run record's writer composes marker + status block + this +
 // record marker; see summary-comment.mjs).
-export function summarySections(state, { outcome, built, followups = [], modelProofs = [] }) {
+export function summarySections(state, { outcome, built, followups = [], modelProofs = [], testsAdded }) {
   const entries = entriesOf(state);
   const implemented = unique(entries.filter(({ item }) => item.final?.decision === 'ACCEPT' && item.implemented)).map(
     ({ item, n }) => `- ${findingLabel(item)} (round ${n})`,
@@ -259,7 +259,7 @@ export function summarySections(state, { outcome, built, followups = [], modelPr
   return [
     section('### Outliers', outliersSection(entries, modelProofs, state)),
     '',
-    section('### What was built', built ? defuse(String(built).trim()) : '_Not provided_'),
+    section('### What was built', (built ? defuse(String(built).trim()) : '_Not provided_') + (typeof testsAdded === 'string' && testsAdded !== '' ? `\n\n${line(testsAdded)}` : '')),
     '',
     section('### Suggestions implemented', implemented.length ? implemented.join('\n') : '_None_'),
     '',

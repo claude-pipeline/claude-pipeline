@@ -3,7 +3,7 @@
 The full text of steps 2-5 of "1. Branch and build"; SKILL.md keeps one line per step.
 
 2. ONE `implementer` dispatch builds the whole change (task list in order, commits in small steps): hand it the tasks, worktree path, acceptance criteria, the tests to write
-   (a bug ⇒ the failing test first, its failing output kept), `verify.quick`, and the commit trailer your system context prescribes (pass it verbatim). Tell it: return immediately when done; no background work; waits only via `job wait` (max 3), else `Status: waiting-on-job <name> <runId>`. More dispatches only when the
+   (the implementer's test rules apply: each test names the production failure it catches, no test without one, extend an existing file first; a bug ⇒ the failing test first, its failing output kept; database / permission change ⇒ allow and deny tests), `verify.quick`, and the commit trailer your system context prescribes (pass it verbatim). Tell it: return immediately when done; no background work; waits only via `job wait` (max 3), else `Status: waiting-on-job <name> <runId>`. More dispatches only when the
    change is big: > ~500 changed non-test lines expected, more than one subsystem, or parts on disjoint files worth running in parallel (only on different files). An implementer that
    stops before it is done (call budget, context) ⇒ continue THE SAME agent once (SendMessage with what is left; extend its budget once) before a fresh dispatch, which gets only the rest.
 3. Quick check on the changed area (`verify.quick`) after each dispatch and before every push. Red ⇒ implementer with the failing

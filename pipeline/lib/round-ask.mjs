@@ -3,7 +3,7 @@
 // Display only: nothing here decides anything (the decision is `triage defer-fixes`, which re-checks all of it). Pure: git, GitHub and the owner's records are
 // read by the command and handed in. Every title is untrusted text (Codex / Fable output) and goes through the ASCII one-line sanitiser, so a hostile title can
 // neither add a line nor fake the closing `Extra review round needed` line (which only the CLI writes).
-import { asciiLine, autoExtraOrdinal, countsTowardCap, itemSeverity, reviewedRoundCount } from './triage.mjs';
+import { asciiLine, autoExtraOrdinal, countsTowardCap, isNewAccept, itemSeverity, reviewedRoundCount } from './triage.mjs';
 
 const cents = (n) => (Number.isFinite(n) ? Math.round(n * 100) / 100 : null);
 const usd = (n) => `$${n.toFixed(2)}`;
@@ -11,6 +11,8 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const BUCKET_WORDS = { BLOCKING: 'BLOCKING', SUGGESTION: 'SUGGESTIONS', WORTH_CONSIDERING: 'WORTH CONSIDERING' };
 const SHOWN = 6;
+// The counted round (k) from which the ask also shows how the last rounds went (4-5 rounds in, the review is usually a loop the owner should see, not just pay for).
+export const LONG_REVIEW_FROM = 6;
 
 // { bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd } from a run record (record.cost), or null when it holds no usable cost.
 // lastRoundUsd is what was booked to the newest COUNTED round of `state` that has a cost.byRound entry (`P cost --round R`; R is the round's number `n`), lastRound its
@@ -112,29 +114,75 @@ export function statusLines({ rounds, cost, open, notClean, asking = true }) {
   return lines;
 }
 
+// The long-review view of an ask for counted round `k` (display only; null below LONG_REVIEW_FROM): the findings of the last three COUNTED rounds (per round: id, bucket, the
+// final decision, the sanitised title, cut at SHOWN) and whether the last two each accepted a NEW BLOCKING item (a blocking loop: another round is unlikely to settle it).
+// -> { k, rounds: [{ round (the counted ordinal), items: [{id, bucket, decision, title}], more }], blockingLoop, blockingLoopRounds: [{round, ids}] } | null
+export function longReviewOf(state, k) {
+  if (!Number.isInteger(k) || k < LONG_REVIEW_FROM) return null;
+  const counted = (state?.rounds ?? []).map((r, i) => ({ r, i })).filter(({ r }) => countsTowardCap(r));
+  const ordinal = (r) => counted.findIndex((c) => c.r === r) + 1;
+  const last = counted.slice(-3).map(({ r }) => r);
+  const rounds = last.map((r) => {
+    const items = (r.items ?? []).map((i) => ({ id: String(i.id), bucket: i.bucket ?? null, decision: i.final?.decision ?? 'pending', title: asciiLine(i.title, 100) }));
+    return { round: ordinal(r), items: items.slice(0, SHOWN), more: Math.max(0, items.length - SHOWN) };
+  });
+  const loopRounds = last.slice(-2).map((r) => ({ round: ordinal(r), ids: (r.items ?? []).filter((i) => i.bucket === 'BLOCKING' && isNewAccept(i)).map((i) => String(i.id)) }));
+  const blockingLoop = loopRounds.length === 2 && loopRounds.every((x) => x.ids.length > 0);
+  return { k, rounds, blockingLoop, blockingLoopRounds: blockingLoop ? loopRounds : [] };
+}
+
+// The recommendation in words, exactly one of: 'follow up' | 'one more round' | 'stop and park or split' (a blocking loop at round 6 or later). `recommend` is askSummary's
+// machine value (follow-up | extra-round), which stays as it was.
+export const recommendedWords = (recommend, longReview) => (longReview?.blockingLoop === true ? 'stop and park or split' : recommend === 'follow-up' ? 'follow up' : 'one more round');
+
+const longReviewLines = (longReview) => {
+  if (!longReview) return [];
+  const lines = [`Long review (this would be counted round ${longReview.k}): the findings of the last ${plural(longReview.rounds.length, 'counted round')}.`];
+  for (const r of longReview.rounds) {
+    const shown = r.items.map((i) => `${i.id} (${BUCKET_WORDS[i.bucket] ?? asciiLine(i.bucket, 20)}, ${asciiLine(i.decision, 20)}) "${i.title}"`);
+    lines.push(`Round ${r.round}: ${shown.length === 0 ? 'no findings' : shown.join('; ')}${r.more > 0 ? `; and ${r.more} more` : ''}.`);
+  }
+  lines.push(longReview.blockingLoop
+    ? `Blocking loop: yes, each of the last two counted rounds accepted a new BLOCKING item (${longReview.blockingLoopRounds.map((x) => `round ${x.round}: ${x.ids.join(', ')}`).join('; ')}).`
+    : 'Blocking loop: no.');
+  return lines;
+};
+
 // The process review the trip-wire (triage.mjs#roundTripWire) asks for before another round (#374 PR B): a prompt, not a gate. `wire` = roundTripWire's answer, `fixScope` = fixRoundScope's (or null
-// when it could not be measured). -> { headline, summary }; the headline is the one line the park comment carries (`pipeline comment --kind blocked --reason`). Pure and display only.
-export function processReviewSummary({ rounds, cost, open, notClean, wire, fixScope, nextRound }) {
+// when it could not be measured); `longReview` = longReviewOf's answer (or null) and `recommend` the ask's follow-up | extra-round value, for the Recommended: words.
+// -> { headline, summary }; the headline is the one line the park comment carries (`pipeline comment --kind blocked --reason`). Pure and display only.
+export function processReviewSummary({ rounds, cost, open, notClean, wire, fixScope, nextRound, longReview = null, recommend }) {
   const past = Number.isFinite(wire.max) ? Math.max(0, wire.reviewed - wire.max) : 0;
   const share = wire.reviewed > 0 ? Math.round((past / wire.reviewed) * 100) : 0;
   const headline = `Process review before round ${nextRound}: ${wire.reasons.map((r) => asciiLine(r, 160)).join('; ')}`;
   const lines = [headline, 'This is a prompt, not a gate: the owner decides, and the usual extra-round words are still needed.', ...statusLines({ rounds, cost, open: open ?? [], notClean: notClean ?? [] })];
   lines.push(`New accepts per round: ${wire.acceptsByRound.join(', ') || 'none'}. Past the limit: ${past} of ${wire.reviewed} counted rounds (${share}%).`);
   if (fixScope) lines.push(fixScope.flagged ? `Fix scope since the last review: flagged (${fixScope.reasons.map((r) => asciiLine(r, 120)).join('; ')}).` : `Fix scope since the last review: not flagged (${fixScope.nonTestLines} non-test added lines).`);
-  lines.push('Options: file the open items as follow-up issues (triage defer-fixes when it is eligible), split the PR, or run one more round (round-request --after-process-review).');
+  lines.push(...longReviewLines(longReview));
+  const words = recommend === undefined && !longReview?.blockingLoop ? null : recommendedWords(recommend, longReview);
+  lines.push(`${words === null ? '' : `Recommended: ${words}. `}Options: file the open items as follow-up issues (triage defer-fixes when it is eligible), split the PR, or run one more round (round-request --after-process-review).`);
   return { headline, summary: lines.join('\n') };
 }
 
-// The plain-English block the agent pastes above the closing line, and the one-sentence why. `follow` = deferEligibility's answer.
-export function askSummary({ rounds, cost, open, notClean, follow, discard }) {
+// The plain-English block the agent pastes above the closing line, and the one-sentence why. `follow` = deferEligibility's answer; `longReview` = longReviewOf's answer (counted round 6 or
+// later: the last rounds' findings and the blocking-loop flag are added, and a blocking loop changes the recommendation to stop and park or split). The recommendation line opens with
+// exactly one of `Recommended: follow up`, `Recommended: one more round`, `Recommended: stop and park or split`.
+export function askSummary({ rounds, cost, open, notClean, follow, discard, longReview = null }) {
   const lines = statusLines({ rounds, cost, open, notClean });
-  if (follow.eligible) {
-    lines.push(`Recommendation: file them as follow-up issues and merge what was reviewed (say "follow up"), or type "extra round". Following up takes out ${plural(discard.count, 'commit')} made since the last review (listed under discard): the fixes and anything else in them.`);
+  lines.push(...longReviewLines(longReview));
+  const words = recommendedWords(follow.eligible ? 'follow-up' : 'extra-round', longReview);
+  if (words === 'stop and park or split') {
+    lines.push('Recommended: stop and park or split (a dependency-aware split plan, never a carve-out of files): the last two counted rounds each accepted a new BLOCKING item, so another round is unlikely to settle it. The owner can still type "extra round" for one more round.');
+  } else if (follow.eligible) {
+    lines.push(`Recommended: follow up. File them as follow-up issues and merge what was reviewed (say "follow up"), or type "extra round". Following up takes out ${plural(discard.count, 'commit')} made since the last review (listed under discard): the fixes and anything else in them.`);
   } else {
-    lines.push('Recommendation: one more review round (type "extra round").');
+    lines.push('Recommended: one more round (type "extra round").');
   }
-  const why = follow.eligible
+  // A blocking loop says the same thing here as in the Recommended line above: the one-sentence why must not argue for the round the summary advises against.
+  const why = words === 'stop and park or split'
+    ? 'The last two counted rounds each accepted a new BLOCKING item, so another round is unlikely to settle it: stop and park, or split the PR with a dependency-aware plan.'
+    : follow.eligible
     ? 'Every open item is low severity and each fix can be taken out and filed as a follow-up, so nothing unreviewed would ship.'
     : sentence(`Another round is the safe path: ${follow.refusals[0] ?? 'the open items cannot be deferred'}`);
-  return { summary: lines.join('\n'), why };
+  return { summary: lines.join('\n'), why, recommended: words };
 }

@@ -20,10 +20,10 @@ import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
-import { askSummary, processReviewSummary, roundsFrom } from '../lib/round-ask.mjs';
+import { askSummary, longReviewOf, processReviewSummary, recommendedWords, roundsFrom } from '../lib/round-ask.mjs';
 import { postMaxApply, fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
-import { gatherRoundStatus, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
+import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
 import { clickNotes, roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
@@ -62,15 +62,19 @@ export const meta = {
     '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
     'pipeline triage round-request --pr N [--ask] [--past] [--after-process-review] [--repo DIR]',
     '  -> the TRIP-WIRE (a prompt, not a gate; ON by default, review.trip_wire_extra_rounds / review.trip_wire_not_falling, the smaller of the working-tree and fork-point values): when the PR has reviewed max_rounds + extra counted rounds, or at least not_falling past-limit rounds',
-    '     accepted (more than 0 and) at least as many new items as the round before, the ask does not print a line: exit 1 {ok:false, error:"trip-wire", tripWire: {tripped, reviewed, max, acceptsByRound, reasons}, processReview: {headline, summary}}. Park the PR with the headline',
+    '     accepted (more than 0 and) at least as many new items as the round before, the ask does not print a line: exit 1 {ok:false, error:"trip-wire", tripWire: {tripped, reviewed, max, acceptsByRound, reasons}, processReview: {headline, summary}[, longReview][, nextRound], warnings}. Park the PR with the headline',
     '     (`pipeline comment --kind blocked --reason <headline>`, run-record outcome blocked, detail process-review), paste the summary and ask the owner. Only after the owner chooses one more round, run it again with --after-process-review: the usual answer and line, plus tripWire and processReview.',
     '     Not tripped: no tripWire field, the answer is unchanged.',
-    '  -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
+    '  -> {ok, line, k, n, head, rounds, cost, open, notClean, recommend, why, discard, summary, warnings[, nextRound][, longReview]}: the LAST line of the reply that asks the owner for ONE more review round past review.max_rounds, `🔁 Extra review round needed #N: round K · head <head12> · repo owner/name`',
     '     (k = the counted round it would be: reviewed rounds + 1, base-only and resolution-only rounds not counted; n = the round number to pass to codex-review --round; head = the checked-out HEAD)',
     '  -> everything but line, k, n and head is display only and decides nothing: rounds {reviewed, max, autoExtraUsed, ownerGranted, next}; cost {bookedUsd, reviewUsd, fableUsd, perRoundUsd, lastRound, lastRoundUsd} (the last two from cost.byRound, \`cost --round R\`: the newest counted round with a booking, else null) from the PR\'s run record (read-only; null with a warning when it cannot be read);',
     '     open [{id, round, bucket, category, severity: low|high, title, file}] = every item that keeps the review from clean; notClean = why, in plain words; recommend follow-up|extra-round, with why (follow-up exactly when `defer-fixes` would accept the',
-    '     current state: every unreviewed accept is a low-severity judge/arbiter fix, nothing else is open, no owner grant is open); discard {anchor, count, commits} = the commits since the last reviewed head that deferring would take out; summary = 3-5 plain lines the reply',
+    '     current state: every unreviewed accept is a low-severity judge/arbiter fix, nothing else is open, no owner grant is open); discard {anchor, count, commits} = the commits since the last reviewed head that deferring would take out; summary = the plain lines the reply',
     '     pastes ABOVE the line; warnings (a severity or config error shows the items as high and recommends extra-round, it never suppresses the line). Titles are untrusted text: one ASCII line each',
+    '     nextRound {prediction: true, previousClean, sinceReviewed: {merges, ownCommits} (or {rewritten: true, commits} when the last reviewed head is not in the first-parent history of HEAD), kind: base-only|resolution|previous|synthetic|merge-base|whole-pr[, resolutionIneligible][, alternative][, contentRestored: true]} = what the next review round would be, from the classification codex-review makes (display only);',
+    '     its "Prediction:" lines end the summary (and processReview.summary of the trip-wire refusal). When the content is already what the last reviewed round saw (no merge in the range, no whole-PR round owed) a "nothing new to review" line replaces the "would be" line and contentRestored is set with it. The free kinds (base-only, resolution) are worded as conditional: a judge-to-Fable escalation makes the real round a counted whole-PR one, and a PR that does not target the default branch gets a counted round on the range since the last reviewed head;',
+    '     alternative (only after a clean previous round with own commits since, with no whole-PR round owed, when the last reviewed head is on the first-parent chain of HEAD) = reverting them; after a merge it only hints that a free base-only recording may follow (the same conditions as the free kinds, and only when every merge in the range is a clean, unedited, two-parent merge of the default branch): a hint, not a promise, to confirm by running round-request again after the revert.',
+    '     longReview {k, rounds, blockingLoop, blockingLoopRounds, recommended} (counted round 6 or later) = the last rounds findings (the "Long review" and "Blocking loop" summary lines); recommended = follow up|one more round|stop and park or split (a blocking loop: summary and why say it too; recommend stays follow-up|extra-round); also on the trip-wire refusal',
     '  -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and',
     '     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state\'s, a repository off github.com,',
     '     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)',
@@ -980,27 +984,44 @@ async function roundRequest(rest, ctx) {
     // Everything below is display only: a failure in it is a warning, never a refusal and never a missing line (Codex R2 P2-4).
     const warnings = [];
     let shown = {};
+    let longReview = null; // counted round 6 or later: the last rounds' findings and the blocking-loop flag (round-ask.mjs#longReviewOf)
+    try {
+      longReview = longReviewOf(state, k);
+    } catch (err) {
+      warnings.push(`the long-review view could not be built (${asciiLine(err?.message, 160)})`);
+    }
     try {
       // The follow-up recommendation uses the STRICT lookups (an unreadable record refuses it, as defer-fixes does); the admission check above stays tolerant.
       const strict = ownerGrantLookups({ repo: slug, pr });
-      shown = roundAskFields({ root, config, state, pr, gh, head, grants: asGrants(strict.grants), grantGap: strict.grantGap, warnings });
+      shown = roundAskFields({ root, config, state, pr, gh, head, grants: asGrants(strict.grants), grantGap: strict.grantGap, warnings, longReview });
     } catch (err) {
       warnings.push(`the ask could not be summarised (${asciiLine(err?.message, 160)}): the line above still stands`);
     }
+    // What the next round would be (display only; a failure is a warning). Its lines go in the summary the reply pastes, on every path below, the trip-wire's too.
+    let nextRound;
+    let prediction = [];
+    try {
+      ({ nextRound, lines: prediction } = predictNextRound({ root, config, state, head }));
+    } catch (err) {
+      warnings.push(`the next-round prediction could not be computed (${asciiLine(err?.message, 160)})`);
+    }
+    if (prediction.length > 0) shown = { ...shown, summary: [shown.summary, ...prediction].filter(Boolean).join('\n') };
     // The trip-wire (#374 PR B): a prompt before another round, never a refusal of the owner's own words. Tripped without --after-process-review: no line, no ask file.
-    const { wire, processReview } = tripWireOf({ state, config, root, head, k, shown, gh });
+    const tripped = tripWireOf({ state, config, root, head, k, shown, gh, longReview });
+    const { wire } = tripped;
+    const processReview = tripped.processReview === null || prediction.length === 0 ? tripped.processReview : { ...tripped.processReview, summary: [tripped.processReview.summary, ...prediction].join('\n') };
     if (wire.tripped && values['after-process-review'] !== true) {
-      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, warnings } };
+      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, ...(longReview === null ? {} : { longReview: { ...longReview, recommended: recommendedWords(shown.recommend, longReview) } }), ...(nextRound === undefined ? {} : { nextRound }), warnings } };
     }
     // (#261) click-to-approve: --ask also writes the dialog's ask file (the question text is exactly the line); it never changes the display fields above.
     const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line }), ctx }) : {};
-    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
+    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, ...(nextRound === undefined ? {} : { nextRound }), warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
   }, pr));
 }
 
 // The round trip-wire (lib/triage.mjs#roundTripWire) with the SMALLER of each setting in the working-tree and the fork-point config (a PR must not loosen its own wire; an unreadable
 // fork-point config leaves the working-tree one). A wire that cannot be computed is not tripped: it is a prompt, and a broken one must never be what blocks the owner's own ask.
-function tripWireOf({ state, config, root, head, k, shown, gh }) {
+function tripWireOf({ state, config, root, head, k, shown, gh, longReview }) {
   try {
     const fork = state.rounds.findLast((r) => typeof r.forkPoint === 'string');
     const read = fork === undefined ? { ok: false } : baseConfigAt(fork.forkPoint, root);
@@ -1016,7 +1037,7 @@ function tripWireOf({ state, config, root, head, k, shown, gh }) {
         fixScope = fixRoundScope({ files: fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, { cwd: root }).files, configs });
       }
     } catch { /* not measured: the line is left out */ }
-    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k }) };
+    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k, longReview, recommend: shown.recommend }) };
   } catch {
     return { wire: { tripped: false, reviewed: 0, max: null, acceptsByRound: [], reasons: [] }, processReview: null };
   }
@@ -1024,7 +1045,7 @@ function tripWireOf({ state, config, root, head, k, shown, gh }) {
 
 // The display fields of the ask. `grants` is the same lookup the admission check used (any head); `grantGap` says why it found nothing ('provenance' = a record exists that cannot be
 // confirmed as the owner's). A lookup that fails here degrades to a warning and the extra-round recommendation: it never loses the ask (`defer-fixes` itself refuses on it).
-function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings }) {
+function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, warnings, longReview = null }) {
   const { rounds, cost, diff, since, open, notClean, trusted } = gatherRoundStatus({ root, config, state, pr, gh, warnings });
   let follow;
   try {
@@ -1051,8 +1072,8 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, w
   }
   if (follow.eligible && since.anchor === null) follow = { ...follow, eligible: false, refusals: ['the commits since the last review could not be listed'] };
   const discard = { anchor: since.anchor, count: since.count, commits: since.commits };
-  const { summary, why } = askSummary({ rounds, cost, open, notClean, follow, discard });
-  return { rounds, cost, open, notClean, recommend: follow.eligible ? 'follow-up' : 'extra-round', why, discard, summary };
+  const { summary, why, recommended } = askSummary({ rounds, cost, open, notClean, follow, discard, longReview });
+  return { rounds, cost, open, notClean, recommend: follow.eligible ? 'follow-up' : 'extra-round', why, discard, summary, ...(longReview === null ? {} : { longReview: { ...longReview, recommended } }) };
 }
 
 // `defer-fixes`: the safe alternative to an extra round when what is left is only low-severity accepted fixes (plan 2026-11-11-round-discipline-one-implementer.md, Item 1b).

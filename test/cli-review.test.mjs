@@ -3932,8 +3932,29 @@ test('codex-review: PR work after the conflict merge is NOT eligible: whole-pr, 
   assert.match(r.json.resolutionIneligible, /^history-nonmerge/);
   const round = w.state().rounds[1];
   assert.deepEqual([round.reviewBaseKind, round.resolutionOnly, round.conflicted], ['whole-pr', undefined, undefined]);
+  assert.equal(round.resolutionIneligible, 'history-nonmerge', 'the short proof-failure code is stored on the round (stats rounds reads it); the detail is not');
+  assert.equal(r.json.reviewKind, 'whole-pr');
   assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 2, 'counted');
   assert.match(patchOf(w, 2), /src\/c\.js/);
+});
+
+// Failure caught: the controller (and the owner's ask) cannot see BEFORE a round why it would be a counted whole-PR round, so a merge of main plus one own commit looks free.
+test('codex-review --plan: shows reviewKind, and resolutionIneligible for a whole-PR fallback; a provable resolution shows reviewKind resolution + resolutionOnly', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = conflictKeepingOurs(w);
+  const planAt = (to) => w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', to, '--plan']);
+  const free = planAt(merged);
+  assertExit(free, 0, free.stderr + free.stdout);
+  assert.deepEqual([free.json.plan.reviewKind, free.json.plan.resolutionOnly, free.json.plan.resolutionIneligible], ['resolution', true, undefined]);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const counted = planAt(head2);
+  assertExit(counted, 0, counted.stderr + counted.stdout);
+  assert.equal(counted.json.plan.reviewKind, 'whole-pr');
+  assert.match(counted.json.plan.resolutionIneligible, /^history-nonmerge/);
+  assert.equal(counted.json.plan.resolutionOnly, undefined);
+  assert.equal(w.state().rounds.length, 1, '--plan records no round');
 });
 
 test('codex-review: an ineligible conflict round at the cap is refused (round-cap) exactly as before', (t) => {
