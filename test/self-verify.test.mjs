@@ -49,7 +49,10 @@ test('CI job names are exactly the required checks', async () => {
   // the Windows shards (one matrix job) are not required themselves: the aggregate `test (windows)` stands for them
   const shards = all.filter((n) => n.includes('${{ matrix.shard }}'));
   assert.deepEqual(shards, ['test (windows ${{ matrix.shard }}/3)']);
-  const names = all.filter((n) => !shards.includes(n));
+  // ...and so are the Ubuntu Node jobs: the aggregate `test (ubuntu)` stands for them
+  const nodes = all.filter((n) => n.includes('${{ matrix.node }}'));
+  assert.deepEqual(nodes, ['test (ubuntu node ${{ matrix.node }})']);
+  const names = all.filter((n) => !shards.includes(n) && !nodes.includes(n));
   assert.deepEqual(names.sort(), [...(await selfConfig()).ci.required_checks].sort());
   const shells = [...ci.matchAll(/^\s*shell:\s*(\S+)/gm)].map((m) => m[1]);
   assert.deepEqual(shells, ['bash'], 'one workflow-wide default, bash, and no step overrides it');
