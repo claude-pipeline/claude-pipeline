@@ -10,7 +10,7 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { checkoutIdentity, formatStamp, installedIdentity, parseStamp } from '../lib/identity.mjs';
-import { git } from '../lib/git.mjs';
+import { isAncestor } from '../lib/git.mjs';
 import { repoRoot } from '../lib/repo.mjs';
 
 export const meta = {
@@ -110,13 +110,13 @@ function retiredFiles(target) {
 }
 
 // The first commit of ianjamila/claude-pipeline: a repo has it only by sharing this history, so a consumer cannot be taken for the source by accident.
-const PIPELINE_ROOT_COMMIT = '61e18721be44051841670c4d103ad30d742e2f54';
+export const PIPELINE_ROOT_COMMIT = '61e18721be44051841670c4d103ad30d742e2f54';
 
-// True when `root` is the pipeline source repo itself: its history contains the pipeline's root commit. Any error (not a git repo, a shallow clone without it) is false, the safe direction: the normal drift check runs.
-function isPipelineSource(root) {
+// True when `root` is the pipeline source repo itself: the pipeline's root commit is an ancestor of its HEAD (having the object in some ref proves nothing). Any error (not a git repo, a shallow clone without it) is false, the safe direction: the normal drift check runs.
+// `rootCommit` is a parameter only so a test can use a fixture repo's own root (CI checks out at depth 1, where the real one is absent).
+export function isPipelineSource(root, rootCommit = PIPELINE_ROOT_COMMIT) {
   try {
-    git(['cat-file', '-e', `${PIPELINE_ROOT_COMMIT}^{commit}`], { cwd: root });
-    return true;
+    return isAncestor(rootCommit, 'HEAD', { cwd: root });
   } catch {
     return false;
   }
@@ -196,7 +196,7 @@ export async function run(argv) {
     const { loadConfig } = await import('../lib/config.mjs');
     const loaded = await loadConfig(root);
     if (loaded.ok && loaded.config.ci.guard_checks === false && !existsSync(target) && isPipelineSource(root)) {
-      return { exitCode: EXIT.OK, output: { ok: true, skipped: 'ci.guard_checks is false, there is no scripts/pipeline/ and this repo contains the pipeline\'s root commit: it is the pipeline source repo, not a consumer, so there is nothing to compare' } };
+      return { exitCode: EXIT.OK, output: { ok: true, skipped: 'ci.guard_checks is false, there is no scripts/pipeline/ and this repo descends from the pipeline\'s root commit: it is the pipeline source repo, not a consumer, so there is nothing to compare' } };
     }
     const drift = vendorDrift(root, items);
     // The +sha moves with every pipeline commit and says nothing about the copied code, so only the base version counts.
