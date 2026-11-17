@@ -11,7 +11,7 @@ import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fak
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { Fail } from '../pipeline/lib/cmd-common.mjs';
 import { EXIT } from '../pipeline/lib/cli.mjs';
-import { admitRound, recordRound, roundPrompt } from '../pipeline/lib/review-round.mjs';
+import { admitRound, planRange, recordRound, requiredBase, roundPrompt } from '../pipeline/lib/review-round.mjs';
 
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main' } },
@@ -113,4 +113,20 @@ test('admitRound + recordRound record a round: roundFields as given, files writt
 
   // The next round is now round 2 only.
   await refusal(() => w.admit(), 'round-order');
+});
+
+// ---- planRange: what `--plan` prints as the base (Item 3, PR A1) ------------------------------------------------------------------------------------------------
+
+test('planRange: base is the base a round must use (the previous round\'s toHead, else the fork point) and reviewBase / reviewBaseKind say what range is reviewed', () => {
+  const round = (toHead) => ({ n: 1, toHead, items: [] });
+  // two rounds, a non-free merge from main: the REVIEWED range starts at the fork point (whole-pr) while the next round must still start at round 1's toHead
+  const adm = { state: { rounds: [round('r1head')] }, forkPoint: 'fork0', review: { base: 'fork0', kind: 'whole-pr' } };
+  assert.deepEqual(planRange(adm), { base: 'r1head', reviewBase: 'fork0', reviewBaseKind: 'whole-pr' });
+  assert.equal(planRange(adm).base, requiredBase(adm.state, adm.forkPoint), 'the same rule checkBase enforces');
+  // round 1: no state, the fork point
+  assert.deepEqual(planRange({ state: null, forkPoint: 'fork0', review: { base: 'fork0', kind: 'whole-pr' } }), { base: 'fork0', reviewBase: 'fork0', reviewBaseKind: 'whole-pr' });
+  // a synthetic range (merge-tree id) is only the reviewed range, never the admitted base
+  const synthetic = planRange({ state: { rounds: [round('r1head')] }, forkPoint: 'fork0', review: { base: 'treeid', kind: 'synthetic' } });
+  assert.equal(synthetic.base, 'r1head');
+  assert.equal(synthetic.reviewBase, 'treeid');
 });

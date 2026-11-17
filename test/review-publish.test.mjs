@@ -1038,3 +1038,61 @@ test('state show (#374 PR B): a Claude ACCEPT over a published post-max FOLLOW-U
   const plain = mk([it('R1-S1', { bucket: 'SUGGESTION', category: 'maintainability', final: settledFollowUp() })]);
   assert.equal(run('Claude ACCEPT over a settled FOLLOW-UP', plain, change(plain, 'R1-S1', { final: claudeOver('ACCEPT', settledFollowUp()) })).r.json.source, 'quarantined');
 });
+
+// F5 (#559): the owner's step over a published, non-protected final is local progress ONLY as the deferral of an unimplemented arbiter / judge / cache ACCEPT (FOLLOW-UP, naming who accepted it).
+test('state show (F5): a local owner step over a published arbiter ACCEPT is kept only as a genuine deferral; a REJECT or ACCEPT, one over an implemented or test ACCEPT, or a mismatched mark is quarantined', (t) => {
+  const accept = (by = 'arbiter', over = {}) => decided({ by, ...over });
+  const ownerOver = (prev, over = {}) => ({ decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'owner defers', ownerQuote: 'R1-B1: follow-up', ruledAt: 'later', ownerDeferral: { accepted: prev.by, ruledAt: 'later' }, overruled: prev, ...over });
+  const show = (name, publishedItem, local) => {
+    const w = world(t);
+    const s0 = mk([publishedItem]);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    saveState(w.A, local(s0));
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    return r.json.source;
+  };
+  for (const by of ['arbiter', 'judge', 'cache']) {
+    const final = accept(by);
+    assert.equal(show(`defers a ${by} ACCEPT`, it('R1-B1', { final }), (s) => change(s, 'R1-B1', { final: ownerOver(final) })), 'local-ahead', `defers a ${by} ACCEPT`);
+  }
+  const arb = accept('arbiter');
+  assert.equal(show('REJECT', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { decision: 'REJECT' }) })), 'quarantined', 'owner REJECT over an arbiter ACCEPT');
+  assert.equal(show('ACCEPT', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { decision: 'ACCEPT' }) })), 'quarantined', 'owner ACCEPT over an arbiter ACCEPT');
+  assert.equal(show('implemented', it('R1-B1', { final: arb, implemented: true }), (s) => change(s, 'R1-B1', { final: ownerOver(arb) })), 'quarantined', 'deferral over an implemented ACCEPT');
+  const tested = accept('test');
+  assert.equal(show('test', it('R1-B1', { final: tested }), (s) => change(s, 'R1-B1', { final: ownerOver(tested) })), 'quarantined', 'deferral over a test ACCEPT');
+  const cachedTest = accept('cache', { evidence: 'test' });
+  assert.equal(show('cached test', it('R1-B1', { final: cachedTest }), (s) => change(s, 'R1-B1', { final: ownerOver(cachedTest) })), 'quarantined', 'deferral over a cached test ACCEPT');
+  assert.equal(show('mismatch', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { ownerDeferral: { accepted: 'judge', ruledAt: 'later' } }) })), 'quarantined', 'a mark naming another accepter');
+  assert.equal(show('no mark', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { ownerDeferral: undefined }) })), 'quarantined', 'a FOLLOW-UP over an ACCEPT without the mark');
+  const forNeedsHuman = waiting();
+  assert.equal(show('control', it('R1-B1', { final: forNeedsHuman }), (s) => change(s, 'R1-B1', { final: { decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'ok', ownerQuote: 'R1-B1: accept', overruled: forNeedsHuman } })), 'local-ahead', 'control: the old owner path');
+  // R1-F1: a final that merely carries an (empty) ownerDeferral object is not the deferral of the published ACCEPT: a Claude REJECT, or an owner step over a Claude final, walks around the checks above
+  const claudeOverArb = claudeFinal({ ownerDeferral: {}, claude: { ruledAt: 'now', cause: 'unknown', critical: false, overruled: arb } });
+  assert.equal(show('claude + empty mark', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: claudeOverArb })), 'quarantined', 'a Claude REJECT over an arbiter ACCEPT carrying ownerDeferral {}');
+  const ownerOverClaude = ownerOver(claudeOverArb, { decision: 'REJECT', ownerDeferral: {} });
+  assert.equal(show('owner over claude', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOverClaude })), 'quarantined', 'an owner REJECT over that Claude final, two steps above the arbiter ACCEPT');
+});
+
+// R1-B1 (#559): the owner defers an arbiter ACCEPT and files its follow-up issue before the ruling is published: both are saved work, kept (not quarantined).
+test('state show (R1-B1): an owner deferral plus the follow-up issue filed before publication stays local-ahead; the issue added to a REJECT over the same ACCEPT is quarantined', (t) => {
+  const arb = decided({ by: 'arbiter' });
+  const deferral = { decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'owner defers', ownerQuote: 'R1-B1: follow-up', ruledAt: 'later', ownerDeferral: { accepted: 'arbiter', ruledAt: 'later' }, overruled: arb };
+  const show = (final) => {
+    const w = world(t);
+    const s0 = mk([it('R1-B1', { final: arb })]);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    const local = change(s0, 'R1-B1', { final, followupIssue: 'https://github.com/acme/widgets/issues/9' });
+    saveState(w.A, local);
+    const r = w.show(w.A);
+    assertExit(r, 0, r.stdout + r.stderr);
+    return { source: r.json.source, kept: w.state(w.A) };
+  };
+  const kept = show(deferral);
+  assert.equal(kept.source, 'local-ahead');
+  assert.equal(kept.kept.rounds[0].items[0].followupIssue, 'https://github.com/acme/widgets/issues/9', 'the issue link is kept');
+  assert.equal(show({ ...deferral, decision: 'REJECT' }).source, 'quarantined', 'no other combination');
+});

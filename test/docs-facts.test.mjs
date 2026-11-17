@@ -272,3 +272,15 @@ test('every doc path a round bundle can print exists (action-valued next, like "
   // every reference file SKILL.md names exists
   for (const m of skillMd().matchAll(/reference\/([a-z-]+)\.md/g)) assert.ok(read(`skills/review/reference/${m[1]}.md`).length > 0, m[0]);
 });
+
+test('#475: every agent that writes findings names the category list exactly as CATEGORIES (codex.mjs) spells it', async () => {
+  const { CATEGORIES } = await import('../pipeline/lib/codex.mjs');
+  const list = CATEGORIES.join(', ');
+  const flat = (rel) => read(rel).replace(/\s+/g, ' ');
+  for (const rel of ['agents/substitute-fable.md', 'agents/substitute-opus.md']) {
+    assert.ok(flat(rel).includes(`\`category\` must be exactly one of: ${list}.`), `${rel} names the category list`);
+  }
+  for (const rel of ['agents/arbiter.md', 'agents/arbiter-fix.md']) {
+    assert.ok(flat(rel).includes(`\`category\` (one of ${list})`), `${rel} names the category list`);
+  }
+});
