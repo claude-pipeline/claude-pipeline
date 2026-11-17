@@ -15,7 +15,7 @@ import { Fail, guarded, requireConfig, resolveRepo, untrustedAnchorRefusal } fro
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { git, headSha, isAncestor, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
-import { hashBranch } from '../lib/risk.mjs';
+import { hashBranch, regressionOnlyFor } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
@@ -585,7 +585,10 @@ async function secondReview(rest, ctx) {
       items.push(item);
     }
     const maxRisk = maxRiskOf(state);
-    return { head: headSha(o), repo: state.repo, risk: state.risk, maxRisk, agent: substituteAgentFor(maxRisk), items: items.map(packetItem), snapshot: askedSnapshot(items) };
+    return {
+      head: headSha(o), repo: state.repo, risk: state.risk, maxRisk, agent: substituteAgentFor(maxRisk), items: items.map(packetItem), snapshot: askedSnapshot(items),
+      fableRound: round.fableRequired === true && round.baseOnly !== true, trustedConfigSha: round.trustedConfigSha, forkPoint: round.forkPoint,
+    };
   }, pr);
   if (asked.exitCode !== undefined) return asked;
 
@@ -597,7 +600,17 @@ async function secondReview(rest, ctx) {
     if (err instanceof GhError) throw new Fail(EXIT.UNAVAILABLE, { ok: false, unavailable: true, reason: 'github', message: err.message });
     throw err;
   }
-  const prompt = buildSecondReviewPrompt({ pr, title, risk: asked.risk, head: asked.head, items: asked.items });
+  // review.regression_only_paths of the round's pinned TRUSTED config (a Fable-lane round only), for the files the findings name: the second reviewer is told to say "same on base" or "regression"
+  // in its reasoning (its decision is unchanged). Anything unreadable: no section, the packet is byte-identical.
+  let regressionOnly = null;
+  if (asked.fableRound && typeof asked.trustedConfigSha === 'string' && typeof asked.forkPoint === 'string') {
+    try {
+      const read = baseConfigAt(asked.trustedConfigSha, root);
+      const globs = read.ok ? regressionOnlyFor(asked.items.filter((i) => typeof i.file === 'string' && i.file !== '').map((i) => ({ path: i.file })), read.config) : [];
+      if (globs.length > 0) regressionOnly = { globs, forkPoint: asked.forkPoint };
+    } catch { /* no section */ }
+  }
+  const prompt = buildSecondReviewPrompt({ pr, title, risk: asked.risk, head: asked.head, items: asked.items, ...(regressionOnly === null ? {} : { regressionOnly }) });
   const promptBytes = Buffer.from(prompt, 'utf8');
   const inputDigest = createHash('sha256').update(promptBytes).digest('hex');
   const dir = ensureRoundDir(root, n);

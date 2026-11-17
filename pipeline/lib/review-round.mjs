@@ -25,7 +25,7 @@ import {
 import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
-import { isSensitivePath, prBaseBranch, rateBranch, threatModelsFor, trustedBase } from './risk.mjs';
+import { isSensitivePath, prBaseBranch, rateBranch, regressionOnlyFor, threatModelsFor, trustedBase } from './risk.mjs';
 import { DEFAULTS, EFFORTS, EFFORT_LANES, baseConfigAt } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
@@ -339,17 +339,25 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   const trustedConfigSha = rated.baseConfig?.ok === true && typeof rated.trustedFork === 'string' ? rated.trustedFork : null;
   // Shown to Codex (and the substitute) only on a Fable round: a threat-model finding they downgrade to a SUGGESTION is routed to a filed issue or a human only by
   // the Fable review path, so a judge-lane or light-lane round would let it be dismissed with neither.
+  // review.regression_only_paths comes from the same source in the same lane: the matching globs and the merge base the reviewer compares with. Unlike a threat model it does not move a bucket:
+  // the reviewer keeps it and only SAYS "same on base"; the arbiter applies the bar.
   let threatModels = [];
+  let regressionOnly = null;
   if (trustedConfigSha !== null && !baseOnly && fable) {
     const trustedRead = baseConfigAt(trustedConfigSha, root);
     try {
-      if (trustedRead.ok) threatModels = threatModelsFor(diffFiles(review.base, head, o), trustedRead.config);
+      if (trustedRead.ok) {
+        const files = diffFiles(review.base, head, o);
+        threatModels = threatModelsFor(files, trustedRead.config);
+        const globs = regressionOnlyFor(files, trustedRead.config);
+        if (globs.length > 0) regressionOnly = { globs, forkPoint: c.forkPoint };
+      }
     } catch { /* unreadable range: no model */ }
   }
 
   return {
     ...c, state, view, slug, level, rated, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView,
-    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, hashAtHead: currentContentHash(root, config),
+    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, regressionOnly, hashAtHead: currentContentHash(root, config),
   };
 }
 
@@ -358,6 +366,7 @@ export const roundPrompt = (adm) => buildReviewPrompt({
   pr: adm.pr, title: adm.view.title, body: adm.view.body, base: adm.review.base, head: adm.head, risk: adm.level, round: adm.round,
   lightLane: adm.lightLane, priorRulings: adm.priorRulings, rulesRef: adm.forkPoint, largeBinaries: adm.largeBinaries, baseKind: adm.review.kind,
   sensitivePaths: adm.lane.sensitivePaths, threatModels: adm.threatModels,
+  ...(adm.regressionOnly ? { regressionOnly: adm.regressionOnly } : {}),
   ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => ({ id: i.id, title: i.title, file: i.file, detail: i.detail })) } : {}),
   ...(adm.resolutionOnly ? { resolution: { from: adm.base, forkPoint: adm.forkPoint, ...adm.resolutionView } } : {}),
 });
