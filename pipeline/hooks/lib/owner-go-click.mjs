@@ -889,7 +889,7 @@ export function followUpClickState({ home = accountHome(), repo, pr, now = Date.
       if (spent.state === 'bad') {
         let ms = nowMs;
         try { ms = lstatSync(askFile(id, 'spent', home)).mtimeMs; } catch { /* the marker's time is unknown: now */ }
-        evidence = ms;
+        if (live(ms)) evidence = ms;
       } else if (spent.state === 'ok' && live(Date.parse(spent.marker.answeredAt) || 0)) evidence = Date.parse(spent.marker.answeredAt) || 0;
       for (const name of names) {
         const m = PENDING_RE.exec(name);
@@ -916,7 +916,11 @@ export function followUpClickState({ home = accountHome(), repo, pr, now = Date.
       if (newest === null || newest.variant !== 'round-v2-follow-up') return say('none', newest?.askId ?? null);
       const id = newest.askId;
       const spent = readSpent(id, home);
-      if (spent.state === 'bad') return say('unverified', id, 'its spent marker cannot be read');
+      if (spent.state === 'bad') {
+        let ms = nowMs;
+        try { ms = lstatSync(askFile(id, 'spent', home)).mtimeMs; } catch { /* the marker's time is unknown: now */ }
+        return live(ms) ? say('unverified', id, 'its spent marker cannot be read') : say('none', id);
+      }
       if (spent.state === 'ok') {
         const m = spent.marker;
         const answeredMs = Date.parse(m.answeredAt);

@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { claimGrantMarkers, grantIdOf, ownerGrantLookups, ownerGrantedRounds, verifyOwnerGrant } from '../pipeline/hooks/lib/owner-go.mjs';
@@ -456,6 +456,20 @@ test('followUpClickState: a follow-up click whose ask file became unreadable bef
   assert.equal(w.state({ pr: 59 }).state, 'unverified', 'an unreadable ask cannot be told to be another PR\'s with no readable prs: it counts');
   // outside the window the click no longer matters
   assert.equal(w.state({ now: () => w.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 }).state, 'none');
+  // the same for a spent marker that cannot be read (dated by its mtime), whether its ask is unreadable or readable: an expired one must not answer unverified for ever (it would refuse `triage defer-fixes` for good)
+  for (const askReadable of [false, true]) {
+    const b = followWorld(t);
+    await b.click();
+    if (!askReadable) writeFileSync(join(asksDir(b.home), `${b.askId}.json`), 'not json');
+    const spentFile = join(asksDir(b.home), `${b.askId}.spent`);
+    writeFileSync(spentFile, 'not json');
+    const clickedAt = new Date(b.answeredAt);
+    utimesSync(spentFile, clickedAt, clickedAt);
+    const inside = followUpClickState({ repo: REPO, pr: 58, home: b.home, now: () => b.answeredAt + 3600 * 1000 });
+    assert.equal(inside.state, 'unverified', `${askReadable}: inside the window the unreadable marker still counts`);
+    const outside = followUpClickState({ repo: REPO, pr: 58, home: b.home, now: () => b.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 });
+    assert.equal(outside.state, 'none', `${askReadable}: outside the window an unreadable spent marker no longer matters`);
+  }
   // an unreadable ask nobody clicked on is not a click
   const quiet = pendingWorld(t);
   writeFileSync(join(asksDir(quiet.home), `${quiet.askId}.json`), 'not json');
