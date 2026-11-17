@@ -223,3 +223,4 @@ full record.
 - 2026-11-17 · #527 · Click-to-approve on 2.1.323: pending clicks verified when used, round tickets (#472) · risk high · rounds 12 · arbiter 9 · substitute 1 · awaiting-owner-merge · Codex 7d: 16294 runs (15817 high)
 - 2026-11-17 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 39 · arbiter 39 (fix-verify 2) · substitute 2 · blocked · Codex 7d: 16322 runs (15833 high)
 - 2026-11-17 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 40 · arbiter 40 (fix-verify 2) · substitute 2 · blocked · Codex 7d: 16328 runs (15834 high)
+- 2026-11-17 · #540 · ci-wait: 'conflicting' verdict, ci.merge_checks, e2e 'others'; merge-commit-alone vs pre-push hook · risk high · rounds 6 · arbiter 4 · awaiting-owner-merge · Codex 7d: 16329 runs (15834 high)
