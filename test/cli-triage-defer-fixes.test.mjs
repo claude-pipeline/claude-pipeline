@@ -603,3 +603,16 @@ test('defer-fixes: a refused Follow up click then the owner\'s typed "follow up"
   assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
   assert.deepEqual([ok.output.followUpClick.state, ok.output.followUpClick.override], ['refused', 'typed']);
 });
+
+test('defer-fixes: after an instructed Follow up click a sensitive-path finding is still refused (the click grants nothing and lifts no severity rule), with the click state printed', async (t) => {
+  // failure caught: a verified Follow up click read as permission, so an accepted fix on a high_risk path is filed away as a follow-up without the extra round the severity rule demands
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  w.config({ yml: 'risk:\n  high_risk_paths: ["src/big.js"]\n' });
+  const before = w.stateText();
+  const r = await deferIn(w, clickHome(w, h2, 'instructed'), 'R2-S1', h2);
+  assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+  assert.match(r.output.reason, /not low severity \(.*sensitive path/);
+  assert.equal(r.output.followUpClick.state, 'instructed');
+  assert.equal(w.stateText(), before, 'nothing saved');
+});
