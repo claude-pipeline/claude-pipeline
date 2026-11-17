@@ -588,7 +588,10 @@ test('resolveSeams: an installed copy ignores every override whatever else is se
 
 // ---- end to end: the real hook, fake docker / ps ----
 // `configured` writes an (empty, valid) machine config: without one the feature is inert and a registration failure never blocks.
-function e2e({ stacks, docker = {}, ps = {}, projects = 'sa-corrections', configured = true } = {}) {
+// `deadlineMs` is the hook's own deadline (PIPELINE_STACKS_DEADLINE_MS). It is the default 20 s except in the tests that prove the deadline fires (they pass '1500' and a
+// fake that hangs far past it): at load 60-100 a node start plus a cache refresh through the fake docker outlasts 1.5 s of clock, and the hook then fails closed (exit 2),
+// which is the deadline working, not the rule under test.
+function e2e({ stacks, docker = {}, ps = {}, projects = 'sa-corrections', configured = true, deadlineMs = '20000' } = {}) {
   const w = world();
   if (configured) {
     mkdirSync(w.root, { recursive: true });
@@ -615,7 +618,7 @@ function e2e({ stacks, docker = {}, ps = {}, projects = 'sa-corrections', config
     FAKE_DOCKER_SCENARIO: dockerScenario,
     FAKE_PS_SCENARIO: psScenario,
     PIPELINE_MACHINE_ID: 'test-machine-id',
-    PIPELINE_STACKS_DEADLINE_MS: '1500',
+    PIPELINE_STACKS_DEADLINE_MS: deadlineMs,
   };
   const hook = (input, { nodeArgs = [], extraEnv = {}, entry } = {}) => {
     const started = performance.now();
@@ -648,13 +651,13 @@ test('e2e: the same hook through the installer\'s fail-closed loader registers t
 });
 
 test('e2e: a fake docker that hangs past the deadline => exit 2 "deadline" in well under 30 s; paused => exit 0', posixOnly, () => {
-  const x = e2e({ docker: { sleepMs: 8000 } });
+  const x = e2e({ docker: { sleepMs: 40000 }, deadlineMs: '1500' });
   const command = `supabase status --workdir ${x.sa.workdir}`;
   const r = x.hook(bash(command, x.w.base));
   assert.equal(r.status, 2);
   assert.match(r.stderr, /deadline/);
   assert.match(r.stderr, /autostop could not register use of stack/);
-  assert.ok(r.ms < 6000, `took ${r.ms} ms`);
+  assert.ok(r.ms < 20000, `took ${r.ms} ms`); // (the fake hangs for 40 s and the harness gives up at 25 s: a hook that waited for the fake would not be under 20 s; 6 s was too tight for a loaded node start)
   console.log(`# e2e docker hang, deadline 1500 ms: exit ${r.status} after ${r.ms.toFixed(0)} ms`);
   assert.equal(existsSync(x.w.files.ledger), false);
   mkdirSync(x.w.root, { recursive: true });
@@ -665,12 +668,12 @@ test('e2e: a fake docker that hangs past the deadline => exit 2 "deadline" in we
 });
 
 test('e2e: a fake ps that hangs past the deadline => exit 2 "deadline" in well under 30 s', posixOnly, () => {
-  const x = e2e({ ps: { sleepMs: 8000 } });
+  const x = e2e({ ps: { sleepMs: 40000 }, deadlineMs: '1500' });
   const r = x.hook(bash(`supabase status --workdir ${x.sa.workdir}`, x.w.base));
   assert.equal(r.status, 2);
   assert.match(r.stderr, /deadline/);
   assert.match(r.stderr, /owner not found/);
-  assert.ok(r.ms < 6000, `took ${r.ms} ms`);
+  assert.ok(r.ms < 20000, `took ${r.ms} ms`); // (the fake hangs for 40 s and the harness gives up at 25 s: a hook that waited for the fake would not be under 20 s; 6 s was too tight for a loaded node start)
   console.log(`# e2e ps hang, deadline 1500 ms: exit ${r.status} after ${r.ms.toFixed(0)} ms`);
 });
 
@@ -714,7 +717,7 @@ test('e2e R3-2: with PIPELINE_STACKS_HOME unset the fake ps / docker and the dea
   mkdirSync(defaultRoot, { recursive: true });
   // a fresh cache so no docker is needed at all; the owner lookup then runs the REAL ps, never the fake
   writeFileSync(join(defaultRoot, 'inventory.json'), JSON.stringify({ writtenAt: Date.now(), inventory: x.w.inv }));
-  const env = { ...x.env };
+  const env = { ...x.env, PIPELINE_STACKS_DEADLINE_MS: '1500' }; // (the override this test proves is NOT honoured, so it must differ from the default)
   delete env.PIPELINE_STACKS_HOME;
   const r = spawnSync(process.execPath, [HOOK], { input: JSON.stringify(bash(`supabase status --workdir ${x.sa.workdir}`, home)), env, encoding: 'utf8', timeout: 25000 });
   assert.equal(x.calls('ps.log'), 0, 'the PIPELINE_PS override must not be used');
