@@ -3,10 +3,13 @@
 // the state version gate. Nothing here runs a command: test/cli-triage-claude.test.mjs does that.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { issueBody } from '../pipeline/commands/followups.mjs';
 import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import {
+  DEFERRABLE_ACCEPT_BY,
   MALFUNCTION_CAUSES,
   applyClaudeRuling,
   applyJudge,
@@ -17,10 +20,16 @@ import {
   fableFindingItems,
   isClaudeRuled,
   isCriticalDismissal,
+  isDeferrableAccept,
+  isOwnerDeferral,
+  isOwnerRuled,
   isProtectedFinal,
   needsHumanCause,
+  reviewEligibilityProblems,
   reuseRuled,
   ruledCacheFrom,
+  rulingContentDigest,
+  rulingsInventory,
   settleSecondReview,
 } from '../pipeline/lib/triage.mjs';
 import { SUPPORTED_STATE_VERSION, decodeFromComment, emptyState, encodeForComment, loadState, saveState, withStateVersion } from '../pipeline/lib/state.mjs';
@@ -330,24 +339,144 @@ test('withStateVersion raises the version and never lowers it', () => {
   assert.equal(base.version, 1, 'the argument is not changed');
 });
 
-test('SUPPORTED_STATE_VERSION 6: a newer state is refused by loadState and decodeFromComment; 1, 2 (Claude ruling), 3 (deferral), 4 (substitute) 5 (out-of-model final) and 6 (post-max final) load', () => {
-  assert.equal(SUPPORTED_STATE_VERSION, 6);
+test('SUPPORTED_STATE_VERSION 7: a newer state is refused by loadState and decodeFromComment; 1, 2 (Claude ruling), 3 (deferral), 4 (substitute) 5 (out-of-model final), 6 (post-max final) and 7 (owner deferral) load', () => {
+  assert.equal(SUPPORTED_STATE_VERSION, 7);
   const dir = mkdtempSync(join(tmpdir(), 'cp-state-version-'));
   try {
     const base = emptyState({ repo: 'a/b', pr: 7, branch: 'x' });
     assert.equal(base.version, 1, 'ordinary states stay at 1');
-    for (const version of [1, 2, 3, 4, 5, 6]) {
+    for (const version of [1, 2, 3, 4, 5, 6, 7]) {
       saveState(dir, { ...base, version });
       assert.equal(loadState(dir).version, version);
       assert.equal(decodeFromComment(encodeForComment({ ...base, version })).version, version);
     }
-    saveState(dir, { ...base, version: 7 });
-    assert.throws(() => loadState(dir), /version 7.*supports.*6/);
-    assert.equal(decodeFromComment(encodeForComment({ ...base, version: 7 })), null);
+    saveState(dir, { ...base, version: 8 });
+    assert.throws(() => loadState(dir), /version 8.*supports.*7/);
+    assert.equal(decodeFromComment(encodeForComment({ ...base, version: 8 })), null);
     mkdirSync(join(dir, '.review'), { recursive: true });
     writeFileSync(join(dir, '.review', 'state.json'), JSON.stringify({ ...base, version: 99 }));
     assert.throws(() => loadState(dir), /newer/);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---- owner deferral of an unimplemented arbiter / judge / cache ACCEPT (plan 2026-11-17 PR A1, Item 1a + F1, F6, F12) ------------------------------------
+
+const accepted = (by = 'arbiter', over = {}) => item({ bucket: 'BLOCKING', category: 'security', final: { decision: 'ACCEPT', by, needsHuman: false, reason: `${by} accepted` }, ...over });
+const DEFER = { decision: 'FOLLOW-UP', reason: 'owner defers it', ownerQuote: 'R1-S1: follow-up', ruledAt: RULED_AT };
+
+test('isDeferrableAccept / isOwnerDeferral: only an unimplemented ACCEPT of the arbiter, judge or cache that nobody protected, tested or owner-ruled', () => {
+  for (const by of ['arbiter', 'judge', 'cache']) assert.equal(isDeferrableAccept(accepted(by)), true, by);
+  assert.deepEqual(DEFERRABLE_ACCEPT_BY, ['arbiter', 'judge', 'cache']);
+  const no = (why, it) => assert.equal(isDeferrableAccept(it), false, why);
+  no('implemented', accepted('arbiter', { implemented: true }));
+  no('by test', accepted('test'));
+  no('a cached copy of a test result (F12)', accepted('cache', { final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'r', evidence: 'test' } }));
+  no('Claude ruled', rule(waiting('low-confidence'), 'ACCEPT'));
+  no('second review forced', settleSecondReview(waiting('security-dismissal'), verdict('ACCEPT')));
+  no('waiting for a human', waiting('low-confidence'));
+  no('a FOLLOW-UP', accepted('arbiter', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r' } }));
+  no('a REJECT', accepted('arbiter', { final: { decision: 'REJECT', by: 'arbiter', needsHuman: false, reason: 'r' } }));
+  no('owner ruled', accepted('cache', { final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'r', ownerQuote: 'q' } }));
+  no('round-cap deferral', accepted('arbiter', { roundCapDeferral: { fixHead: 'a', reviewedHead: 'b', at: RULED_AT } }));
+  no('no final', item());
+  assert.equal(isOwnerDeferral(accepted()), false);
+});
+
+test('applyOwnerRuling: an unimplemented arbiter ACCEPT may be deferred (FOLLOW-UP) only; the final records ownerDeferral and keeps the ACCEPT as overruled', () => {
+  for (const by of ['arbiter', 'judge', 'cache']) {
+    const it = accepted(by);
+    const out = applyOwnerRuling(it, DEFER);
+    assert.equal(out.final.by, 'owner');
+    assert.equal(out.final.decision, 'FOLLOW-UP');
+    assert.equal(out.final.needsHuman, false);
+    assert.deepEqual(out.final.ownerDeferral, { accepted: by, ruledAt: RULED_AT });
+    assert.deepEqual(out.final.overruled, it.final, 'the ACCEPT it deferred is kept');
+    assert.equal(out.final.ownerQuote, DEFER.ownerQuote);
+    assert.equal(out.implemented, false);
+    assert.equal(isOwnerDeferral(out), true);
+    assert.equal(isOwnerRuled(out), true);
+    assert.equal(isDeferrableAccept(out), false, 'once deferred it is no longer an open ACCEPT');
+  }
+  for (const decision of ['REJECT', 'ACCEPT']) throwsWith(() => applyOwnerRuling(accepted(), { ...DEFER, decision }), /needs no human/);
+  throwsWith(() => applyOwnerRuling(accepted('arbiter', { implemented: true }), DEFER), /needs no human/);
+  throwsWith(() => applyOwnerRuling(accepted('test'), DEFER), /needs no human/);
+  throwsWith(() => applyOwnerRuling(accepted('cache', { final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'r', evidence: 'test' } }), DEFER), /needs no human/);
+  // the old paths are as before: a needs-human item takes any decision, an owner-ruled ACCEPT is not reopened
+  assert.equal(applyOwnerRuling(waiting('low-confidence'), { ...DEFER, decision: 'REJECT' }).final.ownerDeferral, undefined);
+  throwsWith(() => applyOwnerRuling(applyOwnerRuling(waiting('low-confidence'), { ...DEFER, decision: 'ACCEPT' }), DEFER), /needs no human/);
+});
+
+test('F1: rulingContentDigest is unchanged for every ordinary item and carries a marker only for a deferrable ACCEPT or an owner deferral (stable once applied)', () => {
+  const plain = waiting('low-confidence', { id: 'R1-S1', bucket: 'SUGGESTION', title: 'same text' });
+  const tuple = [plain.id.toUpperCase(), plain.source, plain.bucket, plain.category, plain.title, plain.file, plain.line, plain.detail, plain.codexReasoning, plain.arbiter?.reasoning].map((v) => v ?? null);
+  assert.equal(rulingContentDigest([plain]), createHash('sha256').update(JSON.stringify([tuple])).digest('hex').slice(0, 12), 'the existing digest is byte-identical');
+  const same = { ...plain, final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'r' } };
+  assert.notEqual(rulingContentDigest([same]), rulingContentDigest([plain]), 'the same text asked while it was ACCEPTED is another question');
+  const claudeOne = rule(plain, 'ACCEPT');
+  assert.equal(rulingContentDigest([claudeOne]), rulingContentDigest([plain]), 'a Claude final is not a deferral: unchanged');
+  assert.equal(rulingContentDigest([applyOwnerRuling(same, { ...DEFER, ownerQuote: 'x' })]), rulingContentDigest([same]), 'applying the ruling leaves the request\'s digest alone');
+  assert.equal(rulingContentDigest([{ ...same, final: { ...same.final, by: 'test' } }]), rulingContentDigest([plain]), 'a test ACCEPT is not deferrable: unchanged');
+});
+
+test('F12 / F6: the result cache carries a test mark, and an owner deferral survives it as a deferral', () => {
+  const tested = applyTestResult(item({ bucket: 'BLOCKING', category: 'bug', testable: true }), 'bug-confirmed', 'it fails');
+  assert.equal(tested.final.by, 'test');
+  const cache = ruledCacheFrom([tested]);
+  const [copy] = reuseRuled([item({ bucket: 'BLOCKING', category: 'bug', fingerprint: tested.fingerprint })], cache);
+  assert.equal(copy.final.by, 'cache');
+  assert.equal(copy.final.evidence, 'test');
+  assert.equal(isDeferrableAccept(copy), false, 'a test ACCEPT stays undeferrable through the cache');
+
+  const deferred = applyOwnerRuling(accepted('arbiter'), DEFER);
+  const [carried] = reuseRuled([item({ bucket: 'BLOCKING', category: 'security', fingerprint: deferred.fingerprint })], ruledCacheFrom([deferred]));
+  assert.equal(carried.final.by, 'cache', 'the cache rewrites by');
+  assert.equal(isOwnerDeferral(carried), true, '...but the deferral is keyed on final.ownerDeferral');
+  assert.equal(isOwnerRuled(carried), true);
+});
+
+// R1-B2: a cached test ACCEPT written before the cache kept final.evidence has only the reason prefix of applyTestResult to tell it from an arbiter ACCEPT.
+test('R1-B2: a legacy cached copy of a test ACCEPT (no evidence mark, reason "test confirmed: ...") is not deferrable and stays a test result through the cache', () => {
+  const legacy = accepted('cache', { final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'test confirmed: it fails' } });
+  assert.equal(isDeferrableAccept(legacy), false);
+  throwsWith(() => applyOwnerRuling(legacy, DEFER), /needs no human/);
+  const tested = applyTestResult(item({ bucket: 'BLOCKING', category: 'security', testable: true }), 'bug-confirmed', 'it fails');
+  const later = { ...legacy, fingerprint: tested.fingerprint };
+  assert.equal(ruledCacheFrom([later])[tested.fingerprint].evidence, 'test', 'the cache stamps the legacy copy');
+  assert.equal(ruledCacheFrom([tested, later])[tested.fingerprint].evidence, 'test', 'a later legacy copy does not erase the mark');
+  assert.equal(isDeferrableAccept(accepted('cache', { final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'arbiter says test confirmed: no' } })), true, 'only the prefix counts');
+});
+
+test('the Rulings block lists an owner deferral (BLOCKING or not), once for a cached copy; the filing gate holds until the issue is filed', () => {
+  const deferred = applyOwnerRuling(accepted('arbiter', { bucket: 'SUGGESTION', category: 'maintainability', id: 'R1-S1', title: 'Rename helper' }), DEFER);
+  const state = { rounds: [{ n: 1, items: [deferred] }] };
+  const { rows } = rulingsInventory(state);
+  assert.equal(rows.length, 1);
+  assert.match(rows[0], /^R1-S1 · FOLLOW-UP · SUGGESTION · maintainability · by owner deferral \(accepted by arbiter\) · content [0-9a-f]{12} · "Rename helper" · why: owner deferral of arbiter ACCEPT; NOT fixed in this merge; issue not filed yet$/);
+  assert.match(reviewEligibilityProblems(state).join('\n'), /owner-deferred follow-up\(s\) without a filed issue: R1-S1 \(run followups create\)/);
+  // a later round's cached copy: still gated (F6), listed once, and the issue clears both
+  const copy = reuseRuled([item({ id: 'R2-S1', bucket: 'SUGGESTION', category: 'maintainability', fingerprint: deferred.fingerprint })], ruledCacheFrom([deferred]), { round: 2 })[0];
+  const two = { rounds: [{ n: 1, items: [deferred] }, { n: 2, items: [copy] }] };
+  assert.equal(rulingsInventory(two).count, 1, 'one deferral, not two');
+  assert.match(reviewEligibilityProblems(two).join('\n'), /R1-S1, R2-S1/);
+  const filed = { rounds: two.rounds.map((r) => ({ ...r, items: r.items.map((i) => ({ ...i, followupIssue: 'https://github.com/acme/widgets/issues/9' })) })) };
+  assert.deepEqual(reviewEligibilityProblems(filed), []);
+  assert.match(rulingsInventory(filed).rows[0], /issue #9$/);
+  // an ordinary owner-ruled non-critical FOLLOW-UP is as before: no row, no gate
+  const ordinary = applyOwnerRuling(waiting('low-confidence', { bucket: 'SUGGESTION' }), DEFER);
+  assert.equal(rulingsInventory({ rounds: [{ items: [ordinary] }] }).count, 0);
+  assert.deepEqual(reviewEligibilityProblems({ rounds: [{ items: [ordinary] }] }), []);
+});
+
+test('F7: the follow-up issue of an owner deferral says a fix was ACCEPTED and deferred by the owner (also for a cached copy); an ordinary owner follow-up reads as before', () => {
+  const deferred = applyOwnerRuling(accepted('arbiter', { bucket: 'SUGGESTION', category: 'maintainability', file: 'src/b.js' }), DEFER);
+  const body = issueBody(deferred, 7);
+  assert.match(body, /\*\*Owner \(why this is a follow-up, not part of the PR\):\*\*/);
+  assert.match(body, /The arbiter ACCEPTED a fix for this finding and the owner deferred it to this issue \(typed ruling\); it is NOT in PR #7/);
+  const copy = { ...deferred, final: { ...deferred.final, by: 'cache' } };
+  assert.match(issueBody(copy, 7), /\*\*Owner \(why/);
+  assert.match(issueBody(copy, 7), /ACCEPTED a fix/);
+  const ordinary = applyOwnerRuling(waiting('low-confidence', { bucket: 'SUGGESTION' }), DEFER);
+  assert.doesNotMatch(issueBody(ordinary, 7), /ACCEPTED a fix/);
 });

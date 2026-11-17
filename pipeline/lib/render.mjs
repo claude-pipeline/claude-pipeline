@@ -46,10 +46,11 @@ const ownerReason = (final) => (typeof final?.ownerQuote === 'string' && final.o
 const claudeRuled = (item) => item?.final?.by === 'claude';
 const claudeBy = (item) => (item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude');
 
+const isPlainOwnerDeferral = (final) => final !== null && typeof final?.ownerDeferral === 'object' && final.ownerDeferral !== null && !Array.isArray(final.ownerDeferral);
 function triageRow(n, item) {
   const { final, judge, arbiter } = item;
   let decision = 'pending';
-  if (final) decision = `${final.decision ?? 'unknown'}${final.needsHuman ? ' (needs human)' : ''}`;
+  if (final) decision = `${final.decision ?? 'unknown'}${final.needsHuman ? ' (needs human)' : ''}${isPlainOwnerDeferral(final) ? ` (owner deferral of ${line(final.ownerDeferral.accepted, 20)} ACCEPT)` : ''}`;
   else if (judge) decision = `${judge.decision} (pending)`;
   const by = claudeRuled(item) ? claudeBy(item) : final?.by ?? '—';
   const conf = arbiter?.confidence ?? judge?.confidence ?? '—';
@@ -201,7 +202,8 @@ function outliersSection(entries, modelProofs, state) {
     out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${judgeView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
   }
   for (const { item } of unique(entries.filter(({ item: i }) => i.final?.ownerQuote))) {
-    out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)} — "${line(item.final.ownerQuote, 300)}"`);
+    const deferral = isPlainOwnerDeferral(item.final) ? ` (deferral of the ${line(item.final.ownerDeferral.accepted, 20)}'s ACCEPT, not fixed)` : '';
+    out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)}${deferral} — "${line(item.final.ownerQuote, 300)}"`);
   }
   for (const g of grantedRounds(state)) {
     out.push(`- Owner (chat) granted ${grantLabel(g)} - "${line(g.quote, 300)}"`);
