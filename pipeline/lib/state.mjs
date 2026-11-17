@@ -46,7 +46,9 @@ export const stateNeedsPostMaxVersion = (state) => (Array.isArray(state?.rounds)
 export const stateNeedsOutOfModelVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => typeof i?.final?.outOfModel === 'string' && i.final.outOfModel !== ''));
 // The state at (at least) `version`: a writer never lowers the version a state already carries.
 export const withStateVersion = (state, version) => ({ ...state, version: Math.max(Number.isFinite(state?.version) ? state.version : 1, version) });
-const newerThanSupported = (state) => Number.isFinite(state.version) && state.version > SUPPORTED_STATE_VERSION;
+// Versions below SUPPORTED_STATE_VERSION that this install must still refuse: 7 belongs to open PR #601 (owner deferral), whose code this install does not hold. #601 removes 7 from this set when it lands.
+const RESERVED_STATE_VERSIONS = [7];
+const newerThanSupported = (state) => Number.isFinite(state.version) && (state.version > SUPPORTED_STATE_VERSION || RESERVED_STATE_VERSIONS.includes(state.version));
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 

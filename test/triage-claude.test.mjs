@@ -341,6 +341,9 @@ test('SUPPORTED_STATE_VERSION 8 (7 is reserved by open PR #601): a newer state i
       assert.equal(loadState(dir).version, version);
       assert.equal(decodeFromComment(encodeForComment({ ...base, version })).version, version);
     }
+    saveState(dir, { ...base, version: 7 });
+    assert.throws(() => loadState(dir), /version 7/, "7 is reserved by open PR #601: this install does not hold its code");
+    assert.equal(decodeFromComment(encodeForComment({ ...base, version: 7 })), null);
     saveState(dir, { ...base, version: 9 });
     assert.throws(() => loadState(dir), /version 9.*supports.*8/);
     assert.equal(decodeFromComment(encodeForComment({ ...base, version: 9 })), null);

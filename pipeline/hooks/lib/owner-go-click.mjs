@@ -877,15 +877,33 @@ export function followUpClickState({ home = accountHome(), repo, pr, now = Date.
     }
     const recorded = moves ?? readRepoMoves({ home }).moves;
     let newest = null;
+    const live = (ms) => nowMs <= ms + CAPTURE_SKEW_MS + MAX_AGE_MS;
+    // An ask that cannot be read cannot be told whose it is (as in pendingClickProblems): unless a raw read shows it plainly belongs to another kind or PR, a click pointer or spent marker of it inside the window
+    // (settled or not: a received click on an ask that cannot be read is settled as refused, which must not read as "no click") makes the answer 'unverified'.
+    const unreadableClick = (id) => {
+      const raw = readSmallJson(askFile(id, 'json', home));
+      if (raw.state === 'ok' && isObj(raw.value) && ((typeof raw.value.kind === 'string' && KINDS.includes(raw.value.kind) && raw.value.kind !== 'round') || (Array.isArray(raw.value.prs) && !raw.value.prs.includes(pr)))) return false;
+      const spent = readSpent(id, home);
+      if (spent.state === 'bad') return true;
+      if (spent.state === 'ok' && live(Date.parse(spent.marker.answeredAt) || 0)) return true;
+      for (const name of names) {
+        const m = PENDING_RE.exec(name);
+        if (m === null || m[1] !== id) continue;
+        let capturedMs = readPending(name, home, nowMs).pending?.capturedMs;
+        if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
+        if (live(capturedMs)) return true;
+      }
+      return false;
+    };
     for (const name of names) {
       if (!/^ask-[0-9a-f]{12}\.json$/.test(name)) continue;
       const loaded = readAsk(name.slice(0, -5), { home });
+      if (!loaded.ok && loaded.reason !== 'none' && unreadableClick(name.slice(0, -5))) return say('unverified', name.slice(0, -5), 'its ask file cannot be read');
       if (!loaded.ok || loaded.ask.kind !== 'round' || !loaded.ask.prs.includes(pr) || !sameRepo({ recorded: loaded.ask.repo, recordedAt: loaded.ask.issuedAt, current: key, moves: recorded }) || marked(loaded.ask.askId, 'superseded', home)) continue;
       if (newest === null || Date.parse(loaded.ask.issuedAt) > Date.parse(newest.issuedAt)) newest = loaded.ask;
     }
     if (newest === null || newest.variant !== 'round-v2-follow-up') return say('none', newest?.askId ?? null);
     const id = newest.askId;
-    const live = (ms) => nowMs <= ms + CAPTURE_SKEW_MS + MAX_AGE_MS;
     const spent = readSpent(id, home);
     if (spent.state === 'bad') return say('unverified', id, 'its spent marker cannot be read');
     if (spent.state === 'ok') {

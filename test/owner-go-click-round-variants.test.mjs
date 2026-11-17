@@ -418,3 +418,21 @@ test('the lever and the issued variant: B1 issues the legacy dialog whatever the
   // failure caught: B1 issuing a dialog the installed verifier on another machine cannot read yet (every ask stays round-v1 until B2)
   for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'legacy' }, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env }), 'round-v1');
 });
+
+test('followUpClickState: a follow-up click whose ask file became unreadable before settlement answers unverified, not none; an unreadable ask of another PR or with no click stays out of it', async (t) => {
+  // failure caught: settlement refuses the click as ask-invalid (which removes it from pendingClickProblems), the state check skips the unreadable ask and says `none`, and `triage defer-fixes` proceeds without a typed follow-up
+  const w = pendingWorld(t);
+  await w.click();
+  writeFileSync(join(asksDir(w.home), `${w.askId}.json`), 'not json');
+  w.settle();
+  assert.equal(readFileSync(join(asksDir(w.home), `${w.askId}.${clickIdOf(w)}.settled`), 'utf8').includes('ask-invalid'), true, 'settled as refused: ask-invalid');
+  const s = w.state();
+  assert.deepEqual([s.state, s.askId], ['unverified', w.askId]);
+  assert.equal(w.state({ pr: 59 }).state, 'unverified', 'an unreadable ask cannot be told to be another PR\'s with no readable prs: it counts');
+  // outside the window the click no longer matters
+  assert.equal(w.state({ now: () => w.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 }).state, 'none');
+  // an unreadable ask nobody clicked on is not a click
+  const quiet = pendingWorld(t);
+  writeFileSync(join(asksDir(quiet.home), `${quiet.askId}.json`), 'not json');
+  assert.equal(quiet.state().state, 'none');
+});
