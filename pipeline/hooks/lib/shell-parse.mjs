@@ -3584,6 +3584,7 @@ class Parser {
         argv.push(w.text);
       }
     }
+    seg.typed = words.slice(i).map((w) => w.text); // (the command's words as typed, before any wrapper is unwrapped: see the `typed` property of process)
     return this.process(argv, env, seg, false);
   }
 
@@ -3644,6 +3645,8 @@ class Parser {
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
+    // typed: the words the command was typed with (a quoted string, a substitution and a heredoc body stay one word; comments are not words; leading NAME=value words are not in it), wrappers included. Not enumerable
+    if (cmd && seg.typed) Object.defineProperty(cmd, 'typed', { value: seg.typed, enumerable: false });
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });

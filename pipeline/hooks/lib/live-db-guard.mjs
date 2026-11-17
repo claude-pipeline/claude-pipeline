@@ -10,7 +10,7 @@ import path from 'node:path';
 import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore, replyBeforeToolUse } from './owner-go.mjs';
 import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.mjs';
 import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
-import { commandName, splitArgs } from './shell-parse.mjs';
+import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock } from './live-db-go.mjs';
 
@@ -172,17 +172,28 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
 // ---- Task 5 (B1a): agent-run supabase CLI lines and Management API calls that can reach a non-local database ----
 // findLiveDbCli(cmds, raw, state) -> reason | null (null = nothing to refuse). A line passes only when the line itself proves a LOCAL target (or the owner's `dev` project); everything the guard does
 // not know is refused ("the owner runs it"). The psql family (psql, pg_dump…, usql, the pg utilities, PG* env) ships in B1b.
+//
+// One SHAPE rule, no list of launchers (rounds 8-10 each found a new wrapper or an over-refusal in one). Per command, two readings are judged and a refusal from either wins: the parsed argv (the parser
+// unwraps npx / timeout / xargs / sudo …) and the words as typed (`c.typed`, the parser's own words of the command: a quoted string, a substitution and a heredoc body stay one word, a comment is not a word).
+// A supabase word (SB_WORD: the binary by any spelling) makes a CALL when it is word 0, or when it is later AND a later non-flag word is a subcommand head or is not a literal; `supabaseRefusal` then judges the
+// words after it. So a doppler / op / direnv / mise / timeout / npx-dotenv wrapper is read without being named, and a directory or package name that merely ends in supabase (`npx eslint lib/supabase --fix`,
+// `npm i supabase`) has no subcommand after it and is no call. A package manager's own install / look-up verb and a `--package` / `--filter` / `workspace` selector name the package without running it.
+// xargs / parallel build the command from stdin: on a line that names supabase they are refused outright.
 const OWNER_RUNS = 'the owner runs this; hand them the exact line';
-const SB_WORD = /^supabase(?:@[^/\\]*)?$/;
-const LAUNCHERS = new Set(['npx', 'bunx', 'pnpx', 'pnpm', 'yarn', 'npm', 'bun', 'corepack', 'xargs', 'env', 'nice', 'time', 'command', 'exec', 'nohup', 'sudo', 'timeout', 'watch',
-  // env-loader wrappers called directly, and every other wrapper the shell parser unwraps (WRAPPERS in shell-parse.mjs)
-  'dotenv', 'dotenv-cli', 'cross-env', 'env-cmd', 'with-env', 'unbuffer', 'taskset', 'sandbox-exec', 'ssh', 'script', 'screen', 'parallel', 'wsl', 'builtin', 'noglob', 'nocorrect', '-', 'setsid', 'ionice', 'stdbuf', 'doas', 'su', 'flock', 'arch', 'caffeinate', 'busybox']);
+const SB_WORD = /^(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\]*)?$/;
+const isSbWord = (w) => typeof w === 'string' && SB_WORD.test(commandName(w));
 // subcommand prefixes (the words before the first flag): LOCAL_ONLY lines pass with no target flag or with `--local`; REMOTE_CAPABLE ones only with a local or `dev` target proof
 const LOCAL_ONLY = [['start'], ['stop'], ['status'], ['init'], ['link'], ['unlink'], ['login'], ['logout'], ['db', 'reset'], ['db', 'diff'], ['db', 'lint'], ['migration', 'new'], ['migration', 'list'], ['migration', 'up'], ['test', 'db'], ['functions', 'serve'], ['functions', 'new'], ['projects', 'list'], ['orgs', 'list'], ['help']];
 const REMOTE_CAPABLE = [['db', 'push'], ['db', 'pull'], ['db', 'dump'], ['migration', 'repair'], ['migration', 'squash'], ['migration', 'fetch'], ['functions', 'deploy'], ['functions', 'delete'], ['functions', 'download'], ['secrets'], ['storage'], ['branches'], ['config', 'push'], ['postgres-config'], ['sso'], ['domains'], ['vanity-subdomains'], ['ssl-enforcement'], ['inspect', 'db'], ['gen', 'types'], ['seed', 'buckets'], ['backups'], ['encryption'], ['snippets']];
-// package-manager verbs that only name the package (they do not run a binary), and `command -v|-V`
+// package managers: their non-run verbs only name the package (`npm install supabase`); `command -v` needs no entry (nothing follows the word)
 const PM_HEADS = new Set(['pnpm', 'yarn', 'npm', 'bun', 'corepack']);
 const NON_RUN_VERBS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'upgrade', 'ls', 'list', 'why', 'view', 'info', 'outdated']);
+// the options a manager takes before its verb, per manager (arity differs); any other option before the verb ends the exemption
+const PM_SKIP = {
+  npm: { bool: ['-g', '--global', '-D', '--save-dev', '-E', '--save-exact', '-O', '--save-optional', '-s', '--silent'], val: ['--prefix', '--workspace', '-w'] },
+  pnpm: { bool: ['-g', '--global', '-D', '--save-dev', '-E', '--save-exact', '-O', '--save-optional', '-r', '--recursive', '-s', '--silent', '-w', '--workspace-root'], val: ['--filter', '-F', '-C', '--dir'] },
+  yarn: { bool: [], val: ['--cwd'], workspace: true },
+};
 const startsWith = (tokens, prefix) => prefix.every((w, i) => tokens[i] === w);
 const BOOL_FLAGS = new Set(['yes', 'debug', 'help', 'experimental', 'include-all', 'include-roles', 'include-seed', 'data-only', 'role-only', 'use-copy', 'keep-comments', 'no-verify-jwt', 'use-api', 'use-docker', 'legacy-bundle', 'prune', 'no-seed', 'use-migra', 'use-pgadmin', 'use-pg-schema', 'no-backup']);
 const NON_LITERAL = /[\s$`*?[\]{}()~\\<>|;&'"!#]/;
@@ -197,7 +208,7 @@ function localDbUrl(v) {
 }
 
 // commands that only read or print their arguments: a Management API hostname mentioned on a line made of these alone (a search, an echo) makes no request
-const NO_REQUEST = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls']);
+const NO_REQUEST = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls', 'cd', 'pwd', 'cut', 'tr', 'sort']);
 const NO_REQUEST_GIT = new Set(['grep', 'log', 'diff', 'show', 'blame', 'status', 'ls-files', 'shortlog', 'rev-list', 'describe']);
 // (a bare command word only: `/tmp/x/rg` and `./rg` are scripts that may be named anything; and a line that writes a file, `echo '…' > run.sh`, is not a mention that goes nowhere)
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
@@ -209,45 +220,75 @@ const runsProgram = (c) => {
   const n = commandName(c.argv[0]);
   const args = c.argv.slice(1);
   if (n === 'rg') return args.some((a) => /^--(?:pre|hostname-bin)(?:=|$)/.test(a));
-  // (ack's Getopt::Long and ag's getopt_long take unique prefixes too: --pa, --pag; ripgrep takes exact names only)
-  if (n === 'ack' || n === 'ag') return args.some((a) => { const o = /^--([^=]*)/.exec(a)?.[1]; return o !== undefined && o.length >= 2 && 'pager'.startsWith(o); });
+  // (ack's Getopt::Long and ag's getopt_long take unique prefixes, and ack also `-pager` and `+pager`: every spelling of p…pager is refused, `-p` too)
+  if (n === 'ack' || n === 'ag') return args.some((a) => /^(?:--|-|\+)p(?:a(?:g(?:er?)?)?)?(?:=|$)/.test(a));
+  // (sort writes with -o / --output and runs --compress-program; a cluster holding o is refused too)
+  if (n === 'sort') return args.some((a) => (a.startsWith('--') ? a.length > 2 && ['output', 'compress-program'].some((o) => o.startsWith(a.slice(2).split('=')[0])) : /^-[A-Za-z0-9]*o/.test(a)));
   if (n === 'git') return args.some((a) => (a.startsWith('--') ? a.length > 3 && PROGRAM_OPTION_GIT.some((o) => o.startsWith(a.slice(2).split('=')[0])) : /^-[A-Za-z0-9]*[oO]/.test(a)));
   return false;
 };
 const makesNoRequest = (c) => {
-  if (c.argv[0].includes('/') || writesFile(c) || Object.keys(c.env ?? {}).length || runsProgram(c)) return false;
+  if (c.argv[0].includes('/') || writesFile(c) || stdinFed(c) || Object.keys(c.env ?? {}).length || runsProgram(c)) return false;
   const n = commandName(c.argv[0]);
   return NO_REQUEST.has(n) || (n === 'git' && NO_REQUEST_GIT.has(c.argv[1]));
 };
 
-// does a launcher line run the supabase binary? Fail closed: after a launcher a wrapper (dotenv, cross-env, env-cmd, timeout…) may run the rest, so ANY later word that is the bare binary name is refused;
-// a path word is refused when it is …/.bin/supabase, an absolute path, is followed by a flag, or has a supabase subcommand among the later non-flag words (a directory argument like lib/supabase is not the binary)
-const SUBCOMMAND_HEADS = new Set([...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]));
-const isSubcommandHead = (w) => w !== undefined && (SUBCOMMAND_HEADS.has(w) || /^network-/.test(w));
-function launcherRunsSupabase(argv) {
-  return argv.some((w, i) => {
-    if (i === 0) return false;
-    if (SB_WORD.test(w)) return true;
-    return w.includes('/') && SB_WORD.test(commandName(w)) && (/(?:^|\/)\.bin\/[^/]*$/.test(w) || w.startsWith('/') || argv[i + 1]?.startsWith('-') || argv.slice(i + 1).some((x) => !x.startsWith('-') && isSubcommandHead(x)));
-  });
+// the first words of every supabase subcommand and alias (`supabase --help` of CLI 2.122; re-check on a CLI update), plus those the tables below do not carry
+const SUB_HEADS = new Set([...[...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]), 'bootstrap', 'completion', 'services', 'migrations', 'pull', 'notebooks', 'logs', 'experimental', 'issue', 'feedback', 'telemetry', 'whoami']);
+const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
+const NON_LITERAL_WORD = /[$`*?[{]/;
+const typedWords = (c) => (Array.isArray(c.typed) ? c.typed : c.argv);
+const nearestHead = (words, i, heads) => { let j = i - 1; while (j >= 0 && !heads.has(commandName(words[j]))) j -= 1; return j; };
+
+// words[i] sits right after a manager's own verb (`npm install supabase`, `pnpm --filter web add supabase`): the nearest manager head, then only that manager's listed options, then a non-run verb
+function pmNonRun(words, i) {
+  const j = nearestHead(words, i, PM_HEADS);
+  if (j < 0) return false;
+  const rules = PM_SKIP[commandName(words[j])];
+  let k = j + 1;
+  while (rules && k < i) {
+    const w = words[k];
+    if (rules.bool.includes(w)) k += 1;
+    else if (rules.val.includes(w)) k += 2;
+    else if (rules.val.some((o) => o.startsWith('--') && w.startsWith(`${o}=`))) k += 1;
+    else if (rules.workspace && w === 'workspace') k += 2;
+    else break;
+  }
+  return k < i && NON_RUN_VERBS.has(words[k]);
 }
 
-// -> { rest } (the argv after the supabase word) | { refuse } | null (not a supabase line)
-function supabaseCall(argv) {
-  const head = commandName(argv[0]);
-  if (SB_WORD.test(head)) return { rest: argv.slice(1) };
-  if (!LAUNCHERS.has(head)) return null;
-  if (head === 'npx' || head === 'bunx' || head === 'pnpx') {
-    const i = argv.findIndex((w, k) => k > 0 && !w.startsWith('-'));
-    if (i > 0 && SB_WORD.test(commandName(argv[i]))) return { rest: argv.slice(i + 1) };
-  } else if (['pnpm', 'yarn', 'npm'].includes(head) && (argv[1] === 'dlx' || argv[1] === 'exec') && argv[2] !== undefined && SB_WORD.test(commandName(argv[2]))) {
-    return { rest: argv.slice(3) };
+// words[i] is the value of a selector, not the executable: `--package X` / `-p X` of a runner (only before its first non-option word), `--filter X` / `-F X` (pnpm), `--workspace X` (npm), `workspace X` (yarn)
+const RUNNERS = new Set(['npx', 'bunx', 'pnpx']);
+function isSelector(words, i) {
+  const j = nearestHead(words, i, new Set([...RUNNERS, ...PM_HEADS]));
+  if (j < 0) return false;
+  const head = commandName(words[j]);
+  const prev = words[i - 1];
+  if ((head === 'pnpm' && (prev === '--filter' || prev === '-F')) || (head === 'npm' && prev === '--workspace') || (head === 'yarn' && prev === 'workspace')) return true;
+  if (!RUNNERS.has(head) && !(PM_HEADS.has(head) && ['exec', 'dlx', 'x'].includes(words[j + 1]))) return false;
+  for (let k = RUNNERS.has(head) ? j + 1 : j + 2; k < i;) {
+    const w = words[k];
+    if (!w.startsWith('-') || w === '--') return false;
+    if (w === '-p' || w === '--package') { if (k + 1 === i) return true; k += 2; } else k += 1;
   }
-  if (PM_HEADS.has(head) && NON_RUN_VERBS.has(argv[1])) return null;
-  if (head === 'command' && (argv[1] === '-v' || argv[1] === '-V')) return null;
-  if (launcherRunsSupabase(argv)) return { refuse: `\`${argv[0]}\` runs supabase in a shape the guard does not read (only \`supabase\`, \`npx\`, \`pnpm dlx|exec\`, \`bunx\`, \`yarn dlx|exec\` are)` };
-  return null;
+  return false;
 }
+
+// every supabase call among the words -> [{ rest }] (the words after the supabase word, for supabaseRefusal)
+function supabaseCalls(words) {
+  const calls = [];
+  words.forEach((w, i) => {
+    if (!isSbWord(w)) return;
+    const rest = words.slice(i + 1);
+    if (i === 0) { calls.push({ rest }); return; }
+    if (isSelector(words, i) || pmNonRun(words, i)) return;
+    if (rest.some((x) => !x.startsWith('-') && (isSubcommandHead(x) || NON_LITERAL_WORD.test(x)))) calls.push({ rest });
+  });
+  return calls;
+}
+
+// xargs / parallel (by command name, in either reading) build the command from stdin text the line does not show
+const stdinFed = (c) => [...c.argv, ...typedWords(c)].some((w) => /^g?(?:xargs|parallel)$/.test(commandName(w)));
 
 function supabaseRefusal(rest, state) {
   const first = rest[0];
@@ -332,18 +373,16 @@ function cleanApiPath(after) {
 // `scanRaw` is the line with the prose flags (commit message, PR body) masked; `wordsOf(cmd)` the words of one command without those prose values (a command inside `$(…)` or backticks in a prose value is its own command, so its words are still read)
 export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv) {
   const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
-  for (const c of cmds) {
-    if (!c.argv?.length) continue;
-    // the parser drops the launchers (`timeout 5 npx dotenv -- supabase …` parses as `dotenv -- supabase …`), so the words the line was typed with are read too
-    const call = supabaseCall(c.argv) ?? supabaseCall(splitArgs(c.raw ?? '').filter((w, i, all) => !(/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) && all.slice(0, i).every((p) => /^[A-Za-z_][A-Za-z0-9_]*=/.test(p)))));
-    if (!call) continue;
-    const why = call.refuse ?? supabaseRefusal(call.rest, state);
+  const reading = cmds.filter((c) => c.argv?.length);
+  // R10-F1: xargs / parallel append words from stdin that no reading shows; with supabase named anywhere on the line the call cannot be judged
+  if (reading.some(stdinFed) && /supabase/i.test([scanRaw, ...cmds.map((c) => c.raw)].join('\n'))) return refuse('`xargs` / `parallel` builds a command from stdin and the line names supabase');
+  for (const c of reading) for (const words of [c.argv, typedWords(c)]) for (const call of supabaseCalls(words)) {
+    const why = supabaseRefusal(call.rest, state);
     if (why) return refuse(why);
   }
   // the Management API: every mention on the line (prose flags of a commit or PR already masked; a variable holding the URL is still caught) must name a dev project's own routes, by a clean path
   const texts = [String(scanRaw ?? ''), ...cmds.map((c) => [...wordsOf(c), ...Object.values(c.env ?? {})].join(' '))];
   // a line made only of commands that make no request (a search, an echo) may mention the hostname; a substitution or pipe into anything else is its own command and keeps the line checked
-  const reading = cmds.filter((c) => c.argv?.length);
   if (reading.length && reading.every(makesNoRequest)) return null;
   for (const text of texts) for (const m of text.matchAll(/api\.supabase\.com/gi)) {
     const after = text.slice(m.index + m[0].length);
