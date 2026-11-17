@@ -32,6 +32,8 @@ const allows = (label, cases) => {
     });
   }
 };
+// A frozen clock for the cases that only judge text (the guard's 5 s deadline can never fire on a loaded machine and deny an allow case).
+const frozen = (cases) => cases.map(([name, line, extra]) => [name, line, { ...(extra ?? PROJ), now: () => 0 }]);
 const body = 'cd proj && find . -delete\n';
 const A = stub({ '/home/u/proj/a.sh': body });
 const E = 'export proj=/home/u; ';
@@ -189,12 +191,12 @@ describe('R17-F5: options held in a run-time word', () => {
 });
 
 describe('R17-F6: eval of a wrapper that sources a switch', () => {
-  denies('F6', [
+  denies('F6', frozen([
     ['eval "$(cat wrap.sh)" (wrap.sh sources sw.sh), then the cd (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}eval "$(cat ./wrap.sh)"; cd proj && find . -delete`, stub({ '/home/u/proj/wrap.sh': '. ./sw.sh\n', '/home/u/proj/sw.sh': SWS })],
-  ]);
-  allows('F6', [
+  ]));
+  allows('F6', frozen([
     ['the same with ./NAME', `${E}eval "$(cat ./wrap.sh)"; cd ./proj && rm -rf build`, stub({ '/home/u/proj/wrap.sh': '. ./sw.sh\n', '/home/u/proj/sw.sh': SWS })],
-  ]);
+  ]));
 });
 
 describe('R17-F7: a loop that runs an earlier file again after a later file moved the directory', () => {
