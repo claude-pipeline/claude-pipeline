@@ -436,6 +436,18 @@ test('F12 / F6: the result cache carries a test mark, and an owner deferral surv
   assert.equal(isOwnerRuled(carried), true);
 });
 
+// R1-B2: a cached test ACCEPT written before the cache kept final.evidence has only the reason prefix of applyTestResult to tell it from an arbiter ACCEPT.
+test('R1-B2: a legacy cached copy of a test ACCEPT (no evidence mark, reason "test confirmed: ...") is not deferrable and stays a test result through the cache', () => {
+  const legacy = accepted('cache', { final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'test confirmed: it fails' } });
+  assert.equal(isDeferrableAccept(legacy), false);
+  throwsWith(() => applyOwnerRuling(legacy, DEFER), /needs no human/);
+  const tested = applyTestResult(item({ bucket: 'BLOCKING', category: 'security', testable: true }), 'bug-confirmed', 'it fails');
+  const later = { ...legacy, fingerprint: tested.fingerprint };
+  assert.equal(ruledCacheFrom([later])[tested.fingerprint].evidence, 'test', 'the cache stamps the legacy copy');
+  assert.equal(ruledCacheFrom([tested, later])[tested.fingerprint].evidence, 'test', 'a later legacy copy does not erase the mark');
+  assert.equal(isDeferrableAccept(accepted('cache', { final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'arbiter says test confirmed: no' } })), true, 'only the prefix counts');
+});
+
 test('the Rulings block lists an owner deferral (BLOCKING or not), once for a cached copy; the filing gate holds until the issue is filed', () => {
   const deferred = applyOwnerRuling(accepted('arbiter', { bucket: 'SUGGESTION', category: 'maintainability', id: 'R1-S1', title: 'Rename helper' }), DEFER);
   const state = { rounds: [{ n: 1, items: [deferred] }] };

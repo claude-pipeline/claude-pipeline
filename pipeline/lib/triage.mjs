@@ -653,8 +653,10 @@ export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
 export const DEFERRABLE_ACCEPT_BY = Object.freeze(['arbiter', 'judge', 'cache']);
 // An open ACCEPT the owner may defer: made by the arbiter, the judge or a cached copy of theirs; not a test result (the cache keeps that as final.evidence 'test'), not Claude's or a
 // forced final, not the owner's own, not a round-limit deferral; and not fixed.
+// A cached test ACCEPT written before the cache kept `evidence` has only the reason prefix applyTestResult wrote (same pattern as LEGACY_CAUSES): read as test evidence.
+const isTestAccept = (final) => final.evidence === 'test' || (final.by === 'cache' && typeof final.reason === 'string' && final.reason.startsWith('test confirmed: '));
 export const isDeferrableAccept = (item) => item?.final?.decision === 'ACCEPT' && item.final.needsHuman !== true && item.implemented !== true
-  && DEFERRABLE_ACCEPT_BY.includes(item.final.by) && item.final.evidence !== 'test' && !isOwnerRuled(item) && !isProtectedFinal(item) && !isRoundCapDeferral(item);
+  && DEFERRABLE_ACCEPT_BY.includes(item.final.by) && !isTestAccept(item.final) && !isOwnerRuled(item) && !isProtectedFinal(item) && !isRoundCapDeferral(item);
 export const isOwnerDeferral = (item) => isObject(item?.final?.ownerDeferral);
 
 // ---- cache and light lane -------------------------------------------------------------------
@@ -730,7 +732,7 @@ export function ruledCacheFrom(items) {
         ...structuredClone(item.final), bucket: item.bucket, category: item.category, ...(issue ? { followupIssue: issue } : {}),
         ...(fixed ? { implemented: true } : {}),
         // A test result stays a test result through the cache (it is not an ACCEPT the owner may defer).
-        ...(item.final.by === 'test' || item.final.evidence === 'test' ? { evidence: 'test' } : {}),
+        ...(item.final.by === 'test' || isTestAccept(item.final) ? { evidence: 'test' } : {}),
       };
     }
   }
