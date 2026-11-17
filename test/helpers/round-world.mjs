@@ -64,7 +64,8 @@ export function roundWorld(t, { max = 1, review = '', yml = '', comments = [], s
   const w = {
     repo, base, head, scratch, slug, fake, issueUrl,
     cli(args, env = {}) {
-      const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env };
+      // A private usage ledger per world: a run without the test runner's mark (`node test/x.test.mjs`) never reaches the account's real one.
+      const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, PIPELINE_CODEX_USAGE_FILE: join(scratch, 'codex-usage.jsonl'), ...floorEnv(), ...env };
       for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_TEST_MODE', 'FAKE_CODEX_OUTPUT']) if (!(k in env)) delete merged[k];
       const r = spawnSync(process.execPath, [bin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;

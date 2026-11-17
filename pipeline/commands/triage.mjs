@@ -30,7 +30,7 @@ import { clickNotes, roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  countsTowardCap, isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
@@ -127,6 +127,7 @@ export const meta = {
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
+    '  -> an UNIMPLEMENTED ACCEPT of the arbiter, the judge or a cached copy of theirs (not a test result, not Claude\'s or a forced final, not already the owner\'s) may also be ruled on, with FOLLOW-UP only: the owner defers the accepted fix to an issue (a typed REJECT or ACCEPT of it is refused, exit 1). The final records ownerDeferral {accepted, ruledAt} and keeps the ACCEPT as overruled; the state is written at format version 7; the item is listed in the Rulings block (`by owner deferral (accepted by arbiter)`) and counted at the final gate (the owner\'s "merge" is still needed); `review-complete` refuses until `followups create` has filed its issue; `state show` keeps the local deferral over the published ACCEPT (local-ahead). The ruling request for such an item says it is ACCEPTED, NOT fixed (`notes` in the output, and the row of the --ask dialog); only ask when the OWNER raised the deferral, and it cannot be undone through the CLI',
     '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
     '  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with the line `triage ruling-request` printed (`⚖️ Owner ruling needed #N: ID[, ID…] · content <digest12> · repo owner/name`; the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com',
     '  -> the request is bound to the findings\' text: the digest is recomputed over ALL the ids of the request from the current review state and must equal the recorded one, so a rebuilt review that reuses an id for a changed finding (or a request in the old line shape, with no digest) cannot reuse the ruling; ask again with ruling-request',
@@ -343,8 +344,12 @@ const OWNER_TEXT_MAX = 1000;
 
 // Why this ruling may not be recorded, or null. The command exists for ONE case: the owner confirmed in chat what to do with
 // an item that is waiting for a human. It is not a way to reopen an item somebody already settled.
-function ownerRulingRefusal(item, id, round) {
+function ownerRulingRefusal(item, id, round, decision) {
   if (item === undefined) return `no item ${id} in round ${round}`;
+  // #559: an unimplemented ACCEPT of the arbiter, the judge or the cache is not waiting for a human; the owner may only DEFER it (FOLLOW-UP: the fix goes to an issue). REJECT and ACCEPT stay refused.
+  if (isDeferrableAccept(item)) {
+    return decision === 'FOLLOW-UP' ? null : `${id} does not need a human decision (an owner ruling cannot reopen a settled item); an arbiter/judge ACCEPT that is not fixed yet may only be deferred (FOLLOW-UP) by an owner ruling, not ${decision === 'ACCEPT' ? 're-accepted' : 'rejected'}`;
+  }
   // The owner may rule on an item waiting for a human, or (E6) override a Claude or forced final that is not implemented yet.
   const protectedFinal = isProtectedFinal(item);
   if (item.final?.needsHuman !== true && !protectedFinal) return `${id} does not need a human decision (an owner ruling cannot reopen a settled item)`;
@@ -382,7 +387,7 @@ async function ownerRuling(rest, ctx) {
     const state = requireState(root);
     if (pr !== undefined && state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     const item = findRound(state, n).items.find((i) => i.id === id);
-    const why = ownerRulingRefusal(item, id, n);
+    const why = ownerRulingRefusal(item, id, n, decision);
     if (why) return refuse(why);
     // Phase 3b: the quote must be the owner's words, as the owner-go recorder wrote them down after a reply that asked for this ruling
     // (hooks/lib/owner-go.mjs presentedRuling): before, --owner-quote was the agent's own word. The repository is the one gh resolves on
@@ -403,7 +408,8 @@ async function ownerRuling(rest, ctx) {
     seedBaseline({ ctx, root, pr: prNum, state }); // the `comment --kind triage` that publishes this ruling needs the baseline too
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
-    const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it unless it overrules a published Claude or forced final, or a published final waiting for a human (then it is kept as local-ahead)`;
+    const deferred = isOwnerDeferral(ruled);
+    const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it unless it overrules a published Claude or forced final, a published final waiting for a human, or a published unimplemented arbiter/judge ACCEPT it defers (then it is kept as local-ahead)${deferred ? `; the deferred fix is NOT in this merge: file its issue now with \`pipeline followups create --round ${n}\` (the review cannot complete until it is filed)` : ''}`;
     return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, published: false, next } };
   }, pr));
 }
@@ -881,6 +887,7 @@ const contentOfState = (state) => (ids) => {
 };
 
 const oneLine = (x) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+const deferNote = (item, { id = true } = {}) => `${id ? `${item.id}: ` : ''}ACCEPTED by ${item.final?.ownerDeferral?.accepted ?? item.final?.by}, NOT fixed; follow-up = defer the fix to an issue; only when it is not a regression vs the default branch`;
 
 // The line that ends the reply asking the owner to rule: the CLI writes it, so the agent cannot state a digest of its own choosing.
 async function rulingRequest(rest, ctx) {
@@ -903,11 +910,13 @@ async function rulingRequest(rest, ctx) {
     const { slug, host } = gh.repo();
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
     const line = `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}`;
-    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line } };
+    // F1: an item that is an ACCEPT (not fixed) is said so, in the CLI's own words, so the owner knows "follow-up" defers an accepted fix (the closing line keeps its fixed shape: the owner-go hook parses it).
+    const notes = items.filter((i) => isDeferrableAccept(i) || isOwnerDeferral(i)).map((i) => deferNote(i));
+    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}) } };
     // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
-    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}`), line].join('\n');
+    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}`), line].join('\n');
     const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block });
-    return { exitCode: EXIT.OK, output: { ok: true, line, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
+    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
   }, pr));
 }
 
