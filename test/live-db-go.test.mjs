@@ -12,7 +12,7 @@ import { OWNER_ENTRY, linesOf, runHook } from './helpers/owner-go.mjs';
 import { run } from '../pipeline/commands/live-db.mjs';
 import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
-import { buildBlock, canonicalDataSql, summaryProblem, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
+import { buildBlock, canonicalDataSql, checkedTopLevel, summaryProblem, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { matchCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
@@ -254,4 +254,21 @@ test('guard: running or importing live-db-go.mjs by hand is refused at every che
     `node ./pipeline/hooks/lib/live-db-go.mjs`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [`cat ${LIB}`, 'node ~/.claude/pipeline/bin/pipeline.mjs live-db catalog tables public', 'git add pipeline/hooks/lib/live-db-go.mjs']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('checkedTopLevel: POSIX needs the exact string; the Windows branch accepts git\'s differently-written form of the same real directory only', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-live-db-top-'));
+  const other = mkdtempSync(join(tmpdir(), 'cp-live-db-other-'));
+  t.after(() => { rmSync(dir, { recursive: true, force: true }); rmSync(other, { recursive: true, force: true }); });
+  const gitSays = (top) => () => `${top}\n`;
+  // what git prints on Windows differs from the dir in case (and slashes); the injected realpath stands in for the native one
+  const winTop = dir.toUpperCase();
+  const realpath = (p) => p;
+  assert.equal(checkedTopLevel(dir, { git: gitSays(dir), platform: 'linux' }), dir);
+  assert.equal(checkedTopLevel(dir, { git: gitSays(winTop), platform: 'linux', realpath }), null, 'off Windows the strings must be identical');
+  assert.equal(checkedTopLevel(dir, { git: gitSays(winTop), platform: 'win32', realpath }), dir, 'on Windows the canonical forms match: the dir is returned as shown');
+  assert.equal(checkedTopLevel(dir, { git: gitSays(other), platform: 'win32', realpath }), null, 'a different directory never matches');
+  assert.equal(checkedTopLevel(dir, { git: gitSays(winTop), platform: 'win32', realpath: () => { throw new Error('gone'); } }), null, 'an unresolvable path fails closed');
+  assert.equal(checkedTopLevel('relative/dir', { git: gitSays(dir), platform: 'win32', realpath }), null, 'still absolute only');
+  assert.equal(checkedTopLevel(join(dir, 'nope'), { git: gitSays(dir), platform: 'win32', realpath }), null, 'still a real directory only');
 });

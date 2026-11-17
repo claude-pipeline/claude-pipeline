@@ -18,7 +18,7 @@
 //
 // The records live beside the merge records (owner-go/<session>.jsonl) as kind 'live-db-go'; the merge readers filter on kind, so nothing else sees them.
 import { createHash } from 'node:crypto';
-import { lstatSync } from 'node:fs';
+import { lstatSync, realpathSync } from 'node:fs';
 import path from 'node:path';
 import { git } from '../../lib/git.mjs';
 import { parseRemote } from '../../lib/remote-url.mjs';
@@ -121,13 +121,18 @@ export const summaryProblem = (s) => (typeof s !== 'string' || s.trim() === '' ?
 
 // ---- git, only in the block's dir --------------------------------------------------------------------------------------------------
 
-// `dir` must be an absolute path to a real directory (not a symlink) equal to its own `git rev-parse --show-toplevel`. Returns the dir or null.
+// `dir` must be an absolute path to a real directory (not a symlink) equal to its own `git rev-parse --show-toplevel`. Returns the dir as given, or null.
+// POSIX: the two strings must be identical. Windows: git prints `D:/a/x` while the dir may be `d:\a\x` or an 8.3 short name, so both are compared in their canonical (real,
+// case-folded) form; the dir is still lstat-checked as given, and what the caller gets back (and rebuilds the block from) is the dir as shown.
 export function checkedTopLevel(dir, io = {}) {
   try {
     if (typeof dir !== 'string' || !path.isAbsolute(dir) || dir.includes('\u0000')) return null;
     if (!lstatSync(dir).isDirectory()) return null;
     const top = (io.git ?? git)(['rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: GIT_TIMEOUT_MS }).trim();
-    return top === dir ? dir : null;
+    if (top === dir) return dir;
+    if ((io.platform ?? process.platform) !== 'win32') return null;
+    const canon = (p) => (io.realpath ?? realpathSync.native)(path.resolve(p)).replaceAll('\\', '/').toLowerCase();
+    return canon(top) === canon(dir) ? dir : null;
   } catch {
     return null;
   }
