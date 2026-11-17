@@ -73,8 +73,9 @@ describe('#492: doubt carried out of a nested text', () => {
   test('inside the child itself the exit narrowing still holds (the script pushes the branch it switched to: allowed)', () => {
     expect('allow', 'bash s.sh', { [S]: 'git checkout agent/y || exit 1\ngit push\n' }, MAIN);
   });
-  test('a child that switches with certainty hands the caller the branch it switched to (allowed)', () => {
-    expect('allow', 'bash s.sh; git push', { [S]: 'git checkout agent/y\nmake\n' }, MAIN);
+  // (PR #362, the owner's rule "a script's state change never carries over to its caller": what the child switched is unknown to the caller, even a switch that is certain inside it; main allowed it)
+  test('a child that switches with certainty does not hand the caller the branch it switched to (denied: never carry over)', () => {
+    expect('deny', 'bash s.sh; git push', { [S]: 'git checkout agent/y\nmake\n' }, MAIN);
   });
 });
 
