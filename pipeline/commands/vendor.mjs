@@ -6,10 +6,11 @@
 // checkout (pipeline/ is a child of the repo root) and from the installed copy under ~/.claude/pipeline/.
 import { createHash } from 'node:crypto';
 import { copyFileSync, existsSync, lstatSync, mkdirSync, readdirSync, readFileSync, unlinkSync, writeFileSync } from 'node:fs';
-import { dirname, join, relative, resolve } from 'node:path';
+import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { EXIT, UsageError, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { checkoutIdentity, formatStamp, installedIdentity, parseStamp } from '../lib/identity.mjs';
+import { git } from '../lib/git.mjs';
 import { repoRoot } from '../lib/repo.mjs';
 
 export const meta = {
@@ -108,10 +109,17 @@ function retiredFiles(target) {
   return found;
 }
 
-// True when `root` holds, under its own pipeline/, every file vendor copies (at the path it has in this checkout) and this command: the pipeline source repo itself, which a consumer cannot be by accident.
-function isPipelineSource(root, l, items) {
-  const own = join(root, 'pipeline');
-  return existsSync(join(own, 'commands', 'vendor.mjs')) && items.every((it) => existsSync(join(own, relative(l.pipelineDir, it.src))));
+// The first commit of ianjamila/claude-pipeline: a repo has it only by sharing this history, so a consumer cannot be taken for the source by accident.
+const PIPELINE_ROOT_COMMIT = '61e18721be44051841670c4d103ad30d742e2f54';
+
+// True when `root` is the pipeline source repo itself: its history contains the pipeline's root commit. Any error (not a git repo, a shallow clone without it) is false, the safe direction: the normal drift check runs.
+function isPipelineSource(root) {
+  try {
+    git(['cat-file', '-e', `${PIPELINE_ROOT_COMMIT}^{commit}`], { cwd: root });
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 // Content drift of a project's scripts/pipeline/ from the code this pipeline would vendor: [{ file, reason }] for every
@@ -181,14 +189,14 @@ export async function run(argv) {
   const allFiles = [...items.map((i) => repoRel(i.rel)), repoRel(VERSION_FILE)];
 
   if (values.check) {
-    // #550: the pipeline's own source repo is not a consumer, so there is nothing to compare there: ci.guard_checks is false, scripts/pipeline/ is absent AND the vendored files' sources sit at their own paths under the repo's pipeline/.
+    // #550: the pipeline's own source repo is not a consumer, so there is nothing to compare there: ci.guard_checks is false, scripts/pipeline/ is absent AND the repo's history contains the pipeline's root commit.
     // guard_checks alone proves nothing (it only governs the required guard statuses; a consumer still runs workflow-contexts, supabase-local, smoke and queue-guards-run), and an absent scripts/pipeline/ alone is a deleted bundle, which stays drift.
     // A config that is missing or invalid does not skip.
     // (Imported here, not at the top: plain vendor, which an edited install must still run, does not load the config module.)
     const { loadConfig } = await import('../lib/config.mjs');
     const loaded = await loadConfig(root);
-    if (loaded.ok && loaded.config.ci.guard_checks === false && !existsSync(target) && isPipelineSource(root, l, items)) {
-      return { exitCode: EXIT.OK, output: { ok: true, skipped: 'ci.guard_checks is false and this is the pipeline source repo (the vendored files sit at their source paths under pipeline/, and there is no scripts/pipeline/): it is not a consumer, so there is nothing to compare' } };
+    if (loaded.ok && loaded.config.ci.guard_checks === false && !existsSync(target) && isPipelineSource(root)) {
+      return { exitCode: EXIT.OK, output: { ok: true, skipped: 'ci.guard_checks is false, there is no scripts/pipeline/ and this repo contains the pipeline\'s root commit: it is the pipeline source repo, not a consumer, so there is nothing to compare' } };
     }
     const drift = vendorDrift(root, items);
     // The +sha moves with every pipeline commit and says nothing about the copied code, so only the base version counts.

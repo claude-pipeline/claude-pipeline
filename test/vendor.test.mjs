@@ -220,17 +220,38 @@ test('vendor --check on a never-vendored repo lists everything as missing', asyn
   assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
 });
 
-// #550: the pipeline's own source repo (ci.guard_checks: false, no scripts/pipeline/, and the vendored files' sources at their own paths under it) is not a consumer: --check has nothing to compare there.
-// R2-B1: guard_checks: false alone, or with scripts/pipeline/ merely absent, is not enough: a consumer that deleted the folder must still see every file missing.
-test('vendor --check skips (exit 0, skipped says so) only for the pipeline source repo: guard_checks false, no scripts/pipeline/, the sources under pipeline/', async () => {
-  const repo = createTmpRepo();
-  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
-  cpSync(join(root, 'pipeline'), join(repo.dir, 'pipeline'), { recursive: true });
-  const r = await vendorInto(repo.dir, ['--check']);
+// #550: the pipeline's own source repo (ci.guard_checks: false, no scripts/pipeline/, and its history contains the pipeline's root commit) is not a consumer: --check has nothing to compare there.
+// R2-B1 / R3-B1: guard_checks: false with scripts/pipeline/ merely absent is not enough (a consumer that deleted the folder must still see every file missing), and neither are placeholder files at the source paths: only the history identifies the source.
+const ROOT_COMMIT = '61e18721be44051841670c4d103ad30d742e2f54';
+test('vendor --check skips (exit 0, skipped says so) for the pipeline source repo: guard_checks false, no scripts/pipeline/, history containing the root commit', async (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-vendor-src-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const cloned = spawnSync('git', ['clone', '-q', '--no-checkout', '--bare', root, join(dir, 'bare.git')], { encoding: 'utf8' });
+  assert.equal(cloned.status, 0, cloned.stderr);
+  const src = join(dir, 'src');
+  const made = spawnSync('git', ['clone', '-q', '--no-checkout', join(dir, 'bare.git'), src], { encoding: 'utf8' });
+  assert.equal(made.status, 0, made.stderr);
+  assert.equal(spawnSync('git', ['-C', src, 'cat-file', '-e', `${ROOT_COMMIT}^{commit}`]).status, 0, 'the clone holds the pipeline root commit');
+  mkdirSync(join(src, '.claude'), { recursive: true });
+  writeFileSync(join(src, '.claude', 'pipeline.yml'), pipelineYml('github', ['ci'], { guardChecks: false }));
+  const r = await vendorInto(src, ['--check']);
   assert.equal(r.exitCode, 0);
   assert.equal(r.output.ok, true);
   assert.match(r.output.skipped, /pipeline source repo/);
   assert.equal(r.output.drift, undefined);
+});
+
+test('vendor --check with ci.guard_checks: false and empty placeholder files at every source path is not the source repo: still drift (R3-B1)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  repo.write('pipeline/commands/vendor.mjs', '');
+  for (const f of ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local', 'workflow-contexts']) repo.write(`pipeline/templates/scripts/pipeline/${f}.mjs`, '');
+  for (const n of LIBS) repo.write(`pipeline/lib/${n}.mjs`, '');
+  repo.write('pipeline/vendor/js-yaml.mjs', '');
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+  assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
 });
 
 test('vendor --check with ci.guard_checks: false in a consumer repo whose scripts/pipeline/ was deleted still reports every file missing (R2-B1)', async () => {
