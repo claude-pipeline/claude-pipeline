@@ -694,7 +694,7 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   // itself. It stays visible here and counts as ownerMerge, so the owner's "merge" for this head is still needed.
   const ruled = ownerRuledItems(state);
   // an item the owner DEFERRED (an accepted fix left out of this merge) says so next to its quote
-  const shownRuled = (i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"${isOwnerDeferral(i) ? ' (defers arbiter ACCEPT, not fixed)' : ''}`;
+  const shownRuled = (i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"${isOwnerDeferral(i) ? ` (defers ${['arbiter', 'judge', 'cache'].includes(i.final.ownerDeferral.accepted) ? i.final.ownerDeferral.accepted : 'unknown'} ACCEPT, not fixed)` : ''}`;
   // E3: a dismissal CLAUDE made (not the arbiter, the judge or a test) is an owner item too: the owner's "merge" is bound to its inventory row, so a changed ruling needs a new word.
   const claudeRulings = claudeRulingRows(state);
   if (claudeRulings.length > 0) {

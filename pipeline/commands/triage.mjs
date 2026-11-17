@@ -344,7 +344,7 @@ function ownerRulingRefusal(item, id, round, decision) {
   if (item === undefined) return `no item ${id} in round ${round}`;
   // #559: an unimplemented ACCEPT of the arbiter, the judge or the cache is not waiting for a human; the owner may only DEFER it (FOLLOW-UP: the fix goes to an issue). REJECT and ACCEPT stay refused.
   if (isDeferrableAccept(item)) {
-    return decision === 'FOLLOW-UP' ? null : `${id} is an ACCEPT by the ${item.final.by} that is not fixed yet: an arbiter/judge ACCEPT may only be deferred (FOLLOW-UP) by an owner ruling, not ${decision === 'ACCEPT' ? 're-accepted' : 'rejected'}`;
+    return decision === 'FOLLOW-UP' ? null : `${id} does not need a human decision (an owner ruling cannot reopen a settled item); an arbiter/judge ACCEPT that is not fixed yet may only be deferred (FOLLOW-UP) by an owner ruling, not ${decision === 'ACCEPT' ? 're-accepted' : 'rejected'}`;
   }
   // The owner may rule on an item waiting for a human, or (E6) override a Claude or forced final that is not implemented yet.
   const protectedFinal = isProtectedFinal(item);

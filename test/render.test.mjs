@@ -761,3 +761,14 @@ test('triageComment / summaryComment: an owner deferral of an arbiter ACCEPT say
   const plain = triageComment(stateWith([[item({ id: 'R1-B1', final: ownerFinal() })]])).split('\n').find((l) => l.startsWith('| 1 | R1-B1'));
   assert.doesNotMatch(plain, /deferral/, 'an ordinary owner ruling reads as before');
 });
+
+test('triageComment / summaryComment: the deferral text names the actual accepter (judge, cache), never a fixed word', () => {
+  const fin = (accepted) => ownerFinal({ overruled: final('ACCEPT', accepted, 'accepted', false), ownerDeferral: { accepted, ruledAt: '2026-11-17T01:02:03.000Z' } });
+  const s = stateWith([[item({ id: 'R1-B1', final: fin('judge') }), item({ id: 'R1-B2', final: fin('cache') })]]);
+  const rows = triageComment(s).split('\n').filter((l) => /^\| \d+ \| R/.test(l));
+  assert.match(rows[0], /\(owner deferral of judge ACCEPT\)/);
+  assert.match(rows[1], /\(owner deferral of cache ACCEPT\)/);
+  const outliers = summaryComment(s, { outcome: 'awaiting-owner-merge' }).split('### What was built')[0];
+  assert.match(outliers, /deferral of the judge's ACCEPT/);
+  assert.match(outliers, /deferral of the cache's ACCEPT/);
+});
