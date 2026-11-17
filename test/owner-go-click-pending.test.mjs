@@ -13,7 +13,7 @@ import {
   MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantLookups, ownerGrantedRounds, ownerRuled, readApprovals, readGrantMarker, readRecords, recordRoundGrant, roundTicketKey,
   settleEnabled, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickNotes, clickProvenance, issueAsk, mergeAsk, readAsk, recordClick, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickNotes, clickProvenance, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { OWNER_GO_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
 import { deferEligibility } from '../pipeline/lib/triage.mjs';
 import { OWNER_ENTRY, cleanupRoundClaims, linesOf, mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
@@ -34,6 +34,7 @@ const PARTS = {
   merge: (pr = 58) => mergeAsk({ repo: REPO, pr, closing: mergeRequest(pr, HEAD, ITEMS, REPO) }),
   round: () => roundAsk({ repo: REPO, pr: 58, line: roundRequest(58, 4, GHEAD, REPO) }),
   ruling: () => rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1', 'R2-S3'], line: rulingRequest(58, ['R1-B1', 'R2-S3'], REPO, 'c0ffee000000') }),
+  many: () => mergeManyAsk({ repo: REPO, entries: [58, 59].map((n) => ({ pr: n, lines: [`#${n} head ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}`] })), ready: '🔀 Ready to merge #58, #59 — say "merge"' }),
 };
 
 // A pending world: a temp home, an issued ask and a transcript that holds the prompt and the tool_use ONLY (the 2.1.323 write order: Claude Code writes the answer's tool_result entry after the
@@ -61,13 +62,15 @@ function pw(t, { kind = 'merge', answer = null, build = BUILD, fixture = 'genuin
   writeFileSync(file, text([prompt, use]));
   const answeredAt = Date.parse(result.timestamp);
   const w = {
-    home, file, issued, askId: issued.askId, dialog, parts, prompt, use, result, session: use.sessionId, toolUseId: block.id, answeredAt, issuedAt, text, t: answeredAt + 1000,
+    home, file, issued, askId: issued.askId, dialog, parts, prompt, use, result, session: use.sessionId, toolUseId: block.id, answeredAt, issuedAt, text, chosen, t: answeredAt + 1000,
     now: () => w.t,
     input: { hook_event_name: 'PostToolUse', tool_name: 'AskUserQuestion', session_id: use.sessionId, transcript_path: file, cwd: '/work/app', tool_use_id: block.id, tool_input: { questions: [dialog] }, tool_response: {} },
   };
   w.clickId = clickIdOf(w.session, w.toolUseId, w.askId);
   w.slept = 0;
-  w.hook = (over = {}, input = {}) => recordClick({ ...w.input, ...input }, { home, now: w.now, sleep: async (ms) => { w.slept += ms; }, hookCheck: OK, ...over });
+  // (#585) the PostToolUse tool_input as Claude Code 2.1.323 is inferred to hand it over: the model's input plus the permission component's `answers` and `annotations`
+  w.shaped = (answers = { [dialog.question]: chosen }, annotations = {}) => ({ tool_input: { questions: [dialog], answers, annotations } });
+  w.hook =(over = {}, input = {}) => recordClick({ ...w.input, ...input }, { home, now: w.now, sleep: async (ms) => { w.slept += ms; }, hookCheck: OK, ...over });
   w.flush = () => appendFileSync(file, text([result]));
   w.settle = (over = {}) => settlePendingClicks({ home, now: w.now, ...over });
   // another click on the SAME ask (another tool use id): the tool_use is written now, its result by .flush()
@@ -196,16 +199,140 @@ test('a retried hook leaves one pending; a 9th UNSETTLED pending is refused too-
   assert.deepEqual(await w2.hook(), { pending: w2.expectedPending });
 });
 
-test('capture refuses a tool_input with keys beyond questions/metadata (answers, annotations, anything else): no pending; metadata alone is fine', async (t) => {
-  for (const extra of [{ answers: { x: 'Merge' } }, { annotations: {} }, { anything: 1 }]) {
+test('capture admits the keys Claude Code 2.1.323 adds to the PostToolUse tool_input (answers, annotations): a pending is written whatever their values say; metadata alone is fine (#585)', async (t) => {
+  const q = (w) => w.dialog.question;
+  const shapes = [
+    ['answers + annotations of a real click', (w) => w.shaped()],
+    ['answers that say "Not yet" (never read)', (w) => w.shaped({ [q(w)]: 'Not yet' })],
+    ['annotations with notes (never read)', (w) => w.shaped({ [q(w)]: 'Merge' }, { [q(w)]: { notes: 'x' } })],
+    ['empty answers', (w) => w.shaped({}, {})],
+    ['answers only', (w) => ({ tool_input: { questions: [w.dialog], answers: { [q(w)]: 'Merge' } } })],
+    ['annotations only', (w) => ({ tool_input: { questions: [w.dialog], annotations: {} } })],
+    ['metadata', (w) => ({ tool_input: { questions: [w.dialog], metadata: { source: 'x' } } })],
+  ];
+  for (const [label, make] of shapes) {
     const w = pw(t);
-    assert.deepEqual(await w.hook({}, { tool_input: { questions: [w.dialog], ...extra } }), { refused: 'tool-use-shape' }, JSON.stringify(extra));
+    assert.deepEqual(await w.hook({}, make(w)), { pending: w.expectedPending }, label);
+    assert.equal(w.pendings().length, 1, label);
+    assert.equal(w.records().length, 0, label);
+  }
+});
+
+test('capture refuses a tool_input with any other key, or a malformed answers / annotations, with a reason that says which (#585): no pending', async (t) => {
+  const cases = [
+    [{ anything: 1 }, 'tool-use-shape: keys anything'],
+    [{ zeta: 1, alpha: 2 }, 'tool-use-shape: keys zeta,alpha'],
+    [{ a: 1, b: 1, c: 1, d: 1, e: 1, f: 1 }, 'tool-use-shape: keys a,b,c,d'],
+    [{ 'not a name!': 1, ok_1: 1 }, 'tool-use-shape: keys ?,ok_1'],
+    [{ ['x'.repeat(33)]: 1 }, 'tool-use-shape: keys ?'],
+    [{ answers: { x: 'Merge' }, extra: 1 }, 'tool-use-shape: keys extra'],
+    [{ answers: ['Merge'] }, 'tool-use-shape: answers'],
+    [{ answers: 'Merge' }, 'tool-use-shape: answers'],
+    [{ answers: null }, 'tool-use-shape: answers'],
+    [{ answers: { 'another question': 'Merge' } }, 'tool-use-shape: answers'],
+    [(w) => ({ answers: { [w.dialog.question]: 'Merge', second: 'x' } }), 'tool-use-shape: answers'],
+    [(w) => ({ answers: { [w.dialog.question]: ['Merge'] } }), 'tool-use-shape: answers'],
+    [(w) => ({ answers: { [w.dialog.question]: 1 } }), 'tool-use-shape: answers'],
+    [{ annotations: [] }, 'tool-use-shape: annotations'],
+    [{ annotations: null }, 'tool-use-shape: annotations'],
+    [{ annotations: 'x' }, 'tool-use-shape: annotations'],
+  ];
+  for (const [extra, reason] of cases) {
+    const w = pw(t);
+    const add = typeof extra === 'function' ? extra(w) : extra;
+    assert.deepEqual(await w.hook({}, { tool_input: { questions: [w.dialog], ...add } }), { refused: reason }, JSON.stringify(add));
     assert.deepEqual(w.pendings(), []);
   }
   const two = pw(t);
   assert.deepEqual(await two.hook({}, { tool_input: { questions: [two.dialog, two.dialog] } }), { refused: 'tool-use-shape' }, 'one question only');
-  const ok = pw(t);
-  assert.deepEqual(await ok.hook({}, { tool_input: { questions: [ok.dialog], metadata: { source: 'x' } } }), { pending: ok.expectedPending });
+  const none = pw(t);
+  assert.equal(await none.hook({}, { tool_input: { answers: {} } }), null, 'no question: not an ask of ours at all');
+});
+
+test('capture, then the transcript decides (#585): a real 2.1.323-shaped hook input settles every genuine fixture as before; a hook input that DISAGREES with the transcript changes nothing', async (t) => {
+  const settled = async (w, hookInput) => {
+    assert.ok((await w.hook({}, hookInput)).pending, 'captured');
+    w.flush();
+    return only(w.settle(), w)[0];
+  };
+  // genuine click, each kind, the multiselect recording
+  for (const [kind, extra] of [['merge', {}], ['round', {}], ['ruling', {}], ['many', { fixture: 'multiselect-click', answer: 'Merge #58, Merge #59' }]]) {
+    const w = pw(t, { kind, ...extra });
+    const o = await settled(w, w.shaped());
+    assert.equal(o.outcome, 'recorded', `${kind}: ${JSON.stringify(o)}`);
+    assert.equal(w.records().length, 1, kind);
+    assert.equal(clickProvenance(w.records()[0], { home: w.home }), 'owner', kind);
+  }
+  // the preview recording: the transcript's annotations are what refuses it
+  const preview = pw(t, { fixture: 'preview-annotations' });
+  const p = await settled(preview, preview.shaped());
+  assert.deepEqual([p.outcome, p.reason], ['refused', 'annotations']);
+  // the hook says "Merge", the owner's click in the transcript says "Not yet": declined
+  const declined = pw(t, { answer: 'Not yet' });
+  assert.equal((await settled(declined, declined.shaped({ [declined.dialog.question]: 'Merge' }))).outcome, 'declined');
+  assert.equal(declined.records().length, 0);
+  // hook annotations non-empty but the transcript's are {}: admitted (the hook's values are never read)
+  const noisy = pw(t);
+  assert.equal((await settled(noisy, noisy.shaped({ [noisy.dialog.question]: 'Merge' }, { [noisy.dialog.question]: { notes: 'x' } }))).outcome, 'recorded');
+  // hook annotations {} but the transcript's non-empty: refused
+  const notes = pw(t);
+  notes.result.toolUseResult.annotations = { [notes.dialog.question]: { notes: 'but only after lunch' } };
+  const n = await settled(notes, notes.shaped());
+  assert.deepEqual([n.outcome, n.reason], ['refused', 'annotations']);
+  assert.equal(notes.records().length, 0);
+});
+
+test('a model-prefilled dialog whose tool_use is already in the transcript at capture gets NO pointer (early refusal, #585); one whose tool_use is not there yet is refused when it settles', async (t) => {
+  for (const extra of [{ answers: { x: 'Merge' } }, { annotations: {} }, { other: 1 }]) {
+    const w = pw(t);
+    w.use.message.content.find((b) => b.type === 'tool_use').input = { questions: [w.dialog], ...extra };
+    writeFileSync(w.file, w.text([w.prompt, w.use]));
+    assert.deepEqual(await w.hook({}, w.shaped()), { refused: 'tool-use-shape' }, JSON.stringify(extra));
+    assert.deepEqual(w.pendings(), [], 'no pointer');
+  }
+  const two = pw(t);
+  two.use.message.content.find((b) => b.type === 'tool_use').input = { questions: [two.dialog, two.dialog] };
+  writeFileSync(two.file, two.text([two.prompt, two.use]));
+  assert.deepEqual(await two.hook(), { refused: 'tool-use-shape' });
+  const later = pw(t);
+  writeFileSync(later.file, later.text([later.prompt]));
+  assert.ok((await later.hook({}, later.shaped())).pending, 'the entry is not there yet: captured');
+  later.use.message.content.find((b) => b.type === 'tool_use').input = { questions: [later.dialog], answers: { [later.dialog.question]: 'Merge' } };
+  writeFileSync(later.file, later.text([later.prompt, later.use, later.result]));
+  later.t = later.answeredAt + 1000;
+  const o = only(later.settle(), later)[0];
+  assert.deepEqual([o.outcome, o.reason], ['refused', 'tool-use-shape']);
+  assert.equal(later.records().length, 0);
+});
+
+test('junk pointers settle as refused and do not block a later genuine click (#585): the cap counts unsettled pointers only, the newest genuine click still settles', async (t) => {
+  const w = pw(t);
+  const junk = [];
+  for (let i = 0; i < 8; i++) {
+    const id = `toolu_junk${i}`;
+    assert.ok((await w.hook({}, { tool_use_id: id, ...w.shaped() })).pending, `captured ${id}`); // (no tool_use in the transcript yet: nothing to refuse early)
+    junk.push(id);
+  }
+  assert.equal(w.pendings().length, 8, 'the cap is full of unsettled pointers');
+  assert.deepEqual(await w.hook({}, { tool_use_id: 'toolu_junk8', ...w.shaped() }), { refused: 'too-many-pending' });
+  // now the model-prefilled entries land: each pointer settles as refused
+  const entries = junk.flatMap((id) => {
+    const [u, r] = structuredClone([w.use, w.result]);
+    u.uuid = `u-${id}-use`;
+    u.message.content[0].id = id;
+    u.message.content[0].input = { questions: [w.dialog], answers: { [w.dialog.question]: 'Merge' } };
+    r.uuid = `u-${id}-result`; r.parentUuid = u.uuid; r.sourceToolAssistantUUID = u.uuid; r.message.content[0].tool_use_id = id;
+    return [u, r];
+  });
+  appendFileSync(w.file, w.text(entries));
+  const o = w.settle().outcomes;
+  assert.equal(o.length, 8);
+  assert.ok(o.every((x) => x.outcome === 'refused' && x.reason === 'tool-use-shape'), JSON.stringify(o));
+  assert.equal(w.records().length, 0);
+  // the genuine click (its tool_use is in the transcript, clean) is still captured and settles
+  assert.deepEqual(await w.hook({}, w.shaped()), { pending: w.expectedPending });
+  w.flush();
+  assert.equal(only(w.settle(), w)[0].outcome, 'recorded');
 });
 
 test('the hook never reads tool_response: it neither decides nor admits anything', async (t) => {

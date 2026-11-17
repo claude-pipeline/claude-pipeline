@@ -126,6 +126,34 @@ test('clickHookLine on the 2.1.323 write order (the answer is not in the transcr
   assert.equal(line, "[claude-pipeline owner-go] the owner's click is received and is verified when it is used: if the owner chose to approve, run P merge --pr 58 --owner-go now; if they chose not to, stop: nothing is approved");
 });
 
+test('clickHookLine with the tool_input Claude Code 2.1.323 hands the hook (the model input plus answers and annotations, #585): the "received" line, a pending, no record; another key shows in the refusal line', async () => {
+  const w = world('merge', 'Merge');
+  const file = w.input.transcript_path;
+  const entries = readFileSync(file, 'utf8').trim().split('\n');
+  writeFileSync(file, `${entries.slice(0, 2).join('\n')}\n`); // prompt + tool_use only (the 2.1.323 write order)
+  const [q] = w.input.tool_input.questions;
+  const shaped = { ...w.input, tool_input: { questions: [q], answers: { [q.question]: 'Merge' }, annotations: {} } };
+  assert.equal(await clickHookLine(shaped, w.opts), "[claude-pipeline owner-go] the owner's click is received and is verified when it is used: if the owner chose to approve, run P merge --pr 58 --owner-go now; if they chose not to, stop: nothing is approved");
+  const other = world('merge', 'Merge');
+  writeFileSync(other.input.transcript_path, `${readFileSync(other.input.transcript_path, 'utf8').trim().split('\n').slice(0, 2).join('\n')}\n`);
+  const odd = { ...other.input, tool_input: { questions: [other.input.tool_input.questions[0]], answers: {}, updatedInput: {} } };
+  assert.equal(await clickHookLine(odd, other.opts), '[claude-pipeline owner-go] the click could not be verified (tool-use-shape: keys updatedInput): ask the owner to type the closing words instead');
+});
+
+// #585: "is recorded" only when the record can be used (a request with a repo: the only kind `P merge --owner-go` accepts). The "binds nothing" branch is defensive (bindAnswer refuses an empty or
+// repo-less request before a click is ever recorded), so these use synthetic records.
+test('clickLine for a recorded merge click that binds nothing (no request, or only repo-less ones) says so and how to continue; with at least one repo request it keeps the recorded wording (#585)', () => {
+  const NOTHING = (prs) => `[claude-pipeline owner-go] the owner's click binds nothing: no Head/items/repo request was bound in the ask${prs}: run the dry run again (P merge --pr N --dry-run --owner-go) and end a reply with its closing lines, then ask the owner to type "merge"`;
+  const rec = (requests, prs) => ({ recorded: { v: 1, via: 'ask', requests, prs } });
+  assert.equal(clickLine(rec([], [58])), NOTHING(' (PRs #58)'));
+  assert.equal(clickLine(rec([], [])), "[claude-pipeline owner-go] the owner's click binds nothing: no merge request was bound in the ask: run the dry run again (P merge --pr N --dry-run --owner-go) and end a reply with its closing lines, then ask the owner to type \"merge\"");
+  assert.equal(clickLine(rec([{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: null }], [58])), NOTHING(' (PRs #58)'));
+  assert.equal(clickLine(rec([{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: null }, { pr: 59, head: HEAD.slice(0, 12), items: ITEMS, repo: null }], [58, 59])), NOTHING(' (PRs #58, #59)'));
+  const mixed = clickLine(rec([{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }, { pr: 59, head: HEAD.slice(0, 12), items: ITEMS, repo: null }], [58, 59]));
+  assert.equal(mixed, `[claude-pipeline owner-go] the owner's click is recorded: "merge" for ${REPO} #58 head ${HEAD.slice(0, 12)} items ${ITEMS}; (no repo: approves nothing) #59 head ${HEAD.slice(0, 12)} items ${ITEMS} — run P merge --pr 58 --owner-go now`);
+  assert.match(clickLine(rec([{ pr: 58, head: HEAD.slice(0, 12), items: ITEMS, repo: REPO }], [58])), /the owner's click is recorded: "merge" for acme\/app #58/);
+});
+
 test('clickLine: null for anything it does not know', () => {
   assert.equal(clickLine(null), null);
   assert.equal(clickLine({}), null);
