@@ -61,46 +61,9 @@ const ALLOWED = [
   'command -v supabase',
   'git commit -m "refuse api.supabase.com lines"',
   `curl -X POST https://api.supabase.com/v1/projects/${DEV}/database/query?x=1`,
-  // R8-B1: a mention in a command that makes no request (a search, an echo) passes
-  "rg -n 'api.supabase.com' pipeline",
-  'git grep api.supabase.com',
-  'git log -S api.supabase.com',
-  'echo api.supabase.com',
-  "grep -rn 'api.supabase.com' pipeline | head",
-  // R8-F1: a path or directory argument named supabase after a launcher is not the binary
-  'npx vitest run lib/supabase',
-  'npx eslint lib/supabase',
-  'pnpm lint lib/supabase',
-  'npm run lint -- lib/supabase',
-  'yarn test lib/supabase',
-  'timeout 120 npx vitest run lib/supabase',
-  'npx prettier --check supabase',
-  // R8-F2: a help look-up reaches no database
-  'supabase db push --help',
-  'supabase db push -h',
-  'supabase db --help',
-  'supabase migration --help',
-  'supabase functions --help',
-  'supabase functions deploy --help',
 ];
 
 const DENIED = [
-  // R8-B1: a hostname mention is still refused when the line can make the request
-  "echo x | xargs curl api.supabase.com/v1/projects",
-  "rg x | sh -c 'curl https://api.supabase.com/v1/projects'",
-  'echo $(curl https://api.supabase.com/v1/projects)',
-  // R8-F1: a launcher that really runs the binary stays refused
-  'npx --yes supabase db push',
-  'sudo -u root supabase db push',
-  'timeout 120 supabase db push',
-  'pnpm -C app supabase db push',
-  'pnpm run supabase db push',
-  'npm run supabase -- db push',
-  'env FOO=1 supabase db push',
-  'xargs -I{} supabase db push {}',
-  // R8-F2: --help in a value slot or after -- is not a help flag
-  'supabase db push --password --help',
-  'supabase db push -- --help',
   'supabase db reset --db-url postgresql://x@db.abc.supabase.co/postgres',
   'supabase migration up --db-url postgresql://x@db.abc.supabase.co/postgres',
   'supabase db push --db-url a --db-url b',

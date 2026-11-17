@@ -194,32 +194,6 @@ function localDbUrl(v) {
   return (u.protocol === 'postgresql:' || u.protocol === 'postgres:') && LOCAL_HOSTS.has(u.hostname) && u.search === '' && u.hash === '';
 }
 
-// commands that only read or print their arguments: a Management API hostname mentioned on a line made of these alone (a search, an echo) makes no request
-const NO_REQUEST = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls']);
-const NO_REQUEST_GIT = new Set(['grep', 'log', 'diff', 'show', 'blame', 'status', 'ls-files', 'shortlog', 'rev-list', 'describe']);
-const makesNoRequest = (c) => { const n = commandName(c.argv[0]); return NO_REQUEST.has(n) || (n === 'git' && NO_REQUEST_GIT.has(c.argv[1])); };
-
-// does a launcher line run the supabase binary? Only a word in command position counts (a path or directory argument named supabase, like `lib/supabase`, does not).
-// A word after an option may be that option's value (`sudo -u root supabase`), so the next word is read too; a package-manager `run`/`exec` verb makes the next word the script.
-const RUN_VERBS = new Set(['run', 'run-script', 'exec', 'x', 'dlx']);
-function launcherRunsSupabase(argv) {
-  const pm = PM_HEADS.has(commandName(argv[0]));
-  let afterFlag = false;
-  let afterRun = false;
-  for (let i = 1; i < argv.length; i += 1) {
-    const w = argv[i];
-    if (w.startsWith('-')) { afterFlag = true; continue; }
-    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(w) || /^\d+(?:\.\d+)?[smhd]?$/.test(w)) continue;
-    if (SB_WORD.test(commandName(w))) return true;
-    if (LAUNCHERS.has(commandName(w))) return Boolean(supabaseCall(argv.slice(i)));
-    if (pm && !afterRun && RUN_VERBS.has(w)) { afterRun = true; afterFlag = false; continue; }
-    if (afterRun) return false;
-    if (afterFlag) { afterFlag = false; continue; }
-    return false;
-  }
-  return false;
-}
-
 // -> { rest } (the argv after the supabase word) | { refuse } | null (not a supabase line)
 function supabaseCall(argv) {
   const head = commandName(argv[0]);
@@ -233,7 +207,7 @@ function supabaseCall(argv) {
   }
   if (PM_HEADS.has(head) && NON_RUN_VERBS.has(argv[1])) return null;
   if (head === 'command' && (argv[1] === '-v' || argv[1] === '-V')) return null;
-  if (launcherRunsSupabase(argv)) return { refuse: `\`${argv[0]}\` runs supabase in a shape the guard does not read (only \`supabase\`, \`npx\`, \`pnpm dlx|exec\`, \`bunx\`, \`yarn dlx|exec\` are)` };
+  if (argv.slice(1).some((w) => SB_WORD.test(commandName(w)))) return { refuse: `\`${argv[0]}\` runs supabase in a shape the guard does not read (only \`supabase\`, \`npx\`, \`pnpm dlx|exec\`, \`bunx\`, \`yarn dlx|exec\` are)` };
   return null;
 }
 
@@ -242,17 +216,6 @@ function supabaseRefusal(rest, state) {
   if (first === undefined) return null; // bare `supabase` prints help
   const sub = [];
   for (const w of rest) { if (w.startsWith('-')) break; sub.push(w); }
-  // a real `--help` / `-h` (before a `--`, not the value of an option that may take the next word) only prints help
-  let ended = false;
-  let takesNext = false;
-  for (const w of rest.slice(sub.length)) {
-    if (w === '--') { ended = true; continue; }
-    const isValue = takesNext;
-    takesNext = false;
-    if (!ended && !isValue && (w === '--help' || w === '-h')) return null;
-    const m = /^--([a-z-]+)(=.*)?$/s.exec(w);
-    if (w.startsWith('-') && !w.includes('=') && !(m && (BOOL_FLAGS.has(m[1]) || ['local', 'linked', 'dry-run'].includes(m[1])))) takesNext = true;
-  }
   if (!sub.length) return ['--version', '--help', '-h', '-v'].includes(first) ? null : `\`supabase ${first}\` leads with a flag, which is not a shape the guard knows`;
   const local = LOCAL_ONLY.some((p) => startsWith(sub, p));
   const remote = REMOTE_CAPABLE.some((p) => startsWith(sub, p)) || /^network-/.test(sub[0]);
@@ -329,9 +292,6 @@ export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv) {
   }
   // the Management API: every mention on the line (prose flags of a commit or PR already masked; a variable holding the URL is still caught) must name a dev project's own routes, by a clean path
   const texts = [String(scanRaw ?? ''), ...cmds.map((c) => [...wordsOf(c), ...Object.values(c.env ?? {})].join(' '))];
-  // a line made only of commands that make no request (a search, an echo) may mention the hostname; a substitution or pipe into anything else is its own command and keeps the line checked
-  const reading = cmds.filter((c) => c.argv?.length);
-  if (reading.length && reading.every(makesNoRequest)) return null;
   for (const text of texts) for (const m of text.matchAll(/api\.supabase\.com/gi)) {
     const after = text.slice(m.index + m[0].length);
     const ref = /^\/v1\/projects\/([a-z0-9]{20})\//.exec(after)?.[1];
