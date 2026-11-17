@@ -34,6 +34,11 @@ const ALLOWED = [
   'bunx supabase db diff',
   `supabase functions deploy x --project-ref ${DEV}`,
   `supabase functions deploy x --project-ref=${DEV}`,
+  `supabase functions deploy x --no-verify-jwt --project-ref ${DEV}`,
+  `supabase functions deploy x --use-api --project-ref ${DEV}`,
+  `supabase functions deploy x --prune --project-ref ${DEV}`,
+  `supabase db reset --no-seed --db-url ${LOCAL}`,
+  `supabase db diff --use-migra --db-url ${LOCAL}`,
   'git commit -m "supabase db push"',
   'supabase db push --local',
   `supabase db dump --db-url ${LOCAL}`,
@@ -136,6 +141,14 @@ for (const line of DENIED) test(`denied: ${line}`, () => {
 
 test('an unknown subcommand names itself', () => {
   assert.match(verdict('supabase frobnicate').reason, /not a subcommand the guard knows/);
+});
+
+test('a target flag after `--` or in an option value slot is refused with its own reason', () => {
+  for (const line of [`supabase db push -- --db-url ${LOCAL}`, `supabase functions deploy x --password --project-ref ${DEV}`]) {
+    const v = verdict(line);
+    assert.equal(v.decision, 'deny', line);
+    assert.match(v.reason, /follows `--` or an option that may take it as its value; put the target flag first/);
+  }
 });
 
 test('the admin switch bypasses the rule', () => {

@@ -191,6 +191,25 @@ test('a registry that cannot be read denies every write and still allows reads',
   assert.equal(evaluateSupabaseMcp(`${TOOL}list_tables`, { project_id: REF }, s.ctx).decision, 'allow');
 });
 
+test('a registry that cannot be read or is invalid denies a generic write on any server; a missing registry leaves other vendors alone', async (t) => {
+  const s = await scene(t);
+  await runDbRefs(['server', 'add', 'mine'], { home: s.home, env: {}, hasClaudeCodeAncestor: () => false });
+  const file = (tool_name, tool_input) => evaluateFileTool({ tool_name, tool_input, cwd: s.repo.dir, session_id: s.session, transcript_path: s.transcript }, { home: s.home, env: {}, platform: process.platform, now: () => NOW });
+  const registry = join(STATE(s.home), 'db-refs.json');
+  writeFileSync(registry, JSON.stringify({ v: 1, refs: [{ ref: 'bad', name: 'x', kind: 'dev' }], servers: ['mine'] }));
+  const invalid = file('mcp__mine__merge_branch', { project_id: REF, branch_id: 'x' });
+  assert.equal(invalid.decision, 'deny');
+  assert.match(invalid.reason, /registry/);
+  assert.equal(file('mcp__mine__list_tables', { project_id: REF }).decision, 'allow');
+  rmSync(registry);
+  mkdirSync(registry); // a directory where the file should be: unreadable
+  const unreadable = file('mcp__mine__merge_branch', { project_id: REF, branch_id: 'x' });
+  assert.equal(unreadable.decision, 'deny');
+  assert.match(unreadable.reason, /unreadable/);
+  rmSync(registry, { recursive: true });
+  assert.equal(file('mcp__github__create_branch', { branch: 'x' }).decision, 'allow', 'no registry file: as today');
+});
+
 test('the marker is durable or the call is denied: write, fsync and close failures deny and the leftover marker stays spent', async (t) => {
   for (const [fault, io] of [
     ['write', { writeSync: () => { throw new Error('disk'); } }],

@@ -26,8 +26,8 @@ export const lastSegment = (tool) => parts(tool).pop();
 export const serverSegment = (tool) => parts(tool)[1] ?? '';
 // the write names only a Supabase server has: any server's tool with one of them is judged (a renamed server in an unprotected .mcp.json: Fable F2). The generic names (create_branch, create_project, run_notebook …) are judged only on a server whose name has `supabase` in it, so another vendor's tool of that name is untouched.
 const SUPABASE_ONLY_NAMES = ['apply_migration', 'execute_sql', 'deploy_edge_function', 'create_edge_function_secret'];
-// `state` (the owner's db-refs registry): a server the owner listed there is a Supabase server for every tool name.
-export const isSupabaseTool = (tool, state) => typeof tool === 'string' && tool.startsWith('mcp__') && (/supabase/i.test(serverSegment(tool)) || SUPABASE_ONLY_NAMES.includes(lastSegment(tool)) || (state?.servers ?? []).includes(serverSegment(tool)));
+// `state` (the owner's db-refs registry): a server the owner listed there is a Supabase server for every tool name. A registry that cannot be read or is invalid (`ok` false) hides that list, so every write name is judged on any server (evaluateSupabaseMcp then denies with the registry error); a missing file is `ok` with an empty list.
+export const isSupabaseTool = (tool, state) => typeof tool === 'string' && tool.startsWith('mcp__') && (/supabase/i.test(serverSegment(tool)) || SUPABASE_ONLY_NAMES.includes(lastSegment(tool)) || (state?.servers ?? []).includes(serverSegment(tool)) || (state?.ok === false && SUPABASE_WRITE_NAMES.includes(lastSegment(tool))));
 
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });
@@ -155,7 +155,7 @@ const REMOTE_CAPABLE = [['db', 'push'], ['db', 'pull'], ['db', 'dump'], ['migrat
 const PM_HEADS = new Set(['pnpm', 'yarn', 'npm', 'bun', 'corepack']);
 const NON_RUN_VERBS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'upgrade', 'ls', 'list', 'why', 'view', 'info', 'outdated']);
 const startsWith = (tokens, prefix) => prefix.every((w, i) => tokens[i] === w);
-const BOOL_FLAGS = new Set(['yes', 'debug', 'help', 'experimental', 'include-all', 'include-roles', 'include-seed', 'data-only', 'role-only', 'use-copy', 'keep-comments']);
+const BOOL_FLAGS = new Set(['yes', 'debug', 'help', 'experimental', 'include-all', 'include-roles', 'include-seed', 'data-only', 'role-only', 'use-copy', 'keep-comments', 'no-verify-jwt', 'use-api', 'use-docker', 'legacy-bundle', 'prune', 'no-seed', 'use-migra', 'use-pgadmin', 'use-pg-schema', 'no-backup']);
 const NON_LITERAL = /[\s$`*?[\]{}()~\\<>|;&'"!#]/;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
@@ -237,6 +237,7 @@ function supabaseRefusal(rest, state) {
   if (dbUrl !== undefined && real['db-url'] === 1 && localDbUrl(dbUrl)) return null;
   if (projectRef !== undefined && real['project-ref'] === 1 && isDevRef(projectRef, state)) return null;
   if (sub[0] === 'db' && sub[1] === 'push' && seen['dry-run'].length === 1 && real['dry-run'] === 1) return null;
+  for (const name of ['db-url', 'project-ref']) if (seen[name].length === 1 && real[name] === 0) return `the \`--${name}\` follows \`--\` or an option that may take it as its value; put the target flag first`;
   const what = dbUrl !== undefined ? 'a `--db-url` that is not a plain localhost URI'
     : projectRef !== undefined ? `\`--project-ref ${projectRef}\`, which the owner has not declared dev`
       : linked ? '`--linked`' : 'no `--local` or other target flag (it defaults to the linked project)';
