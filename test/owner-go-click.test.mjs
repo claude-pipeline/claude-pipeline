@@ -474,13 +474,18 @@ test('the tool_result entry not yet written: polled in 100 ms steps, recorded on
   assert.equal(slept, 300);
 });
 
-test('the entry never appears: refused not-in-transcript after the whole poll, nothing recorded', async (t) => {
+// #472: it used to be `refused: not-in-transcript`. On 2.1.323 the entry lands only AFTER the hooks return, so the click is kept as a pending pointer and verified when a consumer reads (see
+// owner-go-click-pending.test.mjs); nothing is recorded or spent now.
+test('the entry never appears within the poll: a pending click, nothing recorded, nothing spent', async (t) => {
   const w = world(t, { write: false });
   let slept = 0;
   const r = await w.click({ sleep: async (ms) => { slept += ms; }, pollMs: 1000 });
-  assert.deepEqual(r, { refused: 'not-in-transcript' });
+  assert.equal(r.pending?.askId, w.askId, JSON.stringify(r));
+  assert.deepEqual(Object.keys(r), ['pending']);
   assert.equal(slept, 1000);
   assert.equal(w.records().length, 0);
+  assert.equal(existsSync(join(asksDir(w.home), `${w.askId}.spent`)), false);
+  assert.equal(readdirSync(asksDir(w.home)).filter((n) => n.endsWith('.pending')).length, 1);
 });
 
 // ---- the proof every consumer runs (B4) ------------------------------------------------------------------------------------------------------

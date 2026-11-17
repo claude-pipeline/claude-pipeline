@@ -976,6 +976,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'bun ./pipeline/hooks/owner-go.mjs',
     './pipeline/hooks/owner-go.mjs < /tmp/in.json',
     `node -e "import('./pipeline/hooks/lib/owner-go.mjs').then((m) => m.recordApproval({}))"`,
+    `node --input-type=module <<'EOF'\nimport { recordApproval } from './pipeline/hooks/lib/owner-go.mjs';\nEOF`, // (#472: a program read from stdin)
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     'cat pipeline/hooks/owner-go.mjs',
@@ -983,6 +984,132 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'git diff -- pipeline/hooks/lib/owner-go.mjs',
     'node --test test/owner-go.test.mjs',
     'node /home/u/.claude/pipeline/hooks/stack-dev-bind.mjs', // (the other installed hooks keep their read-only standing)
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// #472 (Task 7): the click libraries record an owner "merge" from a dialog answer. A pending marker keeps the capture-time hook fingerprint the hook passed in, so a hand-run
+// recorder with an injected check would write a pending with a made-up capture. Running them by hand is refused on every route, like the recorder itself.
+test('#472 owner-go-click: running the click libraries by hand (a path, program text, a heredoc, a here-string) is refused; reading, testing and committing them is not', () => {
+  const LIBS = ['owner-go-click.mjs', 'owner-go-click-hook.mjs'];
+  for (const lib of LIBS) {
+    const inst = `/home/u/.claude/pipeline/hooks/lib/${lib}`;
+    for (const cmd of [
+      `node ${inst}`,
+      `node ~/.claude/pipeline/hooks/lib/${lib}`,
+      `node ${CHECKOUT}/pipeline/hooks/lib/${lib} < /tmp/in.json`,
+      `node pipeline/hooks/lib/${lib}`,
+      `bun ./pipeline/hooks/lib/${lib}`,
+      `./pipeline/hooks/lib/${lib} < /tmp/in.json`,
+      `node -e "import('./pipeline/hooks/lib/${lib}').then((m) => m.recordClick({ hookCheck: () => ({ ok: true }) }))"`,
+      `node --input-type=module -e "import('./pipeline/hooks/lib/${lib}').then((m) => m.recordClick({ check: () => null }))"`,
+      `node --input-type=module -e "import { recordClick } from '${inst}'; recordClick({})"`,
+      `node --input-type=module <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nrecordClick({ check: () => null });\nEOF`,
+      `node --input-type=module <<EOF\nconst m = await import('${inst}');\nEOF`,
+      `node --input-type=module <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `node - <<< "await import('${inst}')"`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type=module`,
+      // (R1-B1: whether the command reads stdin is decided from its own stdin source, not from the shape of its words)
+      `node --input-type module <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node --input-type=module - x <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node - <<EOF\nawait import('${CHECKOUT}/pipeline/hooks/lib/${lib}')\nEOF`,
+      `node /dev/stdin <<'EOF'\nimport './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node /dev/fd/0 <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node /dev/stdin`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type module`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type=module - x`,
+      `printf '%s' "import('./pipeline/hooks/lib/${lib}')" | bun -`,
+      `cat <<'EOF' | node --input-type module\nimport './pipeline/hooks/lib/${lib}';\nEOF`,
+      `echo x && echo "import('./pipeline/hooks/lib/${lib}')" | cat | node --input-type module`,
+      `node --input-type module <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `bun - <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `node --input-type module < <(echo "import('./pipeline/hooks/lib/${lib}')")`,
+      // (R2: a line that is not flat (a group, a subshell, a compound command, a function, an exec redirect, nested text) is read as a whole: the stdin a runtime gets there is not followed command by command)
+      `printf '%s\\n' "import('./pipeline/hooks/lib/${lib}')" | (node --input-type=module)`,
+      `(echo "import('./pipeline/hooks/lib/${lib}')"; true) | node --input-type=module`,
+      `{ echo "import('./pipeline/hooks/lib/${lib}')"; true; } | node --input-type=module`,
+      `(node --input-type=module) <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `{ node -; } <<'EOF'\nimport('./pipeline/hooks/lib/${lib}')\nEOF`,
+      `bash -c 'node --input-type=module' <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `exec <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module`,
+      `exec 3<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&3`,
+      `f() { node --input-type=module; }; echo "import('./pipeline/hooks/lib/${lib}')" | f`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | while :; do node -; break; done`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | if true; then node -; fi`,
+      // (R3-B1: the whole-line reading also reads the DECODED words of every command, so a name split by shell quotes cannot hide behind an unrelated `(true)`)
+      `printf '%s\\n' "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')" | node --input-type=module; (true)`,
+      `printf '%s\\n' "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')" | node --input-type=module && (true)`,
+      `node --input-type=module -e "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; (true)`,
+      `P=./pipeline/hooks/lib/owner-"${lib.slice(6)}"; node -e "import('\$P')"; (true)`,
+      `node --input-type=module <<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; (true)`,
+      `node - < <(echo "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"); (true)`,
+      // (R3-F1: stdin that arrives through a run-time variable, a kept-open or duplicated descriptor, or a file is not known text: the whole line is read)
+      `read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `read -r P <<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; node --input-type=module <<< "$P"`,
+      `: {fd}<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&$fd`,
+      `: 10<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&10`,
+      `: 10<<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; node - <&10`,
+      `: 10<> /tmp/p.mjs; echo "import('./pipeline/hooks/lib/${lib}')" >&10; node - <&10`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node - < /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node --input-type=module 0< /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node - <> /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat < /tmp/p.mjs | node -`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat /tmp/p.mjs | tee /dev/null < /tmp/p.mjs | node -`,
+      // (R4-B1: every stage feeding a runtime must be a literal printer; a file operand, a decoder or any other command makes the text unknown)
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat /tmp/p.mjs | node --input-type=module`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat -- /tmp/p.mjs | node -`,
+      `base64 -d <<< "aW1wb3J0KCcuL3BpcGVsaW5lL2hvb2tzL2xpYi8ke2xpYn0nKQ==" | node --input-type=module; echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | sed s/a/b/ | node -`,
+      // (R5-F1: a line that redefines echo / printf / cat with an alias does not get the literal-printer reading; the alias words are read as part of the whole line)
+      `alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
+      // (a precommand wrapper or `hash -p` hides the redefiner; any redefinition the parser sees keeps the whole-line reading)
+      `builtin alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
+      `command alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
+      `hash -p pipeline/hooks/lib/${lib} echo\necho | node --input-type=module`,
+      `builtin hash echo=pipeline/hooks/lib/${lib}\necho | node --input-type=module`,
+      // (zsh's command hash table rebinds a name too: `commands[echo]=path`, `read -A commands`)
+      `commands[echo]=pipeline/hooks/lib/${lib}\necho | node --input-type=module`,
+      `read -A commands <<< "echo pipeline/hooks/lib/${lib}"\necho | node --input-type=module`,
+      // (R4-F1: a name the line gave a value and then rebinds at run time still reads as its stale value after expansion: the text AS WRITTEN decides)
+      `P=x true; read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `export P=x; printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      // (a backslash-newline inside an unquoted heredoc splits the name in the raw text; the shell joins it)
+      `node --input-type=module <<EOF\nimport('./pipeline/hooks/lib/${lib.slice(0, 9)}\\\n${lib.slice(9)}')\nEOF`,
+    ]) assert.equal(bash(cmd), 'deny', cmd);
+    for (const cmd of [
+      `cat pipeline/hooks/lib/${lib}`,
+      `git add pipeline/hooks/lib/${lib}`,
+      `git diff -- pipeline/hooks/lib/${lib}`,
+      `grep -n recordClick pipeline/hooks/lib/${lib}`,
+      // (a library named in one command of a line, a runtime that reads no program from stdin in another)
+      `git add pipeline/hooks/lib/${lib} && node scripts/test.mjs owner-go-click.test.mjs`,
+      `git add pipeline/hooks/lib/${lib} && node --test`,
+      `git add pipeline/hooks/lib/${lib} && node --input-type module scripts/x.mjs`,
+      `git add pipeline/hooks/lib/${lib}; echo ok | node scripts/test.mjs owner-go-click.test.mjs`,
+      `cat pipeline/hooks/lib/${lib} && node --test test/owner-go-click.test.mjs`,
+      `git diff -- pipeline/hooks/lib/${lib} | grep recordClick`,
+      `git diff -- pipeline/hooks/lib/${lib} | grep recordClick || node scripts/test.mjs owner-go-click.test.mjs`,
+    ]) assert.equal(bash(cmd), 'allow', cmd);
+  }
+  // (R3-F2: a line that is not flat and names a library next to a runtime is refused as a whole, with a message that names the cause and the way out; a commit message is the deliberate cost)
+  for (const cmd of [
+    "node scripts/test.mjs owner-go-click.test.mjs && git commit -m \"$(cat <<'EOF'\nguard: refuse owner-go-click.mjs read from stdin\nEOF\n)\"",
+    "node scripts/test.mjs owner-go-click-hook.test.mjs; (true); git add pipeline/hooks/lib/owner-go-click-hook.mjs",
+    // (R5-F2: another command's output can feed the runtime; the message names that cause too)
+    'git add pipeline/hooks/lib/owner-go-click.mjs; git status --short | node scripts/x.mjs',
+  ]) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /runs a JavaScript runtime and is not a plain command line/, cmd);
+    assert.match(r.reason, /Run the runtime on a line of its own, or keep the library name off that line/, cmd);
+    assert.match(r.reason, /or the output of another command/, cmd);
+  }
+  for (const cmd of [
+    'node scripts/test.mjs owner-go-click.test.mjs',
+    'node scripts/test.mjs owner-go-click-hook.test.mjs owner-go-click-pending.test.mjs',
+    'node --test test/owner-go-click.test.mjs',
+    'node --test test/owner-go-click-hook.test.mjs',
+    'node /home/u/.claude/pipeline/bin/pipeline.mjs merge --pr 5 --owner-go',
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
@@ -2018,4 +2145,17 @@ test('#256 R5-F4 a Codex session-log write whose home prefix is only known at ru
     'bash -c "echo x >> $(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"',
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of ['cat "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"', 'echo ".codex is a folder"']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// #472 (Task 6): the click state lives INSIDE the protected owner-go folder, so no guard rule had to change; the explicit rows keep it that way.
+test('#472 click state: asks/*.pending, asks/*.settled, consumed/*.json and round-claims/*.json are protected from Write, Edit and every shell write; reading them is open', () => {
+  const R = '/home/u/.claude/pipeline-state/owner-go';
+  const targets = [`${R}/asks/ask-0123456789ab.0123456789abcdef.pending`, `${R}/asks/ask-0123456789ab.0123456789abcdef.settled`, `${R}/consumed/0123456789abcdef.json`, `${R}/round-claims/0123456789abcdef.1.json`];
+  for (const f of targets) {
+    assert.equal(file('Write', { file_path: f, content: '{}' }), 'deny', f);
+    assert.equal(file('Edit', { file_path: f, old_string: 'a', new_string: 'b' }), 'deny', f);
+    for (const cmd of [`echo '{}' > ${f}`, `cp /tmp/x.json ${f}`, `rm -f ${f}`, `touch ${f}`, `tee ${f} < /tmp/x`, `mv /tmp/x.json ${f}`]) assert.equal(bash(cmd), 'deny', cmd);
+    for (const cmd of [`cat ${f}`, `ls -la ${path.dirname(f)}`]) assert.equal(bash(cmd), 'allow', cmd);
+  }
+  assert.equal(file('Write', { file_path: '~/.claude/pipeline-state/owner-go/round-claims/0123456789abcdef.2.json', content: '{}' }), 'deny');
 });
