@@ -6,6 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, symlinkSync, 
 import { tmpdir } from 'node:os';
 import { join, resolve } from 'node:path';
 import { codexUsage, codexUsageSuffix, recordCodexRun, usageFile } from '../pipeline/lib/codex-usage.mjs';
+import { accountHome } from '../pipeline/lib/paths.mjs';
 
 // scripts/test.mjs points the whole suite at a scratch ledger through the environment; these tests choose their own.
 delete process.env.PIPELINE_CODEX_USAGE_FILE;
@@ -100,4 +101,17 @@ test('codexUsageSuffix: nothing when no run; "xhigh" only when X > 0', () => {
 test('usageFile: PIPELINE_CODEX_USAGE_FILE moves the ledger in a checkout; an injected file wins', () => {
   assert.equal(usageFile({ env: { PIPELINE_CODEX_USAGE_FILE: '/tmp/x/u.jsonl' } }), resolve('/tmp/x/u.jsonl')); // (the file is resolved: on Windows a rooted path gains the current drive)
   assert.equal(usageFile({ file: '/tmp/y/u.jsonl', env: { PIPELINE_CODEX_USAGE_FILE: '/tmp/x/u.jsonl' } }), resolve('/tmp/y/u.jsonl'));
+});
+
+// Real failure: a session running `node --test test/x.test.mjs` directly (not through scripts/test.mjs, which sets a scratch ledger) made codex-review tests append
+// fake rows (acme/widgets) to the owner's real ledger, ~17,000 runs against ~300 real ones. Under node's test runner the default ledger must never be the account's.
+test('usageFile: under node --test with no override the default ledger is a scratch file, never the account\'s real one; outside a test run it is unchanged', () => {
+  const real = join(accountHome(), '.claude', 'pipeline-state', 'codex-usage.jsonl');
+  const under = usageFile({ env: { NODE_TEST_CONTEXT: 'child-v8' } });
+  assert.notEqual(under, real);
+  assert.ok(under.startsWith(resolve(tmpdir())), `scratch ledger ${under} is under the temp dir`);
+  assert.equal(usageFile({ home: '/h', env: { NODE_TEST_CONTEXT: 'child-v8' } }), join('/h', '.claude', 'pipeline-state', 'codex-usage.jsonl')); // a test that names its home keeps it
+  const saved = process.env.NODE_TEST_CONTEXT;
+  delete process.env.NODE_TEST_CONTEXT;
+  try { assert.equal(usageFile({ env: {} }), real); } finally { if (saved !== undefined) process.env.NODE_TEST_CONTEXT = saved; }
 });
