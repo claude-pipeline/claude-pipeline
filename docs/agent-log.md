@@ -236,3 +236,4 @@ full record.
 - 2026-11-17 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 44 · arbiter 43 (fix-verify 2) · substitute 3 · awaiting-owner-merge · Codex 7d: 16367 runs (15843 high)
 - 2026-11-17 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 5 · arbiter 4 (fix-verify 1) · awaiting-review · Codex 7d: 16377 runs (15845 high)
 - 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 13 · arbiter 10 · substitute 1 · awaiting-owner-merge · Codex 7d: 16431 runs (15893 high)
+- 2026-11-17 · #590 · test: load-proof the remaining flaky tests (#362 follow-ups) · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge · Codex 7d: 16911 runs (16367 high)
