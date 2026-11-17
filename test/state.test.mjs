@@ -19,6 +19,9 @@ import {
   STATE_VERSION_OUT_OF_MODEL,
   STATE_VERSION_POST_MAX,
   STATE_VERSION_OWNER_DEFERRAL,
+  STATE_VERSION_SAME_ON_BASE,
+  stateNeedsSameOnBaseVersion,
+  requiredStateVersion,
   stateNeedsOwnerDeferralVersion,
   stateNeedsPostMaxVersion,
   maxRiskOf,
@@ -516,7 +519,7 @@ test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForCom
     assert.equal(loadState(dir).version, 4);
     assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
     saveState(dir, { ...s, version: SUPPORTED_STATE_VERSION + 1 });
-    assert.throws(() => loadState(dir), /version 8.*supports.*7/);
+    assert.throws(() => loadState(dir), /version 9.*supports.*8/);
     assert.equal(decodeFromComment(encodeForComment({ ...s, version: SUPPORTED_STATE_VERSION + 1 })), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -574,7 +577,7 @@ test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOf
   assert.equal(stateNeedsOutOfModelVersion(marked), true);
   const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
   assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
-  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_OWNER_DEFERRAL);
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_SAME_ON_BASE);
   assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
   assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
   assert.equal(stateNeedsOutOfModelVersion(null), false);
@@ -684,6 +687,38 @@ test('F11 (owner deferral): version 7 ONLY when a final carries ownerDeferral (a
     saveState(dir, { ...owner, version: 1 });
     assert.equal(loadState(dir).version, STATE_VERSION_OWNER_DEFERRAL, 'a stale writer is lifted back');
     assert.equal(decodeFromComment(encodeForComment({ ...owner, version: 1 })).version, STATE_VERSION_OWNER_DEFERRAL);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// Failure caught: a pipeline of version 7 reads a state holding a same-on-base final, counts its unfiled FOLLOW-UP as done and leaves it out of the owner's bound items; or the new
+// version is written for an ordinary state (an old CLI could no longer read it), or loses to 7 when both marks are in one state.
+test('A2 (regression-only): version 8 ONLY when a final carries sameOnBase (also on a cached copy); version 8 wins over 7; a plain or owner-deferral-only state keeps its version; a CLI supporting 7 refuses 8', () => {
+  const plain = sampleState();
+  assert.equal(stateNeedsSameOnBaseVersion(plain), false);
+  assert.ok(STATE_VERSION_SAME_ON_BASE > STATE_VERSION_OWNER_DEFERRAL);
+  const marked = (by) => ({ decision: 'FOLLOW-UP', by, needsHuman: false, reason: 'r', sameOnBase: 'pipeline/hooks/**' });
+  const orig = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: marked('arbiter') })]);
+  assert.equal(stateNeedsSameOnBaseVersion(orig), true);
+  assert.equal(orig.version, STATE_VERSION_SAME_ON_BASE, 'updateItems writes the version the state needs');
+  assert.equal(updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: marked('cache') })]).version, STATE_VERSION_SAME_ON_BASE, 'a cached copy is lifted too');
+  for (const bad of [{ sameOnBase: '' }, { sameOnBase: true }, { sameOnBase: null }]) assert.equal(stateNeedsSameOnBaseVersion({ rounds: [{ items: [{ final: bad }] }] }), false, JSON.stringify(bad));
+  assert.equal(stateNeedsSameOnBaseVersion(null), false);
+  const deferral = { decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'r', ownerQuote: 'q', ownerDeferral: { accepted: 'arbiter', ruledAt: '2026-11-17T10:00:00.000Z' } };
+  const deferredOnly = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: deferral })]);
+  assert.equal(deferredOnly.version, STATE_VERSION_OWNER_DEFERRAL, 'an owner deferral alone stays at 7');
+  const both = updateItems(deferredOnly, 1, [deferredOnly.rounds[0].items[0], it('R1-S2', { bucket: 'SUGGESTION', final: marked('arbiter') })]);
+  assert.equal(both.version, STATE_VERSION_SAME_ON_BASE, 'version 8 wins over 7');
+  assert.equal(requiredStateVersion(both), STATE_VERSION_SAME_ON_BASE);
+  assert.equal(plain.version, 1, 'a state without the mark stays at its old version');
+  const refusesAt7 = (state) => Number.isFinite(state.version) && state.version > 7;
+  assert.equal(refusesAt7(orig), true);
+  assert.equal(refusesAt7(deferredOnly), false);
+  const dir = tmp();
+  try {
+    saveState(dir, { ...orig, version: 1 });
+    assert.equal(loadState(dir).version, STATE_VERSION_SAME_ON_BASE, 'a stale writer is lifted back');
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
