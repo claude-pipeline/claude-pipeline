@@ -16,7 +16,7 @@ const REPO = 'acme/app';
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
-const FIX = new URL('./fixtures/click/genuine-click.jsonl', import.meta.url);
+const FIX = new URL('./fixtures/click/2.1.322/genuine-click.jsonl', import.meta.url);
 const OK = () => ({ ok: true, hookLayersSha256: null });
 const noSleep = async () => {};
 
@@ -92,6 +92,38 @@ test('an AskUserQuestion that is not ours prints nothing: no ask id, an unknown 
 test('a recorder that throws prints nothing and the entry still returns', async () => {
   assert.equal(await clickHookLine({ hook_event_name: 'PostToolUse', tool_name: 'AskUserQuestion' }, { record: async () => { throw new Error('boom'); } }), null);
   assert.equal(await clickHookLine({ hook_event_name: 'PostToolUse', tool_name: 'AskUserQuestion' }, { record: () => { throw new Error('boom'); } }), null);
+});
+
+// #472: on 2.1.323 the answer reaches the transcript after this hook returns, so the click is only RECEIVED here and verified by the consumer. The line must never say "is recorded" or
+// "could not be verified" (neither is true yet), and it names the consumer command to run now.
+test('clickLine for a pending click: "received, verified when used" with the command to run now, one line per kind; never "is recorded" or "could not be verified"', () => {
+  const HEADS = '[claude-pipeline owner-go] the owner\'s click is received and is verified when it is used';
+  const base = { askId: 'ask-0123456789ab', clickId: '0123456789abcdef', repo: REPO };
+  assert.equal(clickLine({ pending: { ...base, kind: 'merge', prs: [58] } }), `${HEADS}: if the owner chose to approve, run P merge --pr 58 --owner-go now; if they chose not to, stop: nothing is approved`);
+  assert.equal(clickLine({ pending: { ...base, kind: 'merge-many', prs: [58, 61, 62] } }), `${HEADS}: if the owner chose to approve, run P merge --pr 58 --owner-go, P merge --pr 61 --owner-go and P merge --pr 62 --owner-go now (one per PR the owner ticked; a PR that was not ticked is refused); if they chose not to, stop: nothing is approved`);
+  assert.equal(clickLine({ pending: { ...base, kind: 'round', prs: [58] } }), `${HEADS} (extra round for ${REPO} #58): if the owner chose to approve, run P codex-review --pr 58 --round <the n from round-request> now; if they chose not to, stop: nothing is approved`);
+  const ruling = clickLine({ pending: { ...base, kind: 'ruling', prs: [58], quotes: { 'Accept all': 'R1-B1: accept, R2-S3: accept', 'Reject all': 'R1-B1: reject, R2-S3: reject' } } });
+  assert.equal(ruling, `${HEADS} (ruling for ${REPO} #58): if the owner chose to approve a ruling, run P triage owner-ruling now with the --owner-quote of the label the owner chose: "Accept all" -> --owner-quote "R1-B1: accept, R2-S3: accept"; "Reject all" -> --owner-quote "R1-B1: reject, R2-S3: reject"; if they chose not to, stop: nothing is approved`);
+  for (const line of [ruling, clickLine({ pending: { ...base, kind: 'merge', prs: [58] } })]) {
+    assert.doesNotMatch(line, /is recorded|could not be verified/);
+    assert.equal(line.includes('\n'), false);
+    assert.match(line, /if they chose not to, stop: nothing is approved/);
+  }
+  for (const kind of ['merge', 'merge-many', 'round']) {
+    assert.ok(clickLine({ pending: { ...base, kind, prs: [58] } }).includes('if they chose not to, stop'), kind);
+  }
+  // a repo-less or garbled pending still prints a safe line, never a throw
+  assert.match(clickLine({ pending: { askId: 'ask-0123456789ab', clickId: '0123456789abcdef', kind: 'merge', prs: [] } }), /received and is verified when it is used/);
+  assert.match(clickLine({ pending: {} }), /received and is verified when it is used/);
+});
+
+test('clickHookLine on the 2.1.323 write order (the answer is not in the transcript yet) prints the "received" line, writes a pending and nothing else', async () => {
+  const w = world('merge', 'Merge');
+  const file = w.input.transcript_path;
+  const entries = readFileSync(file, 'utf8').trim().split('\n');
+  writeFileSync(file, `${entries.slice(0, 2).join('\n')}\n`); // prompt + tool_use only: the result is written after the hooks return
+  const line = await clickHookLine(w.input, w.opts);
+  assert.equal(line, "[claude-pipeline owner-go] the owner's click is received and is verified when it is used: if the owner chose to approve, run P merge --pr 58 --owner-go now; if they chose not to, stop: nothing is approved");
 });
 
 test('clickLine: null for anything it does not know', () => {

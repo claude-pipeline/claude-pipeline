@@ -163,7 +163,9 @@ test('a working-tree default_branch edit moves neither hash', (t) => {
   assert.equal(b, trusted);
 });
 
-test('an untrusted anchor (origin remote, no origin/HEAD, ls-remote fails) hashes from the config value in both, no throw', (t) => {
+// The LOW-LEVEL hash functions still hash from the config value (no throw); the commands that vouch for or record from that hash refuse or warn on top of it:
+// review-complete, state mark-implemented and state fable-refresh refuse, state outcome warns (test/untrusted-anchor-commands.test.mjs), the merge gate refuses (finalgate).
+test('an untrusted anchor (origin remote, no origin/HEAD, ls-remote fails) hashes from the config value in both, no throw (the commands refuse or warn on top: untrusted-anchor-commands.test.mjs)', (t) => {
   const repo = world(t);
   addOrigin(t, repo, { head: false });
   breakOrigin(repo); // before the first read: ls-remote answers are remembered per process

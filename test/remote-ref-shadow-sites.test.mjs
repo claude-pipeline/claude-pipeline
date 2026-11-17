@@ -7,15 +7,19 @@
 // elsewhere (guard, identity, agent log, verify report) and the artifacts branch, issue #454.)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { copyFileSync, readFileSync, writeFileSync } from 'node:fs';
+import { copyFileSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
+import { pipelineYml } from './helpers/fakegh-env.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { addOrigin } from './helpers/origin.mjs';
 import { project, scratchDir } from './helpers/project.mjs';
 import { AGENT_LOG } from './helpers/gate-env.mjs';
 import { ARTIFACTS_BRANCH, publishArtifacts } from '../pipeline/commands/artifacts.mjs';
 import { ownerGoWiring } from '../pipeline/hooks/lib/git-wiring.mjs';
+import { draftBehindBase } from '../pipeline/commands/review-complete.mjs';
+import { loadRepo } from '../pipeline/lib/worktree-prune/run.mjs';
 import { headOnMain } from '../pipeline/lib/identity.mjs';
 import { AGENT_LOG_BRANCH, AGENT_LOG_HEADER, originLogLines, publishLines } from '../pipeline/lib/agentlog.mjs';
 
@@ -174,4 +178,79 @@ test('#454 artifacts: the publish starts from the fetched refs/remotes/origin/<a
   const files = repo.git(['--git-dir', bare, 'ls-tree', '-r', '--name-only', ARTIFACTS_BRANCH]).split('\n').filter(Boolean);
   assert.ok(files.includes('pr-1/old.png') && files.includes('pr-2/new.png'), 'the remote\'s file and the new one are published');
   assert.ok(!files.includes('shadow.txt'), 'the shadow commit\'s file is not on the published branch');
+});
+
+// ---- f. #455: a MISSING remote-tracking ref must not be answered by a branch or tag literally named refs/remotes/origin/<b> --------
+// `git show|rev-parse|merge-base refs/remotes/origin/<b>` finds the exact ref first, but with it missing falls through to refs/tags/<name> and refs/heads/<name>.
+// (lib/git.mjs#reviewBaseRef and #remoteDefaultBranch are covered by test/remote-ref-shadow.test.mjs.)
+const shadowFull = (repo, name, sha) => {
+  repo.git(['update-ref', `refs/heads/refs/remotes/origin/${name}`, sha]);
+  repo.git(['update-ref', `refs/tags/refs/remotes/origin/${name}`, sha]);
+};
+
+test('#455 identity: with refs/remotes/origin/main missing, a branch or tag named refs/remotes/origin/main does not make headOnMain true', () => {
+  const repo = createTmpRepo();
+  repo.write('a.txt', '1\n');
+  const sha = repo.commit('first'); // HEAD
+  shadowFull(repo, 'main', sha);
+  assert.equal(headOnMain(repo.dir), false);
+});
+
+test('#455 guard: with origin/main missing, the copy a branch or tag named refs/remotes/origin/main holds is not read as the remote\'s', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', CHAT);
+  const chatSha = repo.commit('chat config');
+  repo.write('.claude/pipeline.yml', LABEL);
+  repo.commit('drop chat');
+  for (const name of ['main', 'master']) shadowFull(repo, name, chatSha);
+  assert.equal(ownerGoWiring('sess').mode(repo.dir), 'label');
+});
+
+test('#455 agent log: with origin/<default> missing, originLogLines is unreadable (null), not the log of a branch or tag named refs/remotes/origin/<default>', (t) => {
+  const { repo, shadowSha } = logWorld(t);
+  repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+  repo.git(['update-ref', '-d', `refs/heads/origin/main`]);
+  repo.git(['update-ref', '-d', `refs/tags/origin/main`]);
+  shadowFull(repo, 'main', shadowSha);
+  const { lines } = originLogLines(repo.dir, { logFile: join(repo.dir, AGENT_LOG), defaultBranch: 'main' });
+  assert.equal(lines, null);
+});
+
+test('#455 worktree prune: a missing origin/main is skipped for origin/master even when a branch or tag named refs/remotes/origin/main exists', async () => {
+  const base = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-wtcfg455-')));
+  const repo = createTmpRepo();
+  try {
+    const origin = join(base, 'origin.git');
+    repo.git(['init', '--bare', '-q', '-b', 'main', origin]);
+    repo.write('.claude/pipeline.yml', pipelineYml());
+    const sha = repo.commit('init');
+    repo.git(['remote', 'add', 'origin', origin]);
+    repo.git(['push', '-q', 'origin', 'main']);
+    repo.git(['checkout', '-q', '-b', 'local/root-scratch']);
+    repo.rm('.claude/pipeline.yml');
+    repo.commit('scratch', { allowEmpty: true });
+    repo.git(['update-ref', 'refs/remotes/origin/master', 'refs/remotes/origin/main']);
+    repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+    shadowFull(repo, 'main', sha);
+    const r = await loadRepo({}, { cwd: repo.dir });
+    assert.equal(r.configSource, 'origin/master');
+  } finally {
+    rmSync(base, { recursive: true, force: true });
+    repo.cleanup();
+  }
+});
+
+test('#455 review-complete: draftBehindBase skips the behind-base check (warning) when refs/remotes/origin/<b> is missing, whatever a branch or tag of that full name says', (t) => {
+  const repo = createTmpRepo();
+  t.after(() => repo.cleanup());
+  repo.write('a.txt', '1\n');
+  repo.commit('base');
+  addOrigin(t, repo);
+  repo.branch('feat/x');
+  repo.write('b.txt', '2\n');
+  const head = repo.commit('feature');
+  repo.git(['update-ref', '-d', 'refs/remotes/origin/main']);
+  shadowFull(repo, 'main', head); // an ancestor of HEAD: the old code read it as the base and answered "not behind"
+  const r = draftBehindBase({ root: repo.dir, config: { default_branch: 'main' }, gh: null, pr: 7, view: { isDraft: true }, refresh: { refreshed: true } });
+  assert.match(r.warning ?? '', /behind-base check skipped/);
 });

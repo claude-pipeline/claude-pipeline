@@ -1219,6 +1219,7 @@ test('R21: a declined ${…} is no command text, a (( keeps the outer heredoc ou
 
 test('R22: a case in a declined ${…}, brackets across expansions in arithmetic, a bare { in ${…}, and heredoc newlines in arrays and subscripts are refused', () => {
   const cp = 'd=.clau; cp /tmp/payload ~/${d}de/settings.json'; // (built at run time, as in R19)
+  const FROZEN = { now: () => 0 }; // (a frozen clock: the guard's 5 s deadline can never fire on a loaded machine, so a deny or an allow is the rule's own answer, #477)
   const failures = [];
   for (const cmd of [
     // R22-B1: a `case` inside ${…} is no case; its # is no comment there
@@ -1235,7 +1236,7 @@ test('R22: a case in a declined ${…}, brackets across expansions in arithmetic
     "cat <<'E' >/dev/null; a=(\nx\nE\n)\n" + cp + '\nE\n',
     // R22-F4: bash reads the subscript across the newline
     "cat <<'E' >/dev/null; a[0\n+$(" + cp + ')]=1\nE\ntrue\n',
-  ]) if (bash(cmd, {}, '/home/u') !== 'deny') failures.push(cmd);
+  ]) if (bash(cmd, FROZEN, '/home/u') !== 'deny') failures.push(cmd);
   assert.deepEqual(failures, [], 'these R22 lines were not refused');
   const blocked = [];
   for (const cmd of [
@@ -1246,7 +1247,7 @@ test('R22: a case in a declined ${…}, brackets across expansions in arithmetic
     'echo ${x:-{a,b}} # fine',
     'a=(\nx\ny\n)\necho done',
     "cat <<'E'\nbody\nE\na=(\nx\ny\n)\necho done",
-  ]) if (bash(cmd, {}, '/home/u') !== 'allow') blocked.push(cmd);
+  ]) if (bash(cmd, FROZEN, '/home/u') !== 'allow') blocked.push(cmd);
   assert.deepEqual(blocked, [], 'these R22 lines were refused');
 });
 

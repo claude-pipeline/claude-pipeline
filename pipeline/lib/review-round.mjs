@@ -31,6 +31,7 @@ import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } fro
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
+import { clickNotes } from '../hooks/lib/owner-go-click.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
 import {
   allItems, currentContentHash, ensureRoundDir, excerptWindow, refreshTrustedDefault, reviewBaseRef, roundDir, withReviewLock, withRouteLock, writeFileAtomic, writeJson,
@@ -93,10 +94,15 @@ export const checkRound = (st, { pr, round }) => {
 
 // Round 1 starts at the PR's merge base; every later round starts where the previous one ended.
 // When a whole-PR round is owed (review-route.mjs#wholePrOwed: an Opus substitute round came before the PR's risk rose to high) it starts at the merge base too.
+// The base a round must use: the single rule checkBase enforces and `pipeline round codex` defaults to.
+export const requiredBase = (st, forkPoint) => {
+  const last = st?.rounds.at(-1);
+  return last && !wholePrOwed(st) ? last.toHead : forkPoint;
+};
 export const checkBase = (st, { round, base, forkPoint }) => {
   const last = st?.rounds.at(-1);
   const owed = last !== undefined && wholePrOwed(st);
-  const required = last && !owed ? last.toHead : forkPoint;
+  const required = requiredBase(st, forkPoint);
   if (base !== required) {
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'base-mismatch',
@@ -123,6 +129,17 @@ const reviewedAdmission = ({ baseOnly, resolutionOnly }) => (baseOnly || resolut
 const admit = (c, st, flags) => (st
   ? roundAdmission(st, c.round, { ...flags, head: c.head, grants: (k) => ownerRecords(c, k) })
   : { admission: reviewedAdmission(flags), problem: null });
+// Why (#472): the round-cap refusal also says what became of an owner click on the extra-round dialog (waiting for its transcript entry, refused, or recorded for a round already used), so the agent
+// neither asks again for a click that is only waiting nor reads "no grant" over it. '' when there is nothing to say; never throws.
+const pendingClickNotes = (c) => {
+  try {
+    if (c.config.owner_approval !== 'chat' || c.ghRepo?.host !== 'github.com') return '';
+    const notes = clickNotes({ repo: c.ghRepo.slug, prs: [c.pr], kinds: ['round'] });
+    return notes.length > 0 ? `; ${notes.join('; ')}` : '';
+  } catch {
+    return '';
+  }
+};
 // #128: an extra round recorded for this PR whose prompt cannot be confirmed as the owner's grants nothing; the refusal says so (and, R2-F3, says the config dir must be a .claude* folder under the home when that may be the reason).
 const unconfirmedGrant = (c, st) => {
   try {
@@ -142,12 +159,48 @@ export const checkCap = (c, st, flags, { already = false } = {}) => {
   if (problem) {
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'round-cap',
-      message: (already ? `the owner's extra round was already used (grant already used): ${problem}` : problem) + unconfirmedGrant(c, st),
+      message: (already ? `the owner's extra round was already used (grant already used): ${problem}` : problem) + unconfirmedGrant(c, st) + pendingClickNotes(c),
       ...(c.resolutionIneligible === undefined ? {} : { resolutionIneligible: c.resolutionIneligible }),
     });
   }
   return admission;
 };
+
+// The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists). GitHub's answer wins; without one the PR is read as
+// targeting the TRUSTED default branch (risk.mjs#prBaseBranch), never the working-tree config's default_branch, which the PR can edit (#398). When that fallback is needed and the
+// default branch could not be anchored on the remote (an origin remote that did not answer), the working tree's value is the PR's to choose: exit 3 rather than let it set the range (S1).
+// `view` is the PR as GitHub names it ({baseRefName}); `head` a full SHA. -> { prBase, forkPoint }. Shared by admitRound and `pipeline round codex` (the base it defaults to).
+export function resolveForkPoint({ root, config, view, head }) {
+  const o = { cwd: root };
+  const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
+  if (prBaseUntrusted !== null) {
+    throw unavailable('github', { error: 'unanchored-base', message: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}` });
+  }
+  // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
+  // slow one just means the cached ref is used.
+  try {
+    git(['fetch', '--no-tags', 'origin', `+refs/heads/${prBase}:refs/remotes/origin/${prBase}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+  }
+  // The trusted fork point (rateBranch, the model, the lanes) is measured from origin/<default branch>, which is not the PR's base for a stack: refresh it too (R2-F1).
+  refreshTrustedDefault(root, config, { except: prBase });
+  return { prBase, forkPoint: mergeBase(reviewBaseRef(root, config, prBase), head, o) };
+}
+
+// The range a round uses when the caller names none: the base the admission would demand and the checked-out HEAD. Reads the PR from GitHub (exit 3 `github` when unreachable).
+export function defaultRoundRange({ root, config, ctx, pr, state }) {
+  let view;
+  try {
+    view = createGitHub({ cwd: root, env: ctx.env }).prView(pr, ['baseRefName']);
+  } catch (err) {
+    if (err instanceof GhError) throw unavailable('github', { error: 'unavailable', message: err.message });
+    throw err;
+  }
+  const head = headSha({ cwd: root });
+  const { forkPoint } = resolveForkPoint({ root, config, view, head });
+  return { base: requiredBase(state, forkPoint), head };
+}
 
 // Phase one. `base` and `head` are full SHAs (head is the checked-out HEAD). Returns the admitted round (opaque to the caller except
 // for these fields): { state, view, slug, ghRepo, forkPoint, level, rated, lane, fable, lightLane, review: {base, kind}, resolution,
@@ -173,23 +226,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
     throw err;
   }
 
-  // The merge base of the whole PR: where the PR forked from the branch it targets (origin/<base> when it exists). GitHub's answer wins; without one the PR is read as
-  // targeting the TRUSTED default branch (risk.mjs#prBaseBranch), never the working-tree config's default_branch, which the PR can edit (#398). When that fallback is needed and the
-  // default branch could not be anchored on the remote (an origin remote that did not answer), the working tree's value is the PR's to choose: exit 3 rather than let it set the range (S1).
-  const { branch: prBase, untrusted: prBaseUntrusted } = prBaseBranch(view, root, config);
-  if (prBaseUntrusted !== null) {
-    throw unavailable('github', { error: 'unanchored-base', message: `GitHub did not name the PR's base branch, and ${prBaseUntrusted}` });
-  }
-  // Best effort: a fresh origin/<base> is what "merged in from the base branch" is measured against. Offline, no remote or a
-  // slow one just means the cached ref is used.
-  try {
-    git(['fetch', '--no-tags', 'origin', `+refs/heads/${prBase}:refs/remotes/origin/${prBase}`], { ...o, timeoutMs: NETWORK_TIMEOUT_MS });
-  } catch (err) {
-    if (!(err instanceof GitError)) throw err;
-  }
-  // The trusted fork point (rateBranch, the model, the lanes) is measured from origin/<default branch>, which is not the PR's base for a stack: refresh it too (R2-F1).
-  refreshTrustedDefault(root, config, { except: prBase });
-  const forkPoint = mergeBase(reviewBaseRef(root, config, prBase), head, o);
+  const { prBase, forkPoint } = resolveForkPoint({ root, config, view, head });
   c.forkPoint = forkPoint;
   checkBase(state, c);
   const wholePr = state !== null && state.rounds.length > 0 && wholePrOwed(state);
@@ -512,7 +549,8 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
       // discard-round); the first claimer on the machine wins. A failed claim discards the reviewer's answer.
       claimGrant = () => {
-        const claim = claimGrantMarkers(records, { repo: adm.ghRepo.slug, pr, k, head, checkout: root });
+        // #472: an extra-round claim takes a round ticket first, so claims of one round are totally ordered (owner-go.mjs claimGrantMarkers); `used` covers a grant a ticket already covers.
+        const claim = claimGrantMarkers(records, { repo: adm.ghRepo.slug, pr, k, head, checkout: root }, { ticket: true });
         if (!claim.ok) {
           throw new Fail(EXIT.USAGE, {
             ok: false, error: 'round-cap',

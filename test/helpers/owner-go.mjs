@@ -12,7 +12,11 @@ import { fileURLToPath } from 'node:url';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { randomUUID } from 'node:crypto';
-import { accountHome, areasBlock, ownerGoDir, recordApproval, recordPastRoundGrant, recordRoundGrant, recordRuling } from '../../pipeline/hooks/lib/owner-go.mjs';
+import { accountHome, areasBlock, markerPath, ownerGoDir, recordApproval, recordPastRoundGrant, recordRoundGrant, recordRuling, roundTicketKey } from '../../pipeline/hooks/lib/owner-go.mjs';
+
+// #472: the owner-go readers settle pending clicks, and this folder is the account's real one. A test that reads through the default home must never settle the owner's real pending clicks, so importing
+// this helper turns settling off for the process (scripts/test.mjs does the same for every test file; this covers a file run on its own). Already recorded clicks still count; a test of settling asks with `settle: true`.
+process.env.PIPELINE_CLICK_SETTLE = 'off';
 
 const HOOK = fileURLToPath(new URL('../../pipeline/hooks/owner-go.mjs', import.meta.url));
 
@@ -81,6 +85,33 @@ export function cleanupAtExit(file) {
   if (exitHook) return;
   exitHook = true;
   process.on('exit', () => { for (const f of leftovers) rmSync(f, { recursive: true, force: true }); });
+}
+
+// #472 (Fable F4): an extra-round claim writes a round TICKET (owner-go/round-claims/<key>.<n>.json) and the per-grant markers it covers (owner-go/consumed/<id>.json) into the account's real folder, so a test
+// whose codex-review claims a round must clean up exactly that, and must have a repository name of its own (`acme/widgets-<uuid>`: the ticket key is a hash of repo, PR and round, so only this test can
+// make it). Registers the removal for t.after and for process exit (the claim has not happened yet when this is called) and returns it. It removes the tickets of its own key, the markers those tickets
+// name and the markers of `grantIds` (the test's own grants, swept or repaired ones included): paths this test created, never a sweep of the folder by name pattern or age.
+const UNIQUE_SLUG = /^[a-z0-9_.-]+\/[a-z0-9_.-]+-[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/;
+const exitRuns = new Set();
+export function cleanupRoundClaims({ slug, pr, k, grantIds = [], home = accountHome(), t = undefined } = {}) {
+  if (!UNIQUE_SLUG.test(String(slug))) throw new Error(`cleanupRoundClaims: ${slug} is not unique to the test (use a per-test repository name such as acme/widgets-<uuid>)`);
+  const key = roundTicketKey(slug, pr, k);
+  const mine = new RegExp(`^${key}\\.[1-9]\\d*\\.json$`);
+  const dir = join(ownerGoDir(home), 'round-claims');
+  const run = () => {
+    let names = [];
+    try { names = readdirSync(dir).filter((n) => mine.test(n)); } catch { /* nothing was claimed */ }
+    const ids = new Set(grantIds);
+    for (const n of names) {
+      try { for (const id of JSON.parse(readFileSync(join(dir, n), 'utf8')).grantIds ?? []) ids.add(id); } catch { /* unparseable: it names nothing */ }
+      rmSync(join(dir, n), { force: true });
+    }
+    for (const id of ids) { const f = markerPath(id, { home }); if (f !== null) rmSync(f, { force: true }); }
+  };
+  exitRuns.add(run);
+  if (exitRuns.size === 1) process.on('exit', () => { for (const r of exitRuns) r(); });
+  if (t !== undefined) t.after(run);
+  return run;
 }
 
 function said(t, prompt, reply, recorder, entry = OWNER_ENTRY, after = undefined) {

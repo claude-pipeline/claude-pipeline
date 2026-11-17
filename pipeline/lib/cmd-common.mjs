@@ -7,6 +7,7 @@ import { EXIT } from './cli.mjs';
 import { loadConfig } from './config.mjs';
 import { GitError } from './git.mjs';
 import { repoRoot } from './repo.mjs';
+import { trustedDefaultBranch } from './risk.mjs';
 
 // Thrown to end a command early with a specific { exitCode, output }.
 export class Fail extends Error {
@@ -15,6 +16,18 @@ export class Fail extends Error {
     this.exitCode = exitCode;
     this.output = output;
   }
+}
+
+// Under an UNTRUSTED anchor (risk.mjs#trustedDefaultBranch: an origin remote that names no default branch, so the content hash is measured from the working tree's PR-editable default_branch)
+// a command that records from, or vouches with, that hash refuses: exit 3 (the remote could not say), nothing written. `then` finishes the sentence (what was not done). Returns null when the anchor is
+// trusted, else the Fail to throw (#456); the sentence names the fix (`git remote set-head origin -a`).
+export function untrustedAnchorRefusal(root, config, then) {
+  const { untrusted } = trustedDefaultBranch(root, config);
+  if (untrusted === null) return null;
+  return new Fail(EXIT.UNAVAILABLE, {
+    ok: false, unavailable: true, reason: 'untrusted-anchor', error: 'untrusted-anchor',
+    message: `${untrusted}; the content hash is measured from that branch, so ${then}`,
+  });
 }
 
 // Wraps a command's run(): Fail and GitError become results; UsageError and anything unexpected still reach the
