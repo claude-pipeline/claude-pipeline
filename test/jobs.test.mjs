@@ -184,6 +184,27 @@ test('a clear whose delete fails on another file keeps the tombstone; the next s
   assert.equal(existsSync(tomb), false, 'the tombstone is gone');
 });
 
+// #537: Node ignores maxRetries without recursive, so the tombstone delete must pass both to survive a transient Windows EBUSY/EPERM like its neighbours.
+test('the tombstone delete retries like the other deletes of the clear (recursive + maxRetries)', async (t) => {
+  const cwd = scratch(t);
+  start('retry', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('retry', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const tomb = join(jobDirOf(cwd, 'retry'), 'meta.cleared.json');
+  const opts = [];
+  const real = fs.rmSync;
+  fs.rmSync = (target, ...rest) => {
+    if (target === tomb) opts.push(rest[0]);
+    return real(target, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.rmSync = real; syncBuiltinESMExports(); });
+  start('retry', node("console.log('second-run')"), { cwd });
+  fs.rmSync = real;
+  syncBuiltinESMExports();
+  assert.deepEqual(opts, [{ recursive: true, force: true, maxRetries: 3 }]);
+  assert.equal((await waitJob('retry', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+});
+
 test('a policy refusal throws and starts nothing', async (t) => {
   const cwd = scratch(t);
   const seen = [];

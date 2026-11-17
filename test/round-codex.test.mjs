@@ -414,6 +414,7 @@ test('a recorded round is not picked up once HEAD moved past its toHead: head-mo
   assertExit(r, 1, r.stdout + r.stderr);
   assert.equal(r.json.error, 'head-moved-since-round');
   assert.equal(r.json.pickedUp, true);
+  assert.equal(r.json.next, "round codex --pr 7 --round 2", 'the action is the next round, not a rerun of this one');
   assert.equal('codex' in r.json, false, 'the old result was not reported');
   assert.equal(w.stateText(), before);
 });
