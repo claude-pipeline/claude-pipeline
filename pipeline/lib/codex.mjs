@@ -13,6 +13,33 @@ export const CATEGORIES = [
   'performance', 'maintainability', 'testing', 'design', 'docs', 'other',
 ];
 
+// Spelling variants of ONE canonical category (#475): an alias only ever names the same category in another spelling (never a different one, and never a move out of the
+// security class). Case, spaces and underscores are folded first (`Data Integrity` is `data-integrity`, `data loss` is `data-loss`); the keys here are the folded forms.
+export const CATEGORY_ALIASES = Object.freeze({
+  test: 'testing', tests: 'testing', doc: 'docs', documentation: 'docs', perf: 'performance', 'broken-behavior': 'broken-behaviour',
+});
+const foldCategory = (c) => c.trim().toLowerCase().replace(/[\s_]+/g, '-');
+// -> { json: a copy whose findings carry canonical categories, mapped: [{where, from, to}] }. An unknown category stays as written (validateFindings refuses it with the list); a non-object is returned as is.
+// `keys`: the lists that hold findings (the review answer's three buckets, or the arbiter's `findings`).
+export function normalizeFindingCategories(json, keys = ['blocking', 'suggestions', 'worth_considering']) {
+  if (!isObject(json)) return { json, mapped: [] };
+  const copy = structuredClone(json);
+  const mapped = [];
+  for (const key of keys) {
+    if (!Array.isArray(copy[key])) continue;
+    copy[key].forEach((f, i) => {
+      if (!isObject(f) || typeof f.category !== 'string') return;
+      const folded = foldCategory(f.category);
+      const to = CATEGORIES.includes(folded) ? folded : Object.hasOwn(CATEGORY_ALIASES, folded) ? CATEGORY_ALIASES[folded] : undefined;
+      if (to === undefined || to === f.category) return;
+      mapped.push({ where: `${key}[${i}]`, from: f.category, to });
+      f.category = to;
+    });
+  }
+  return { json: copy, mapped };
+}
+export const categoryNotes = (mapped) => mapped.map((m) => `${m.where}: category ${JSON.stringify(m.from)} read as ${JSON.stringify(m.to)}`);
+
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
 const BODY_LIMIT = 2000;
 const RULING_LIMIT = 40;
