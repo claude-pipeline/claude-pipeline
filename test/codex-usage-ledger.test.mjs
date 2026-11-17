@@ -115,3 +115,25 @@ test('usageFile: under node --test with no override the default ledger is a scra
   delete process.env.NODE_TEST_CONTEXT;
   try { assert.equal(usageFile({ env: {} }), real); } finally { if (saved !== undefined) process.env.NODE_TEST_CONTEXT = saved; }
 });
+
+// Real failure (#604): 13 test files spawn the CLI with a fake Codex ($PIPELINE_CODEX) and their own env, with no ledger override and no NODE_TEST_CONTEXT when run as plain `node test/x.test.mjs`;
+// each codex-review then appended fake rows to the account's real ledger. A checkout running a substituted Codex is never a real run, so the seam alone diverts the default ledger.
+// (Pure on purpose: a spawn cannot be pointed at another account home, so a failing run of a spawn test would itself write the real ledger.)
+test('usageFile: a substituted Codex (PIPELINE_CODEX) diverts the default ledger without NODE_TEST_CONTEXT; an override or a named home still wins', () => {
+  const real = join(accountHome(), '.claude', 'pipeline-state', 'codex-usage.jsonl');
+  const saved = process.env.NODE_TEST_CONTEXT;
+  const savedCodex = process.env.PIPELINE_CODEX;
+  delete process.env.NODE_TEST_CONTEXT;
+  delete process.env.PIPELINE_CODEX;
+  try {
+    const under = usageFile({ env: { PIPELINE_CODEX: 'node fake-codex.mjs' } });
+    assert.notEqual(under, real);
+    assert.ok(under.startsWith(resolve(tmpdir())), `scratch ledger ${under} is under the temp dir`);
+    assert.equal(usageFile({ env: { PIPELINE_CODEX: 'node fake-codex.mjs', PIPELINE_CODEX_USAGE_FILE: '/tmp/x/u.jsonl' } }), resolve('/tmp/x/u.jsonl'));
+    assert.equal(usageFile({ home: '/h', env: { PIPELINE_CODEX: 'node fake-codex.mjs' } }), join('/h', '.claude', 'pipeline-state', 'codex-usage.jsonl'));
+    assert.equal(usageFile({ env: {} }), real, 'no seam, no test run: the real ledger');
+  } finally {
+    if (saved !== undefined) process.env.NODE_TEST_CONTEXT = saved;
+    if (savedCodex !== undefined) process.env.PIPELINE_CODEX = savedCodex;
+  }
+});
