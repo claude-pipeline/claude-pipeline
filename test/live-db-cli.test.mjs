@@ -65,6 +65,7 @@ const ALLOWED = [
   "rg -n 'api.supabase.com' pipeline",
   'git grep api.supabase.com',
   'git log -S api.supabase.com',
+  "rg -n 'api.supabase.com' pipeline > /dev/null",
   'echo api.supabase.com',
   "grep -rn 'api.supabase.com' pipeline | head",
   // R8-F1: a path or directory argument named supabase after a launcher is not the binary
@@ -75,6 +76,9 @@ const ALLOWED = [
   'yarn test lib/supabase',
   'timeout 120 npx vitest run lib/supabase',
   'npx prettier --check supabase',
+  'pnpm lint lib/supabase',
+  'npx vitest run lib/supabase',
+  'yarn workspace web lint lib/supabase',
   // R8-F2: a help look-up reaches no database
   'supabase db push --help',
   'supabase db push -h',
@@ -89,6 +93,18 @@ const DENIED = [
   "echo x | xargs curl api.supabase.com/v1/projects",
   "rg x | sh -c 'curl https://api.supabase.com/v1/projects'",
   'echo $(curl https://api.supabase.com/v1/projects)',
+  // security-scan follow-up to R8: the exemption is for a bare command word, and not for a line that writes a file
+  `/tmp/x/rg https://api.supabase.com/v1/projects/${LIVE}/database/query`,
+  `./rg https://api.supabase.com/v1/projects/${LIVE}/database/query`,
+  `echo 'curl https://api.supabase.com/v1/projects/${LIVE}/database/query' > run.sh`,
+  `echo 'curl https://api.supabase.com/v1/projects/${LIVE}/database/query' >> run.sh`,
+  `echo 'curl https://api.supabase.com/v1/projects/${LIVE}/database/query' | tee x.sh`,
+  // security-scan follow-up to R8: package-manager workspace verbs before the command word
+  'yarn workspace web supabase db push',
+  'yarn workspaces foreach run supabase db push',
+  'yarn workspaces foreach -A exec supabase db push',
+  'pnpm recursive exec supabase db push',
+  'pnpm -r exec supabase db push',
   // R8-F1: a launcher that really runs the binary stays refused
   'npx --yes supabase db push',
   'sudo -u root supabase db push',
