@@ -175,12 +175,12 @@ export async function run(argv) {
   const allFiles = [...items.map((i) => repoRel(i.rel)), repoRel(VERSION_FILE)];
 
   if (values.check) {
-    // #550: a repo that sets ci.guard_checks: false runs none of the vendored CI guards (this repo is one: it is the source), so there is nothing to compare. A config that is missing or invalid does not skip.
+    // #550: a repo that sets ci.guard_checks: false AND has no scripts/pipeline/ was never vendored into (this repo is one: it is the source), so there is nothing to compare. guard_checks only governs the required guard statuses: a repo that has vendored code still runs workflow-contexts, supabase-local, smoke and queue-guards-run, so it is compared as ever. A config that is missing or invalid does not skip.
     // (Imported here, not at the top: plain vendor, which an edited install must still run, does not load the config module.)
     const { loadConfig } = await import('../lib/config.mjs');
     const loaded = await loadConfig(root);
-    if (loaded.ok && loaded.config.ci.guard_checks === false) {
-      return { exitCode: EXIT.OK, output: { ok: true, skipped: 'ci.guard_checks is false in .claude/pipeline.yml: this repo runs none of the vendored CI guards, so scripts/pipeline/ is not compared (run `pipeline vendor --check` again after setting it to true)' } };
+    if (loaded.ok && loaded.config.ci.guard_checks === false && !existsSync(target)) {
+      return { exitCode: EXIT.OK, output: { ok: true, skipped: 'ci.guard_checks is false in .claude/pipeline.yml and this repo has no scripts/pipeline/: it was never vendored into, so there is nothing to compare (once scripts/pipeline/ exists, --check compares it)' } };
     }
     const drift = vendorDrift(root, items);
     // The +sha moves with every pipeline commit and says nothing about the copied code, so only the base version counts.

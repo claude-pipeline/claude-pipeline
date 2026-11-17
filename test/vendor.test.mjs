@@ -231,6 +231,18 @@ test('vendor --check on a repo with ci.guard_checks: false skips (exit 0, skippe
   assert.equal(r.output.drift, undefined);
 });
 
+test('vendor --check with ci.guard_checks: false still compares a repo that has scripts/pipeline/ (R1-B1: the flag does not govern the other vendored scripts)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  await vendorInto(repo.dir);
+  assert.equal((await vendorInto(repo.dir, ['--check'])).exitCode, 0);
+  writeFileSync(join(sp(repo.dir), 'workflow-contexts.mjs'), 'process.exit(0);\n');
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+  assert.deepEqual(r.output.drift, [{ file: 'scripts/pipeline/workflow-contexts.mjs', reason: 'differs' }]);
+});
+
 test('vendor --check with ci.guard_checks: true still reports a never-vendored repo as drift (only an explicit false skips)', async () => {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: true }));
