@@ -309,3 +309,16 @@ test('testsAdded: counts test files that gained lines, added test-case calls, an
   assert.equal(r.line, 'Tests added: 1 files, 2 cases; changed source lines : test lines = 4 : 4');
   assert.equal(testsAdded([], ['test/**']).line, 'Tests added: 0 files, 0 cases; changed source lines : test lines = 0 : 0');
 });
+
+// Failure caught: a Playwright spec (one describe, hooks, settings, two tests) is reported as 4+ cases in the `Tests added` line because test.describe / test.beforeEach / test.use / test.setTimeout count as cases; skip/todo stubs are declared cases and still count.
+test('testsAdded: counts only case-making calls, not test.describe, hooks, test.use, test.setTimeout or test.step', () => {
+  const diff = [
+    'diff --git a/e2e/a.spec.ts b/e2e/a.spec.ts', '--- a/e2e/a.spec.ts', '+++ b/e2e/a.spec.ts', '@@ -0,0 +1,14 @@',
+    "+test.describe('group', () => {", '+  test.use({ locale: "en" });', '+  test.setTimeout(5000);', '+  test.describe.configure({ mode: "serial" });',
+    '+  test.beforeEach(async () => {});', '+  test.afterEach(async () => {});', '+  test.beforeAll(async () => {});', '+  test.afterAll(async () => {});',
+    "+  test('one', async () => { await test.step('s', async () => {}); });", "+  test.only('two', async () => {});", "+  test.skip('three', async () => {});",
+    "+  test.describe.skip.each([1])('x', () => {});", "+  it.todo('four');", "+  test.fixme('five', async () => {});", '',
+  ].join('\n');
+  const r = testsAdded(parseUnifiedDiff(diff), ['e2e/**']);
+  assert.equal(r.cases, 5);
+});
