@@ -592,7 +592,7 @@ function capturePending({ ask, askId, session, toolUseId, transcriptPath, cwd, h
 // hook runs within seconds of the answer: 15 s covers the installed timeout. A test pins it. The check is capturedAt - 15 s <= answeredAt <= capturedAt + 15 s; its upper half is what the
 // evidence expiry (capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS) relies on: no admitted answer is later than that bound minus 24 h, so no grant it could become is usable after the expiry.
 export const CAPTURE_SKEW_MS = 15 * 1000;
-// Scheduling only, never evidence: a unit captured longer ago than this goes to the back of the retry queue. Nothing is refused or settled on time alone but the evidence expiry.
+// Scheduling only, never evidence: a unit captured longer ago than this is RETIRED: it is scanned after the active ones, newest first (#528), so the click the owner just made is reached before old stuck ones. Nothing is refused or settled on time alone but the evidence expiry.
 export const WAIT_GRACE_MS = 10 * 60 * 1000;
 export const SETTLE_SCAN_BUDGET = 32; // transcript scans (clickEvidence calls) one settlePendingClicks call makes
 const SETTLED_OUTCOMES = Object.freeze(['recorded', 'declined', 'refused']);
@@ -630,7 +630,7 @@ let settling = false;
 // by `io` for fault injection, and reads only through readSmallJson / readAsk / clickEvidence.
 //
 // Scheduling is not evidence. Pointers are grouped into UNITS, one per ask across every session; a unit is included as soon as any member matches the `session` / `askId` filter (the guard's
-// session-scoped read), with all its members. Units captured less than WAIT_GRACE_MS ago are ACTIVE and go first, FIFO; the rest are RETIRED and get what is left of the budget (SETTLE_SCAN_BUDGET
+// session-scoped read), with all its members. Units captured less than WAIT_GRACE_MS ago are ACTIVE and go first, FIFO; the rest are RETIRED, go NEWEST first (#528: the click the owner just made is reached before old stuck ones; the mirror case, an old valid click behind 32 newer unverifiable ones, is left to the 24 h evidence expiry) and get what is left of the budget (SETTLE_SCAN_BUDGET
 // transcript scans per call; a unit is started only below it, then looked at whole). A unit's members go in capturedAt order and the walk STOPS at the first one that is not terminal, so a later click is
 // never admitted ahead of an earlier, still-unverified one (Fable F7). Nothing is refused or settled on time alone but the evidence expiry capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS: after that even a
 // verified grant would be past its 24 h use window. A missing or unreadable transcript is `waiting`; an unreadable spent marker, a failed write and the like are `retry` (no `.settled`); every
@@ -666,7 +666,7 @@ export function settlePendingClicks({ home = accountHome(), now = Date.now, askI
       .map((u) => ({ ...u, oldest: u.members[0].capturedMs, askId: u.members[0].askId }));
     const fifo = (a, b) => a.oldest - b.oldest || a.askId.localeCompare(b.askId);
     const active = units.filter((u) => nowMs - u.oldest < WAIT_GRACE_MS).sort(fifo);
-    const retired = units.filter((u) => nowMs - u.oldest >= WAIT_GRACE_MS).sort(fifo);
+    const retired = units.filter((u) => nowMs - u.oldest >= WAIT_GRACE_MS).sort((a, b) => fifo(b, a));
     let scans = 0;
     for (const unit of [...active, ...retired]) {
       if (scans >= SETTLE_SCAN_BUDGET) break;
@@ -766,6 +766,9 @@ export function pendingClickProblems({ home = accountHome(), repo, pr, kinds = [
 // used). clickNotes reads the click pointers of a repository (repository moves followed) / PRs / kinds and answers up to three plain notes (newest first) for the merge, owner-ruling and round-cap refusals
 // to append. Only clicks whose evidence could still matter are reported (now <= capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS). A merge or ruling click that was recorded says nothing (the refusal gives its own
 // reason); a recorded ROUND click says so only when its round was already used. Never settles, never writes, never throws; no repo / PR / folder -> [].
+// #538 / #542: only the ask the owner was shown LAST for a PR is reported (the newest issuedAt among the asks of this repository and kinds that display it; ties keep every tied ask), so a stale decline or refusal of an older ask
+// is not printed after a newer click. Display freshness, not authorization: spent and supersession markers are not consulted. If the newest ask has no click of its own for the PR, nothing is said (the refusal the notes
+// are appended to already tells the agent to show the request again).
 const KIND_WORD = { merge: 'merge', 'merge-many': 'merge', round: 'round', ruling: 'ruling' };
 export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 'merge-many', 'round', 'ruling'], now = Date.now, moves } = {}) {
   try {
@@ -774,6 +777,13 @@ export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 
     const nowMs = now();
     const names = readdirSync(asksDir(home));
     const recorded = moves ?? readRepoMoves({ home }).moves;
+    const newest = new Map(); // PR -> issue time of the newest ask (of this repository and kinds) that displays it; an unreadable ask file is ignored
+    for (const name of names) {
+      if (!/^ask-[0-9a-f]{12}\.json$/.test(name)) continue;
+      const loaded = readAsk(name.slice(0, -5), { home });
+      if (!loaded.ok || !kinds.includes(loaded.ask.kind) || !sameRepo({ recorded: loaded.ask.repo, recordedAt: loaded.ask.issuedAt, current: key, moves: recorded })) continue;
+      for (const n of prs.filter((x) => loaded.ask.prs.includes(x))) newest.set(n, Math.max(newest.get(n) ?? 0, Date.parse(loaded.ask.issuedAt)));
+    }
     const found = [];
     let records = null;
     for (const name of names) {
@@ -784,6 +794,7 @@ export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 
       const a = loaded.ask;
       const pr = prs.find((n) => a.prs.includes(n));
       if (!kinds.includes(a.kind) || pr === undefined || !sameRepo({ recorded: a.repo, recordedAt: a.issuedAt, current: key, moves: recorded })) continue;
+      if (Date.parse(a.issuedAt) < newest.get(pr)) continue; // an older ask than the one the owner last saw for this PR
       const r = readPending(name, home, nowMs);
       let capturedMs = r.pending?.capturedMs;
       if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }

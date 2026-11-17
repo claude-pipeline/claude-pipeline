@@ -624,6 +624,33 @@ test('garbled pending skipped: unreadable JSON, a clickId that is not the hash o
   assert.equal(settlePendingClicks({ home: 42 }).problems.length, 1, 'a settle that cannot run reports a problem and does not throw');
 });
 
+// #528: the RETIRED list goes newest first, so the click the owner just made is reached before old stuck ones. Residual (stateless, no rotation): an old valid click behind 32 NEWER unverifiable ones is the mirror case;
+// the 24 h evidence expiry still retires those without a scan.
+test('retired units go newest first: a valid click made after 32 old unverifiable ones is still reached once all 33 are retired', async (t) => {
+  const home = mkdtempSync(join(tmpdir(), 'owner-go-click-pending-'));
+  const old = [];
+  for (let i = 0; i < SETTLE_SCAN_BUDGET; i++) {
+    const x = pw(t, { home, slot: i, pr: 100 + i });
+    x.t += i; // distinct capture times; never flushed, so every one is `waiting`
+    assert.ok((await x.hook()).pending, `unit ${i}`);
+    old.push(x);
+  }
+  const A0 = old[0].answeredAt;
+  const ready = pw(t, { home, slot: 40, pr: 140, shiftMs: 100000 });
+  assert.ok((await ready.hook()).pending);
+  ready.flush();
+  const nowMs = A0 + 100000 + WAIT_GRACE_MS + 60000; // all 33 are past the grace (retired)
+  const one = settlePendingClicks({ home, now: () => nowMs });
+  assert.deepEqual(one.outcomes[0], { askId: ready.askId, clickId: ready.clickId, outcome: 'recorded' }, 'the newest retired unit goes first');
+  assert.deepEqual(allSettled(home), [`${ready.askId}.${ready.clickId}.settled`], 'only the valid one is settled');
+  assert.equal(one.outcomes.length, SETTLE_SCAN_BUDGET);
+  assert.ok(one.outcomes.slice(1).every((o) => o.outcome === 'waiting'));
+  const two = settlePendingClicks({ home, now: () => nowMs });
+  assert.equal(two.outcomes.length, SETTLE_SCAN_BUDGET, 'a second settle still scans only the budget');
+  assert.ok(two.outcomes.every((o) => o.outcome === 'waiting'), 'the 32 old units are still pending');
+  assert.equal(allSettled(home).length, 1);
+});
+
 test('fair progress across retryable units: 40 retryable units ahead of 1 ready unit (15 missing transcripts, 15 half-written .spent, 10 failing record writes); a unit is never split by the budget', async (t) => {
   const home = mkdtempSync(join(tmpdir(), 'owner-go-click-pending-'));
   const worlds = [];
@@ -1143,6 +1170,52 @@ test('clickNotes: a refused click says why and points to the typed words; "Not y
   assert.deepEqual(clickNotes({ home: no.home, repo: REPO, prs: [59], kinds: ['merge'], now: no.now }), [], 'another PR');
   assert.deepEqual(clickNotes({ home: no.home, repo: REPO, prs: [58], kinds: ['round'], now: no.now }), [], 'another kind');
   assert.deepEqual(clickNotes({ home: no.home, repo: 'acme/other', prs: [58], kinds: ['merge'], now: no.now }), [], 'another repository');
+});
+
+// #538 / #542: the notes follow the ask the owner was shown LAST for this PR; every pointer of an older ask is dropped, whatever its outcome. Spent and replay semantics are untouched.
+test('clickNotes: only the newest issued ask that shows the PR is reported; an older ask\'s decline, refusal or waiting note is not printed once a newer ask exists', async (t) => {
+  const A = pw(t, { answer: 'Not yet' });
+  assert.ok((await A.hook()).pending);
+  A.flush();
+  A.settle();
+  const read = (w, over = {}) => clickNotes({ home: w.home, repo: REPO, prs: [58], kinds: ['merge', 'merge-many'], now: w.now, ...over });
+  assert.equal(read(A).length, 1, 'alone, the decline of A is reported (unchanged)');
+  assert.match(read(A)[0], /was declined/);
+  // B is issued after A was declined and never clicked: A's decline is stale, the owner last saw B
+  const B = pw(t, { home: A.home, slot: 1, shiftMs: 3_600_000 });
+  B.t = Math.max(A.t, B.t);
+  assert.deepEqual(read(B), [], 'a stale decline is not printed after a newer ask');
+  // B answered Merge and recorded: nothing to say either
+  assert.ok((await B.hook()).pending);
+  B.flush();
+  B.settle();
+  assert.equal(B.records().filter((r) => r.via === 'ask').length, 1);
+  assert.deepEqual(read(B), []);
+  // a refused older ask and a waiting older ask are dropped the same way
+  const C = pw(t, { fixture: 'pretooluse-hook-answer' });
+  assert.ok((await C.hook()).pending);
+  C.flush();
+  C.settle();
+  assert.equal(read(C).length, 1, 'alone, the refusal of C is reported');
+  const D = pw(t, { home: C.home, slot: 1, shiftMs: 3_600_000 });
+  assert.ok((await D.hook()).pending); // waiting (never flushed)
+  D.t = Math.max(C.t, D.t);
+  const notes = read(D);
+  assert.equal(notes.length, 1);
+  assert.match(notes[0], new RegExp(D.askId));
+  assert.doesNotMatch(notes[0], new RegExp(C.askId));
+});
+
+test('clickNotes: partial selection: when the newest ask shows #12 and #13, an older ask\'s note for #12 is not printed and #13 says nothing', async (t) => {
+  const A = pw(t, { pr: 12 });
+  assert.ok((await A.hook()).pending); // waiting for #12
+  const read = (pr) => clickNotes({ home: A.home, repo: REPO, prs: [pr], kinds: ['merge', 'merge-many'], now: () => A.t + 3_600_000 + 1000 });
+  assert.equal(read(12).length, 1, 'alone, A is waiting');
+  const many = mergeManyAsk({ repo: REPO, entries: [12, 13].map((pr) => ({ pr, lines: [`#${pr} head ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}`] })), ready: '🔀 Ready to merge #12, #13 — say "merge"' });
+  const issued = issueAsk({ ...many, hookLayersSha256: null, home: A.home, now: () => A.t + 3_600_000 });
+  assert.ok(issued.askId, JSON.stringify(issued));
+  assert.deepEqual(read(12), [], 'B is the ask the owner last saw for #12: no older note, and B has no click of its own');
+  assert.deepEqual(read(13), []);
 });
 
 test('clickNotes: a recorded round click whose round is already used says so; a recorded merge click says nothing; bad input never throws', async (t) => {

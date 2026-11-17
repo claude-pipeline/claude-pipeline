@@ -103,12 +103,22 @@ test('clickLine for a pending click: "received, verified when used" with the com
   assert.equal(clickLine({ pending: { ...base, kind: 'merge-many', prs: [58, 61, 62] } }), `${HEADS}: if the owner chose to approve, run P merge --pr 58 --owner-go, P merge --pr 61 --owner-go and P merge --pr 62 --owner-go now (one per PR the owner ticked; a PR that was not ticked is refused); if they chose not to, stop: nothing is approved`);
   assert.equal(clickLine({ pending: { ...base, kind: 'round', prs: [58] } }), `${HEADS} (extra round for ${REPO} #58): if the owner chose to approve, run P codex-review --pr 58 --round <the n from round-request> now; if they chose not to, stop: nothing is approved`);
   const ruling = clickLine({ pending: { ...base, kind: 'ruling', prs: [58], quotes: { 'Accept all': 'R1-B1: accept, R2-S3: accept', 'Reject all': 'R1-B1: reject, R2-S3: reject' } } });
-  assert.equal(ruling, `${HEADS} (ruling for ${REPO} #58): if the owner chose to approve a ruling, run P triage owner-ruling now with the --owner-quote of the label the owner chose: "Accept all" -> --owner-quote "R1-B1: accept, R2-S3: accept"; "Reject all" -> --owner-quote "R1-B1: reject, R2-S3: reject"; if they chose not to, stop: nothing is approved`);
-  for (const line of [ruling, clickLine({ pending: { ...base, kind: 'merge', prs: [58] } })]) {
+  assert.equal(ruling, `${HEADS} (ruling for ${REPO} #58): if the owner chose one of these labels, run P triage owner-ruling now with its --owner-quote: "Accept all" -> --owner-quote "R1-B1: accept, R2-S3: accept"; "Reject all" -> --owner-quote "R1-B1: reject, R2-S3: reject"; if they chose Not now, stop: nothing is ruled`);
+  const mergeLine = clickLine({ pending: { ...base, kind: 'merge', prs: [58] } });
+  for (const line of [ruling, mergeLine]) {
     assert.doesNotMatch(line, /is recorded|could not be verified/);
     assert.equal(line.includes('\n'), false);
-    assert.match(line, /if they chose not to, stop: nothing is approved/);
   }
+  assert.match(mergeLine, /if they chose not to, stop: nothing is approved/);
+  // #541: only the declining label stops a ruling; Reject all / Follow-up all still run the ruling command, so the line must not read "approve" = run, "not" = stop
+  assert.match(ruling, /if they chose Not now, stop: nothing is ruled/);
+  assert.doesNotMatch(ruling, /chose to approve|chose not to/);
+  // the literal "Not now" is the ONE label of rulingAsk with a null action (the declining one); a rename there must fail here
+  const rask = rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1'], line: 'x' });
+  assert.deepEqual(Object.entries(rask.actions).filter(([, v]) => v === null).map(([k]) => k), ['Not now']);
+  // no deciding quotes to list: still says which label stops and which runs
+  const bare = clickLine({ pending: { ...base, kind: 'ruling', prs: [58], quotes: {} } });
+  assert.equal(bare, `${HEADS} (ruling for ${REPO} #58): if the owner chose any label other than Not now, run P triage owner-ruling now; if they chose Not now, stop: nothing is ruled`);
   for (const kind of ['merge', 'merge-many', 'round']) {
     assert.ok(clickLine({ pending: { ...base, kind, prs: [58] } }).includes('if they chose not to, stop'), kind);
   }

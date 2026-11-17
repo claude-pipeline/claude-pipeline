@@ -211,7 +211,7 @@ export function buildReviewPrompt({ pr, title, body, base, head, risk, round, li
     '- SUGGESTIONS: clear improvements',
     '- WORTH CONSIDERING: ideas, trade-offs, future work',
     '',
-    'Every finding needs: file (repository-relative path), line (0 if not line-specific), category, detail (what is wrong, concretely), reasoning (why it matters and how you know), and testable (true if a unit or integration test could prove or disprove it).',
+    'Every finding needs: file (repository-relative path), line (0 if not line-specific), category, detail (what is wrong, concretely), reasoning (why it matters and how you know), and testable (true if a unit or integration test could prove or disprove it). A finding in the testing category must name the concrete failure that no existing test would catch.',
     'Do not pad. Empty buckets are fine, and so is an empty review when you find nothing.',
     'Answer with JSON only, matching the provided output schema (summary, blocking, suggestions, worth_considering).',
   );

@@ -649,3 +649,13 @@ test('F4 (PR B): the state version is bumped to 6 ONLY when a final carries post
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// Failure caught: a round that carries the new `resolutionIneligible` key (or an older one without it) fails to load or loses the key when the state is saved again.
+test('resolutionIneligible: addRound keeps the short code only when given; a state round written before the key existed loads and round-trips unchanged', () => {
+  const base = emptyState({ repo: 'a/b', pr: 1, branch: 'x', risk: 'low' });
+  const round = { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], reviewBase: 'a', reviewBaseKind: 'whole-pr' };
+  assert.equal(addRound(base, { ...round, resolutionIneligible: 'history-nonmerge' }).rounds[0].resolutionIneligible, 'history-nonmerge');
+  const plain = addRound(base, round);
+  assert.equal('resolutionIneligible' in plain.rounds[0], false, 'no key when none was given: older rounds stay as they were');
+  assert.equal(plain.version, 1, 'the key needs no state version bump');
+});
