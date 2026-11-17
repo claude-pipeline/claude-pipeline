@@ -226,11 +226,13 @@ export function decodeFromComment(body) {
 // resolutionIneligible: the short code (history-nonmerge, extra-files, ...) of why a conflict resolution was tried and refused, so the round reviewed the whole PR (a counted
 // round); telemetry for `stats rounds` only. An older installation ignores an unknown round key (no per-round validation, rounds are copied as they are), so no version bump.
 // A round recorded before this field existed has none: stats reads a whole-PR round without it as `unknown`, never as "no failure".
+// escalated: true on a round that reviewed the whole PR because the judge lane now needs Fable (not because a conflict resolution was refused); stats then reads a whole-PR round with no
+// resolutionIneligible as no refusal. Telemetry only, no version bump (same reason as resolutionIneligible).
 // trustedConfigSha: the commit whose committed .claude/pipeline.yml is the TRUSTED config of this round (the default branch's fork point, risk.mjs#trustedBase), which
 // review.threat_models are read from; null = pinned as unavailable (no model applies). Absent only on a round written before it existed (arbiter needed then pins it once).
 export function addRound(state, {
   n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
-  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort, trustedConfigSha, resolutionIneligible,
+  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort, trustedConfigSha, resolutionIneligible, escalated,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
@@ -256,6 +258,7 @@ export function addRound(state, {
       ...(budget === undefined ? {} : { budget: structuredClone(budget) }),
       ...(trustedConfigSha === undefined ? {} : { trustedConfigSha }),
       ...(typeof resolutionIneligible === 'string' && resolutionIneligible !== '' ? { resolutionIneligible } : {}),
+      ...(escalated === true ? { escalated: true } : {}),
       ...(baseOnly === true ? { baseOnly: true } : {}),
       ...(fableRefresh === true ? { fableRefresh: true } : {}),
       ...(Array.isArray(confirmFixed) && confirmFixed.length > 0 ? { confirmFixed: [...confirmFixed] } : {}),
