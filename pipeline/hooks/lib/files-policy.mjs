@@ -59,6 +59,8 @@ const PROTECTED_REL = [
   '.claude/settings.local.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it (typed words, and clicks: a pending click, its settled outcome, round tickets; #472), P merge and the guard read it. The guard refuses running the recorder or the click libraries by hand (OWNER_GO_RECORDER)
   '.claude/pipeline-state/owner-go',
+  // #262 (live-database guard): the owner's registry of Supabase projects (hooks/lib/db-refs.mjs): which project is dev, the live projects' display names and the MCP servers the owner trusts. Only the owner writes it, from their own terminal (`pipeline db-refs set`)
+  '.claude/pipeline-state/db-refs.json',
   // cp #256: the machine-wide Codex outage record (status.json: the last quota stop and the PRs waiting for Codex; only pipeline commands write it) and Codex's own session
   // logs (the weekly-usage figure is read from them, so an agent may not write them)
   '.claude/pipeline-state/codex',
@@ -876,7 +878,7 @@ function physicalTargets(target, ctx) {
 const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go(?:-click(?:-hook)?)?\.mjs$/i;
 const OWNER_GO_WORD = /owner-go(?:-click(?:-hook)?)?\.mjs/i;
 
-const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json, the owner-go records (~/.claude/pipeline-state/owner-go) and the database registry (~/.claude/pipeline-state/db-refs.json) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
 // MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
 // same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.
@@ -3697,6 +3699,22 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
 
 const PROTECT_APPLY_RAW = /\bpipeline(?:\.mjs)?["']?\s[^;&|\n]*\bprotect\b[^;&|\n]*--apply\b/i;
 
+// #262: `pipeline db-refs set|remove|server …` edits the registry that decides which databases count as live: an agent line running anything of it but `show` is refused
+// (the command also refuses itself inside Claude Code; this is the same rule at the guard, so the refusal comes before the run).
+const DB_REFS_RAW = /\bpipeline(?:\.mjs)?["']?\s[^;&|\n]*\bdb-refs\b(?!\s+show\b)/i;
+
+function findDbRefsWrite(cmds, raw) {
+  for (const c of cmds) {
+    const i = c.argv.findIndex((a) => PIPELINE_BIN_NAMES.has(baseOf(a)));
+    if (i >= 0) {
+      const rest = c.argv.slice(i + 1);
+      const at = rest.indexOf('db-refs');
+      if (at >= 0 && rest[at + 1] !== 'show') return true;
+    } else if (c.raw.includes('\\') && DB_REFS_RAW.test(toPosix(c.raw))) return true;
+  }
+  return !!cmds.truncated && DB_REFS_RAW.test(toPosix(raw));
+}
+
 function findProtectApply(cmds, raw) {
   for (const c of cmds) {
     const i = c.argv.findIndex((a) => PIPELINE_BIN_NAMES.has(baseOf(a)));
@@ -4837,6 +4855,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // 3 and 4: installers and `protect --apply`
   const installer = findInstaller(cmds, raw, dirs, ctx, opts);
   if (installer) return deny(installer);
+  if (findDbRefsWrite(cmds, raw)) return deny('pipeline db-refs changes which databases count as live; only the owner may run it, from their own terminal (`pipeline db-refs show` is allowed)');
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');
 
   // 6: the job runner executes its inner command on the agent's behalf

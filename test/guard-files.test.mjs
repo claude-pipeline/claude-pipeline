@@ -41,6 +41,7 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/hooks', // (#261)
     '/home/u/.claude/settings.local.json', // (#261)
     '/home/u/.claude/pipeline-state/owner-go',
+    '/home/u/.claude/pipeline-state/db-refs.json', // (#262)
     '/home/u/.claude/pipeline-state/codex',
     '/home/u/.codex/sessions',
   ]);
