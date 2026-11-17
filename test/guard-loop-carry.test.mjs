@@ -515,3 +515,9 @@ test('#362 R39-F3 / F4: a startup file or a line-written script judged once in a
   denies('F4: a script written on the line, run twice, push on the line', `${n}; git switch agent/x; bash n.sh; git switch agent/x; bash n.sh; ${PB} origin HEAD`, {}, /may have been written by an earlier command on the line/);
   denies('F4: the same, the push in a named script', `${n}; git switch agent/x; bash n.sh; git switch agent/x; bash n.sh; bash p.sh`, { 'p.sh': `${PB} origin HEAD\n` }, BRANCH);
 });
+
+test('#362 R40-B1: an alias written and put back by an eval\'d text in a subshell (an exit between) is unsure after the subshell', () => {
+  const SET_STATUS = 'git config alias.ship status';
+  denies('file-fed eval in a ( ) subshell', `${SET_STATUS}; ( eval "$(cat f.sh)" ); git ship`, { 'f.sh': `${SHIP}\nexit 0\n${SET_STATUS}\n` }, ALIAS);
+  allows('file-fed eval in a ( ) subshell that writes no alias', `${SET_STATUS}; ( eval "$(cat f.sh)" ); git ship`, { 'f.sh': 'echo hi\nexit 0\n' });
+});

@@ -1978,9 +1978,11 @@ function loopReseed(ctx, entry, left) {
   loopMark(ctx, left);
 }
 // #352 R8-B1: the git state a command may change, for the may-not-run rule (evalString): branches, aliases (and the marks of unsure ones), repository / global config. Compared before and after a command.
-const stateMark = (ctx) => ({ log: aliasLogLen(ctx), branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure), cfg: ctx.cfgDirty, envCfg: ctx.envCfgDirty });
+const stateMark = (ctx) => ({ log: aliasLogLen(ctx), blog: (ctx.budget.branchLog ??= []).length, branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure), cfg: ctx.cfgDirty, envCfg: ctx.envCfgDirty });
 function stateChanged(ctx, was) {
   if (!was) return false;
+  // (#352 R40-B1: a write put back later in the same command (an eval'd text with an `exit` between) is a change too: the logs grew)
+  if (aliasLogLen(ctx) !== was.log || (ctx.budget.branchLog ??= []).length !== was.blog) return true;
   if (ctx.cfgDirty !== was.cfg || ctx.envCfgDirty !== was.envCfg || ctx.aliasUnsure.size !== was.unsure.size) return true;
   for (const n of ctx.aliasUnsure) if (!was.unsure.has(n)) return true;
   for (const [then, now] of [[was.git, ctx.gitAliases], [was.gh, ctx.ghAliases]]) {
