@@ -12,7 +12,8 @@ import { scriptFileOf } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const HOME = '/home/u';
 const BASE = { home: HOME, env: {}, platform: 'linux', cwd: HOME, realpath: (p) => p, existsSync: () => false, readText: () => null };
-const run = (command, extra = {}) => evaluateBashForFiles(command, { ...BASE, ...extra });
+// A frozen clock unless a case passes its own: these cases judge text, and the guard's 5 s deadline must not fire on a loaded machine and turn a rule's answer into a refusal (#477).
+const run = (command, extra = {}) => evaluateBashForFiles(command, { ...BASE, now: () => 0, ...extra });
 const PROJ = { cwd: `${HOME}/proj` };
 const stub = (files, extra = {}) => ({ cwd: `${HOME}/proj`, readText: (p) => files[p] ?? null, existsSync: (p) => Object.hasOwn(files, p), ...extra });
 
