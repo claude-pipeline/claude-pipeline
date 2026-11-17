@@ -173,14 +173,14 @@ test('missing inputs -> run', async () => {
 
 // ---- how ci.yml wires it in ----
 const ci = read('.github/workflows/ci.yml');
-const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu|windows-shard|windows):)/m).slice(1);
+const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu-node|ubuntu|windows-shard|windows):)/m).slice(1);
 const blockOf = (id) => jobBlocks().find((b) => b.startsWith(`test-${id}:`));
 const stepsOf = (block) => block.split(/^ {6}(?=- )/m).slice(1);
 
-test('the test jobs open with the skip step, push only, naming their own job (ubuntu and each Windows shard)', () => {
+test('the test jobs open with the skip step, push only, naming their own job (each Ubuntu Node version and each Windows shard)', () => {
   const blocks = jobBlocks();
-  assert.equal(blocks.length, 3, 'ubuntu, the Windows shard job and the aggregate');
-  for (const block of blocks.filter((b) => !b.startsWith('test-windows:'))) {
+  assert.equal(blocks.length, 4, 'the Ubuntu Node job, its aggregate, the Windows shard job and its aggregate');
+  for (const block of blocks.filter((b) => !b.startsWith('test-windows:') && !b.startsWith('test-ubuntu:'))) {
     const jobName = block.match(/^ {4}name: (.+)$/m)[1].trim();
     const steps = stepsOf(block);
     const at = steps.findIndex((s) => s.includes('tested-tree.mjs'));
@@ -216,6 +216,24 @@ test('the Windows shard job: JOB_NAME is the per-shard name, shards run `--shard
   const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
   assert.equal(installer.length, 1);
   assert.match(installer[0], /if: matrix\.shard == 3 && \(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\)/);
+});
+
+test('the Ubuntu Node job: JOB_NAME is the per-Node-version name, the suite and the installer run for every Node version', () => {
+  const block = blockOf('ubuntu-node');
+  assert.match(block, /^ {4}name: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
+  assert.match(block, /JOB_NAME: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
+  assert.match(block, /run: node scripts\/test\.mjs$/m);
+  const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
+  assert.equal(installer.length, 1);
+  assert.match(installer[0], /^ {8}if: github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'$/m);
+});
+
+test('the aggregate test (ubuntu) job has no skip step and always evaluates the Node jobs result', () => {
+  const block = blockOf('ubuntu');
+  assert.ok(!block.includes('tested-tree.mjs'), 'nothing to skip: it only reads the Node jobs');
+  assert.match(block, /^ {4}name: test \(ubuntu\)$/m);
+  assert.match(block, /^ {4}needs: test-ubuntu-node$/m);
+  assert.match(block, /^ {4}if: always\(\) && \(github\.event_name != 'pull_request' \|\| !github\.event\.pull_request\.draft\)$/m);
 });
 
 test('the aggregate test (windows) job has no skip step and always evaluates the shard result', () => {
