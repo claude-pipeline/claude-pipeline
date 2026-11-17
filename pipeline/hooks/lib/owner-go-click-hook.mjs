@@ -18,6 +18,7 @@ function pendingLine(p) {
     return all ? `${said}: if the owner chose to approve, run ${all} now (one per PR the owner ticked; a PR that was not ticked is refused); if they chose not to, stop: nothing is approved` : said;
   }
   if (p?.kind === 'merge') return prs.length ? `${said}: if the owner chose to approve, run P merge --pr ${prs[0]} --owner-go now; if they chose not to, stop: nothing is approved` : said;
+  if (p?.kind === 'live-db') return `${said} (live-database go): if the owner chose to apply, call the Supabase write (apply_migration or execute_sql) with exactly the SQL shown now, the guard verifies the click then; if they chose not to, stop: nothing is applied`;
   if (p?.kind === 'round') return where ? `${said} (extra round for ${where}): if the owner chose to approve, run P codex-review --pr ${prs[0]} --round <the n from round-request> now; if they chose not to, stop: nothing is approved` : said;
   if (p?.kind === 'ruling') {
     const quotes = Object.entries(p.quotes ?? {}).filter(([, v]) => typeof v === 'string').map(([label, text]) => `${JSON.stringify(label)} -> --owner-quote ${JSON.stringify(text)}`);
@@ -31,6 +32,7 @@ export function clickLine(result) {
   if (result?.pending) return pendingLine(result.pending);
   if (result?.recorded) {
     const r = result.recorded;
+    if (r.kind === 'live-db-go') return `${HEAD} the owner's click is recorded: live-database go for ${r.op} ${r.op === 'migration' ? r.name : String(r.sqlSha256).slice(0, 12)} on ${r.projectRef}: call the Supabase write with exactly the SQL shown now`;
     if (r.kind === 'ruling') return `${HEAD} the owner's click is recorded: ruling recorded for ${r.repo} #${r.pr}: ${(r.ids ?? []).join(', ')} (pass --owner-quote ${JSON.stringify(String(r.prompt ?? ''))})`;
     if (r.kind === 'extra-round') return `${HEAD} the owner's click is recorded: extra round for ${r.repo} #${r.pr} counted round ${r.k} head ${String(r.head).slice(0, 12)}: run P codex-review --pr ${r.pr} --round <the n from round-request>`;
     const reqs = Array.isArray(r.requests) ? r.requests : [];

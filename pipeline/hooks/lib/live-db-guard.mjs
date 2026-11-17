@@ -7,7 +7,8 @@
 import { createHash } from 'node:crypto';
 import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
 import path from 'node:path';
-import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore } from './owner-go.mjs';
+import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore, settleEnabled } from './owner-go.mjs';
+import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.mjs';
 import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
@@ -36,9 +37,10 @@ const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
 // ---- the claim ----------------------------------------------------------------------------------------------------------------------
 
 // Exclusive-create marker, durable before it answers `claimed`: write, fsync the file, close, fsync the folder. Any failure -> 'error' (the leftover marker stays spent). EEXIST -> 'spent'.
-// `io` ({openSync, writeSync, fsyncSync, closeSync}) are the fault seams of the tests.
-function takeMarker({ home, session, promptId, op, projectRef, sqlSha256, now, io = {} }) {
-  const id = createHash('sha256').update(`live-db|${session}|${promptId}`).digest('hex').slice(0, 32);
+// `io` ({openSync, writeSync, fsyncSync, closeSync}) are the fault seams of the tests. `promptId` is the typed go's prompt id, or (`click`) the click's id: one go, one apply either way, and
+// the two key spaces ('live-db' vs 'live-db-click') cannot collide.
+function takeMarker({ home, session, promptId, click = false, op, projectRef, sqlSha256, now, io = {} }) {
+  const id = createHash('sha256').update(`${click ? 'live-db-click' : 'live-db'}|${session}|${promptId}`).digest('hex').slice(0, 32);
   const open = io.openSync ?? openSync;
   const write = io.writeSync ?? writeSync;
   const sync = io.fsyncSync ?? fsyncSync;
@@ -73,28 +75,45 @@ function takeMarker({ home, session, promptId, op, projectRef, sqlSha256, now, i
 // -> { status: 'claimed'|'none'|'spent'|'unverified'|'expired'|'error', reason }
 export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef, name = null, sqlSha256, now = Date.now, io = {} }) {
   if (typeof sessionId !== 'string' || sessionId === '') return { status: 'none', reason: 'the call carries no session id' };
+  // A click the owner has just made may still be a pending pointer (Claude Code 2.1.323 writes the answer to the transcript only after the PostToolUse hook returns): verify it now, before the read below.
+  // `waiting`: a live-database click of this session that could not be settled yet.
+  const settled = settleEnabled() ? settlePendingClicks({ home, now, session: sessionId }) : { outcomes: [] };
+  const waiting = settled.outcomes.some((o) => (o.outcome === 'waiting' || o.outcome === 'retry') && readAsk(o.askId, { home }).ask?.kind === 'live-db');
   const records = liveDbRecords({ home, session: sessionId, now })
     .filter((r) => r.op === op && r.projectRef === projectRef && r.sqlSha256 === sqlSha256 && (op !== 'migration' || r.name === name))
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+  if (records.length === 0 && waiting) return { status: 'unverified', reason: 'the owner\'s click on the live-database dialog is received but cannot be verified yet (Claude Code writes the answer to the transcript a moment later): try the call again in a moment, and if it is still refused ask the owner to type the go instead' };
   if (records.length === 0) return { status: 'none', reason: 'no go from the owner is recorded for this exact SQL, project and name in this session' };
   let first = null;
   let spent = false;
   for (const r of records) {
     const skip = (status, reason) => { first ??= { status, reason }; };
-    if (typeof r.prompt_id !== 'string' || r.prompt_id === '') { skip('unverified', 'the recorded go has no prompt id, so it cannot be tied to the owner\'s prompt'); continue; }
-    const found = promptEntryOf(r, { home });
-    if (found.source !== 'owner' || !found.entry) { skip('unverified', `the recorded go's prompt is ${found.source === 'missing' ? 'not in a transcript the guard trusts' : 'not the owner\'s typed prompt'}`); continue; }
-    const typed = parseGo(promptTextOf(found.entry));
-    if (promptTextOf(found.entry) !== plain(r.prompt) || !typed || typed.op !== r.op || typed.arg !== (r.op === 'migration' ? r.name : r.sqlSha256.slice(0, 12))) { skip('unverified', 'the transcript entry of that prompt does not say what the record says'); continue; }
-    if (r.transcript_path !== transcriptPath) { skip('unverified', 'the recorded go is from another transcript than this call\'s'); continue; }
-    const before = replyBefore(transcriptPath, r.prompt_id);
-    if (before.text === undefined) { skip('unverified', before.reason); continue; }
-    const v = verifyBlock(before.text, { home, io });
-    const f = v.fields;
-    if (!v.ok || f.op !== r.op || f.ref !== r.projectRef || f.sqlSha256 !== r.sqlSha256 || f.head !== r.head || f.file !== r.file || f.repo !== r.repo || f.name !== r.name) { skip('unverified', `the block the owner was shown before that go does not match the record${v.ok ? '' : ` (${v.reason})`}`); continue; }
-    const age = now() - Date.parse(found.entry.timestamp);
+    let at;
+    let click = false;
+    if (r.via === 'ask') {
+      // The owner's click. clickProvenance re-reads the transcript: the question the dialog showed (its block re-passes verifyBlock in bindAnswer), the answer and the ask's own file must give exactly this
+      // record, whose kind (live-db-go) only a live-db ask can bind. It is the same transcript as this call's, and the go's age runs from the answer's own time.
+      click = true;
+      if (clickProvenance(r, { home }) !== 'owner') { skip('unverified', 'the owner\'s click on the live-database dialog cannot be verified from the transcript: ask the owner to type the go instead'); continue; }
+      if (r.transcript_path !== transcriptPath) { skip('unverified', 'the recorded click is from another transcript than this call\'s'); continue; }
+      at = Date.parse(r.ts);
+    } else {
+      if (typeof r.prompt_id !== 'string' || r.prompt_id === '') { skip('unverified', 'the recorded go has no prompt id, so it cannot be tied to the owner\'s prompt'); continue; }
+      const found = promptEntryOf(r, { home });
+      if (found.source !== 'owner' || !found.entry) { skip('unverified', `the recorded go's prompt is ${found.source === 'missing' ? 'not in a transcript the guard trusts' : 'not the owner\'s typed prompt'}`); continue; }
+      const typed = parseGo(promptTextOf(found.entry));
+      if (promptTextOf(found.entry) !== plain(r.prompt) || !typed || typed.op !== r.op || typed.arg !== (r.op === 'migration' ? r.name : r.sqlSha256.slice(0, 12))) { skip('unverified', 'the transcript entry of that prompt does not say what the record says'); continue; }
+      if (r.transcript_path !== transcriptPath) { skip('unverified', 'the recorded go is from another transcript than this call\'s'); continue; }
+      const before = replyBefore(transcriptPath, r.prompt_id);
+      if (before.text === undefined) { skip('unverified', before.reason); continue; }
+      const v = verifyBlock(before.text, { home, io });
+      const f = v.fields;
+      if (!v.ok || f.op !== r.op || f.ref !== r.projectRef || f.sqlSha256 !== r.sqlSha256 || f.head !== r.head || f.file !== r.file || f.repo !== r.repo || f.name !== r.name) { skip('unverified', `the block the owner was shown before that go does not match the record${v.ok ? '' : ` (${v.reason})`}`); continue; }
+      at = Date.parse(found.entry.timestamp);
+    }
+    const age = now() - at;
     if (!Number.isFinite(age) || age > LIVE_DB_MAX_AGE_MS || age < -FUTURE_SKEW_MS) { skip('expired', `the owner's go is older than ${LIVE_DB_MAX_AGE_MS / 3600000} hours (or from the future)`); continue; }
-    const m = takeMarker({ home, session: sessionId, promptId: r.prompt_id, op, projectRef, sqlSha256, now, io });
+    const m = takeMarker({ home, session: sessionId, promptId: click ? r.ask.clickId : r.prompt_id, click, op, projectRef, sqlSha256, now, io });
     if (m === 'claimed') return { status: 'claimed', reason: '' };
     if (m === 'spent') { spent = true; continue; }
     return { status: 'error', reason: 'the go could not be marked as used (the folder is not a real directory, or a write failed), so nothing is applied' };
@@ -134,7 +153,7 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
     const c = claimLiveDbGo({ home, sessionId: ctx.sessionId, transcriptPath: ctx.transcriptPath, op, projectRef: target.ref, name: migName, sqlSha256: sha256Of(query), now: ctx.now ?? Date.now, io: ctx.io });
     if (c.status === 'claimed') return allow();
     const lookup = name === 'execute_sql' ? ` For a schema look-up use \`${CLI} live-db catalog <kind> …\` and pass its sql verbatim.` : '';
-    const ask = `Run \`${presentHint(op, target.ref)}\`, end the reply with its block and wait for the owner's typed go.`;
+    const ask = `Run \`${presentHint(op, target.ref)} --ask\`, end the reply with its block, then call AskUserQuestion with its ask.questions verbatim (when ask is null, wait for the owner's typed go instead).`;
     const after = c.status === 'spent' || c.status === 'error' ? ' A used go is never reused: check the live state read-only (list_migrations or a catalog query) before asking for a new one.' : '';
     return deny(`${name} on ${where} needs the owner's go for exactly this query (${show(query)}${op === 'migration' ? `, name ${migName}` : ''}): ${c.reason}.${lookup} ${ask}${after}`);
   }

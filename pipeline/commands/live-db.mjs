@@ -1,14 +1,18 @@
 // `pipeline live-db present | catalog`: the Claude side of the live-database guard (#262; the rules are in hooks/lib/live-db-guard.mjs, the block and the recorder in hooks/lib/live-db-go.mjs).
 // `present` builds the block the owner must be shown before a live Supabase change (a migration file, or a data fix); the owner's typed go is recorded only when the reply ends with exactly that block.
+// `--ask` (click-to-approve, #261): also prints the choice dialog the owner may answer with a click instead of typing the go (the typed go stays as the fallback).
 // `catalog` prints the fixed catalog look-up SQL that execute_sql may run on a live project without a go (hooks/lib/live-db-catalog.mjs). Both only read: neither applies anything.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
 import { git } from '../lib/git.mjs';
 import { createGitHub } from '../lib/github.mjs';
+import { requireConfig } from '../lib/cmd-common.mjs';
+import { askFields, clickGate } from '../lib/click-ask.mjs';
 import { accountHome } from '../lib/paths.mjs';
 import { CATALOG_TEMPLATES, GUC_NAMES, buildCatalogQuery } from '../hooks/lib/live-db-catalog.mjs';
 import { readDbRefs } from '../hooks/lib/db-refs.mjs';
+import { liveDbAsk } from '../hooks/lib/owner-go-click.mjs';
 import { blobAt, buildBlock, canonicalDataSql, liveLabel, migrationSqlProblem, repoOf, sha256Of, summaryProblem } from '../hooks/lib/live-db-go.mjs';
 
 export const meta = {
@@ -17,8 +21,10 @@ export const meta = {
     'pipeline live-db present --op migration --pr <N> --file supabase/migrations/<f>.sql --project <ref> --summary "<one line>"',
     '  -> {ok, block, sqlSha256, name} : refuses unless the working-tree file equals HEAD:<file>, HEAD is the PR head on GitHub, the bytes are valid (UTF-8, no CR/NUL, no fence line, at most 300 lines) and the project is live.',
     '     End your reply with `block` (its last line is the ask) and wait for the owner to type `go migration <name>`; then call apply_migration with name = <name> and query = the file text, unchanged.',
+    '  -> --ask (click-to-approve): also {ask: {askId, questions}}: a choice question (Yes, apply <name> | Not yet) whose text is the title and then exactly `block`, written as an ask file (one-time use, expires after 24 h); after the block, pass `ask.questions` to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same go the typed `go migration <name>` records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued): the owner types the go as before',
     'pipeline live-db present --op data --project <ref> --sql-file <path> --summary "<one line>"',
     '  -> {ok, block, sqlSha256, sql} : the SQL is canonicalised (BOM and trailing whitespace stripped; CR, NUL, a fence line, a line with trailing spaces, over 60 lines or 4000 characters are refused: make it a migration). Pass `sql` verbatim as execute_sql query; the owner types `go data <sha12>`.',
+    '  -> --ask on a data fix: the same dialog (Yes, run <sha12> | Not yet), when the checkout has an origin remote; otherwise ask: null and askSkipped.',
     `pipeline live-db catalog <kind> [args…]   -> {ok, sql} : the only execute_sql text a live project takes without a go; pass sql verbatim. kinds: ${Object.entries(CATALOG_TEMPLATES).map(([k, t]) => [k, ...t.args.map((a) => `<${a}>`)].join(' ')).join(' · ')}`,
     `  arguments are lower-case names (a-z 0-9 _, up to 63 characters); setting takes one of: ${GUC_NAMES.join(' ')}`,
   ].join('\n'),
@@ -30,7 +36,7 @@ export async function run(argv, ctx = {}) {
   const env = ctx.env ?? process.env;
   const home = ctx.home ?? accountHome();
   const { values, positionals } = parseCommandArgs(argv, {
-    op: { type: 'string' }, pr: { type: 'string' }, file: { type: 'string' }, project: { type: 'string' }, summary: { type: 'string' }, 'sql-file': { type: 'string' },
+    ask: { type: 'boolean' }, op: { type: 'string' }, pr: { type: 'string' }, file: { type: 'string' }, project: { type: 'string' }, summary: { type: 'string' }, 'sql-file': { type: 'string' },
   });
   const sub = positionals[0];
 
@@ -63,6 +69,18 @@ export async function run(argv, ctx = {}) {
   let dir = null;
   try { dir = git(['rev-parse', '--show-toplevel'], { cwd }).trim() || null; } catch { /* not in a repository */ }
   const repo = dir ? repoOf(dir) : null;
+  // --ask: the click dialog beside the typed go (the same gate and fields as `triage round-request --ask`)
+  const asked = async (parts, unaskable) => {
+    if (values.ask !== true) return {};
+    const where = { ...ctx, home };
+    let gate;
+    try {
+      gate = clickGate({ config: (await requireConfig(dir ?? cwd)).config, root: dir ?? cwd, ctx: where });
+    } catch {
+      gate = { ok: false, reason: 'no readable .claude/pipeline.yml in this repository, so a click cannot count' };
+    }
+    return askFields({ gate, parts, unaskable, ctx: where });
+  };
 
   if (op === 'data') {
     let text;
@@ -70,7 +88,9 @@ export async function run(argv, ctx = {}) {
     const canon = canonicalDataSql(text);
     if (canon.problem) return FAIL(canon.problem);
     const block = buildBlock({ op, ref: values.project, label, repo, dir, sql: canon.sql, summary: values.summary });
-    return { exitCode: EXIT.OK, output: { ok: true, block: block.join('\n'), sqlSha256: sha256Of(canon.sql), sql: canon.sql, label } };
+    const sha = sha256Of(canon.sql);
+    const parts = repo === null ? null : liveDbAsk({ repo, block: block.join('\n'), op, arg: sha.slice(0, 12), label, ref: values.project });
+    return { exitCode: EXIT.OK, output: { ok: true, block: block.join('\n'), sqlSha256: sha, sql: canon.sql, label, ...await asked(parts, 'the block names no repository (no origin remote here), so a click cannot be bound: the owner types the go') } };
   }
 
   // migration
@@ -98,5 +118,6 @@ export async function run(argv, ctx = {}) {
   if (prHead !== head) return FAIL(`HEAD ${head.slice(0, 12)} is not the head of PR #${pr} on GitHub (${String(prHead).slice(0, 12)}): push, or check out the PR head, and run this again`);
   const name = path.posix.basename(file, '.sql');
   const block = buildBlock({ op, ref: values.project, label, name, file, head, repo, dir, sql: committed, summary: values.summary });
-  return { exitCode: EXIT.OK, output: { ok: true, block: block.join('\n'), sqlSha256: sha256Of(committed), name, label } };
+  const parts = repo === null ? null : liveDbAsk({ repo, pr, block: block.join('\n'), op, arg: name, label, ref: values.project });
+  return { exitCode: EXIT.OK, output: { ok: true, block: block.join('\n'), sqlSha256: sha256Of(committed), name, label, ...await asked(parts, 'the block names no repository (no origin remote here), so a click cannot be bound: the owner types the go') } };
 }
