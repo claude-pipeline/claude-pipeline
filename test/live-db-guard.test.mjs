@@ -4,7 +4,9 @@ import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
+import { execFileSync, spawn } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { OWNER_ENTRY, linesOf } from './helpers/owner-go.mjs';
 import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
@@ -195,4 +197,54 @@ test('through the real guard entry: a call another rule denies leaves the go unc
   assert.equal(file(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: SQL }), 'allow');
   assert.equal(file(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: SQL }), 'deny');
   assert.equal(file(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: 'drop table t' }, { [['PIPELINE', 'ADMIN'].join('_')]: '1' }), 'allow');
+});
+
+test('two processes claiming the same go on one home: exactly one claims, the other sees it spent', async (t) => {
+  const s = await scene(t);
+  const guardUrl = new URL('../pipeline/hooks/lib/live-db-guard.mjs', import.meta.url).href;
+  const args = JSON.stringify({ home: s.home, sessionId: s.session, transcriptPath: s.transcript, op: 'migration', projectRef: REF, name: NAME, sqlSha256: sha256Of(SQL), at: Date.now() + 1500, now: NOW });
+  // each child waits for the same wall-clock instant, then claims once
+  const child = `const { claimLiveDbGo } = await import(${JSON.stringify(guardUrl)});
+const a = JSON.parse(process.argv[1]);
+while (Date.now() < a.at) { /* start together */ }
+const r = claimLiveDbGo({ home: a.home, sessionId: a.sessionId, transcriptPath: a.transcriptPath, op: a.op, projectRef: a.projectRef, name: a.name, sqlSha256: a.sqlSha256, now: () => a.now });
+process.stdout.write(r.status);`;
+  const runChild = () => new Promise((resolve, reject) => {
+    const p = spawn(process.execPath, ['--input-type=module', '-e', child, args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', reject);
+    p.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`child exit ${code}: ${err}`))));
+  });
+  const outcomes = (await Promise.all([runChild(), runChild()])).sort();
+  assert.deepEqual(outcomes, ['claimed', 'spent']);
+  assert.equal(readdirSync(consumed(s)).length, 1);
+});
+
+// rollback safety: the previous release's owner-go.mjs (the commit before the live-db records existed) reads a home that holds live-db go records and markers
+const OLD_OWNER_GO = 'bd202a3e';
+const haveOld = (() => { try { execFileSync('git', ['cat-file', '-e', `${OLD_OWNER_GO}^{commit}`], { cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: 'ignore' }); return true; } catch { return false; } })();
+
+// (a shallow CI checkout does not hold that commit: only then is the test not run, and it says why)
+test('coexistence: the previous owner-go.mjs still reads a home that holds live-db go records and markers', { skip: haveOld ? false : `commit ${OLD_OWNER_GO} is not in this checkout (shallow clone)` }, async (t) => {
+  const s = await scene(t);
+  assert.equal(apply(s).decision, 'allow'); // a go record in owner-go/<session>.jsonl and a marker in live-db-consumed/
+  assert.ok(readdirSync(consumed(s)).length === 1);
+  // the old module with everything it imports, from git history, in its own folder
+  const old = mkdtempSync(join(tmpdir(), 'cp-old-owner-go-'));
+  t.after(() => rmSync(old, { recursive: true, force: true }));
+  const tar = execFileSync('git', ['archive', OLD_OWNER_GO, 'pipeline'], { cwd: fileURLToPath(new URL('..', import.meta.url)), maxBuffer: 256 * 1024 * 1024 });
+  execFileSync('tar', ['-x', '-C', old], { input: tar });
+  const prior = await import(pathToFileURL(join(old, 'pipeline', 'hooks', 'lib', 'owner-go.mjs')).href);
+  const grant = () => {
+    const prompt = 'extra round';
+    return { kind: 'extra-round', session: s.session, ts: new Date(NOW).toISOString(), prompt_sha256: createHash('sha256').update(prompt).digest('hex'), repo: 'acme/widgets', pr: 7, k: 1, head: 'a'.repeat(40), prompt };
+  };
+  const problems = [];
+  assert.deepEqual(prior.readApprovals({ home: s.home, now: () => NOW, settle: false }), [], 'a live-db go is no merge approval');
+  prior.readRecords({ home: s.home, now: () => NOW, problems, settle: false });
+  assert.deepEqual(problems, [], 'the old reader finds nothing unreadable');
+  assert.equal(prior.roundCoverage(grant(), { home: s.home, repo: 'acme/widgets', moves: [] }), 'absent', 'the round-grant coverage reader still answers ok (not indeterminate)');
 });
