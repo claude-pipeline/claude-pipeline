@@ -633,7 +633,7 @@ function trackConfig(args, ctx) {
   let writes = positionals.length >= 2 || flags.some((f) => ['unset', 'unset-all', 'add', 'replace-all', 'remove-section', 'rename-section'].includes(f.name));
   if (['set', 'unset'].includes(positionals[0])) { writes = true; positionals = positionals.slice(1); }
   const key = String(positionals[0] ?? '').toLowerCase();
-  if (key.startsWith('alias.') && positionals.length >= 2) ctx.gitAliases[key.slice('alias.'.length)] = positionals[1];
+  if (key.startsWith('alias.') && positionals.length >= 2) { ctx.gitAliases[key.slice('alias.'.length)] = positionals[1]; logAlias(ctx, `git:${key.slice('alias.'.length)}`); }
   if (writes && RISKY_CONFIG(key, String(positionals[1] ?? ''))) ctx.cfgDirty = true;
   // (see directMergeVerdict; security review of de62b36: url.<base>.insteadOf rewrites a remote's URL, include / includeIf pull in other config)
   if (writes && (DYNAMIC.test(key) || key === '' || /^(?:remote|url|include|includeif|core)\./.test(key))) ctx.ghRepoDirty = true;
@@ -1316,6 +1316,7 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
     if (name !== undefined && expansion !== undefined) {
       const shell = expansion.startsWith('!') || flags.some((f) => f.name === 's' || f.name === 'shell');
       ctx.ghAliases[name.toLowerCase()] = { expansion, shell };
+      logAlias(ctx, `gh:${name.toLowerCase()}`);
       const v = shell ? evalString(expansion.replace(/^!/, ''), dir, ctx, level + 1) : checkGh(['gh', ...splitArgs(expansion)], env, dir, ctx, raw, level + 1);
       if (v && v.decision === 'deny') return deny(`gh alias "${name}" would expand to a blocked command: ${v.reason}`);
     }
@@ -1977,7 +1978,7 @@ function loopReseed(ctx, entry, left) {
   loopMark(ctx, left);
 }
 // #352 R8-B1: the git state a command may change, for the may-not-run rule (evalString): branches, aliases (and the marks of unsure ones), repository / global config. Compared before and after a command.
-const stateMark = (ctx) => ({ branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure), cfg: ctx.cfgDirty, envCfg: ctx.envCfgDirty });
+const stateMark = (ctx) => ({ log: aliasLogLen(ctx), branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure), cfg: ctx.cfgDirty, envCfg: ctx.envCfgDirty });
 function stateChanged(ctx, was) {
   if (!was) return false;
   if (ctx.cfgDirty !== was.cfg || ctx.envCfgDirty !== was.envCfg || ctx.aliasUnsure.size !== was.unsure.size) return true;
@@ -2304,8 +2305,13 @@ function judgeScoped(text, dir, ctx, level, sf, child = false) {
 // a startup file) changed, or may have changed, is UNKNOWN for its caller afterwards, never the value the walk gave it (an exit, a return, `set -e`, `cd d || exit` before the change; a speculative candidate that may not run at
 // all is the same): a branch it wrote or that differs from before becomes an unknown branch, an alias it (re)defined is unsure. What it did not touch stays as it was. The mark is the state before; every write of a branch is
 // in the log (a text that switched and switched back has still changed it), and a forget changes an entry in place (the mark holds copies).
+// (R39-B1: every alias write, git:<name> / gh:<name>, like the branch log: a text that set an alias and put the old value back (an exit between) has still changed it)
+function logAlias(ctx, key) { (ctx.budget.aliasLog ??= []).push(key); }
+const aliasLogLen = (ctx) => (ctx.budget.aliasLog ??= []).length;
+function forgetLoggedAliases(ctx, from) { for (const k of ctx.budget.aliasLog.slice(from)) ctx.aliasUnsure.add(k); }
 function markChildState(ctx) {
   return {
+    aliasLogged: aliasLogLen(ctx),
     branches: new Map([...ctx.branches].map(([d, e]) => [d, { name: e.name, trackMain: e.trackMain }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases },
     logged: (ctx.budget.branchLog ??= []).length,
   };
@@ -2317,6 +2323,7 @@ function forgetChildChanges(ctx, mark) {
     if (was?.name !== now?.name || was?.trackMain !== now?.trackMain) ctx.branches.set(d, { name: null, trackMain: false });
   }
   for (const d of ctx.budget.branchLog.slice(mark.logged)) ctx.branches.set(d, { name: null, trackMain: false });
+  forgetLoggedAliases(ctx, mark.aliasLogged);
   for (const n of new Set([...Object.keys(mark.git), ...Object.keys(ctx.gitAliases)])) {
     if (mark.git[n] !== ctx.gitAliases[n]) ctx.aliasUnsure.add(`git:${n}`);
   }
@@ -2325,7 +2332,11 @@ function forgetChildChanges(ctx, mark) {
   }
 }
 function judgeScopedIn(text, dir, ctx, level, sf, child) {
-  if (sf.sourced && !sf.candidate) return evalString(text, dir, ctx, level + 1);
+  if (sf.sourced && !sf.candidate) {
+    // (R39-F1: the walk does not model a `return`: an alias the sourced file wrote, whatever it was set back to, is unsure for the caller)
+    const from = aliasLogLen(ctx);
+    try { return evalString(text, dir, ctx, level + 1); } finally { forgetLoggedAliases(ctx, from); }
+  }
   const saved = Object.assign(Object.create(null), ctx.vars);
   const savedTaint = new Set(ctx.tainted);
   const savedUnsure = new Set(ctx.unsureVars);
@@ -3170,6 +3181,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   const restore = (x) => { dir = x.dir; trackers = [...x.trackers]; };
   // (an alias a change that is not certain (re)defined is unsure for every later use, as for a speculative candidate (judgeScopedIn): the use is refused, whatever the value the walk gave it)
   const aliasesUnsure = (was) => {
+    if (was.log !== undefined) forgetLoggedAliases(ctx, was.log); // (R39-F2: a write put back before the level ended (an exit between) is a change too)
     for (const [kind, then, now] of [['git', was.git, ctx.gitAliases], ['gh', was.gh, ctx.ghAliases]]) for (const n of new Set([...Object.keys(then), ...Object.keys(now)])) if (then[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n.toLowerCase()}`);
   };
   const forget = (x) => {
@@ -3339,7 +3351,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       failGroup = null;
     }
     settle(c, i); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
-    if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases } } });
+    if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
     // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
     // and what every further pass restarts from. Before it, a pass restored a subshell that had ended (`(true); for ...`) or lacked the one the loop is in (`( for ...; done ); push`).)
     for (const r of loopsAt.get(i) ?? []) {
