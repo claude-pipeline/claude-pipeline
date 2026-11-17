@@ -26,6 +26,11 @@ function admissionOf(round, k, max) {
   return 'unknown';
 }
 
+// What the round actually reviewed (reviewBaseKind) and why the free resolution-only round was refused (the short code on the round, state.mjs#addRound). A round recorded before
+// either field existed reads as 'unknown' (missing telemetry); a whole-PR round with no recorded code is 'unknown' too, never "no failure"; any other kind has no proof to fail (null).
+const kindOf = (r) => (typeof r.reviewBaseKind === 'string' && r.reviewBaseKind !== '' ? r.reviewBaseKind : 'unknown');
+const ineligibleOf = (r) => (typeof r.resolutionIneligible === 'string' && r.resolutionIneligible !== '' ? r.resolutionIneligible : kindOf(r) === 'whole-pr' || kindOf(r) === 'unknown' ? 'unknown' : null);
+
 // A decoded triage state that belongs to PR `pr` and whose rounds are numbered (a comment is untrusted text: a round `n` that is not an integer would be printed as it is).
 export const isReadableState = (state, pr) => !!state && state.pr === pr && Array.isArray(state.rounds) && state.rounds.every((r) => Number.isInteger(r?.n));
 
@@ -44,7 +49,7 @@ export function analysePr({ repo, pr, state, record }) {
     }
     k += 1;
     const items = r.items ?? [];
-    const row = { n: r.n, k, pastCap: max !== null && k > max, usd: money(byRound[String(r.n)]?.usd), acceptedBlocking: items.some((i) => i.bucket === 'BLOCKING' && isNewAccept(i)) };
+    const row = { n: r.n, k, pastCap: max !== null && k > max, reviewKind: kindOf(r), resolutionIneligible: ineligibleOf(r), usd: money(byRound[String(r.n)]?.usd), acceptedBlocking: items.some((i) => i.bucket === 'BLOCKING' && isNewAccept(i)) };
     if (row.pastCap) {
       const prevAccepts = newAccepts(prev);
       row.admission = admissionOf(r, k, max);
@@ -65,7 +70,7 @@ const bump = (o, key) => { o[key] = (o[key] ?? 0) + 1; };
 // { prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission, previous, found, blockingLoopPrs, usd, pastCapUsd } over analysed PRs (nulls dropped).
 export function aggregate(analysed) {
   const prs = analysed.filter(Boolean);
-  const t = { prs: prs.length, prsPastCap: 0, countedRounds: 0, pastCapRounds: 0, pastCapShare: null, admission: {}, previous: {}, found: {}, blockingLoopPrs: 0, usd: 0, pastCapUsd: null };
+  const t = { prs: prs.length, prsPastCap: 0, countedRounds: 0, pastCapRounds: 0, pastCapShare: null, admission: {}, previous: {}, found: {}, kind: {}, ineligible: {}, blockingLoopPrs: 0, usd: 0, pastCapUsd: null };
   let pastUsd = 0;
   let pastKnown = 0;
   for (const p of prs) {
@@ -74,6 +79,10 @@ export function aggregate(analysed) {
     if (p.pastCapRounds > 0) t.prsPastCap += 1;
     if (p.blockingLoop) t.blockingLoopPrs += 1;
     t.usd += p.usd ?? 0;
+    for (const r of p.rounds) {
+      bump(t.kind, r.reviewKind);
+      if (r.resolutionIneligible !== null) bump(t.ineligible, r.resolutionIneligible);
+    }
     for (const r of p.rounds.filter((x) => x.pastCap)) {
       bump(t.admission, r.admission);
       bump(t.previous, r.previous);
@@ -103,6 +112,7 @@ export function renderTable({ since, repos, totals, prs, withoutState }) {
   const list = (o) => Object.entries(o).map(([k, v]) => cell(`${k} ${v}`)).join(', ') || 'none';
   out.push('', `PRs ${totals.prs} (${totals.prsPastCap} went past the limit) · counted rounds ${totals.countedRounds} · past the limit ${totals.pastCapRounds}${totals.pastCapShare === null ? '' : ` (${(totals.pastCapShare * 100).toFixed(1)}%)`} · booked ${usdText(totals.usd)}`);
   out.push(`Past-limit admission: ${list(totals.admission)}`, `Round before them: ${list(totals.previous)}`, `What they found: ${list(totals.found)}`);
+  out.push(`Round kinds (counted rounds): ${list(totals.kind)}`, `Why a conflict resolution was not reviewed alone: ${list(totals.ineligible)}`);
   out.push(`PRs without a review state: ${Number.isFinite(withoutState) ? withoutState : 0}`);
   out.push(`PRs with a BLOCKING loop (BLOCKING accepted in 2+ consecutive rounds): ${totals.blockingLoopPrs}${totals.pastCapUsd ? ` · past-limit rounds with a booking: ${totals.pastCapUsd.rounds}, ${usdText(totals.pastCapUsd.usd)}` : ''}`);
   return out.join('\n');

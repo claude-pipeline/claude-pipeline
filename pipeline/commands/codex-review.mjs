@@ -48,7 +48,8 @@ export const meta = {
     '    at least review.codex_budget.soft, every other round that is not protected use review.effort.small_fix. Protected rounds always keep the normal effort: round 1, the first round after a maxRisk rise (or one that sees the rise),',
     '    a round with confirmFixed items, a resolution-only round, a whole-PR round that is owed. The round records effort; a round the governor lowered also records governor:{usedPct, threshold, observedAt} (state version 4)',
     '  --plan prints what the round would do and runs nothing, writes no route.json and no round: {ok, plan:{route: codex|substitute, evidence: none|budget|governor, effort, why, round, base, wholePrOwed, protected, small, lowered?, budget:{used, budget},',
-    '    governor:{usedPct, soft, hard, observedAt}|null, facts:{changedLines, newFile, sensitive}}, expectedEffort}; the skill passes expectedEffort as --effort (--effort is optional with --plan)',
+    '    governor:{usedPct, soft, hard, observedAt}|null, facts:{changedLines, newFile, sensitive}, reviewKind, resolutionOnly?, resolutionIneligible?}, expectedEffort}; the skill passes expectedEffort as --effort (--effort is optional with --plan)',
+    '    reviewKind (display only) = what the round would review: merge-base (round 1 / a whole PR owed) | previous | synthetic (the default branch merged in cleanly) | resolution (resolutionOnly: true) | whole-pr; resolutionIneligible = the short code (and detail) of why the free resolution-only round was refused, when it was tried',
     '  a small fix-check (not protected, see above) goes to the substitute instead of Codex when the PR has used review.codex_round_budget Codex runs (recorded Codex rounds and recorded Codex second reviews in the state; a killed or retried run',
     '    does not count) or the weekly Codex quota used is at least review.codex_budget.hard (P codex-status; an unreadable figure turns the governor off). Codex is not run: exit 3 {ok:false, unavailable:true, reason:withheld, message,',
     '    substitute:{eligible:true, why: budget-spent|governor-hard, evidence: budget|governor, agent, resetAt:null}, plan}; route.json holds {evidence: budget, budget:{used, budget}} or {evidence: governor, governor:{usedPct, threshold, observedAt}}',
@@ -87,7 +88,7 @@ export const meta = {
     '    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}',
     '  when that merge conflicted and the resolution only chose lines the two sides already had, Codex reviews just the resolution:',
     '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
-    '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not',
+    '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not; every round output also carries reviewKind',
     '    taken alone',
     '  exit 3 {ok:false, unavailable:true, reason: quota|model|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
     '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) or a proven refused model (below) with',
@@ -184,10 +185,12 @@ export const run = guarded(async (argv, ctx) => {
   // Who reviews this round and at what effort (lib/review-route.mjs table). A base-only round asks nothing: no plan.
   const plan = adm.baseOnly ? null : planRound(adm, { env: ctx.env });
   if (planOnly) {
+    // What the round reviews (display only): its kind, and why the free resolution-only round was refused when it was tried.
+    const kind = { reviewKind: adm.review.kind, ...(resolutionOnly ? { resolutionOnly: true } : {}), ...(resolutionIneligible === undefined ? {} : { resolutionIneligible }) };
     return {
       exitCode: EXIT.OK,
       output: {
-        ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base } : planOutput(plan), expectedEffort: plan?.effort ?? sub.effort.followup,
+        ok: true, plan: plan === null ? { baseOnly: true, round, base: adm.review.base, ...kind } : { ...planOutput(plan), ...kind }, expectedEffort: plan?.effort ?? sub.effort.followup,
         ...(modelNote !== undefined && plan?.route !== 'substitute' ? { modelNote } : {}),
       },
     };
@@ -346,6 +349,7 @@ export const run = guarded(async (argv, ctx) => {
         worth_considering: findings.worth_considering.length,
       },
       ...(baseOnly ? { baseOnly: true } : {}),
+      reviewKind: adm.review.kind,
       ...(retried ? { retried } : {}),
       ...(modelNote === undefined ? {} : { modelNote }),
       ...(plan?.effortNote === undefined ? {} : { effortNote: plan.effortNote }),

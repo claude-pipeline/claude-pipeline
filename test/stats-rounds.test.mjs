@@ -249,3 +249,24 @@ test('R2-F2 stats rounds: the plain-text table prints how many PRs had no review
   const text = renderTable({ since: '2026-11-05', repos: ['acme/widgets'], totals: aggregate([]), prs: [], withoutState: 3 });
   assert.match(text, /PRs without a review state: 3/);
 });
+
+// Failure caught: a round recorded before `resolutionIneligible` existed is read as "no failure", hiding how often the free resolution round was refused (and why).
+test('analysePr / aggregate: reviewKind and resolutionIneligible per counted round; a round without the field reads as unknown, never as no failure; totals by kind and by reason', () => {
+  const round = (n, over) => ({ n, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], ...over });
+  const state = {
+    pr: 7, maxRounds: 3,
+    rounds: [
+      round(1, { reviewBaseKind: 'merge-base' }),
+      round(2, { reviewBaseKind: 'whole-pr', resolutionIneligible: 'history-nonmerge' }),
+      round(3, { reviewBaseKind: 'whole-pr' }), // recorded before the field existed
+      round(4, {}), // recorded before reviewBaseKind existed
+      round(5, { reviewBaseKind: 'resolution', resolutionOnly: true }), // not counted: no row
+    ],
+  };
+  const p = analysePr({ repo: 'acme/widgets', pr: 7, state, record: null });
+  assert.deepEqual(p.rounds.map((r) => [r.n, r.reviewKind, r.resolutionIneligible]), [[1, 'merge-base', null], [2, 'whole-pr', 'history-nonmerge'], [3, 'whole-pr', 'unknown'], [4, 'unknown', 'unknown']]);
+  const t = aggregate([p]);
+  assert.deepEqual(t.kind, { 'merge-base': 1, 'whole-pr': 2, unknown: 1 });
+  assert.deepEqual(t.ineligible, { 'history-nonmerge': 1, unknown: 2 });
+  assert.match(renderTable({ since: '2026-11-01', repos: ['acme/widgets'], totals: t, prs: [p], withoutState: 0 }), /Why a conflict resolution was not reviewed alone: history-nonmerge 1, unknown 2/);
+});
