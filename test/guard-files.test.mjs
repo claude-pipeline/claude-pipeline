@@ -215,6 +215,7 @@ const BASH_DENY = [
   ['sudo wrapper', 'sudo rm -rf ~/.claude/pipeline'],
   ['xargs wrapper', 'echo ~/.claude/pipeline | xargs rm -rf'],
   ['xargs fan-out from a read-only listing', 'find ~/.claude/pipeline -type f | xargs rm'],
+  ['xargs inside a substitution in a quoted argument (#563: quoted prose is blanked, a substitution is not)', 'echo "$(find ~/.claude/pipeline -type f | xargs rm)"'],
   ['sh fed by a read-only listing', "find ~/.claude/pipeline -type f -printf 'rm %p\\n' | sh"],
   ['eval of a substitution', 'eval "$(cat ~/.claude/pipeline/VERSION)"'],
   ['assignment then use', 'D=~/.claude/pipeline; rm -rf $D'],
@@ -265,6 +266,9 @@ const BASH_ALLOW = [
   ['pwsh Get-Content', `pwsh -NoProfile -Command "Get-Content ~/.claude/settings.json"`],
   ['PowerShell word in an unrelated path', 'ls /repo/docs/PIPELINE.md'],
   ['pipeline protect without --apply', 'node ~/.claude/pipeline/bin/pipeline.mjs protect --repo .'],
+  // #563, second case: the word `parallel` / `xargs` inside a quoted prose argument (a PR title in `summary --built`, `agent-log publish --line`) is data, not a fan-out command
+  ['summary text that says parallel', 'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 561 --outcome awaiting-owner-merge --built "Load-proof guard timing tests and parallel ubuntu Node 20 and 24 CI jobs"'],
+  ['agent-log line that says parallel', "node ~/.claude/pipeline/bin/pipeline.mjs agent-log publish --line 'Load-proof guard timing tests and parallel ubuntu Node jobs (#477, #243)'"],
   ['a different repo .claude dir', 'cat /repo/.claude/settings.json > /dev/null'],
   ['empty command', ''],
 ];
