@@ -7,6 +7,9 @@
 // the shell itself. The change takes effect whenever it runs and its status is only looked at by the operator that follows it: a change that failed counts only when an && / || / ! decides on that status
 // (`change || push`, `change && x || push`, `! change && push`); a failure that a `;` or `&` goes past is not modelled (the guard has always taken `git switch x; push` as run on x). If the push can run on a path where the change had not taken effect, the guard must DENY (soundness: asserted). When the change surely took effect before the push, the guard may allow it;
 // a refusal there is an over-refusal: counted and reported, never a failure.
+// (#352 R36, the guard's `redirectsFirm`: NO redirection is firm. A redirect on a command that changes something, or on the subshell / shell that runs it (a here-document, a here-string, `( ) 2>&1`), may keep it from running at all (`cd d < /missing`;
+// a closed descriptor or a lowered descriptor limit makes even `>&2` and `2>/dev/null` fail), and the guard does not wait for an && / || to look at that status: a redirected change followed by `;` and the later command may not have taken effect.
+// So the reference lets a redirected change or a redirected subshell not run, with a failure that a `;` or `&` does NOT go past. A redirect on a command that changes nothing is nothing.)
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
@@ -212,14 +215,18 @@ function evalList(n, ins, kind) {
 }
 function evalNode(n, s, kind) {
   switch (n.t) {
-    case 'change': return [{ ...s, ok: false, fl: true }, { ...s, ...(kind === 'cd' ? { cd: true } : { sw: true }), ok: true, fl: false }];
+    case 'change': return [{ ...s, ok: false, fl: !n.hd }, { ...s, ...(kind === 'cd' ? { cd: true } : { sw: true }), ok: true, fl: false }]; // (a here-document on it: R36, it may not have run, and no `;` goes past that)
     case 'push': return both({ ...s, bad: s.bad || !(s.sw || s.cd) });
     case 'noop': return both(s);
     case 'empty': return [{ ...s, ok: true, fl: false }];
     case 'list': return evalList(n, [s], kind);
     case 'group': case 'anon': case 'eval': return evalList(n.body, [s], kind);
     case 'case': return evalList(n.body, [s], kind);
-    case 'sub': case 'bashc': case 'stdin': return evalList(n.body, [s], kind).map((r) => ({ ...r, cd: s.cd }));
+    case 'sub': case 'bashc': case 'stdin': {
+      const ran = evalList(n.body, [s], kind).map((r) => ({ ...r, cd: s.cd }));
+      const redirected = (n.t === 'sub' && n.redir) || (n.t === 'stdin' && (n.how === 'herestr' || n.how === 'heredoc')); // (a pipe or a process substitution is no redirect of this command)
+      return redirected ? uniq([...ran, { ...s, ok: false, fl: false }]) : ran; // (R36: the redirect failed, so the shell never ran)
+    }
     case 'iftrue': return evalList(n.body, [s], kind);
     case 'ifelse': return n.cond === 'true' ? evalList(n.body, [{ ...s, fl: false }], kind) : evalList(n.other, [{ ...s, fl: false }], kind).map((r) => (n.elif ? { ...r, ok: true, fl: false } : r)); // (the condition is known: one branch runs; an elif's condition leaves the status of the `true` after it)
     case 'loop': return flat(evalList(n.body, [s], kind).filter((r) => !r.fl), (r) => evalList(n.body, [r], kind)); // (`for x in a b` runs its body twice, the second time from what the first left; a failure the loop goes past is not modelled, as for a ;)
