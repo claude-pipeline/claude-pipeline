@@ -224,6 +224,9 @@ const BASH_DENY = [
   // (#563 R3-F1: every INTERPRETERS name keeps its quoted text, not only the SHELL_NAMES list)
   ['ash -c runs a quoted fan-out', "find ~/.claude/pipeline -type f | ash -c 'cat | xargs rm'"],
   ['mksh behind gtimeout runs a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 mksh -c 'cat | xargs rm'"],
+  // (#563 R4-F1: a shell the parser runs but no name list holds (rbash, yash) keeps its quoted text: only a known non-runner is blanked)
+  ['rbash -c runs a quoted fan-out', "find ~/.claude/pipeline -type f | rbash -c 'cat | xargs rm'"],
+  ['yash behind gtimeout runs a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 yash -c 'cat | xargs rm'"],
   ['xargs inside a substitution in a quoted argument (#563: quoted prose is blanked, a substitution is not)', 'echo "$(find ~/.claude/pipeline -type f | xargs rm)"'],
   ['sh fed by a read-only listing', "find ~/.claude/pipeline -type f -printf 'rm %p\\n' | sh"],
   ['eval of a substitution', 'eval "$(cat ~/.claude/pipeline/VERSION)"'],
