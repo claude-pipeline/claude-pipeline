@@ -852,7 +852,7 @@ export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 
 // What became of the owner's click on the follow-up round dialog (round-v2-follow-up), for `triage defer-fixes`: a Follow up click grants nothing, so nothing else refuses a deferral whose click was never verified.
 // Read-only (never settles, never writes) and never throws: call it AFTER a strict lookup, which settles pending clicks. It looks at the NEWEST round ask for the repository (repository moves followed) and PR that
 // is not superseded; any other variant, or no such ask, is 'none'. Then: a spent marker (the immediate path) or a `.settled` outcome (a pending click) with `instruction` -> 'instructed'; a `.settled` 'refused' -> 'refused'
-// (+ reason); a pointer with no `.settled` -> 'waiting'; an unreadable spent marker, pointer or outcome -> 'unverified'; a click on the Yes label -> 'recorded', a decline -> 'declined'; no click, or only clicks whose evidence
+// (+ reason); a pointer with no `.settled` -> 'waiting'; an unreadable spent marker, pointer or outcome -> 'unverified' (so is an unreadable ask with a click, unless the newest ask has a verified answer after it); a click on the Yes label -> 'recorded', a decline -> 'declined'; no click, or only clicks whose evidence
 // could no longer matter (now > answeredAt / capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS, as in clickNotes) -> 'none' (the owner typed, or has not answered). -> { state, askId, reason?, note }; `moves` replaces the recorded repository moves (tests).
 export function followUpClickState({ home = accountHome(), repo, pr, now = Date.now, moves } = {}) {
   const note = {
@@ -879,59 +879,76 @@ export function followUpClickState({ home = accountHome(), repo, pr, now = Date.
     let newest = null;
     const live = (ms) => nowMs <= ms + CAPTURE_SKEW_MS + MAX_AGE_MS;
     // An ask that cannot be read cannot be told whose it is (as in pendingClickProblems): unless a raw read shows it plainly belongs to another kind or PR, a click pointer or spent marker of it inside the window
-    // (settled or not: a received click on an ask that cannot be read is settled as refused, which must not read as "no click") makes the answer 'unverified'.
+    // (settled or not: a received click on an ask that cannot be read is settled as refused, which must not read as "no click") makes the answer 'unverified', unless the newest readable follow-up ask has a verified answer
+    // later than that click (the owner was asked again and answered). Returns the time of its latest click evidence (a spent marker that cannot be read: its mtime), or null for none.
     const unreadableClick = (id) => {
       const raw = readSmallJson(askFile(id, 'json', home));
-      if (raw.state === 'ok' && isObj(raw.value) && ((typeof raw.value.kind === 'string' && KINDS.includes(raw.value.kind) && raw.value.kind !== 'round') || (Array.isArray(raw.value.prs) && !raw.value.prs.includes(pr)))) return false;
+      if (raw.state === 'ok' && isObj(raw.value) && ((typeof raw.value.kind === 'string' && KINDS.includes(raw.value.kind) && raw.value.kind !== 'round') || (Array.isArray(raw.value.prs) && !raw.value.prs.includes(pr)))) return null;
+      let evidence = null;
       const spent = readSpent(id, home);
-      if (spent.state === 'bad') return true;
-      if (spent.state === 'ok' && live(Date.parse(spent.marker.answeredAt) || 0)) return true;
+      if (spent.state === 'bad') {
+        let ms = nowMs;
+        try { ms = lstatSync(askFile(id, 'spent', home)).mtimeMs; } catch { /* the marker's time is unknown: now */ }
+        evidence = ms;
+      } else if (spent.state === 'ok' && live(Date.parse(spent.marker.answeredAt) || 0)) evidence = Date.parse(spent.marker.answeredAt) || 0;
       for (const name of names) {
         const m = PENDING_RE.exec(name);
         if (m === null || m[1] !== id) continue;
         let capturedMs = readPending(name, home, nowMs).pending?.capturedMs;
         if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
-        if (live(capturedMs)) return true;
+        if (live(capturedMs) && (evidence === null || capturedMs > evidence)) evidence = capturedMs;
       }
-      return false;
+      return evidence;
     };
+    let blocking = null; // the unreadable ask whose click evidence is the latest
     for (const name of names) {
       if (!/^ask-[0-9a-f]{12}\.json$/.test(name)) continue;
       const loaded = readAsk(name.slice(0, -5), { home });
-      if (!loaded.ok && loaded.reason !== 'none' && unreadableClick(name.slice(0, -5))) return say('unverified', name.slice(0, -5), 'its ask file cannot be read');
+      if (!loaded.ok && loaded.reason !== 'none') {
+        const evidenceMs = unreadableClick(name.slice(0, -5));
+        if (evidenceMs !== null && (blocking === null || evidenceMs > blocking.evidenceMs)) blocking = { id: name.slice(0, -5), evidenceMs };
+      }
       if (!loaded.ok || loaded.ask.kind !== 'round' || !loaded.ask.prs.includes(pr) || !sameRepo({ recorded: loaded.ask.repo, recordedAt: loaded.ask.issuedAt, current: key, moves: recorded }) || marked(loaded.ask.askId, 'superseded', home)) continue;
       if (newest === null || Date.parse(loaded.ask.issuedAt) > Date.parse(newest.issuedAt)) newest = loaded.ask;
     }
-    if (newest === null || newest.variant !== 'round-v2-follow-up') return say('none', newest?.askId ?? null);
-    const id = newest.askId;
-    const spent = readSpent(id, home);
-    if (spent.state === 'bad') return say('unverified', id, 'its spent marker cannot be read');
-    if (spent.state === 'ok') {
-      const m = spent.marker;
-      const answeredMs = Date.parse(m.answeredAt);
-      if (!Number.isFinite(answeredMs)) return say('unverified', id, 'its spent marker has no usable time');
-      if (!live(answeredMs)) return say('none', id);
-      if (Object.hasOwn(m, 'instruction')) return m.instruction === 'follow-up' ? say('instructed', id) : say('unverified', id, 'its spent marker names an instruction this install does not know');
-      return say(m.declined === true ? 'declined' : 'recorded', id);
-    }
-    // no spent marker: the pending pointers of this ask; the newest one inside its window decides
-    let latest = null;
-    for (const name of names) {
-      const m = PENDING_RE.exec(name);
-      if (m === null || m[1] !== id) continue;
-      const r = readPending(name, home, nowMs);
-      let capturedMs = r.pending?.capturedMs;
-      if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
-      if (live(capturedMs) && (latest === null || capturedMs > latest.capturedMs)) latest = { clickId: m[2], capturedMs, bad: r.bad === true };
-    }
-    if (latest === null) return say('none', id);
-    const settled = readSmallJson(clickFile(id, latest.clickId, 'settled', home));
-    if (settled.state === 'none') return latest.bad ? say('unverified', id, 'its pending pointer cannot be read') : say('waiting', id);
-    const outcome = settled.state === 'ok' && isObj(settled.value) ? settled.value.outcome : undefined;
-    if (outcome === 'instructed') return say('instructed', id);
-    if (outcome === 'refused') return say('refused', id, typeof settled.value.reason === 'string' ? settled.value.reason : 'unknown');
-    if (outcome === 'declined' || outcome === 'recorded') return say(outcome, id);
-    return say('unverified', id, 'its outcome cannot be read');
+    let verifiedMs = -Infinity; // when the newest ask's click was verified (instructed, recorded or declined)
+    const result = (() => {
+      if (newest === null || newest.variant !== 'round-v2-follow-up') return say('none', newest?.askId ?? null);
+      const id = newest.askId;
+      const spent = readSpent(id, home);
+      if (spent.state === 'bad') return say('unverified', id, 'its spent marker cannot be read');
+      if (spent.state === 'ok') {
+        const m = spent.marker;
+        const answeredMs = Date.parse(m.answeredAt);
+        if (!Number.isFinite(answeredMs)) return say('unverified', id, 'its spent marker has no usable time');
+        if (!live(answeredMs)) return say('none', id);
+        if (Object.hasOwn(m, 'instruction')) {
+          if (m.instruction !== 'follow-up') return say('unverified', id, 'its spent marker names an instruction this install does not know');
+          verifiedMs = answeredMs;
+          return say('instructed', id);
+        }
+        verifiedMs = answeredMs;
+        return say(m.declined === true ? 'declined' : 'recorded', id);
+      }
+      // no spent marker: the pending pointers of this ask; the newest one inside its window decides
+      let latest = null;
+      for (const name of names) {
+        const m = PENDING_RE.exec(name);
+        if (m === null || m[1] !== id) continue;
+        const r = readPending(name, home, nowMs);
+        let capturedMs = r.pending?.capturedMs;
+        if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
+        if (live(capturedMs) && (latest === null || capturedMs > latest.capturedMs)) latest = { clickId: m[2], capturedMs, bad: r.bad === true };
+      }
+      if (latest === null) return say('none', id);
+      const settled = readSmallJson(clickFile(id, latest.clickId, 'settled', home));
+      if (settled.state === 'none') return latest.bad ? say('unverified', id, 'its pending pointer cannot be read') : say('waiting', id);
+      const outcome = settled.state === 'ok' && isObj(settled.value) ? settled.value.outcome : undefined;
+      if (outcome === 'refused') return say('refused', id, typeof settled.value.reason === 'string' ? settled.value.reason : 'unknown');
+      if (outcome === 'instructed' || outcome === 'declined' || outcome === 'recorded') { verifiedMs = latest.capturedMs; return say(outcome, id); }
+      return say('unverified', id, 'its outcome cannot be read');
+    })();
+    return blocking !== null && !(verifiedMs > blocking.evidenceMs) ? say('unverified', blocking.id, 'its ask file cannot be read') : result;
   } catch {
     return say('unverified', null, 'the click state could not be checked');
   }

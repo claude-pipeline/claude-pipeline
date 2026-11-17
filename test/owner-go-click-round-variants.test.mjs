@@ -419,8 +419,25 @@ test('the lever and the issued variant: B1 issues the legacy dialog whatever the
   for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'legacy' }, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env }), 'round-v1');
 });
 
-test('followUpClickState: a follow-up click whose ask file became unreadable before settlement answers unverified, not none; an unreadable ask of another PR or with no click stays out of it', async (t) => {
-  // failure caught: settlement refuses the click as ask-invalid (which removes it from pendingClickProblems), the state check skips the unreadable ask and says `none`, and `triage defer-fixes` proceeds without a typed follow-up
+test('followUpClickState: an older unreadable ask with a click stays unverified until a newer follow-up ask of the PR has a verified click after it, then the newer click decides', async (t) => {
+  // failure caught: a refused-and-corrupted first click leaves `triage defer-fixes` refusing for the whole window, although the owner was asked again and clicked Follow up (the refusal's own advice cannot work)
+  for (const badSpent of [false, true]) {
+    const w = followWorld(t);
+    await w.click();
+    writeFileSync(join(asksDir(w.home), `${w.askId}.json`), 'not json');
+    if (badSpent) writeFileSync(join(asksDir(w.home), `${w.askId}.spent`), 'not json');
+    assert.equal(followUpClickState({ repo: REPO, pr: 58, home: w.home, now: w.now }).state, 'unverified', `${badSpent}: no newer click yet`);
+    const next = issueAsk({ ...parts('round-v2-follow-up'), home: w.home, now: () => w.answeredAt + 5000 });
+    assert.equal(followUpClickState({ repo: REPO, pr: 58, home: w.home, now: w.now }).state, 'unverified', `${badSpent}: the newer ask has no click`);
+    const later = (badSpent ? Date.now() : w.answeredAt) + 60000; // a marker that cannot be read is dated by its mtime (real time)
+    writeFileSync(join(asksDir(w.home), `${next.askId}.spent`), `${JSON.stringify({ v: 1, askId: next.askId, clickId: 'c0ffee0000000000', toolUseId: 'toolu_next', dialogSha256: sha('next'), answeredAt: new Date(later).toISOString(), declined: true, instruction: 'follow-up' })}\n`);
+    const s = followUpClickState({ repo: REPO, pr: 58, home: w.home, now: () => later + 1000 });
+    assert.deepEqual([s.state, s.askId], ['instructed', next.askId], `${badSpent}: the newer verified click wins`);
+  }
+});
+
+test('followUpClickState: a follow-up click whose ask file became unreadable before settlement answers unverified, not none; an unreadable ask nobody clicked on, or one that plainly belongs to another kind or PR, stays out of it', async (t) => {
+  // failure caught: settlement refuses the click as ask-invalid (which removes it from pendingClickProblems), the state check skips the unreadable ask and says `none`, and `triage defer-fixes` proceeds without a typed follow-up; or the reverse, every merge or other-PR ask the installed builders no longer reproduce (clicked yesterday) making `triage defer-fixes` refuse on every PR
   const w = pendingWorld(t);
   await w.click();
   writeFileSync(join(asksDir(w.home), `${w.askId}.json`), 'not json');
@@ -435,4 +452,13 @@ test('followUpClickState: a follow-up click whose ask file became unreadable bef
   const quiet = pendingWorld(t);
   writeFileSync(join(asksDir(quiet.home), `${quiet.askId}.json`), 'not json');
   assert.equal(quiet.state().state, 'none');
+  // a clicked ask that is valid JSON but fails readAsk, and names another kind or another PR, is not a follow-up click for this PR
+  for (const over of [{ kind: 'merge' }, { kind: 'round', prs: [59] }]) {
+    const other = followWorld(t);
+    await other.click();
+    const file = join(asksDir(other.home), `${other.askId}.json`);
+    writeFileSync(file, `${JSON.stringify({ ...JSON.parse(readFileSync(file, 'utf8')), ...over })}\n`);
+    assert.equal(readAsk(other.askId, { home: other.home }).reason, 'invalid', JSON.stringify(over));
+    assert.equal(followUpClickState({ repo: REPO, pr: 58, home: other.home, now: other.now }).state, 'none', `pr 58 is not blocked by an ask of ${JSON.stringify(over)}`);
+  }
 });
