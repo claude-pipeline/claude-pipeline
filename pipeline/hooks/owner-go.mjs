@@ -33,7 +33,7 @@ async function onPrompt(input) {
     const prs = record.prs.map((n) => `#${n}`).join(', ');
     // (#585) "is recorded" only when the record is usable: a request with a repo is the only kind `P merge --owner-go` accepts. Otherwise say it binds nothing and how to continue (the stored record is the same either way).
     if (record.requests.some((q) => q.repo)) process.stdout.write(`[claude-pipeline owner-go] the owner's "merge" is recorded: ${shown.join('; ')}${prs ? `; PRs ${prs}` : ''}.\n`);
-    else process.stdout.write(`[claude-pipeline owner-go] the owner's "merge" binds nothing: ${prs ? `no Head/items/repo request was bound in the last reply (PRs ${prs})` : 'no merge request was shown in the last reply'}: run the dry run again (P merge --pr N --dry-run --owner-go) and end a reply with its closing lines, then ask the owner to type "merge"\n`);
+    else process.stdout.write(`[claude-pipeline owner-go] the owner's "merge" binds nothing: ${prs ? `no Head/items/repo request was bound in the last reply (PRs ${prs})` : 'no merge request was shown in the last reply'}: if a merge request is open, show its closing lines again as the reply's last lines (in an owner_approval: chat repo, from P merge --pr N --dry-run --owner-go), then ask the owner to type "merge"\n`);
   }
 }
 

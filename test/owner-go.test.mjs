@@ -1156,7 +1156,7 @@ test('#128 hook: a notice, a peer message and a scheduled "merge" are not record
 
 // #585: the typed "merge" line says "is recorded" only when the record is usable (a request with a repo: the only kind `P merge --owner-go` accepts); otherwise it says it binds nothing and how to continue.
 test('#585 hook: a typed "merge" that bound nothing says so (no request shown, or only repo-less ones); one repo request keeps the "is recorded" line; a mixed reply too', (t) => {
-  const AGAIN = 'run the dry run again (P merge --pr N --dry-run --owner-go) and end a reply with its closing lines, then ask the owner to type "merge"';
+  const AGAIN = 'if a merge request is open, show its closing lines again as the reply\'s last lines (in an owner_approval: chat repo, from P merge --pr N --dry-run --owner-go), then ask the owner to type "merge"';
   const none = runHook(t, { entries: [promptEntry('go'), said('Nothing to merge yet.')], prompt: 'merge' });
   assert.equal(none.stdout, `[claude-pipeline owner-go] the owner's "merge" binds nothing: no merge request was shown in the last reply: ${AGAIN}\n`);
   assert.deepEqual(none.record?.requests, []);
