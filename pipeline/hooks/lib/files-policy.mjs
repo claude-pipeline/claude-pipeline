@@ -6011,8 +6011,11 @@ function evaluateBashForFilesFrame(command, opts) {
   if (!mentioning.length && !unaccounted) return allow();
 
   // A read-only command can still feed a writer further down the pipe (find ... | xargs rm, ls ... | sh).
-  // (#563: the word `parallel` / `xargs` in a quoted prose argument (a PR title in `pipeline summary --built "…"`) is data: quoted text is blanked, except for a command that runs inline code, whose program text it may be)
-  const fansOut = (c) => FAN_OUT_RE.test(runsInlineCode(c, ctx) ? c.raw : (withoutLiteralText(c.raw, { dqData: true }) ?? c.raw));
+  // (#563: the word `parallel` / `xargs` in a quoted prose argument (a PR title in `pipeline summary --built "…"`) is data: quoted text of a plain data command is blanked)
+  // (R1-B2: only a plain data command is blanked; one that runs inline code, a wrapper (WRAPPER_CMDS: env -S, flock -c, su -c, watch, script -c ...), xargs / parallel or find -exec may run its quoted text)
+  const rawHead = (c) => baseOf((c.raw ?? '').trim().split(/\s+/).find((w) => !/^[A-Za-z_]\w*=/.test(w)) ?? ''); // (the parser unwraps `env -S 'nice xargs rm'` to argv [rm]: the written first word is the wrapper)
+  const runsText = (c) => runsInlineCode(c, ctx) || WRAPPER_CMDS.has(rawHead(c)) || c.argv.some((w) => WRAPPER_CMDS.has(baseOf(w))) || (baseOf(c.argv[0] ?? '') === 'find' && c.argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
+  const fansOut = (c) => FAN_OUT_RE.test(runsText(c) ? c.raw : (withoutLiteralText(c.raw, { dqData: true }) ?? c.raw));
   if (cmds.some((c) => fansOut(c) || (SHELL_NAMES.has(baseOf(c.argv[0] ?? '')) && !isReadOnly(c, ctx)))) return deny('the command refers to a protected pipeline file and hands work to xargs or a shell, which could modify it');
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;

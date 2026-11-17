@@ -215,6 +215,9 @@ const BASH_DENY = [
   ['sudo wrapper', 'sudo rm -rf ~/.claude/pipeline'],
   ['xargs wrapper', 'echo ~/.claude/pipeline | xargs rm -rf'],
   ['xargs fan-out from a read-only listing', 'find ~/.claude/pipeline -type f | xargs rm'],
+  // (#563 R1-B2: a wrapper that runs a quoted string keeps its text; only a plain data command's quoted text is blanked)
+  ['env -S runs a quoted string that fans out', "find ~/.claude/pipeline -type f | env -S 'nice xargs rm'"],
+  ['flock -c runs a quoted string that fans out', "find ~/.claude/pipeline -type f | flock f -c 'cat | xargs rm'"],
   ['xargs inside a substitution in a quoted argument (#563: quoted prose is blanked, a substitution is not)', 'echo "$(find ~/.claude/pipeline -type f | xargs rm)"'],
   ['sh fed by a read-only listing', "find ~/.claude/pipeline -type f -printf 'rm %p\\n' | sh"],
   ['eval of a substitution', 'eval "$(cat ~/.claude/pipeline/VERSION)"'],
