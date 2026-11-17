@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { DEFAULTS } from '../pipeline/lib/config.mjs';
 import { classifyHardStops } from '../pipeline/lib/hardstops.mjs';
-import { assessRisk, isLightLane, reviewLane, threatModelsFor } from '../pipeline/lib/risk.mjs';
+import { assessRisk, isLightLane, regressionOnlyFor, reviewLane, threatModelsFor } from '../pipeline/lib/risk.mjs';
 
 const config = (risk = {}) => {
   const c = structuredClone(DEFAULTS);
@@ -361,4 +361,16 @@ test('threatModelsFor: no config, no models or a malformed list means no model; 
   assert.deepEqual(threatModelsFor(files, { review: { threat_models: 'x' } }), []);
   assert.deepEqual(threatModelsFor(files, { review: { threat_models: [null, { name: 'a', paths: 5, text: 't' }] } }), []);
   assert.throws(() => threatModelsFor('x', models(['a', 'a/**'])), TypeError);
+});
+
+// regressionOnlyFor: catches a bar that applies to a file it was not set for (the globs that match nothing the PR touched must not be named), or that misses a rename out of a listed path.
+test('regressionOnlyFor: the globs that match a changed file (old or new path), in config order, each once; nothing for an unrelated diff, no list or a malformed one', () => {
+  const cfg = { review: { regression_only_paths: ['pipeline/hooks/**', 'pipeline/lib/**', 'docs/**'] } };
+  const files = [file('pipeline/lib/a.mjs', 4), file('pipeline/lib/b.mjs', 2), file('pipeline/hooks/x.mjs', 2)];
+  assert.deepEqual(regressionOnlyFor(files, cfg), ['pipeline/hooks/**', 'pipeline/lib/**']);
+  assert.deepEqual(regressionOnlyFor([file('src/new.mjs', 2, { status: 'R', oldPath: 'docs/old.md' })], cfg), ['docs/**']);
+  assert.deepEqual(regressionOnlyFor([file('src/a.mjs', 2)], cfg), []);
+  for (const bad of [null, {}, { review: {} }, { review: { regression_only_paths: 'x' } }]) assert.deepEqual(regressionOnlyFor(files, bad), []);
+  assert.deepEqual(regressionOnlyFor(files, { review: { regression_only_paths: [5, null] } }), []);
+  assert.throws(() => regressionOnlyFor('x', cfg), TypeError);
 });
