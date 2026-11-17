@@ -6,7 +6,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { OWNER_ENTRY, runHook } from './helpers/owner-go.mjs';
-import { PR, bump, cli, ghEntries, scenario, ymlFor } from './helpers/gate-env.mjs';
+import { PR, QUEUE_AWARE_SHA, bump, cli, ghEntries, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { createFakeGh } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { publishedComments } from './helpers/rulings-world.mjs';
@@ -150,7 +150,7 @@ function world({ build = (h) => stateOf(h, [[1, subRound()]]), yml = goYml(), qu
   s.set = (state, marker = {}) => {
     s.state = state;
     saveState(s.repo.dir, state);
-    s.fake = createFakeGh(ghEntries({ prHead: s.head, baseOid: s.baseTip, prFiles: s.prFiles, mergeStateStatus: 'CLEAN', queue, extra: queue ? [NO_EVENTS] : [], comments: publishedComments(state, { hash: s.hash, head: s.head, base: s.baseTip, marker }) }));
+    s.fake = createFakeGh(ghEntries({ prHead: s.head, baseOid: s.baseTip, prFiles: s.prFiles, mergeStateStatus: 'CLEAN', queue, ...(queue ? { queueAware: QUEUE_AWARE_SHA } : {}), extra: queue ? [NO_EVENTS] : [], comments: publishedComments(state, { hash: s.hash, head: s.head, base: s.baseTip, marker }) }));
   };
   s.set(build(s.hash));
   const env = { ...s.env, ...floorEnv() };
