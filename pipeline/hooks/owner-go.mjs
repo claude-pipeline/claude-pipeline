@@ -28,6 +28,14 @@ async function onPrompt(input) {
   if (round) process.stdout.write(`[claude-pipeline owner-go] the owner's extra round is recorded for ${round.repo} #${round.pr} counted round ${round.k} head ${round.head.slice(0, 12)}: run P codex-review --pr ${round.pr} --round <the n from round-request>\n`);
   else if (past) process.stdout.write(`[claude-pipeline owner-go] the owner's past-round approval is recorded for ${past.repo} #${past.pr} counted round ${past.k} head ${past.head.slice(0, 12)}: run P state past-round-grant --pr ${past.pr} --round <the n from round-request --past>\n`);
   else if (nudge) process.stdout.write(`${nudge}\n`);
+  // #262: the owner's typed go for a live-database change (lib/live-db-go.mjs, loaded lazily: a fault there never touches the merge recorders above). One line when it records;
+  // when the prompt reads as a go and nothing was recorded, one line with the reason, so Claude presents the block again.
+  try {
+    const { liveDbGoOutcome } = await import('./lib/live-db-go.mjs');
+    const go = liveDbGoOutcome(input);
+    if (go?.record) process.stdout.write(`[claude-pipeline owner-go] the owner's live-database go is recorded: ${go.record.op} ${go.record.op === 'migration' ? go.record.name : go.record.sqlSha256.slice(0, 12)} on ${go.label} (${go.record.projectRef}).\n`);
+    else if (go?.reason) process.stdout.write(`[claude-pipeline owner-go] the owner's go for a live-database change was NOT recorded: ${go.reason}. Run \`pipeline live-db present\` again, end the reply with its block, and ask the owner once more.\n`);
+  } catch { /* never block or break a prompt */ }
   if (record) {
     const shown = record.requests.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${q.head} items ${q.items}`);
     const prs = record.prs.map((n) => `#${n}`).join(', ');

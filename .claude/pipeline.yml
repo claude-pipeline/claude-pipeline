@@ -100,7 +100,7 @@ risk:
     "pipeline/lib/schedule.mjs", "pipeline/lib/cmd-io.mjs", "pipeline/lib/merge-cleanup.mjs",
     "pipeline/lib/stacks/config.mjs", "pipeline/lib/stacks/result.mjs", "pipeline/lib/worktree-prune/live-sessions.mjs",
     "pipeline/commands/summary.mjs", "pipeline/commands/queue-sweep.mjs", "pipeline/commands/merge-hold.mjs", "pipeline/commands/job.mjs", "pipeline/commands/round.mjs", "pipeline/commands/update-branch.mjs", "pipeline/commands/redraft.mjs", "pipeline/commands/protect.mjs", "pipeline/commands/repo-move.mjs", "pipeline/commands/smoke.mjs", "pipeline/commands/followups.mjs", "pipeline/commands/artifacts.mjs", "pipeline/commands/vendor.mjs", "pipeline/commands/agent-log.mjs",
-    "pipeline/commands/cost.mjs", "pipeline/commands/db-refs.mjs",
+    "pipeline/commands/cost.mjs", "pipeline/commands/db-refs.mjs", "pipeline/commands/live-db.mjs",
     "pipeline/lib/agentlog.mjs", "pipeline/lib/agentlog-close.mjs",
     "pipeline/lib/click-ask.mjs", "pipeline/lib/local-branches.mjs", "pipeline/commands/owner-go.mjs",
     "test/repo-risk-config.test.mjs", "test/fixtures/static-imports.mjs",

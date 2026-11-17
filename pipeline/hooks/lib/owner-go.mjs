@@ -38,7 +38,7 @@ import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcr
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
-const FUTURE_SKEW_MS = 5 * 60 * 1000;
+export const FUTURE_SKEW_MS = 5 * 60 * 1000;
 const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const PROVENANCE_CHUNK_BYTES = 4 * 1024 * 1024; // promptProvenance reads the transcript backwards in chunks this big …
 const PROVENANCE_CAP_BYTES = 64 * 1024 * 1024; // … and gives up (missing) this far back
@@ -254,7 +254,7 @@ export function presentedRuling(text) {
 const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
 // (round 4: a user message is a prompt unless it carries a tool_result: an image-only message is one too, with no text)
 const isPromptEntry = (e) => e?.type === 'user' && (typeof e.message?.content === 'string' || (Array.isArray(e.message?.content) && !e.message.content.some((b) => b?.type === 'tool_result')));
-const promptTextOf = (e) => {
+export const promptTextOf = (e) => {
   const c = e?.message?.content;
   return plain(typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n') : '');
 };
@@ -502,7 +502,9 @@ function originsOf(entries) {
 }
 
 export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
-  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  return replyOf(tailEntries(transcriptPath, tailBytes).entries, { prompt, skipSynthetic });
+}
+function replyOf(entries, { prompt, skipSynthetic = false } = {}) {
   const { origin, parent } = originsOf(entries);
   const hidden = (i) => invisibleNote(entries, parent, i);
   // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
@@ -579,6 +581,20 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
 
+// #262 (Fable F5): the reply slot right BEFORE the prompt entry with that promptId, read as it stood when the owner typed (the ruling reader's rules: skipSynthetic), whatever came after:
+// the live-database claim rebuilds the block the owner was shown from it, so a record a script appended with a different hash than that block fails. { text } | { reason }.
+// (A bigger window than the recorders': the claim can come up to two hours after the prompt.)
+const REPLY_BEFORE_TAIL_BYTES = 16 * 1024 * 1024;
+export function replyBefore(transcriptPath, promptId, { tailBytes = REPLY_BEFORE_TAIL_BYTES } = {}) {
+  if (typeof promptId !== 'string' || promptId === '') return { reason: 'the record has no prompt id' };
+  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  const at = [];
+  entries.forEach((e, i) => { if (isPromptEntry(e) && e.promptId === promptId) at.push(i); });
+  if (at.length === 0) return { reason: 'the owner\'s prompt is not in the transcript window' };
+  if (at.length > 1) return { reason: 'two prompt entries carry that prompt id' };
+  return { text: replyOf(entries.slice(0, at[0] + 1), { prompt: promptTextOf(entries[at[0]]), skipSynthetic: true }).text };
+}
+
 // ---- #128: is this prompt the owner's words? --------------------------------------------------------------------------------------
 
 // The openings of a prompt the harness (or another model) writes: a background-task notice, a system reminder, another session's or
@@ -623,10 +639,10 @@ export function notOwnerWords(input, transcriptPath) {
 // is read as the answer to the LAST ask of that reply, which may be newer than what the owner had on screen when typing; the transcript cannot tell (the queue-operation entries are no
 // record of when the owner typed). So it records nothing and approves nothing, for a "merge", an "extra round" and a ruling alike: the agent shows the request again, the owner answers once more.
 // True only when the transcript already holds the entry; for a hook that runs before it does, promptProvenance refuses the record at use time.
-const queuedAnswer = (input) => currentPromptEntry(String(input?.transcript_path ?? ''), input?.prompt)?.promptSource === 'queued';
+export const queuedAnswer = (input) => currentPromptEntry(String(input?.transcript_path ?? ''), input?.prompt)?.promptSource === 'queued';
 
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
-function notOwnerPrompt(input) {
+export function notOwnerPrompt(input) {
   if (input?.hook_event_name !== undefined && input.hook_event_name !== 'UserPromptSubmit') return true;
   if (input?.agent_id !== undefined && input.agent_id !== null && input.agent_id !== '') return true;
   const tp = String(input?.transcript_path ?? '').replaceAll('\\', '/');
@@ -775,12 +791,20 @@ export function rulingNudge(input) {
 // agent (plain text on stdout, never blocking): re-run the request command so the closing lines are FRESH (a stale Head line re-shown by hand would bind a stale head) and ask again. Said
 // whether or not an ask was shown (over-nudging is harmless); not for a prompt that is evidently not the owner's. Takes precedence over the ruling nudge.
 export const QUEUED_NUDGE = '[claude-pipeline owner-go] the owner\'s answer was typed while the agent was still working, so it was not recorded: re-run the dry run (`P merge --pr N --dry-run --owner-go`), `P triage round-request` or `P triage ruling-request`, show the FRESH closing lines, and ask the owner once more after the reply ends.';
+// #262: the owner's typed go for a live-database change: `go migration <name>` or `go data <sha12>` and nothing else. (Here, not in live-db-go.mjs, so queuedNudge can read it without an import cycle.)
+export const GO_PROMPT_MAX = 300;
+export function parseGo(prompt) {
+  if (typeof prompt !== 'string' || prompt.length > GO_PROMPT_MAX) return null;
+  const m = /^\s*go (migration|data) ([A-Za-z0-9_.-]{0,119}[A-Za-z0-9_-])[.!]?\s*$/i.exec(prompt);
+  return m ? { op: m[1].toLowerCase(), arg: m[2] } : null;
+}
 export function queuedNudge(input) {
   try {
     if (notOwnerPrompt(input)) return null;
     const answer = input?.prompt;
     if (typeof answer !== 'string') return null;
     const readsAsAnswer = parseApproval(answer) !== null
+      || parseGo(answer) !== null
       || (answer.length <= ROUND_GRANT_PROMPT_MAX && (parseRoundGrant(answer) !== null || parsePastRoundGrant(answer) !== null))
       || (answer.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim()));
     if (!readsAsAnswer || notOwnerWords(input, String(input?.transcript_path ?? ''))) return null;
@@ -888,9 +912,14 @@ export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REP
 // otherwise pass for the owner's words) and NOT $CLAUDE_CONFIG_DIR (this runs in the agent's shell: `CLAUDE_CONFIG_DIR=/tmp/.claude-x P merge`). `home` is the account's home (accountHome, never $HOME); tests pass a temp one.
 // An entry of unknown source (no provenance field) counts as the owner's ONLY when no prompt in the scanned transcript carries any
 // such field (a genuinely old Claude Code); in a modern transcript it is untrusted, and so is an unknown one when the scan fell short of the start.
-export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, home = accountHome() } = {}) {
+export function promptProvenance(record, opts = {}) {
+  return promptEntryOf(record, opts).source;
+}
+// The same lookup, with the entry it found: { source: 'owner'|'synthetic'|'missing', entry } (entry only when one was found). #262: the live-database claim reads the entry's text and timestamp.
+export function promptEntryOf(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, home = accountHome() } = {}) {
+  const missing = { source: 'missing' };
   const file = record?.transcript_path;
-  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { home })) return 'missing';
+  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { home })) return missing;
   let match;
   if (typeof record.prompt_id === 'string' && record.prompt_id !== '') {
     const id = record.prompt_id;
@@ -898,22 +927,22 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
   } else if (typeof record.prompt === 'string' && record.prompt.trim() !== '') {
     const at = Date.parse(record.ts);
     const words = plain(record.prompt);
-    if (!Number.isFinite(at)) return 'missing';
+    if (!Number.isFinite(at)) return missing;
     match = { wants: (line) => line.includes('"user"'), is: (e) => isPromptEntry(e) && promptTextOf(e) === words && Math.abs(Date.parse(e.timestamp) - at) <= FALLBACK_WINDOW_MS };
   } else {
-    return 'missing';
+    return missing;
   }
   const found = [];
   const scan = scanBackwards(file, (e) => { if (match.is(e)) found.push(e); return found.length >= 2; }, match.wants, { chunkBytes, capBytes });
-  if (scan === null || found.length === 0) return 'missing';
-  if (found.length > 1) return 'synthetic';
-  if (found[0].promptSource === 'queued') return 'synthetic'; // (#191 B2, every record kind: a queued answer may land on an ask newer than what the owner had on screen; #189 refused only a promoted ask's)
+  if (scan === null || found.length === 0) return missing;
+  if (found.length > 1) return { source: 'synthetic' };
+  if (found[0].promptSource === 'queued') return { source: 'synthetic', entry: found[0] }; // (#191 B2, every record kind: a queued answer may land on an ask newer than what the owner had on screen; #189 refused only a promoted ask's)
   const source = entrySource(found[0]);
-  if (source !== 'unknown') return source;
+  if (source !== 'unknown') return { source, entry: found[0] };
   // unknown: legacy only if the whole transcript is free of provenance fields
   let modern = false;
   const whole = scanBackwards(file, (e) => { if (isPromptEntry(e) && hasProvenanceField(e)) modern = true; return modern; }, (line) => line.includes('"user"'), { chunkBytes, capBytes });
-  return whole !== null && whole.reachedStart && !modern ? 'owner' : 'synthetic';
+  return { source: whole !== null && whole.reachedStart && !modern ? 'owner' : 'synthetic', entry: found[0] };
 }
 
 // Visits the parsed lines of a file newest first, in chunk-sized reads, at most capBytes back from the end; `wants(line)` filters before the

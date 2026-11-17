@@ -875,8 +875,10 @@ function physicalTargets(target, ctx) {
 
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 // #472: and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs): run by hand with an injected check they would write a pending click with a made-up capture-time hook result.
-const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go(?:-click(?:-hook)?)?\.mjs$/i;
-const OWNER_GO_WORD = /owner-go(?:-click(?:-hook)?)?\.mjs/i;
+// #262: and the live-database go recorder (lib/live-db-go.mjs): run by hand it would write a "typed go" the owner never typed. ONE alternation feeds both expressions, so the path check and the word / stdin checks cannot drift apart.
+const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go`;
+const OWNER_GO_RECORDER = new RegExp(String.raw`(?:^|/)hooks/(?:lib/)?(?:${OWNER_GO_LIBS})\.mjs$`, 'i');
+const OWNER_GO_WORD = new RegExp(String.raw`(?:${OWNER_GO_LIBS})\.mjs`, 'i');
 
 const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json, the owner-go records (~/.claude/pipeline-state/owner-go) and the database registry (~/.claude/pipeline-state/db-refs.json) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
@@ -2524,7 +2526,7 @@ function isPipelineTool(arg, ctx) {
 function pipelineToolInRaw(raw, ctx) {
   const t = expandRefs(raw, ctx);
   const root = escapeRe(`${ctx.homePosix}/.claude/pipeline`);
-  if (/owner-go/i.test(t)) return false;
+  if (/owner-go|live-db-go/i.test(t)) return false;
   return new RegExp(`^\\s*(?:\\S*/)?node(?:\\.exe)?\\s+["']?${root}/(?:bin/pipeline\\.mjs|hooks/[^\\s'"]*)(?:["']?\\s|["']?$)`, ctx.ci ? 'i' : '').test(t);
 }
 
