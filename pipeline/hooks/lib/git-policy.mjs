@@ -2471,14 +2471,13 @@ const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || nextSep(cmds, i) === 
 const VALUE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select']);
 const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree', 'config']);
 // R1-F1: can this git command move a branch (what trackGit records: checkout / switch, a rebase with two positionals, symbolic-ref HEAD <ref>, branch -m / -M, worktree add)? A read (`symbolic-ref --short HEAD`,
-// `config --get`, `branch -r`, `worktree list`) raises no branch doubt. (the words are the command's own, global options included: an option's value counts as a positional, which only over-doubts)
+// `config --get`, `branch -r`, `worktree list`) raises no branch doubt. (#558: the subcommand is the one parseGitGlobal finds after the global options, so a -C / --git-dir value spelled like a subcommand is not read as one)
 const MOVER_SUBS = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree']);
-const movesBranch = (argv) => {
-  const at = argv.findIndex((w) => MOVER_SUBS.has(w));
-  if (at < 0) return false;
-  const rest = argv.slice(at + 1);
+const movesBranch = (argv, ctx) => {
+  const { sub, args: rest } = parseGitGlobal(argv, null, {}, ctx);
+  if (!MOVER_SUBS.has(sub)) return false;
   const pos = rest.filter((w) => !w.startsWith('-'));
-  switch (argv[at]) {
+  switch (sub) {
     case 'rebase': return pos.length >= 2;
     case 'symbolic-ref': return pos.length >= 2 && pos.includes('HEAD');
     case 'branch': return rest.some((w) => w === '--move' || /^-[a-zA-Z]*[mM]/.test(w));
@@ -3574,7 +3573,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const changedState = argv.length > 0 && stateChanged(ctx, before);
     if (argv.length > 0 && (changesStateWords || changedState)) {
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', ran: how === 'chain' && surelyRan(c), lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', ran: how === 'chain' && surelyRan(c), lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       if (changesStateWords && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond, from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {

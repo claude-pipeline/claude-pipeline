@@ -324,3 +324,13 @@ describe('ordinary work stays allowed', () => {
   OK('a tee into the work tree, then the push', 'npm test | tee out.log; git push');
   OK('a copy into the work tree, then the push', 'cp a.txt b.txt; git push');
 });
+
+// #558: production failure: a -C / --git-dir / --work-tree value spelled like a git subcommand (`git -C worktree checkout main`) was read as that subcommand, so the checkout inside the parentheses raised
+// no branch doubt and the push after it was judged on the branch the directory had on disk
+describe('#558: movesBranch takes the subcommand, not the first mover word (a global option value is skipped)', () => {
+  for (const word of ['worktree', 'branch', 'rebase', 'symbolic-ref']) {
+    test(`denied: (git -C ${word} checkout main); a push after it`, () => expect('deny', `(git -C ${word} checkout main); git push`));
+  }
+  test('denied: --git-dir with a value spelled like a subcommand', () => expect('deny', '(git --git-dir branch checkout main); git push'));
+  test('reference: the same checkout without the odd -C value was already denied', () => expect('deny', '(git -C sub checkout main); git push'));
+});
