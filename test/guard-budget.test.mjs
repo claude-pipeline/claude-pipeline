@@ -250,9 +250,12 @@ const PROTECTED_WRITE = `echo x > ~/.claude/${'sett'}${'ings.json'}`; // what gu
 for (const [name, run] of both) {
   const decide = (cmd, o) => run(cmd, {}, o);
   const BAD = name === 'guard-git' ? MAIN_PUSH : PROTECTED_WRITE;
-  test(`${name}: the parenthesis scan inside \${...} is linear (CPU time at 2n vs n)`, () => {
-    const sample = (n) => () => cpuTime(() => decide(parenBomb(n, 'echo hi')));
-    assertLinear(sample(20_000), sample(40_000), { label: `${name} paren scan` });
+  // 100,000 parentheses against 25,000 (linear 4x, quadratic 16x), ratio 8 is 2x from each, as in guard-r10-288 B1; a span of 2x (20,000 vs 40,000) had only 1.5x of margin and flaked under load. 100,000 is about as large as the scan goes: past it the guard refuses the line by its size, which costs nothing and would read as "fast".
+  // One call is only 1-20 ms there, so a sample repeats it (the baseline is tens of ms, well above the helper's slack, and a quadratic cannot hide in it).
+  test(`${name}: the parenthesis scan inside \${...} is linear (CPU time at 4n vs n)`, () => {
+    const REPS = 20;
+    const sample = (n) => () => cpuTime(() => { for (let i = 0; i < REPS; i++) decide(parenBomb(n, 'echo hi')); });
+    assertLinear(sample(25_000), sample(100_000), { label: `${name} paren scan`, factor: 4, ratio: 8 });
   });
 
   test(`${name}: 150,000 open parentheses in \${...} then a guarded command is denied, and fast`, () => {
