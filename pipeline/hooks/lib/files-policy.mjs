@@ -21,6 +21,7 @@ import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
+import { evaluateSupabaseMcp, isSupabaseTool } from './live-db-guard.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, samePath, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice } from './shell-parse.mjs';
@@ -919,7 +920,18 @@ function mcpFields(ti) {
   return { paths: paths.slice(0, 500), contents, values: values.slice(0, 2000) };
 }
 
+// #262: a Supabase MCP tool is judged by every generic rule below first, then by the live-database rules (lib/live-db-guard.mjs), LAST: the rules there consume the owner's go, so no other
+// rule may deny the same call after it (a go is spent at the attempt).
 function evaluateMcp(tool, ti, input, opts) {
+  const generic = evaluateMcpGeneric(tool, ti, input, opts);
+  if (generic.decision === 'deny' || !isSupabaseTool(tool)) return generic;
+  if ((opts.env ?? process.env).PIPELINE_ADMIN === '1') return allow();
+  return evaluateSupabaseMcp(tool, ti, {
+    home: opts.home || os.homedir(), sessionId: input?.session_id, transcriptPath: input?.transcript_path, now: opts.now, io: opts.liveDbIo,
+  });
+}
+
+function evaluateMcpGeneric(tool, ti, input, opts) {
   const last = tool.split('__').pop();
   if ((opts.env ?? process.env).PIPELINE_ADMIN === '1') return allow();
   if (MCP_READ_ONLY.test(last)) return allow();

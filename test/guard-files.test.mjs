@@ -531,7 +531,8 @@ const MCP_ALLOW = [
   ['write_file mentioning disableAllHooks outside a settings file', 'mcp__filesystem__write_file', { path: '/repo/docs/n.md', content: 'about disableAllHooks' }],
   ['write_file documenting the guard without assigning PIPELINE_ADMIN', 'mcp__filesystem__write_file', { path: '/repo/docs/n.md', content: 'the PIPELINE_ADMIN guard' }],
   ['write tool with no path keys', 'mcp__notes__create_note', { title: 't', text: 'launch with PIPELINE_ADMIN=1 claude' }],
-  ['database tool', 'mcp__plugin_supabase_supabase__apply_migration', { name: 'x', query: 'select 1' }],
+  // (#262: a Supabase WRITE with no project_id is refused now, test/live-db-guard.test.mjs; the allow row keeps a read-class database tool)
+  ['database tool', 'mcp__plugin_supabase_supabase__list_tables', { project_id: 'abcdefghij0123456789', schemas: ['public'] }],
   ['issue update with no path keys', 'mcp__sentry__update_issue', { issueId: 'A-1', status: 'resolved' }],
   ['no tool_input', 'mcp__filesystem__write_file', undefined],
   ['non-string path values', 'mcp__filesystem__write_file', { path: 7, paths: [null, {}], content: 'x' }],
