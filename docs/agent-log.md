@@ -232,3 +232,4 @@ full record.
 - 2026-11-17 · #574 · Click/merge follow-ups from #527: clean-status merge retry, newest-first clicks, wording · risk high · rounds 4 · arbiter 3 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 16359 runs (15843 high)
 - 2026-11-17 · #362 · guard: a Next.js start script is no longer refused; a cd to the script's own folder no longer hides npm/npx bins (#352) · risk high · rounds 43 · arbiter 42 (fix-verify 2) · substitute 2 · blocked · Codex 7d: 16361 runs (15843 high)
 - 2026-11-17 · #536 · Round discipline 2: fewer avoidable review rounds + tighter test-writing rules · risk high · rounds 12 · arbiter 10 · substitute 1 · awaiting-owner-merge · Codex 7d: 16367 runs (15843 high)
+- 2026-11-17 · #242 · Queue: refuse pre-switch branches (+ update-branch catch-up), fix queue-guards template, fold #237 #238 #239 and EW #1784 #1785 · risk high · rounds 28 · arbiter 24 (fix-verify 3) · substitute 3 · awaiting-owner-merge · Codex 7d: 16367 runs (15843 high)
