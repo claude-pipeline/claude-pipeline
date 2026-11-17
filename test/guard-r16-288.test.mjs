@@ -30,6 +30,8 @@ const allows = (label, cases) => {
     });
   }
 };
+// A frozen clock for the cases that only judge text (the guard's 5 s deadline can never fire on a loaded machine and deny an allow case).
+const frozen = (cases) => cases.map(([name, line, extra]) => [name, line, { ...(extra ?? PROJ), now: () => 0 }]);
 const body = 'cd proj && find . -delete\n';
 const A = stub({ '/home/u/proj/a.sh': body });
 const SWX = 'export BASHOPTS=cdable_vars\n'; // (a switch file handed to every child shell)
@@ -73,7 +75,7 @@ describe('R16-F2: the late switch reaches package scripts, bins, splices and sta
 describe('R16-F1: a child shell given the option on its own command line', () => {
   const E = 'export proj=/home/u; ';
   const LS = stub({ '/home/u/proj/a.sh': 'cd proj && ls\n' });
-  denies('F1', [
+  denies('F1', frozen([
     ['bash -O cdable_vars -c (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}bash -O cdable_vars -c 'cd proj && find . -delete'`],
     ['bash -O cdable_vars FILE (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}bash -O cdable_vars ./a.sh`, A],
     ['bash +O cdable_vars FILE (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}bash +O cdable_vars ./a.sh`, A],
@@ -96,8 +98,8 @@ describe('R16-F1: a child shell given the option on its own command line', () =>
     ['stdin feed: cat file | zsh -T (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}cat ./a.sh | zsh -T`, A],
     ['sh -O cdable_vars -s (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}sh -O cdable_vars -s < ./a.sh`, A],
     ['a shebang that names the option (R19 owner decision: a plain cd name narrows unless CDPATH is set)', `${E}./a.sh`, stub({ '/home/u/proj/a.sh': `#!/usr/bin/env -S zsh -T\n${body}` })],
-  ]);
-  allows('F1', [
+  ]));
+  allows('F1', frozen([
     ['bash -euo pipefail FILE', `${E}bash -euo pipefail ./a.sh`, LS],
     ['bash -o pipefail -c', `${E}bash -o pipefail -c 'cd proj && ls'`],
     ['bash -c (existing pin)', `${E}bash -c 'cd proj && ls'`],
@@ -108,7 +110,7 @@ describe('R16-F1: a child shell given the option on its own command line', () =>
     ['no export, bash -euo pipefail FILE', 'bash -euo pipefail ./a.sh', LS],
     ['a first operand that is a path built at run time is the file, not options', `${E}D=/home/u/proj; bash "$D/a.sh"`, LS],
     ['bash -c with a run-time text', `${E}bash -c "$CMD"`],
-  ]);
+  ]));
 });
 
 describe('R16-F3: fed text that runs in this shell is absorbed', () => {
