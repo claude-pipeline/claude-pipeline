@@ -494,28 +494,42 @@ test('R2-B2: a fragment that switches the branch does not change the state the j
     assert.equal(r.decision, 'deny', `${c} -> ${r.reason}`);
   }
   // and what the fragments changed does not leak to the commands AFTER the feed: the real text `#git switch agent/x` switches nothing, so the later push is from main
-  const leak = () => fakeFs(GIT_ROOT, { 'a.sh': '#', 'b.sh': 'git switch agent/x\n', 'p.sh': 'git push\n' }, ['sub', 'd']);
+  const leak = () => fakeFs(GIT_ROOT, { 'a.sh': '#', 'b.sh': 'git switch agent/x\n', 'p.sh': 'git push\n', 'pn.sh': 'git push origin agent/x\n' }, ['sub', 'd']);
   for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, leak()).decision, 'deny', c);
-  assert.equal(gitOnMain('cat b.sh | bash; bash p.sh', leak()).decision, 'allow'); // b alone IS the switch (a single file carries)
+  assert.equal(gitOnMain('eval "$(cat b.sh)"; bash p.sh', leak()).decision, 'allow', 'eval'); // b alone IS the switch (eval runs it in this shell: a single file carries)
+  // #352 R38-F2: a script's change never carries over to its caller (owner decision): `bash b.sh` is a child that may have ended before the switch; the push that names the branch is the twin
+  assert.equal(gitOnMain('bash b.sh; bash p.sh', leak()).decision, 'deny', 'bash b.sh');
+  assert.equal(gitOnMain('bash b.sh; bash pn.sh', leak()).decision, 'allow', 'bash b.sh, naming the branch');
+  assert.equal(gitOnMain('bash < b.sh; bash p.sh', leak()).decision, 'deny'); // (#352 R35: a `<` redirection can fail before bash runs: the switch may not have happened)
+  assert.equal(gitOnMain('cat b.sh | bash; bash p.sh', leak()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   // c alone pushes from main too (the baseline); the rewriting producer's files are scanned, never carried
   assert.equal(gitOnMain('cat c.sh | bash', fs()).decision, 'deny');
 });
 
 // (the later push is in a NAMED script: a push written on the line itself makes the guard refuse any run-time fed shell before this matters)
-const carried = () => ({ 'a.sh': 'git switch ', 'b.sh': 'agent/x\n', 'sw.sh': 'git switch agent/x\n', 'st.sh': 'git status\n', 'p.sh': 'git push\n' });
+const carried = () => ({ 'a.sh': 'git switch ', 'b.sh': 'agent/x\n', 'sw.sh': 'git switch agent/x\n', 'st.sh': 'git status\n', 'p.sh': 'git push\n', 'pn.sh': 'git push origin agent/x\n' });
 
 test('R2-B2: the joined program is the real one: its own branch switch carries on to the commands after it', () => {
   const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
   assert.equal(gitOnMain('bash p.sh', fs()).decision, 'deny'); // the baseline: p pushes from main
   // a + b = `git switch agent/x`: the rest of the line is on agent/x, where a push is allowed
-  for (const c of ['cat a.sh b.sh | bash; bash p.sh', 'bash <(cat a.sh b.sh); bash p.sh', 'eval "$(cat a.sh b.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c);
+  assert.equal(gitOnMain('eval "$(cat a.sh b.sh)"; bash p.sh', fs()).decision, 'allow', 'eval'); // (eval runs the joined text in this shell: its switch carries on)
+  // #352 R38-F2: a script's change never carries over to its caller (owner decision): the shell `bash <(…)` starts is a child that may have ended before the switch; the push that names the branch is the twin
+  assert.equal(gitOnMain('bash <(cat a.sh b.sh); bash p.sh', fs()).decision, 'deny', 'bash <(cat a.sh b.sh)');
+  assert.equal(gitOnMain('bash <(cat a.sh b.sh); bash pn.sh', fs()).decision, 'allow', 'bash <(cat a.sh b.sh), naming the branch');
+  assert.equal(gitOnMain('cat a.sh b.sh | bash; bash p.sh', fs()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   // without the switch (b alone is just a word, st is a status) the line stays on main
   for (const c of ['cat b.sh | bash; bash p.sh', 'cat st.sh st.sh | bash; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'deny', c);
 });
 
 test('R2-B2: a feed with ONE file keeps carrying that file\'s real state changes', () => {
   const fs = () => fakeFs(GIT_ROOT, carried(), ['sub', 'd']);
-  for (const c of ['cat sw.sh | bash; bash p.sh', 'bash < sw.sh; bash p.sh', 'eval "$(cat sw.sh)"; bash p.sh']) assert.equal(gitOnMain(c, fs()).decision, 'allow', c); // the switch is real
+  assert.equal(gitOnMain('eval "$(cat sw.sh)"; bash p.sh', fs()).decision, 'allow', 'eval'); // the switch is real (eval runs it in this shell)
+  // #352 R38-F2: a script's change never carries over to its caller (owner decision): `bash sw.sh` is a child that may have ended before the switch; the push that names the branch is the twin
+  assert.equal(gitOnMain('bash sw.sh; bash p.sh', fs()).decision, 'deny', 'bash sw.sh');
+  assert.equal(gitOnMain('bash sw.sh; bash pn.sh', fs()).decision, 'allow', 'bash sw.sh, naming the branch');
+  assert.equal(gitOnMain('bash < sw.sh; bash p.sh', fs()).decision, 'deny'); // (#352 R35: a `<` redirection can fail before bash runs: the switch may not have happened)
+  assert.equal(gitOnMain('cat sw.sh | bash; bash p.sh', fs()).decision, 'deny'); // (#352 R10: a change in a pipeline stage is unknown after it)
   assert.equal(gitOnMain('cat st.sh | bash; bash p.sh', fs()).decision, 'deny'); // nothing switched: still main
 });
 

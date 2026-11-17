@@ -1751,13 +1751,14 @@ test('directory / branch / variable state from a command that may not have run i
     'B=agent/x & git push origin HEAD:$B',
   ];
   for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  // (#352 R37: no redirection on a cd is trusted, not even before && (a failed redirection means the cd never ran, and a text ending in one must not hand the move on): was allowed, a redirect is not a background job)
+  assert.equal(evaluate('cd /safe > /dev/null 2>&1 && git push', o).decision, 'deny');
   const allowCmds = [
     'cd /safe && git push',
     'true && cd /safe && git push',
     'git checkout agent/y && git push',
     'cd /safe; git push',
     'git checkout agent/y; git push',
-    'cd /safe > /dev/null 2>&1 && git push', // redirects and &> are not a background job
     'cd /safe &>/dev/null; git status',
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);

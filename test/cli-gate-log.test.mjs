@@ -74,6 +74,30 @@ test('summary: upserts the marker comment from the state and prints the agent-lo
   assert.match(body, /\*\*merged\*\*/);
 });
 
+// Failure caught: a summary posted after the PR's commits are already inside the base ref (a merge-commit merge) replaced the real "Tests added" line with zeros.
+test('summary: the Tests added line is left out when the diff against the base ref is empty, and present when a line changed', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  saveState(repo.dir, summaryState());
+
+  const empty = summaryGh();
+  const none = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: empty });
+  assertExit(none, 0, none.stderr + none.stdout);
+  assert.equal(none.json.testsAdded, undefined, 'HEAD is the base ref: nothing changed, no line of zeros');
+  assert.doesNotMatch(JSON.parse(empty.calls().find((c) => c.argv.includes('POST')).stdin).body, /Tests added/);
+
+  repo.branch('feat/x');
+  repo.write('src/a.js', 'export const a = 1;\n');
+  repo.commit('add a');
+  const changed = summaryGh();
+  const some = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: changed });
+  assertExit(some, 0, some.stderr + some.stdout);
+  assert.match(some.json.testsAdded, /^Tests added: 0 files, 0 cases; changed source lines : test lines = 1 : 0$/);
+  assert.match(JSON.parse(changed.calls().find((c) => c.argv.includes('POST')).stdin).body, /Tests added: 0 files, 0 cases; changed source lines : test lines = 1 : 0/);
+});
+
 test('summary: the agent-log line ends with the weekly Codex figure (7 days, every repo); codexUsage is in the JSON; the pending line carries it too', () => {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml());

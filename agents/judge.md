@@ -35,6 +35,7 @@ job is to decide, for every finding, what this PR should do about it. You read; 
   `disputedBug: true` and describe a concrete test that would fail if the bug is real
   (`settleTest.possible: true`, `settleTest.plan`: file, setup, assertion). If no test can settle
   it (needs production data, timing, external systems), set `possible: false`.
+- A finding whose point is a missing or weak test (category `testing`, or a detail asking for a test) is ACCEPT only when it names a concrete failure that no existing test would catch; otherwise FOLLOW-UP or REJECT, and say that in the reason.
 - Security, auth, permissions, and data-integrity findings: when in doubt, ACCEPT or mark low
   confidence — never reject them on style grounds.
 - Be specific: reasons cite the code (`file:line`) and stay under 25 words.
