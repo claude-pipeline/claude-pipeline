@@ -319,7 +319,7 @@ function supersedeOlder(ask, home) {
 
 // ---- answer -> binding (B1): the same cores as the typed path ---------------------------------------------------------------------------
 
-// What the chosen answer says, per the ask's action map: { declined: label } | { text } | { error }. An exact label maps by `actions`; several labels (multiSelect) joined by ', ' must each
+// What the chosen answer says, per the ask's action map: { declined: label } | { instruction, label } | { text } | { error }. An exact label maps by `actions`; several labels (multiSelect) joined by ', ' must each
 // be an exact label; any other text (the dialog's "Other") is the owner's own words and goes through the strict parser as typed.
 function answerText(ask, raw) {
   if (typeof raw !== 'string' || raw.trim() === '') return { error: 'empty-answer' };
@@ -330,8 +330,11 @@ function answerText(ask, raw) {
     if (texts.some((t) => typeof t !== 'string' || !/^merge #\d{1,6}$/.test(t))) return { error: 'answer-not-a-label' };
     return { text: `merge ${texts.map((t) => t.slice(6)).join(' ')}` };
   }
-  if (Object.hasOwn(ask.actions, raw)) return ask.actions[raw] === null ? { declined: raw } : { text: ask.actions[raw] };
-  return { text: raw };
+  if (Object.hasOwn(ask.actions, raw)) {
+    const act = ask.actions[raw];
+    return act === null ? { declined: raw } : isInstruction(act) ? { instruction: act.instruction, label: raw } : { text: act };
+  }
+  return { text: raw }; // (also the label of ANOTHER variant's button typed into "Other": it is the owner's own words and dies in bindAnswer)
 }
 
 // The record body (without the click fields) a text answers a question with, using the typed recorders' cores: { kind, body } | { error }. `kind` is the record kind ('approval' has none on disk).
@@ -430,7 +433,7 @@ export function clickEvidence(transcriptPath, toolUseId, { home = accountHome() 
 const UNCHECKED = () => ({ ok: false, reason: 'dialog-hooks-unchecked' });
 const realSleep = (ms) => new Promise((resolve) => { setTimeout(resolve, ms); });
 
-// A PostToolUse hook input for AskUserQuestion -> the record the click makes. Returns { recorded: record, kind, replay? } | { declined: label, replay? } | { pending: { askId, clickId, kind, repo, prs, quotes? } }
+// A PostToolUse hook input for AskUserQuestion -> the record the click makes. Returns { recorded: record, kind, replay? } | { declined: label, replay? } | { instruction, kind, repo, prs, replay? } (a click on an instruction label: it grants and approves nothing) | { pending: { askId, clickId, kind, repo, prs, variant?, quotes? } }
 // | { refused: reason } | null (not ours: not AskUserQuestion, a subagent, no session, no ask id in the question's first line, an ask this machine never issued). Never throws. Async: on 2.1.322 the
 // transcript entry lands 100-200 ms after the hook starts (spike S6), so the evidence is polled for up to `pollMs` (500 ms) in 100 ms steps (`sleep` is injectable). On 2.1.323 it lands only after the
 // hooks have returned (#472): an entry still missing after the poll leaves the click PENDING (captureClick), verified when a consumer reads.
@@ -490,7 +493,7 @@ function evidenceRefusal({ ask, ev, session, now }) {
 
 // Why (#472): the tail of the recorder, the part that consumes the ask and writes the record, so the immediate path and settlePendingClicks admit a click through ONE core. `ev` is a transcript entry
 // that passed clickEvidence and evidenceRefusal; `hc` is the dialog-hook check's result (taken now by the immediate path, at capture time for a pending one: the fingerprint must equal the ask's
-// either way; it is not needed, and may be null, for a replay or a superseded ask). -> { recorded, kind, replay? } | { declined, replay? } | { refused, retry? }; `retry: true` marks a refusal that
+// either way; it is not needed, and may be null, for a replay or a superseded ask). -> { recorded, kind, replay? } | { declined, replay? } | { instruction, kind, repo, prs, replay? } | { refused, retry? }; `retry: true` marks a refusal that
 // is a state to try again later (an unreadable spent marker, a failed write), not a verdict: the deferred recorder leaves such a click pending. `io` (tests only) replaces the two writes.
 function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home, io = {} }) {
   const askId = ask.askId;
@@ -506,15 +509,17 @@ function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home
 
   const mapped = answerText(ask, ev.answer);
   if (mapped.error) return { refused: mapped.error };
-  const marker = { v: 1, askId, clickId, toolUseId, answeredAt: ev.answeredAt, dialogSha256: ask.dialogSha256, producerVersion: ev.version, hookLayersSha256: hc.hookLayersSha256 ?? null, session, declined: mapped.declined !== undefined };
+  // A decline and an instruction both write only the marker (no record, no grant marker, no round ticket). The instruction's marker also says `declined: true`, so a reader that does not know
+  // `instruction` reads "declined, nothing approved": fail-safe.
+  const marker = { v: 1, askId, clickId, toolUseId, answeredAt: ev.answeredAt, dialogSha256: ask.dialogSha256, producerVersion: ev.version, hookLayersSha256: hc.hookLayersSha256 ?? null, session, declined: mapped.declined !== undefined || mapped.instruction !== undefined, ...(mapped.instruction === undefined ? {} : { instruction: mapped.instruction }) };
   // The exclusive create decides who consumes the ask. Losing it to the SAME click (a hook retried, a second settler) is a replay: the winner's marker is read back and the click is finished from it.
   const lost = () => {
     const again = readSpent(askId, home);
     return again.state === 'ok' ? finishReplay({ spent: again.marker, ask, clickId, ev, session, cwd, home, transcriptPath, io }) : { refused: 'spent', ...(again.state === 'bad' ? { retry: true } : {}) };
   };
-  if (mapped.declined !== undefined) {
+  if (mapped.declined !== undefined || mapped.instruction !== undefined) {
     const made = write(askFile(askId, 'spent', home), marker, home);
-    return made === 'ok' ? { declined: mapped.declined } : made === 'exists' ? lost() : { refused: 'write-failed', retry: true };
+    return made === 'ok' ? (mapped.instruction === undefined ? { declined: mapped.declined } : instructionResult(ask, mapped.instruction)) : made === 'exists' ? lost() : { refused: 'write-failed', retry: true };
   }
   const bound = bindAnswer(ask, mapped.text, ev.question);
   if (bound.error) return { refused: bound.error }; // (nothing consumed: the owner can answer the same dialog again, or type)
@@ -525,10 +530,16 @@ function admitClick({ ask, ev, session, toolUseId, transcriptPath, cwd, hc, home
   return record === null ? { refused: 'record-write-failed', retry: true } : { recorded: record, kind: ask.kind };
 }
 
+const instructionResult = (ask, instruction) => ({ instruction, kind: ask.kind, repo: ask.repo, prs: [...ask.prs] });
+
 // The same click again (a hook retried, a crash between the marker and the record): never consumes twice. Same click id and a verifiable marker -> the record exists (returned) or is written now
 // from the marker's own answeredAt; anything else -> refused.
 function finishReplay({ spent, ask, clickId, ev, session, cwd, home, transcriptPath, io = {} }) {
   if (spent.clickId !== clickId || spent.answeredAt !== ev.answeredAt || spent.dialogSha256 !== ask.dialogSha256) return { refused: 'spent' };
+  // The marker's `instruction` is tested BEFORE `declined` (an instruction's marker says both). The same instruction is repeated only while the answer still maps to it.
+  const again = answerText(ask, ev.answer);
+  if (Object.hasOwn(spent, 'instruction')) return again.instruction !== undefined && again.instruction === spent.instruction ? { ...instructionResult(ask, spent.instruction), replay: true } : { refused: 'spent' };
+  if (again.instruction !== undefined) return { refused: 'spent' }; // (a marker without `instruction` for an answer that maps to one: never a record, never a decline line)
   if (spent.declined === true) return { declined: ev.answer, replay: true };
   const existing = readRecords({ home, session, maxAgeMs: Infinity, settle: false }).find((r) => r.via === 'ask' && r.ask?.clickId === clickId);
   if (existing) return { recorded: existing, kind: ask.kind, replay: true };
@@ -570,13 +581,13 @@ async function captureClick({ input, ask, askId, session, toolUseId, transcriptP
   return capturePending({ ask, askId, session, toolUseId, transcriptPath, cwd, hc, home, now });
 }
 
-// Why (#472): writes the pending pointer (exclusive create, 0600, fsync) and answers `{ pending: { askId, clickId, kind, repo, prs, quotes? } }` for the line the agent is told. `capturedAt` is taken
+// Why (#472): writes the pending pointer (exclusive create, 0600, fsync) and answers `{ pending: { askId, clickId, kind, repo, prs, variant?, quotes? } }` for the line the agent is told. `capturedAt` is taken
 // AFTER the hook check, just before the write (the time rules measure the answer against it). A retried hook finds its own pointer and answers with it without rewriting it; the per-ask cap counts
 // UNSETTLED pointers only (Fable F9) and never refuses the pointer a retry already has. `quotes` (a ruling ask only) is the answer text of each deciding label, the `--owner-quote` the consumer needs.
 function capturePending({ ask, askId, session, toolUseId, transcriptPath, cwd, hc, home, now }) {
   const clickId = clickIdOf(session, toolUseId, askId);
   const file = clickFile(askId, clickId, 'pending', home);
-  const result = { pending: { askId, clickId, kind: ask.kind, repo: ask.repo, prs: [...ask.prs], ...(ask.kind === 'ruling' ? { quotes: Object.fromEntries(Object.entries(ask.actions).filter(([, v]) => typeof v === 'string')) } : {}) } };
+  const result = { pending: { askId, clickId, kind: ask.kind, repo: ask.repo, prs: [...ask.prs], ...(ask.variant === undefined ? {} : { variant: ask.variant }), ...(ask.kind === 'ruling' ? { quotes: Object.fromEntries(Object.entries(ask.actions).filter(([, v]) => typeof v === 'string')) } : {}) } };
   const mine = readSmallJson(file);
   if (mine.state === 'ok') return mine.value?.clickId === clickId && mine.value.askId === askId ? result : { refused: 'write-failed' };
   if (mine.state === 'bad') return { refused: 'write-failed' }; // (a half-written pointer is no pointer: the owner types)
@@ -603,7 +614,7 @@ export const CAPTURE_SKEW_MS = 15 * 1000;
 // Scheduling only, never evidence: a unit captured longer ago than this is RETIRED: it is scanned after the active ones, newest first (#528), so the click the owner just made is reached before old stuck ones. Nothing is refused or settled on time alone but the evidence expiry.
 export const WAIT_GRACE_MS = 10 * 60 * 1000;
 export const SETTLE_SCAN_BUDGET = 32; // transcript scans (clickEvidence calls) one settlePendingClicks call makes
-const SETTLED_OUTCOMES = Object.freeze(['recorded', 'declined', 'refused']);
+const SETTLED_OUTCOMES = Object.freeze(['recorded', 'declined', 'instructed', 'refused']); // 'instructed': a click on an instruction label (Follow up): verified, grants nothing
 
 // Why (#472): whether the ask was superseded BEFORE the answer, which is what the answer is judged by. A click settled long after it was made must not be refused because a newer dry run issued a
 // fresh ask afterwards (the owner had answered the then-current dialog), and must not be admitted because nobody settled it before the supersession. No marker -> false. A marker whose superseding ask
@@ -642,8 +653,8 @@ let settling = false;
 // transcript scans per call; a unit is started only below it, then looked at whole). A unit's members go in capturedAt order and the walk STOPS at the first one that is not terminal, so a later click is
 // never admitted ahead of an earlier, still-unverified one (Fable F7). Nothing is refused or settled on time alone but the evidence expiry capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS: after that even a
 // verified grant would be past its 24 h use window. A missing or unreadable transcript is `waiting`; an unreadable spent marker, a failed write and the like are `retry` (no `.settled`); every
-// verdict (recorded, declined, refused) writes `<askId>.<clickId>.settled`, and a click that loses that race reports the winner's outcome. Garbled pointers are skipped (`skipped`, no budget).
-// -> { outcomes: [{ askId, clickId, outcome: 'recorded' | 'declined' | 'refused' | 'waiting' | 'retry' | 'skipped', reason? }], problems }.
+// verdict (recorded, declined, instructed, refused) writes `<askId>.<clickId>.settled`, and a click that loses that race reports the winner's outcome. Garbled pointers are skipped (`skipped`, no budget).
+// -> { outcomes: [{ askId, clickId, outcome: 'recorded' | 'declined' | 'instructed' | 'refused' | 'waiting' | 'retry' | 'skipped', reason? }], problems }.
 export function settlePendingClicks({ home = accountHome(), now = Date.now, askId = null, session = null, io = {} } = {}) {
   const out = { outcomes: [], problems: [] };
   if (settling) return out;
@@ -727,6 +738,7 @@ function settleOne(p, { home, now, nowMs, io, scanned }) {
     return finish('recorded');
   }
   if (r.declined !== undefined) return finish('declined');
+  if (r.instruction !== undefined) return finish('instructed');
   return r.retry ? { outcome: 'retry', reason: r.refused } : finish('refused', r.refused);
 }
 
@@ -816,6 +828,7 @@ export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 
         if (s.state === 'ok' && isObj(s.value)) {
           if (s.value.outcome === 'refused') note = `${who} was received but could not be verified (${String(s.value.reason ?? 'unknown')}): ${typed}`;
           else if (s.value.outcome === 'declined') note = `${who} was declined (the owner chose not now): nothing is approved`;
+          else if (s.value.outcome === 'instructed' && a.kind === 'round') note = `the click on the round dialog for #${pr} (${m[1]}) was Follow up: it admits no round and approves no merge; do the follow-up steps (P triage defer-fixes), not codex-review`;
           else if (s.value.outcome === 'recorded' && a.kind === 'round') {
             records ??= readRecords({ home, now, settle: false, maxAgeMs: Infinity });
             const rec = records.find((x) => x?.via === 'ask' && x.ask?.clickId === m[2] && x.kind === 'extra-round');
@@ -833,6 +846,76 @@ export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 
     return found.sort((x, y) => y.capturedMs - x.capturedMs).slice(0, 3).map((x) => x.note);
   } catch {
     return [];
+  }
+}
+
+// What became of the owner's click on the follow-up round dialog (round-v2-follow-up), for `triage defer-fixes`: a Follow up click grants nothing, so nothing else refuses a deferral whose click was never verified.
+// Read-only (never settles, never writes) and never throws: call it AFTER a strict lookup, which settles pending clicks. It looks at the NEWEST round ask for the repository (repository moves followed) and PR that
+// is not superseded; any other variant, or no such ask, is 'none'. Then: a spent marker (the immediate path) or a `.settled` outcome (a pending click) with `instruction` -> 'instructed'; a `.settled` 'refused' -> 'refused'
+// (+ reason); a pointer with no `.settled` -> 'waiting'; an unreadable spent marker, pointer or outcome -> 'unverified'; a click on the Yes label -> 'recorded', a decline -> 'declined'; no click, or only clicks whose evidence
+// could no longer matter (now > answeredAt / capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS, as in clickNotes) -> 'none' (the owner typed, or has not answered). -> { state, askId, reason?, note }; `moves` replaces the recorded repository moves (tests).
+export function followUpClickState({ home = accountHome(), repo, pr, now = Date.now, moves } = {}) {
+  const note = {
+    none: 'no verified click on a Follow up button for this PR (the owner typed, or has not answered)',
+    instructed: 'the owner\'s click on "Follow up" is verified: it grants no round and approves no merge',
+    refused: 'the owner\'s click on the follow-up dialog was received but could not be verified',
+    unverified: 'the owner\'s click on the follow-up dialog could not be read',
+    waiting: 'the owner\'s click on the follow-up dialog is received and not verified yet',
+    recorded: 'the owner clicked "Yes, one more round" on the follow-up dialog (a grant, not a follow-up)',
+    declined: 'the owner declined the follow-up dialog: nothing is approved',
+  };
+  const say = (state, askId, reason) => ({ state, askId, ...(reason === undefined ? {} : { reason }), note: `${note[state]}${reason === undefined ? '' : ` (${reason})`}` });
+  try {
+    const key = repoKey(repo);
+    if (key === null || !Number.isInteger(pr)) return say('none', null);
+    const nowMs = now();
+    let names;
+    try {
+      names = readdirSync(asksDir(home));
+    } catch (err) {
+      return err?.code === 'ENOENT' ? say('none', null) : say('unverified', null, `the asks folder cannot be read (${err?.code ?? 'error'})`);
+    }
+    const recorded = moves ?? readRepoMoves({ home }).moves;
+    let newest = null;
+    for (const name of names) {
+      if (!/^ask-[0-9a-f]{12}\.json$/.test(name)) continue;
+      const loaded = readAsk(name.slice(0, -5), { home });
+      if (!loaded.ok || loaded.ask.kind !== 'round' || !loaded.ask.prs.includes(pr) || !sameRepo({ recorded: loaded.ask.repo, recordedAt: loaded.ask.issuedAt, current: key, moves: recorded }) || marked(loaded.ask.askId, 'superseded', home)) continue;
+      if (newest === null || Date.parse(loaded.ask.issuedAt) > Date.parse(newest.issuedAt)) newest = loaded.ask;
+    }
+    if (newest === null || newest.variant !== 'round-v2-follow-up') return say('none', newest?.askId ?? null);
+    const id = newest.askId;
+    const live = (ms) => nowMs <= ms + CAPTURE_SKEW_MS + MAX_AGE_MS;
+    const spent = readSpent(id, home);
+    if (spent.state === 'bad') return say('unverified', id, 'its spent marker cannot be read');
+    if (spent.state === 'ok') {
+      const m = spent.marker;
+      const answeredMs = Date.parse(m.answeredAt);
+      if (!Number.isFinite(answeredMs)) return say('unverified', id, 'its spent marker has no usable time');
+      if (!live(answeredMs)) return say('none', id);
+      if (Object.hasOwn(m, 'instruction')) return m.instruction === 'follow-up' ? say('instructed', id) : say('unverified', id, 'its spent marker names an instruction this install does not know');
+      return say(m.declined === true ? 'declined' : 'recorded', id);
+    }
+    // no spent marker: the pending pointers of this ask; the newest one inside its window decides
+    let latest = null;
+    for (const name of names) {
+      const m = PENDING_RE.exec(name);
+      if (m === null || m[1] !== id) continue;
+      const r = readPending(name, home, nowMs);
+      let capturedMs = r.pending?.capturedMs;
+      if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
+      if (live(capturedMs) && (latest === null || capturedMs > latest.capturedMs)) latest = { clickId: m[2], capturedMs, bad: r.bad === true };
+    }
+    if (latest === null) return say('none', id);
+    const settled = readSmallJson(clickFile(id, latest.clickId, 'settled', home));
+    if (settled.state === 'none') return latest.bad ? say('unverified', id, 'its pending pointer cannot be read') : say('waiting', id);
+    const outcome = settled.state === 'ok' && isObj(settled.value) ? settled.value.outcome : undefined;
+    if (outcome === 'instructed') return say('instructed', id);
+    if (outcome === 'refused') return say('refused', id, typeof settled.value.reason === 'string' ? settled.value.reason : 'unknown');
+    if (outcome === 'declined' || outcome === 'recorded') return say(outcome, id);
+    return say('unverified', id, 'its outcome cannot be read');
+  } catch {
+    return say('unverified', null, 'the click state could not be checked');
   }
 }
 
@@ -864,7 +947,7 @@ export function clickProvenance(record, { home = accountHome() } = {}) {
     const issuedAt = Date.parse(ask.issuedAt);
     if (ev.session !== record.session || ev.dialogSha256 !== ask.dialogSha256 || m.answeredAt !== ev.answeredAt || Date.parse(record.ts) !== answeredAt || answeredAt < issuedAt || answeredAt > issuedAt + MAX_AGE_MS) return 'synthetic';
     const mapped = answerText(ask, ev.answer);
-    if (mapped.error || mapped.declined !== undefined) return 'synthetic';
+    if (mapped.error || mapped.declined !== undefined || mapped.instruction !== undefined) return 'synthetic'; // (a round record pointing at a Follow-up click is forged: that click admits nothing)
     const bound = bindAnswer(ask, mapped.text, ev.question);
     if (bound.error) return 'synthetic';
     const expected = clickRecordOf({ body: bound.body, session: record.session, text: mapped.text, cwd: null, transcriptPath: file, answeredAt: ev.answeredAt, ask: a });

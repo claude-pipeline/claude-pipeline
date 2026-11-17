@@ -4,11 +4,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtempSync, readFileSync, readdirSync } from 'node:fs';
+import { appendFileSync, mkdtempSync, readFileSync, readdirSync, unlinkSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { claimGrantMarkers, grantIdOf, ownerGrantedRounds, verifyOwnerGrant } from '../pipeline/hooks/lib/owner-go.mjs';
-import { ROUND_VARIANT_IDS, asksDir, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, readAsk, roundAsk, rulingAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { claimGrantMarkers, grantIdOf, ownerGrantLookups, ownerGrantedRounds, verifyOwnerGrant } from '../pipeline/hooks/lib/owner-go.mjs';
+import { CAPTURE_SKEW_MS, HUMAN_DECISION, ROUND_VARIANT_IDS, asksDir, clickNotes, clickProvenance, dialogSha256, followUpClickState, issueAsk, mergeAsk, mergeManyAsk, readAsk, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { HEAD, ITEMS, REPO, world } from './helpers/click-world.mjs';
 
@@ -182,4 +182,179 @@ test('a v2 ask whose transcript dialog was edited after issue is refused dialog-
   });
   assert.deepEqual(await w.click(), { refused: 'dialog-differs' });
   assert.deepEqual(w.records(), []);
+});
+
+// ---- 4 the click that grants nothing (Follow up) -------------------------------------------------------------------------------------------------
+
+const FOLLOW = 'Follow up (Recommended)';
+const followWorld = (t, over = {}) => world(t, { parts: parts('round-v2-follow-up'), answer: FOLLOW, ...over });
+// 2.1.323 write order: the answer's entry is not in the transcript when the hook runs; `w.flush()` appends it, `w.settle()` verifies the pointer.
+const pendingWorld = (t, over = {}) => {
+  const w = followWorld(t, { build: '2.1.323', write: false, ...over });
+  w.flush = () => appendFileSync(w.file, w.text([w.result]));
+  w.settle = () => settlePendingClicks({ home: w.home, now: w.now });
+  w.state = (over2 = {}) => followUpClickState({ repo: REPO, pr: 58, home: w.home, now: w.now, ...over2 });
+  return w;
+};
+const files = (home) => readdirSync(asksDir(home)).sort();
+const markerOf = (w) => JSON.parse(readFileSync(join(asksDir(w.home), `${w.askId}.spent`), 'utf8'));
+const clickIdOf = (w) => sha(`${w.session}|${w.toolUseId}|${w.askId}`).slice(0, 16);
+
+test('a verified click on Follow up is an instruction: only the spent marker is written (declined + instruction), no record, no grant; the same click again repeats it; a Yes on the spent ask is refused', async (t) => {
+  // failure caught: the Follow-up click admitting a round or approving a merge, leaving the ask answerable (a later Yes granting after the owner chose to follow up), or being lost on a retry
+  const w = followWorld(t);
+  assert.deepEqual(await w.click(), { instruction: 'follow-up', kind: 'round', repo: REPO, prs: [58] });
+  assert.deepEqual(files(w.home), [`${w.askId}.json`, `${w.askId}.spent`]);
+  const m = markerOf(w);
+  assert.deepEqual([m.declined, m.instruction, m.clickId], [true, 'follow-up', clickIdOf(w)]);
+  assert.deepEqual(w.records(), []);
+  assert.deepEqual(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home: w.home, now: w.now }), []);
+  assert.deepEqual(await w.click(), { instruction: 'follow-up', kind: 'round', repo: REPO, prs: [58], replay: true });
+  assert.deepEqual(w.records(), [], 'a replay writes no record either');
+  // another dialog call on the same ask, this time answering Yes: the ask is spent
+  const [use2, result2] = structuredClone([w.use, w.result]);
+  use2.uuid = 'u-second-use'; use2.message.content[0].id = 'toolu_second';
+  result2.uuid = 'u-second-result'; result2.parentUuid = 'u-second-use'; result2.sourceToolAssistantUUID = 'u-second-use'; result2.message.content[0].tool_use_id = 'toolu_second';
+  result2.toolUseResult.answers = { [w.dialog.question]: 'Yes, one more round' };
+  appendFileSync(w.file, w.text([use2, result2]));
+  assert.deepEqual(await w.click({}, { tool_use_id: 'toolu_second' }), { refused: 'spent' });
+  assert.deepEqual(w.records(), []);
+});
+
+test('Follow-up click, stale or superseded: an answer after the 24 h window is expired and a newer ask supersedes it; neither writes anything', async (t) => {
+  // failure caught: a Follow-up click on a dialog the owner could no longer be looking at (a day old, or replaced by a newer ask) still counting
+  const old = followWorld(t, { issueBeforeUseMs: 25 * 3600 * 1000 });
+  assert.deepEqual(await old.click(), { refused: 'expired' });
+  assert.deepEqual(files(old.home), [`${old.askId}.json`]);
+  const w = followWorld(t);
+  assert.ok(issueAsk({ ...parts('round-v2-follow-up'), home: w.home, now: () => w.issuedAt + 1000 }).askId);
+  assert.deepEqual(await w.click(), { refused: 'superseded' });
+  assert.equal(files(w.home).some((n) => n.endsWith('.spent')), false);
+});
+
+test('fail-safe marker: a spent marker with no `instruction` for a Follow-up answer is `spent` (no record, no decline line); one whose answer is not that instruction is `spent`; an unknown instruction is `spent`', async (t) => {
+  // failure caught: a marker written by a reader that did not know `instruction` (or tampered) being finished as a grant record or as a plain decline
+  const w = followWorld(t);
+  await w.click();
+  const file = join(asksDir(w.home), `${w.askId}.spent`);
+  const { instruction: _i, ...bare } = markerOf(w);
+  writeFileSync(file, `${JSON.stringify(bare)}\n`);
+  assert.deepEqual(await w.click(), { refused: 'spent' });
+  assert.deepEqual(w.records(), []);
+  writeFileSync(file, `${JSON.stringify({ ...bare, instruction: 'park' })}\n`);
+  assert.deepEqual(await w.click(), { refused: 'spent' });
+  // a marker that says follow-up for a click whose answer is the Yes label (the transcript shows Yes): not an instruction replay, and never a record
+  const yes = world(t, { parts: parts('round-v2-follow-up'), answer: 'Yes, one more round' });
+  writeFileSync(join(asksDir(yes.home), `${yes.askId}.spent`), `${JSON.stringify({ v: 1, askId: yes.askId, clickId: clickIdOf(yes), toolUseId: yes.toolUseId, answeredAt: new Date(yes.answeredAt).toISOString(), dialogSha256: yes.issued.questions[0] && dialogSha256(yes.dialog), declined: true, instruction: 'follow-up' })}\n`);
+  assert.deepEqual(await yes.click(), { refused: 'spent' });
+  assert.deepEqual(yes.records(), []);
+});
+
+test('a round record that points at a Follow-up click is not the owner (the click admits nothing, even with its marker edited to look like a grant)', async (t) => {
+  // failure caught: a forged extra-round record made from a Follow-up click being consumed as a grant
+  const w = followWorld(t);
+  await w.click();
+  const forgedRecord = {
+    v: 1, kind: 'extra-round', ts: new Date(w.answeredAt).toISOString(), session: w.session, prompt: 'extra round', via: 'ask', repo: REPO, pr: 58, k: 4, head: GHEAD, transcript_path: w.file,
+    ask: { askId: w.askId, toolUseId: w.toolUseId, clickId: clickIdOf(w), variant: 'round-v2-follow-up' },
+  };
+  assert.equal(clickProvenance(forgedRecord, { home: w.home }), 'synthetic', 'the marker says declined');
+  writeFileSync(join(asksDir(w.home), `${w.askId}.spent`), `${JSON.stringify({ ...markerOf(w), declined: false })}\n`);
+  assert.equal(clickProvenance(forgedRecord, { home: w.home }), 'synthetic', 'declined edited away: the answer still maps to an instruction');
+});
+
+test('pending Follow-up click (2.1.323): the pointer carries the variant, settles as `instructed` with no record, and a strict grant lookup stops refusing once it is settled', async (t) => {
+  // failure caught: a Follow-up click left pending for ever (every strict lookup refusing), settled as a grant, or lost its variant (the hook could not tell the session what to do)
+  const w = pendingWorld(t);
+  const r = await w.click();
+  assert.equal(r.pending?.variant, 'round-v2-follow-up', JSON.stringify(r));
+  assert.deepEqual([r.pending.kind, r.pending.prs], ['round', [58]]);
+  assert.throws(() => ownerGrantLookups({ repo: REPO, pr: 58, home: w.home, now: w.now }).grants(4), /not verified yet/, 'unverified while the entry is missing');
+  w.flush();
+  assert.deepEqual(w.settle().outcomes.map((o) => o.outcome), ['instructed']);
+  assert.deepEqual(w.records(), []);
+  const settled = JSON.parse(readFileSync(join(asksDir(w.home), `${w.askId}.${clickIdOf(w)}.settled`), 'utf8'));
+  assert.equal(settled.outcome, 'instructed');
+  assert.deepEqual(ownerGrantLookups({ repo: REPO, pr: 58, home: w.home, now: w.now }).grants(4), []);
+  assert.match(clickNotes({ repo: REPO, prs: [58], home: w.home, now: w.now })[0], /was Follow up: it admits no round and approves no merge; do the follow-up steps.*not codex-review/);
+  // a legacy ask's pending result carries no variant key
+  const legacy = pendingWorld(t, { parts: parts('round-v1'), answer: 'Yes, one more round' });
+  assert.equal(Object.hasOwn((await legacy.click()).pending, 'variant'), false);
+});
+
+// ---- 5 followUpClickState ------------------------------------------------------------------------------------------------------------------------
+
+test('followUpClickState: every state of the newest round ask, read-only (instructed twice over, recorded, declined, waiting, refused, unverified, none, superseded, other variant, outside the window)', async (t) => {
+  // failure caught: defer-fixes reading "no click" over a Follow-up click that was refused / unreadable / still pending, or an old click standing for a new dialog
+  const none = followUpClickState({ repo: REPO, pr: 58, home: tmpHome(), now: () => 1 });
+  assert.deepEqual([none.state, none.askId], ['none', null]);
+  for (const bad of [{ repo: null }, { pr: 'x' }, { repo: undefined }]) assert.equal(followUpClickState({ repo: REPO, pr: 58, home: tmpHome(), ...bad }).state, 'none');
+
+  const imm = followWorld(t); // immediate path: the spent marker says instructed
+  assert.equal(followUpClickState({ repo: REPO, pr: 58, home: imm.home, now: imm.now }).state, 'none', 'issued, not answered');
+  await imm.click();
+  const st = followUpClickState({ repo: REPO, pr: 58, home: imm.home, now: imm.now });
+  assert.deepEqual([st.state, st.askId], ['instructed', imm.askId]);
+  assert.match(st.note, /grants no round and approves no merge/);
+  const before = files(imm.home);
+  followUpClickState({ repo: REPO, pr: 58, home: imm.home, now: imm.now });
+  assert.deepEqual(files(imm.home), before, 'read-only');
+  assert.equal(followUpClickState({ repo: REPO, pr: 58, home: imm.home, now: () => imm.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 1 }).state, 'none', 'outside the window');
+  assert.equal(followUpClickState({ repo: 'other/repo', pr: 58, home: imm.home, now: imm.now }).state, 'none', 'another repository');
+  assert.equal(followUpClickState({ repo: REPO, pr: 59, home: imm.home, now: imm.now }).state, 'none', 'another PR');
+  // a newer ask supersedes it: the old click is ignored, the new ask has no click
+  const next = issueAsk({ ...parts('round-v2-follow-up'), home: imm.home, now: () => imm.answeredAt + 5000 });
+  assert.deepEqual(followUpClickState({ repo: REPO, pr: 58, home: imm.home, now: imm.now }), { state: 'none', askId: next.askId, note: followUpClickState({ repo: REPO, pr: 58, home: imm.home, now: imm.now }).note });
+  // ... and a newer ask of another variant (or the legacy one) hides it too
+  issueAsk({ ...parts('round-v2-extra-round'), home: imm.home, now: () => imm.answeredAt + 6000 });
+  assert.equal(followUpClickState({ repo: REPO, pr: 58, home: imm.home, now: imm.now }).state, 'none', 'newest ask is another variant');
+
+  const pend = pendingWorld(t); // pending path: waiting, then instructed through `.settled` alone (the spent marker removed)
+  await pend.click();
+  assert.equal(pend.state().state, 'waiting');
+  pend.flush();
+  pend.settle();
+  assert.equal(pend.state().state, 'instructed');
+  unlinkSync(join(asksDir(pend.home), `${pend.askId}.spent`));
+  assert.equal(pend.state().state, 'instructed', 'the settled outcome stands on its own');
+
+  const yes = pendingWorld(t, { answer: 'Yes, one more round' });
+  await yes.click(); yes.flush(); yes.settle();
+  assert.equal(yes.state().state, 'recorded');
+  const no = pendingWorld(t, { answer: 'No' });
+  await no.click(); no.flush(); no.settle();
+  assert.equal(no.state().state, 'declined');
+
+  // refused: the settled outcome's reason is carried, for each way a click fails verification
+  const cases = {
+    'not-a-human-answer': { mutate: ({ result }) => { result.permissionDecision = { ...HUMAN_DECISION, reasonCode: 'hook:PreToolUse' }; } },
+    'capture-skew': { hookAt: 60000 }, // the hook ran a minute after the answer: the pointer's capture time and the answer disagree
+    'too-fast': { mutate: ({ use, result }) => { result.timestamp = new Date(Date.parse(use.timestamp) + 500).toISOString(); } },
+  };
+  for (const [reason, over] of Object.entries(cases)) {
+    const { hookAt, ...worldOver } = over;
+    const w = pendingWorld(t, worldOver);
+    const r = await w.click(hookAt === undefined ? {} : { now: () => w.answeredAt + hookAt });
+    assert.ok(r.pending, `${reason}: ${JSON.stringify(r)}`);
+    w.flush(); w.settle();
+    const s = w.state();
+    assert.deepEqual([s.state, s.reason], ['refused', reason]);
+    assert.match(s.note, new RegExp(`could not be verified \\(${reason}\\)`));
+  }
+
+  // unverified: an unreadable spent marker, an unreadable pointer with no outcome, an unreadable outcome
+  const bad = followWorld(t);
+  await bad.click();
+  writeFileSync(join(asksDir(bad.home), `${bad.askId}.spent`), 'not json');
+  assert.equal(followUpClickState({ repo: REPO, pr: 58, home: bad.home, now: bad.now }).state, 'unverified');
+  const ptr = pendingWorld(t);
+  await ptr.click();
+  const pointer = join(asksDir(ptr.home), `${ptr.askId}.${clickIdOf(ptr)}.pending`);
+  writeFileSync(pointer, 'not json');
+  assert.equal(ptr.state({ now: () => ptr.answeredAt + 1000 }).state, 'unverified');
+  const out = pendingWorld(t);
+  await out.click(); out.flush(); out.settle();
+  unlinkSync(join(asksDir(out.home), `${out.askId}.spent`));
+  writeFileSync(join(asksDir(out.home), `${out.askId}.${clickIdOf(out)}.settled`), '{"outcome":"made-up"}');
+  assert.equal(out.state().state, 'unverified');
 });
