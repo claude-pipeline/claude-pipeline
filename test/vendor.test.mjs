@@ -519,7 +519,7 @@ test('vendor from an installed copy stamps the installed identity (.modified whe
     vendorFrom(join(home, 'pipeline'), target.dir);
     assert.equal(stampOf(target.dir), '7.7.7+abcdef0');
 
-    writeFileSync(join(home, 'pipeline', 'lib', 'glob.mjs'), '// hand edit\n');
+    writeFileSync(join(home, 'pipeline', 'lib', 'glob.mjs'), `${readFileSync(join(home, 'pipeline', 'lib', 'glob.mjs'), 'utf8')}\n// hand edit\n`);
     const target2 = createTmpRepo();
     vendorFrom(join(home, 'pipeline'), target2.dir);
     assert.equal(stampOf(target2.dir), '7.7.7+abcdef0.modified');
