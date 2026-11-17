@@ -554,9 +554,10 @@ node pipeline/bin/pipeline.mjs --help
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (Node 20 and 24) and Windows (Node 24),
 plus an installer round trip into a throwaway Claude home with a space in its path. Its job names
-`test (ubuntu)` and `test (windows)` are this repo's required checks. The Windows suite runs as three
-parallel shards (`node scripts/test.mjs --shard I/3`, named `test (windows 1/3)` to `3/3`); `test (windows)`
-is the aggregate that is green only when all three succeeded.
+`test (ubuntu)` and `test (windows)` are this repo's required checks, and both are aggregates. The Ubuntu suite runs once
+per Node version in parallel (`test (ubuntu node 20)` and `test (ubuntu node 24)`); `test (ubuntu)` is green only when both
+succeeded. The Windows suite runs as three parallel shards (`node scripts/test.mjs --shard I/3`, named `test (windows 1/3)`
+to `3/3`); `test (windows)` is the aggregate that is green only when all three succeeded.
 
 The repo is onboarded to itself (`.claude/pipeline.yml`) with **every path a hard-stop**, so a
 change to the pipeline never auto-merges: the review skill builds, checks and reviews it, then hands you a
