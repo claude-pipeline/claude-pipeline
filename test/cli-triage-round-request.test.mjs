@@ -505,6 +505,33 @@ test('round-request nextRound: after the hinted revert the confirming run gives 
   assert.doesNotMatch(back.json.summary, /No-round alternative/);
   assert.match(back.json.summary, /^Prediction: the next round has nothing new to review: the content is what the last reviewed round saw\.$/m);
   assert.doesNotMatch(back.json.summary, /counted round/);
+  assert.equal(back.json.nextRound.contentRestored, true);
+  assert.equal(r.json.nextRound.contentRestored, undefined, 'set only when the line is shown (the merge case above is base-only)');
+});
+
+// Failure caught: with a whole-PR round owed (an Opus substitute round, then the risk rose to high) the revert hint said "needs no round" and, after the revert, "nothing new to review".
+// The owed round runs whatever the content, so the counted whole-PR prediction stays and no revert is advised.
+test('round-request nextRound: with a whole-PR round owed there is no revert alternative and no nothing-new line, before or after the revert', (t) => {
+  const w = roundWorld(t);
+  w.atCap();
+  w.edit((s) => {
+    for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' };
+    s.version = Math.max(s.version, 5);
+    s.rounds[0].substitute = { agent: 'substitute-opus' };
+    s.rounds[0].risk = 'low';
+    s.rounds[1].risk = 'high';
+  });
+  const check = (r) => {
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.equal(r.json.nextRound.kind, 'merge-base');
+    assert.equal(r.json.nextRound.alternative, undefined);
+    assert.equal(r.json.nextRound.contentRestored, undefined);
+    assert.doesNotMatch(r.json.summary, /No-round alternative|nothing new to review/);
+    assert.match(r.json.summary, /^Prediction: the next round would be a counted whole-PR round/m);
+  };
+  check(ask(w));
+  w.repo.git(['revert', '--no-edit', 'HEAD']);
+  check(ask(w));
 });
 
 // Failure caught: with 10 or more own commits the alternative's summary line went past the 400-character cap and was cut mid-word.

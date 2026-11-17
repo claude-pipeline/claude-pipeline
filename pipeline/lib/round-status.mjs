@@ -88,7 +88,7 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
 // round). It uses the same classification admitRound makes (review-round.mjs#classifyReview: the review base and kind, the resolution-only proof) without the cap, without
 // writing a review artifact and without touching a grant; git writes at most the trial merge's objects. A judge-to-Fable escalation and a PR that targets another branch than the
 // default are not modelled, so the free kinds (base-only, resolution) are worded as conditional (the real round is a counted one then: whole-PR for the escalation).
-// -> { nextRound: { prediction: true, previousClean, sinceReviewed: {merges, ownCommits} | {rewritten: true, commits}, kind, resolutionIneligible?, alternative? }, lines: ['Prediction: ...'] }. Throws on a git failure:
+// -> { nextRound: { prediction: true, previousClean, sinceReviewed: {merges, ownCommits} | {rewritten: true, commits}, kind, resolutionIneligible?, alternative?, contentRestored? }, lines: ['Prediction: ...'] }. Throws on a git failure:
 // the caller turns that into a warning.
 export function predictNextRound({ root, config, state, head }) {
   const o = { cwd: root };
@@ -114,10 +114,11 @@ export function predictNextRound({ root, config, state, head }) {
     } else ownCommits += 1;
   }
   const baseRef = reviewBaseRef(root, config);
+  const owed = wholePrOwed(state); // a whole-PR round is owed: it runs whatever the content, and reverting commits does not clear it
   const forkPoint = mergeBase(baseRef, headFull, o);
   const base = requiredBase(state, forkPoint);
   const { review, resolutionIneligible } = classifyReview({
-    state, wholePr: wholePrOwed(state), base, forkPoint, trusted: true,
+    state, wholePr: owed, base, forkPoint, trusted: true,
     tryResolution: () => resolutionReviewBase({ from: base, forkPoint, head: headFull, baseRef }, o),
   }, o);
   const baseOnly = review.kind === 'synthetic' && git(['diff', '--name-only', `${review.base}..${headFull}`], o) === '';
@@ -133,7 +134,7 @@ export function predictNextRound({ root, config, state, head }) {
       contentRestored = currentContentHash(root, config) === last.contentHashAtToHead;
     } catch { /* an unreadable hash leaves the hint shown */ }
   }
-  if (previousClean && ownCommits > 0 && anchorOnChain && kind !== 'base-only' && !contentRestored) {
+  if (previousClean && ownCommits > 0 && anchorOnChain && kind !== 'base-only' && !contentRestored && !owed) {
     const revert = `revert the ${plural(ownCommits, 'own commit')} since the last reviewed head (newest first)`;
     // With a merge in the range, nothing is promised after the revert: the filter below only decides WHICH wording shows, and the owner confirms by running round-request again
     // (the revert's result is the only proof: identical edits on both sides, for one, are removed by the revert but kept by the synthetic base). The filter: a clean trial merge
@@ -155,6 +156,8 @@ export function predictNextRound({ root, config, state, head }) {
         ? `${revert}; a free base-only recording may then follow (the default branch merges cleanly; run round-request again after the revert to confirm)${unlessCounted}`
         : `${revert}; that does not make the next round free here: a merge since the last reviewed head is not a clean, unedited merge of the default branch, so a counted round would still follow`;
   }
+  const nothingNew = contentRestored && !owed; // contentRestored alone still hides the alternative (a revert was made); the owed whole-PR round keeps the counted prediction
+  if (nothingNew) nextRound.contentRestored = true;
   const words = {
     'base-only': `base-only: only the default branch was merged in, free, no Codex, not counted${unlessCounted}`,
     resolution: `resolution-only: a real review of the conflict resolution, not counted, no owner grant${unlessCounted}`,
@@ -168,7 +171,7 @@ export function predictNextRound({ root, config, state, head }) {
     rewritten
       ? `Prediction: the last reviewed head is not in HEAD's first-parent history (rewritten history); ${plural(chain.length, 'commit')} since it.`
       : `Prediction: ${plural(merges, 'merge commit')} and ${plural(ownCommits, 'own commit')} since the last reviewed head.`,
-    contentRestored
+    nothingNew
       ? 'Prediction: the next round has nothing new to review: the content is what the last reviewed round saw.'
       : `Prediction: the next round would be ${words}${nextRound.resolutionIneligible ? `; the conflict resolution could not be reviewed alone (${nextRound.resolutionIneligible})` : ''}.`,
     ...(nextRound.alternative ? [`Prediction: No-round alternative: ${nextRound.alternative}.`] : []),
