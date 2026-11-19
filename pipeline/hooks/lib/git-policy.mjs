@@ -3464,7 +3464,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const name = baseName(argv[0]);
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
-    let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist: nothing runs)
+    let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist, not even as a dangling link: nothing runs; #630)
     if (VAR_BUILTINS.includes(name)) {
       const d = declAttrs(argv);
       for (const [k, v] of d.assigns) {
@@ -3526,7 +3526,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (sf && (name === 'source' || name === '.')) {
         sf.sourced = true;
         const word = sf.candidate || sf.ambiguous || sf.joined ? '' : expandVars(sf.file, ctx);
-        sourceGone = /^[\w./~@+-]+$/.test(word) && (!word.includes('~') || /^~(?:\/|$)/.test(word)) && !word.startsWith('/dev/') && (dir !== null || path.isAbsolute(word) || /^~(?:\/|$)/.test(word)) && !ctx.pathExists(path.resolve(dir ?? ctx.cwd, /^~(?:\/|$)/.test(word) ? ctx.home + word.slice(1) : word));
+        sourceGone = /^[\w./~@+-]+$/.test(word) && (!word.includes('~') || /^~(?:\/|$)/.test(word)) && !word.startsWith('/dev/') && (dir !== null || path.isAbsolute(word) || /^~(?:\/|$)/.test(word)) && (() => { const abs = path.resolve(dir ?? ctx.cwd, /^~(?:\/|$)/.test(word) ? ctx.home + word.slice(1) : word); return !ctx.pathExists(abs) && !ctx.lexists(abs); })();
       }
       const withPath = (rec) => { if (sourcePathSearch(rec, c.argv, cmds)) { rec.ambiguous = true; rec.words ??= [rec.file]; rec.pathSearch = true; } if (rec.words?.some(isEqualsWord) || rec.pathSearch) rec.pathValues = pathValuesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n) }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
