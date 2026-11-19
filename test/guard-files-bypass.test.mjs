@@ -347,7 +347,8 @@ const MCP_ALLOW = [
   ['mcp__desktop__start_process', { command: 'cat ~/.claude/settings.json' }],
   ['mcp__desktop__start_process', { command: 'npm test' }],
   ['mcp__sentry__search_issues', { query: 'x' }],
-  ['mcp__plugin_supabase_supabase__execute_sql', { query: 'select 1' }],
+  // (#262: a live project takes only a fixed catalog look-up without a go; any other execute_sql needs the owner's typed go: test/live-db-guard.test.mjs)
+  ['mcp__plugin_supabase_supabase__execute_sql', { project_id: 'abcdefghij0123456789', query: 'select e.extname, e.extversion from pg_catalog.pg_extension e order by e.extname' }],
   ['mcp__claude_ai_Claude_Docs__update', { path: 'x', content: 'y' }],
   ['mcp__claude_ai_Google_Drive__create_file', { title: 'x', content: 'install to ~/.claude/pipeline' }],
   ['mcp__notes__create_note', { title: 't', text: 'the files live in ~/.claude/pipeline/hooks' }],
