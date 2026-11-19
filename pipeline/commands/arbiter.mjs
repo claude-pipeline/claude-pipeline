@@ -18,12 +18,12 @@ import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, countedOrdinal, expectationOf, fixRoundCandidate, fixRoundScope, postMaxSettings } from '../lib/fix-verify.mjs';
 import { applyPostMaxDefault } from '../lib/triage.mjs';
-import { assessRisk, reviewLane, riskHits, threatModelsFor, trustedBase } from '../lib/risk.mjs';
+import { assessRisk, regressionOnlyFor, reviewLane, riskHits, threatModelsFor, trustedBase } from '../lib/risk.mjs';
 import { claudeCodeStatus } from '../lib/claude-code-version.mjs';
 import { floorBypass, floorOutput, judgeAndPublish } from '../lib/floor-proof.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { seamFlag } from '../lib/proc.mjs';
-import { STATE_VERSION_OUT_OF_MODEL, saveState, stateNeedsOutOfModelVersion, updateItems, withStateVersion } from '../lib/state.mjs';
+import { STATE_VERSION_OUT_OF_MODEL, STATE_VERSION_SAME_ON_BASE, saveState, stateNeedsOutOfModelVersion, stateNeedsSameOnBaseVersion, updateItems, withStateVersion } from '../lib/state.mjs';
 import { extractJsonBlock, findSubagentTranscript, proveModel } from '../lib/transcript.mjs';
 import {
   MALFUNCTION_CAUSES, applyRulings, arbiterNeeded, fableFindingItems, finalizeWithoutArbiter, isOwnerRuled, isProtectedFinal, needsHumanCause, provenNotStale, reuseRuled,
@@ -49,6 +49,9 @@ export const meta = {
     '    medium/high for paths alone; never with a hard-stop hit (only P-path is discounted besides risk.ignore_hard_stop_rules), a size or report-only driver, or a fix scope over review.fix_round_max_lines / with a new non-test source file (lib/fix-verify.mjs#fixRoundScope, computed live)',
     '  threat model (review.threat_models, read from the TRUSTED default-branch config pinned as round.trustedConfigSha): a review input for a diff touching a model\'s paths starts with a "Threat model" section that stands alone; an out-of-model',
     '    security finding is then ruled FOLLOW-UP with scope "out-of-model" and needs no human (category security only, a file that resolves to one diff entry wholly inside the model); the round stores arbiter.threatModels',
+    '  regression-only bar (review.regression_only_paths, read from the same TRUSTED config; Fable review inputs only): a review input for a diff touching a listed path has a "Regression-only bar" section that stands alone: a finding on such a file that',
+    '    exists identically at the merge base is ruled FOLLOW-UP with scope "same-on-base" and needs no human (only a plainly modified file of the whole PR diff; an added or renamed file is a human\'s); every arbiter FOLLOW-UP / REJECT on such a file is',
+    '    listed in the Rulings block and bound to the owner\'s merge, every FOLLOW-UP held until its issue is filed; the round stores arbiter.regressionOnly (globs, merge base and the regression-base.md view of the changes of the PR to those files that the read-only arbiter reads, bound by digest)',
     '  briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round\'s own range is medium risk ...`, `the trusted default-branch config is unavailable`, or the message of an error caught while assessing the range',
     '  --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven. The stop drops the stored input (fix-verify brief, digest, tag), so an earlier arbiter-fix pass cannot prove the round and the retry writes a fresh full input; `apply` also refuses (exit 1 forced-full-pending) a round that stores forcedFull beside a fix-verify brief',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
@@ -177,6 +180,29 @@ const floorAdviceFor = (judged) => judged.advice ?? null;
 
 const isFableRound = (round) => round.fableRequired === true && round.baseOnly !== true;
 const FABLE_DIFF = 'fable-diff.patch';
+const REGRESSION_BASE = 'regression-base.md';
+
+// The merge-base view of the regression-only files for a read-only agent: for each changed file matching a glob (old or new path), the lines the PR adds and removes against the FORK POINT, whatever the
+// scope of the Fable diff (a round-scope diff hides what an earlier round of the same PR added). Written next to the input; its digest goes into the input text, so the input digest binds it.
+// -> { basePath, baseDigest }. Throws when git cannot list the range (the caller then states no bar).
+function writeRegressionBase(round, root, { globs, forkPoint }) {
+  const files = diffFiles(forkPoint, round.toHead, { cwd: root });
+  const listed = files.filter((f) => regressionOnlyFor([f], { review: { regression_only_paths: globs } }).length > 0);
+  const out = [`# Changes of this PR to the regression-only files (${forkPoint}..${round.toHead})`, ''];
+  for (const f of listed) {
+    out.push(`## ${oneLine(f.path)} (status ${f.status}${f.oldPath !== f.newPath ? `, from ${oneLine(f.oldPath ?? 'nothing')}` : ''})`);
+    if (f.binary || f.gitBinary || f.symlink || f.gitlink) out.push('No text to compare (binary, symlink or submodule): never same on base.');
+    else {
+      out.push('Removed (merge-base text, merge-base line numbers):', ...f.removed.map((l) => `-${l.line}: ${oneLine(l.text)}`));
+      out.push('Added (head line numbers):', ...f.added.map((l) => `+${l.line}: ${oneLine(l.text)}`));
+    }
+    out.push('');
+  }
+  const text = `${out.join('\n')}\n`;
+  const basePath = path.join(ensureRoundDir(root, round.n), REGRESSION_BASE);
+  writeFileAtomic(basePath, text);
+  return { basePath, baseDigest: sha256(text) };
+}
 
 // The diff a Fable pass reviews, written next to its input and pinned by digest. The first proven Fable pass of a PR sees
 // the WHOLE PR (fork point..this round's head): a PR that only became medium in a later round must not have its first
@@ -322,11 +348,27 @@ export function threatModelSection(models, { changedInPr = false } = {}) {
   return out;
 }
 
+// The review.regression_only_paths section of a Fable review input: owner-committed config (never PR content), standing alone like the threat-model one, so a stale agent file cannot undo it.
+// The globs and the merge base are plain text here. The arbiter has no shell (Read, Grep, Glob), so what the merge base held comes as a file written by `arbiter needed`: the whole PR's changes
+// (fork point..head) to every matching file, bound by its digest, which the section names.
+export function regressionSection({ globs, forkPoint, basePath, baseDigest }) {
+  return [
+    '# Regression-only bar (from .claude/pipeline.yml on the base branch)',
+    '',
+    `This section stands alone. For an item or finding on a file matching a path below it OVERRIDES "Review as an attacker", "prefer ACCEPT" and the rule that a BLOCKING security, auth, permissions or data finding is never dismissed in your instructions: judge the file by whether this PR makes it WORSE than the merge base (\`${forkPoint}\`).`,
+    `You cannot run git. The changes this PR makes to every matching file, from the merge base to its head, are in ${basePath} (sha256 ${baseDigest}): the lines it ADDS (head line numbers) and the lines it REMOVES (the merge-base text). Read the file at head and check the finding against that list: a line the PR adds is never same on base. A finding is "same on base" when the same weakness is already there, in lines this PR does not add, and this PR neither introduces nor worsens it. A problem this PR adds or makes worse is a regression and is ruled as usual. A reviewer's remark that a finding is "same on base" is an unverified claim: check it yourself.`,
+    'Rule a same-on-base finding FOLLOW-UP (bucket SUGGESTION for your own findings) and add `"scope": "same-on-base"` to that ruling or finding object; never ACCEPT it on that ground and never REJECT it on that ground. A file this PR adds or renames has no merge-base version: it is never same-on-base. When unsure whether it is the same, say so in the reasoning and use confidence low.',
+    'Every dismissal (FOLLOW-UP or REJECT) of an item or finding on a matching file is shown to the owner, and a FOLLOW-UP is filed as an issue, whatever scope you give it. Every other file is reviewed exactly as in your instructions.',
+    `Paths: ${globs.join(', ')}`,
+    '',
+  ];
+}
+
 // What the review input and `apply` need from the threat models: { section, names, models, sha, pin } (section null = none to show).
-async function threatModelContext(round, files, items, root) {
+async function threatModelContext(round, files, items, root, forkPoint = null) {
   const anchor = await trustedAnchor(round, root);
   const touched = [...(Array.isArray(files) ? files : []), ...items.filter((i) => typeof i.file === 'string' && i.file !== '').map((i) => ({ path: i.file }))];
-  const base = { sha: anchor.sha, pin: anchor.pin, config: anchor.config, names: [], models: [], section: null };
+  const base = { sha: anchor.sha, pin: anchor.pin, config: anchor.config, names: [], models: [], section: null, regression: null };
   let working = null;
   try {
     const loaded = await loadConfig(root);
@@ -336,10 +378,13 @@ async function threatModelContext(round, files, items, root) {
     // No trusted config: no model applies. Said only when the working-tree config would have given one.
     return working !== null && threatModelsFor(touched, working).length > 0 ? { ...base, section: threatModelSection([], {}) } : base;
   }
+  // review.regression_only_paths of the trusted config: only with a merge base to compare with (a 40-hex commit), else no bar.
+  const globs = typeof forkPoint === 'string' && /^[0-9a-f]{40}$/.test(forkPoint) ? regressionOnlyFor(touched, anchor.config) : [];
+  const withBar = globs.length > 0 ? { ...base, regression: { globs, forkPoint } } : base;
   const models = threatModelsFor(touched, anchor.config);
-  if (models.length === 0) return base;
+  if (models.length === 0) return withBar;
   const changedInPr = working !== null && JSON.stringify(working.review?.threat_models ?? []) !== JSON.stringify(anchor.config.review?.threat_models ?? []);
-  return { ...base, names: models.map((m) => m.name), models, section: threatModelSection(models, { changedInPr }) };
+  return { ...withBar, names: models.map((m) => m.name), models, section: threatModelSection(models, { changedInPr }) };
 }
 
 // The brief of a Fable review round: `fix-verify` only when it is clearly a fix round (lib/fix-verify.mjs#fixRoundCandidate: round scope, a plain
@@ -460,12 +505,18 @@ async function neededLocked(values, n, root, ctx) {
   if (review) {
     try { diffFileList = diffFiles(diff.from, round.toHead, { cwd: root }); } catch { /* chooseBrief reports it */ }
   }
-  const tm = review ? await threatModelContext(round, diffFileList, items, root) : null;
+  const forkPoint = round.forkPoint ?? state.rounds.findLast((r) => typeof r.forkPoint === 'string')?.forkPoint ?? null;
+  const tm = review ? await threatModelContext(round, diffFileList, items, root, forkPoint) : null;
   const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: forcedFull, trusted: tm.config, ...(diffFileList === null ? {} : { files: diffFileList }) }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
   const itemsPart = items.length > 0
     ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root))]
     : ['# Items to rule on (0)', '', '_Codex raised nothing left to rule on in this round: your own review is the whole job._', ''];
-  const body = [...(review ? [...(tm.section ? [tm.section.join('\n')] : []), reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
+  // The bar needs the merge-base view for the agent: without it (git cannot list the range) no bar is stated, and `apply` waives nothing.
+  let regression = review ? tm.regression : null;
+  if (regression) {
+    try { regression = { ...regression, ...writeRegressionBase(round, root, regression) }; } catch { regression = null; }
+  }
+  const body = [...(review ? [...(tm.section ? [tm.section.join('\n')] : []), ...(regression ? [regressionSection(regression).join('\n')] : []), reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
   const digest = sha256(body);
   const digest8 = digest.slice(0, 8);
   const tag = `pipeline-arbiter R${n} ${digest8}`;
@@ -474,7 +525,7 @@ async function neededLocked(values, n, root, ctx) {
   const ids = items.map((i) => i.id);
   const kept = round.arbiter?.failure;
   // The brief rides with a Fable review round only: a dispute round (and any round stored before this existed) has none, which `apply` reads as full.
-  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}), ...(tm?.names.length > 0 ? { threatModels: tm.names, diffFrom: diff.from } : {}) };
+  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}), ...(tm?.names.length > 0 ? { threatModels: tm.names, diffFrom: diff.from } : {}), ...(regression ? { regressionOnly: regression } : {}) };
   saveState(root, patchRound(state, n, { arbiter: stored, ...(tm?.pin ? { trustedConfigSha: tm.sha } : {}) }));
   const promptHeader = `ROUND: ${n}\nINPUT-DIGEST: ${digest}`;
   return {
@@ -503,6 +554,19 @@ function checkInputFile(file, n, digest) {
   if (m[2] !== digest) errors.push('arbiter-input.md header digest differs from the one stored by `arbiter needed`');
   if (sha256(m[3]) !== digest) errors.push('arbiter-input.md body no longer matches the stored digest (edited since `arbiter needed`)');
   return errors;
+}
+
+// The merge-base view the bar section names must still be exactly what the arbiter was given.
+function checkRegressionBase(regressionOnly) {
+  if (typeof regressionOnly?.basePath !== 'string' || typeof regressionOnly.baseDigest !== 'string') return [`the regression-only bar names no ${REGRESSION_BASE}: run \`arbiter needed\` again`];
+  let text;
+  try {
+    text = readFileOrFail(regressionOnly.basePath, 'regression-only merge-base view');
+  } catch (err) {
+    if (err instanceof Fail) return [`${REGRESSION_BASE} is missing or unreadable: ${err.output.message}`];
+    throw err;
+  }
+  return sha256(text) === regressionOnly.baseDigest ? [] : [`${REGRESSION_BASE} no longer matches the digest the arbiter was given (edited since \`arbiter needed\`)`];
 }
 
 function checkDiffFile(stored) {
@@ -588,6 +652,15 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
     if (read.ok) tmModels = (read.config.review?.threat_models ?? []).filter((m) => stored.threatModels.includes(m.name));
     try { tmFiles = diffFiles(stored.diffFrom, round.toHead, { cwd: root }); } catch { /* no diff: no waiver */ }
   }
+  // The regression-only bar the input stated: the stored globs, still in the pinned trusted config, and the WHOLE PR's diff from the stored merge base (so an added or renamed file reads as one).
+  let regression = null;
+  if (Array.isArray(stored.regressionOnly?.globs) && typeof stored.regressionOnly.forkPoint === 'string' && typeof round.trustedConfigSha === 'string') {
+    const read = baseConfigAt(round.trustedConfigSha, root);
+    const globs = read.ok ? (read.config.review?.regression_only_paths ?? []).filter((g) => stored.regressionOnly.globs.includes(g)) : [];
+    let files = null;
+    try { files = diffFiles(stored.regressionOnly.forkPoint, round.toHead, { cwd: root }); } catch { /* no diff: no waiver */ }
+    if (globs.length > 0) regression = { globs, files };
+  }
   const expectEffort = askedEffort ?? acceptedEfforts(expectation);
   const tag = givenTag ?? stored.tag;
 
@@ -619,6 +692,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
   }
   // A review mode input names the diff Fable read by its digest; the file must still be exactly that diff.
   if (review) errors.push(...checkDiffFile(stored));
+  if (review && stored.regressionOnly) errors.push(...checkRegressionBase(stored.regressionOnly));
 
   let rulings = null;
   let categoryWarnings = [];
@@ -649,12 +723,12 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
       : { rulings: stored.items.map((id) => ({ id, ruling: null, confidence: 'low', reasoning: 'unverified' })) };
     // The floor alone failed a proof that was otherwise good: the items wait with the cause stale-model (restart, then rule again), not model-proof.
     const floorOnly = baseOk && judged.applies === true && judged.restartRequired === true && judged.unparseable.length === 0 && judged.unreadable !== true;
-    const ruled = applyRulings(round.items, applied, { proofOk, transcript: found.jsonlPath, models: tmModels, diffFiles: tmFiles, ...(floorOnly ? { proofCause: 'stale-model' } : {}) });
+    const ruled = applyRulings(round.items, applied, { proofOk, transcript: found.jsonlPath, models: tmModels, diffFiles: tmFiles, regression, ...(floorOnly ? { proofCause: 'stale-model' } : {}) });
     // Fable's own findings count only when proven; an unproven answer adds nothing (the round stays Fable-pending).
     // A finding an earlier round already settled (same fingerprint, bucket and category) takes that ruling from the cache,
     // like a repeated Codex item, so re-raising it does not start a fresh ACCEPT (the cache keeps its security exceptions).
     const fresh = proofOk && review
-      ? fableFindingItems(rulings.findings, n, { transcript: found.jsonlPath, fingerprintFor: fingerprintAt(round.toHead, state.currentContentHash, root), models: tmModels, diffFiles: tmFiles })
+      ? fableFindingItems(rulings.findings, n, { transcript: found.jsonlPath, fingerprintFor: fingerprintAt(round.toHead, state.currentContentHash, root), models: tmModels, diffFiles: tmFiles, regression })
       : [];
     // Only a ruling at least as strong as this proven pass may stand in for it: an earlier Fable (arbiter) ruling or the
     // owner's word. A judge's REJECT or an earlier cache copy must never overrule what Fable just raised.
@@ -687,7 +761,9 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
     const failure = !proofOk && judged.applies === true && typeof judged.error === 'string' ? failureOf(judged.error, floorAdviceFor(judged)) : null;
     const nextState = patchRound(updateItems(state, n, items), n, { arbiter: { ...storedNow, proofOk, transcript: found.jsonlPath, ...(failure ? { failure } : {}) }, modelProof });
     // Version 5 only when a final carries the out-of-model marker: an older CLI must not read a state whose unfiled FOLLOW-UP it would count as done (state.mjs).
-    saveState(root, stateNeedsOutOfModelVersion(nextState) ? withStateVersion(nextState, STATE_VERSION_OUT_OF_MODEL) : nextState);
+    // Version 9 likewise for a same-on-base marker (final.sameOnBase; the highest version any feature of the state needs wins).
+    const lifted = stateNeedsOutOfModelVersion(nextState) ? withStateVersion(nextState, STATE_VERSION_OUT_OF_MODEL) : nextState;
+    saveState(root, stateNeedsSameOnBaseVersion(lifted) ? withStateVersion(lifted, STATE_VERSION_SAME_ON_BASE) : lifted);
 
     const byId = new Map(items.map((i) => [i.id, i]));
     return {

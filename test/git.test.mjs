@@ -643,6 +643,20 @@ test('diffFiles still returns lines for files git would call binary (NUL byte, -
     assert.match(by[p].added[0].text, /^it\.skip\("drops", \(\) => \{\}\);/, p);
   }
   assert.ok(by['src/y.test.js'].added[0].text.includes('\0'));
+  // R1-B2: git's own binary verdict survives --text as `gitBinary` (the regression-only waiver reads it); a text file never carries it
+  assert.equal(by['src/x.test.ts'].gitBinary, true);
+  assert.equal(by['src/y.test.js'].gitBinary, true);
+});
+
+test('diffFiles: a plain text change carries no gitBinary flag', () => {
+  const { repo, o } = baseRepo();
+  repo.write('src/t.js', 'a\n');
+  repo.commit('t');
+  repo.branch('feat');
+  repo.write('src/t.js', 'b\n');
+  repo.commit('edit');
+  const [f] = diffFiles('main', 'feat', o);
+  assert.equal(Object.hasOwn(f, 'gitBinary'), false);
 });
 
 // ---- large binary documents are named, not dumped ---------------------------------------------------------------

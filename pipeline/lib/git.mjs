@@ -484,7 +484,7 @@ function largeBinaryChanges(from, to, o) {
     if (m[1] === '-' && m[2] === '-') binary.add(key);
     i += renamed ? 3 : 1;
   }
-  if (binary.size === 0) return { skipped: [], order: new Map() };
+  if (binary.size === 0) return { skipped: [], order: new Map(), binary };
 
   const changes = rawChanges(from, to, o);
   const order = new Map(changes.map((c, i) => [c.newPath ?? c.oldPath, i]));
@@ -497,7 +497,7 @@ function largeBinaryChanges(from, to, o) {
     && c.oldId !== c.newId
     && [c.oldPath, c.newPath].filter(Boolean).every(isBinaryFormat)
     && !hasDescendant(c));
-  if (candidates.length === 0) return { skipped: [], order };
+  if (candidates.length === 0) return { skipped: [], order, binary };
 
   const ids = [...new Set(candidates.flatMap((c) => [c.oldId, c.newId]).filter((id) => !/^0+$/.test(id)))];
   const sizes = new Map();
@@ -520,7 +520,7 @@ function largeBinaryChanges(from, to, o) {
     skipped.push(c);
     total -= c.printed;
   }
-  return { skipped, order };
+  return { skipped, order, binary };
 }
 
 // Literal, repo-root pathspecs that leave the given changes (old and new path) out of a diff, as in contentHash: a name like
@@ -549,13 +549,15 @@ export function diffFiles(base, head, o, { treeBase = false } = {}) {
     mb = base;
   }
   const range = `${mb}..${assertRef(head, ['diff', head])}`;
-  const { skipped, order } = largeBinaryChanges(mb, head, o);
+  const { skipped, order, binary } = largeBinaryChanges(mb, head, o);
   const exclude = excludeSpecs(skipped);
   const text = git([
     ...STABLE_CONFIG, 'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--src-prefix=a/', '--dst-prefix=b/',
     range, ...(exclude.length > 0 ? ['--', ':/', ...exclude] : []),
   ], o);
   const files = parseUnifiedDiff(text);
+  // --text prints a binary file as text (binary: false); git's own numstat verdict is kept as `gitBinary` (only when true) for a caller that must not treat such a file as text.
+  for (const f of files) if (binary.has(f.path)) f.gitBinary = true;
   if (skipped.length === 0) return files;
   for (const c of skipped) {
     files.push({
