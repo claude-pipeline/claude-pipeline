@@ -868,8 +868,9 @@ export function clickNotes({ home = accountHome(), repo, prs, kinds = ['merge', 
 
 // What became of the owner's click on the follow-up round dialog (round-v2-follow-up), for `triage defer-fixes`: a Follow up click grants nothing, so nothing else refuses a deferral whose click was never verified.
 // Read-only (never settles, never writes) and never throws: call it AFTER a strict lookup, which settles pending clicks. It looks at the NEWEST round ask for the repository (repository moves followed) and PR that
-// is not superseded; any other variant, or no such ask, is 'none'. Then: a spent marker (the immediate path) or a `.settled` outcome (a pending click) with `instruction` -> 'instructed'; a `.settled` 'refused' -> 'refused'
-// (+ reason); a pointer with no `.settled` -> 'waiting'; an unreadable spent marker, pointer or outcome -> 'unverified' (so is an unreadable ask with a click, unless the newest ask has a verified answer after it); a click on the Yes label -> 'recorded', a decline -> 'declined'; no click, or only clicks whose evidence
+// is not superseded; any other variant, or no such ask, is 'none' (except for the carried case below). Then: a spent marker (the immediate path) or a `.settled` outcome (a pending click) with `instruction` -> 'instructed'; a `.settled` 'refused' -> 'refused'
+// (+ reason), whether it follows a pending pointer or is a lone `.settled` file the hook left at once (#613, no pointer); a pointer with no `.settled` -> 'waiting'. CARRIED (#619): a 'refused' or 'unverified' click on an OLDER,
+// superseded follow-up ask of the PR still answers (the owner was asked again) until a verified answer on a newer ask, later than that click, lifts it, or the click leaves the window below; a superseded 'instructed' click is not carried; an unreadable spent marker, pointer or outcome -> 'unverified' (so is an unreadable ask with a click, unless the newest ask has a verified answer after it); a click on the Yes label -> 'recorded', a decline -> 'declined'; no click, or only clicks whose evidence
 // could no longer matter (now > answeredAt / capturedAt + CAPTURE_SKEW_MS + MAX_AGE_MS, as in clickNotes) -> 'none' (the owner typed, or has not answered). -> { state, askId, reason?, note }; `moves` replaces the recorded repository moves (tests).
 export function followUpClickState({ home = accountHome(), repo, pr, now = Date.now, moves } = {}) {
   const note = {
@@ -914,6 +915,15 @@ export function followUpClickState({ home = accountHome(), repo, pr, now = Date.
         let capturedMs = readPending(name, home, nowMs).pending?.capturedMs;
         if (capturedMs === undefined) { try { capturedMs = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { capturedMs = nowMs; } }
         if (live(capturedMs) && (evidence === null || capturedMs > evidence)) evidence = capturedMs;
+      }
+      // a refusal the hook left with no pointer (#613) is click evidence too (its settledAt, or its mtime when that is unusable)
+      for (const name of names) {
+        const m = SETTLED_RE.exec(name);
+        if (m === null || m[1] !== id || names.includes(`${id}.${m[2]}.pending`)) continue;
+        const r = readSmallJson(path.join(asksDir(home), name));
+        let ms = isObj(r.value) ? isoMs(r.value.settledAt) : NaN;
+        if (!Number.isFinite(ms)) { try { ms = lstatSync(path.join(asksDir(home), name)).mtimeMs; } catch { ms = nowMs; } }
+        if (live(ms) && (evidence === null || ms > evidence)) evidence = ms;
       }
       return evidence;
     };
@@ -968,7 +978,8 @@ export function followUpClickState({ home = accountHome(), repo, pr, now = Date.
         } else {
           const r = readSmallJson(path.join(asksDir(home), name));
           bad = r.state !== 'ok' || !isObj(r.value) || r.value.outcome !== 'refused' || r.value.askId !== id || r.value.clickId !== lone[2];
-          ms = timeOf(name, bad ? undefined : isoMs(r.value.settledAt));
+          const settledMs = bad ? NaN : isoMs(r.value.settledAt);
+          ms = timeOf(name, Number.isFinite(settledMs) ? settledMs : undefined); // a missing or malformed settledAt: the file's mtime, never a dropped refusal
         }
         if (live(ms) && (latest === null || ms > latest.ms)) latest = { clickId: (p ?? lone)[2], ms, bad, lone: lone !== null };
       }

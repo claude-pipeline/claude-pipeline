@@ -570,3 +570,21 @@ test('#619 a refused or unreadable Follow up click stays in force across newer a
   issueAsk({ ...parts('round-v2-follow-up'), home: i.home, now: () => i.answeredAt + 5000 });
   assert.equal(readState(i).state, 'none', 'an instructed click superseded by a newer ask is no longer in force');
 });
+
+test('#613 a standalone refusal still answers when its ask file became unreadable, or when its settledAt is missing or invalid', async (t) => {
+  // failure caught: the pointer-less refusal is only seen through a readable ask (or a valid settledAt), so a corrupted ask or refusal file turns "refused" into `none` and `triage defer-fixes` files the deferral without a typed follow-up
+  const w = followWorld(t, { mutate: tooFast });
+  assert.deepEqual(await w.click(), { refused: 'too-fast' });
+  const refusal = join(asksDir(w.home), `${w.askId}.${clickIdOf(w)}.settled`);
+  const original = readFileSync(refusal, 'utf8');
+  for (const settledAt of [undefined, 'invalid']) {
+    writeFileSync(refusal, `${JSON.stringify({ ...JSON.parse(original), settledAt })}\n`);
+    const s = readState(w);
+    assert.deepEqual([s.state, s.askId], ['refused', w.askId], `settledAt ${settledAt}: dated by the file's mtime, not dropped`);
+  }
+  writeFileSync(refusal, original);
+  writeFileSync(join(asksDir(w.home), `${w.askId}.json`), 'not json');
+  const s = readState(w);
+  assert.deepEqual([s.state, s.askId], ['unverified', w.askId], 'an unreadable ask with a refusal on record');
+  assert.equal(readState(w, { now: () => w.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 }).state, 'none', 'outside the window it no longer matters');
+});
