@@ -1538,6 +1538,30 @@ test('e2e label (R1-F1): a newer skipped no-op run of the suite does not hide th
   assert.deepEqual(onlySkipped.output.others, []);
 });
 
+// A run-e2e PR whose required checks are green returned `passed` with the Playwright suite still running; the hand-off then needed the same ci-wait job re-run by hand every few minutes.
+// --wait-others keeps polling until no `others` entry is running; without it the verdict is unchanged.
+test('e2e label + waitOthers: a still-running non-required check is waited for; a red one ends the wait as passed with others; without the option the first read answers', async () => {
+  const world = (suite) => ({ classic: present('A'), labels: ['run-e2e'], checkRuns: (t) => [cr('A', 'success', { id: 1 }), suite(t)] });
+  const running = (t) => (t < 100 ? cr('Playwright suite', null, { id: 2 }) : cr('Playwright suite', 'success', { id: 2 }));
+  const waited = sim(world(running), { ...E2E, waitOthers: true });
+  const w = await waited.run();
+  assert.equal(w.output.verdict, 'passed');
+  assert.deepEqual(w.output.others, []);
+  assert.ok(waited.elapsed() >= 100_000, 'it polled until the suite finished');
+  const plain = sim(world(running), E2E);
+  const p = await plain.run();
+  assert.equal(p.output.others.length, 1);
+  assert.equal(plain.elapsed(), 0);
+  const red = sim(world(() => cr('Playwright suite', 'failure', { id: 2 })), { ...E2E, waitOthers: true });
+  const r = await red.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(r.output.others[0].status, 'failure');
+  assert.equal(red.elapsed(), 0);
+  const stuck = sim(world(() => cr('Playwright suite', null, { id: 2 })), { ...E2E, waitOthers: true, timeoutMs: 60_000 });
+  const s = await stuck.run();
+  assert.equal(s.output.others[0].status, 'in_progress', 'at the limit the running entry is still reported, never hidden');
+});
+
 test('e2e label: no label on the PR, or no ci.e2e_label configured, leaves the output unchanged (no `others`, no label read without the option)', async () => {
   const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Playwright suite', null)] };
   const unlabelled = sim({ ...world, labels: ['bug'] }, E2E);
