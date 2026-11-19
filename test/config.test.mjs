@@ -277,6 +277,7 @@ test('review.regression_only_paths: a `!` entry is refused; a glob with a wildca
   assert.ok(has(set(['src/{a,b}.js'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a brace entry is not a literal path');
   assert.ok(has(set(['src/'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a trailing slash is src/**, not a literal path');
   assert.ok(has(set(['src\\'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a trailing backslash is the same');
+  assert.ok(has(set(['/x'], { risk: { high_risk_paths: ['*/x'] } }), 'is not covered by'), 'a leading slash is dropped at run time: /x is the file x, which */x does not match');
   assert.equal(set(['src/'], { risk: { high_risk_paths: ['src/'] } }).ok, true, 'verbatim');
   assert.equal(set(['src/**'], { risk: { high_risk_paths: ['src/**'] } }).ok, true, 'verbatim');
   assert.equal(set(['src/a.js'], { risk: { high_risk_paths: ['src/*'] } }).ok, true, 'a literal path is matched');
