@@ -39,6 +39,7 @@ export const meta = {
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
     '  owner grants the PR holds on rounds this copy has (and it lacks or holds differently) are copied onto them, nothing is quarantined and local rounds / decisions are kept: grantsRestored:[round numbers]. This also holds when the PR moved off this copy\'s baseline by such a grant alone (another checkout published it) while this copy has unpublished decisions or a trailing round. A local-only owner grant (the PR\'s round has none) that does not verify on this machine is dropped, with the admission it set: grantsDropped:[round numbers] (the refusal `unverified-grant` of `state past-round-grant` names this remedy); it is checked against the gh repository, like `past-round-grant` does, and a check that failed with an error (not a "no") keeps the grant with a warning. After adopting grants the baseline follows the PR only when this copy equals the PR apart from grants and trailing local rounds (a copy that lacks a published decision or round-level proof keeps its baseline, so it cannot publish over it)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
+    '  (the PR\'s triage comment was written by a newer pipeline: with no local state exit 2 {error:no-state, newerFormat:true}; with one it is served as source local-unverified with a `warnings` entry; run `pipeline update`)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict',
@@ -323,7 +324,10 @@ async function showLocked(values, n, pr, root, ctx) {
       warnings.push(`GitHub unavailable: the local review state was not compared with the published triage comment (${String(err.message).split('\n')[0].slice(0, 200)})`);
       source = 'local-unverified';
     }
-    if (found?.newerFormat) warnings.push(`the local review state was not compared with the published triage comment: ${newerFormatText(found.newerFormat)}`);
+    if (found?.newerFormat) {
+      warnings.push(`the local review state was not compared with the published triage comment: ${newerFormatText(found.newerFormat)}`);
+      source = 'local-unverified';
+    }
     // The PR moving off this copy's baseline by owner grants alone (another checkout published one) is not a change of decisions: the grants are adopted below,
     // and, whatever else this copy holds that the PR lacks, the PR then differs from what this copy last saw by those grants only.
     const seen = found?.state ? readBaseline(root, pr) : null;
@@ -407,7 +411,11 @@ async function discardRound(rest, ctx) {
     if (withVerdict.length > 0) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'round-has-verdict', message: `round ${n} holds a second-review verdict (${withVerdict.join(', ')}), so it cannot be discarded: a second review runs once per item` });
     }
-    const published = (await recoverState(root, pr, ctx)).state;
+    const found = await recoverState(root, pr, ctx);
+    if (found.newerFormat) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'history-unreadable', newerFormat: true, message: `cannot tell whether round ${n} is published: ${newerFormatText(found.newerFormat)}` });
+    }
+    const published = found.state;
     if ((published?.rounds ?? []).some((r) => r.n === n)) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'round-published', message: `round ${n} is in the PR triage comment: it is history, not an interrupted round` });
     }
@@ -898,6 +906,9 @@ async function pastRoundGrant(rest, ctx) {
     } catch (err) {
       if (err instanceof GhError || err instanceof UnavailableError) {
         return { exitCode: EXIT.UNAVAILABLE, output: { ok: false, unavailable: true, reason: 'github', ...out, published: false, remaining, next: `GitHub could not be reached, so the approval is saved here only: ${retry}` } };
+      }
+      if (err instanceof Fail && err.output?.error === 'newer-format') {
+        return { exitCode: EXIT.FAILED, output: { ok: false, error: 'newer-format', ...out, published: false, remaining, reason: err.output.reason, next: 'NOT published: the approval is saved here only. Run `pipeline update`, then ' + retry } };
       }
       if (err instanceof Fail && (err.output?.error === 'stale-publication' || err.output?.error === 'history-loss')) {
         return { exitCode: EXIT.FAILED, output: { ok: false, error: err.output.error, ...out, published: false, remaining, reason: err.output.reason, next: `NOT published: the approval is saved here only. Run \`pipeline state show --pr ${pr}\`, then ${retry}` } };

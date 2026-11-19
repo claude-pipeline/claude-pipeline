@@ -101,7 +101,7 @@ export const meta = {
     '  -> ACCEPT is always allowed (also for a judge/arbiter malfunction). FOLLOW-UP alone only for a non-BLOCKING, non-security item with a known cause; any REJECT, and any dismissal of a BLOCKING or security item,',
     '     needs a second review already on the item that also dismisses it at high confidence (the result is the stricter of the two). Refused: a dismissal through a model-proof / invalid-arbiter / invalid-judge',
     '     malfunction (re-run the judge/arbiter, or ACCEPT), a loosened ACCEPT (only the owner\'s typed ruling loosens), an implemented item, and anything settled by a test, the judge, the arbiter or the owner',
-    '  -> the ruling is published at once, under the review lock (published: true): the triage comment is updated as a compare-and-swap on the state\'s content (lib/review-publish.mjs). When GitHub cannot be reached the ruling stands locally (published: false, next = the retry, `pipeline comment --kind triage`); when the PR holds a state this copy did not publish or restore it is published: false, publishError: \'stale-publication\' (run `pipeline state show --pr N`, then redo). It writes review state format version 2 (a state already at a higher version keeps it)',
+    '  -> the ruling is published at once, under the review lock (published: true): the triage comment is updated as a compare-and-swap on the state\'s content (lib/review-publish.mjs). When GitHub cannot be reached the ruling stands locally (published: false, next = the retry, `pipeline comment --kind triage`); when the PR holds a state this copy did not publish or restore it is published: false, publishError: \'stale-publication\' (run `pipeline state show --pr N`, then redo); when the PR\'s triage comment was written by a newer pipeline it is published: false, publishError: \'newer-format\' (run `pipeline update`, then `pipeline comment --kind triage`). It writes review state format version 2 (a state already at a higher version keeps it)',
     'pipeline triage second-review --round R --ids ID[,ID…] --pr N [--repo DIR]',
     '  -> {ok, round, verdicts:[{id, decision, confidence, reasoning, final}], forcedAccept:[ids], published, publishError?, next}; runs ONE Codex call (the trusted review.codex_model: the config at the fork point of the default branch, else the built-in default; effort high, read-only, fresh session) over a BLIND packet of the named items',
     '     and stores its verdict in each item (item.secondReview), for claude-ruling to read. The packet is built from the review state and git alone: the original finding (id, bucket, category, title, file, line, detail, the reviewer\'s reasoning),',
@@ -420,14 +420,15 @@ async function ownerRuling(rest, ctx) {
 // checks what only the command can (mode, PR, the text), writes the state under the lock, and says what is left to publish.
 // Publication (claude-ruling and second-review both end here), still under the review lock: the compare-and-swap of review-publish.mjs. The local
 // result always stands. -> { published: true } when GitHub took it; { published: false, next } when GitHub could not be reached (`next` is the retry);
-// { published: false, publishError: 'stale-publication', next } when the PR holds a state this copy neither published nor restored (run state show).
+// { published: false, publishError: 'stale-publication', next } when the PR holds a state this copy neither published nor restored (run state show);
+// { published: false, publishError: 'newer-format', next } when the PR's triage comment was written by a newer pipeline (`pipeline update`).
 function publishRuling({ ctx, root, pr, state }) {
   try {
     publishTriage({ gh: createGitHub({ cwd: root, env: ctx.env }), root, pr, state });
     return { published: true };
   } catch (err) {
-    if (err instanceof Fail && err.output?.error === 'stale-publication') {
-      return { published: false, publishError: 'stale-publication', next: `NOT published: ${err.output.reason}. The decision is saved here only` };
+    if (err instanceof Fail && (err.output?.error === 'stale-publication' || err.output?.error === 'newer-format')) {
+      return { published: false, publishError: err.output.error, next: `NOT published: ${err.output.reason}. The decision is saved here only` };
     }
     if (err instanceof GhError || err instanceof UnavailableError) {
       return { published: false, next: `GitHub could not be reached, so the result is only local: run \`pipeline comment --pr ${pr} --kind triage\` when it is back (until then \`pipeline state show\` keeps a ruling that continues the published state, with a warning, and replaces one the PR has moved on from)` };
