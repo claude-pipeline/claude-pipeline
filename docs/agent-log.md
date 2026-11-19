@@ -263,3 +263,4 @@ full record.
 - 2026-11-19 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 11 · arbiter 10 (fix-verify 4) · blocked · Codex 7d: 505 runs (131 high)
 - 2026-11-19 · #272 · Quick verify also runs the tests related to the branch's changes · risk high · rounds 6 · arbiter 6 · blocked · Codex 7d: 505 runs (131 high)
 - 2026-11-19 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 9 · arbiter 9 · blocked · Codex 7d: 511 runs (131 high)
+- 2026-11-19 · #592 · Click-to-approve works on 2.1.323 (harness-added answers), a re-shown request with a hold binds, honest merge-line wording (#585) · risk high · rounds 7 · arbiter 3 · awaiting-owner-merge · Codex 7d: 516 runs (131 high)
