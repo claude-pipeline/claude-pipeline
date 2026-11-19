@@ -5,23 +5,34 @@ import assert from 'node:assert/strict';
 
 // The CPU clock: the main thread's own CPU time where Node has it (process.threadCpuUsage, newer Node), else the whole process's.
 // The thread clock leaves out the GC and helper threads, which share the cores with parallel test files on a CI runner and inflate the
-// process figure; Node 20 lacks it. Detected once.
+// process figure; Node 20 lacks it. Detected once. Either way a sample is also capped at the wall time that elapsed (see measureWith).
 const cpuUsage = typeof process.threadCpuUsage === 'function' ? (prev) => process.threadCpuUsage(prev) : (prev) => process.cpuUsage(prev);
 
-// CPU time (user + system) `fn` burns, in ms. CPU time ignores the time the OS spent running something else.
+// Runs `fn` once on the given clocks; returns its value and the ms it burned. SEAM: the tests inject fake clocks here.
+export function measureWith(cpuClock, wallClock, fn) {
+  const w0 = wallClock();
+  const c0 = cpuClock();
+  const r = fn();
+  const d = cpuClock(c0);
+  const w1 = wallClock();
+  // The main thread cannot burn more CPU than the wall time that elapsed around it. The process-wide clock (Node 20) also counts GC and
+  // helper threads running in parallel, which can push one sample past the elapsed time (5.0 s cap read 5.05-5.3 s on a 4.5 s run). So the
+  // wall time caps the figure. Load inflates wall, not CPU, so CPU still wins there; a real blow-up is slow on both. Applied on both
+  // clocks: harmless on the thread clock (it never exceeds wall) and one code path.
+  return { r, ms: Math.min((d.user + d.system) / 1000, w1 - w0) };
+}
+
+const wallNow = () => Number(process.hrtime.bigint()) / 1e6;
+
+// CPU time (user + system) `fn` burns, in ms, never more than the wall time that elapsed. CPU time ignores the time the OS spent running
+// something else.
 export function cpuTime(fn) {
-  const t0 = cpuUsage();
-  fn();
-  const d = cpuUsage(t0);
-  return (d.user + d.system) / 1000;
+  return measureWith(cpuUsage, wallNow, fn).ms;
 }
 
 // Runs `fn` once; returns its value and the CPU ms it burned. Load-proof like cpuTime, for caps that also need the result.
 export function cpuTimed(fn) {
-  const t0 = cpuUsage();
-  const r = fn();
-  const d = cpuUsage(t0);
-  return { r, ms: (d.user + d.system) / 1000 };
+  return measureWith(cpuUsage, wallNow, fn);
 }
 
 // The fastest of `runs` samples; `sample()` returns a number of ms.

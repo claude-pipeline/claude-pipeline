@@ -2,7 +2,7 @@
 // The "clock" here is fake (numbers computed from the size), so these tests cannot flake themselves.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertLinear, bestOf, cpuTime, cpuTimed } from './helpers/timing.mjs';
+import { assertLinear, bestOf, cpuTime, cpuTimed, measureWith } from './helpers/timing.mjs';
 
 const fake = (cost, n) => () => cost(n);
 
@@ -78,6 +78,23 @@ test("cpuTimed returns fn's value; CPU burn counts, a sleep does not (so machine
   const sleep = cpuTimed(() => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50));
   assert.ok(sleep.ms < 25, `a 50 ms sleep read ${sleep.ms} ms of CPU`);
   assert.ok(sleep.ms < burn.ms);
+});
+
+// Fake clocks for measureWith: the process clock reports `cpuMs` of CPU for the sample, the wall clock `wallMs` of elapsed time.
+const fakeClocks = (cpuMs, wallMs) => {
+  const cpu = (prev) => (prev ? { user: cpuMs * 1000 - prev.user, system: 0 } : { user: 0, system: 0 });
+  const walls = [100, 100 + wallMs];
+  return [cpu, () => walls.shift()];
+};
+
+test("measureWith: on a process clock that also counts helper threads (CPU 2x the wall time), a sample is capped at the wall time, so Node 20 cannot read more CPU than time passed", () => {
+  const [cpu, wall] = fakeClocks(40, 20);
+  assert.equal(measureWith(cpu, wall, () => 7).ms, 20);
+  assert.equal(measureWith(...fakeClocks(40, 20), () => 7).r, 7);
+});
+
+test("measureWith: on a loaded machine (wall 3x the CPU) the CPU time is reported, not the wall, so load still cannot trip a cap", () => {
+  assert.equal(measureWith(...fakeClocks(20, 60), () => 0).ms, 20);
 });
 
 // ---- rounds: a burst of load that slows a whole round is absorbed by a fresh round; a real quadratic is slow in every round ----
