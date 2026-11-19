@@ -268,3 +268,4 @@ full record.
 - 2026-11-19 · #622 · Review: opt-in regression-only bar for listed paths (#559 A2) · risk high · rounds 6 · arbiter 6 (fix-verify 2) · blocked · Codex 7d: 516 runs (131 high)
 - 2026-11-19 · #634 · Merge-queue ready: run CI on merge_group; update source is claude-pipeline/claude-pipeline · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 518 runs (131 high)
 - 2026-11-19 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 13 · arbiter 12 (fix-verify 4) · awaiting-owner-merge · Codex 7d: 523 runs (135 high)
+- 2026-11-19 · #634 · Merge-queue ready: run CI on merge_group; update source is claude-pipeline/claude-pipeline · risk high · rounds 3 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 529 runs (139 high)
