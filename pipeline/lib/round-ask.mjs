@@ -11,6 +11,23 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const BUCKET_WORDS = { BLOCKING: 'BLOCKING', SUGGESTION: 'SUGGESTIONS', WORTH_CONSIDERING: 'WORTH CONSIDERING' };
 const SHOWN = 6;
+// The round dialog variant `round-request --ask` issues (round discipline 2, B2): the one whose first option is the recommended one the summary names. `recommend` is shown.recommend
+// ('follow-up' | 'extra-round' | undefined when the display could not compute it); `longReview` is longReviewOf(). A counted round 6+ blocking loop recommends stopping and parking (a display failure
+// with a blocking loop still has that recommendation); no computed recommendation and no blocking loop -> the legacy dialog, so the dialog and the summary always agree.
+export const ROUND_DIALOG_LEGACY = 'round-v1';
+export function roundDialogVariant(recommend, longReview) {
+  if (longReview?.blockingLoop === true) return 'round-v2-park';
+  if (recommend === 'follow-up') return 'round-v2-follow-up';
+  if (recommend === 'extra-round') return 'round-v2-extra-round';
+  return ROUND_DIALOG_LEGACY;
+}
+// The lever `PIPELINE_ROUND_DIALOG=legacy` (the exact string; anything else does nothing) can only narrow to the legacy dialog and is read at ISSUE time only: verification never reads it.
+export const roundDialogLever = (env) => env?.PIPELINE_ROUND_DIALOG === 'legacy';
+export function issuedRoundVariant({ env, recommend, longReview } = {}) {
+  if (roundDialogLever(env)) return ROUND_DIALOG_LEGACY;
+  return roundDialogVariant(recommend, longReview);
+}
+
 // The counted round (k) from which the ask also shows how the last rounds went (4-5 rounds in, the review is usually a loop the owner should see, not just pay for).
 export const LONG_REVIEW_FROM = 6;
 

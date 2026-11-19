@@ -97,6 +97,8 @@ export function verifyOwnerGrants(state, { repo, pr, maxRounds, published, ...op
       try {
         if (counted) v = verifyOwnerGrant({ repo, pr, k, toHead: r.toHead, ownerGrant: r.ownerGrant }, opts);
       } catch { /* unverifiable */ }
+      // A grant that came from a click on a new-variant dialog must say so (state version 8): the marker is what makes an older pipeline refuse the state instead of misreading the grant. Not evidence: the grant is proven above.
+      if (v.ok && typeof v.record?.ask?.variant === 'string' && r.ownerGrant?.askVariant !== v.record.ask.variant) problems.push(`round ${n}: its grant came from a click dialog variant the state does not record, so an older pipeline would misread it`);
       if (v.ok) granted.push({ n, k, quote: v.quote, ...(r.ownerGrant?.past === true ? { past: true } : {}) });
       else problems.push(cannotVerify(n, pr) + (pastRound(n) ? `; or, when the owner's words for it are gone from every transcript, ${pastRemedy(n, pr)}` : ''));
       continue;

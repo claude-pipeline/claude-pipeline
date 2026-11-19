@@ -235,7 +235,7 @@ export function classifyReview({ state, wholePr, base, forkPoint, trusted, escal
 
 // Phase one. `base` and `head` are full SHAs (head is the checked-out HEAD). Returns the admitted round (opaque to the caller except
 // for these fields): { state, view, slug, ghRepo, forkPoint, level, rated, lane, fable, lightLane, review: {base, kind}, resolution,
-// resolutionOnly, resolutionView, resolutionIneligible, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
+// resolutionOnly, resolutionView, resolutionIneligible, escalated, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
 // hashAtHead, dir } plus the inputs it was given.
 export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   const o = { cwd: root };
@@ -349,7 +349,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
 
   return {
     ...c, state, view, slug, level, rated, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView,
-    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, hashAtHead: currentContentHash(root, config),
+    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, hashAtHead: currentContentHash(root, config), escalated,
   };
 }
 
@@ -560,7 +560,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       const k = reviewedRoundCount(fresh) + 1;
       const records = ownerGrantedRounds({ repo: adm.ghRepo.slug, pr, k, head });
       const newest = records[0];
-      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts };
+      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts, ...(typeof newest.ask?.variant === 'string' ? { askVariant: newest.ask.variant } : {}) }; // askVariant: a click on a new-variant dialog (state version 8, lib/state.mjs); a compat marker, never evidence
       // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
       // discard-round); the first claimer on the machine wins. A failed claim discards the reviewer's answer.
       claimGrant = () => {
@@ -587,6 +587,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => i.id) } : {}),
       ...(adm.wholePr ? { wholePr: true } : {}),
+      ...(adm.escalated ? { escalated: true } : {}),
       ...(adm.resolutionOnly ? { resolutionOnly: true, ...adm.resolutionView } : {}),
       ...(reviewer === 'fable' && !adm.baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: adm.lane.sensitivePaths.slice(0, 50) } : {}),
     });

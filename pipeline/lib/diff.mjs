@@ -221,7 +221,8 @@ export function parseUnifiedDiff(text) {
 // A soft "tests added" signal for `pipeline summary` (never a gate): of the files of a parsed diff, how many TEST files (`testGlobs`: integrity.test_globs) gained lines, how many test-case
 // calls (`it(`, `test(`, `it.each(` ...) those added lines hold, and the changed (added + removed) lines in source files versus test files.
 // -> { files, cases, sourceLines, testLines, line: 'Tests added: N files, M cases; changed source lines : test lines = a : b' }
-const TEST_CASE_CALL = /^\s*(?:it|test|specify)(?:\.\w+)*\s*\(/;
+// Only case-making suffixes count (todo/skip/fixme stubs are declared cases); test.describe/hooks/use/setTimeout/step do not.
+const TEST_CASE_CALL = /^\s*(?:it|test|specify)(?:\.(?:each|only|skip|concurrent|sequential|fails|fixme|todo|runIf|skipIf|failing|for))*\s*\(/;
 export function testsAdded(files, testGlobs) {
   const out = { files: 0, cases: 0, sourceLines: 0, testLines: 0 };
   for (const f of files) {

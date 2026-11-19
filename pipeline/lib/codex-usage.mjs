@@ -406,9 +406,10 @@ export function usageFile({ file, home, env } = {}) {
   if (file) return path.resolve(file);
   const override = seamValue('PIPELINE_CODEX_USAGE_FILE', env);
   if (override) return path.resolve(override);
-  // Under node's test runner (it sets NODE_TEST_CONTEXT in every test process, and children inherit it) a checkout never writes the account's real ledger: a run that bypassed
-  // scripts/test.mjs (`node --test test/x.test.mjs`) and forgot the override above filled it with fake rows. A test that names its `home` keeps it. An installed copy is never diverted.
-  if (!home && (env?.NODE_TEST_CONTEXT ?? process.env.NODE_TEST_CONTEXT) && !isInstalledCopy()) {
+  // Under node's test runner (it sets NODE_TEST_CONTEXT in every test process, and children inherit it) or with a substituted Codex ($PIPELINE_CODEX, a checkout-only seam that a real run never
+  // sets: seamValue ignores it in an installed copy) a checkout never writes the account's real ledger: a run that bypassed scripts/test.mjs (`node --test test/x.test.mjs`, or plain
+  // `node test/x.test.mjs`, whose env builder names a fake Codex but no NODE_TEST_CONTEXT) and forgot the override above filled it with fake rows. A test that names its `home` keeps it. An installed copy is never diverted.
+  if (!home && ((env?.NODE_TEST_CONTEXT ?? process.env.NODE_TEST_CONTEXT) || seamValue('PIPELINE_CODEX', env) !== undefined) && !isInstalledCopy()) {
     let who = 'user';
     try { who = os.userInfo().username; } catch { who = String(process.getuid?.() ?? 'user'); } // no passwd entry: usageFile() must never throw
     return path.join(os.tmpdir(), `cp-codex-usage-under-test-${who}`, 'codex-usage.jsonl');

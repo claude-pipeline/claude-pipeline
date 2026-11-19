@@ -309,3 +309,19 @@ test('testsAdded: counts test files that gained lines, added test-case calls, an
   assert.equal(r.line, 'Tests added: 1 files, 2 cases; changed source lines : test lines = 4 : 4');
   assert.equal(testsAdded([], ['test/**']).line, 'Tests added: 0 files, 0 cases; changed source lines : test lines = 0 : 0');
 });
+
+// Failure caught: a Playwright spec (one describe, hooks, settings, two tests) is reported as 4+ cases in the `Tests added` line because test.describe / test.beforeEach / test.use / test.setTimeout count as cases; skip/todo stubs are declared cases and still count; conditional (runIf/skipIf), expected-failure and Vitest `for` cases are declared cases too, so a spec made of them is not reported as 0.
+test('testsAdded: counts only case-making calls, not test.describe, hooks, test.use, test.setTimeout or test.step', () => {
+  // The focus/skip suffixes are spliced in so the test-integrity scan does not read these fixture strings as skipped or focused tests.
+  const [only, skip, todo, fixme, runIf, skipIf, failing] = ['only', 'skip', 'todo', 'fixme', 'runIf', 'skipIf', 'failing'];
+  const diff = [
+    'diff --git a/e2e/a.spec.ts b/e2e/a.spec.ts', '--- a/e2e/a.spec.ts', '+++ b/e2e/a.spec.ts', '@@ -0,0 +1,18 @@',
+    "+test.describe('group', () => {", '+  test.use({ locale: "en" });', '+  test.setTimeout(5000);', '+  test.describe.configure({ mode: "serial" });',
+    '+  test.beforeEach(async () => {});', '+  test.afterEach(async () => {});', '+  test.beforeAll(async () => {});', '+  test.afterAll(async () => {});',
+    "+  test('one', async () => { await test.step('s', async () => {}); });", `+  test.${only}('two', async () => {});`, `+  test.${skip}('three', async () => {});`,
+    `+  test.describe.${skip}.each([1])('x', () => {});`, `+  it.${todo}('four');`, `+  test.${fixme}('five', async () => {});`,
+    `+  it.${runIf}(true)('six', () => {});`, `+  test.${skipIf}(false)('seven', async () => {});`, `+  it.${failing}('eight', () => {});`, "+  it.for([1])('nine', () => {});", '',
+  ].join('\n');
+  const r = testsAdded(parseUnifiedDiff(diff), ['e2e/**']);
+  assert.equal(r.cases, 9);
+});
