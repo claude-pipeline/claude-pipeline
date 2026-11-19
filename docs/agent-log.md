@@ -275,3 +275,4 @@ full record.
 - 2026-11-19 · #647 · Guard: a literal loop that may exit early no longer hands on its cd / switch (#615) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 543 runs (144 high)
 - 2026-11-19 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 12 · arbiter 11 (fix-verify 1) · blocked · Codex 7d: 549 runs (145 high)
 - 2026-11-19 · #638 · Floor A: low-only fixes accepted at the round limit go to follow-up issues unapplied (cap-low deferral) · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge · Codex 7d: 549 runs (145 high)
+- 2026-11-19 · #622 · Review: opt-in regression-only bar for listed paths (#559 A2) · risk high · rounds 8 · arbiter 7 (fix-verify 3) · merged · Codex 7d: 555 runs (145 high)
