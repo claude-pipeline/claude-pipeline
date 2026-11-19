@@ -12,6 +12,7 @@ import { cli, AGENT_LOG } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { git as gitRun, GitError } from '../pipeline/lib/git.mjs';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
+import { PLANTED, makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
 import { AGENT_LOG_BRANCH, AGENT_LOG_HEADER, assertSafeLogTarget, logRelPath, publishLines } from '../pipeline/lib/agentlog.mjs';
 
 const BRANCH = AGENT_LOG_BRANCH;
@@ -564,4 +565,23 @@ test('an abnormal GitError (code 1) from the ref check is never "no file": the p
     return gitRun(args, o);
   };
   assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn }), (e) => e instanceof GitError && e.abnormal === true);
+});
+
+// Outbound text guard: a repository listed in the machine-local scan config gets its log lines scanned before they are pushed.
+test('publish: a blocked outbound scan keeps every line queued, pushes nothing and exits 1 with the reason (never the hit)', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+  const scanner = makeScanner(tmp('cp-log-scanner-'));
+  writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: scanner.command } });
+  w.run(['queue', '--line', L1]);
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(r.json.remaining, 2);
+  assert.match(r.json.message, /agent-log line/);
+  assert.ok(!r.stdout.includes(PLANTED), 'the output never echoes the scanned text');
+  assert.deepEqual(w.queued(), [L1, planted], 'both lines are still queued');
+  assert.equal(w.onOrigin('branch', '--list', BRANCH).trim(), '', 'nothing was pushed');
+  assert.equal(scanner.runs().length, 1);
 });

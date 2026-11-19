@@ -4,9 +4,13 @@
 // means (preflight reads it as "pause is open", a merge gate reads it as "do not merge"). JSON
 // bodies are sent on stdin (`--input -`) so no model- or diff-derived text is ever shell-quoted.
 import { gh, GhError } from './proc.mjs';
-import { UnavailableError, UsageError } from './cli.mjs';
+import { OutboundScanBlocked, UnavailableError, UsageError } from './cli.mjs';
 import { repoRoot, repoSlug } from './repo.mjs';
-import { resolve } from 'node:path';
+import { accountHome } from './paths.mjs';
+import { seamValue } from './seams.mjs';
+import { accessSync, constants, readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { isAbsolute, join as joinPath, resolve } from 'node:path';
 
 // A hung gh must never hang the pipeline: a call that outlives this is a failure.
 const CALL_TIMEOUT_MS = 60_000;
@@ -114,10 +118,20 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
   };
   const getJson = (args, opts) => parse(ok(args, opts), args);
 
+  // Outbound text guard (see "outbound text guard" below): for a repository listed in the machine-local scan config, every text a write sends is scanned
+  // first, and a scanner that is not clean blocks the write (OutboundScanBlocked, never a GhError). Nothing listed (no config file): a no-op that
+  // does not even look the repository up. `fields` may be a function, so an unlisted machine does not build the text list either.
+  const scanOut = (fields) => guardOutbound({ slug: () => self.repo().slug, fields, env: env ? { ...process.env, ...env } : process.env });
+  const labelText = (name, description) => [{ kind: 'label name', text: String(name) }, { kind: 'label description', text: String(description ?? '') }];
+  const labelFields = (names) => names.map((text) => ({ kind: 'label name', text: String(text) }));
+
   // GET, or a write whose JSON body goes on stdin. An empty reply (204) is null.
   const api = (method, path, body) => {
     const args = method === 'GET' ? ['api', path] : ['api', '-X', method, path];
-    if (body !== undefined) args.push('--input', '-');
+    if (body !== undefined) {
+      if (method !== 'GET') scanOut(() => fieldsOfJson(body));
+      args.push('--input', '-');
+    }
     const r = ok(args, body === undefined ? {} : { input: JSON.stringify(body) });
     return r.stdout.trim() === '' ? null : parse(r, args);
   };
@@ -182,21 +196,32 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
 
     // The pipeline's own transitions. The global hook stops agents doing some of these directly; that is intended.
     addLabels(n, labels) {
-      if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--add-label', l])]);
+      if (labels.length) {
+        scanOut(() => labelFields(labels));
+        ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--add-label', l])]);
+      }
     },
     removeLabels(n, labels) {
-      if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
+      if (labels.length) {
+        scanOut(() => labelFields(labels));
+        ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
+      }
     },
 
     // REST DELETE of one label of a PR (not `pr edit`): `P merge --owner-go` lifts the needs-human hold the owner's "merge" named with it
     // (lib/hold.mjs). A label that is not on the PR answers 404 and throws, like any other failure.
     deleteLabel(n, name) {
+      scanOut(() => labelFields([name]));
       ok(['api', '-X', 'DELETE', `repos/${self.repo().slug}/issues/${prNumber(n)}/labels/${encodeURIComponent(name)}`]);
     },
 
     // POST a GraphQL query through `gh api graphql`: strings go as -f (never type-coerced, so a repo called "123" stays a
     // string), numbers and booleans as -F. A reply with `errors` (or without `data`) is a failure, never partial data.
     graphql(query, variables = {}) {
+      // A mutation writes: its text (inline literals included) and every string variable are scanned. A query only reads.
+      if (/\bmutation\b/i.test(query)) {
+        scanOut(() => [{ kind: 'graphql mutation', text: query }, ...Object.entries(variables).filter(([, v]) => typeof v === 'string').map(([k, v]) => ({ kind: `graphql variable ${k}`, text: v }))]);
+      }
       const args = ['api', 'graphql', '-f', `query=${query}`];
       for (const [k, v] of Object.entries(variables)) {
         if (v === undefined || v === null) continue;
@@ -271,8 +296,8 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     },
 
     listLabels: () => getJson(['label', 'list', '--json', 'name,color,description', '--limit', '200']),
-    createLabel: ({ name, color, description }) => ok(['label', 'create', name, '--color', color, '--description', description]),
-    editLabel: ({ name, color, description }) => ok(['label', 'edit', name, '--color', color, '--description', description]),
+    createLabel: ({ name, color, description }) => (scanOut(() => labelText(name, description)), ok(['label', 'create', name, '--color', color, '--description', description])),
+    editLabel: ({ name, color, description }) => (scanOut(() => labelText(name, description)), ok(['label', 'edit', name, '--color', color, '--description', description])),
 
     listComments(n) {
       return commentList(['api', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, '--paginate']);
@@ -509,7 +534,9 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // told apart by their message; anything else (403, 404, 5xx, an unrecognised 422) throws, so it can never read as success.
     updateBranch(n, expectedHeadSha) {
       const args = ['api', '-X', 'PUT', `repos/${self.repo().slug}/pulls/${prNumber(n)}/update-branch`, '--input', '-'];
-      const r = exec(args, { input: JSON.stringify({ expected_head_sha: expectedHeadSha }) });
+      const body = { expected_head_sha: expectedHeadSha };
+      scanOut(() => fieldsOfJson(body));
+      const r = exec(args, { input: JSON.stringify(body) });
       if (r.code === 0 && !r.timedOut) return { result: 'accepted' };
       let message = '';
       try {
@@ -540,6 +567,133 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     },
   };
   return self;
+}
+
+// ---- outbound text guard (layer 2) --------------------------------------------------------------
+// Lives in this file (a high-risk path of its own) rather than a new module: it decides whether a write goes out at all.
+// Before the pipeline posts text to a repo that is LISTED in the machine-local scan config, that
+// text goes to a scanner command on its stdin, and anything but a clean exit 0 blocks the write (fail closed).
+//
+//   <account home>/.claude/pipeline-local/outbound-scan.json     { "<owner/name>": { "command": ["/abs/path/scanner", "arg", ...] } }
+//
+// The file lives on the machine, never in a repo tree, so a branch cannot drop it. The account home is the OS user database's
+// (paths.mjs accountHome), not $HOME; PIPELINE_OUTBOUND_SCAN_HOME is a test seam (seams.mjs: ignored by an installed copy).
+//   - file absent                      -> no slug is listed: nothing is scanned, behaviour is exactly as before.
+//   - file present but unreadable / not a JSON object -> every write is blocked (we cannot tell which slugs are listed).
+//   - slug listed, command missing / not absolute / not executable / not a list of strings -> that slug's writes are blocked.
+// The scanned text goes on STDIN only (never argv). A block names the field kinds that were scanned and the scanner's exit, and
+// never the scanned text or the scanner's stdout (it may hold the hit); only a masked first line of its stderr is quoted.
+
+export { OutboundScanBlocked };
+
+export const OUTBOUND_SCAN_TIMEOUT_MS = 60_000;
+const OUTBOUND_SCAN_MAX_BUFFER = 1024 * 1024;
+
+export const scanHomeOf = (env) => seamValue('PIPELINE_OUTBOUND_SCAN_HOME', env) ?? accountHome();
+export const scanConfigPath = (home) => joinPath(home, '.claude', 'pipeline-local', 'outbound-scan.json');
+
+// -> null when the file does not exist (nothing is listed), else the parsed object. Anything else throws OutboundScanBlocked.
+export function loadScanConfig(home) {
+  const file = scanConfigPath(home);
+  let text;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return null;
+    throw new OutboundScanBlocked(`outbound scan: ${file} exists but cannot be read (${err?.code ?? 'error'}); every write is blocked until it is fixed`, { reason: 'config-unreadable' });
+  }
+  let cfg;
+  try {
+    cfg = JSON.parse(text);
+  } catch {
+    throw new OutboundScanBlocked(`outbound scan: ${file} is not valid JSON; every write is blocked until it is fixed`, { reason: 'config-invalid' });
+  }
+  if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    throw new OutboundScanBlocked(`outbound scan: ${file} must be a JSON object keyed by owner/name; every write is blocked until it is fixed`, { reason: 'config-invalid' });
+  }
+  return cfg;
+}
+
+const isExecutableFile = (p) => {
+  try {
+    if (!statSync(p).isFile()) return false;
+    accessSync(p, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// -> null (slug not listed) or { command: [file, ...args] }. A listed slug with a bad entry throws OutboundScanBlocked.
+export function scannerFor(cfg, slug) {
+  const want = String(slug).toLowerCase();
+  const keys = Object.keys(cfg).filter((k) => k.toLowerCase() === want);
+  if (keys.length === 0) return null;
+  const bad = (why) => new OutboundScanBlocked(`outbound scan: ${slug} is listed but ${why}; its writes are blocked`, { reason: 'scanner-missing' });
+  if (keys.length > 1) throw bad('the config lists it more than once (differing only in case)');
+  const entry = cfg[keys[0]];
+  const command = entry?.command;
+  if (!Array.isArray(command) || command.length === 0 || !command.every((c) => typeof c === 'string' && c !== '')) throw bad('its "command" is not a non-empty list of strings');
+  if (!isAbsolute(command[0])) throw bad('its scanner path is not absolute');
+  if (!isExecutableFile(command[0])) throw bad('its scanner is missing or not executable');
+  return { command };
+}
+
+// Every outbound text of one write: [{ kind, text }]. `kind` is a short field kind ("title", "body", "label name"), named in a block.
+// A JSON body is walked: every string value, at any depth, is a field of its own (kind = its top-level key).
+export function fieldsOfJson(value, kind = 'body', out = [], top = true) {
+  if (typeof value === 'string') out.push({ kind, text: value });
+  else if (Array.isArray(value)) for (const v of value) fieldsOfJson(v, kind, out, false);
+  else if (value !== null && typeof value === 'object') for (const [k, v] of Object.entries(value)) fieldsOfJson(v, top ? k : kind, out, false);
+  return out;
+}
+
+// The scanner's stderr, first line only, with every word that also occurs in the scanned text replaced by ***, control characters
+// stripped, at most 100 characters: enough to tell "usage error" from "found something" without ever echoing the hit.
+function maskedFirstLine(stderr, scanned) {
+  const line = String(stderr ?? '').split(/\r?\n/).find((l) => l.trim() !== '');
+  if (line === undefined) return '';
+  const hay = scanned.toLowerCase();
+  const masked = line.replace(/[\x00-\x1f\x7f]/g, ' ').replace(/\S{3,}/g, (w) => (hay.includes(w.toLowerCase()) ? '***' : w));
+  return masked.trim().slice(0, 100);
+}
+
+const kindsOf = (fields) => [...new Set(fields.map((f) => f.kind))].join(', ') || 'none';
+
+// Runs `scanner` over `fields`. Returns on exit 0; throws OutboundScanBlocked on anything else.
+export function runScanner({ command, fields, env, timeoutMs = OUTBOUND_SCAN_TIMEOUT_MS, spawnFn = spawnSync }) {
+  const text = fields.map((f) => `=== outbound field: ${f.kind} ===\n${f.text}\n`).join('');
+  const kinds = kindsOf(fields);
+  const block = (how, stderr) => {
+    const note = maskedFirstLine(stderr, text);
+    return new OutboundScanBlocked(`outbound scan blocked this write (scanned: ${kinds}; scanner ${how})${note ? `; scanner said: ${note}` : ''}`, { reason: 'blocked', kinds });
+  };
+  const r = spawnFn(command[0], command.slice(1), { input: text, encoding: 'utf8', timeout: timeoutMs, maxBuffer: OUTBOUND_SCAN_MAX_BUFFER, env: env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  if (r.error) throw block(r.error.code === 'ETIMEDOUT' ? `timed out after ${Math.round(timeoutMs / 1000)}s` : `could not run (${r.error.code ?? 'spawn error'})`, '');
+  if (r.signal) throw block(`was killed by ${r.signal}`, r.stderr);
+  if (r.status !== 0) throw block(`exited ${r.status}`, r.stderr);
+}
+
+// The one entry point. `slug` is a string or a function returning it (resolved only when a config file exists, so an unlisted
+// machine never pays for a lookup). `fields` is an array or a function returning one. Returns true when a scan ran and passed,
+// false when the slug is not listed; throws OutboundScanBlocked otherwise.
+export function guardOutbound({ slug, fields, env, home = scanHomeOf(env), spawnFn }) {
+  const cfg = loadScanConfig(home);
+  if (cfg === null) return false;
+  const entry = scannerFor(cfg, typeof slug === 'function' ? slug() : slug);
+  if (entry === null) return false;
+  const list = (typeof fields === 'function' ? fields() : fields).filter((f) => typeof f.text === 'string');
+  runScanner({ command: entry.command, fields: list, env, spawnFn });
+  return true;
+}
+
+// For what cannot be scanned at all (images): refused for a listed slug, allowed otherwise. -> false when not listed.
+export function refuseIfListed({ slug, what, env, home = scanHomeOf(env) }) {
+  const cfg = loadScanConfig(home);
+  if (cfg === null) return false;
+  const name = typeof slug === 'function' ? slug() : slug;
+  if (scannerFor(cfg, name) === null) return false;
+  throw new OutboundScanBlocked(`outbound scan: ${name} is a listed repository, and ${what} cannot be scanned (images are not text); attach them outside the public repository`, { reason: 'unscannable' });
 }
 
 // ---- helpers shared by the gh-backed commands -------------------------------------------------

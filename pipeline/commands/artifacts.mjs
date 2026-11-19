@@ -8,7 +8,7 @@ import { join, resolve } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { git as gitRun, GitError, NETWORK_TIMEOUT_MS } from '../lib/git.mjs';
-import { createGitHub, guardGh } from '../lib/github.mjs';
+import { createGitHub, guardGh, refuseIfListed } from '../lib/github.mjs';
 
 export const meta = {
   summary: 'publish UI screenshots to the pipeline-artifacts branch and print PR-body markdown',
@@ -135,7 +135,10 @@ export const run = guarded(async (argv, ctx) => {
   if (selected.files.length === 0) return { exitCode: EXIT.OK, output: { ok: true, files: [], skipped: selected.skipped } };
 
   return guardGh(async () => {
-    const { slug } = createGitHub({ cwd: root, env: ctx.env }).repo();
+    const gh = createGitHub({ cwd: root, env: ctx.env });
+    // Outbound text guard: a scanner reads text, not pixels, so a listed (public) repository never gets screenshots from here.
+    refuseIfListed({ slug: () => gh.repo().slug, what: 'screenshots pushed to the pipeline-artifacts branch', env: { ...process.env, ...ctx.env } });
+    const { slug } = gh.repo();
     const { commit, pushed } = publishArtifacts({ root, pr, files: selected.files });
     return {
       exitCode: EXIT.OK,

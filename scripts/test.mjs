@@ -57,6 +57,8 @@ const env = {
   // #472: the owner-go readers settle pending clicks (writes under the account's owner-go folder). A test must never settle the owner's real ones, so every test file runs with the switch off;
   // a test of settling asks for it with `settle: true`. Already recorded clicks still count: the switch only stops pending clicks becoming records through the readers.
   PIPELINE_CLICK_SETTLE: 'off',
+  // The outbound text guard reads its machine-local scan config from the account home unless this seam names another: an empty scratch home keeps the owner's real config out of every test.
+  PIPELINE_OUTBOUND_SCAN_HOME: join(usageDir, 'scan-home'),
 };
 const timesOut = process.env.CP_TEST_TIMES;
 const nodeArgs = timesOut ? ['--import', pathToFileURL(join(libDir, 'file-times-preload.mjs')).href] : [];
