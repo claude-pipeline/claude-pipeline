@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import { GhError } from '../pipeline/lib/proc.mjs';
 import { createGitHub, parseConcatenatedJson, classifyApiError, OutboundScanBlocked, runScanner } from '../pipeline/lib/github.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { PLANTED, makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
@@ -440,7 +440,9 @@ test('unlisted slug posts unchanged: no scanner is spawned, and gh gets exactly 
 
 test('an invalid scan config blocks every write, listed or not', (t) => {
   const { gh, fake, writes } = scanKit(t, 'scan', { listed: null });
-  for (const bad of ['{ not json', '[]', '"x"']) {
+  // a key that can never match a `gh repo view` name would leave a repository looking listed while nothing is scanned
+  const keyed = (key) => JSON.stringify({ [key]: { command: ['/x'] } });
+  for (const bad of ['{ not json', '[]', '"x"', keyed('https://github.com/acme/widgets'), keyed('acme/widgets.git'), keyed('acme/widgets '), keyed('widgets')]) {
     writeScanConfig(fake.scanHome, bad);
     const err = caught(() => gh.createComment(7, 'a clean comment'));
     assert.ok(err instanceof OutboundScanBlocked, bad);
@@ -449,16 +451,46 @@ test('an invalid scan config blocks every write, listed or not', (t) => {
   assert.deepEqual(writes(), [], 'nothing reached GitHub');
 });
 
-test('every write path of a listed repository is scanned (labels, a GraphQL mutation variable, update-branch); a query is not', (t) => {
+test('every free-text write of a listed repository is scanned (label create, a GraphQL mutation variable); a query and the id-only stop controls are not', (t) => {
   const { gh, scanner, writes } = scanKit(t);
   assert.match(caught(() => gh.createLabel({ name: 'ok', color: 'ffffff', description: `d ${PLANTED}` })).message, /label description/);
-  assert.ok(caught(() => gh.addLabels(7, [`l-${PLANTED}`])) instanceof OutboundScanBlocked);
   assert.match(caught(() => gh.graphql('mutation M($b:String!){m(input:{b:$b}){id}}', { b: PLANTED })).message, /graphql variable b/);
   assert.deepEqual(writes(), []);
-  assert.equal(scanner.runs().length, 3);
+  assert.equal(scanner.runs().length, 2);
   gh.graphql('query Q($o:String!){x(o:$o){id}}', { o: PLANTED }); // a read: nothing to scan
-  assert.equal(scanner.runs().length, 3);
-  gh.updateBranch(7, 'a'.repeat(40)); // clean text goes through to gh
-  assert.equal(scanner.runs().length, 4);
-  assert.equal(writes().length, 2);
+  gh.addLabels(7, ['needs-human']); // an existing label's name: not free text
+  gh.updateBranch(7, 'a'.repeat(40));
+  assert.equal(scanner.runs().length, 2, 'none of those reached the scanner');
+  assert.equal(writes().length, 3);
+});
+
+test('dequeue, enqueue and convert-to-draft still reach gh when the scan config is invalid (a stop control never depends on the scanner)', (t) => {
+  const { fake, gh, writes } = scanKit(t, 'scan', { listed: null });
+  writeScanConfig(fake.scanHome, '{ not json');
+  fake.setScript([REPO, { match: '^api graphql', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_x' } }, dequeuePullRequest: { mergeQueueEntry: { id: 'Q' } }, enqueuePullRequest: { mergeQueueEntry: { id: 'Q', state: 'QUEUED', position: 1 } }, convertPullRequestToDraft: { pullRequest: { isDraft: true, autoMergeRequest: null } } } } }]);
+  gh.dequeue(7);
+  gh.enqueue(7, 'a'.repeat(40));
+  assert.equal(gh.convertToDraft(7).isDraft, true);
+  assert.equal(writes().filter((l) => l.startsWith('api graphql')).length, 6, 'three node-id lookups and three mutations');
+  assert.ok(caught(() => gh.createComment(7, 'text')) instanceof OutboundScanBlocked, 'free text is still blocked by the invalid config');
+});
+
+test('a blocked write never echoes the scanner output, whatever punctuation wraps the hit', () => {
+  const secret = 'alice@example.test';
+  for (const stderr of [`found "${secret}"`, `${secret}.`, `email=${secret}`]) {
+    const err = caught(() => runScanner({ command: ['/x'], fields: [{ kind: 'body', text: `mail ${secret}` }], spawnFn: () => ({ status: 1, stdout: secret, stderr }) }));
+    assert.ok(err instanceof OutboundScanBlocked);
+    assert.ok(!err.message.includes('alice'), err.message);
+    assert.match(err.message, /exited 1/);
+  }
+});
+
+test('a scanner that ignores SIGTERM is killed at the timeout and the write is blocked', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-outscan-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const stubborn = join(dir, 'stubborn.mjs');
+  writeFileSync(stubborn, "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);\n");
+  const err = caught(() => runScanner({ command: [process.execPath, stubborn], fields: [{ kind: 'body', text: 'x' }], timeoutMs: 1500 }));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.match(err.message, /timed out/);
 });
