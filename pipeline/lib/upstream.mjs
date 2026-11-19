@@ -16,8 +16,8 @@ import { gh, run, seamValue } from './proc.mjs';
 export { removeTree };
 
 export const UPSTREAM_HOST = 'github.com';
-export const UPSTREAM_REPO = 'ianjamila/claude-pipeline';
-export const UPSTREAM_URL = 'https://github.com/ianjamila/claude-pipeline';
+export const UPSTREAM_REPO = 'claude-pipeline/claude-pipeline';
+export const UPSTREAM_URL = 'https://github.com/claude-pipeline/claude-pipeline';
 
 const FULL_SHA = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/;
 const ANY_SHA = /^[0-9a-f]{7,64}$/;
