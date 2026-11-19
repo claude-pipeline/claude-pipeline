@@ -611,3 +611,18 @@ test('publish: for a listed repository the log commit carries the fixed noreply 
   assertExit(w.run(['publish', '--line', L2]), 0);
   assert.equal(w.onOrigin('log', '-1', '--format=%ae', BRANCH).trim(), 'private-address@example.invalid');
 });
+
+// Failure caught: only the first push URL was checked, so a listed second destination of `git push origin` got the log unscanned.
+test('publish: a listed repository as the SECOND push URL of origin is scanned too', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]); // gh: acme/widgets, unlisted
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'https://example.test/private/Repo.git']);
+  w.repo.git(['remote', 'set-url', '--add', '--push', 'origin', 'https://example.test/Listed/Mirror.git']);
+  const scanner = makeScanner(tmp('cp-log-scanner-'));
+  writeScanConfig(w.fake.scanHome, { 'listed/mirror': { command: scanner.command } });
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(scanner.runs().length, 1, 'the listed second push destination was scanned');
+});
