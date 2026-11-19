@@ -303,3 +303,31 @@ test('verify --quick lists exact .test.mjs files only, each present in test/ (a 
   assert.ok(args.includes('test-runner.test.mjs'), 'the quick check must test its own file selection');
   assert.ok(!args.includes('worktree-prune-config-fallback.test.mjs'), 'the slow prune fallback test is not a quick check');
 });
+
+// ---- #472 Task 1: pending clicks are settled by the readers, so a test must never settle the owner's real ones ------------------------------
+// Already recorded clicks still count; PIPELINE_CLICK_SETTLE=off only stops pending clicks from becoming records through the readers. Strict lookups still see unresolved round clicks,
+// so setting it never widens what is approved.
+
+test('the test runner gives every test file PIPELINE_CLICK_SETTLE=off, whatever the caller had set', () => {
+  for (const before of [undefined, 'on', '']) {
+    const env = nestedEnv();
+    if (before === undefined) delete env.PIPELINE_CLICK_SETTLE; else env.PIPELINE_CLICK_SETTLE = before;
+    const r = spawnSync(process.execPath, [runner, 'runner-env-probe.test.mjs'], { encoding: 'utf8', env });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /PROBE PIPELINE_CLICK_SETTLE=off\b/, `caller had ${JSON.stringify(before)}`);
+  }
+});
+
+test('test/helpers/owner-go.mjs sets PIPELINE_CLICK_SETTLE=off when it is imported', () => {
+  const helper = join(root, 'test', 'helpers', 'owner-go.mjs');
+  const child = join(root, 'test', 'helpers', 'print-settle-env.mjs');
+  for (const before of [undefined, 'on']) {
+    const env = nestedEnv();
+    if (before === undefined) delete env.PIPELINE_CLICK_SETTLE; else env.PIPELINE_CLICK_SETTLE = before;
+    const r = spawnSync(process.execPath, [child, helper], { encoding: 'utf8', env });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim(), 'SETTLE=off', `caller had ${JSON.stringify(before)}`);
+  }
+  const control = spawnSync(process.execPath, [child, join(root, 'pipeline', 'hooks', 'lib', 'owner-go.mjs')], { encoding: 'utf8', env: (() => { const e = nestedEnv(); delete e.PIPELINE_CLICK_SETTLE; return e; })() });
+  assert.equal(control.stdout.trim(), 'SETTLE=(unset)', 'the library itself never sets it: only tests do');
+});

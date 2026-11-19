@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { cpuTime, cpuTimed } from './helpers/timing.mjs';
 
 const CL = '.cl' + 'aude';
 const none = { readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null };
@@ -67,14 +68,11 @@ const SHAPES = {
   'heredoc-markers': '<<E ', 'heredoc-lines': 'cat <<E\n', 'open-brace': '{', 'assign-brace': 'a=${', 'tee-operands': 'tee ', ands: '&&', newlines: '\n', 'dollar-quote': '"$', 'for-in': 'for i in ',
   'dollar-brace-subscript': '${a[', 'indirect-subscript': '${!a[', 'quoted-subscript': '"${a["', 'subscript-dollar-brace': 'a[${', 'length-subscript': '${#a[', 'for-subscript': 'for a[', 'blank-slash': ' / ', 'slash-quote': "/'", 'quote-slash': "'/", 'name-paren': 'f(){ ', 'array-open': 'a=(', backslashes: '\\',
 };
-const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
 for (const [name, unit] of Object.entries(SHAPES)) {
   test(`H2 a ${LIMIT}-character line of ${name} is answered in under 6 s of CPU time by each guard (allow or deny, never a throw)`, () => {
     const line = fill(unit);
     for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
-      const t0 = cpu();
-      const r = run();
-      const ms = cpu() - t0;
+      const { r, ms } = cpuTimed(run);
       assert.ok(r.decision === 'allow' || r.decision === 'deny', `${who}: ${r.decision}`);
       assert.ok(ms < 6000, `${who}: ${Math.round(ms)} ms of CPU for ${name}`);
     }
@@ -94,9 +92,7 @@ test(`H2 a long word of unclosed subscripts after a command that can take option
       const line = prefix + unit.repeat(Math.floor((LIMIT - prefix.length) / unit.length));
       assert.ok(line.length <= LIMIT);
       for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
-        const t0 = cpu();
-        const r = run();
-        const ms = cpu() - t0;
+        const { r, ms } = cpuTimed(run);
         assert.ok(r.decision === 'allow' || r.decision === 'deny', `${who}: ${r.decision}`);
         assert.ok(ms < SUBSCRIPT_CAP_MS, `${who}: ${Math.round(ms)} ms of CPU for ${prefix}${unit}...`); // (~0.2-0.33 s on a Mac on the worst shape)
       }
@@ -139,9 +135,7 @@ test('H2 a long run of quotes or blanks inside a word that ends in a slash is re
   const quotes = "a'" + "'".repeat(LIMIT / 2) + '/b';
   const blanks = "x '" + ' '.repeat(LIMIT / 2) + "/'";
   for (const line of [quotes, blanks, `echo ${quotes}`, `echo > ${blanks}`]) {
-    const t0 = cpu();
-    files(line);
-    const ms = cpu() - t0;
+    const ms = cpuTime(() => files(line));
     assert.ok(ms < 3000, `${Math.round(ms)} ms of CPU`);
   }
 });
@@ -163,9 +157,7 @@ test('H1 an assigned word longer than the scan keeps is the unknown word, not a 
 test('H2 a line of open braces is read without flattening the word for each one (well under the general bound)', () => {
   const line = fill('{');
   for (const run of [() => git(line), () => files(line)]) {
-    const t0 = cpu();
-    run();
-    const ms = cpu() - t0;
+    const ms = cpuTime(run);
     assert.ok(ms < 1000, `${Math.round(ms)} ms of CPU`);
   }
 });
@@ -209,9 +201,7 @@ test('H2 a 200 kB line of nested name-subscripts is answered quickly by both gua
   const line = fill('a[');
   // (bounds: ~0.2 s / 0.4 s locally, ~4x that on a Windows runner; the uncapped scan took 2.7 s locally, 10 s there)
   for (const [run, bound] of [[() => git(line), 1500], [() => files(line), 3000]]) {
-    const t0 = cpu();
-    run();
-    const ms = cpu() - t0;
+    const ms = cpuTime(run);
     assert.ok(ms < bound, `${Math.round(ms)} ms of CPU`);
   }
   const r = git(`${'a['.repeat(30000)}; git ${'pu' + 'sh'} origin ${'ma' + 'in'}`);
@@ -243,9 +233,7 @@ test('H2 lines of unclosed subscripts after `${` are answered well under the gen
   for (const unit of ['${a[', '${!a[', '"${a["', 'a[${', '${#a[', '${a[1]:-${a[']) {
     const line = fill(unit);
     for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
-      const t0 = cpu();
-      run();
-      const ms = cpu() - t0;
+      const ms = cpuTime(run);
       assert.ok(ms < 2500, `${who}: ${Math.round(ms)} ms of CPU for ${unit}`); // (~0.2 s locally, ~4x on a Windows runner)
     }
   }

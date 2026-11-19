@@ -6,11 +6,12 @@ import { spawnSync } from 'node:child_process';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { run as vendor, meta, vendorDrift } from '../pipeline/commands/vendor.mjs';
+import { pipelineYml } from './helpers/fakegh-env.mjs';
+import { run as vendor, meta, vendorDrift, isPipelineSource, PIPELINE_ROOT_COMMIT } from '../pipeline/commands/vendor.mjs';
 import { MANIFEST_REL, sha256File, walkFiles } from '../pipeline/lib/installer.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
-const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members', 'workflow-contexts'];
+const LIBS = ['proc', 'shell-words', 'seams', 'paths', 'yaml', 'codex-model-id', 'config', 'glob', 'diff', 'git', 'hardstops', 'risk', 'integrity', 'locks', 'guard-provenance', 'review-marker', 'resolution', 'doc-paths', 'queue-members', 'workflow-contexts'];
 const ENTRIES = ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local', 'workflow-contexts'];
 
 const vendorInto = (dir, extra = []) => vendor(['--repo', dir, ...extra], { cwd: dir, env: process.env });
@@ -219,6 +220,119 @@ test('vendor --check on a never-vendored repo lists everything as missing', asyn
   assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
 });
 
+// #550: the pipeline's own source repo (ci.guard_checks: false, no scripts/pipeline/, and its history contains the pipeline's root commit) is not a consumer: --check has nothing to compare there.
+// R2-B1 / R3-B1: guard_checks: false with scripts/pipeline/ merely absent is not enough (a consumer that deleted the folder must still see every file missing), and neither are placeholder files at the source paths: only the history identifies the source.
+const ROOT_COMMIT = PIPELINE_ROOT_COMMIT;
+test('vendor --check skips (exit 0, skipped says so) for the pipeline source repo: guard_checks false, no scripts/pipeline/, HEAD descending from the root commit', async (t) => {
+  // (CI checks out at depth 1, where this checkout lacks the root commit: the unit tests of isPipelineSource below cover the rule there.)
+  if (spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', ROOT_COMMIT, 'HEAD']).status !== 0) return t.skip('this checkout is shallow: it lacks the pipeline root commit');
+  const dir = mkdtempSync(join(tmpdir(), 'cp-vendor-src-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const cloned = spawnSync('git', ['clone', '-q', '--no-checkout', '--bare', root, join(dir, 'bare.git')], { encoding: 'utf8' });
+  assert.equal(cloned.status, 0, cloned.stderr);
+  const src = join(dir, 'src');
+  const made = spawnSync('git', ['clone', '-q', '--no-checkout', join(dir, 'bare.git'), src], { encoding: 'utf8' });
+  assert.equal(made.status, 0, made.stderr);
+  assert.equal(spawnSync('git', ['-C', src, 'merge-base', '--is-ancestor', ROOT_COMMIT, 'HEAD']).status, 0, 'the clone descends from the pipeline root commit');
+  mkdirSync(join(src, '.claude'), { recursive: true });
+  writeFileSync(join(src, '.claude', 'pipeline.yml'), pipelineYml('github', ['ci'], { guardChecks: false }));
+  const r = await vendorInto(src, ['--check']);
+  assert.equal(r.exitCode, 0);
+  assert.equal(r.output.ok, true);
+  assert.match(r.output.skipped, /pipeline source repo/);
+  assert.equal(r.output.drift, undefined);
+});
+
+// isPipelineSource(root, rootCommit): the commit is a parameter so these run on a fixture repo whatever the depth of the checkout.
+test('isPipelineSource: true for a repo whose HEAD descends from the given root commit; false for a commit only in an unrelated ref and for a non-git folder', () => {
+  const repo = createTmpRepo();
+  repo.write('a.txt', 'a\n');
+  const first = repo.commit('first');
+  repo.write('b.txt', 'b\n');
+  repo.commit('second');
+  assert.equal(isPipelineSource(repo.dir, first), true);
+  const main = repo.git(['rev-parse', '--abbrev-ref', 'HEAD']).trim();
+  repo.git(['checkout', '-q', '--orphan', 'unrelated']);
+  repo.write('c.txt', 'c\n');
+  const stray = repo.commit('stray');
+  repo.git(['checkout', '-q', main]);
+  assert.equal(repo.git(['cat-file', '-t', stray]).trim(), 'commit');
+  assert.equal(isPipelineSource(repo.dir, stray), false, 'the object is there but is not an ancestor of HEAD');
+  const bare = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-vendor-nogit-')));
+  try {
+    assert.equal(isPipelineSource(bare, first), false);
+  } finally {
+    rmSync(bare, { recursive: true, force: true });
+  }
+});
+
+// R4-B1: holding the root commit's object is not sharing the history: a consumer that fetched the pipeline repo into some ref must still get the drift check.
+test('vendor --check with ci.guard_checks: false in a consumer that only fetched the pipeline root commit into an unrelated ref is still drift (R4-B1)', async (t) => {
+  const reachable = spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', ROOT_COMMIT, 'HEAD']).status === 0;
+  if (!reachable) return t.skip('this checkout is shallow: it lacks the pipeline root commit');
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  repo.git(['fetch', '-q', root, `${ROOT_COMMIT}:refs/heads/unrelated`]);
+  assert.equal(repo.git(['cat-file', '-t', ROOT_COMMIT]).trim(), 'commit', 'the object is present');
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+});
+
+test('vendor --check with ci.guard_checks: false and empty placeholder files at every source path is not the source repo: still drift (R3-B1)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  repo.write('pipeline/commands/vendor.mjs', '');
+  for (const f of ['ci-guard', 'ci-guards-run', 'queue-guards-run', 'smoke', 'supabase-local', 'workflow-contexts']) repo.write(`pipeline/templates/scripts/pipeline/${f}.mjs`, '');
+  for (const n of LIBS) repo.write(`pipeline/lib/${n}.mjs`, '');
+  repo.write('pipeline/vendor/js-yaml.mjs', '');
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+  assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
+});
+
+test('vendor --check with ci.guard_checks: false in a consumer repo whose scripts/pipeline/ was deleted still reports every file missing (R2-B1)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  await vendorInto(repo.dir);
+  rmSync(sp(repo.dir), { recursive: true });
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+  assert.equal(r.output.drift.length, ENTRIES.length + LIBS.length + 2);
+  assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
+});
+
+test('vendor --check with ci.guard_checks: false in a consumer repo that was never vendored into is still drift (only the pipeline source repo skips)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+});
+
+test('vendor --check with ci.guard_checks: false still compares a repo that has scripts/pipeline/ (R1-B1: the flag does not govern the other vendored scripts)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
+  await vendorInto(repo.dir);
+  assert.equal((await vendorInto(repo.dir, ['--check'])).exitCode, 0);
+  writeFileSync(join(sp(repo.dir), 'workflow-contexts.mjs'), 'process.exit(0);\n');
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+  assert.deepEqual(r.output.drift, [{ file: 'scripts/pipeline/workflow-contexts.mjs', reason: 'differs' }]);
+});
+
+test('vendor --check with ci.guard_checks: true still reports a never-vendored repo as drift (only an explicit false skips)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: true }));
+  const r = await vendorInto(repo.dir, ['--check']);
+  assert.equal(r.exitCode, 1);
+  assert.equal(r.output.skipped, undefined);
+  assert.ok(r.output.drift.every((d) => d.reason === 'missing'));
+});
+
 test('vendor --check ignores the +sha suffix but not a different base version', async () => {
   const repo = createTmpRepo();
   await vendorInto(repo.dir);
@@ -405,7 +519,7 @@ test('vendor from an installed copy stamps the installed identity (.modified whe
     vendorFrom(join(home, 'pipeline'), target.dir);
     assert.equal(stampOf(target.dir), '7.7.7+abcdef0');
 
-    writeFileSync(join(home, 'pipeline', 'lib', 'glob.mjs'), '// hand edit\n');
+    writeFileSync(join(home, 'pipeline', 'lib', 'glob.mjs'), `${readFileSync(join(home, 'pipeline', 'lib', 'glob.mjs'), 'utf8')}\n// hand edit\n`);
     const target2 = createTmpRepo();
     vendorFrom(join(home, 'pipeline'), target2.dir);
     assert.equal(stampOf(target2.dir), '7.7.7+abcdef0.modified');
@@ -523,4 +637,19 @@ test('a missing or unreadable .github/workflows warns instead of crashing', asyn
   const r3 = await vendorInto(odd.dir, ['--check']);
   assert.equal(r3.exitCode, 0);
   assert.equal(unwired(r3).length, 1);
+});
+
+test('#443: the vendored config.mjs resolves its codex-model-id import in the project layout and validates review.codex_model (the vendored guard entry loads too)', async () => {
+  const repo = createTmpRepo();
+  const r = await vendorInto(repo.dir);
+  assert.ok(r.output.files.includes('scripts/pipeline/lib/codex-model-id.mjs'), 'the model id shape ships to projects (the vendored config.mjs imports it)');
+  assert.equal(readFileSync(join(sp(repo.dir), 'lib', 'codex-model-id.mjs'), 'utf8'), readFileSync(join(root, 'pipeline', 'lib', 'codex-model-id.mjs'), 'utf8'));
+  const vendored = await import(pathToFileURL(join(sp(repo.dir), 'lib', 'config.mjs')).href);
+  await import(pathToFileURL(join(sp(repo.dir), 'ci-guard.mjs')).href);
+  const base = { version: 1, project: 'p', verify: { full: 'f', quick: 'q' } };
+  const bad = vendored.validateConfig({ ...base, review: { codex_model: 'gpt 5' } });
+  assert.equal(bad.ok, false);
+  assert.ok(bad.errors.some((e) => e.includes('review.codex_model must be a model id')), bad.errors.join('; '));
+  const good = vendored.validateConfig({ ...base, review: { codex_model: 'gpt-6-astra' } });
+  assert.equal(good.ok, true, good.errors.join('; '));
 });

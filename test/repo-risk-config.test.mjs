@@ -1,0 +1,426 @@
+// The repo's own .claude/pipeline.yml: it must validate, and its risk settings must stay what the rating tests and the plan assume.
+import { test } from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { parseYaml } from '../pipeline/lib/yaml.mjs';
+import { validateConfig } from '../pipeline/lib/config.mjs';
+import { matchAny } from '../pipeline/lib/glob.mjs';
+import { assessRisk, reviewLane } from '../pipeline/lib/risk.mjs';
+
+const root = path.join(path.dirname(fileURLToPath(import.meta.url)), '..');
+const raw = parseYaml(fs.readFileSync(path.join(root, '.claude', 'pipeline.yml'), 'utf8'));
+
+test('repo config: .claude/pipeline.yml passes validateConfig', () => {
+  const r = validateConfig(raw);
+  assert.equal(r.ok, true, r.errors.join('; '));
+});
+
+test('repo config: every literal high_risk_paths entry exists on disk', () => {
+  const list = raw.risk.high_risk_paths;
+  assert.ok(Array.isArray(list) && list.length > 0);
+  for (const p of list.filter((x) => !/[*?[{]/.test(x))) {
+    assert.ok(fs.existsSync(path.join(root, p)), `${p} is in risk.high_risk_paths but does not exist`);
+  }
+});
+
+test('repo config: ignore_hard_stop_rules is exactly P-path and R4-config', () => {
+  assert.deepEqual(raw.risk.ignore_hard_stop_rules, ['P-path', 'R4-config']);
+  assert.deepEqual(validateConfig(raw).config.risk.ignore_hard_stop_rules, ['P-path', 'R4-config']);
+});
+
+test('repo config: the rating tests read this same high_risk_paths list (no hand-copied fixture); no duplicates; the helper and wrapper files are in it', () => {
+  const src = fs.readFileSync(path.join(root, 'test', 'risk-rate-branch.test.mjs'), 'utf8');
+  assert.match(src, /CP_HIGH = parseYaml\(.*\.claude\/pipeline\.yml.*\)\.risk\.high_risk_paths/, 'risk-rate-branch.test.mjs must read the real list, not a copy');
+  const list = raw.risk.high_risk_paths;
+  assert.equal(new Set(list).size, list.length);
+  for (const p of ['pipeline/lib/glob.mjs', 'pipeline/lib/git.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/docs-exempt.mjs', 'pipeline/lib/yaml.mjs', 'pipeline/vendor/**', 'pipeline/lib/proc.mjs', 'pipeline/lib/paths.mjs', 'pipeline/lib/resolution.mjs', 'pipeline/lib/seams.mjs', 'pipeline/lib/shell-words.mjs', 'install.sh', 'install.ps1']) {
+    assert.ok(list.includes(p), p);
+  }
+});
+
+// Relative imports of a source file. STATIC ones (`import ... from`, `export ... from`, bare `import './x.mjs'`, multi-line, any comment or
+// string or regex-literal or nested-template shape) come from V8's own module parser, run in ONE child process per call
+// (test/fixtures/static-imports.mjs, `vm.SourceTextModule` needs --experimental-vm-modules); this file does not parse JavaScript itself.
+// A source that does not parse throws, so the test fails closed. DYNAMIC `import('./x.mjs')` needs a literal specifier ('…', "…", or a
+// backtick without `${`) and is found by a regex over the RAW text with no comment stripping. A block or line comment may sit between
+// `import`, `(`, the specifier and the closing `,` or `)`. The regex may only OVER-match: a mention inside a comment or string is taken as an
+// import, which is the safe direction (importClosure skips a dynamic target that does not exist on disk). A computed or interpolated
+// specifier has no path to follow and is deliberately not matched.
+// No match may consume text: the pattern is tried with a STICKY regex at EVERY `import` token (one candidate per token), so a real literal
+// import always matches from its own token and an earlier `import`, comment or quote cannot swallow it. A block comment ends at its FIRST
+// `*/` and a line comment at its line end (no backtracking to a later one), so one candidate never reaches into the next import.
+const STATIC_IMPORTS_HELPER = path.join(root, 'test', 'fixtures', 'static-imports.mjs');
+const SKIP = String.raw`(?:\s|\/\*(?:[^*]|\*(?!\/))*\*\/|\/\/[^\n]*(?![^\n]))*`;
+const DYNAMIC_IMPORT_AT = new RegExp(String.raw`import${SKIP}\(${SKIP}(?:'([^'\n]+)'|"([^"\n]+)"|\`((?:[^\`$\\]|\$(?!\{))+)\`)${SKIP}[,)]`, 'y');
+
+function staticSpecifiers(sources) {
+  const r = spawnSync(process.execPath, ['--experimental-vm-modules', '--no-warnings', STATIC_IMPORTS_HELPER], {
+    input: JSON.stringify(sources), encoding: 'utf8', maxBuffer: 64 * 1024 * 1024,
+  });
+  if (r.error) throw r.error;
+  if (r.status !== 0) throw new Error(`static import parse failed (exit ${r.status}): ${r.stderr}`);
+  return JSON.parse(r.stdout);
+}
+
+function dynamicSpecifiers(src) {
+  const out = [];
+  for (const token of src.matchAll(/\bimport/g)) {
+    DYNAMIC_IMPORT_AT.lastIndex = token.index;
+    const m = DYNAMIC_IMPORT_AT.exec(src);
+    if (m) out.push(m[1] ?? m[2] ?? m[3]);
+  }
+  return out;
+}
+
+// One entry per source: { static: [...], dynamic: [...] }.
+function scanImports(sources) {
+  const stat = staticSpecifiers(sources);
+  return sources.map((src, i) => ({ static: stat[i], dynamic: dynamicSpecifiers(src) }));
+}
+
+const isRelative = (spec) => spec.startsWith('./') || spec.startsWith('../');
+const relFrom = (fromAbs, spec) => path.relative(root, path.resolve(path.dirname(fromAbs), spec)).split(path.sep).join('/');
+
+// Direct relative imports of each file in `rels` (repo-relative, posix): every static one (a missing target is reported by the caller),
+// plus each dynamic one whose target exists on disk. Bare specifiers (node:fs, packages) are ignored.
+function directImports(rels) {
+  const scans = scanImports(rels.map((rel) => {
+    const abs = path.join(root, rel);
+    assert.ok(fs.existsSync(abs), `${rel} is imported but does not exist`);
+    return fs.readFileSync(abs, 'utf8');
+  }));
+  return rels.map((rel, i) => {
+    const abs = path.join(root, rel);
+    const stat = scans[i].static.filter(isRelative).map((s) => relFrom(abs, s));
+    const dyn = scans[i].dynamic.filter(isRelative).map((s) => relFrom(abs, s)).filter((t) => fs.existsSync(path.join(root, t)));
+    return [...new Set([...stat, ...dyn])];
+  });
+}
+
+// The names a source imports from one specifier (#388), from its import clause: '{ a, b as c }' -> a, b; 'x' -> default; '* as ns' / 'export *' / a dynamic import
+// that is not destructured -> '*'; a bare `import 'x'` -> '(side effect)'. A clause that cannot be found for a specifier V8 reported fails the caller closed.
+// Comments are blanked in one pass that steps over string literals (a '/*' or '//' inside a string is no comment); a miss fails the caller closed.
+const SIDE_EFFECT = '(side effect)';
+function importedNames(src, spec) {
+  const clean = src.replace(/\/\*[\s\S]*?\*\/|\/\/[^\n]*|'(?:\\.|[^'\\\n])*'|"(?:\\.|[^"\\\n])*"|`(?:\\.|[^`\\])*`/g, (t) => (t.startsWith('/') ? ' ' : t));
+  const q = spec.replace(/[.*+?^${}()|[\]\\/]/g, '\\$&');
+  const names = new Set();
+  let found = false;
+  for (const m of clean.matchAll(new RegExp(String.raw`\b(?:import|export)\s*([^;'"]*?)\s*from\s*['"]${q}['"]`, 'g'))) {
+    found = true;
+    const clause = m[1].trim();
+    const braces = /\{([^}]*)\}/.exec(clause);
+    if (braces) for (const part of braces[1].split(',')) { const n = part.trim().split(/\s+as\s+/)[0].trim(); if (n) names.add(n); }
+    const rest = clause.replace(/\{[^}]*\}/, '').replace(/,/g, ' ').trim();
+    if (rest.startsWith('*')) names.add('*');
+    else if (rest !== '' && !/^type\b/.test(rest)) names.add('default');
+  }
+  if (new RegExp(String.raw`\bimport\s*['"]${q}['"]`).test(clean)) { found = true; names.add(SIDE_EFFECT); }
+  for (const m of clean.matchAll(new RegExp(String.raw`\bimport\s*\(\s*(?:'${q}'|"${q}"|\`${q}\`)`, 'g'))) {
+    found = true;
+    const before = clean.slice(Math.max(0, m.index - 300), m.index);
+    const d = /(?:const|let|var)\s*\{([^}]*)\}\s*=\s*(?:await\s+)?$/.exec(before);
+    if (d) for (const part of d[1].split(',')) { const n = part.trim().split(/\s*:\s*/)[0].trim(); if (n) names.add(n); }
+    else names.add('*');
+  }
+  if (!found) throw new Error(`no import clause found for ${spec}`);
+  return names;
+}
+
+// root -> target -> the names that root imports from it (relative imports only, to files that exist).
+function importedNamesByTarget(rels) {
+  const out = new Map();
+  for (const rel of rels) {
+    const abs = path.join(root, rel);
+    const src = fs.readFileSync(abs, 'utf8');
+    const scan = scanImports([src])[0];
+    const byTarget = new Map();
+    for (const spec of new Set([...scan.static, ...scan.dynamic].filter(isRelative))) {
+      const t = relFrom(abs, spec);
+      if (!fs.existsSync(path.join(root, t))) continue;
+      let names;
+      try { names = importedNames(src, spec); } catch (err) { throw new Error(`${rel}: ${err.message}`); }
+      byTarget.set(t, new Set([...(byTarget.get(t) ?? []), ...names]));
+    }
+    out.set(rel, byTarget);
+  }
+  return out;
+}
+
+function importClosure(startRel) {
+  const seen = new Set();
+  let frontier = [startRel];
+  while (frontier.length) {
+    const batch = [...new Set(frontier)].filter((rel) => !seen.has(rel));
+    for (const rel of batch) seen.add(rel);
+    frontier = directImports(batch).flat();
+  }
+  return [...seen].sort();
+}
+
+test('repo config: the import scanner finds multi-line, export-from and bare imports and skips bare specifiers and comments', () => {
+  const src = "import a from './a.mjs';\nimport {\n  b,\n  c,\n} from '../b.mjs';\nexport { d } from './d.mjs';\nimport './e.mjs';\nimport fs from 'node:fs';\n// import x from './nope.mjs';\nexport const s = './f.mjs';\n";
+  assert.deepEqual(scanImports([src])[0].static, ['./a.mjs', '../b.mjs', './d.mjs', './e.mjs', 'node:fs']);
+});
+
+test('repo config: the import scanner follows a dynamic import with a literal path (any quote, a backtick with no interpolation), ignores an interpolated or computed one, and over-matches a commented one', () => {
+  const src = "const m = await import('./dyn.mjs');\nconst n = import(\"../up.mjs\").then((x) => x);\nawait import(name);\nawait import(`./tpl-${x}.mjs`);\nawait import(`./tick.mjs`);\nawait import(/* why */ './cmt.mjs', { with: {} });\n// await import('./mention.mjs');\n";
+  assert.deepEqual(scanImports([src])[0].dynamic, ['./dyn.mjs', '../up.mjs', './tick.mjs', './cmt.mjs', './mention.mjs']);
+});
+
+test('repo config: the dynamic-import scan allows a comment between import, the paren, the specifier and the closing paren or comma', () => {
+  const src = [
+    "await import('./a-trail.mjs' /* why */);",
+    "await import /* why */ ('./b-before-paren.mjs');",
+    "await import( // why",
+    "  './c-line.mjs');",
+    "await import(\n  /* one */ /* two */ // three\n  \"./d-mixed.mjs\" // four\n  , { with: {} });",
+    "await import /* a */ // b\n (`./e-tick.mjs` /* c */);",
+    "await import(/* a * / b */ './f-star.mjs');",
+    "await import(/* why */ name);",
+    "",
+  ].join('\n');
+  assert.deepEqual(scanImports([src])[0].dynamic, ['./a-trail.mjs', './b-before-paren.mjs', './c-line.mjs', './d-mixed.mjs', './e-tick.mjs', './f-star.mjs']);
+});
+
+test('repo config: round-4 regressions (R4-B1, R4-F1): no dynamic-import match consumes a later import, whatever comment or computed import comes first', () => {
+  // A computed import with a leading block comment must not reach a later `*/` and eat the real import after it.
+  const computed = "await import(/* @vite-ignore */ url);\nawait import('./real.mjs');\nlog(/* level */ 'info', msg);\n";
+  assert.deepEqual(scanImports([computed])[0].dynamic, ['./real.mjs']);
+  // Codex's case: a mention in a line comment opens a `/*` that a later line comment closes; the real import in between stays found.
+  const fake = "// import('./fake.mjs' /*\nawait import('./real.mjs');\n// */);\n";
+  assert.deepEqual(scanImports([fake])[0].dynamic, ['./fake.mjs', './real.mjs']);
+  // The earlier test's `import(/* why */ name)` line moved FIRST must still return every later specifier.
+  const moved = [
+    "await import(/* why */ name);",
+    "await import('./a-trail.mjs' /* why */);",
+    "await import /* why */ ('./b-before-paren.mjs');",
+    "await import( // why",
+    "  './c-line.mjs');",
+    "",
+  ].join('\n');
+  assert.deepEqual(scanImports([moved])[0].dynamic, ['./a-trail.mjs', './b-before-paren.mjs', './c-line.mjs']);
+  // A static import with a comment before its brace, then a comment before a later parenthesis.
+  const staticFirst = "import /* types */ { a } from './a.mjs';\nconst s = f /* x */ ('./not-an-import.mjs');\nawait import('./later.mjs');\n";
+  assert.deepEqual(scanImports([staticFirst])[0].dynamic, ['./later.mjs']);
+});
+
+test('repo config: the import scanner does not skip a multi-line import whose braces hold a comment with a quote, semicolon or brace', () => {
+  const src = [
+    "import {",
+    "  a, // the owner's pick; see #1",
+    "  /* don't drop; \"b\" } */ b,",
+    "  c, // a } stray brace",
+    "} from './multi.mjs';",
+    "import { d } from './after.mjs';",
+    "",
+  ].join('\n');
+  assert.deepEqual(scanImports([src])[0].static, ['./multi.mjs', './after.mjs']);
+});
+
+test('repo config: a `/*` inside a string, a `//` comment, a regex literal or a nested template does not hide the imports after it', () => {
+  const inString = "const g = 'a /* b';\nimport { x } from './kept-after-string.mjs';\nconst h = 'src/**/*.mjs';\nexport { y } from './kept-after-glob.mjs';\n";
+  assert.deepEqual(scanImports([inString])[0].static, ['./kept-after-string.mjs', './kept-after-glob.mjs']);
+  const inLine = "// see /* the glob\nimport { x } from './kept-after-line.mjs';\n// and src/**/ here\nimport './kept-after-glob.mjs';\n";
+  assert.deepEqual(scanImports([inLine])[0].static, ['./kept-after-line.mjs', './kept-after-glob.mjs']);
+  const inTemplate = "const t = `/* ${1}`;\nimport z from './kept-after-template.mjs';\n/* real */ import w from './kept-after-block.mjs';\n";
+  assert.deepEqual(scanImports([inTemplate])[0].static, ['./kept-after-template.mjs', './kept-after-block.mjs']);
+  // A real block comment still hides an import it holds, and ends at its own `*/`.
+  assert.deepEqual(scanImports(["/*\nimport a from './hidden.mjs';\n*/\nimport b from './shown.mjs';\n"])[0].static, ['./shown.mjs']);
+  // Round-2 regressions (R2-B1, R2-F1): the old hand-written scanner opened a fake block comment at each of these and dropped the import after it.
+  const inRegex = "const re = /[/*]/;\nimport x from './late.mjs';\n";
+  assert.deepEqual(scanImports([inRegex])[0].static, ['./late.mjs']);
+  const nested = "const g = `${a ? `${d}/*` : ''}`;\nimport x from './late.mjs';\n";
+  assert.deepEqual(scanImports([nested])[0].static, ['./late.mjs']);
+  const tickInRegex = "const r = /[`'\"]/;\nconst t = `a/*`;\nimport x from './late.mjs';\nexport * from './reexp.mjs';\n";
+  assert.deepEqual(scanImports([tickInRegex])[0].static, ['./late.mjs', './reexp.mjs']);
+  const everything = ["const re = /[/*]/;", "const g = `${a ? `${d}/*` : ''}`;", "import x from './late.mjs';", "import {", "  a, // a } stray brace", "  /* b } */ b,", "} from './multi.mjs';", "export * from './reexp.mjs';", ""].join('\n');
+  assert.deepEqual(scanImports([everything])[0].static, ['./late.mjs', './multi.mjs', './reexp.mjs']);
+});
+
+test('repo config: a source the engine cannot parse makes the scanner throw (the closure test fails closed)', () => {
+  assert.throws(() => scanImports(["import x from './a.mjs';\nconst = ;\n"]), /static import parse failed/);
+});
+
+// The gate and review-proof set: listed BY HAND in risk.high_risk_paths. Roots come from the config, not from a second list here: every
+// LITERAL .mjs entry of risk.high_risk_paths is a depth-1 ROOT, and each file it imports directly must be listed or sit in DEPTH1_EXEMPT, so
+// the list is closed under "a direct import of a listed file is listed or exempt" (issue #356; round 7 dropped the leaf set: a file that
+// decides something is a root, and a file that decides nothing belongs in DEPTH1_EXEMPT with a true reason, not in a half-checked middle).
+// A glob entry (pipeline/hooks/**, pipeline/vendor/**) is never a root. A NEW literal .mjs entry therefore becomes a root automatically.
+const isLiteralMjs = (p) => p.endsWith('.mjs') && !/[*?[{]/.test(p);
+const LITERAL = raw.risk.high_risk_paths.filter(isLiteralMjs);
+// pipeline/hooks/** is a glob, so it is never a LITERAL root, but every .mjs the glob covers on disk is one (#387): what a hook file imports directly is
+// listed or exempt like what a listed file imports. Expanded here from the config's own glob entries, not from a second list.
+const hookGlobs = raw.risk.high_risk_paths.filter((p) => p.startsWith('pipeline/hooks/') && /[*?[{]/.test(p));
+const hookFiles = (dir) => fs.readdirSync(path.join(root, dir), { withFileTypes: true }).flatMap((e) => (
+  e.isDirectory() ? hookFiles(`${dir}/${e.name}`) : (e.name.endsWith('.mjs') ? [`${dir}/${e.name}`] : [])));
+const HOOK_ROOTS = hookFiles('pipeline/hooks').filter((f) => matchAny(f, hookGlobs, { nocase: true })).sort();
+const ROOTS = [...new Set([...LITERAL, ...HOOK_ROOTS])];
+
+test('repo config: every literal .mjs entry of risk.high_risk_paths is a root; no duplicate entry; no glob became a root', () => {
+  assert.equal(new Set(LITERAL).size, LITERAL.length, 'a duplicate literal .mjs entry in risk.high_risk_paths');
+  assert.ok(ROOTS.length >= 60, `suspiciously few roots: ${ROOTS.length}`);
+  assert.ok(!ROOTS.some((p) => /[*?[{]/.test(p)), 'a glob entry became a root');
+});
+
+test('repo config: a one-line change to any literal .mjs entry of risk.high_risk_paths rates high and goes to Fable', () => {
+  const list = raw.risk.high_risk_paths;
+  const { config } = validateConfig(raw);
+  for (const p of LITERAL) {
+    assert.ok(matchAny(p, list, { nocase: true }), `${p} is not matched by risk.high_risk_paths`);
+    const files = [{ path: p, added: ['// one line'], removed: [] }];
+    const r = assessRisk({ files, hits: [], config });
+    assert.equal(r.level, 'high', `${p}: ${r.reasons.join('; ')}`);
+    assert.equal(r.drivers.path, true, p);
+    assert.equal(reviewLane({ level: r.level, files, config }).reviewer, 'fable', p);
+  }
+  // Control: a file outside the list with the same one-line change stays low and goes to the judge.
+  const other = [{ path: 'pipeline/lib/unlisted-example.mjs', added: ['// one line'], removed: [] }];
+  assert.equal(assessRisk({ files: other, hits: [], config }).level, 'low');
+});
+
+test('repo config: every file the risk rating imports (transitively) is covered by risk.high_risk_paths', () => {
+  const list = raw.risk.high_risk_paths;
+  const closure = importClosure('pipeline/lib/risk.mjs');
+  // The 14 files the rater reads today (2026-11-13). A walker that silently loses an import drops one of them and fails here; a NEW
+  // import only grows the closure and must be covered by the check below.
+  const known = [
+  'pipeline/lib/risk.mjs', 'pipeline/lib/config.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/doc-paths.mjs', 'pipeline/lib/git.mjs',
+  'pipeline/lib/glob.mjs', 'pipeline/lib/hardstops.mjs', 'pipeline/lib/paths.mjs', 'pipeline/lib/proc.mjs', 'pipeline/lib/resolution.mjs',
+  'pipeline/lib/seams.mjs', 'pipeline/lib/shell-words.mjs', 'pipeline/lib/yaml.mjs', 'pipeline/vendor/js-yaml.mjs',
+  ];
+  assert.deepEqual(known.filter((f) => !closure.includes(f)), [], `import closure of pipeline/lib/risk.mjs lost a known file: ${closure.join(', ')}`);
+  assert.ok(closure.length >= known.length, `suspiciously small import closure: ${closure.join(', ')}`);
+  const uncovered = closure.filter((f) => !matchAny(f, list, { nocase: true }));
+  assert.deepEqual(uncovered, [], `imported by pipeline/lib/risk.mjs but not in risk.high_risk_paths: ${uncovered.join(', ')}`);
+});
+
+// Files a root imports DIRECTLY that are deliberately NOT in risk.high_risk_paths: path -> one line on why it decides no gate, proof, trust
+// boundary, owner-only check, or which code is installed or run. Each reason must hold for EVERY root that imports the file: before an entry
+// is added, read each importer's call sites and check that no root branches, refuses, merges, lifts a hold, installs or trusts something on
+// the file's return value or side effect (then LIST it instead; round 6 moved summary-comment, run-progress, cmd-io, schedule and
+// merge-cleanup out of this map for that reason).
+// The four stacks libs below are an OWNER-DECIDED EXCEPTION to the rule above (2026-11-13, #392): one of them (register.mjs) is the verdict of a hook that can
+// block a Bash/Edit tool call. What each hook does with the result is stated per file; none of them decides a review gate, proof, trust or install.
+const STACKS_EXEMPT_WHY = 'owner-decided exception to the rule above (2026-11-13, #392)';
+const DEPTH1_EXEMPT = new Map([
+  ['pipeline/lib/codex-usage-kinds.mjs', 'display only: codex-status.mjs imports only summariseUsage, which reads the Codex session logs and sums tokens per session kind for the printed report; it writes nothing and no gate, proof or route reads its result'],
+  ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask and the park comment (round-status.mjs hands costFrom, roundsFrom, openItems, notCleanReasons and statusLines to the owner-facing display, triage.mjs hands askSummary and processReviewSummary (the process-review text of the trip-wire prompt: pure string building from values triage.mjs computed) to the ask, and uses longReviewOf (the last counted rounds\' findings and the blocking-loop flag, shown in the ask) and recommendedWords (the recommendation in words) for display fields only); admission, the trip-wire itself (roundTripWire) and defer eligibility are decided in triage.mjs (listed) and defer-fixes re-checks'],
+  ['pipeline/lib/worktree-prune/inspect.mjs', 'live-sessions.mjs imports only unFirm (strips the macOS /System/Volumes/Data firmlink prefix from a path), which only liveSessionsIn calls (the worktree-prune session match); review-lease.mjs uses claudeConfigDirs and psStarts, never liveSessionsIn, so no gate, proof, trust or install branches on it'],
+  ['pipeline/lib/worktree-prune/run.mjs', 'update-schedule.mjs, queue-sweep-schedule.mjs and queue-sweep.mjs import only pruneLogDir (the folder the cron-*.log files are appended to); it picks no command, argument or code to run, and the worktree prune the file holds decides no gate, proof, trust or install'],
+  ['pipeline/lib/stacks/dev.mjs', `hooks/stack-dev-bind.mjs awaits runDevBind (it stamps and binds a dev-server record in the stack ledger) and exits 0 whatever it returns or throws (the failure goes to stacks.log), so nothing branches on the result and it never blocks a tool call; it decides no review gate, proof, trust or install; ${STACKS_EXEMPT_WHY}`],
+  ['pipeline/lib/stacks/fastpath.mjs', `hooks/stack-register.mjs and hooks/stack-dev-bind.mjs use registerFastSkip / devBindFastSkip only to skip work: true means "nothing to register / bind" (register exits 0 without loading register.mjs), anything else or a throw takes the full path, so a skip can only waive the stack registration (the one thing stack-register can block a tool call for), never a review gate, proof, trust or install; ${STACKS_EXEMPT_WHY}`],
+  ['pipeline/lib/stacks/register.mjs', `hooks/stack-register.mjs exits 0 or 2 on register()'s verdict, so it CAN block a Bash/Edit tool call (exit 2), but only to record or refuse use of a private Supabase stack; it decides no review gate, proof, trust or install; ${STACKS_EXEMPT_WHY}`],
+  ['pipeline/lib/stacks/session-end.mjs', `hooks/stack-session-end.mjs awaits sessionEndHook (it starts the detached worker that later stops idle stacks) and exits 0 whatever it returns or throws (SessionEnd cannot block anything), so no tool call, gate, proof, trust or install branches on the result; ${STACKS_EXEMPT_WHY}`],
+]);
+
+// The names a root may import from each DEPTH1_EXEMPT file (#388): an exemption is a claim about the HELPERS the roots use, so a root that starts
+// importing anything else from the file (a namespace, a default, a new name, a side-effect import) fails until someone re-reads it. '*' = a namespace
+// or an unreadable clause; '(side effect)' = a bare `import './x.mjs'`. Checked against every root's import clause, static and dynamic.
+const DEPTH1_NAMES = new Map([
+  ['pipeline/lib/codex-usage-kinds.mjs', ['summariseUsage']],
+  ['pipeline/lib/round-ask.mjs', ['askSummary', 'costFrom', 'issuedRoundVariant', 'longReviewOf', 'notCleanReasons', 'openItems', 'processReviewSummary', 'recommendedWords', 'roundsFrom', 'statusLines']],
+  ['pipeline/lib/worktree-prune/inspect.mjs', ['unFirm']],
+  ['pipeline/lib/worktree-prune/run.mjs', ['pruneLogDir']],
+  ['pipeline/lib/stacks/dev.mjs', ['runDevBind']],
+  ['pipeline/lib/stacks/fastpath.mjs', ['devBindFastSkip', 'registerFastSkip']],
+  ['pipeline/lib/stacks/register.mjs', ['register']],
+  ['pipeline/lib/stacks/session-end.mjs', ['sessionEndHook']],
+]);
+
+test('repo config: every relative import (depth 1) of every root (literal .mjs entry) is covered by risk.high_risk_paths or listed in DEPTH1_EXEMPT', () => {
+  const list = raw.risk.high_risk_paths;
+  const imports = directImports(ROOTS);
+  const byFile = new Map(ROOTS.map((rel, i) => [rel, imports[i]]));
+  // finalgate.mjs imports a few dozen files today (2026-11-13); a scanner that silently loses its imports fails here.
+  const direct = byFile.get('pipeline/lib/finalgate.mjs');
+  assert.ok(direct.length >= 20, `suspiciously few direct imports of finalgate.mjs: ${direct.join(', ')}`);
+  for (const f of ['pipeline/lib/triage.mjs', 'pipeline/lib/model-floor.mjs', 'pipeline/hooks/lib/owner-go.mjs']) assert.ok(direct.includes(f), `${f} is no longer found in finalgate.mjs's imports: ${direct.join(', ')}`);
+  const uncovered = [];
+  for (const [rel, targets] of byFile) for (const t of targets) if (!matchAny(t, list, { nocase: true }) && !DEPTH1_EXEMPT.has(t)) uncovered.push(`${t} (imported by ${rel})`);
+  assert.deepEqual(uncovered, [], `imported by a named high-risk file but neither in risk.high_risk_paths nor in DEPTH1_EXEMPT: ${uncovered.join(', ')}`);
+  // A stale exemption hides nothing but rots: each must still exist, still be imported by a named file, and not be listed after all.
+  const imported = new Set([...byFile.values()].flat());
+  for (const [t, why] of DEPTH1_EXEMPT) {
+    assert.ok(why.length > 0 && fs.existsSync(path.join(root, t)), `DEPTH1_EXEMPT ${t}: missing file or reason`);
+    assert.ok(imported.has(t), `DEPTH1_EXEMPT ${t} is no longer imported by a named file: remove it`);
+    assert.ok(!matchAny(t, list, { nocase: true }), `DEPTH1_EXEMPT ${t} is now in risk.high_risk_paths: remove the exemption`);
+  }
+});
+
+test('repo config: DEPTH1_NAMES pins the names every root imports from each DEPTH1_EXEMPT file; a root that imports more fails', () => {
+  assert.deepEqual([...DEPTH1_NAMES.keys()].sort(), [...DEPTH1_EXEMPT.keys()].sort(), 'DEPTH1_NAMES and DEPTH1_EXEMPT list different files');
+  const used = new Map([...DEPTH1_EXEMPT.keys()].map((t) => [t, new Set()]));
+  const extra = [];
+  for (const [rel, byTarget] of importedNamesByTarget(ROOTS)) {
+    for (const [t, names] of byTarget) {
+      if (!used.has(t)) continue;
+      for (const n of names) {
+        used.get(t).add(n);
+        if (!DEPTH1_NAMES.get(t).includes(n)) extra.push(`${rel} imports ${n} from ${t}`);
+      }
+    }
+  }
+  assert.deepEqual(extra, [], `a root imports more than DEPTH1_NAMES allows from an exempt file: re-read the file, then list the name or list the file in risk.high_risk_paths: ${extra.join('; ')}`);
+  for (const [t, names] of DEPTH1_NAMES) assert.deepEqual([...used.get(t)].sort(), [...names].sort(), `DEPTH1_NAMES ${t} pins a name no root imports (or lacks one): keep it exactly the names in use`);
+});
+
+test('repo config: the import-clause reader names default, namespace, side-effect, renamed and destructured dynamic imports', () => {
+  const src = [
+    "import def, { a, b as c } from './x.mjs';", "import * as ns from './y.mjs';", "import './z.mjs';", "export { d } from './w.mjs';", "export * from './v.mjs';",
+    "const { e, f: g } = await import('./u.mjs');", "const m = await import('./t.mjs');", "// import { nope } from './x.mjs';",
+  ].join('\n');
+  const at = (spec) => [...importedNames(src, spec)].sort();
+  assert.deepEqual(at('./x.mjs'), ['a', 'b', 'default']);
+  assert.deepEqual(at('./y.mjs'), ['*']);
+  assert.deepEqual(at('./z.mjs'), [SIDE_EFFECT]);
+  assert.deepEqual(at('./w.mjs'), ['d']);
+  assert.deepEqual(at('./v.mjs'), ['*']);
+  assert.deepEqual(at('./u.mjs'), ['e', 'f']);
+  assert.deepEqual(at('./t.mjs'), ['*']);
+  assert.throws(() => importedNames(src, './gone.mjs'), /no import clause found/);
+  // the pin fails a root that imports more than the named helper: here a second name from the same file
+  const more = new Set([...importedNames("import { helper, other } from './x.mjs';", './x.mjs')]);
+  assert.deepEqual([...more].filter((n) => !['helper'].includes(n)), ['other']);
+});
+
+// Every file in pipeline/commands/ is either matched by risk.high_risk_paths or sits here with a one-line TRUE reason (round 7, R7-F2: the
+// commands were the one dimension still audited by hand, one file per round). A command is exempt only when it decides no review gate, merge,
+// hold or review proof and writes no review state or run record: it reads or displays, or it only manages local machine state or GitHub labels
+// (labels.mjs, stacks.mjs and worktrees.mjs act through libs that are not listed; the owner decided 2026-11-13 they stay exempt, tracked in
+// issue #392). A command that books into the run record (cost.mjs) is listed. A new or unaudited command fails the test below until it is
+// listed in risk.high_risk_paths or classified here. Before adding an entry, read what the command does (not its header).
+const COMMANDS_EXEMPT = new Map([
+  ['config.mjs', 'read-only display: prints the validated config; the validation and defaults are lib/config.mjs (listed) through requireConfig in lib/cmd-common.mjs (listed)'],
+  ['guard-log.mjs', 'read-only: counts the guard deny log per day and reason code; writes nothing and no decision reads it'],
+  ['labels.mjs', 'creates or realigns the label names, colours and descriptions on GitHub (idempotent); it applies and removes no label on any PR and grants nothing, and no gate reads a label\'s colour or description; it writes GitHub labels but no review state or run record'],
+  ['leases.mjs', 'read-only: shows what the review-lease folder says; takes no lease and sweeps nothing, the live-or-dead judgement is scanLeases in lib/review-lease.mjs (listed)'],
+  ['stats.mjs', 'read-only display of review rounds of merged PRs (reads PR comments, prints a table or JSON); writes nothing and no gate reads it'],
+  ['stacks.mjs', 'stops idle local dev Supabase stacks and dev servers (the stack-stop sweep, session-end worker, status, repair, init) and installs one fixed schedule line (stacks sweep --apply --summary-only, constant arguments) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the stack-stop libs are not gate inputs; tracked in issue #392 (owner, 2026-11-13: stays exempt)'],
+  ['version.mjs', 'read-only: prints the version stamp; what an install proves is decided in lib/identity.mjs and lib/installer.mjs (both listed)'],
+  ['worktrees.mjs', 'removes finished local worktrees (prune), keep-locks, the holding folder and the read-only sessions check, and installs one fixed schedule line (worktrees prune --summary-only) through lib/schedule.mjs (listed, which decides the line\'s shape); decides no merge gate, review proof, trust, owner-only check or pipeline code install; the prune rules live in lib/worktree-prune/*; of those only live-sessions.mjs is listed (review-lease.mjs reads it), the rest decides no gate; the unlisted libs this command acts through are tracked in issue #392 (owner, 2026-11-13: stays exempt)'],
+]);
+
+test('repo config: every file in pipeline/commands/ is matched by risk.high_risk_paths or sits in COMMANDS_EXEMPT with a reason (a new command fails until it is classified)', () => {
+  const list = raw.risk.high_risk_paths;
+  const files = fs.readdirSync(path.join(root, 'pipeline', 'commands')).filter((f) => f.endsWith('.mjs')).sort();
+  assert.ok(files.length >= 35, `suspiciously few command files: ${files.length}`);
+  const unclassified = files.filter((f) => !matchAny(`pipeline/commands/${f}`, list, { nocase: true }) && !COMMANDS_EXEMPT.has(f));
+  assert.deepEqual(unclassified, [], `in pipeline/commands/ but neither in risk.high_risk_paths nor in COMMANDS_EXEMPT: ${unclassified.join(', ')}: read what the command does, then list it or exempt it with a true reason`);
+  // A stale exemption hides nothing but rots: each must still exist, carry a real reason, and not be listed after all.
+  for (const [f, why] of COMMANDS_EXEMPT) {
+    assert.ok(files.includes(f), `COMMANDS_EXEMPT ${f} is not a file in pipeline/commands/: remove it`);
+    assert.ok(why.length >= 40, `COMMANDS_EXEMPT ${f}: give a real one-line reason`);
+    assert.ok(!matchAny(`pipeline/commands/${f}`, list, { nocase: true }), `COMMANDS_EXEMPT ${f} is now in risk.high_risk_paths: remove the exemption`);
+  }
+});
+
+test('repo config: the commands audit lists the decision-making commands (merge-hold, job, update-branch, redraft, protect, summary, queue-sweep)', () => {
+  const list = raw.risk.high_risk_paths;
+  for (const c of ['merge-hold', 'job', 'update-branch', 'redraft', 'protect', 'summary', 'queue-sweep', 'repo-move', 'followups']) {
+    assert.ok(list.includes(`pipeline/commands/${c}.mjs`), `pipeline/commands/${c}.mjs decides a hold, a guard, a protection, a record or an owner-only check: it must stay listed`);
+  }
+});

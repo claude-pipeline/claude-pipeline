@@ -8,6 +8,8 @@ import { parseYaml } from './yaml.mjs';
 import { globToRegExp, matchAny } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { isUniversalHardStopPath } from './hardstops.mjs';
+import { showFile } from './git.mjs';
+import { isCodexModelId } from './codex-model-id.mjs';
 
 // How many verify proofs a run record holds, and how long a proof step name may be. Defined here (config.mjs is vendored into
 // project repos; run-record.mjs is not) and imported by run-record.mjs, so a config this file accepts always fits the record.
@@ -34,6 +36,10 @@ export const DEFAULTS = deepFreeze({
   // owner adds human-approved / test-change-approved; 'chat' = no label and CI does not fail on those: the review skill stops
   // before the merge, asks in chat, and runs the merge when the owner says "merge".
   owner_approval: 'label',
+  // owner_go: click-to-approve (#261). click 'on' (default) = under owner_approval: chat the review skill may offer the owner's "merge" / "extra round" / rulings as a click on a choice dialog
+  // (`--ask` on `merge --dry-run` and `triage round-request|ruling-request`); the owner may still type. 'off' = typed words only. It can only switch clicks OFF: the Claude Code builds a click is trusted on
+  // are installed code, never this file. Needs `P owner-go approve-dialog-hooks` run once by the owner.
+  owner_go: { click: 'on' },
   default_branch: 'main',
   worktree_dir: '.worktrees',
   // worktrees: `pipeline worktrees prune`. mode 'report' (default) only reports; nothing is removed until 'on'.
@@ -51,13 +57,17 @@ export const DEFAULTS = deepFreeze({
   verify: { report: '.verify/report.json', screenshots: '.verify/screenshots', stop_queue_wait_minutes: 0, after_fix: 'full' },
   // guard_checks: the tamper-proof "Test integrity" and "Hard-stop scan" statuses are always required on top of
   // required_checks. false only for a repo that does not run the pipeline-guards workflow (e.g. this one).
+  // merge_checks: check names the repo's own merge command also requires although branch protection does not (EagleWatch: "Replay
+  // from zero", a path-filtered workflow). Only `pipeline ci-wait` reads them: a merge check is judged only when it reports (pending
+  // waits, a failure fails, a draft-era skip is stale); one with no producer at all once the required set is final is not owed and
+  // is listed as `notOwed`, never `missing`. They are NOT part of the protected set (requiredChecks).
   // approvers: GitHub logins whose approval labels (human-approved, test-change-approved) count. Empty = the repo owner,
   // which only exists for user-owned repos: an org-owned repo MUST list its approvers. The same logins (or the owner) are the
   // authors whose review-complete comment counts for review_check.
   // review_check: the pipeline-guards workflow also posts a "Cross-model review" status (success only when the latest
   // review-complete comment's content hash is the PR head's), and preflight, `protect` and the gate require it. Off by
   // default: turn it on in the same change that applies branch protection with it, or every merge waits for a missing check.
-  ci: { required_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, review_check: false, approvers: [] },
+  ci: { required_checks: [], merge_checks: [], e2e_label: null, draft_while_iterating: false, guard_checks: true, review_check: false, approvers: [] },
   // {sha} is required: the approved head is passed to the merge so a head that moved after review can never merge.
   // behind_base (read from the BASE branch's copy only, and only by `P merge --owner-go`): 'update' (default) = a PR that lacks commits of its base
   // must be updated and re-verified; 'disjoint' = it may merge as is when main's new commits touch none of the PR's files (and none of the
@@ -73,7 +83,10 @@ export const DEFAULTS = deepFreeze({
   // smoke_bypass_origins: the ONLY origins the header may be sent to (exact match, https, e.g. "https://www.example.com").
   // Required (non-empty) when smoke_bypass_header is set; a preview URL, any other host or localhost never gets the header.
   smoke_bypass_origins: [],
-  risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10 },
+  // ignore_hard_stop_rules: hard-stop rules whose hits do NOT count toward the risk level (they stay hits: reported, owner-merge items, final gate,
+  // never the light lane). Only P-path and R4-config may be listed (RISK_IGNORABLE_RULES). The rating also reads the config committed at the PR's
+  // fork point and the stricter of the two wins (risk.mjs#rateBranch), so a PR cannot loosen its own rating.
+  risk: { high_risk_paths: [], medium_lines: 150, high_lines: 600, medium_files: 10, ignore_hard_stop_rules: [] },
   hard_stops: { paths: [], patterns: [], auth_calls: [], disable_rules: [], report_only_rules: [], report_only_paths: [] },
   integrity: {
     test_globs: [
@@ -83,9 +96,18 @@ export const DEFAULTS = deepFreeze({
   },
   review: {
     codex_model: 'gpt-6-astra',
-    effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium' },
+    // low|medium|high: round 1 by the PR's risk; followup: every later round. small_fix: the effort of a fix-check round whose reviewed range is at most
+    // small_fix_lines changed lines, adds no new file and touches no sensitive path (also used for every non-protected round when the weekly Codex governor is soft).
+    // The review command refuses an --effort that is not the configured one for the round.
+    effort: { low: 'medium', medium: 'medium', high: 'high', followup: 'medium', small_fix: 'low', small_fix_lines: 40 },
     max_rounds: 2,
+    // Codex runs (rounds and second reviews the state records) one PR may use before a small fix-check goes to the substitute instead.
+    codex_round_budget: 6,
+    // The weekly Codex quota used, in percent (P codex-status): soft lowers every non-protected round to small_fix effort; hard sends small fix-checks to the substitute. Unreadable = off.
+    codex_budget: { soft: 75, hard: 90 },
     light_lane_max_lines: 50,
+    // Who reviews after Codex when a PR is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path): 'judge' (Sonnet) or 'fable'.
+    size_only_medium_reviewer: 'judge',
     // Paths whose every review round gets the Fable pass (triage + its own review), whatever the risk level.
     arbiter_always_paths: [],
     // EXACT repo-relative paths of ordinary documents (lib/doc-paths.mjs#isDocPath, no hard-stop path, not under supabase/ or a
@@ -93,6 +115,27 @@ export const DEFAULTS = deepFreeze({
     // A commit after the last review round that only ADDS lines to these files needs no new round (lib/docs-exempt.mjs).
     // Empty = off.
     docs_exempt_paths: [],
+    // The stand-in reviewer used for a round Codex refuses with a real quota error (plan 2026-11-11-codex-substitute-reviewer).
+    // mode: auto = use it, off = park as before. min_wait_minutes: 0 never waits for Codex; above 0, a reset that near is waited for instead
+    // (no substitute, the output says waitUntil). max_packet_mb: the evidence a substitute needs may not pass this size.
+    substitute: { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 },
+    // Up to 10 { name, paths, text } (name /^[a-z0-9-]{1,40}$/, paths = non-empty globs, text <= 4000 chars): the repo's own threat model for
+    // those paths, read from the TRUSTED default-branch config and put in the Fable arbiter's input, and in the Codex prompt on a Fable-lane round only
+    // (list a modelled path in risk.high_risk_paths or review.arbiter_always_paths to have it apply to every PR touching it). A security finding
+    // outside a model is FOLLOW-UP, not merge-blocking. Empty = off (today's behaviour).
+    threat_models: [],
+    // null (off) or 1..10: counted review rounds past this ordinal may use the narrow fix-verify brief even on sensitive paths (never
+    // on a hard-stop hit other than an ignored P-path/R4-config, a size driver, or a flagged fix scope). Both configs must set it.
+    fix_verify_after_round: null,
+    // Non-test added lines a fix round may have before the late lane flags it (flagged => full brief). A new non-test source file flags it too.
+    fix_round_max_lines: 150,
+    // 'review' (off) | 'follow-up': past review.max_rounds (counted ordinal > max + 1: the first round past the limit (the automatic extra round, or the owner's first grant when there was none) is exempt, later owner-granted rounds are affected) a low-severity SUGGESTION / WORTH CONSIDERING
+    // the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP (filed as an issue; Claude may tighten it back). 'review' in ANY config (working tree, fork point or the trusted default-branch one; an unreadable one counts) keeps it off.
+    post_max_suggestions: 'review',
+    // The round trip-wire (chat mode, at `triage round-request`): once the PR has reviewed max_rounds + trip_wire_extra_rounds counted rounds, or trip_wire_not_falling rounds
+    // past the limit accepted at least as many new items as the round before (and some), the ask becomes a process-review prompt first. The smaller value of the two configs applies.
+    trip_wire_extra_rounds: 3,
+    trip_wire_not_falling: 2,
   },
   agent_log: 'docs/agent-log.md',
 });
@@ -115,9 +158,11 @@ export function requiredChecks(ci) {
   return [...new Set([...configured, ...guards, ...review])];
 }
 
-const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const EFFORT_LANES = ['low', 'medium', 'high', 'followup'];
+// Lowest to highest: the order the stricter-of-two readers of review.effort compare in (review-round.mjs#strictestRouteConfig).
+export const EFFORTS = Object.freeze(['low', 'medium', 'high', 'xhigh']);
+export const EFFORT_LANES = Object.freeze(['low', 'medium', 'high', 'followup', 'small_fix']);
 const OWNER_APPROVALS = ['label', 'chat'];
+const OWNER_GO_CLICKS = ['on', 'off'];
 const PROVIDERS = ['vercel', 'github-deployments', 'other'];
 // Who owns the production smoke: a session or a CI workflow that posts the result on the merged PR.
 // `preview` and `production` are validated exactly as before, but the final gate and `pipeline merge` no longer read them;
@@ -154,23 +199,28 @@ export const SAFE_STEP = /^[A-Za-z0-9_.:-]+$/;
 // the PR ahead, the provider's own release of that PR, or the provider's own override.
 export const MERGE_HOLD_KEYS = ['hold_command', 'hold_release_command', 'hold_check_command'];
 export const BEHIND_BASE_MODES = Object.freeze(['update', 'disjoint']);
+export const SUBSTITUTE_MODES = Object.freeze(['auto', 'off']);
 
 // Allowed keys per mapping. Anything else is a typo (or a removed option) and is rejected.
 const KEYS = {
   top: [...Object.keys(DEFAULTS), 'project'],
+  owner_go: ['click'],
   worktrees: ['mode', 'protect', 'min_idle_hours', 'min_merged_hours', 'delete', 'archive', 'memory_dirs'],
   verify: ['full', 'quick', 'report', 'screenshots', 'expected_steps', 'skippable_steps', 'stop_queue_wait_minutes', 'after_fix', 'after_fix_steps_by_path', 'after_fix_never', 'max_parallel_full', 'max_load', 'max_load_wait_minutes', 'deferrable_steps', 'ci_proof', 'ci_proof_inputs', 'ci_proof_wait_minutes'],
   ci_proof: ['workflow', 'job', 'event', 'steps'],
-  ci: ['required_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'review_check', 'approvers'],
+  ci: ['required_checks', 'merge_checks', 'e2e_label', 'draft_while_iterating', 'guard_checks', 'review_check', 'approvers'],
   merge: ['command', 'wait_minutes', 'behind_base', 'behind_base_stale_paths', ...MERGE_HOLD_KEYS],
   preview: ['environment', 'smoke', 'provider'],
   production: ['url', 'provider', 'environment', 'smoke', 'deploy_timeout_minutes', 'rollback', 'watch'],
   rollback: ['command', 'notes'],
-  risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files'],
+  risk: ['high_risk_paths', 'medium_lines', 'high_lines', 'medium_files', 'ignore_hard_stop_rules'],
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'arbiter_always_paths', 'docs_exempt_paths'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'fix_verify_after_round', 'fix_round_max_lines', 'post_max_suggestions', 'trip_wire_extra_rounds', 'trip_wire_not_falling'],
+  review_codex_budget: ['soft', 'hard'],
+  review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
+  threat_model: ['name', 'paths', 'text'],
   smoke: ['path', 'status', 'contains', 'location_contains'],
 };
 
@@ -492,6 +542,21 @@ function checkProduction(p, errors) {
 // chain lever), engines.node, and the fail-closed "package.json could not be parsed; dependency changes unchecked".
 // Migrations, destructive SQL, auth paths and removed guards, secrets, pipeline files, dependencies and unscannable
 // input stay on for every project; naming one of them is a config error, not a silent no-op.
+// Rules risk.ignore_hard_stop_rules may list: their hits stop counting toward the risk LEVEL (not toward anything else). Never the database / auth /
+// secret rules, nor R4-pipeline (the guard core: a PR that edits the rating config is itself an R4-pipeline hit, so it cannot lower its own rating).
+export const RISK_IGNORABLE_RULES = Object.freeze(['P-path', 'R4-config']);
+export const SIZE_ONLY_REVIEWERS = Object.freeze(['judge', 'fable']);
+export const POST_MAX_POLICIES = Object.freeze(['follow-up', 'review']);
+
+function checkIgnoreRules(rules, errors) {
+  if (!Array.isArray(rules)) return errors.push('risk.ignore_hard_stop_rules must be an array');
+  rules.forEach((r, i) => {
+    if (!RISK_IGNORABLE_RULES.includes(r)) {
+      errors.push(`risk.ignore_hard_stop_rules[${i}]: ${JSON.stringify(r)} cannot be ignored for risk (allowed: ${RISK_IGNORABLE_RULES.join(', ')})`);
+    }
+  });
+}
+
 export const DISABLEABLE_HARD_STOP_RULES = Object.freeze(['R6-sensitive']);
 
 function checkDisableRules(rules, errors) {
@@ -567,6 +632,36 @@ function checkPatterns(patterns, errors) {
   });
 }
 
+// review.threat_models: at most MAX_THREAT_MODELS mappings { name, paths, text }, names unique.
+export const MAX_THREAT_MODELS = 10;
+export const MAX_THREAT_MODEL_TEXT = 4000;
+const THREAT_MODEL_NAME = /^[a-z0-9-]{1,40}$/;
+function checkThreatModels(models, errors) {
+  if (!Array.isArray(models)) return errors.push('review.threat_models must be an array');
+  if (models.length > MAX_THREAT_MODELS) errors.push(`review.threat_models has ${models.length} entries; at most ${MAX_THREAT_MODELS}`);
+  const seen = new Set();
+  models.forEach((item, i) => {
+    const at = `review.threat_models[${i}]`;
+    if (!isObj(item)) return errors.push(`${at} must be a mapping with name, paths and text`);
+    unknownKeys(item, KEYS.threat_model, `${at}.`, errors);
+    if (typeof item.name !== 'string' || !THREAT_MODEL_NAME.test(item.name)) errors.push(`${at}.name must match ${THREAT_MODEL_NAME}`);
+    else if (seen.has(item.name)) errors.push(`${at}.name (${JSON.stringify(item.name)}) is listed twice`);
+    else seen.add(item.name);
+    if (!isStrArray(item.paths) || item.paths.length === 0) errors.push(`${at}.paths must be a non-empty array of glob strings`);
+    else {
+      item.paths.forEach((g, j) => {
+        try {
+          globToRegExp(g);
+        } catch (err) {
+          errors.push(`${at}.paths[${j}] (${JSON.stringify(g)}) is not a usable glob (${err.message})`);
+        }
+      });
+    }
+    if (!isStr(item.text)) errors.push(`${at}.text is required (a non-empty string)`);
+    else if (item.text.length > MAX_THREAT_MODEL_TEXT) errors.push(`${at}.text is ${item.text.length} characters; at most ${MAX_THREAT_MODEL_TEXT}`);
+  });
+}
+
 function checkSmokeChecks(checks, errors) {
   if (!Array.isArray(checks)) return errors.push('smoke_checks must be an array');
   checks.forEach((item, i) => {
@@ -601,6 +696,9 @@ export function validateConfig(obj) {
   if (!isStr(config.project)) errors.push('project is required (a non-empty string)');
   if (!['github', 'gate'].includes(config.enforcement)) errors.push('enforcement must be github|gate');
   if (!OWNER_APPROVALS.includes(config.owner_approval)) errors.push(`owner_approval must be ${OWNER_APPROVALS.join('|')}`);
+
+  const ownerGo = section(config, 'owner_go', errors);
+  if (ownerGo && !OWNER_GO_CLICKS.includes(ownerGo.click)) errors.push(`owner_go.click must be ${OWNER_GO_CLICKS.join('|')}`);
 
   const verify = section(config, 'verify', errors);
   if (verify) {
@@ -664,21 +762,49 @@ export function validateConfig(obj) {
 
   const review = section(config, 'review', errors);
   if (review) {
+    if (!isCodexModelId(review.codex_model)) errors.push('review.codex_model must be a model id (letters, digits, . _ -), e.g. gpt-6-astra');
     if (!inRange(review.max_rounds, 1, 5)) errors.push('review.max_rounds must be an integer 1..5');
     checkPosInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
     checkStrArray(review.arbiter_always_paths, 'review.arbiter_always_paths', errors);
+    checkThreatModels(review.threat_models, errors);
+    if (review.fix_verify_after_round !== null && !inRange(review.fix_verify_after_round, 1, 10)) errors.push('review.fix_verify_after_round must be null or an integer 1..10');
+    checkPosInt(review.fix_round_max_lines, 'review.fix_round_max_lines', errors);
+    if (!POST_MAX_POLICIES.includes(review.post_max_suggestions)) errors.push(`review.post_max_suggestions must be one of ${POST_MAX_POLICIES.join('|')}`);
+    if (!inRange(review.trip_wire_extra_rounds, 1, 10)) errors.push('review.trip_wire_extra_rounds must be an integer 1..10');
+    if (!inRange(review.trip_wire_not_falling, 1, 5)) errors.push('review.trip_wire_not_falling must be an integer 1..5');
+    if (!SIZE_ONLY_REVIEWERS.includes(review.size_only_medium_reviewer)) errors.push(`review.size_only_medium_reviewer must be one of ${SIZE_ONLY_REVIEWERS.join('|')}`);
     if (!isObj(review.effort)) errors.push('review.effort must be a mapping');
     else {
       for (const lane of Object.keys(review.effort)) {
-        if (!EFFORT_LANES.includes(lane)) errors.push(`unknown key: review.effort.${lane} (lanes are ${EFFORT_LANES.join('|')})`);
+        if (lane === 'small_fix_lines') {
+          if (!inRange(review.effort.small_fix_lines, 1, 10000)) errors.push('review.effort.small_fix_lines must be an integer 1..10000');
+        } else if (!EFFORT_LANES.includes(lane)) errors.push(`unknown key: review.effort.${lane} (lanes are ${EFFORT_LANES.join('|')}, plus small_fix_lines)`);
         else if (!EFFORTS.includes(review.effort[lane])) errors.push(`review.effort.${lane} must be one of ${EFFORTS.join('|')}`);
       }
+    }
+    if (!inRange(review.codex_round_budget, 1, 100)) errors.push('review.codex_round_budget must be an integer 1..100');
+    const cb = review.codex_budget;
+    if (!isObj(cb)) errors.push('review.codex_budget must be a mapping');
+    else {
+      unknownKeys(cb, KEYS.review_codex_budget, 'review.codex_budget.', errors);
+      if (!inRange(cb.soft, 1, 100)) errors.push('review.codex_budget.soft must be an integer 1..100');
+      if (!inRange(cb.hard, 1, 100)) errors.push('review.codex_budget.hard must be an integer 1..100');
+      else if (inRange(cb.soft, 1, 100) && cb.soft > cb.hard) errors.push('review.codex_budget.soft must not be above review.codex_budget.hard');
+    }
+    const sub = review.substitute;
+    if (!isObj(sub)) errors.push('review.substitute must be a mapping');
+    else {
+      unknownKeys(sub, KEYS.review_substitute, 'review.substitute.', errors);
+      if (!SUBSTITUTE_MODES.includes(sub.mode)) errors.push(`review.substitute.mode must be one of ${SUBSTITUTE_MODES.join('|')}`);
+      if (!inRange(sub.min_wait_minutes, 0, 720)) errors.push('review.substitute.min_wait_minutes must be an integer 0..720');
+      checkPosInt(sub.max_packet_mb, 'review.substitute.max_packet_mb', errors);
     }
   }
 
   const risk = section(config, 'risk', errors);
   if (risk) {
     checkStrArray(risk.high_risk_paths, 'risk.high_risk_paths', errors);
+    checkIgnoreRules(risk.ignore_hard_stop_rules, errors);
     for (const k of ['medium_lines', 'high_lines', 'medium_files']) checkPosInt(risk[k], `risk.${k}`, errors);
     const pos = (v) => isInt(v) && v >= 1;
     if (pos(risk.medium_lines) && pos(risk.high_lines) && risk.medium_lines > risk.high_lines) {
@@ -716,6 +842,7 @@ export function validateConfig(obj) {
   const ci = section(config, 'ci', errors);
   if (ci) {
     checkStrArray(ci.required_checks, 'ci.required_checks', errors);
+    checkStrArray(ci.merge_checks, 'ci.merge_checks', errors);
     if (ci.e2e_label !== null && typeof ci.e2e_label !== 'string') errors.push('ci.e2e_label must be a string or null');
     if (typeof ci.draft_while_iterating !== 'boolean') errors.push('ci.draft_while_iterating must be a boolean');
     if (!Array.isArray(ci.approvers) || !ci.approvers.every((l) => typeof l === 'string' && /^[A-Za-z0-9][A-Za-z0-9-]*(\[bot\])?$/.test(l))) {
@@ -775,6 +902,28 @@ export function stopHookTimeoutWarning(config, settingsText) {
     }
   }
   return null;
+}
+
+// The config as the base side (the PR's fork point) has it: { ok: true, config } | { ok: false, reason }. A PR must not loosen its own rules, so
+// the rating (risk.mjs#rateBranch), the Fable brief choice (arbiter) and the final gate read the committed copy too. Moved here from arbiter.mjs.
+export function baseConfigAt(forkPoint, root) {
+  const msgOf = (err) => String(err?.message ?? err).split('\n')[0];
+  if (typeof forkPoint !== 'string' || forkPoint === '') return { ok: false, reason: 'the round records no fork point' };
+  let text;
+  try {
+    text = showFile(forkPoint, '.claude/pipeline.yml', { cwd: root });
+  } catch (err) {
+    return { ok: false, reason: `could not read .claude/pipeline.yml at the fork point: ${msgOf(err)}` };
+  }
+  if (text === null) return { ok: false, reason: 'the fork point has no .claude/pipeline.yml' };
+  let parsed;
+  try {
+    parsed = validateConfig(parseYaml(text));
+  } catch (err) {
+    return { ok: false, reason: `the fork point's .claude/pipeline.yml cannot be parsed: ${msgOf(err)}` };
+  }
+  if (!parsed.ok) return { ok: false, reason: `the fork point's .claude/pipeline.yml is not a valid config: ${parsed.errors.slice(0, 2).join('; ')}` };
+  return { ok: true, config: parsed.config };
 }
 
 /** Read <repoDir>/.claude/pipeline.yml and validate it. IO is injectable for tests. */

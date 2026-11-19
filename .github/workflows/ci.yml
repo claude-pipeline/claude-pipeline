@@ -1,8 +1,18 @@
 # Repo CI for claude-pipeline itself. The two check names "test (ubuntu)" and "test (windows)" are this repo's required
-# checks (.claude/pipeline.yml ci.required_checks): renaming either breaks branch protection. "test (windows)" is an
-# AGGREGATE job: the suite runs in three shards ("test (windows 1/3)" .. "3/3", not required on their own) and the
-# aggregate goes green only when every shard succeeded. A failed, cancelled or skipped shard makes it red, never
-# green or skipped, so a required check can never be satisfied by a shard that did not run.
+# checks (.claude/pipeline.yml ci.required_checks): renaming either breaks branch protection. Both are AGGREGATE jobs:
+#   "test (ubuntu)"  the suite runs once per Node version in parallel ("test (ubuntu node 20)", "test (ubuntu node 24)", not
+#                    required on their own); the aggregate goes green only when both succeeded. (One serial job ran the suite
+#                    twice, ~23 min each on a slow runner, and the 45-minute limit cut it short with every test passing.)
+#   "test (windows)" the suite runs in three shards ("test (windows 1/3)" .. "3/3", not required on their own); the aggregate
+#                    goes green only when every shard succeeded.
+# On a non-draft event a failed, cancelled or skipped Node job or shard makes its aggregate red, never green or skipped, so a
+# required check can never be satisfied by a job that did not run.
+#
+# Draft PRs are skipped (ci.draft_while_iterating: true in .claude/pipeline.yml; `pipeline redraft` turns a ready PR back to
+# draft before each review-fix push): both required checks read "skipped" on a draft, the suite runs once when the PR is marked
+# ready (`ready_for_review`) and on every push after that. `converted_to_draft` is a listed trigger: it joins the PR's
+# concurrency group (below), so redrafting cancels a suite that is still running, and its own run skips because the PR is a draft
+# by then. Each aggregate skips on exactly the same condition as its jobs, never on anything else. Push to main is unchanged.
 #
 # Every step runs under bash (Git Bash on Windows) so one script serves both runners. The
 # installer runs into a throwaway Claude home whose path contains a space, then --check must
@@ -19,6 +29,8 @@ name: CI
 
 on:
   pull_request:
+    # The default types (opened, synchronize, reopened) plus the two the draft flow needs.
+    types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
 
@@ -37,10 +49,18 @@ defaults:
     shell: bash
 
 jobs:
-  test-ubuntu:
-    name: test (ubuntu)
+  # The suite runs once per Node version, in parallel: 20 is the oldest line the pipeline supports, 24 the current LTS. Each is ~12-23 min
+  # on a slow runner; run serially in one job they hit the 45-minute limit on 2026-11-12 (PR #308) with every test green.
+  test-ubuntu-node:
+    name: test (ubuntu node ${{ matrix.node }})
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
+    strategy:
+      # Let the other Node version finish so one run shows every failure; the aggregate below still goes red.
+      fail-fast: false
+      matrix:
+        node: [20, 24]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -56,31 +76,37 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
           SHA: ${{ github.sha }}
-          JOB_NAME: test (ubuntu)
+          JOB_NAME: test (ubuntu node ${{ matrix.node }})
 
-      - name: Node 20
+      - name: Node ${{ matrix.node }}
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
-          node-version: 20
-      - name: Tests (Node 20)
+          node-version: ${{ matrix.node }}
+      - name: Tests (Node ${{ matrix.node }})
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
         run: node scripts/test.mjs
-      - name: Installer round trip (Node 20)
+      - name: Installer round trip (Node ${{ matrix.node }})
         if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
-        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 20"
+        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home ${{ matrix.node }}"
 
-      - name: Node 24
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 24
-      - name: Tests (Node 24)
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
-        run: node scripts/test.mjs
-      - name: Installer round trip (Node 24)
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
-        run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 24"
+  # The required check. always() makes it run (and report) even when a Node job failed or was cancelled; it is green only
+  # when the Node jobs' overall result is exactly "success" (a skipped or cancelled matrix would otherwise leave the
+  # check missing or neutral). Do not add steps that can succeed independently of that result. On a draft PR the Node jobs are
+  # skipped by design, so this skips too (same condition); on every other event it is still always().
+  test-ubuntu:
+    name: test (ubuntu)
+    needs: test-ubuntu-node
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Every Ubuntu Node job passed
+        env:
+          NODES_RESULT: ${{ needs.test-ubuntu-node.result }}
+        run: |
+          echo "test-ubuntu-node result: $NODES_RESULT"
+          [ "$NODES_RESULT" = "success" ] || exit 1
 
   # Never runs (if: false). Referencing a reusable workflow is what makes GitHub record the commit this run tested
   # (referenced_workflows: refs/pull/<N>/merge + sha), which the final gate's CI proof for `tests` requires
@@ -94,9 +120,10 @@ jobs:
   # --shard I/3 gives each runner a third of the test files balanced by measured time (scripts/lib/test-weights.json, refreshed
   # with scripts/shard-weights.mjs from the file times printed below; files not measured yet are balanced by size).
   # One Node version on Windows: Node 24, the current LTS line and what the actions themselves run on. Node 20 stays covered
-  # on ubuntu.
+  # on ubuntu (test-ubuntu-node).
   test-windows-shard:
     name: test (windows ${{ matrix.shard }}/3)
+    if: github.event_name != 'pull_request' || !github.event.pull_request.draft
     runs-on: windows-latest
     timeout-minutes: 45
     strategy:
@@ -152,11 +179,12 @@ jobs:
 
   # The required check. always() makes it run (and report) even when a shard failed or was cancelled; it is green only
   # when the shard job's overall result is exactly "success" (a skipped or cancelled matrix would otherwise leave the
-  # check missing or neutral). Do not add steps that can succeed independently of that result.
+  # check missing or neutral). Do not add steps that can succeed independently of that result. On a draft PR the shards are
+  # skipped by design, so this skips too (same condition); on every other event it is still always().
   test-windows:
     name: test (windows)
     needs: test-windows-shard
-    if: always()
+    if: always() && (github.event_name != 'pull_request' || !github.event.pull_request.draft)
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:

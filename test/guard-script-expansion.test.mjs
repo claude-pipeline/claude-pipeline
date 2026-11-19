@@ -757,7 +757,9 @@ test('R1: repository and global state a speculative candidate may change is unkn
   assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git checkout main')).decision, 'deny');
   assert.match(git('bash p[12].sh && git push', fs2('git status', 'git checkout agent/y'), onMain).reason, /determine the current branch/);
   // the first candidate creates the very first branch entry of the evaluation
-  assert.equal(git('bash p1.sh && git push', gitFs({ 'p1.sh': 'git checkout -b agent/z' }), onMain).decision, 'allow'); // a named script really runs: believed
+  // #352 R38-F2: a script's change never carries over to its caller (owner decision): a named script that really runs is no longer believed either (it may have ended before the switch); the push that names the branch is the twin
+  assert.equal(git('bash p1.sh && git push', gitFs({ 'p1.sh': 'git checkout -b agent/z' }), onMain).decision, 'deny');
+  assert.equal(git('bash p1.sh && git push origin agent/z', gitFs({ 'p1.sh': 'git checkout -b agent/z' }), onMain).decision, 'allow');
   assert.equal(git('bash p*.sh && git push', gitFs({ 'p1.sh': 'git checkout -b agent/z' }), onMain).decision, 'deny'); // a glob match is not told apart from the others
   // candidates that leave the branch alone change nothing
   assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git status')).decision, 'allow');
@@ -963,8 +965,9 @@ test('guard-files: a program named by a variable or a default word is judged wit
     '"${X:-bash}" w.sh', '${X:-bash} w.sh', '${X-bash} w.sh', '${X:=bash} w.sh', 'X=x; ${X:+bash} w.sh', 'G=bash; $G w.sh', 'G=bash; "$G" w.sh', 'G=bash; ${G} w.sh',
     'G="bash -x"; $G w.sh', 'G="bash -c"; $G ./w.sh', '${X:-bash -x} w.sh', '${X:-sh} w.sh', ': ${G:=bash}; $G w.sh',
   ]) assert.equal(files(c).decision, 'deny', c);
-  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', '${X:-./ok.sh}', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G w.sh'])
+  for (const c of ['"${X:-bash}" ok.sh', 'G=bash; $G ok.sh', 'G="bash -x"; $G ok.sh', '${X:-bash -x} ok.sh', 'G=./ok.sh; $G', 'G=bash; $G', 'G=ls; $G w.sh'])
     assert.equal(files(c).decision, 'allow', c);
+  assert.equal(files('${X:-./ok.sh}').decision, 'deny', '(R17 owner decision: a lone run-time command word may be a directory)');
   assert.equal(files(`${'${A:-'.repeat(20)}bash${'}'.repeat(20)} ok.sh`).decision, 'deny');
 });
 
@@ -976,8 +979,9 @@ test('guard-git: a reading that may not run never sets the branch for later comm
   // the hypothetical `bash s.sh` reading switches to agent/x; X=echo means it never ran, so p.sh pushes from the default branch
   for (const c of ['X=echo; ${X:-bash} s.sh; bash p.sh', 'G=bash; $G s.sh; bash p.sh', 'bash ${A:--c ./s.sh}; bash p.sh', 'bash ${A:--c "bash s.sh"}; bash p.sh'])
     assert.equal(git(c, fx, onMain).decision, 'deny', c);
-  // a switch that certainly runs is still believed
-  assert.equal(git('bash s.sh; bash p.sh', fx, onMain).decision, 'allow');
+  // a switch that certainly runs: #352 R38-F2: a script's change never carries over to its caller (owner decision), so it is not believed either; a push that names the branch is the twin
+  assert.equal(git('bash s.sh; bash p.sh', fx, onMain).decision, 'deny');
+  assert.equal(git('bash s.sh; bash q.sh', gitFs({ 's.sh': 'git checkout agent/x', 'q.sh': 'git push origin agent/x' }), onMain).decision, 'allow');
   assert.equal(git('bash p.sh', fx, onMain).decision, 'deny');
 });
 

@@ -45,6 +45,8 @@ Use implementer subagents for the file work; give each the exact template path +
   clean install → typecheck → lint/static guards → unit tests → database reset + all migrations
   + permission/policy tests → production build → Playwright E2E smoke (screenshots to
   `.verify/screenshots/`). `--quick` = typecheck + lint + tests related to changed files.
+  A script agents run (`verify.mjs`, and any script it starts) must not spell the config-root path, even in a comment: the guard refuses a script whose text names
+  it and which writes, and `pipeline preflight` warns about it. Describe the file in words.
 - Writes `.verify/report.json` (per step: status `pass|fail|not-run|skipped`, duration, error excerpt, `skipReason` when skipped; plus `mode`,
   `expectedSteps`, git head/tree/dirty). Fail fast.
 - Add missing tooling: Vitest (JS/TS unit), Playwright (`e2e/smoke/*.spec.ts`, own config +
@@ -93,6 +95,7 @@ Validate: `P config` (it prints `warnings`: read them, e.g. a missing guard cont
   the project's REQUIRED PR-check workflow (it fails a PR that adds a workflow GitHub rejects as a whole, e.g. `runner.temp` in a
   job-level `env:`) and say so in the setup report; `P vendor --check` warns `workflow-contexts-unwired` until some workflow runs it.
   The `verify.yml` template already runs that step before `node scripts/verify.mjs`.
+- Set `ci.draft_while_iterating: true` only when every heavy required workflow (a) skips drafts (job `if: !github.event.pull_request.draft` or equivalent), (b) lists `ready_for_review` and `converted_to_draft` in its `pull_request`/`pull_request_target` `types` (a bare `pull_request:` gets neither: the default types are opened, synchronize, reopened), and (c) puts one PR's runs in one concurrency group with `cancel-in-progress`, so the `converted_to_draft` run cancels a running suite: `pipeline redraft` then turns a ready PR back to draft before a fix push, so CI runs once at re-ready. The `verify.yml` and `pipeline-guards.yml` templates already do; existing CI must meet the same rule. Otherwise leave it `false`.
 - Branch protection is applied **after the onboarding PR merges**: `P protect --repo .` prints
   the exact `gh api` calls (required checks = `ci.required_checks` + the two guard contexts, each pinned to GitHub Actions;
   a check another app posts, such as `Vercel`, keeps its current app or takes `--pin Vercel=<app id>`); `P protect --repo . --apply` (requires the session to have been
@@ -124,6 +127,8 @@ Queue mode itself needs no setting: `P merge`, `P final-gate`, the dry run, `P u
 whether the base branch has a merge queue, and with none they behave as before. In queue mode `P merge` enqueues the owner-approved head,
 and `P queue-sweep` (LaunchAgent `com.claude-pipeline.queue-sweep`, every 10 min, written and removed by the installer) carries a queued PR to its end
 when no session is watching. The repo's own queue settings, its `merge_group` triggers and its `Queue gate` check are the repo's workflow PR (EagleWatch's A2), not part of onboarding here.
+
+A repo that turns the queue on AND has a custom `merge.command` (it runs the PR branch's own script) must first declare which commit made that script queue-aware: add the plain file `.claude/merge-queue-aware` to the BASE branch (first line that is not blank or a `#` comment = the full 40-hex sha of that commit AS IT LANDED ON THE BASE BRANCH: the squash or merge commit, never the PR's own commit, which a squash leaves off the base; a sha the base does not contain refuses every PR with `branchState: unknown`, "fix the marker"). `P merge` reads it from the base branch through GitHub and refuses (`queue-branch-predates-switch`) any branch that does not contain the commit, or when the file is missing, names a commit the base does not have, or cannot be read (a GitHub error answers `queue-unreadable`: try again). Order for the rollout: land the queue-aware script, add the file on the base branch, THEN install this pipeline version / switch the queue on. A repo on the default merge command needs no file.
 
 **Before moving a repo into a GitHub organization** (lessons from EagleWatch's move, 2026-11-09; do these first):
 

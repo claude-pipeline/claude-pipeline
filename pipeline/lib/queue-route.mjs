@@ -8,11 +8,12 @@
 import { statSync } from 'node:fs';
 import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
-import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, waitBlockers } from './finalgate.mjs';
+import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, substituteRouteProblem, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
-import { QueueRecordUnreadable, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
+import { QueueRecordUnreadable, adoptHeadMoved, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, predatesQueueMessage, queueCatchUpState, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
 import { headSha } from './git.mjs';
+import { hashBranch } from './risk.mjs';
 import { envWithGhDir, runShellAsync } from './proc.mjs';
 import { canonicalPath, samePath } from './paths.mjs';
 import { gitCommonDir } from './repo.mjs';
@@ -62,6 +63,8 @@ export function gateFreshSince(gate, since) {
 // Before a re-queue on the --owner-go route: the live scan again, the owner's approval for what it found, and the blockers. Shared by `P merge` (its own watch)
 // and the queue sweep (an unattended re-queue), so both judge a re-queue exactly as the first enqueue was judged. `hold` = the lifted hold binding the record owns.
 export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, hold }) {
+  const substitute = substituteRouteProblem({ root, config, pr, route: 'owner-go' });
+  if (substitute !== null) return { ok: false, error: substitute.error, reasons: [substitute.reason] };
   const again = await evaluateOwnerGo({ root, config, pr, gh, env, queueMode: true });
   if (again.head !== head) return { ok: false, error: 'live-check', reasons: ['the worktree moved while the PR was queued'] };
   if (!again.ok) return { ok: false, error: 'live-check', reasons: again.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`) };
@@ -75,6 +78,8 @@ export async function recheckOwnerGo({ root, config, pr, gh, env, head, repo, ho
 // for the owner, and the blockers. `P merge` (its own watch) calls it with the gate it holds; the queue sweep through recheckGatedRecorded below.
 // `evaluate` / `problemsOf` are test seams.
 export async function recheckGated({ root, config, pr, gh, env, gate, ownerApproved, ownerMergeReason, evaluate = evaluateGate, problemsOf = preMergeProblems }) {
+  const substitute = substituteRouteProblem({ root, config, pr, route: 'gated' });
+  if (substitute !== null) return { ok: false, error: substitute.error, reasons: [substitute.reason] };
   const fresh = await evaluate({ root, config, pr, gh, env, queueMode: true });
   const failed = fresh.checks.filter((c) => !c.ok);
   if (failed.length > 0) return { ok: false, error: 'live-check', reasons: failed.map((c) => `${c.name}: ${c.detail}`) };
@@ -105,7 +110,7 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
   const prHead = gh.prView(pr, [...PR_FIELDS]).headRefOid;
   let hash = '';
   try {
-    hash = localHash(root, config);
+    hash = localHash(root, config, typeof gate.trustedBranch === 'string' && gate.trustedBranch !== '' ? gate.trustedBranch : undefined); // the branch the gate measured from
   } catch { /* gateRefusals reports the mismatch */ }
   const refusals = gateRefusals({ gate, pr, head, prHead, hash, repo, now: now() });
   if (refusals.length > 0) return { ok: false, error: 'live-check', reasons: refusals.map((why) => `${why}: run the final gate again`) };
@@ -124,7 +129,8 @@ export async function recheckGatedRecorded({ root, config, pr, gh, env, head, re
 export const isDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
 // canonicalPath (realpath.native), not JS realpathSync: only the native one expands a Windows 8.3 short name (RUNNER~1), so a temp folder and `git rev-parse` spell the same place alike.
 export const canon = (p) => canonicalPath(p);
-// Two folders are the same place when their canonical spellings agree (samePath: slash-normalised, case-insensitive where the file system is).
+// Two folders are the same place when their canonical spellings agree and the disk does not say otherwise (samePath: slash-normalised; on macOS / Windows
+// folded to lower case, but when both exist - or one does - the file's device + inode decides, so /repo/work and /repo/WORK stay two folders on a case-sensitive volume).
 const samePlace = (a, b) => samePath(canon(a), canon(b));
 
 // Why the worktree a live record was opened in cannot do that record's one re-queue, or null when it can: gone, no longer at the recorded head, or not a worktree of
@@ -179,7 +185,7 @@ export function createQueueRoute({
   let requeued = 0;
   let rules = null;
   try {
-    rules = queueRulesOf(gh.branchRules(config.default_branch));
+    rules = queueRulesOf(gh.branchRules(hashBranch(root, config)));
   } catch { /* unreadable: queueWaitMs falls back to its default */ }
   const budgetMs = Math.min(queueWaitMs(rules), timing.waitCapMs ?? Infinity);
 
@@ -198,9 +204,13 @@ export function createQueueRoute({
   };
   // An unmerged end: the hold seam first (it puts a lifted label back), then the record ends if it still is open and the seam did not keep it.
   // -> the fields the seam adds to the refusal.
-  const terminal = async (kind) => {
+  // `adopt` ({ head, entryId }, #237): instead of ending, the record is replaced by the orphan record for the live entry at the new head (adoptHeadMoved).
+  const terminal = async (kind, adopt = null) => {
     const out = (await onTerminal({ kind, rec: readQueueRecord(root, pr) })) ?? {};
-    if (out.keepOpen !== true && liveRecord() !== null) endRecord(root, pr, kind, { now });
+    if (out.keepOpen !== true && liveRecord() !== null) {
+      if (adopt !== null) adoptHeadMoved(root, pr, { ...adopt, now });
+      else endRecord(root, pr, kind, { now });
+    }
     return out.fields ?? {};
   };
 
@@ -213,7 +223,24 @@ export function createQueueRoute({
     });
   };
   const unmergedEnd = async (kind) => {
-    const holdFields = await terminal(kind);
+    // A head move over a live record: an entry at the new head (queued from another checkout or the GitHub UI) is tracked from here on, as settleRecord does for the
+    // sweep (#237), instead of being left with no record. GitHub is asked once more (reconcile's answer names only the new head); a read that fails leaves the record
+    // live and the hold alone (ending it could lose the entry; the next merge or sweep settles it).
+    let adopt = null;
+    const rec = kind === 'head-moved' ? liveRecord() : null;
+    if (rec !== null) {
+      let cur;
+      try {
+        cur = gh.queueState(pr);
+      } catch (err) {
+        return unreadable(`PR #${pr}'s head moved off the approved ${head.slice(0, 12)}, but the merge queue could not be read to see whether an entry sits at the new head`, err);
+      }
+      if (cur.state === 'OPEN' && cur.entry && typeof cur.head === 'string' && cur.head !== rec.head) adopt = { head: cur.head, entryId: cur.entry.id ?? null };
+    }
+    const holdFields = await terminal(kind, adopt);
+    if (adopt !== null && readQueueRecord(root, pr)?.adopted) {
+      return refusal(kind, [`PR #${pr}'s head moved off the approved ${head.slice(0, 12)} and the PR is in the merge queue at ${adopt.head.slice(0, 12)}, which nobody approved: it is not dequeued or merged on the old approval, and \`queue-sweep\` keeps tracking that entry`], { queued: false, adopted: adopt, ...holdFields });
+    }
     return refusal(kind, [kind === 'closed' ? `PR #${pr} was closed without merging` : `PR #${pr}'s head moved off the approved ${head.slice(0, 12)}: nothing was queued or merged for it`], { queued: false, ...holdFields });
   };
 
@@ -336,6 +363,37 @@ export function createQueueRoute({
     return { enqueue: true, requeue: rec !== null && rec.head === head && rec.removals.length > 0 };
   }
 
+  // ---- 1b. the branch's own merge script ----------------------------------------------------------------------------------------------
+  // A custom merge.command runs the PR BRANCH's code, and a branch that lacks the commit which taught the repo's merge script the queue may carry a
+  // script that does not know it (eaglewatch #1735: it took "queued" for "merged" and deleted the head branch). The default command enqueues through gh
+  // and runs no branch code, so it is never asked. Not provably containing the commit the base declares in .claude/merge-queue-aware (or unreadable) =
+  // refused, nothing queued, nothing run. -> null | the refusal output.
+  // `closeRecord`: a live record (a re-queue after a removal) ends 'blocked' with the hold put back, as every other unmerged end does; the sweep's
+  // re-queue leaves that to settleRecord, which ends the record on the { ok: false } it gets back.
+  // A read that THREW (a GitHub blip: state.unreadable) is not a verdict, whatever the call is: it must not spend the owner's word on a refusal, so it answers
+  // queue-unreadable (nothing enqueued, a live record and its hold kept, the next pass or the owner's `P merge` tries again, the sweep reads that as unsettled). That holds
+  // for a live record with no removal too (the retry after enqueue-failed, a crash before the enqueue landed), so it does not depend on a re-queue. Only a structural
+  // unknown (no usable marker, a sha the base does not have) or a branch that lacks the commit ends it.
+  let branchChecked = false;
+  async function branchPredatesQueue({ closeRecord: ends = true } = {}) {
+    if (isDefaultMergeCommand(config)) return null;
+    const state = queueCatchUpState({ gh, branch: hashBranch(root, config), head });
+    if (!state.needed) return null;
+    if (state.unreadable) return unreadable('the commit the base names in .claude/merge-queue-aware could not be checked (nothing was enqueued, a queue record and its hold are kept; run `P merge` again, or wait for the next `queue-sweep`)', state.why);
+    const holdFields = ends && liveRecord() !== null ? await terminal('blocked') : {};
+    return refusal('queue-branch-predates-switch', [predatesQueueMessage({ pr, state })], {
+      queued: false, branchState: state.kind, queueAwareSha: state.queueAwareSha, ...holdFields,
+    });
+  }
+
+  // The same check, run by the merge command right after the precheck answers enqueue, before anything is written (the owner-go route's hold lift, the guard
+  // wait): a refusal then costs no label event, comment or wait. A clean answer is remembered, so the first enqueue below does not read GitHub twice. -> null | the refusal.
+  async function checkBranch() {
+    const old = await branchPredatesQueue();
+    branchChecked = old === null;
+    return old;
+  }
+
   // ---- 2. enqueue --------------------------------------------------------------------------------------------------------------
   async function sendEnqueue() {
     if (isDefaultMergeCommand(config)) {
@@ -390,6 +448,11 @@ export function createQueueRoute({
     try {
       for (;;) {
         if (enqueueNow) {
+          if (branchChecked) branchChecked = false; // (checkBranch ran for this first enqueue)
+          else {
+            const old = await branchPredatesQueue();
+            if (old !== null) return old;
+          }
           openRecord(root, pr, head, approval, opts);
           // SEAM (hold): the record exists, no attempt yet. This is where a lifted needs-human hold is written to it (setHold, owner 'session'),
           // so a signal or a crash between the lift and the enqueue is still known to the record.
@@ -439,10 +502,12 @@ export function createQueueRoute({
   // -> { ok: true } | { done } (a refusal or a merge the confirm found).
   async function reenqueue() {
     requeued = 1;
+    const old = await branchPredatesQueue({ closeRecord: false });
+    if (old !== null) return { done: old };
     openRecord(root, pr, head, approval, opts);
     beginAttempt(root, pr, head, approval, opts);
     return confirm(await sendEnqueue());
   }
 
-  return { precheck, enqueueAndWatch, reenqueue, budgetMs, budgetMinutes: Math.ceil(budgetMs / 60_000) };
+  return { precheck, checkBranch, enqueueAndWatch, reenqueue, budgetMs, budgetMinutes: Math.ceil(budgetMs / 60_000) };
 }

@@ -14,7 +14,7 @@ import { createFakeGh, pipelineYml } from './helpers/fakegh-env.mjs';
 import { LOCK_DIR, PR, ME, REPO, cli, scenario } from './helpers/gate-env.mjs';
 import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { repoLockKey, reviewLockName } from '../pipeline/lib/review-context.mjs';
-import { acquireAdmission, blocking, releaseAdmission, scanLeases } from '../pipeline/lib/review-lease.mjs';
+import { HOLDER_ENV, acquireAdmission, blocking, releaseAdmission, scanLeases } from '../pipeline/lib/review-lease.mjs';
 import { tryAcquire, release } from '../pipeline/lib/locks.mjs';
 import { LEASED_COMMANDS, leaseArgs, leasesOffForTests } from '../pipeline/lib/review-lease-wiring.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -37,7 +37,7 @@ function scratch(label = 'cp-lw') {
 
 const withFakePs = () => noClaudeSession();
 
-// One machine: a lease folder and a home, and the environment of a child CLI. `session: false` is a plain terminal (no session marker).
+// One machine: a lease folder and a home, and the environment of a child CLI. `session: false` is a plain terminal (no session marker): its commands take a process lease for the length of the command.
 function world({ session = true, extra = {} } = {}) {
   const root = scratch();
   const home = join(root, 'home');
@@ -46,6 +46,8 @@ function world({ session = true, extra = {} } = {}) {
   const env = {
     ...withFakePs(), HOME: home, USERPROFILE: home, CLAUDE_CONFIG_DIR: undefined, PIPELINE_MACHINE_ID: MACHINE,
     PIPELINE_REVIEW_LEASE_DIR: dir, [SESSION_VAR]: session ? '1' : undefined, ...extra,
+    // Hermetic: a suite run inside a `P job` carries the launching session's PIPELINE_LEASE_HOLDER; handed to the child CLI it would make the lease a job-scoped one of that session (live only while a job runs).
+    [HOLDER_ENV]: undefined,
   };
   return { root, home, dir, env };
 }
@@ -59,7 +61,7 @@ const leaseOn = (w, repo) => leasesOf(w).find((l) => l.worktree === realpathSync
 
 // A repo with a review state for PR 12 and a valid config; the state names its PR, so state-only commands get a PR lease.
 function reviewRepo({ state = true } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   repo.write('.claude/pipeline.yml', pipelineYml());
   repo.write('.gitignore', '.review/\n.verify/\n');
   repo.write('src/app.js', 'export const a = 1;\n');
@@ -88,7 +90,7 @@ const summaryGh = () => createFakeGh([
 test('wiring: the leased commands are exactly the ones that read or write a worktree\'s review state (read-only commands take none)', () => {
   assert.deepEqual([...LEASED_COMMANDS].sort(), [
     'agent-log', 'arbiter', 'checkpoint', 'ci-wait', 'codex-review', 'comment', 'cost', 'final-gate', 'followups', 'job', 'merge', 'merge-hold',
-    'review-complete', 'smoke', 'state', 'summary', 'triage', 'update-branch', 'verify',
+    'redraft', 'review-complete', 'round', 'smoke', 'state', 'substitute', 'summary', 'triage', 'update-branch', 'verify',
   ]);
   for (const name of ['preflight', 'config', 'labels', 'update', 'version', 'model-floor', 'risk', 'hardstops', 'integrity', 'queue-sweep', 'protect', 'vendor']) {
     assert.equal(LEASED_COMMANDS.has(name), false, name);
@@ -203,12 +205,12 @@ test('an ended run closes the lease; a checkpoint of a run that goes on only ren
 
 // ---- no session, read-only commands, errors ------------------------------------------------------------------------------------------
 
-test('a plain terminal (no Claude Code session) writes no lease and its commands run as before; read-only commands take none either', () => {
+test('a plain terminal (no Claude Code session) takes a process lease only while its command runs (test/review-lease-terminal.test.mjs holds one open); read-only commands take none', () => {
   const plain = world({ session: false });
   const repo = reviewRepo();
   assertExit(P(plain, repo, ['state', 'show']), 0);
-  assert.deepEqual(leaseFiles(plain), []);
-  assert.equal(existsSync(plain.dir), false, 'not even the folder');
+  assert.deepEqual(leaseFiles(plain), [], 'the process lease was closed when the command ended');
+  assert.equal(existsSync(plain.dir), true, 'the folder was used (admission and the lease file)');
 
   const w = world();
   assertExit(P(w, repo, ['config']), 0);
@@ -255,9 +257,14 @@ test('a lease folder that cannot be written fails the command closed with a code
 // ---- order: admission before the state lock; a review that starts after the final scan ------------------------------------------------
 
 // Starts the real CLI without waiting; `done` resolves { code, stdout, stderr } when it exits.
-function startCli(w, repo, args) {
+function startCli(tc, w, repo, args) {
   const env = { ...process.env, PIPELINE_LOCK_DIR: LOCK_DIR, PIPELINE_MACHINE_ID: MACHINE, ...w.env };
   const child = spawn(process.execPath, [BIN, ...args], { cwd: repo.dir, env, stdio: ['ignore', 'pipe', 'pipe'] });
+  tc.after(() => { // an assertion that fails first must not leave this child (and its open pipes) hanging the file
+    if (child.exitCode === null && child.signalCode === null) child.kill('SIGKILL');
+    child.stdout.destroy();
+    child.stderr.destroy();
+  });
   let stdout = '';
   let stderr = '';
   child.stdout.on('data', (d) => { stdout += d; });
@@ -267,7 +274,7 @@ function startCli(w, repo, args) {
 }
 const pause = (ms) => new Promise((r) => setTimeout(r, ms));
 
-test('a review that starts after the installer\'s final scan waits for admission, then gets its lease AFTER the swap; it never holds the PR state lock while it waits', async () => {
+test('a review that starts after the installer\'s final scan waits for admission, then gets its lease AFTER the swap; it never holds the PR state lock while it waits', async (tc) => {
   const w = world();
   const repo = reviewRepo();
   process.env.PIPELINE_MACHINE_ID = MACHINE;
@@ -277,7 +284,7 @@ test('a review that starts after the installer\'s final scan waits for admission
   assert.deepEqual(blocking(scanLeases({ dir: w.dir, env: { [SESSION_VAR]: '1' } })), [], 'the final scan finds no review');
 
   // A review command starts now, after that scan.
-  const review = startCli(w, repo, ['state', 'show']);
+  const review = startCli(tc, w, repo, ['state', 'show']);
   await pause(1500);
   assert.equal(review.exited(), false, 'it is waiting for admission, not running');
   assert.deepEqual(leaseFiles(w), [], 'and has no lease');

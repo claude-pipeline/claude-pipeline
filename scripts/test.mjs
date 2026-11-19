@@ -16,7 +16,8 @@
 // scripts/lib/shard.mjs); the Windows CI job uses 3 shards.
 // CP_TEST_TIMES=<path> also records each file's wall-clock time into <path> as { file: { spanMs } }
 // (scripts/lib/file-times-preload.mjs); CI prints it so scripts/shard-weights.mjs can refresh the weights.
-import { readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -107,10 +108,16 @@ if (files.length === 0) {
   console.error(shard ? `no test files in shard ${shard.i}/${shard.n}` : 'no test files matched');
   process.exit(2);
 }
-// A fixed machine id keeps lock tests from creating a machine-id file in the developer's own pipeline state folder.
+// A fixed machine id keeps lock tests from creating a machine-id file in the developer's own pipeline state folder; a scratch Codex usage
+// ledger keeps every codex-review / second-review the suite runs out of the account's real weekly figure (and the real figure out of the tests' summary lines).
+const usageDir = mkdtempSync(join(tmpdir(), 'cp-codex-usage-'));
 const env = {
   ...process.env,
   PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID || 'test-machine-id',
+  PIPELINE_CODEX_USAGE_FILE: join(usageDir, 'codex-usage.jsonl'),
+  // #472: the owner-go readers settle pending clicks (writes under the account's owner-go folder). A test must never settle the owner's real ones, so every test file runs with the switch off;
+  // a test of settling asks for it with `settle: true`. Already recorded clicks still count: the switch only stops pending clicks becoming records through the readers.
+  PIPELINE_CLICK_SETTLE: 'off',
 };
 const timesOut = process.env.CP_TEST_TIMES;
 const nodeArgs = timesOut ? ['--import', pathToFileURL(join(libDir, 'file-times-preload.mjs')).href] : [];
@@ -118,6 +125,7 @@ if (timesOut) rmSync(`${timesOut}.jsonl`, { force: true });
 // The suite must not touch the account's real Fable floor registry (tests use a scratch PIPELINE_MODEL_FLOOR_DIR): compare before and after.
 const registryBefore = snapshotRegistry();
 const r = spawnSync(process.execPath, [...nodeArgs, '--test', ...files], { stdio: 'inherit', env });
+rmSync(usageDir, { recursive: true, force: true });
 const registryProblem = registryChange(registryBefore, snapshotRegistry(), realRegistryFile());
 if (registryProblem) console.error(`FAIL: ${registryProblem}`);
 if (timesOut) {

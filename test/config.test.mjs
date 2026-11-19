@@ -135,6 +135,20 @@ test('owner_approval: defaults to label, accepts label|chat, rejects anything el
   }
 });
 
+test('owner_go.click: defaults to on, accepts on|off, rejects anything else (and unknown keys)', () => {
+  assert.equal(DEFAULTS.owner_go.click, 'on');
+  assert.equal(validateConfig(minimal()).config.owner_go.click, 'on');
+  assert.equal(validateConfig({ ...minimal(), owner_go: { click: 'off' } }).config.owner_go.click, 'off');
+  assert.equal(validateConfig({ ...minimal(), owner_go: {} }).config.owner_go.click, 'on');
+  for (const bad of ['yes', 'On', '', null, true, ['on']]) {
+    const r = validateConfig({ ...minimal(), owner_go: { click: bad } });
+    assert.equal(r.ok, false, JSON.stringify(bad));
+    assert.ok(has(r, 'owner_go.click must be on|off'), JSON.stringify(bad));
+  }
+  assert.ok(has(validateConfig({ ...minimal(), owner_go: { click: 'on', extra: 1 } }), 'unknown key: owner_go.extra'));
+  assert.ok(has(validateConfig({ ...minimal(), owner_go: 'off' }), 'owner_go must be a mapping'));
+});
+
 test('merge.command without {sha} is rejected (and without {pr})', () => {
   const noSha = validateConfig({ ...minimal(), merge: { command: 'gh pr merge {pr} --squash' } });
   assert.equal(noSha.ok, false);
@@ -155,6 +169,23 @@ test('missing verify.full / verify.quick is rejected', () => {
   assert.ok(has(r, 'verify.full') && has(r, 'verify.quick'));
 });
 
+test('review.codex_model must be a model id: a number, a list, spaces, an empty string or 101 characters are rejected (#443); ordinary ids and an absent key pass', () => {
+  const withModel = (codex_model) => validateConfig({ ...minimal(), review: { codex_model } });
+  for (const bad of [5, ['gpt-6-astra'], 'gpt 5', '', 'a'.repeat(101), 'gpt"x', 'gpt-6\nastra', null]) {
+    const r = withModel(bad);
+    assert.equal(r.ok, false, `${JSON.stringify(bad)} must be refused`);
+    assert.ok(has(r, 'review.codex_model must be a model id (letters, digits, . _ -), e.g. gpt-6-astra'), r.errors.join('; '));
+  }
+  for (const good of ['gpt-6-astra', 'o4-mini', 'gpt-5.1-codex', 'a'.repeat(100)]) {
+    const r = withModel(good);
+    assert.equal(r.ok, true, `${good}: ${r.errors.join('; ')}`);
+    assert.equal(r.config.review.codex_model, good);
+  }
+  const absent = validateConfig({ ...minimal(), review: { max_rounds: 2 } });
+  assert.equal(absent.ok, true, absent.errors.join('; '));
+  assert.equal(absent.config.review.codex_model, DEFAULTS.review.codex_model);
+});
+
 test('review.max_rounds outside 1..5 is rejected; effort values validated', () => {
   const r = validateConfig({ ...minimal(), review: { max_rounds: 9 } });
   assert.equal(r.ok, false);
@@ -173,6 +204,67 @@ test('review.arbiter_always_paths: a list of glob strings, anything else rejecte
   for (const bad of ['lib/auth/**', [1], { a: 1 }, null]) {
     assert.ok(has(validateConfig({ ...minimal(), review: { arbiter_always_paths: bad } }), 'review.arbiter_always_paths'), JSON.stringify(bad));
   }
+});
+
+test('review.threat_models / fix_verify_after_round / fix_round_max_lines: defaults', () => {
+  const r = validateConfig(minimal());
+  assert.deepEqual(r.config.review.threat_models, []);
+  assert.equal(r.config.review.fix_verify_after_round, null);
+  assert.equal(r.config.review.fix_round_max_lines, 150);
+  assert.deepEqual(DEFAULTS.review.threat_models, []);
+});
+
+const model = (over = {}) => ({ name: 'guards', paths: ['pipeline/hooks/**'], text: 'Attackers are other repo users, not the owner.', ...over });
+const withModels = (threat_models) => validateConfig({ ...minimal(), review: { threat_models } });
+
+test('review.threat_models: valid entries are kept in order; invalid ones are rejected naming the key', () => {
+  const ok = withModels([model(), model({ name: 'second-1', paths: ['a/**', 'b.mjs'] })]);
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.review.threat_models.map((m) => m.name), ['guards', 'second-1']);
+  assert.ok(has(withModels('x'), 'review.threat_models must be an array'));
+  assert.ok(has(withModels(['x']), 'review.threat_models[0] must be a mapping'));
+  for (const name of ['', 'Guards', 'has space', 'a'.repeat(41), 5, undefined]) {
+    assert.ok(has(withModels([model({ name })]), 'review.threat_models[0].name'), String(name));
+  }
+  assert.equal(withModels([model({ name: 'a'.repeat(40) })]).ok, true);
+  assert.ok(has(withModels([model(), model()]), 'is listed twice'));
+  for (const paths of [[], 'a/**', [1], undefined, null]) {
+    assert.ok(has(withModels([model({ paths })]), 'review.threat_models[0].paths'), JSON.stringify(paths));
+  }
+  assert.ok(has(withModels([model({ paths: ['a/' + '**/'.repeat(40) + 'b'] })]), 'review.threat_models[0].paths'));
+  for (const text of ['', '   ', 5, undefined]) assert.ok(has(withModels([model({ text })]), 'review.threat_models[0].text'), String(text));
+  assert.ok(has(withModels([model({ text: 'x'.repeat(4001) })]), 'review.threat_models[0].text'));
+  assert.equal(withModels([model({ text: 'x'.repeat(4000) })]).ok, true);
+  const many = Array.from({ length: 11 }, (_, i) => model({ name: 'm' + i }));
+  assert.ok(has(withModels(many), 'at most 10'));
+  assert.equal(withModels(many.slice(0, 10)).ok, true);
+  assert.ok(has(withModels([{ ...model(), x: 1 }]), 'unknown key: review.threat_models[0].x'));
+});
+
+test('review.fix_verify_after_round: null or an integer 1..10; review.fix_round_max_lines: a positive integer', () => {
+  const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
+  for (const v of [null, 1, 3, 10]) assert.equal(set('fix_verify_after_round', v).ok, true, String(v));
+  for (const v of [0, 11, 2.5, '3', true]) assert.ok(has(set('fix_verify_after_round', v), 'review.fix_verify_after_round must be null or an integer 1..10'), String(v));
+  assert.equal(set('fix_round_max_lines', 1).ok, true);
+  for (const v of [0, -1, 1.5, '150', null]) assert.ok(has(set('fix_round_max_lines', v), 'review.fix_round_max_lines must be a positive integer'), String(v));
+});
+
+test('review.post_max_suggestions / trip_wire_extra_rounds / trip_wire_not_falling: defaults', () => {
+  const r = validateConfig(minimal());
+  assert.equal(r.config.review.post_max_suggestions, 'review');
+  assert.equal(r.config.review.trip_wire_extra_rounds, 3);
+  assert.equal(r.config.review.trip_wire_not_falling, 2);
+  assert.equal(DEFAULTS.review.post_max_suggestions, 'review');
+});
+
+test('review.post_max_suggestions: follow-up|review; trip_wire_extra_rounds 1..10; trip_wire_not_falling 1..5', () => {
+  const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
+  for (const v of ['follow-up', 'review']) assert.equal(set('post_max_suggestions', v).ok, true, v);
+  for (const v of ['off', '', 1, null, true]) assert.ok(has(set('post_max_suggestions', v), 'review.post_max_suggestions must be one of follow-up|review'), String(v));
+  for (const v of [1, 3, 10]) assert.equal(set('trip_wire_extra_rounds', v).ok, true, String(v));
+  for (const v of [0, 11, 2.5, '3', null]) assert.ok(has(set('trip_wire_extra_rounds', v), 'review.trip_wire_extra_rounds must be an integer 1..10'), String(v));
+  for (const v of [1, 2, 5]) assert.equal(set('trip_wire_not_falling', v).ok, true, String(v));
+  for (const v of [0, 6, 1.5, '2', null]) assert.ok(has(set('trip_wire_not_falling', v), 'review.trip_wire_not_falling must be an integer 1..5'), String(v));
 });
 
 test('production without smoke is rejected; production: null is ok', () => {
@@ -1000,4 +1092,96 @@ test('verify.ci_proof parses from real YAML (hyphenated step names, nested mappi
   const r = validateConfig(parseYaml(text));
   assert.equal(r.ok, true, r.errors.join('; '));
   assert.deepEqual(r.config.verify.ci_proof, { 'sql-arms': { workflow: '.github/workflows/ci.yml', job: 'SQL arms', event: 'pull_request' } });
+});
+
+test('review.substitute: defaults (auto, never wait, 8 MB packet) and validation of every key', () => {
+  const d = validateConfig(minimal());
+  assert.deepEqual(d.config.review.substitute, { mode: 'auto', min_wait_minutes: 0, max_packet_mb: 8 });
+  assert.ok(Object.isFrozen(DEFAULTS.review.substitute));
+  const ok = validateConfig({ ...minimal(), review: { substitute: { mode: 'off', min_wait_minutes: 20 } } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.review.substitute, { mode: 'off', min_wait_minutes: 20, max_packet_mb: 8 });
+  const cases = [
+    [{ mode: 'on' }, 'review.substitute.mode must be one of auto|off'],
+    [{ min_wait_minutes: -1 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ min_wait_minutes: 1.5 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ min_wait_minutes: 721 }, 'review.substitute.min_wait_minutes must be an integer 0..720'],
+    [{ max_packet_mb: 0 }, 'review.substitute.max_packet_mb must be a positive integer'],
+    [{ max_packet_mb: 'big' }, 'review.substitute.max_packet_mb must be a positive integer'],
+    [{ modee: 'auto' }, 'unknown key: review.substitute.modee'],
+  ];
+  for (const [substitute, expected] of cases) {
+    const r = validateConfig({ ...minimal(), review: { substitute } });
+    assert.equal(r.ok, false, expected);
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+  assert.ok(has(validateConfig({ ...minimal(), review: { substitute: 'auto' } }), 'review.substitute must be a mapping'));
+});
+
+test('review.effort.small_fix / small_fix_lines, review.codex_round_budget and review.codex_budget: defaults and validation', () => {
+  const d = validateConfig(minimal());
+  assert.equal(d.config.review.effort.small_fix, 'low');
+  assert.equal(d.config.review.effort.small_fix_lines, 40);
+  assert.equal(d.config.review.codex_round_budget, 6);
+  assert.deepEqual(d.config.review.codex_budget, { soft: 75, hard: 90 });
+  const ok = validateConfig({ ...minimal(), review: { effort: { small_fix: 'medium', small_fix_lines: 20 }, codex_round_budget: 4, codex_budget: { soft: 60 } } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual([ok.config.review.effort.small_fix, ok.config.review.effort.small_fix_lines, ok.config.review.codex_round_budget], ['medium', 20, 4]);
+  assert.deepEqual(ok.config.review.codex_budget, { soft: 60, hard: 90 });
+  const cases = [
+    [{ effort: { small_fix: 'tiny' } }, 'review.effort.small_fix must be one of'],
+    [{ effort: { small_fix_lines: 0 } }, 'review.effort.small_fix_lines must be an integer 1..10000'],
+    [{ effort: { small_fix_lines: 'x' } }, 'review.effort.small_fix_lines must be an integer 1..10000'],
+    [{ codex_round_budget: 0 }, 'review.codex_round_budget must be an integer 1..100'],
+    [{ codex_budget: { soft: 95 } }, 'review.codex_budget.soft must not be above review.codex_budget.hard'],
+    [{ codex_budget: { hard: 101 } }, 'review.codex_budget.hard must be an integer 1..100'],
+    [{ codex_budget: { sofft: 1 } }, 'unknown key: review.codex_budget.sofft'],
+    [{ codex_budget: 80 }, 'review.codex_budget must be a mapping'],
+  ];
+  for (const [review, expected] of cases) {
+    const r = validateConfig({ ...minimal(), review });
+    assert.equal(r.ok, false, expected);
+    assert.ok(has(r, expected), `${expected}: ${r.errors.join(' | ')}`);
+  }
+});
+
+test('risk.ignore_hard_stop_rules: defaults to empty; only P-path and R4-config are accepted, anything else names the allowlist', () => {
+  assert.deepEqual(DEFAULTS.risk.ignore_hard_stop_rules, []);
+  const ok = validateConfig({ ...minimal(), risk: { ignore_hard_stop_rules: ['P-path', 'R4-config'] } });
+  assert.equal(ok.ok, true, ok.errors.join('; '));
+  assert.deepEqual(ok.config.risk.ignore_hard_stop_rules, ['P-path', 'R4-config']);
+  assert.deepEqual(validateConfig(minimal()).config.risk.ignore_hard_stop_rules, []);
+  // the guard core, the database/auth/secret rules and the rest can never be discounted
+  for (const rule of ['R4-pipeline', 'R0-unscannable', 'R1-destructive', 'R2-auth', 'R3-secrets', 'R5-major-dep', 'R6-sensitive', 'P-pattern', 'nonsense']) {
+    const r = validateConfig({ ...minimal(), risk: { ignore_hard_stop_rules: [rule] } });
+    assert.ok(has(r, 'risk.ignore_hard_stop_rules[0]'), rule);
+    assert.ok(has(r, 'P-path, R4-config'), `${rule}: the error names the allowlist`);
+  }
+  for (const bad of ['P-path', { a: 1 }, null, [1]]) {
+    assert.ok(has(validateConfig({ ...minimal(), risk: { ignore_hard_stop_rules: bad } }), 'risk.ignore_hard_stop_rules'), JSON.stringify(bad));
+  }
+});
+
+test('review.size_only_medium_reviewer: judge (default) or fable, anything else rejected', () => {
+  assert.equal(DEFAULTS.review.size_only_medium_reviewer, 'judge');
+  assert.equal(validateConfig(minimal()).config.review.size_only_medium_reviewer, 'judge');
+  const fable = validateConfig({ ...minimal(), review: { size_only_medium_reviewer: 'fable' } });
+  assert.equal(fable.ok, true, fable.errors.join('; '));
+  assert.equal(fable.config.review.size_only_medium_reviewer, 'fable');
+  for (const bad of ['sonnet', '', true, null, ['judge']]) {
+    assert.ok(has(validateConfig({ ...minimal(), review: { size_only_medium_reviewer: bad } }), 'review.size_only_medium_reviewer'), JSON.stringify(bad));
+  }
+});
+
+test('ci.merge_checks defaults to [] (frozen), must be an array of strings, and is not part of the required (protection) list', () => {
+  assert.deepEqual(DEFAULTS.ci.merge_checks, []);
+  assert.ok(Object.isFrozen(DEFAULTS.ci.merge_checks));
+  for (const bad of ['Replay from zero', [1], [{}], null]) {
+    assert.ok(has(validateConfig({ ...minimal(), ci: { merge_checks: bad } }), 'ci.merge_checks'), JSON.stringify(bad));
+  }
+  const ok = validateConfig({ ...minimal(), ci: { merge_checks: ['Replay from zero'] } });
+  assert.equal(ok.ok, true, JSON.stringify(ok));
+  assert.deepEqual(ok.config.ci.merge_checks, ['Replay from zero']);
+  // ci-wait waits for them, but branch protection / `protect` / the final gate list must not start requiring them
+  assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: false, merge_checks: ['Replay from zero'] }), ['build']);
 });

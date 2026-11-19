@@ -234,3 +234,78 @@ test('ci-wait (real gh args): the failing status\'s Actions run is read with `gh
   assert.match(r.json.message, /Cross-model review=fail .*\(result predates ready\)/);
   assert.ok(fake.lines().includes('api repos/acme/widgets/actions/runs/555'), fake.lines().join('\n'));
 });
+
+test('ci-wait (real gh args): an absent required check on a CONFLICTING PR is verdict `conflicting`, read with `gh pr view --json mergeable,mergeStateStatus` (#471)', () => {
+  // the first matching entry wins: the mergeability read goes before the base script's general PR view
+  const fake = createFakeGh([{ match: '^pr view 5 --json mergeable,mergeStateStatus$', stdoutJson: { mergeable: 'CONFLICTING', mergeStateStatus: 'DIRTY' } }, ...base([
+    { match: '/check-runs', stdout: pages([run(2, 'ci', 'success')]) },
+    { match: '/statuses', stdout: '[]\n' },
+    { match: '/timeline', stdout: '[]\n' },
+    { match: '/actions/runs', stdout: '[]\n' },
+  ])]);
+  // `lint` is required but never reports (no workflow ran: the PR conflicts); --appear-timeout 0 puts the first poll past the window
+  const r = cli(['ci-wait', '--pr', '5', '--appear-timeout', '0', '--interval', '1'], { repo: repoWith(), fake });
+  assert.equal(r.code, 1, r.stdout + r.stderr);
+  assert.equal(r.json.verdict, 'conflicting');
+  assert.equal(r.json.message, 'merge conflict with main: merge the base, then run the resolution round');
+  assert.deepEqual(r.json.mergeState, { mergeable: 'CONFLICTING', state: 'DIRTY' });
+  assert.ok(fake.lines().includes('pr view 5 --json mergeable,mergeStateStatus'));
+});
+
+test('ci-wait: ci.merge_checks is waited on as well, and on a ci.e2e_label PR a still-running non-required check is reported as others (in-process)', async () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}  merge_checks: [Replay from zero]\n  e2e_label: run-e2e\n`);
+  repo.commit('init');
+  let t = 0;
+  const calls = [];
+  const gh = {
+    prView: (n, fields) => {
+      calls.push(fields.join(','));
+      return fields.includes('labels') ? { labels: [{ name: 'run-e2e' }] } : pr();
+    },
+    protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'ci', app_id: 15368 }] } } }),
+    branchRules: () => [],
+    checkRunsOf: () => [
+      run(1, 'ci', 'success'),
+      // the merge check finishes on the third read; the e2e suite is not required and is still running
+      ...(t >= 30_000 ? [run(2, 'Replay from zero', 'success')] : [{ ...run(2, 'Replay from zero', null), status: 'in_progress', conclusion: null }]),
+      { ...run(3, 'Playwright suite', null), status: 'in_progress', conclusion: null },
+    ],
+    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
+  };
+  const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
+  const r = await ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(t, 30_000, 'held until the merge check passed');
+  assert.deepEqual(r.output.checks.map((c) => [c.name, c.state, c.source]), [['ci', 'pass', undefined], ['Replay from zero', 'pass', 'merge_checks']]);
+  assert.deepEqual(r.output.others, [{ name: 'Playwright suite', status: 'in_progress', url: 'https://github.example/runs/3' }]);
+  assert.ok(calls.includes('labels'));
+});
+
+test('ci-wait (R1-B2): a pipeline.yml that exists but is invalid is a config error (exit 2), never a silent pass without ci.merge_checks / ci.e2e_label; a missing file is still allowed', async () => {
+  const gh = {
+    prView: () => pr(),
+    protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'ci', app_id: 15368 }] } } }),
+    branchRules: () => [],
+    checkRunsOf: () => [run(1, 'ci', 'success'), run(2, 'Replay from zero', 'failure')],
+    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
+  };
+  const go = (repo) => ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock: { now: () => 0, sleep: async () => {} }, onProgress: () => {} } });
+  const bad = createTmpRepo();
+  bad.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}  merge_checks: [Replay from zero]\nverify_oops: 1\nverify:\n  stop_queue_wait_minutes: -1\n`);
+  bad.commit('init');
+  const r = await go(bad);
+  assert.equal(r.exitCode, 2, JSON.stringify(r.output));
+  assert.equal(r.output.error, 'config');
+  assert.ok(Array.isArray(r.output.errors) && r.output.errors.length > 0);
+  const none = createTmpRepo();
+  none.write('README.md', 'x');
+  none.commit('init');
+  const ok = await go(none);
+  assert.equal(ok.output.verdict, 'passed', JSON.stringify(ok.output));
+});
+
+test('meta: the usage names the new output fields and verdict', () => {
+  for (const word of ['conflicting', 'others', 'notOwed']) assert.ok(meta.usage.includes(word), word);
+});

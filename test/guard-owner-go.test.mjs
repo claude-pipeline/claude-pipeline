@@ -140,7 +140,7 @@ test('#58 ownerGoWiring: the repository root\'s pipeline.yml in every version at
   writeFileSync(join(none, 'src', 'deep', '.claude', 'pipeline.yml'), CHAT);
   assert.equal(w.mode(join(none, 'src', 'deep')), 'none');
   // a committed copy (HEAD or the remote's default branch) saying chat wins over a working-tree edit to label
-  const shown = ownerGoWiring('sess', { gitShow: (r, ref) => (ref === 'origin/main' ? CHAT : null) });
+  const shown = ownerGoWiring('sess', { gitShow: (r, ref) => (ref === 'refs/remotes/origin/main' ? CHAT : null) });
   assert.equal(shown.mode(label), 'chat');
   assert.deepEqual(shown.mergeTemplates(label).map((t) => t.prefix[0]).sort(), ['gh', 'npm']);
   const broken = repo('broken', 'owner_approval: [chat\n  : :');

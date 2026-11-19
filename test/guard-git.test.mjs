@@ -328,6 +328,11 @@ const MORE_DENY = [
   ['find . -name x -exec git push origin main ;'],
   // cwd tracking
   ['cd /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }],
+  ['chdir /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }], // (#372: zsh's chdir is cd)
+  // #425 R1-F2: chdir is a zsh builtin only (bash: command not found, the line goes on in the old directory), so the directory after it is unknown
+  ['chdir /wt; git push', { byDir: { '/work/repo': 'main', '/wt': 'agent/x' } }],
+  ['chdir /wt && git push', { byDir: { '/work/repo': 'main', '/wt': 'agent/x' } }],
+  ['chdir /other && git push', { byDir: { '/work/repo': 'main', '/other': 'agent/x' } }],
   ['git -C /other push', { byDir: { '/work/repo': 'agent/x', '/other': 'master' } }],
   ['git -C ../other push', { cwd: '/work/repo', byDir: { '/work/other': 'main' } }],
   ['git -C a -C b push', { cwd: '/w', byDir: { '/w/a/b': 'main' } }],
@@ -1577,6 +1582,14 @@ test('string-running wrappers are unwrapped or scanned', () => {
   for (const c of allow) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
 });
 
+// #563 (owner's choice, option 1): the scan of interpreter program text is deliberate: a program that only WRITES a file whose text names a guarded command is refused too. It is pinned so that the refusal
+// stays a recorded decision, not an accident; the workaround is in the implementer brief (write such a test file with the Write tool, or build the string at run time).
+test('a node -e that only writes a file whose text names a push to main is refused (deliberate, #563)', () => {
+  const v = evaluate("node -e \"require('fs').writeFileSync('t.mjs','git push origin main')\"");
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /node was given a string that contains a guarded command/);
+});
+
 test('spawn: a script file in the real working directory is read by the hook', () => {
   const dir = join(TMP, 'scripts');
   execFileSync('mkdir', ['-p', dir]);
@@ -1740,13 +1753,14 @@ test('directory / branch / variable state from a command that may not have run i
     'B=agent/x & git push origin HEAD:$B',
   ];
   for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  // (#352 R37: no redirection on a cd is trusted, not even before && (a failed redirection means the cd never ran, and a text ending in one must not hand the move on): was allowed, a redirect is not a background job)
+  assert.equal(evaluate('cd /safe > /dev/null 2>&1 && git push', o).decision, 'deny');
   const allowCmds = [
     'cd /safe && git push',
     'true && cd /safe && git push',
     'git checkout agent/y && git push',
     'cd /safe; git push',
     'git checkout agent/y; git push',
-    'cd /safe > /dev/null 2>&1 && git push', // redirects and &> are not a background job
     'cd /safe &>/dev/null; git status',
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
@@ -1827,6 +1841,7 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     'true && cd /other; bash step.sh',
     'false || cd /other; ./step.sh',
     'cd /other || exit 1 & git push', // `|| exit` does not help a backgrounded cd
+    'cd /other || return; git push', // #427: a top-level `return` is an error and the shell goes on (this was an allow before; the files guard's cd narrowing refused it since #425)
     // a ( subshell is still found in the text
     '(B=main); git push origin HEAD:$B',
   ];
@@ -1842,7 +1857,6 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     'B=agent/x; git commit -m "fix for loop"; git push origin "$B"',
     'git commit -m "fix (again)"; B=agent/x; git push origin HEAD:$B',
     'cd /other || exit 1; git push',
-    'cd /other || return; git push',
     'cd /other; bash ok.sh',
     'source env.sh && npm test',
   ];

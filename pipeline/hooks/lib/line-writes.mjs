@@ -1868,6 +1868,23 @@ function addFiles(f, rec, word, P, st, fi, depth, exists, into, frames = null) {
   }
 }
 
+// #506: does the command at idx write a name below a `.git` directory (a redirection, `exec N>`, git --output, cp / mv / tee / install ...)? A write to the repository's HEAD or refs moves its
+// branch without any git command the guard reads. Only a target that can be named is judged (a run-time word is not: `> "$OUT"` is everyday); `.gitignore` / `.github` are no .git directory.
+// (R1-B3: only a name that can move a branch: the directory itself (a copy onto it), HEAD, a linked worktree's HEAD, config, refs, packed-refs; an exclude file, a hook or a message file cannot)
+// (#556: a destination that is a linked worktree's directory (`.git/worktrees/w`, `.git/worktrees/w/`) may receive a file named HEAD; the target is matched case-insensitively where the filesystem is, `.git/head`; locateWord has
+// already collapsed `//`, `.` and `..`)
+const UNDER_GIT = /(?:^|\/)\.git(?:\/*$|\/(?:HEAD|config|packed-refs|refs(?:\/|$)|worktrees\/[^/]+(?:\/(?:HEAD)?)?$))/;
+const UNDER_GIT_CI = new RegExp(UNDER_GIT.source, 'i');
+export function writesUnderGit(f, idx) {
+  for (const rec of f.recs) {
+    if (rec.idx !== idx || rec.dest === null || rec.dest === undefined || rec.inline !== undefined) continue;
+    const e = expandWord(f, rec.dest);
+    if (e === null) continue;
+    if (locateWord(f, e, idx).some((d) => (f.ci ? UNDER_GIT_CI : UNDER_GIT).test(String(d).replace(/\\/g, '/')))) return true;
+  }
+  return false;
+}
+
 // Names the line's writes put into directory `dir` (so `bash n*.sh` after `cp f.sh n.sh` has n.sh among its glob matches).
 export function writtenNamesIn(frames, dir) {
   const out = new Set();

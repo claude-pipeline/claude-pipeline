@@ -25,7 +25,7 @@ const RUN_ID = 555;
 const pr = (over = {}) => ({ number: NUM, merged_at: '2026-10-07T10:00:00Z', base: { ref: 'main' }, head: { sha: HEAD }, ...over });
 
 // The happy-path GitHub. `over` replaces whole entries by key; a value of 'fail' makes that call exit 1.
-function gh(tree, over = {}) {
+function gh(tree, over = {}, extra = []) {
   const e = {
     pulls: { stdoutJson: [pr()] },
     headCommit: { stdoutJson: { tree: { sha: tree } } },
@@ -37,6 +37,7 @@ function gh(tree, over = {}) {
   };
   const entry = (match, key) => (e[key] === 'fail' ? { match, code: 1, stderr: 'HTTP 500' } : { match, ...e[key] });
   return [
+    ...extra,
     entry(`^api repos/${REPO}/commits/${SHA}/pulls$`, 'pulls'),
     entry(`^api repos/${REPO}/git/commits/${HEAD}$`, 'headCommit'),
     entry(`^api repos/${REPO}/commits/${SHA}$`, 'pushed'),
@@ -46,7 +47,7 @@ function gh(tree, over = {}) {
   ];
 }
 
-async function decide({ over = {}, headTree, env = {} } = {}) {
+async function decide({ over = {}, extra = [], headTree, env = {} } = {}) {
   const repo = createTmpRepo();
   repo.write('a.txt', 'one\n');
   repo.commit('pushed');
@@ -55,7 +56,7 @@ async function decide({ over = {}, headTree, env = {} } = {}) {
   const scriptFile = join(dir, 'script.json');
   const out = join(dir, 'output');
   const log = join(dir, 'log.jsonl');
-  writeFileSync(scriptFile, JSON.stringify(gh(headTree ?? tree, over)));
+  writeFileSync(scriptFile, JSON.stringify(gh(headTree ?? tree, over, extra)));
   writeFileSync(out, '');
   const r = await runNode([script], {
     cwd: repo.dir,
@@ -81,6 +82,25 @@ test('identical tree + the same job green on the PR head -> skip, with the evide
 test('a rerun that went green counts: only a later attempt of the job succeeded', async () => {
   const r = await decide({ over: { jobs: { stdoutJson: { jobs: [{ name: JOB, conclusion: 'failure' }, { name: JOB, conclusion: 'success' }] } } } });
   assert.equal(r.output, 'run=false');
+});
+
+// The draft flow (ci.draft_while_iterating): the PR head's draft-era run concluded skipped (every job skipped); the run after ready_for_review is the real one.
+test('a draft-era run whose jobs were all skipped never counts as green; the ready-era run on the same head does', async () => {
+  const DRAFT_RUN = 554;
+  const draftJobs = { match: `^api repos/${REPO}/actions/runs/${DRAFT_RUN}/jobs\\?filter=all`, stdoutJson: { jobs: [{ name: 'test (windows 1/3)', conclusion: 'skipped' }, { name: JOB, conclusion: 'skipped' }, { name: 'test (windows)', conclusion: 'skipped' }] } };
+  const draftRun = { id: DRAFT_RUN, status: 'completed', conclusion: 'skipped' };
+  const readyRun = { id: RUN_ID, status: 'completed', conclusion: 'success' };
+  const both = await decide({ over: { runs: { stdoutJson: { workflow_runs: [readyRun, draftRun] } } }, extra: [draftJobs] });
+  assert.equal(both.output, 'run=false', both.stdout);
+  assert.match(both.stdout, new RegExp(`evidence: run ${RUN_ID} `));
+  const draftFirst = await decide({ over: { runs: { stdoutJson: { workflow_runs: [draftRun, readyRun] } } }, extra: [draftJobs] });
+  assert.equal(draftFirst.output, 'run=false', 'listing order is irrelevant');
+  assert.doesNotMatch(draftFirst.stdout, new RegExp(`evidence: run ${DRAFT_RUN} `));
+
+  // only the skipped run: nothing proves the tree was tested
+  const only = await decide({ over: { runs: { stdoutJson: { workflow_runs: [draftRun] } } }, extra: [draftJobs] });
+  assert.equal(only.output, 'run=true', only.stdout);
+  assert.match(only.stdout, /RUN: no completed ci\.yml pull_request run/);
 });
 
 test('a different tree -> run', async () => {
@@ -153,14 +173,14 @@ test('missing inputs -> run', async () => {
 
 // ---- how ci.yml wires it in ----
 const ci = read('.github/workflows/ci.yml');
-const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu|windows-shard|windows):)/m).slice(1);
+const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu-node|ubuntu|windows-shard|windows):)/m).slice(1);
 const blockOf = (id) => jobBlocks().find((b) => b.startsWith(`test-${id}:`));
 const stepsOf = (block) => block.split(/^ {6}(?=- )/m).slice(1);
 
-test('the test jobs open with the skip step, push only, naming their own job (ubuntu and each Windows shard)', () => {
+test('the test jobs open with the skip step, push only, naming their own job (each Ubuntu Node version and each Windows shard)', () => {
   const blocks = jobBlocks();
-  assert.equal(blocks.length, 3, 'ubuntu, the Windows shard job and the aggregate');
-  for (const block of blocks.filter((b) => !b.startsWith('test-windows:'))) {
+  assert.equal(blocks.length, 4, 'the Ubuntu Node job, its aggregate, the Windows shard job and its aggregate');
+  for (const block of blocks.filter((b) => !b.startsWith('test-windows:') && !b.startsWith('test-ubuntu:'))) {
     const jobName = block.match(/^ {4}name: (.+)$/m)[1].trim();
     const steps = stepsOf(block);
     const at = steps.findIndex((s) => s.includes('tested-tree.mjs'));
@@ -198,12 +218,31 @@ test('the Windows shard job: JOB_NAME is the per-shard name, shards run `--shard
   assert.match(installer[0], /if: matrix\.shard == 3 && \(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\)/);
 });
 
+test('the Ubuntu Node job: JOB_NAME is the per-Node-version name, the suite and the installer run for every Node version', () => {
+  const block = blockOf('ubuntu-node');
+  assert.match(block, /^ {4}name: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
+  assert.match(block, /JOB_NAME: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
+  assert.match(block, /run: node scripts\/test\.mjs$/m);
+  const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
+  assert.equal(installer.length, 1);
+  assert.match(installer[0], /^ {8}if: github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'$/m);
+});
+
+test('the aggregate test (ubuntu) job has no skip step and always evaluates the Node jobs result', () => {
+  const block = blockOf('ubuntu');
+  assert.ok(!block.includes('tested-tree.mjs'), 'nothing to skip: it only reads the Node jobs');
+  assert.match(block, /^ {4}name: test \(ubuntu\)$/m);
+  assert.match(block, /^ {4}needs: test-ubuntu-node$/m);
+  assert.match(block, /^ {4}if: always\(\) && \(github\.event_name != 'pull_request' \|\| !github\.event\.pull_request\.draft\)$/m);
+});
+
 test('the aggregate test (windows) job has no skip step and always evaluates the shard result', () => {
   const block = blockOf('windows');
   assert.ok(!block.includes('tested-tree.mjs'), 'nothing to skip: it only reads the shards');
   assert.match(block, /^ {4}name: test \(windows\)$/m);
   assert.match(block, /^ {4}needs: test-windows-shard$/m);
-  assert.match(block, /^ {4}if: always\(\)$/m);
+  // always() (a failed shard must still report), plus the draft skip the shards have: a draft PR skips the whole suite
+  assert.match(block, /^ {4}if: always\(\) && \(github\.event_name != 'pull_request' \|\| !github\.event\.pull_request\.draft\)$/m);
 });
 
 test('ci.yml grants only the extra read scopes the skip step needs, with a comment', () => {
