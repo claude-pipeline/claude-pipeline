@@ -639,3 +639,93 @@ test('defer-fixes: a Follow up click the hook refused at once (#613), or refused
   assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
   assert.equal(ok.output.followUpClick.override, 'typed');
 });
+
+// ---- cap-defer (review.cap_low_accepts): the first step of `round publish`, through the real CLI ---------------------------------------------------------------------------
+// max_rounds 1: round 1 accepted one low fix nobody built.
+function capWorld(t, opts = {}) {
+  const w = roundWorld(t, opts);
+  assertExit(w.codex(1, findingsOf([], [low({ title: 'Issue 1' })])), 0);
+  assertExit(w.judge(1, { 'R1-S1': ['ACCEPT'] }), 0);
+  return w;
+}
+const capDefer = (w, round = '1', pr = '7') => w.cli(['triage', 'cap-defer', '--pr', pr, '--round', round]);
+const issuePosts = (w) => w.fake.lines().filter((l) => l.startsWith(`api -X POST repos/${w.slug}/issues `)).length;
+
+test('cap-defer: round publish defers the unbuilt low accept, files its issue, reads clean; a rerun (applied false) still reports it and files nothing twice', (t) => {
+  const w = capWorld(t);
+  const r = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.capDeferral.applied, r.json.capDeferral.ids, r.json.accepted.count, r.json.outcome.clean, r.json.outcome.capDeferred], [true, ['R1-S1'], 0, true, ['R1-S1']]);
+  assert.deepEqual(r.json.followups.map((f) => f.id), ['R1-S1']);
+  const item = w.item('R1-S1');
+  assert.deepEqual([item.final.decision, item.final.postMax.rule, item.implemented, w.state().version], ['FOLLOW-UP', 'cap-low', false, 6]);
+  assert.equal(issuePosts(w), 1);
+  assert.ok(JSON.parse(w.fake.calls().find((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues `)).stdin).body.includes('deferred unapplied'));
+  // the retry: the state already holds it, so nothing is applied, the skill still sees the ids (F6), and no second issue is filed
+  const again = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assertExit(again, 0, again.stderr + again.stdout);
+  assert.deepEqual([again.json.capDeferral.applied, again.json.capDeferral.ids, again.json.capDeferral.rounds, again.json.outcome.capDeferred, again.json.outcome.clean], [false, ['R1-S1'], [], ['R1-S1'], true]);
+  assert.equal(issuePosts(w), 1);
+});
+
+test('cap-defer: every refusal is exit 0 applied:false with the state untouched (label mode, the working-tree switch, a dirty tree, an already published round); a wrong PR is exit 1', (t) => {
+  const unchanged = (w, re, label, run = () => capDefer(w)) => {
+    const before = w.stateText();
+    const r = run();
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.equal(r.json.applied, false, label);
+    assert.match(r.json.refusals.join(';'), re, label);
+    assert.equal(w.stateText(), before, `${label}: state untouched`);
+  };
+  unchanged(capWorld(t, { mode: 'label' }), /only with owner_approval: chat/, 'label mode');
+  const sw = capWorld(t);
+  sw.config({ review: '  cap_low_accepts: extra-round\n' });
+  unchanged(sw, /review.cap_low_accepts is extra-round/, 'a PR switching it off');
+  const dirty = capWorld(t);
+  writeFileSync(join(dirty.repo.dir, 'stray.txt'), 'x');
+  unchanged(dirty, /uncommitted changes/, 'dirty tree');
+  const published = capWorld(t);
+  assertExit(published.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  unchanged(published, /already published with its accepts/, 'decided once');
+  const wrong = capWorld(t);
+  const before = wrong.stateText();
+  const r = capDefer(wrong, '1', '8');
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'identity-mismatch');
+  assert.equal(wrong.stateText(), before);
+});
+
+test('cap-defer: the owner\'s extra round (any head) wins, and a record whose provenance cannot be confirmed refuses (the real strict lookups)', (t) => {
+  for (const [provenance, re] of [[undefined, /owner granted extra round 2 \(unspent\)/], ['missing', /recorded for round 2 but cannot be confirmed as typed by the owner/]]) {
+    const w = capWorld(t);
+    const record = provenance === undefined ? ownerGrants(t, 'extra round', roundRequest(7, 2, w.head, w.slug)) : ownerGrants(t, 'extra round', roundRequest(7, 2, w.head, w.slug), OWNER_ENTRY, provenance);
+    assert.ok(record, 'the recorder wrote the grant');
+    cleanupAtExit(markerPath(grantIdOf(record)));
+    t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+    const before = w.stateText();
+    const r = capDefer(w);
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.equal(r.json.applied, false);
+    assert.match(r.json.refusals.join(';'), re);
+    assert.equal(w.stateText(), before);
+  }
+});
+
+test('cap-defer: accepts carried by a later resolution-only round are deferred too, and the issues are filed per round (an interrupted publish files the rest, none twice)', (t) => {
+  const w = capWorld(t);
+  w.edit((s) => {
+    const r1 = s.rounds[0];
+    const extra = { ...r1.items[0], id: 'R2-S1', round: 2, title: 'Other idea', fingerprint: 'fp-r2', line: 7, file: 'src/a.js' };
+    s.rounds.push({ ...r1, n: 2, items: [extra], resolutionOnly: true, admission: undefined });
+  });
+  const r = capDefer(w, '2');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.applied, r.json.ids, r.json.rounds], [true, ['R1-S1', 'R2-S1'], [1, 2]]);
+  // interrupted after round 1's issue only: the publish files the rest and skips what exists
+  assertExit(w.cli(['followups', 'create', '--round', '1']), 0);
+  assert.equal(issuePosts(w), 1);
+  const pub = w.cli(['round', 'publish', '--pr', '7', '--round', '2']);
+  assertExit(pub, 0, pub.stderr + pub.stdout);
+  assert.deepEqual([pub.json.capDeferral.applied, pub.json.capDeferral.rounds, pub.json.outcome.clean, pub.json.outcome.capDeferred], [false, [2], true, ['R1-S1', 'R2-S1']]);
+  assert.equal(issuePosts(w), 2, 'one issue per item, none twice');
+});
