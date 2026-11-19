@@ -222,6 +222,9 @@ test('describeSelection: counts, the skipped names (truncated) and the changed-f
   assert.match(line, /3 selected \(1 changed, 1 direct, 1 transitive; 0 name-only\), 3 skipped over budget \(s1\.test\.mjs, s2\.test\.mjs, \+1 more\); 7 changed files \(basis text\); estimated 188232 of budget 90000 ms$/);
   const weakSel = describeSelection({ selected: [{ name: 'w.test.mjs', tier: 1, distance: 1, weak: true, ms: 1 }, sel('b.test.mjs', 1)], skipped: [], changedCount: 1, basis: 'b', budgetMs: 10, estimatedMs: 2 });
   assert.match(weakSel, /2 selected \(0 changed, 2 direct, 0 transitive; 1 name-only\), 0 skipped/);
+  const w = (name, ms) => ({ name, tier: 2, distance: 2, weak: true, ms });
+  const capped = describeSelection({ selected: [w('w1.test.mjs', 4000), w('w2.test.mjs', 4000), w('w3.test.mjs', 4000)], skipped: [w('w4.test.mjs', 4000), sel('s.test.mjs', 2)], changedCount: 1, basis: 'b', budgetMs: 90000, estimatedMs: 12000 });
+  assert.match(capped, /2 skipped over budget \(w4\.test\.mjs, s\.test\.mjs\), 1 of them name-only \(name-only cap 15000 ms, 12000 used\); 1 changed files/);
   const uncapped = describeSelection({ selected: [], skipped: [], changedCount: 0, basis: 'b', budgetMs: Infinity, estimatedMs: 5 });
   assert.match(uncapped, /; estimated 5 ms, no budget cap$/);
 });
@@ -236,6 +239,8 @@ test('describeSelectionDetail: every selected file with its tier and every skipp
   assert.ok(lines.every((l) => !l.endsWith('.test.mjs')));
   const weak = describeSelectionDetail({ selected: [{ ...sel('w1.test.mjs', 1), weak: true }, { ...sel('w2.test.mjs', 2), weak: true }, sel('s.test.mjs', 1)], skipped: [] });
   assert.equal(weak[0], 'related selected (3): w1.test.mjs [direct, name only], w2.test.mjs [transitive, name only], s.test.mjs [direct] (end)');
+  const skippedWeak = describeSelectionDetail({ selected: [], skipped: [{ ...sel('w4.test.mjs', 2), weak: true }, sel('s.test.mjs', 2)] });
+  assert.equal(skippedWeak[0], 'related skipped over budget (2): w4.test.mjs [name only], s.test.mjs (end)');
   assert.deepEqual(describeSelectionDetail({ selected: [], skipped: [] }), []);
 });
 

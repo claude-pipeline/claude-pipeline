@@ -124,7 +124,7 @@ function makeGraph({ files, changed, read }) {
 
 // Shortest distance from `test` to a changed file: 0 = the test is changed, 1 = a direct dependency, 2+ = further.
 // Strong edges only first; only when no strong path exists is a path through a weak edge (a bare root-name mention) used,
-// and then the result says `weak` so the ranking puts it after every strongly related test of its tier.
+// and then the result says `weak` so the ranking puts it after every strongly related test of any tier.
 function distanceToChange(graph, test) {
   if (graph.changedSet.has(test)) return { distance: 0, weak: false };
   const search = (allowWeak) => {
@@ -192,19 +192,23 @@ export function describeSelection({ selected, skipped, changedCount, basis, budg
   const used = Math.round(estimatedMs);
   const budget = budgetMs === Infinity ? `estimated ${used} ms, no budget cap` : `estimated ${used} of budget ${budgetMs} ms`;
   const names = skipped.map((s) => s.name);
+  // A name-only file can be skipped by the name-only cap while most of the whole budget is unused: say so, with the cap and what was used.
+  const weakSkipped = skipped.filter((s) => s.weak).length;
+  const weakUsed = Math.round(selected.filter((s) => s.weak).reduce((sum, s) => sum + s.ms, 0));
+  const weakNote = weakSkipped && budgetMs !== Infinity ? `, ${weakSkipped} of them name-only (name-only cap ${weakBudgetOf(budgetMs)} ms, ${weakUsed} used)` : '';
   const shown = names.slice(0, listMax).join(', ') + (names.length > listMax ? `, +${names.length - listMax} more` : '');
   return `related tests: ${selected.length} selected (${tiers[0]} changed, ${tiers[1]} direct, ${tiers[2]} transitive; ${nameOnly} name-only), `
-    + `${skipped.length} skipped over budget${skipped.length ? ` (${shown})` : ''}; ${changedCount} changed files (${basis}); ${budget}`;
+    + `${skipped.length} skipped over budget${skipped.length ? ` (${shown})` : ''}${weakNote}; ${changedCount} changed files (${basis}); ${budget}`;
 }
 
 // The full record of what a quick run covered, printed after the summary: every selected related file with its tier
-// (plus "name only" for a weak relation) and every file skipped over budget, so a CI failure in a test quick passed can be
+// (plus "name only" for a weak relation) and every file skipped over budget (a name-only one marked the same way), so a CI failure in a test quick passed can be
 // told apart (skipped vs never related) from the log alone. Each line ends with ')' so no line reads as a bare test-file name.
 export function describeSelectionDetail({ selected, skipped }) {
   const tierName = ['changed', 'direct', 'transitive'];
   const lines = [];
   if (selected.length) lines.push(`related selected (${selected.length}): ${selected.map((s) => `${s.name} [${tierName[s.tier] ?? s.tier}${s.weak ? ', name only' : ''}]`).join(', ')} (end)`);
-  if (skipped.length) lines.push(`related skipped over budget (${skipped.length}): ${skipped.map((s) => s.name).join(', ')} (end)`);
+  if (skipped.length) lines.push(`related skipped over budget (${skipped.length}): ${skipped.map((s) => `${s.name}${s.weak ? ' [name only]' : ''}`).join(', ')} (end)`);
   return lines;
 }
 
