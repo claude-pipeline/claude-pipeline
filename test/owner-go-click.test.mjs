@@ -17,25 +17,18 @@ import {
   ASKS_REL, CLICK_BUILDS, HUMAN_DECISION, MIN_ANSWER_MS, asksDir, canonicalDialog, clickEvidence, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk,
 } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { HEAD, ITEMS, OK, OLDEST, REPO, forgeAsk, loadFixture, mergeParts, noSleep, world } from './helpers/click-world.mjs';
 
-const REPO = 'acme/app';
-const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const HEAD2 = 'fedcba9876543210fedcba9876543210fedcba98';
-const ITEMS = 'abcdef012345';
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const FIX = new URL('./fixtures/click/', import.meta.url);
-const OLDEST = '2.1.322'; // the build the rest of this file's builds-agnostic tests (and its few 2.1.322-specific assertions) run on
 const BUILD_DIR = (build) => new URL(`${build}/`, FIX);
-const loadFixture = (name, build = OLDEST) => readFileSync(new URL(`${name}.jsonl`, BUILD_DIR(build)), 'utf8').trim().split('\n').map((l) => JSON.parse(l));
 const buildNo = (b) => b.split('.').map(Number);
 const buildAtLeast = (b, min) => { const [x, y] = [buildNo(b), buildNo(min)]; for (let i = 0; i < 3; i++) if (x[i] !== y[i]) return x[i] > y[i]; return true; };
 // The fixture set every build in CLICK_BUILDS must have; the two prefilled-dialog recordings exist from 2.1.323 on (2.1.322 has no such Claude Code behaviour to record).
 const REQUIRED = ['genuine-click', 'pretooluse-hook-answer', 'permissionrequest-hook-answer', 'model-prefilled-answers', 'preview-annotations', 'multiselect-click'];
 const requiredFor = (build) => (buildAtLeast(build, '2.1.323') ? [...REQUIRED, 'pretooluse-ask-prefill', 'pretooluse-fill-no-decision'] : REQUIRED);
-const OK = () => ({ ok: true, hookLayersSha256: null });
-const noSleep = async () => {};
 
-const mergeParts = (pr = 58, head = HEAD) => mergeAsk({ repo: REPO, pr, closing: mergeRequest(pr, head, ITEMS, REPO) });
 const roundParts = () => roundAsk({ repo: REPO, pr: 58, line: roundRequest(58, 4, GHEAD, REPO) });
 const rulingParts = () => rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1', 'R2-S3'], line: rulingRequest(58, ['R1-B1', 'R2-S3'], REPO, 'c0ffee000000') });
 const manyParts = () => mergeManyAsk({
@@ -43,53 +36,6 @@ const manyParts = () => mergeManyAsk({
   entries: [58, 59].map((pr) => ({ pr, lines: [`#${pr} head ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}`] })),
   ready: '🔀 Ready to merge #58, #59 — say "merge"',
 });
-
-// An ask file written by hand the way a copy of the lib minted outside the three commands would (R1-F4): any title, options and actions, a consistent dialog hash.
-function forgeAsk({ kind, repo, prs, header, title, block, options, actions, hookLayersSha256, home, issuedAt }) {
-  const askId = `ask-${'a1b2c3d4e5f6'}`;
-  mkdirSync(asksDir(home), { recursive: true });
-  const dialog = canonicalDialog({ question: `${title} (${askId})\n\n${block}`, header, multiSelect: kind === 'merge-many', options });
-  writeFileSync(join(asksDir(home), `${askId}.json`), `${JSON.stringify({ v: 1, askId, kind, repo, prs, dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(issuedAt).toISOString(), hookLayersSha256 })}\n`);
-  return { askId, questions: [dialog] };
-}
-
-// A world: a temp home, an issued ask and a transcript holding the fixture's entries rewritten to the ask's dialog and `answer` (default: the approving label). `tamper(dialog)` returns the dialog the
-// transcript shows instead of the issued one; `mutate({ prompt, use, result })` edits the entries (a metadata case); `fixture` picks the spike transcript; `write: false` leaves the transcript with
-// the prompt and the tool_use only (poll tests append the result themselves).
-function world(t, { parts = mergeParts(), answer = null, fixture = 'genuine-click', build = OLDEST, tamper = null, mutate = null, hookLayersSha256 = null, issueBeforeUseMs = 10000, write = true, forge = false } = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'owner-go-click-'));
-  const entries = loadFixture(fixture, build);
-  const [prompt, use, result] = entries;
-  // a recording the script made by keys or a hook was answered in under 2 s: move the answer to 30 s so that the 2 s floor is never what a case proves (mutate may still set its own time)
-  if (Date.parse(result.timestamp) - Date.parse(use.timestamp) < MIN_ANSWER_MS) result.timestamp = new Date(Date.parse(use.timestamp) + 30000).toISOString();
-  const issuedAt = Date.parse(use.timestamp) - issueBeforeUseMs;
-  const issued = forge ? forgeAsk({ ...parts, hookLayersSha256, home, issuedAt }) : issueAsk({ ...parts, hookLayersSha256, home, now: () => issuedAt });
-  assert.ok(issued.askId, `issue failed: ${JSON.stringify(issued)}`);
-  const dialog = tamper ? tamper(structuredClone(issued.questions[0])) : issued.questions[0];
-  const chosen = answer ?? Object.keys(parts.actions).find((l) => parts.actions[l] !== null);
-  const block = use.message.content.find((b) => b.type === 'tool_use');
-  block.input = { questions: [dialog] };
-  const stamped = typeof result.toolUseResult === 'object' && result.toolUseResult !== null ? result.toolUseResult : {}; // (the rejected spike's result is a string)
-  result.toolUseResult = { ...stamped, questions: [structuredClone(dialog)], answers: { [dialog.question]: chosen } };
-  if (!('annotations' in stamped)) delete result.toolUseResult.annotations;
-  result.message.content[0].content = `Your questions have been answered: "${dialog.question}"="${chosen}". You can now continue with these answers in mind.`;
-  mutate?.({ prompt, use, result, dialog });
-  const cfg = join(home, '.claude-click-test');
-  mkdirSync(join(cfg, 'projects', '-repo'), { recursive: true });
-  const file = join(cfg, 'projects', '-repo', 't.jsonl');
-  const text = (es) => `${es.map((e) => JSON.stringify(e)).join('\n')}\n`;
-  writeFileSync(file, text(write ? [prompt, use, result] : [prompt, use]));
-  const answeredAt = Date.parse(result.timestamp);
-  const w = {
-    home, file, issued, askId: issued.askId, dialog, prompt, use, result, session: use.sessionId, toolUseId: block.id, answeredAt, issuedAt, text,
-    now: () => answeredAt + 1000,
-    input: { hook_event_name: 'PostToolUse', tool_name: 'AskUserQuestion', session_id: use.sessionId, transcript_path: file, cwd: '/work/app', tool_use_id: block.id, tool_input: { questions: [dialog] }, tool_response: {} },
-  };
-  w.click = (over = {}, input = {}) => recordClick({ ...w.input, ...input }, { home, now: w.now, sleep: noSleep, hookCheck: OK, ...over });
-  w.records = () => { try { return readFileSync(join(ownerGoDir(home), `${w.session}.jsonl`), 'utf8').trim().split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { return []; } };
-  w.gap = (over = {}) => approvalGap({ repo: REPO, pr: 58, head: HEAD, items: ITEMS, areas: [], home, now: w.now, ...over });
-  return w;
-}
 
 // ---- the happy paths, through every consumer --------------------------------------------------------------------------------------------
 
