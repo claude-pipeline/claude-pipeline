@@ -1276,14 +1276,18 @@ export function waitBlockers(gh, { base = null, exemptHold = false } = {}) {
 // Polls until the PR is MERGED, CLOSED, or the deadline passes. Transient gh errors are tolerated (a flaky call must
 // not lose a 15-minute wait) but three in a row surface as 'error'. With `blockers`, every poll of a still-OPEN PR asks
 // it for problems and a non-empty answer ends the wait as 'blocked' (the caller disables auto-merge).
+// A 'timeout' also says whether the LAST read of the PR worked (`readOk`): a zero wait that fails once is a timeout, not an 'error', so only this field
+// tells a caller whether the PR was ever seen (and its blockers checked).
 export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sleep = defaultSleep, blockers = null }) {
   const deadline = now() + waitMs;
   const fields = ['state', 'mergeCommit', ...(blockers ? ['labels', ...(blockers.fields ?? [])] : [])];
   let errors = 0;
+  let readOk = false;
   for (;;) {
     try {
       const view = gh.prView(pr, fields);
       errors = 0;
+      readOk = true;
       if (view.state === 'MERGED') return { state: 'merged', mergeSha: await readMergeSha({ gh, pr, first: view.mergeCommit?.oid, sleep, pollMs }) };
       if (view.state === 'CLOSED') return { state: 'closed' };
       if (blockers) {
@@ -1297,10 +1301,11 @@ export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sle
       }
     } catch (err) {
       errors += 1;
+      readOk = false;
       if (errors >= MAX_CONSECUTIVE_ERRORS) return { state: 'error', error: String(err?.message ?? err) };
     }
     const left = deadline - now();
-    if (left <= 0) return { state: 'timeout' };
+    if (left <= 0) return { state: 'timeout', readOk };
     await sleep(Math.min(pollMs, left));
   }
 }
