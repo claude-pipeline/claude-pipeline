@@ -143,8 +143,9 @@ function ownWhere(stmt, from) {
   return text === 'TRUE' || /^(\d+) = \1$/.test(text) || text === '( TRUE )' ? 'true' : 'ok';
 }
 
-// every UPDATE/DELETE keyword of a statement that starts with it, or (WITH ...) found anywhere in it
-const dmlStarts = (words, kw) => (words[0] === kw ? [0] : words[0] === 'WITH' ? words.flatMap((w, i) => (w === kw ? [i] : [])) : []);
+// every UPDATE/DELETE keyword of a statement that starts with it, or (WITH ...) found anywhere in it; a word after FOR / KEY (locking clause),
+// DO (upsert action) or THEN (MERGE action) is part of a statement, not the start of one
+const dmlStarts = (words, kw) => (words[0] === kw ? [0] : words[0] === 'WITH' ? words.flatMap((w, i) => (w === kw && !['FOR', 'KEY', 'DO', 'THEN'].includes(words[i - 1]) ? [i] : [])) : []);
 
 export function describeSql(sql) {
   const tok = tokenizeSql(sql);
