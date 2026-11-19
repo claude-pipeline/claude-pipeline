@@ -443,3 +443,110 @@ test('linkDeferredFollowups: a finding raised again takes the open follow-up iss
   assert.equal(linkDeferredFollowups([again], [deferred()])[0], again);
   assert.equal(linkDeferredFollowups([again], [{ ...item({ fingerprint: 'fp-r2' }), followupIssue: 'https://github.com/a/b/issues/9' }])[0], again);
 });
+
+// ---- cap-low deferral (review.cap_low_accepts): the last allowed round accepted only low fixes nobody built, so they become follow-ups unapplied ----------------------------
+// Each case names the production failure it guards: a deferral that strands or merges the PR without issues, one that defers what must be reviewed, or one a PR can force.
+import { applyCapLowDeferral, capLowDeferral, capLowPolicy, claudeRulingRefusal as claudeRefusal, roundAdmission } from '../pipeline/lib/triage.mjs';
+import { issueBody } from '../pipeline/commands/followups.mjs';
+import { requiredStateVersion } from '../pipeline/lib/state.mjs';
+
+const BASE = { risk: { high_risk_paths: ['src/payroll/**'] }, review: { arbiter_always_paths: [], max_rounds: 1 } };
+const unbuilt = (over = {}) => item({ implemented: false, implementedAfterRound: undefined, round: 1, ...over });
+// One counted round at max_rounds 1 holding the accepts nobody built.
+const capState = (items, over = {}) => ({ pr: 7, maxRounds: 1, currentContentHash: HASH, rounds: [round(1, items)], ...over });
+const cap = (state, over = {}) => capLowDeferral(state, { config: CONFIG, baseConfig: BASE, files: FILES, grants: () => [], grantGap: () => 'none', policy: 'defer', ...over });
+const capped = (state) => ({ ...state, rounds: state.rounds.map((r) => ({ ...r, items: r.items.map((i) => (i.final?.decision === 'ACCEPT' ? applyCapLowDeferral(i, { max: 1, at: '2026-11-19T00:00:00Z' }) : i)) })) });
+const filedOf = (state) => ({ ...state, rounds: state.rounds.map((r) => ({ ...r, items: r.items.map((i) => (i.final?.postMax ? { ...i, followupIssue: 'https://github.com/o/r/issues/9' } : i)) })) });
+
+test('cap-low: a low-only last round defers; the review is held until the issues are filed, then reads clean, and the Rulings row says it was NOT fixed', () => {
+  const a = unbuilt();
+  const b = unbuilt({ category: 'docs', file: 'src/a.js' });
+  const state = capState([a, b]);
+  const v = cap(state);
+  assert.deepEqual([v.apply, v.ids, v.refusals], [true, [a.id, b.id], []]);
+  const after = capped(state);
+  const f = after.rounds[0].items[0].final;
+  assert.deepEqual([f.decision, f.by, f.needsHuman, f.postMax.rule, f.postMax.ordinal, f.postMax.max, f.postMax.from], ['FOLLOW-UP', 'judge', false, 'cap-low', 1, 1, 'ACCEPT']);
+  assert.match(reviewEligibilityProblems(after).join(';'), new RegExp(`post-limit follow-up\\(s\\) without a filed issue: ${a.id}, ${b.id}`), 'stranded: merge would pass with no issue');
+  assert.equal(roundOutcome({ ...filedOf(after), currentContentHash: HASH }).clean, true);
+  assert.deepEqual(reviewEligibilityProblems(filedOf(after)), []);
+  assert.match(rulingsInventory(after).rows[0], /why: accepted by judge in round 1 at limit 1; deferred unapplied, NOT fixed in this merge; issue not filed yet$/);
+  assert.match(rulingsInventory(filedOf(after)).rows[0], /issue #9$/);
+  assert.equal(requiredStateVersion(after), 6, 'v6-v8 readers load it');
+});
+
+test('cap-low: a state without the rule keeps its Rulings row text byte for byte (the digest an older install wrote stays valid)', () => {
+  const old = item({ implemented: false, final: { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later', postMax: { from: 'ACCEPT', by: 'judge', ordinal: 4, max: 3 } } });
+  const row = rulingsInventory({ rounds: [round(4, [old])] }).rows[0];
+  assert.match(row, /why: accepted by judge in round 4 past limit 3; NOT fixed in this merge; issue not filed yet$/);
+});
+
+test('cap-low: one non-low accept, or anything else open, defers nothing (the extra round reviews the fixes as before)', () => {
+  const low1 = unbuilt();
+  const cases = {
+    'a BLOCKING accept': [low1, unbuilt({ bucket: 'BLOCKING', category: 'bug', file: 'src/a.js' })],
+    'a bug category': [low1, unbuilt({ category: 'bug', file: 'src/a.js' })],
+    'a sensitive path only the trusted list has': [unbuilt({ file: 'src/payroll/x.js' })],
+    'an accepted BLOCKING in the same file': [low1, unbuilt({ bucket: 'BLOCKING', category: 'bug', file: low1.file })],
+    'a pending item': [low1, unbuilt({ final: undefined })],
+    'a needs-human item': [low1, unbuilt({ final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, reason: 'x' } })],
+    'a Claude-ruled accept': [unbuilt({ final: { decision: 'ACCEPT', by: 'claude', needsHuman: false, reason: 'x', claude: { cause: 'low-confidence' } } })],
+    'a forced accept': [unbuilt({ final: { decision: 'ACCEPT', by: 'claude', forcedBy: 'second-review', needsHuman: false, reason: 'x' } })],
+    'an owner-ruled accept': [unbuilt({ final: { decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'x', ownerQuote: 'do it' } })],
+    'a test-evidence accept': [unbuilt({ final: { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'x', evidence: 'test' } })],
+    'a cached unbuilt accept': [low1, unbuilt({ final: { decision: 'ACCEPT', by: 'cache', needsHuman: false, reason: 'x' } })],
+    'an accept already built': [unbuilt({ implemented: true })],
+    'a settle-testable dismissal': [low1, unbuilt({ bucket: 'BLOCKING', category: 'bug', file: 'src/a.js', implemented: false, judge: { disputedBug: true, settleTest: { possible: true } }, final: { decision: 'REJECT', by: 'judge', needsHuman: false, reason: 'no' } })],
+  };
+  for (const [name, items] of Object.entries(cases)) {
+    const v = cap(capState(items));
+    assert.equal(v.apply, false, name);
+    assert.ok(v.refusals.length > 0, name);
+  }
+  // the PR lowered its own round limit to reach the lever (the trusted default branch says 3)
+  assert.match(cap(capState([low1]), { baseConfig: { ...BASE, review: { ...BASE.review, max_rounds: 3 } } }).refusals.join(';'), /round limit \(1\) is lower than the default branch's \(3\)/);
+  assert.equal(cap(capState([low1]), { baseConfig: null }).apply, false, 'the trusted config unreadable');
+});
+
+test('cap-low: only exactly at the limit; an unreadable hash, an under-limit or an over-limit state refuses', () => {
+  const x = unbuilt();
+  assert.equal(cap(capState([x], { maxRounds: 2 })).apply, false, 'reviewed < max');
+  assert.equal(cap({ ...capState([x]), rounds: [round(1, [item({ id: 'R1-S0', file: 'src/a.js' })]), round(2, [{ ...x, round: 2 }])] }).apply, false, 'reviewed > max');
+  assert.equal(cap({ ...capState([x]), rounds: [round(1, [x], { contentHashAtToHead: '' })] }).apply, false);
+  assert.equal(cap(capState([x]), { policy: 'extra-round' }).apply, false);
+});
+
+test('cap-low: the owner\'s typed extra round wins (any head), and a lookup that fails or cannot be confirmed refuses', () => {
+  const s = capState([unbuilt()]);
+  assert.match(cap(s, { grants: () => [{ grantId: 'g1', head: 'b'.repeat(40), quote: 'extra round' }] }).refusals.join(';'), /owner granted extra round 2 \(unspent\)/);
+  assert.match(cap(s, { grants: () => { throw new Error('records unreadable'); } }).refusals.join(';'), /could not be read \(records unreadable\)/);
+  assert.match(cap(s, { grantGap: () => 'provenance' }).refusals.join(';'), /cannot be confirmed as typed by the owner/);
+});
+
+test('cap-low: the policy is on only when EVERY config says defer (a PR can switch it off, never on)', () => {
+  const on = { review: { cap_low_accepts: 'defer' } };
+  const off = { review: { cap_low_accepts: 'extra-round' } };
+  assert.deepEqual([capLowPolicy([on, on]), capLowPolicy([on, off]), capLowPolicy([off, on]), capLowPolicy([on, null]), capLowPolicy([on, {}]), capLowPolicy([])], ['defer', 'extra-round', 'extra-round', 'extra-round', 'extra-round', 'extra-round']);
+});
+
+test('cap-low: after a deferral an extra round needs the owner; Claude can tighten back to ACCEPT, and once built the extra round is automatic', () => {
+  const s = capped(capState([unbuilt()]));
+  const id = s.rounds[0].items[0].id;
+  assert.match(roundAdmission(s, 2, {}).problem ?? '', /would pass review.max_rounds/, 'no automatic round: the state is clean');
+  const it = s.rounds[0].items[0];
+  assert.equal(claudeRefusal(it, 'ACCEPT'), null);
+  assert.match(claudeRefusal(it, 'REJECT') ?? '', /not waiting for a human decision/, 'Claude may only tighten');
+  const tightened = applyClaudeRuling(it, { decision: 'ACCEPT', reason: 'owner asked for the fix', ruledAt: '2026-11-19T01:00:00Z' });
+  assert.equal(tightened.final.claude.overruled.postMax.rule, 'cap-low');
+  const built = { ...s, rounds: [round(1, [{ ...tightened, followupIssue: 'https://github.com/o/r/issues/9' }])] };
+  assert.equal(roundOutcome({ ...built, currentContentHash: HASH }).extraRound, false, 'not built yet: the fix comes first');
+  built.rounds[0].items[0].implemented = true;
+  const o = roundOutcome({ ...built, currentContentHash: HASH });
+  assert.deepEqual([o.extraRound, o.newAccepted], [true, [id]]);
+  assert.equal(roundAdmission(built, 2, {}).admission, 'auto-extra');
+});
+
+test('cap-low: the follow-up issue says the fix was deferred unapplied and is not in the PR', () => {
+  const it = capped(capState([unbuilt()])).rounds[0].items[0];
+  assert.match(issueBody(it, 7), /The judge ACCEPTED a fix at the round limit; it was deferred unapplied \(review\.cap_low_accepts\); it is NOT in PR #7\./);
+});
