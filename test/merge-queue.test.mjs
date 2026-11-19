@@ -700,7 +700,8 @@ test('watchQueue progress: once GitHub stops showing the entry the beat says so,
   const c = clock();
   const { lines, log } = logger(c);
   const gh = withChecks(stubGh({ states: [() => queuedAt()(2), () => st()] }), { runs: [{ id: 1, name: 'ci', status: 'in_progress', conclusion: null }] });
-  await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 20 * MIN, pollMs: 90_000, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  const r = await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 20 * MIN, pollMs: 90_000, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.equal(r.position, null, 'the result does not carry the last position GitHub showed');
   const beats = lines.map((x) => x.l).filter((l) => /^PR #7 (queued|not visible)/.test(l));
   assert.ok(beats.length >= 2, beats.join('\n'));
   assert.ok(beats.every((l) => l === 'PR #7 not visible in the merge queue'), beats.join('\n'));

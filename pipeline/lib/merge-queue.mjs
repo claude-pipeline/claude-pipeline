@@ -566,6 +566,7 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     if (r.kind === 'removed') return { state: 'removed', removal: r.removal };
     if (r.kind === 'not-queued') { // not visible (yet): keep looking until the budget ends
       entry = null;
+      position = null;
       return null;
     }
     position = r.entry.position;
