@@ -258,3 +258,4 @@ full record.
 - 2026-11-17 · #561 · Load-proof guard timing tests and parallel ubuntu Node jobs (#477, #243) · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 16301 runs (15817 high)
 - 2026-11-19 · #626 · Round discipline 2, PR B2: issue the recommended-first round dialog; refused Follow up clicks stay refused (#613, #619) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 494 runs (130 high)
 - 2026-11-19 · #623 · Follow-ups from #536/#596: honest Tests-added count, escalation stats, revert and queue advice, no fake Codex usage rows · risk high · rounds 5 · arbiter 2 · awaiting-owner-merge · Codex 7d: 495 runs (130 high)
+- 2026-11-19 · #626 · Round discipline 2, PR B2: issue the recommended-first round dialog; refused Follow up clicks stay refused (#613, #619) · risk high · rounds 3 · arbiter 2 · awaiting-owner-merge · Codex 7d: 495 runs (130 high)
