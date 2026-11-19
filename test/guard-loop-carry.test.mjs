@@ -523,3 +523,38 @@ test('#362 R40-B1: an alias written and put back by an eval\'d text in a subshel
   denies('file-fed eval in a ( ) subshell', `${SET_STATUS}; ( eval "$(cat f.sh)" ); git ship`, { 'f.sh': `${SHIP}\nexit 0\n${SET_STATUS}\n` }, ALIAS);
   allows('file-fed eval in a ( ) subshell that writes no alias', `${SET_STATUS}; ( eval "$(cat f.sh)" ); git ship`, { 'f.sh': 'echo hi\nexit 0\n' });
 });
+
+// #615: a change made in a loop over literal words was kept as "surely ran" at the end of a text, but a body that leaves early (break / continue / return / exit) never reaches its cd or switch. Nothing a loop did is
+// handed on as certain once the loop's level is left; only the command chained to the change inside the body (`cd d && git push`) sees it.
+test('#615: a loop over literal words that exits early before its cd / switch does not move the directory or branch the later commands are judged in', () => {
+  // (the start directory /work/other is a repository on main, /work/repo is on agent/x: a bare push judged in /work/repo is allowed, in the start directory it is refused)
+  const at = (cmd, files = {}) => evaluateGitCommand(cmd, {
+    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p,
+    ...fakeFs('/work/other', { [`${GIT_ROOT}/.keep`]: '', ...files }),
+  });
+  const push = `${PB} origin HEAD`;
+  for (const [what, line] of [
+    ['break', `for d in a; do break; cd ${GIT_ROOT}; done; ${push}`],
+    ['continue', `for d in a; do continue; cd ${GIT_ROOT}; done; ${push}`],
+    ['exit in the body', `for d in a; do exit 1; cd ${GIT_ROOT}; done; ${push}`],
+    ['exit in a subshell of the body', `for d in a; do ( exit 0; cd ${GIT_ROOT} ); cd ${GIT_ROOT}; done; ${push}`],
+    ['return in a function', `f() { for d in a; do return; cd ${GIT_ROOT}; done; }; f; ${push}`],
+    ['break, the push chained to the loop', `for d in a; do break; cd ${GIT_ROOT}; done && ${push}`],
+    ['break, the loop as the last command of a group', `{ for d in a; do break; cd ${GIT_ROOT}; done; }; ${push}`],
+  ]) {
+    const r = at(line);
+    assert.equal(r.decision, 'deny', `${what}: allowed`);
+    assert.match(r.reason, DIRS, `${what}: ${r.reason}`);
+    const s = at('bash ./s.sh', { 's.sh': `#!/bin/bash\n${line}\n` });
+    assert.equal(s.decision, 'deny', `${what}, in a script: allowed`);
+  }
+  // (a script that ends in such a loop hands nothing on to a push in another repository: the walk cannot tell the switch ran, so every branch is unknown afterwards)
+  for (const body of ['for d in a; do break; git switch agent/x; done', 'for d in a; do git switch agent/x; done']) {
+    const r = at(`bash ./s.sh; git -C ${GIT_ROOT} ${PUSH} origin HEAD`, { 's.sh': `#!/bin/bash\n${body}\n` });
+    assert.equal(r.decision, 'deny', `a script ending in \`${body}\`, then a push elsewhere: allowed`);
+    assert.match(r.reason, BRANCH, r.reason);
+  }
+  // (twin: the same push in the same loop, in the iteration where the cd really ran, is judged in /work/repo: allowed)
+  assert.equal(at(`for d in a; do cd ${GIT_ROOT} && ${push}; done`).decision, 'allow', 'cd && push inside the body');
+  assert.equal(at(`cd ${GIT_ROOT} && ${push}`).decision, 'allow', 'cd && push, no loop');
+});
