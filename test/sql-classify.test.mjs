@@ -63,6 +63,12 @@ test('describeSql: only the own WHERE of the statement counts, not one inside a 
   assert.deepEqual(flags('delete from t where id in (select id from u where u.x = 1)'), []);
   assert.deepEqual(flags('update t set x = 1 where id = 2'), []);
   assert.deepEqual(flags('with s as (select 1 as id) update t set a = 1 where id in (select id from s)'), []);
+  // a locking clause, an upsert action and a MERGE action are not statements of their own
+  assert.deepEqual(flags('with p as (select id from t where id = 1 for update) select * from p'), []);
+  assert.deepEqual(flags('with p as (select id from t where id = 1 for no key update) select * from p'), []);
+  assert.deepEqual(flags('with s as (select id from u where x = 1) insert into t select id from s on conflict (id) do update set a = 1'), []);
+  assert.deepEqual(flags('with s as (select id from u where x = 1) merge into t using s on t.id = s.id when matched then update set a = 1'), []);
+  assert.deepEqual(flags('with s as (select id from u where x = 1) merge into t using s on t.id = s.id when matched then delete'), []);
   // scope that cannot be determined (unbalanced parentheses) warns rather than stays silent
   assert.deepEqual(flags('update t set a = (select 1 where true'), ['UPDATE-NO-WHERE']);
 });
