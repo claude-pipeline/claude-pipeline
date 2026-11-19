@@ -2229,7 +2229,7 @@ test('followups create: a rate limit on the issue POST that DID land is retried 
     { match: '^repo view', stdoutJson: REPO_VIEW },
     { match: '^api user', stdout: 'me\n' },
     // the lookup: empty the first time; the second time the issue the limited POST had actually created is there
-    { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=30 --paginate', sequence: [
+    { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100 --paginate', sequence: [
       { stdout: '[]' },
       { stdoutJson: [{ number: 11, html_url: url, state: 'open', body: `${marker}\nbody`, user: { login: 'me' } }] },
     ] },

@@ -228,7 +228,7 @@ test('waitForMerge: zero wait looks exactly once; transient errors are tolerated
 });
 
 test('waitForMerge: with a log, one "waiting" line per heartbeat (not per poll) naming the PR state; same number of reads; no log, no extra field', async () => {
-  const open = () => Array.from({ length: 200 }, () => ({ state: 'OPEN', mergeStateStatus: 'BLOCKED' }));
+  const open = () => Array.from({ length: 200 }, () => ({ state: 'OPEN' }));
   const quiet = fakeGh(open());
   await waitForMerge({ gh: quiet, pr: 12, waitMs: 20 * 60_000, pollMs: 10_000, ...clock() });
   const gh = fakeGh(open());
@@ -236,9 +236,9 @@ test('waitForMerge: with a log, one "waiting" line per heartbeat (not per poll) 
   const r = await waitForMerge({ gh, pr: 12, waitMs: 20 * 60_000, pollMs: 10_000, log: (l) => lines.push(l), ...clock() });
   assert.equal(r.state, 'timeout');
   assert.equal(lines.length, 5, 'beats at 4, 8, 12, 16 and 20 min of a 20-minute wait, not one per 10-s poll');
-  assert.equal(lines[0], 'PR #12 waiting for merge 4 min: OPEN, merge state BLOCKED');
+  assert.equal(lines[0], 'PR #12 waiting for merge 4 min: OPEN');
   assert.equal(gh.calls.length, quiet.calls.length, 'the log adds no reads');
-  assert.ok(gh.calls[0].fields.includes('mergeStateStatus') && !quiet.calls[0].fields.includes('mergeStateStatus'));
+  assert.deepEqual(gh.calls[0].fields, quiet.calls[0].fields, 'the log adds no field to the read');
 });
 
 test('waitForMerge: a blocker found on an OPEN poll ends the wait at once; MERGED is never second-guessed', async () => {
