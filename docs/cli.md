@@ -271,7 +271,7 @@ book tokens / USD / retries of one agent call in the run record (shown by `P sum
 pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|verifier|controller|other
               [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]
   -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable
-  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);
+  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped);
   explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
   --round R: the review round the call served (judge or arbiter of round R, and the implementer that fixes round R's accepts); the entry is also added to cost.byRound[R],
   which the extra-round ask uses to name what the last round cost. Build-phase calls pass none.
@@ -368,7 +368,7 @@ Exit: 0 ok or overridden by `test-change-approved` · 1 violations · 2 usage / 
 run a long command detached (start), poll it (wait), or read its state (read).
 
 ```
-pipeline job start [--repo DIR] [--tag TAG] NAME -- CMD...   -> {ok, name, jobDir, pid, runId, tag}; exit 1 {ok:false, refused:true, reason} when a guard denies CMD
+pipeline job start [--repo DIR] [--tag TAG] NAME -- CMD...   -> {ok, name, cwd, jobDir, pid, runId, tag} (cwd = the directory the command runs in: --repo, else the current one); exit 1 {ok:false, refused:true, reason} when a guard denies CMD
   --tag TAG: what the job is about (default: the repo HEAD sha); keep the returned runId and hand it to wait/read as --run-id
 pipeline job wait  [--repo DIR] [--run-id ID] NAME [--timeout SEC]   (default 540, max 570) -> {ok, name, state, tag, runId, exitCode?, tail}
 pipeline job wait  [--repo DIR] [--run-id ID] --until-done [--max-minutes M] NAME   (M default 60, max 120) -> same shape; BACKGROUND ONLY (Bash run_in_background): a foreground call is killed at 600 s,
