@@ -16,6 +16,7 @@ import {
 } from '../pipeline/lib/run-record.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { transcriptUsage } from '../pipeline/commands/cost.mjs';
+import { UsageError } from '../pipeline/lib/cli.mjs';
 
 const NOW = Date.parse('2026-10-14T10:00:00Z');
 const rec = () => emptyRecord({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main' });
@@ -152,7 +153,7 @@ test('transcriptUsage: a transcript that is not on disk yet is read again a few 
   const never = [];
   assert.throws(
     () => transcriptUsage(join(dir, 'missing.jsonl'), dir, undefined, { sleep: (ms) => never.push(ms), tries: 4, delayMs: 500 }),
-    (err) => err.name === 'UsageError' && /cannot read .*missing\.jsonl \(ENOENT\)/.test(err.message) && /not be on disk yet/.test(err.message) && /4 tries/.test(err.message),
+    (err) => err instanceof UsageError && /cannot read .*missing\.jsonl \(ENOENT\)/.test(err.message) && /not be on disk yet/.test(err.message) && /4 tries/.test(err.message),
   );
   assert.equal(never.length, 3, 'tries - 1 waits, never after the last look');
 });
