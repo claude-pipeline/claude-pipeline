@@ -45,7 +45,7 @@ Details of steps 2–5: `reference/build.md`.
 2. ONE `implementer` dispatch builds the whole change (tasks in order, tests first, `verify.quick`, the commit trailer, "return immediately when done"); more only for a big change; continue THE SAME agent before a fresh dispatch.
 3. `verify.quick` after each dispatch and before every push; red ⇒ implementer, max 3 fix cycles, then stop (outcome `blocked`).
 4. Draft PR: `git push -u origin agent/<slug>`, `gh pr create --draft`; body opens with `## In plain English`; one keyword per issue (`Closes #170. Closes #171.`). Then book every call made before the PR existed, e.g. the build implementer (`reference/cost-booking.md`).
-5. `mkdir -p .review`, then `P risk`, `P hardstops > .review/hardstops.json` and `P integrity` on the real diff; note any `blocking` / `ownerMerge` item or integrity violation (3.3 depends on it). The review runs either way.
+5. `mkdir -p .review`, then `P risk --base origin/<default_branch> --head HEAD`, `P hardstops --base origin/<default_branch> --head HEAD > .review/hardstops.json` and `P integrity --base origin/<default_branch> --head HEAD` on the real diff (all three require `--base` and `--head`); note any `blocking` / `ownerMerge` item or integrity violation (3.3 depends on it). The review runs either way.
 
 ## 2. Review rounds (max `review.max_rounds`, plus the one extra round `P state outcome` calls `extraRound`, plus one per owner `extra round`)
 
@@ -64,7 +64,7 @@ Round `R`; `P codex-review` itself refuses any other round (`round-cap`). The ol
 Full text: `reference/ready-and-handoff.md`: read it before step 1 (the verdicts, `update-branch`, queue mode (never merge the default branch in unless the PR is CONFLICTING), the conflict-merge rule, the freeze after a clean review and the merge holds are only there).
 
 1. `P review-complete --pr N` (HEAD pushed). Exit 1 ⇒ read `reason` and go back to the round it names.
-2. Only after exit 0: if the head changed since 1.5 ran (any review fix), re-run 1.5 (`P risk`, `P hardstops`, `P integrity`) on it first; high risk (1.5's `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured); then `gh pr ready N`, then CI via `P job start ci -- node ~/.claude/pipeline/bin/pipeline.mjs ci-wait --pr N` (never `gh pr checks --watch`); verdicts, `update-branch`, queue mode and merge holds are in the reference.
+2. Only after exit 0: if the head changed since 1.5 ran (any review fix), re-run 1.5 (`P risk`, `P hardstops`, `P integrity`, each with `--base origin/<default_branch> --head HEAD`) on it first; high risk (1.5's `P risk`) ⇒ `gh pr edit N --add-label <ci.e2e_label>` (if configured); then `gh pr ready N`, then CI via `P job start ci -- node ~/.claude/pipeline/bin/pipeline.mjs ci-wait --pr N` (never `gh pr checks --watch`); verdicts, `update-branch`, queue mode and merge holds are in the reference.
 3. **STOP** (outcome `awaiting-owner-merge`): stop ritual, tell the owner in plain English what changed, the PR link, the review outcome and follow-ups; read `reference/owner-merge.md` (3.3) and end the reply exactly as it says. The closing lines look like:
    `Head <sha12> · items <digest> · repo <owner/name>`
    `🔀 Ready to merge #N — say "merge"`
