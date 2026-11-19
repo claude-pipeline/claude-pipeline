@@ -141,6 +141,7 @@ No guard change expected; the agent still cannot run `gh pr merge` or edit label
 ## Block order and a Hold line (PR 2 decision)
 A `Hold` line follows the `Areas` pattern (canonical line directly above Head, digest in the record, compared in `approvalGap`) with one difference: a Hold-shaped
 line (canonical prefix `Hold <id> by `) that is not consumed exactly in the closing block binds NOTHING for the whole reply, where a stray Areas line only drops the areas.
+Exception (cp #585): an EARLIER line above the block that is the same text (ends trimmed of spaces and tabs only, no lone `\r`) as a Hold line the block consumed (its PR on the 🔀 line, bound once) is tolerated: a Hold line names one GitHub event, so an identical copy shows the owner the same event, and a re-shown request (the closing lines written again after a dialog) is not voided. The copy binds nothing itself; any other Hold-shaped line above the block still voids the reply.
 Block order, top to bottom: Areas (optional), Hold, Head, then the 🔀 line.
 
 ## As built (PR 2), changes from the text above

@@ -108,7 +108,7 @@ export function parseApproval(prompt) {
 // `items …` and `repo …`, and a canonical `Hold <id> by <login> at <ISO>` line (holdBlock) DIRECTLY above that Head line. Block order, top to bottom: Areas (optional),
 // Hold, Head; Areas binds above Head or above a Hold that sits above its Head. UNLIKE Areas, a Hold-shaped line (the canonical prefix `Hold <id> by `, HOLD_START; prose such as
 // "Hold on, …" is none) anywhere in the reply that is not consumed exactly so (prose between it and its Head, two in a row, against the 🔀 line, ahead of Areas, another PR's, an id
-// other than its Head's `hold` field, a malformed rest) makes the WHOLE reply bind nothing, and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated
+// other than its Head's `hold` field, a malformed rest) makes the WHOLE reply bind nothing (one exception, #585: an earlier line that is an identical copy of a Hold line the block consumed, see below), and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated
 // or after `repo` is no Head line at all. The record keeps the hold id and sha256 of the block (holdDigest). And a request with a hold binds only when the 🔀 line says it lifts the hold
 // (readyLine, LIFT_PHRASE) AND every request bound carries one (singular: the one PR; plural: all listed): the phrase with no hold in the bound requests, or a hold with no phrase, binds nothing.
 // Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas?, hold?, holdBlock? }] } (repo: the
@@ -190,6 +190,7 @@ export function presentedRequests(text) {
     if (!h && !a && !o) break;
     block.unshift({ h, a, o });
   }
+  const blockStart = i + 1; // (lines[blockStart + j] is block[j])
   // The rulings block, if any, sits directly above the Areas / Hold / Head lines: rows walked up while contiguous, then exactly one header. A run of rows with no header directly above, a
   // header with no rows, prose in between, or a second header / run above the one found binds nothing (rulings stay absent; the lines are then plain prose to every rule below).
   let rulings = null;
@@ -208,7 +209,9 @@ export function presentedRequests(text) {
   }
   if (rulings !== null && prs.length !== 1) return none(prs); // a rulings block belongs to ONE PR: with several on the 🔀 line the whole reply binds nothing
   if (i >= 0 && AREAS_START.test(lines[i])) return none(prs); // an Areas line of any other shape against the block: malformed
-  if (lines.slice(0, i + 1).some((l) => HOLD_START.test(l))) return none(prs); // a canonical-prefix Hold line outside the block (prose between it and its Head, an earlier block's): review note 6
+  // a canonical-prefix Hold line outside the block (prose between it and its Head, an earlier block's) voids the reply (review note 6), unless it is an identical copy of a Hold line the block consumed (#585, below)
+  const earlierHolds = lines.slice(0, i + 1).filter((l) => HOLD_START.test(l));
+  const holdsOf = []; // [{ pr, text }]: the Hold line above each Head line that carries one
   const bound = new Map();
   for (let j = 0; j < block.length; j++) {
     const { h } = block[j];
@@ -223,16 +226,25 @@ export function presentedRequests(text) {
       if (holdBlock(rebuilt) === '') return none(prs); // (the regex reads T / Z in any case; the block is canonical only in upper case)
       hasHold = rebuilt;
     }
+    const holdText = o ? lines[blockStart + j - 1] : null;
     const above = o ? block[j - 2]?.a ?? null : block[j - 1]?.a ?? null;
     if (above && (above[1] ?? null) !== (h[1] ?? null)) return none(prs); // another PR's Areas line
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
+    if (holdText !== null) holdsOf.push({ pr, text: holdText });
     const areas = above ? createHash('sha256').update(`Areas ${above[2].trim().split(/\s+/).join(' ')}`).digest('hex') : null;
     bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[5] ? h[5].toLowerCase() : null, ...(areas ? { areas } : {}), ...(rulings !== null ? { rulings } : {}), ...(hasHold ? { hold: hasHold.id, holdBlock: holdDigest(hasHold) } : {}) });
   }
   // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block; so is a Hold line no Head line right below takes.
   const takesHead = (j) => block[j + 1]?.h || (block[j + 1]?.o && block[j + 2]?.h);
   if (block.some((b, j) => (b.a && !takesHead(j)) || (b.o && !block[j + 1]?.h))) return none(prs);
+  // #585: a re-shown request (the closing lines written again, in the same turn) holds the Hold line twice. A Hold line names one GitHub event (node id, actor, time), so an earlier copy that is the SAME text as a Hold line
+  // the terminal block CONSUMED shows the owner the same event and changes nothing about what is approved; it binds nothing itself (only the terminal block binds). Consumed = the Hold line of a request that survives binding:
+  // its Head's PR is on the 🔀 line and bound exactly once (a Hold line next to an unlisted or duplicate PR's Head is not). Compared as exact text after stripping spaces and tabs at the ends (never trim(): a non-breaking
+  // space is not stripped), and a line with a lone \r (it redraws on a terminal) is never tolerated. Anything else above the block (another id, actor, time, prefix, case, spacing; a copy of nothing consumed) still voids the reply.
+  const trimmed = (l) => l.replace(/^[ \t]+|[ \t]+$/g, '');
+  const consumed = new Set(holdsOf.filter((x) => bound.get(x.pr)).map((x) => trimmed(x.text)));
+  if (earlierHolds.some((l) => l.includes('\r') || !consumed.has(trimmed(l)))) return none(prs);
   // rev 4 item 2a: a hold binds only under the lift wording, and the wording only when EVERY request bound carries a hold (singular: the one PR; plural: all listed). A Hold-bearing
   // Head line that binds nothing itself (a PR not on the 🔀 line, an unprefixed Head in the several-PR form, a duplicate) neither makes the wording legitimate nor forbids it.
   const requests = [...bound.values()].filter(Boolean);
