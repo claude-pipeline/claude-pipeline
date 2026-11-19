@@ -538,3 +538,29 @@ test('defaultResolved: exit 1 is "no override" only from a git that finished; a 
     assert.equal(defaultResolved('/x', res(patch)), null, JSON.stringify(patch));
   }
 });
+
+// Guard false-alarm batch, item 1: `sh ~/claude-memory/.setup/memory-commit.sh ...` (a 33-line script) was refused "the check took too long"
+// because every simple command re-read the repository's pipeline.yml in four committed refs (190 git spawns, 2.3 s of a 5 s deadline).
+test('ownerGoWiring reads a repository\'s configs once per wiring, not once per simple command; a failed read is not remembered', () => {
+  const root = mkdtempSync(join(tmpdir(), 'owner-go-memo-'));
+  mkdirSync(join(root, '.claude'), { recursive: true });
+  writeFileSync(join(root, '.git'), 'gitdir: x\n');
+  const CHAT = 'owner_approval: chat\nmerge:\n  command: npm run merge -- {pr} --expect-head {sha}\n';
+  writeFileSync(join(root, '.claude', 'pipeline.yml'), CHAT);
+  let shows = 0;
+  const counting = ownerGoWiring('sess', { gitShow: () => { shows++; return null; }, remotes: () => null });
+  const line = Array.from({ length: 30 }, (_, i) => `echo ${i}`).join('; ');
+  const v = evaluateGitCommand(line, { cwd: root, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo: counting });
+  assert.equal(v.decision, 'allow', v.reason);
+  assert.ok(shows <= 4, `git show ran ${shows} times for 30 commands in one repository (at most once per committed ref)`);
+  // deny control: the cached answer is still the chat one, so an unapproved merge on the same line is refused
+  const merge = evaluateGitCommand(`${line}; npm run merge -- 12 --expect-head ${H8}`, { cwd: root, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo: counting });
+  assert.equal(merge.decision, 'deny');
+  // a throwing read (an unreadable pipeline.yml) is not cached: the next question fails closed again, and recovers once the file reads
+  let broken = true;
+  const flaky = ownerGoWiring('sess', { readText: () => { if (broken) throw new Error('EACCES'); return CHAT; }, gitShow: () => null });
+  assert.throws(() => flaky.mode(root));
+  assert.throws(() => flaky.mode(root));
+  broken = false;
+  assert.equal(flaky.mode(root), 'chat');
+});
