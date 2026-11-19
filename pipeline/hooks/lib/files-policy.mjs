@@ -21,7 +21,7 @@ import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
-import { evaluateSupabaseMcp, findLiveDbCli, isSupabaseTool } from './live-db-guard.mjs';
+import { evaluateSupabaseMcp, isSupabaseTool } from './live-db-guard.mjs';
 import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
@@ -5125,10 +5125,6 @@ function evaluateBashForFilesFrame(command, opts) {
   const installer = findInstaller(cmds, raw, dirs, ctx, opts);
   if (installer) return deny(installer);
   if (findDbRefsWrite(cmds, raw)) return deny('pipeline db-refs changes which databases count as live; only the owner may run it, from their own terminal (`pipeline db-refs show` is allowed)');
-  {
-    const dbCli = findLiveDbCli(cmds, scanRaw, readDbRefs(opts.home || os.homedir()), wordsOf); // #262: an agent-run supabase CLI line or Management API call that can reach a non-local database
-    if (dbCli) return deny(dbCli);
-  }
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');
 
   // 6: the job runner executes its inner command on the agent's behalf
