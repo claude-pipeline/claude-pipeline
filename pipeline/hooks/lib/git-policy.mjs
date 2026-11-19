@@ -1223,7 +1223,15 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
       break;
     }
   }
-  if (texts.some((t) => DYNAMIC.test(t))) {
+  // (replay 11-19: `--title "cost +\$0.29"` / `--body "saw \`sh x.sh\` refused"` hold `$` / a backtick as escaped text: the shell parser's own fact, litWords, as for the GraphQL query below. The text must be exactly one
+  // word of this command's own, literal, and no word may have been changed by a variable the line set: a second word with the same text could be the expanded one)
+  const literalText = (t) => {
+    const w = ctx.ghWords;
+    if (!w || w.argv.some((x) => expandVars(x, ctx) !== x)) return false;
+    const holders = w.argv.filter((x) => x.endsWith(t));
+    return holders.length === 1 && w.lit?.has(holders[0]) === true;
+  };
+  if (texts.some((t) => DYNAMIC.test(t) && !literalText(t))) {
     return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the pipeline markers (review-complete, triage). Write the body to a file and pass --body-file with a literal name.');
   }
   for (const file of files) {
@@ -2502,14 +2510,19 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
     // Once even where the loop may not run (an empty list, `false && for …`): an unknown value already stands for any value, the one held before included.
     if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], computedLoopWord(c) === null ? 2 : 1);
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
+    // (`while read p; do ps -p $p; done`, replay 11-19: a plain `read NAME…` in a loop gives each name ONE value, only known at run time, like `P=$(cmd)`: counted once, so the value is judged where it lands
+    // (a command word, a script, a ref), as for the loop variable of `for p in $(cmd)` above. Any other form (`-a`, `-p`, `NAME?prompt`, `NAME[i]`) and the other binders stay unsure)
     if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
+      const plainRead = baseName(c.argv[0]) === 'read' && (c.loops?.length ?? 0) > 0 && c.argv.slice(1).every((a) => /^(?:-r|[A-Za-z_][A-Za-z0-9_]*)$/.test(a));
       for (const a of c.argv.slice(1)) {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(a);
-        if (m) bump(m[1], 2);
+        if (m) bump(m[1], plainRead ? 1 : 2);
       }
     }
     for (const k of implicitBindsOf(c)) implicit.add(k); // (`read` sets REPLY, `getopts` OPTARG, `[[ =~ ]]` MATCH, `k[0]=`, `$_` …: see implicitBindsOf)
-    for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
+    // (a prefix assignment, `PATH=x gh pr view 1`, sets the name in that command's own environment only (withPrefixEnv judges the command with it): it is no assignment of this shell,
+    // unless the command evaluates words in this shell or the line defines a function, which sees it, as before. Replay 11-19: `cd d && PATH=/opt/homebrew/bin:$PATH gh pr view 1` was refused)
+    if (!(c.argv.length > 0 && topLevelLocal && readsOnlyData(c))) for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
       // Why: -L / -R / -Z / -i change the value the text gives (width cut, arithmetic): unknown too. -l / -u are applied where the value is recorded; declared
