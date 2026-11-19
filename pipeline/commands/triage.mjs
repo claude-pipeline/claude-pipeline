@@ -1255,8 +1255,10 @@ async function capDefer(rest, ctx) {
       if (currentContentHash(root, config) !== last.contentHashAtToHead) return no('the tree is not at the content the last round reviewed: nothing was deferred');
       const { slug, host } = gh.repo();
       if (host !== 'github.com') return no(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded grants name a repository on github.com`);
-      // Decide once: a round the PR already holds was shown (and may have been acted on) with these accepts.
-      if (readPublished(gh, pr).state?.rounds?.some((r) => r.n === n)) return no(`round ${n} is already published with its accepts: they are not deferred after the fact`);
+      // Decide once: a round the PR already holds was shown (and may have been acted on) with these accepts. A comment of ours that cannot be decoded may hold any round: it refuses too.
+      const published = readPublished(gh, pr);
+      if (published.undecodable) return no('our newest triage comment on the PR cannot be read, so it is unknown which rounds were published: nothing was deferred');
+      if (published.state?.rounds?.some((r) => r.n === n)) return no(`round ${n} is already published with its accepts: they are not deferred after the fact`);
       // The owner's typed "extra round" wins at any head. STRICT lookups: a record that cannot be read refuses, it never reads as "no grant".
       const strict = ownerGrantLookups({ repo: slug, pr, home: ctx.home });
       const diff = reviewedDiff(root, config, state);
@@ -1265,6 +1267,9 @@ async function capDefer(rest, ctx) {
       if (trusted.problem) return no(`severity could not be judged: the trusted base config is unreadable (${asciiLine(trusted.problem, 160)})`);
       const verdict = capLowDeferral(state, { config, baseConfig: trusted.config, files: diff.files, grants: asGrants(strict.grants), grantGap: strict.grantGap, policy: capLowPolicy([config, trusted.config]) });
       if (!verdict.apply) return no(...verdict.refusals);
+      // The deferral rewrites every proposed accept, in whichever round it sits: one a published round already shows is not deferred after the fact (an unpublished later round does not change that).
+      const shown = (published.state?.rounds ?? []).flatMap((r) => (r.items ?? []).map((i) => i?.id)).filter((id) => verdict.ids.includes(id));
+      if (shown.length > 0) return no(`${shown.join(', ')} is already published with its accept: it is not deferred after the fact`);
       seedBaseline({ ctx, root, pr, state });
       const next = withStateVersion(capDeferItemsInState(state, verdict.ids, { max: state.maxRounds, at: new Date().toISOString() }), STATE_VERSION_POST_MAX);
       saveState(root, next);

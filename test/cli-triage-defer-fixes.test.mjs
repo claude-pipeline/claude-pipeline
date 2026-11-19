@@ -11,6 +11,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { cleanupAtExit, OWNER_ENTRY, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { aFile, findingsOf, low, roundWorld } from './helpers/round-world.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
+import { MARKERS } from '../pipeline/lib/render.mjs';
 import { run as triageRun } from '../pipeline/commands/triage.mjs';
 import { asksDir, issueAsk, roundAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
 
@@ -693,6 +694,31 @@ test('cap-defer: every refusal is exit 0 applied:false with the state untouched 
   assertExit(r, 1);
   assert.equal(r.json.error, 'identity-mismatch');
   assert.equal(wrong.stateText(), before);
+});
+
+test('cap-defer: a round already published is never deferred through a later unpublished round, and a triage comment that cannot be decoded counts as published (R1-B3, R1-F1)', (t) => {
+  // Failure caught: round 1's accept was shown on the PR, then an unpublished resolution-only round 2 lets cap-defer rewrite it to a FOLLOW-UP (the publish-sync rules cannot reconcile that); an edited, undecodable comment read as "not published".
+  const w = capWorld(t);
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  w.edit((s) => {
+    const r1 = s.rounds[0];
+    const extra = { ...r1.items[0], id: 'R2-S1', round: 2, title: 'Other idea', fingerprint: 'fp-r2', line: 7, file: 'src/a.js' };
+    s.rounds.push({ ...r1, n: 2, items: [extra], resolutionOnly: true, admission: undefined });
+  });
+  const before = w.stateText();
+  const r = capDefer(w, '2');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.applied, false);
+  assert.match(r.json.refusals.join(';'), /R1-S1 is already published with its accept/);
+  assert.equal(w.stateText(), before, 'state untouched');
+  const damaged = capWorld(t);
+  damaged.fake.addComment({ body: `${MARKERS.triage}\nnot a state` });
+  const damagedBefore = damaged.stateText();
+  const d = capDefer(damaged);
+  assertExit(d, 0, d.stderr + d.stdout);
+  assert.equal(d.json.applied, false);
+  assert.match(d.json.refusals.join(';'), /triage comment on the PR cannot be read/);
+  assert.equal(damaged.stateText(), damagedBefore, 'state untouched');
 });
 
 test('cap-defer: the owner\'s extra round (any head) wins, and a record whose provenance cannot be confirmed refuses (the real strict lookups)', (t) => {
