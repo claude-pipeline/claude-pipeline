@@ -14,7 +14,7 @@ import { HEAD, ITEMS, REPO, world } from './helpers/click-world.mjs';
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { STATE_VERSION_CLICK_DIALOG, SUPPORTED_STATE_VERSION, requiredStateVersion, withStateVersion } from '../pipeline/lib/state.mjs';
 import { clickLine } from '../pipeline/hooks/lib/owner-go-click-hook.mjs';
-import { issuedRoundVariant } from '../pipeline/lib/round-ask.mjs';
+import { issuedRoundVariant, roundDialogVariant } from '../pipeline/lib/round-ask.mjs';
 
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const LINE = roundRequest(58, 4, GHEAD, REPO);
@@ -225,15 +225,16 @@ test('a verified click on Follow up is an instruction: only the spent marker is 
   assert.deepEqual(w.records(), []);
 });
 
-test('Follow-up click, stale or superseded: an answer after the 24 h window is expired and a newer ask supersedes it; neither writes anything', async (t) => {
+test('Follow-up click, stale or superseded: an answer after the 24 h window is expired and a newer ask supersedes it; neither admits anything (since #613 each leaves only its refusal file, never a spent marker or a record)', async (t) => {
   // failure caught: a Follow-up click on a dialog the owner could no longer be looking at (a day old, or replaced by a newer ask) still counting
   const old = followWorld(t, { issueBeforeUseMs: 25 * 3600 * 1000 });
   assert.deepEqual(await old.click(), { refused: 'expired' });
-  assert.deepEqual(files(old.home), [`${old.askId}.json`]);
+  assert.deepEqual(files(old.home), [`${old.askId}.${clickIdOf(old)}.settled`, `${old.askId}.json`].sort(), 'was: only the ask file; now also the refusal #613 leaves');
   const w = followWorld(t);
   assert.ok(issueAsk({ ...parts('round-v2-follow-up'), home: w.home, now: () => w.issuedAt + 1000 }).askId);
   assert.deepEqual(await w.click(), { refused: 'superseded' });
   assert.equal(files(w.home).some((n) => n.endsWith('.spent')), false);
+  assert.deepEqual(w.records(), []);
 });
 
 test('fail-safe marker: a spent marker with no `instruction` for a Follow-up answer is `spent` (no record, no decline line); one whose answer is not that instruction is `spent`; an unknown instruction is `spent`', async (t) => {
@@ -414,9 +415,21 @@ test('hook lines: a Follow-up instruction says it is no grant and names defer-fi
   assert.equal(pend(undefined), pend('round-v2-extra-round'), 'legacy and the extra-round variant keep today\'s wording');
 });
 
-test('the lever and the issued variant: B1 issues the legacy dialog whatever the environment says; only the exact value "legacy" is read at all', () => {
-  // failure caught: B1 issuing a dialog the installed verifier on another machine cannot read yet (every ask stays round-v1 until B2)
-  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'legacy' }, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env }), 'round-v1');
+test('roundDialogVariant and the lever: the first option follows the summary\'s recommendation (a blocking loop wins, no recommendation and no loop is legacy); only the exact value "legacy" narrows', () => {
+  // failure caught: a dialog whose "(Recommended)" label disagrees with the summary's Recommended: line (e.g. a grant-first dialog after a display failure), or a lever that does not narrow / narrows on a near-miss
+  const loop = { blockingLoop: true };
+  const calm = { blockingLoop: false };
+  assert.equal(roundDialogVariant('follow-up', calm), 'round-v2-follow-up');
+  assert.equal(roundDialogVariant('follow-up', null), 'round-v2-follow-up');
+  assert.equal(roundDialogVariant('extra-round', calm), 'round-v2-extra-round');
+  assert.equal(roundDialogVariant('follow-up', loop), 'round-v2-park');
+  assert.equal(roundDialogVariant('extra-round', loop), 'round-v2-park');
+  assert.equal(roundDialogVariant(undefined, loop), 'round-v2-park', 'a display failure with a blocking loop still recommends stopping');
+  assert.equal(roundDialogVariant(undefined, calm), 'round-v1');
+  assert.equal(roundDialogVariant(undefined, null), 'round-v1', 'a display failure with no loop: the legacy dialog, no recommendation');
+  assert.equal(roundDialogVariant('park', calm), 'round-v1', 'an unknown recommendation is no recommendation');
+  assert.equal(issuedRoundVariant({ env: { PIPELINE_ROUND_DIALOG: 'legacy' }, recommend: 'follow-up', longReview: loop }), 'round-v1');
+  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env, recommend: 'follow-up' }), 'round-v2-follow-up');
 });
 
 test('followUpClickState: an older unreadable ask with a click stays unverified until a newer follow-up ask of the PR has a verified click after it, then the newer click decides', async (t) => {
@@ -483,4 +496,95 @@ test('followUpClickState: a follow-up click whose ask file became unreadable bef
     assert.equal(readAsk(other.askId, { home: other.home }).reason, 'invalid', JSON.stringify(over));
     assert.equal(followUpClickState({ repo: REPO, pr: 58, home: other.home, now: other.now }).state, 'none', `pr 58 is not blocked by an ask of ${JSON.stringify(over)}`);
   }
+});
+
+// ---- #613 a click refused at the hook leaves a refusal on record; #619 a refused / unreadable Follow up click outlives a newer ask -----------------------------------------------
+
+const readState = (w, over = {}) => followUpClickState({ repo: REPO, pr: 58, home: w.home, now: w.now, ...over });
+const tooFast = ({ use, result }) => { result.timestamp = new Date(Date.parse(use.timestamp) + 500).toISOString(); };
+
+test('#613 a Follow up click the hook refuses at once (too-fast) is on record as refused, so defer-fixes cannot read it as "no click"; nothing else is written and a retried hook repeats it', async (t) => {
+  // failure caught: an immediate-path refusal (e.g. an Enter under 2 s) returns before anything is written, followUpClickState answers `none`, and `triage defer-fixes` files the deferral without the owner's Follow up ever being verified
+  const w = followWorld(t, { mutate: tooFast });
+  assert.deepEqual(await w.click(), { refused: 'too-fast' });
+  const s = readState(w);
+  assert.deepEqual([s.state, s.askId, s.reason], ['refused', w.askId, 'too-fast']);
+  assert.match(s.note, /could not be verified \(too-fast\)/);
+  assert.deepEqual(files(w.home), [`${w.askId}.${clickIdOf(w)}.settled`, `${w.askId}.json`].sort(), 'only the refusal file: no spent marker, no pending pointer, no record');
+  assert.deepEqual(w.records(), []);
+  assert.deepEqual(JSON.parse(readFileSync(join(asksDir(w.home), `${w.askId}.${clickIdOf(w)}.settled`), 'utf8')).outcome, 'refused');
+  assert.deepEqual(await w.click(), { refused: 'too-fast' }, 'a retried hook: same refusal, the first record stands');
+  assert.equal(readState(w).state, 'refused');
+  assert.equal(readState(w, { now: () => w.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 }).state, 'none', 'outside the window a refusal no longer matters');
+  assert.equal(readAsk(w.askId, { home: w.home }).ok, true, 'the refusal consumes nothing');
+});
+
+test('#613 only a click on a Follow up dialog leaves a refusal: a refused click on another variant or a spent ask writes nothing', async (t) => {
+  // failure caught: the new write path turning every refused click into a file (an extra-round refusal blocking a deferral), or a second click on a spent ask overriding the verified first one
+  for (const variant of ['round-v2-extra-round', 'round-v2-park', 'round-v1']) {
+    const w = world(t, { parts: parts(variant), answer: variant === 'round-v2-extra-round' ? 'Yes, one more round (Recommended)' : 'Yes, one more round', mutate: tooFast });
+    assert.deepEqual(await w.click(), { refused: 'too-fast' });
+    assert.deepEqual(files(w.home), [`${w.askId}.json`], variant);
+  }
+  const w = followWorld(t);
+  assert.ok((await w.click()).instruction);
+  const again = await w.click({}, { tool_use_id: 'toolu_other' });
+  assert.ok(again.refused, JSON.stringify(again));
+  assert.equal(readState(w).state, 'instructed', 'the verified click stands over a later refused one');
+});
+
+test('#619 a refused or unreadable Follow up click stays in force across newer asks of the PR until a verified answer later than it (a grant, a decline, an instructed Follow up); an instructed click is still superseded', async (t) => {
+  // failure caught: the owner is asked again (a newer ask supersedes the old one), the newest ask has no click yet, and `triage defer-fixes` reads `none` and files the deferral the refused click never authorised
+  const w = pendingWorld(t, { mutate: tooFast });
+  assert.ok((await w.click()).pending);
+  w.flush(); w.settle();
+  assert.equal(w.state().state, 'refused');
+  const next = issueAsk({ ...parts('round-v2-follow-up'), home: w.home, now: () => w.answeredAt + 5000 });
+  const s = w.state();
+  assert.deepEqual([s.state, s.askId, s.reason], ['refused', w.askId, 'too-fast'], 'a newer ask with no answer: the refusal stands');
+  issueAsk({ ...parts('round-v2-extra-round'), home: w.home, now: () => w.answeredAt + 6000 });
+  assert.equal(w.state().state, 'refused', 'and so does a newer ask of another variant');
+  assert.equal(w.state({ now: () => w.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 }).state, 'none', 'outside the window it no longer matters');
+  // a verified answer LATER than the click, on a newer ask, lifts it: the state is that answer's own
+  const newest = issueAsk({ ...parts('round-v2-follow-up'), home: w.home, now: () => w.answeredAt + 7000 });
+  const answer = (id, ms, body) => writeFileSync(join(asksDir(w.home), `${id}.spent`), `${JSON.stringify({ v: 1, askId: id, clickId: 'c0ffee0000000000', toolUseId: 'toolu_next', dialogSha256: sha('next'), answeredAt: new Date(ms).toISOString(), ...body })}\n`);
+  answer(newest.askId, w.answeredAt + 20000, { declined: true, instruction: 'follow-up' });
+  const lifted = readState(w, { now: () => w.answeredAt + 30000 });
+  assert.deepEqual([lifted.state, lifted.askId], ['instructed', newest.askId]);
+  answer(newest.askId, w.answeredAt + 20000, { declined: false });
+  assert.equal(readState(w, { now: () => w.answeredAt + 30000 }).state, 'recorded', 'a recorded grant');
+  answer(newest.askId, w.answeredAt + 20000, { declined: true });
+  assert.equal(readState(w, { now: () => w.answeredAt + 30000 }).state, 'declined', 'a decline');
+  // ... but an answer that is not later than the refused click cannot stand in for it
+  answer(newest.askId, w.answeredAt - 1000, { declined: true, instruction: 'follow-up' });
+  assert.equal(readState(w, { now: () => w.answeredAt + 30000 }).state, 'refused', 'earlier than the refused click');
+  // an unreadable spent marker of a superseded ask is carried the same way
+  const u = followWorld(t);
+  await u.click();
+  writeFileSync(join(asksDir(u.home), `${u.askId}.spent`), 'not json');
+  issueAsk({ ...parts('round-v2-follow-up'), home: u.home, now: () => u.answeredAt + 5000 });
+  assert.equal(readState(u, { now: () => Date.now() }).state, 'unverified', 'a superseded ask whose click cannot be read stays unverified');
+  // the carried refusal is only the latest one: an instructed click on a superseded ask is ignored, as before
+  const i = followWorld(t);
+  await i.click();
+  issueAsk({ ...parts('round-v2-follow-up'), home: i.home, now: () => i.answeredAt + 5000 });
+  assert.equal(readState(i).state, 'none', 'an instructed click superseded by a newer ask is no longer in force');
+});
+
+test('#613 a standalone refusal still answers when its ask file became unreadable, or when its settledAt is missing or invalid', async (t) => {
+  // failure caught: the pointer-less refusal is only seen through a readable ask (or a valid settledAt), so a corrupted ask or refusal file turns "refused" into `none` and `triage defer-fixes` files the deferral without a typed follow-up
+  const w = followWorld(t, { mutate: tooFast });
+  assert.deepEqual(await w.click(), { refused: 'too-fast' });
+  const refusal = join(asksDir(w.home), `${w.askId}.${clickIdOf(w)}.settled`);
+  const original = readFileSync(refusal, 'utf8');
+  for (const settledAt of [undefined, 'invalid']) {
+    writeFileSync(refusal, `${JSON.stringify({ ...JSON.parse(original), settledAt })}\n`);
+    const s = readState(w);
+    assert.deepEqual([s.state, s.askId], ['refused', w.askId], `settledAt ${settledAt}: dated by the file's mtime, not dropped`);
+  }
+  writeFileSync(refusal, original);
+  writeFileSync(join(asksDir(w.home), `${w.askId}.json`), 'not json');
+  const s = readState(w);
+  assert.deepEqual([s.state, s.askId], ['unverified', w.askId], 'an unreadable ask with a refusal on record');
+  assert.equal(readState(w, { now: () => w.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 }).state, 'none', 'outside the window it no longer matters');
 });

@@ -274,38 +274,43 @@ test('triage round-request --ask: the question is the title and exactly the prin
   assert.equal(r.output.line, plain.output.line);
   const q = r.output.ask.questions[0];
   assert.equal(q.question, `One more review round for #${PR}? (${r.output.ask.askId})\n\n${r.output.line}`);
-  assert.deepEqual(q.options.map((o) => o.label), ['No', 'Yes, one more round']);
+  assert.equal(r.output.recommend, 'extra-round', 'the world has an open BLOCKING item');
+  assert.equal(r.output.dialogVariant, 'round-v2-extra-round');
+  assert.deepEqual(q.options.map((o) => o.label), ['Yes, one more round (Recommended)', 'No'], 'the recommended choice the summary names is the first option');
   assert.equal(presentedRoundRequest(q.question).pr, PR);
   assert.equal(readAsk(r.output.ask.askId, { home }).ask.kind, 'round');
 });
 
-test('triage round-request --ask: the issued ask is still the legacy one byte for byte (v 1, no variant key, dialogVariant round-v1) with and without PIPELINE_ROUND_DIALOG=legacy; a reader from before the variants takes it and refuses a v 2 ask', async () => {
-  // failure caught: B1 issuing an ask an installed pipeline on another machine (pre-variants readAsk: `a.v !== 1` refuses) cannot read, so the owner's click records nothing; or the lever changing what is issued
+test('triage round-request --ask: the recommended variant is issued (v 2) unless the lever is the exact string "legacy", which issues the legacy ask byte for byte (v 1, no variant key); a reader from before the variants refuses the v 2 ask', async () => {
+  // failure caught: the lever not narrowing to the legacy dialog (no way to roll back a misbehaving label), or a near-miss value (LEGACY, 1, empty) silently turning the new dialogs off; a legacy ask an installed pipeline on another machine cannot read, so the owner's click records nothing
   const s = triageWorld();
   const home = newHome();
   const KEYS = ['v', 'askId', 'kind', 'repo', 'prs', 'dialog', 'dialogSha256', 'actions', 'issuedAt', 'hookLayersSha256'];
   // the structural part of the readAsk predicate as it was before the variants (`a?.v !== 1` refuses); the installed-dialog check is not part of what this pins
   const oldReaderTakes = (a) => a?.v === 1 && typeof a.askId === 'string' && ['merge', 'merge-many', 'round', 'ruling'].includes(a.kind) && typeof a.repo === 'string' && Array.isArray(a.prs) && typeof a.actions === 'object' && typeof a.dialog === 'object' && typeof a.dialogSha256 === 'string' && typeof a.issuedAt === 'string';
   const fileOf = (askId) => JSON.parse(readFileSync(join(asksDir(home), `${askId}.json`), 'utf8'));
-  const issued = [];
-  let line;
-  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'legacy' }]) {
+  const issue = async (env) => {
     const r = await triageRun(['round-request', '--pr', String(PR), '--ask'], { cwd: s.repo.dir, env: { ...baseEnv(s), ...env }, home, managedPaths: [] });
     assert.equal(r.exitCode, 0, JSON.stringify(r.output));
-    assert.equal(r.output.dialogVariant, 'round-v1');
-    line = r.output.line;
-    const raw = fileOf(r.output.ask.askId);
-    assert.deepEqual(Object.keys(raw), KEYS, 'the legacy key set, in the legacy order');
-    assert.equal(raw.v, 1);
-    assert.equal(oldReaderTakes(raw), true, 'a pre-variants reader accepts what the lever and the default issue');
-    assert.deepEqual(r.output.ask.questions[0].options.map((o) => o.label), ['No', 'Yes, one more round']);
-    issued.push({ ...raw, askId: 'x', issuedAt: 'x', dialogSha256: 'x', dialog: { ...raw.dialog, question: raw.dialog.question.replace(raw.askId, 'x') } }); // (the id is in the question text and so in its hash)
+    return r.output;
+  };
+  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }]) {
+    const out = await issue(env);
+    assert.equal(out.dialogVariant, 'round-v2-extra-round', JSON.stringify(env));
+    const raw = fileOf(out.ask.askId);
+    assert.equal(raw.v, 2);
+    assert.equal(raw.variant, 'round-v2-extra-round');
+    assert.equal(oldReaderTakes(raw), false, 'a v 2 ask is what a pre-variants reader refuses (clean ask-invalid; typing still works)');
   }
-  assert.deepEqual(issued[0], issued[1], 'the lever changes nothing in what is issued');
-  const v2 = issueAsk({ ...roundAsk({ repo: 'acme/widgets', pr: PR, line, variant: 'round-v2-extra-round' }), home });
-  assert.ok(v2.askId, JSON.stringify(v2));
-  assert.equal(fileOf(v2.askId).v, 2);
-  assert.equal(oldReaderTakes(fileOf(v2.askId)), false, 'a v 2 ask is what a pre-variants reader refuses (so nothing issues one before the verifier is everywhere)');
+  const out = await issue({ PIPELINE_ROUND_DIALOG: 'legacy' });
+  assert.equal(out.dialogVariant, 'round-v1');
+  assert.equal(out.recommend, 'extra-round', 'the summary still names its recommendation; only the dialog is the old one');
+  const raw = fileOf(out.ask.askId);
+  assert.deepEqual(Object.keys(raw), KEYS, 'the legacy key set, in the legacy order');
+  assert.equal(raw.v, 1);
+  assert.equal(oldReaderTakes(raw), true, 'a pre-variants reader accepts what the lever issues');
+  assert.deepEqual(out.ask.questions[0].options.map((o) => o.label), ['No', 'Yes, one more round']);
+  assert.equal(readAsk(out.ask.askId, { home }).ok, true);
 });
 
 test('triage round-request --ask: label mode refuses as before (no ask); click off and an unapproved hook give ask null + askSkipped', async () => {
