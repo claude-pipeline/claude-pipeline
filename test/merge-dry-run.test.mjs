@@ -677,7 +677,17 @@ test('dry run, a low-risk review that holds a cap-low deferral (review.cap_low_a
     final: { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later', postMax: { from: 'ACCEPT', by: 'judge', ordinal: 1, max: 1, rule: 'cap-low', at: '2026-11-19T00:00:00.000Z' } },
   }];
   writeFileSync(file, JSON.stringify(state));
-  const d = dry(s);
+  // R1-B1. Failure caught: the deferral kept only the PREVIEW off the low-risk path while a plain `merge --pr N` (final gate, no approval flags) still merged the PR unattended: the gated route refuses it, and so does its dry run.
+  const plain = s.merge();
+  assert.equal(plain.json.error, 'cap-low-owner-go-only', `${plain.stderr}${plain.stdout}`);
+  assert.match(plain.json.reasons[0], /--dry-run --owner-go/);
+  assert.deepEqual(s.mergeCalls(), [], 'the merge command never ran');
+  const gated = dry(s);
+  assert.ok(kinds(gated.r).includes('cap-low-owner-go-only'), JSON.stringify(gated.r.json.blockers));
+  assert.equal(gated.r.json.ownerStep, null, 'no owner step on the gated route');
+  // the owner-go route carries the Rulings row for the deferral and ends at say-merge
+  const d = dry(s, ['--owner-go']);
   assert.notEqual(d.r.json.ownerStep, null, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.ownerStep.kind, 'say-merge');
+  assert.equal(d.r.json.ownerStep.rulingCount, 1);
 });

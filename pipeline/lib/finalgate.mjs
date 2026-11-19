@@ -24,7 +24,7 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { claudeRulingRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
+import { capLowItems, claudeRulingRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
 import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
@@ -982,6 +982,8 @@ export const areasOf = (lines) => [...new Set(lines.map((l) => String(l).split('
 //   * owner_approval: label  -> `P merge` refuses on EVERY route (substitute-label-mode): no label or flag clears it, the owner merges by hand;
 //   * the gated route and the queue sweep's gated recheck refuse (substitute-owner-go-only): they bind the items digest only, and the Areas line (which carries `substitute`)
 //     is what the owner is shown; only `--owner-go` binds it. That also keeps the PR out of any low-risk auto-merge (the gated route is the only one).
+// A cap-low deferral (triage.mjs#capLowItems: review.cap_low_accepts) is the same: the gated route and the queue sweep's gated recheck refuse (cap-low-owner-go-only), because only `--owner-go` binds the Rulings
+// block that lists the deferred rows and needs the owner's word for them; a PR holding one is never an unattended merge. (No label-mode refusal: the deferral exists only with owner_approval: chat.)
 // -> { error, reason } or null. `route`: 'gated' | 'owner-go'. An unreadable or absent state is no inventory here (the review checks fail it on their own).
 export function substituteRouteProblem({ root, config, pr, route }) {
   let state = null;
@@ -990,7 +992,13 @@ export function substituteRouteProblem({ root, config, pr, route }) {
   } catch {
     return null;
   }
-  if (!state || state.pr !== pr || substituteInventory(state).length === 0) return null;
+  if (!state || state.pr !== pr) return null;
+  if (substituteInventory(state).length === 0) {
+    if (route === 'gated' && capLowItems(state).length > 0) {
+      return { error: 'cap-low-owner-go-only', reason: `#${pr} holds an accepted fix that was deferred unapplied at the round limit (review.cap_low_accepts): it merges only on the owner's word for its Rulings block, so ask with \`pipeline merge --pr ${pr} --dry-run --owner-go\`, show the request it prints (Rulings block included), and merge with \`pipeline merge --pr ${pr} --owner-go\`` };
+    }
+    return null;
+  }
   if (config?.owner_approval === 'label') {
     return { error: 'substitute-label-mode', reason: `#${pr} was reviewed by a Claude stand-in while Codex was out of quota, and owner_approval is label: the owner merges this PR by hand (no approval flag or label clears it)` };
   }
