@@ -1276,14 +1276,22 @@ export function waitBlockers(gh, { base = null, exemptHold = false } = {}) {
 // Polls until the PR is MERGED, CLOSED, or the deadline passes. Transient gh errors are tolerated (a flaky call must
 // not lose a 15-minute wait) but three in a row surface as 'error'. With `blockers`, every poll of a still-OPEN PR asks
 // it for problems and a non-empty answer ends the wait as 'blocked' (the caller disables auto-merge).
-export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sleep = defaultSleep, blockers = null }) {
-  const deadline = now() + waitMs;
-  const fields = ['state', 'mergeCommit', ...(blockers ? ['labels', ...(blockers.fields ?? [])] : [])];
+// With `log`, every heartbeatMs of elapsed time one line says how long the PR has waited and what the poll just read (the PR state and its
+// mergeStateStatus: one more field on the same read, no extra call). Nothing is printed between beats.
+export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sleep = defaultSleep, blockers = null, log = null, heartbeatMs = 240_000 }) {
+  const startedAt = now();
+  const deadline = startedAt + waitMs;
+  const fields = ['state', 'mergeCommit', ...(log ? ['mergeStateStatus'] : []), ...(blockers ? ['labels', ...(blockers.fields ?? [])] : [])];
   let errors = 0;
+  let lastBeat = startedAt;
   for (;;) {
     try {
       const view = gh.prView(pr, fields);
       errors = 0;
+      if (log && view.state === 'OPEN' && now() - lastBeat >= heartbeatMs) {
+        lastBeat = now();
+        log(`PR #${pr} waiting for merge ${Math.floor((now() - startedAt) / 60_000)} min: ${view.state}${view.mergeStateStatus ? `, merge state ${view.mergeStateStatus}` : ''}`);
+      }
       if (view.state === 'MERGED') return { state: 'merged', mergeSha: await readMergeSha({ gh, pr, first: view.mergeCommit?.oid, sleep, pollMs }) };
       if (view.state === 'CLOSED') return { state: 'closed' };
       if (blockers) {

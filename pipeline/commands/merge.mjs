@@ -33,7 +33,7 @@ import { hashBranch } from '../lib/risk.mjs';
 // The default branch the gate resolved for its run (finalgate.mjs#evaluateGate's trustedBranch), recorded in the gate file; absent (an older gate file) -> undefined, so the hash helper works it out.
 const trustedBranchOf = (gate) => (typeof gate?.trustedBranch === 'string' && gate.trustedBranch !== '' ? gate.trustedBranch : undefined);
 import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, predatesQueueMessage, queueCatchUpState, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
-import { approvalGapSince, createQueueRoute, isDefaultMergeCommand, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
+import { approvalGapSince, createQueueRoute, queueTiming, isDefaultMergeCommand, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
 
@@ -110,6 +110,9 @@ const liveRecordHold = (root, pr) => {
   const rec = readQueueRecord(root, pr);
   return rec !== null && rec.terminal === null ? recordedHold(rec) : null;
 };
+
+// Progress for whoever is watching the terminal: stderr only (stdout stays the one JSON result), one line each.
+const progress = (line) => process.stderr.write(`merge: ${line}\n`);
 
 // An entry already exists (a re-run, or a restarted job): watch it, with the run record showing it. Nothing is gated again and nothing is enqueued.
 async function watchOnly({ route, gh, pr, head }) {
@@ -197,7 +200,7 @@ export const run = guarded(async (argv, ctx) => {
     const approval = { items: gate.ownerItems ?? null, areas: null, rulings: null, ownerRequired: false };
     if (queue.on) {
       route = createQueueRoute({
-        gh, root, config, pr, head: gate.head, route: 'gated', env: ctx.env ?? process.env, refuse, track,
+        gh, root, config, pr, head: gate.head, route: 'gated', env: ctx.env ?? process.env, refuse, track, log: progress,
         approval,
         // (a watch-only resume returns before the run record is read: the live record says whether the enqueue stood on the owner's word, and then the word must still be on record, as for the sweep: R2-F1)
         recheck: () => queueRecheckGated({ root, config, pr, gh, ctx, gate, ownerApproved: values['owner-approved-head'] !== undefined || readQueueRecord(root, pr)?.approval?.ownerRequired === true }),
@@ -380,7 +383,7 @@ export const run = guarded(async (argv, ctx) => {
 
       // 5. Wait for MERGED, re-checking the blockers on every poll. If the command failed it may still have merged (a
       // branch-delete error after a merge exits non-zero), so look once before calling it a failure.
-      const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh) });
+      const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh), log: progress, heartbeatMs: queueTiming(ctx.env ?? process.env).heartbeatMs });
       if (outcome.state === 'merged') {
         return merged(outcome.mergeSha, classifyMergeCommand(ran));
       }
@@ -507,7 +510,7 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
   // this run lifted, else the one a live record still owns, so a resumed watch (which returns before the live scan) can re-queue too.
   const rechecker = () => queueRecheckOwnerGo({ root, config, pr, gh, ctx, head, repo, hold: hold ?? liveRecordHold(root, pr) });
   if (queue.on) {
-    route = createQueueRoute({ gh, root, config, pr, head, route: 'owner-go', env: ctx.env ?? process.env, refuse, track, extra, approval, recheck: () => rechecker(), ...queueHoldSeams({ gh, root, pr, getHold: () => hold }) });
+    route = createQueueRoute({ gh, root, config, pr, head, route: 'owner-go', env: ctx.env ?? process.env, refuse, track, extra, approval, log: progress, recheck: () => rechecker(), ...queueHoldSeams({ gh, root, pr, getHold: () => hold }) });
     pre = await route.precheck();
     if (pre.done) return pre.done;
     Object.assign(carried, pre.holdFields);
@@ -572,7 +575,7 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
         : { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...extra },
     });
     // Every --owner-go merge (behind or not) waits with GitHub's baseRefOid pinned to the evaluated one: a queued merge (--auto) must not land on a base nobody checked.
-    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { base: live.baseRefOid }) });
+    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { base: live.baseRefOid }), log: progress, heartbeatMs: queueTiming(ctx.env ?? process.env).heartbeatMs });
     if (outcome.state === 'merged') return merged(outcome.mergeSha, classifyMergeCommand(ran));
     const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
     if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });

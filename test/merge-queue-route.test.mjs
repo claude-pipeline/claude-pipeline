@@ -160,6 +160,20 @@ test('removed once (group checks): the same head is re-queued once, then merged;
   never(s, /--disable-auto/, 'auto-merge is never touched');
 });
 
+// #244: the wait used to print nothing. Progress goes to stderr, one "merge: " line each; stdout stays the ONE JSON result a script parses.
+test('P merge in queue mode narrates the wait on stderr (heartbeat, removal, re-queue, merge) and stdout is still exactly one JSON object (#244)', () => {
+  const first = [added(), removed('failed_checks')];
+  const s = world({ env: { PIPELINE_QUEUE_HEARTBEAT_MS: '1' }, after: [[Q(), Q(), OUT(first)], [Q(1, [...first, added()]), Q(1, [...first, added()]), M()]] });
+  const r = s.run();
+  assertExit(r, 0);
+  assert.deepEqual(JSON.parse(r.stdout), r.json, 'stdout is one JSON document and nothing else');
+  const err = r.stderr.split('\n').filter((l) => l.startsWith('merge: '));
+  assert.ok(err.some((l) => /^merge: PR #12 queued \d+ min: AWAITING_CHECKS, position 1, group commit b{12}: checks 1 passed \/ 0 pending \/ 1 failed \(failed: ci\)$/.test(l)), r.stderr);
+  assert.ok(err.includes('merge: PR #12 was removed from the merge queue (reason failed_checks)'), r.stderr);
+  assert.ok(err.includes("merge: PR #12: re-queuing it once (the group's checks removed it)"), r.stderr);
+  assert.ok(err.includes(`merge: PR #12 merged as ${MERGE_SHA.slice(0, 12)}`), r.stderr);
+});
+
 // #230: a resumed watch from a worktree at another head than the live entry's. While the entry lives it is simply queued; when it leaves, the
 // removal belongs on the record (with its reason), not under a "head-moved" that says nothing was queued.
 test('resumed watch at another head (--owner-go): the live entry\'s removal is noted on the record, not head-moved; no re-queue from that worktree (#230)', (t) => {
