@@ -175,10 +175,10 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
 //
 // One SHAPE rule, no list of launchers (rounds 8-10 each found a new wrapper or an over-refusal in one). Per command, two readings are judged and a refusal from either wins: the parsed argv (the parser
 // unwraps npx / timeout / xargs / sudo …) and the words as typed (`c.typed`, the parser's own words of the command: a quoted string, a substitution and a heredoc body stay one word, a comment is not a word).
-// A supabase word (SB_WORD: the binary by any spelling) makes a CALL when it is word 0, or when it is later AND a later non-flag word is a subcommand head or is not a literal; `supabaseRefusal` then judges the
-// words after it. So a doppler / op / direnv / mise / timeout / npx-dotenv wrapper is read without being named, and a directory or package name that merely ends in supabase (`npx eslint lib/supabase --fix`,
+// A supabase word (SB_WORD: the binary by any spelling) makes a CALL when it is word 0, or when it is later, the command that runs is not a data command (rg, git, find, cp, gh, make …: its supabase word is an operand), and a later
+// non-flag word is a subcommand head or an expansion (`$SUB`, a substitution); `supabaseRefusal` then judges the words after it. So a doppler / op / direnv / mise / timeout / npx-dotenv wrapper is read without being named, and a directory or package name that merely ends in supabase (`npx eslint lib/supabase --fix`,
 // `npm i supabase`) has no subcommand after it and is no call. A package manager's own install / look-up verb and a `--package` / `--filter` / `workspace` selector name the package without running it.
-// xargs / parallel build the command from stdin: on a line that names supabase they are refused outright.
+// xargs / parallel as the command that runs build the command from stdin: on a line that names supabase they are refused unless the command they name is plain data (`xargs wc -l`).
 const OWNER_RUNS = 'the owner runs this; hand them the exact line';
 const SB_WORD = /^(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\]*)?$/;
 const isSbWord = (w) => typeof w === 'string' && SB_WORD.test(commandName(w));
@@ -236,7 +236,11 @@ const makesNoRequest = (c) => {
 // the first words of every supabase subcommand and alias (`supabase --help` of CLI 2.122; re-check on a CLI update), plus those the tables below do not carry
 const SUB_HEADS = new Set([...[...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]), 'bootstrap', 'completion', 'services', 'migrations', 'pull', 'notebooks', 'logs', 'experimental', 'issue', 'feedback', 'telemetry', 'whoami']);
 const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
-const NON_LITERAL_WORD = /[$`*?[{]/;
+// an expansion after the supabase word (`supabase $SUB`, `supabase "$@"`) can become a subcommand; a glob (`'src/**/*.ts'`, `'httpx[http2]'`) is a file or package pattern
+const NON_LITERAL_WORD = /[$`]/;
+// commands whose operands are data (a pattern, a path, a package, a message), not a program: a supabase word after one is a name, never the binary (git / make / gh can start a program only through an option or a word the line quotes, which stays one word)
+const STDIN_DATA = ['grep', 'egrep', 'fgrep', 'cat', 'head', 'tail', 'wc', 'ls', 'cut', 'tr', 'uniq', 'sed', 'cp', 'mv', 'rm', 'mkdir', 'touch', 'diff', 'echo', 'printf', 'which', 'pip', 'pip3'];
+const DATA_COMMANDS = new Set([...STDIN_DATA, 'rg', 'ag', 'ack', 'git', 'gh', 'find', 'make', 'sort', 'cd', 'pwd']);
 const typedWords = (c) => (Array.isArray(c.typed) ? c.typed : c.argv);
 const nearestHead = (words, i, heads) => { let j = i - 1; while (j >= 0 && !heads.has(commandName(words[j]))) j -= 1; return j; };
 
@@ -264,7 +268,8 @@ function isSelector(words, i) {
   if (j < 0) return false;
   const head = commandName(words[j]);
   const prev = words[i - 1];
-  if ((head === 'pnpm' && (prev === '--filter' || prev === '-F')) || (head === 'npm' && prev === '--workspace') || (head === 'yarn' && prev === 'workspace')) return true;
+  // (a directory option's value is no executable either: `npm --prefix supabase test`, `pnpm -C supabase test`)
+  if ((head === 'pnpm' && ['--filter', '-F', '-C', '--dir'].includes(prev)) || (head === 'npm' && ['--workspace', '-w', '--prefix'].includes(prev)) || (head === 'yarn' && ['workspace', '--cwd'].includes(prev))) return true;
   if (!RUNNERS.has(head) && !(PM_HEADS.has(head) && ['exec', 'dlx', 'x'].includes(words[j + 1]))) return false;
   for (let k = RUNNERS.has(head) ? j + 1 : j + 2; k < i;) {
     const w = words[k];
@@ -274,21 +279,23 @@ function isSelector(words, i) {
   return false;
 }
 
-// every supabase call among the words -> [{ rest }] (the words after the supabase word, for supabaseRefusal)
-function supabaseCalls(words) {
+// every supabase call among the words -> [{ rest }] (the words after the supabase word, for supabaseRefusal). `data`: the command that runs is a data command, so a later supabase word is an operand
+function supabaseCalls(words, data) {
   const calls = [];
   words.forEach((w, i) => {
     if (!isSbWord(w)) return;
     const rest = words.slice(i + 1);
     if (i === 0) { calls.push({ rest }); return; }
-    if (isSelector(words, i) || pmNonRun(words, i)) return;
+    if (data || isSelector(words, i) || pmNonRun(words, i)) return;
     if (rest.some((x) => !x.startsWith('-') && (isSubcommandHead(x) || NON_LITERAL_WORD.test(x)))) calls.push({ rest });
   });
   return calls;
 }
 
-// xargs / parallel (by command name, in either reading) build the command from stdin text the line does not show
-const stdinFed = (c) => [...c.argv, ...typedWords(c)].some((w) => /^g?(?:xargs|parallel)$/.test(commandName(w)));
+// xargs / parallel is the command that runs (the parser's `fan`): it builds the command from stdin text the line does not show. As an operand (`rg -n parallel supabase`) it is just a word
+const stdinFed = (c) => c.fan === true;
+// ... and what it builds can be the binary or a launcher of it unless the command it names is plain data (`xargs wc -l`; none named, or a search that can run a program from its options, is not)
+const buildsProgram = (c) => !(STDIN_DATA.includes(commandName(c.argv[0])));
 
 function supabaseRefusal(rest, state) {
   const first = rest[0];
@@ -375,8 +382,8 @@ export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv) {
   const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
   const reading = cmds.filter((c) => c.argv?.length);
   // R10-F1: xargs / parallel append words from stdin that no reading shows; with supabase named anywhere on the line the call cannot be judged
-  if (reading.some(stdinFed) && /supabase/i.test([scanRaw, ...cmds.map((c) => c.raw)].join('\n'))) return refuse('`xargs` / `parallel` builds a command from stdin and the line names supabase');
-  for (const c of reading) for (const words of [c.argv, typedWords(c)]) for (const call of supabaseCalls(words)) {
+  if (reading.some((c) => stdinFed(c) && buildsProgram(c)) && /supabase/i.test([scanRaw, ...cmds.map((c) => c.raw)].join('\n'))) return refuse('`xargs` / `parallel` builds a command from stdin and the line names supabase');
+  for (const c of reading) for (const words of [c.argv, typedWords(c)]) for (const call of supabaseCalls(words, DATA_COMMANDS.has(commandName(c.argv[0])))) {
     const why = supabaseRefusal(call.rest, state);
     if (why) return refuse(why);
   }

@@ -3601,10 +3601,12 @@ class Parser {
     // script such a wrapper started (`env -C D sh -c '…'`) runs in D or wherever the script's own cd took it: unknown, null)
     let chdir = chdir0 !== undefined ? chdir0 : this.ctx.chdirInherit !== undefined ? null : undefined;
     let fan = null; // the xargs / parallel that built this command from stdin text
+    let fanRuns = false; // (xargs / parallel is the command that runs, with or without a command to build: a bare `parallel` has none, `unwrap` gives nothing)
     const runnerDirs = [];
     let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
     for (let guard = 0; guard < 32 && a.length; guard++) {
+      if (base(a[0]) === 'xargs' || base(a[0]) === 'parallel') fanRuns = true;
       const un = unwrap(a);
       if (!un) break;
       if (PACKAGE_RUNNERS.has(base(a[0]))) {
@@ -3650,6 +3652,7 @@ class Parser {
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
+    if (cmd && fanRuns) Object.defineProperty(cmd, 'fan', { value: true, enumerable: false }); // (R11-F2: xargs / parallel is the command that runs, not a word among the arguments: the live-database guard)
     if (cmd && (seg.negated || segNeg(seg))) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);

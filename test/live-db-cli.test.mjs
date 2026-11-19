@@ -125,6 +125,32 @@ const ALLOWED = [
   'supabase migration --help',
   'supabase functions --help',
   'supabase functions deploy --help',
+  // R11-B1 / R11-F1: a supabase directory, package or search word under a command that does not start a program is no call, whatever follows it
+  'rg supabase db',
+  "rg supabase -g '*.ts'",
+  "rg -n supabase --glob '!*.lock'",
+  "git grep -n supabase -- '*.mjs'",
+  "find . -type d -name supabase -not -path '*/node_modules/*'",
+  'git add supabase "$f"',
+  'git diff main -- supabase test',
+  "git log -p -- supabase ':(exclude)*.snap'",
+  'cp -r supabase backups',
+  "npx prettier --check supabase 'src/**/*.ts'",
+  "pip install supabase 'httpx[http2]'",
+  'npm --prefix supabase test',
+  'pnpm -C supabase test',
+  'make -C supabase test',
+  'git -C supabase pull',
+  'npm -w supabase test',
+  "gh pr create --title \"Move client into lib/supabase\" --body \"$(cat <<'EOF'\nMoves the client; the owner runs it.\nEOF\n)\"",
+  // R11-B2 / R11-F2: xargs / parallel count only when they are the command that runs, and it can become the binary or a launcher of it
+  'rg --files supabase | xargs wc -l',
+  "find supabase/migrations -name '*.sql' | xargs grep -l x",
+  "rg -l supabase | xargs sed -i 's/a/b/'",
+  'rg -n parallel supabase/functions',
+  'git grep -n xargs -- supabase',
+  'cd supabase && which parallel',
+  'rg -n xargs docs | rg api.supabase.com',
 ];
 
 const DENIED = [
