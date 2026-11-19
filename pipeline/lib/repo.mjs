@@ -34,3 +34,16 @@ export function repoSlug(cwd = process.cwd(), { ghJsonFn = ghJson } = {}) {
   const host = /^https?:\/\/([^/]+)\//i.exec(String(r.url ?? ''))?.[1]?.toLowerCase() ?? null;
   return { owner, name, slug: `${owner}/${name}`, host, defaultBranch: r.defaultBranchRef?.name || 'main' };
 }
+
+// owner/name of where `git push origin` really goes (the push URL, with url.<base>.pushInsteadOf rewrites applied), which gh need not agree with
+// (GH_REPO, `gh repo set-default`, another remote). The last two path segments, so an ssh host alias still yields a name. [] when it cannot be read.
+export function pushRemoteSlugs(cwd = process.cwd(), remote = 'origin') {
+  let url;
+  try {
+    url = git(['remote', 'get-url', '--push', remote], { cwd }).trim();
+  } catch {
+    return [];
+  }
+  const parts = url.replace(/\/+$/, '').replace(/\.git$/, '').split(/[/:]/).filter(Boolean);
+  return parts.length >= 2 ? [`${parts.at(-2)}/${parts.at(-1)}`] : [];
+}

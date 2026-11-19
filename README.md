@@ -461,10 +461,12 @@ Re-vendor (`pipeline vendor`) so the project's `scripts/pipeline/smoke.mjs` and 
 For a repository that is public, text the pipeline posts there (comments, issue and PR titles and bodies, labels, GraphQL mutations, the agent-log branch) can be run through a
 scanner on your machine first. The list lives in `~/.claude/pipeline-local/outbound-scan.json` (the account's home, never a repo, so a branch cannot drop it):
 `{ "owner/name": { "command": ["/absolute/path/to/scanner", "arg"] } }`. Each outbound text goes to the scanner on stdin (never argv); exit 0 lets the write through,
-anything else (a non-zero exit, a crash, a timeout after 60 s) blocks it with exit 1 and `error: outbound-scan-blocked`, naming the field kinds scanned and never the text or the
-scanner's output. A repo that is not listed behaves exactly as before; no file means nothing is listed. It fails closed: a file that cannot be read or parsed blocks every write, and a
+anything else (a non-zero exit, a crash, a timeout after 60 s) blocks it with exit 1 and `error: outbound-scan-blocked`, naming the field kinds scanned and how the scanner ended, never the text or anything the scanner printed. A repo that is not listed behaves exactly as before; no file means nothing is listed. It fails closed: a file that cannot be read or parsed blocks every write, and a
 listed repo whose scanner path is missing or not executable blocks that repo's writes. Screenshots (`pipeline artifacts push`) cannot be scanned and are refused for a listed repo;
-a blocked `agent-log publish` leaves its lines queued.
+a blocked `agent-log publish` leaves its lines queued (the error names the queue file, `.git/claude-pipeline/agent-log-queue.jsonl`: delete a flagged line there), and for a listed repo
+the log commit is made under the fixed `claude-pipeline` noreply identity, not your git name and email. A repo counts as listed when either its `gh` name or the owner/name of `git push origin`'s URL is listed.
+Keys must be exactly `owner/name` (no URL, no `.git`, no spaces); any other key blocks every write. A renamed or transferred repository must be re-listed under its new name, or it stops being scanned.
+Writes that carry only ids, a sha or the name of an existing label (enqueue, dequeue, convert to draft, update-branch, add / remove / delete a label) are not scanned, so a scanner fault can never keep a PR in the merge queue.
 
 ### Faster verify (opt-in)
 

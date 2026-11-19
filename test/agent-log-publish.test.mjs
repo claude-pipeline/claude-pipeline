@@ -585,3 +585,29 @@ test('publish: a blocked outbound scan keeps every line queued, pushes nothing a
   assert.equal(w.onOrigin('branch', '--list', BRANCH).trim(), '', 'nothing was pushed');
   assert.equal(scanner.runs().length, 1);
 });
+
+test('publish: the scan follows the push destination, not only what gh resolves (origin listed, gh says an unlisted repo)', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]); // gh: acme/widgets, unlisted
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'https://example.test/Listed/Repo.git']);
+  const scanner = makeScanner(tmp('cp-log-scanner-'));
+  writeScanConfig(w.fake.scanHome, { 'listed/repo': { command: scanner.command } });
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(scanner.runs().length, 1, 'the listed push destination was scanned');
+});
+
+test('publish: for a listed repository the log commit carries the fixed noreply identity, not the configured git name and email; an unlisted one keeps it', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+  w.repo.git(['config', 'user.email', 'private-address@example.invalid']);
+  const scanner = makeScanner(tmp('cp-log-scanner-'), 'clean');
+  writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: scanner.command } });
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  assert.equal(w.onOrigin('log', '-1', '--format=%ae|%ce', BRANCH).trim(), 'claude-pipeline@users.noreply.github.com|claude-pipeline@users.noreply.github.com');
+  writeScanConfig(w.fake.scanHome, { 'other/repo': { command: scanner.command } });
+  assertExit(w.run(['publish', '--line', L2]), 0);
+  assert.equal(w.onOrigin('log', '-1', '--format=%ae', BRANCH).trim(), 'private-address@example.invalid');
+});

@@ -316,3 +316,15 @@ test('artifacts push is refused for a repository listed in the outbound scan con
   assert.equal(w.onOrigin('branch', '--list', ARTIFACTS_BRANCH).trim(), '', 'no artifacts branch on origin');
   assert.equal(scanner.runs().length, 0);
 });
+
+test('artifacts push checks where git push origin really goes: gh resolving an unlisted repo (GH_REPO) does not let screenshots reach a listed origin', () => {
+  const w = world();
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'git@github.com:Listed/Repo.git']); // push URL names the listed repo; gh (the fake) says acme/widgets
+  const scanner = makeScanner(tmp('cp-art-scanner-'), 'clean');
+  writeScanConfig(w.fake.scanHome, { 'listed/repo': { command: scanner.command } });
+  w.put('a.png');
+  const r = w.cli(['push', '--pr', '7', '--dir', w.images]);
+  assert.equal(r.code, 1, r.stderr);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(w.onOrigin('branch', '--list', ARTIFACTS_BRANCH).trim(), '', 'nothing was pushed');
+});
