@@ -685,6 +685,27 @@ test('watchQueue progress: the check summary uses the latest run per name and th
   assert.match(lines[0].l, /checks 2 passed \/ 2 pending \/ 1 failed \(pending: Hard-stop scan, e2e; failed: lint\)$/);
 });
 
+test('watchQueue progress: a failed check run is not hidden by a passing status of the same name', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(1)] }), {
+    runs: [{ id: 1, name: 'ci', status: 'completed', conclusion: 'failure' }],
+    statuses: [{ context: 'ci', state: 'success' }],
+  });
+  await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 5 * MIN, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.match(lines[0].l, /checks 0 passed \/ 0 pending \/ 1 failed \(failed: ci\)$/);
+});
+
+test('watchQueue progress: once GitHub stops showing the entry the beat says so, not the old position', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(2), () => st()] }), { runs: [{ id: 1, name: 'ci', status: 'in_progress', conclusion: null }] });
+  await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 20 * MIN, pollMs: 90_000, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  const beats = lines.map((x) => x.l).filter((l) => /^PR #7 (queued|not visible)/.test(l));
+  assert.ok(beats.length >= 2, beats.join('\n'));
+  assert.ok(beats.every((l) => l === 'PR #7 not visible in the merge queue'), beats.join('\n'));
+});
+
 test('watchQueue progress: one stall warning per window while nothing moves, and a move resets the clock', async () => {
   const c = clock();
   const { lines, log } = logger(c);

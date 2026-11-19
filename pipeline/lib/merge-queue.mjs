@@ -499,11 +499,15 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     return rec !== null && rec.terminal === null ? rec.head : head;
   };
   let position = null;
+  let seen = false; // an entry was seen at least once
+  let pollFailed = false; // the latest poll threw, so `entry` is the last known state
   for (;;) {
     let outcome = null;
+    pollFailed = false;
     try {
       outcome = await pollOnce();
     } catch (err) {
+      pollFailed = true;
       log(`PR #${pr}: queue poll failed, retrying (${String(err?.message ?? err).split('\n')[0]})`);
     }
     if (outcome) return finish(outcome);
@@ -520,8 +524,12 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
   // Every heartbeatMs of elapsed time: one line saying where the entry is and what its merge-group commit's checks say (read here and only here: once per
   // beat, never per poll). While the same picture holds for stallMs, one extra warning per window. A failed read says so and the wait goes on.
   function heartbeat() {
-    if (entry === null || now() - lastBeat < heartbeatMs) return;
+    if (!seen || now() - lastBeat < heartbeatMs) return;
     lastBeat = now();
+    if (entry === null) { // it was queued once, but GitHub no longer shows an entry: say so rather than repeat the old position
+      log(`PR #${pr} not visible in the merge queue${pollFailed ? ' (the latest poll failed)' : ''}`);
+      return;
+    }
     try {
       const since = Date.parse(entry.enqueuedAt);
       const mins = minutesSince(Number.isNaN(since) ? startedAt : since);
@@ -535,7 +543,7 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
         }
         summary = { text: `group commit ${entry.headCommit.slice(0, 12)}: ${read.text}`, signature: read.signature };
       }
-      log(`PR #${pr} queued ${mins} min: ${entry.state}, position ${entry.position}, ${summary.text}`);
+      log(`PR #${pr} queued ${mins} min: ${entry.state}, position ${entry.position}, ${summary.text}${pollFailed ? ' (last known state: the latest poll failed)' : ''}`);
       const sig = [entry.state, entry.position, entry.headCommit ?? '', summary.signature].join('|');
       if (sig !== signature) {
         signature = sig;
@@ -556,9 +564,13 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     if (r.kind === 'closed') return { state: 'closed' };
     if (r.kind === 'head-moved') return { state: 'head-moved' };
     if (r.kind === 'removed') return { state: 'removed', removal: r.removal };
-    if (r.kind === 'not-queued') return null; // not visible (yet): keep looking until the budget ends
+    if (r.kind === 'not-queued') { // not visible (yet): keep looking until the budget ends
+      entry = null;
+      return null;
+    }
     position = r.entry.position;
     entry = r.entry;
+    seen = true;
     const view = gh.prView(pr, ['state', 'labels', ...(check.fields ?? [])]);
     const problems = await check(view);
     if (problems.length === 0) return null;
@@ -661,7 +673,10 @@ export function checkSummary(gh, sha) {
   for (const s of gh.statusesOf(sha)) { // newest first
     if (seen.has(s?.context)) continue;
     seen.add(s?.context);
-    latest.set(s.context, ['failure', 'error'].includes(s.state) ? 'failed' : s.state === 'success' ? 'passed' : 'pending');
+    const state = ['failure', 'error'].includes(s.state) ? 'failed' : s.state === 'success' ? 'passed' : 'pending';
+    // a check run and a status of one name are separate results (failingChecksOn reports both): on a collision the worse one stands
+    const worse = (a, b) => ['failed', 'pending', 'passed'].find((v) => v === a || v === b);
+    latest.set(s.context, latest.has(s.context) ? worse(latest.get(s.context), state) : state);
   }
   const names = (want) => [...latest].filter(([, v]) => v === want).map(([k]) => k).sort();
   const [passed, pending, failed] = [names('passed'), names('pending'), names('failed')];

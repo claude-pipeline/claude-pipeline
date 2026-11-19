@@ -22,7 +22,7 @@ const FULL_SHA = /^[0-9a-f]{40}$/;
 
 // Why verifyOwnerGrant said no (its `reason`), in plain words; the first check that failed is the one named.
 const WHY = {
-  provenance: "the owner's words for this grant were not found as typed by the owner in this session's transcript on this machine (a record from before transcript capture is proven through exactly one <config dir>/projects/*/<session>.jsonl in a Claude config folder under the home directory; none, or more than one, was found)",
+  provenance: "the owner's words for this grant were not found as typed by the owner in this session's transcript on this machine (if this record predates transcript capture, it needs exactly one <config dir>/projects/*/<session>.jsonl in a Claude config folder under the home directory; none, or more than one, fails)",
   'no-marker': 'this grant was never consumed on this machine',
   'no-record': "no record of the owner's words for this grant exists on this machine",
   mismatch: "the owner's record or the grant marker is for a different repository, PR, round or head",
