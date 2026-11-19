@@ -178,6 +178,15 @@ test('F4 apply: the same ruling on a file the PR ADDS, without the scope, or on 
   assert.equal(s.version, 1);
 });
 
+// R6-F1. Failure caught: the arbiter's own finding, filed as SUGGESTION as the bar section instructs, ruled "same on base" on a line the PR adds or in a file it adds, stored as same-on-base with no human.
+test('R6-F1 apply: a SUGGESTION same-on-base finding on a PR-added line or an added file waits for a human and stores no same-on-base scope', (t) => {
+  const w = world(t);
+  const needed = w.round1();
+  assertExit(w.apply(needed, { rulings: [], findings: [finding({ bucket: 'SUGGESTION', line: 12 }), finding({ bucket: 'SUGGESTION', file: 'src/new.js', line: 1 }), finding({ bucket: 'SUGGESTION', line: 5 })] }), 0);
+  const items = w.state().rounds[0].items;
+  assert.deepEqual(items.map((i) => [i.final.needsHuman, i.final.scope]), [[true, undefined], [true, undefined], [false, 'same-on-base']]);
+});
+
 // F2. Failure caught: a SUGGESTION FOLLOW-UP the arbiter rules on a matched file WITHOUT the scope is neither in the Rulings block nor held by the filing gate.
 test('F2 apply: a SUGGESTION FOLLOW-UP without scope on a matched file is marked, listed and filing-gated; the same on an unmatched file is not', (t) => {
   const w = world(t, { baseYml: yml('[src/a.js]', '[src/**]') });

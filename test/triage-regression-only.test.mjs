@@ -99,6 +99,19 @@ test('F4 applyRulings: an added file, a rename (into or inside the matched paths
   }
 });
 
+// R6-F1. Failure caught: a SUGGESTION (or a non-security BLOCKING) Codex item ruled FOLLOW-UP "same on base" on a file the PR adds, stored as same-on-base with no human.
+test('R6-F1 applyRulings: a SUGGESTION or non-security BLOCKING FOLLOW-UP with the scope on an added file or a PR-added line parks for a human with no scope; a plain modification is unchanged', () => {
+  const added = { globs: GLOBS, files: [entry('pipeline/hooks/new.mjs', { oldPath: null, status: 'A' }), entry('pipeline/hooks/a.mjs', { added: [{ line: 4, text: 'x' }] })] };
+  for (const over of [{ bucket: 'SUGGESTION', file: 'pipeline/hooks/new.mjs' }, { bucket: 'BLOCKING', category: 'bug', file: 'pipeline/hooks/new.mjs' }, { bucket: 'SUGGESTION', category: 'design', file: 'pipeline/hooks/a.mjs', line: 4 }]) {
+    const it = item(over);
+    const [out] = apply([it], [rule(it)], { regression: added });
+    assert.equal(out.final.needsHuman, true, JSON.stringify(over));
+    assert.equal(out.final.scope, undefined, JSON.stringify(over));
+  }
+  const plain = item({ bucket: 'SUGGESTION' });
+  assert.deepEqual([apply([plain], [rule(plain)])[0].final.needsHuman, apply([plain], [rule(plain)])[0].final.scope], [false, 'same-on-base']);
+});
+
 test('applyRulings: low confidence and an unproven answer still park for a human; a REJECT of a BLOCKING security item is never waived', () => {
   const low = item();
   assert.equal(apply([low], [rule(low, { confidence: 'low' })])[0].final.needsHuman, true);
@@ -167,6 +180,14 @@ test('fableFindingItems: a same-on-base BLOCKING security finding is final with 
   const added = { globs: GLOBS, files: [entry('pipeline/hooks/a.mjs', { oldPath: null, status: 'A' })] };
   assert.deepEqual(parked(findingItems([finding()], { regression: added })[0]), HUMAN, 'F4: an added file');
   assert.deepEqual(parked(findingItems([finding({ confidence: 'low' })])[0]), [true, 'low-confidence'], 'low confidence stays human');
+});
+
+test('R6-F1 fableFindingItems: a SUGGESTION same-on-base finding on an added file or a PR-added line parks for a human with no scope', () => {
+  const added = { globs: GLOBS, files: [entry('pipeline/hooks/a.mjs', { added: [{ line: 3, text: 'x' }] }), entry('pipeline/hooks/new.mjs', { oldPath: null, status: 'A' })] };
+  for (const over of [{}, { file: 'pipeline/hooks/new.mjs' }]) {
+    const [out] = findingItems([finding({ bucket: 'SUGGESTION', ...over })], { regression: added });
+    assert.deepEqual([out.final.needsHuman, out.final.scope], [true, undefined], JSON.stringify(over));
+  }
 });
 
 test('F2 fableFindingItems: a SUGGESTION FOLLOW-UP without scope on a matched file is marked (Rulings row + filing gate); an ACCEPT or another file is not', () => {
