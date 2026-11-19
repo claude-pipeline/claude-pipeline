@@ -22,7 +22,7 @@ export const meta = {
     'pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-review [--outcome O] [--built TEXT] [--reason TEXT] [--hits-file F] [--repo DIR]',
     '  --kind triage publishes the review state under the review lock as a compare-and-swap on its content (lib/review-publish.mjs): it is refused',
     '  (exit 1 {ok:false, error:\'stale-publication\', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`',
-    '  and redo the decision; {action:\'unchanged\'} when the PR already holds exactly this state. The other kinds take no lock.',
+    '  and redo the decision; and (exit 1 {ok:false, error:\'newer-format\', reason}, before any write) when the PR\'s triage comment holds a state of a NEWER version than this install reads: run `pipeline update` first; {action:\'unchanged\'} when the PR already holds exactly this state. The other kinds take no lock.',
     '  --kind blocked renders the verify report\'s failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.',
     '  --kind needs-human adds, when a review state with at least one round exists for this PR, a short status block under the paragraph: rounds, booked cost (with the last round\'s share),',
     '  open items with their severity and why the review is not clean (the extra-round ask\'s text without its recommendation). Display only: a part that cannot be read becomes a "not available" line; the comment is always written.',
