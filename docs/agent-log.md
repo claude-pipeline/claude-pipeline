@@ -279,3 +279,4 @@ full record.
 - 2026-11-19 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 16 · arbiter 15 (fix-verify 6) · awaiting-owner-merge · Codex 7d: 557 runs (145 high)
 - 2026-11-19 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 13 · arbiter 12 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 557 runs (145 high)
 - 2026-11-19 · #666 · CI: Node 20 timing caps never count more CPU than time passed (main red since 08:15Z) · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge · Codex 7d: 561 runs (147 high)
+- 2026-11-19 · #670 · Two load-flaky tests tolerate a busy machine (#589, guard CPU budget) · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge · Codex 7d: 566 runs (150 high)
