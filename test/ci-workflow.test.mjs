@@ -146,6 +146,7 @@ test('ci.yml listens to ready_for_review and converted_to_draft, and one PR\'s r
   // a bare `pull_request:` has neither: the default types are opened, synchronize, reopened
   assert.deepEqual(ci.on.pull_request.types, ['opened', 'synchronize', 'reopened', 'ready_for_review', 'converted_to_draft']);
   assert.deepEqual(ci.on.push.branches, ['main']);
+  assert.deepEqual(ci.on.merge_group.types, ['checks_requested'], 'without this trigger the merge queue never gets a result for the required checks');
   assert.equal(ci.concurrency.group, 'ci-${{ github.ref }}', 'every event of one PR has the same ref, so converted_to_draft cancels a running suite');
   assert.equal(ci.concurrency['cancel-in-progress'], "${{ github.event_name == 'pull_request' }}", 'push to main never cancels');
 });
@@ -157,5 +158,6 @@ test('a draft PR skips the whole suite (both required checks read skipped); a re
     assert.equal(runsOn(cond, { event: 'pull_request', draft: true }), false, `${name}: a draft PR (also the converted_to_draft run) is skipped`);
     assert.equal(runsOn(cond, { event: 'pull_request', draft: false }), true, `${name}: a ready PR (also the ready_for_review run) runs`);
     assert.equal(runsOn(cond, { event: 'push' }), true, `${name}: push to main is unchanged`);
+    assert.equal(runsOn(cond, { event: 'merge_group' }), true, `${name}: a queue commit runs the suite, never skipped (a skipped required check counts as passing)`);
   }
 });

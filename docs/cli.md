@@ -1065,7 +1065,7 @@ update the installed pipeline to upstream main (run in your own terminal); --che
 
 ```
 pipeline update [--claude-home DIR] [--check] [--json]
-  Fetches upstream main (github.com/ianjamila/claude-pipeline), installs it and verifies the install.
+  Fetches upstream main (github.com/claude-pipeline/claude-pipeline), installs it and verifies the install.
   --claude-home DIR  where the pipeline is installed (default ~/.claude: both Claude accounts share ~/.claude/pipeline,
                      so CLAUDE_CONFIG_DIR is deliberately not consulted)
   --check            read-only: report the installed stamp, upstream main and how they relate; exit 0 only when

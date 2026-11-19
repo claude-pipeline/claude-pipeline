@@ -53,7 +53,7 @@ ancestry: an agent must not be able to rewrite its own rules). Run it **in your 
 Claude with `PIPELINE_ADMIN=1 claude`.
 
 ```sh
-git clone https://github.com/ianjamila/claude-pipeline ~/Claude/claude-pipeline
+git clone https://github.com/claude-pipeline/claude-pipeline ~/Claude/claude-pipeline
 cd ~/Claude/claude-pipeline
 ./install.sh --skip-file-guard     # macOS / Linux   (Windows: .\install.ps1 --skip-file-guard)
 ./install.sh --check               # drift report only; exit 1 if anything differs; never writes
