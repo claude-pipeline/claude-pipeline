@@ -109,7 +109,7 @@ function retiredFiles(target) {
   return found;
 }
 
-// The first commit of ianjamila/claude-pipeline: a repo has it only by sharing this history, so a consumer cannot be taken for the source by accident.
+// The first commit of claude-pipeline/claude-pipeline: a repo has it only by sharing this history, so a consumer cannot be taken for the source by accident.
 export const PIPELINE_ROOT_COMMIT = '61e18721be44051841670c4d103ad30d742e2f54';
 
 // True when `root` is the pipeline source repo itself: the pipeline's root commit is an ancestor of its HEAD (having the object in some ref proves nothing). Any error (not a git repo, a shallow clone without it) is false, the safe direction: the normal drift check runs.
