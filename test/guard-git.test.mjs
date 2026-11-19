@@ -1588,6 +1588,14 @@ test('string-running wrappers are unwrapped or scanned', () => {
   for (const c of allow) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
 });
 
+// #563 (owner's choice, option 1): the scan of interpreter program text is deliberate: a program that only WRITES a file whose text names a guarded command is refused too. It is pinned so that the refusal
+// stays a recorded decision, not an accident; the workaround is in the implementer brief (write such a test file with the Write tool, or build the string at run time).
+test('a node -e that only writes a file whose text names a push to main is refused (deliberate, #563)', () => {
+  const v = evaluate("node -e \"require('fs').writeFileSync('t.mjs','git push origin main')\"");
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /node was given a string that contains a guarded command/);
+});
+
 test('spawn: a script file in the real working directory is read by the hook', () => {
   const dir = join(TMP, 'scripts');
   execFileSync('mkdir', ['-p', dir]);

@@ -90,13 +90,29 @@ describe('#505: every branch is unknown, also the ones no entry was made for', (
     expect('deny', 'bash build.sh; git push', { ...FILES, [BUILD]: 'make\ncd dist || { source /work/repo/cleanup.sh; exit 1; }\n' });
   });
   test('a git checkout in an unknown directory (after a source) marks every branch unknown, even a directory entered later', () => {
-    expect('deny', 'source env.sh; cd /work/repo; git checkout agent/y; cd /other; git push', { [resolve('env.sh')]: 'X=1\n' });
+    expect('deny', 'source env.sh; git checkout agent/y; cd /other; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('a branch recorded after the mark is known again (a checkout of the directory the push runs in)', () => {
-    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y; git push', { [resolve('env.sh')]: 'X=1\n' });
+    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('reference: a build script whose failure group is a plain echo keeps the caller branch (allowed)', () => {
     expect('allow', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
+  });
+});
+
+describe('#554: a mark set inside a failure group survives when the nested text goes on after the group', () => {
+  // production failure: `bash build.sh; git push` on agent/x was allowed although the group's script switched the repository to main (the next line of the text restored the mark to false)
+  // (a plain trailing line: the issue's `npm run build` is denied for a package-script reason of its own)
+  const GROUP = 'cd dist || { bash /work/repo/cleanup.sh; exit 1; }\n';
+  const FILES = { [CLEAN]: 'git checkout main\n' };
+  test('a line after the group in the script (the #505 fixture plus a trailing line): denied', () => {
+    expect('deny', 'bash build.sh; git push', { ...FILES, [BUILD]: `make\n${GROUP}echo built\n` });
+  });
+  test('#506 shape: a failure group that writes .git/HEAD, then any line: denied', () => {
+    expect('deny', 'bash build.sh; git push', { [BUILD]: "cd dist || { echo 'ref: refs/heads/main' > /work/repo/.git/HEAD; exit 1; }\nmake\n" });
+  });
+  test('reference: an inert group followed by a line keeps the caller branch (allowed)', () => {
+    expect('allow', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\necho built\n' });
   });
 });
 
@@ -153,6 +169,26 @@ describe('R1-B3: a write below .git that cannot move a branch stays allowed', ()
     ['rsync onto .git/', 'rsync -a other/.git/ .git/; git push'],
     ['tar into .git', 'tar -xf a.tar -C .git; git push'],
   ]) test(`denied: ${why}`, () => expect('deny', line));
+});
+
+// #556: production failure: `cp backup/HEAD .git/worktrees/w/; git -C /work/w push` switched the linked worktree to main (the copy lands on HEAD) and was allowed, because only a destination spelled `.../HEAD` was matched;
+// a spelling of the same file that the text does not show (`.git//HEAD`, `.git/./HEAD`, `.git/refs/../HEAD`, and on a case-insensitive filesystem `.git/head`) was allowed too
+describe('#556: a directory destination under .git/worktrees, and a differently spelled HEAD, make the branches unknown', () => {
+  const CI = process.platform === 'win32' || process.platform === 'darwin'; // (the guard matches case-insensitively only where the filesystem is)
+  for (const [why, line] of [
+    ['a copy into a linked worktree directory (trailing slash)', 'cp backup/HEAD .git/worktrees/w/; git push'],
+    ['a copy into a linked worktree directory', 'cp backup/HEAD .git/worktrees/w; git push'],
+    ['tar into a linked worktree directory', 'tar -xf a.tar -C .git/worktrees/w; git push'],
+    ['a doubled slash', 'echo ref > .git//HEAD; git push'],
+    ['a dot segment', 'echo ref > .git/./HEAD; git push'],
+    ['a dot-dot segment', 'echo ref > .git/refs/../HEAD; git push'],
+    ['a linked worktree HEAD with a dot-dot', 'echo ref > .git/worktrees/w/x/../HEAD; git push'],
+  ]) test(`denied: ${why}`, () => expect('deny', line));
+  test(`${CI ? 'denied' : 'allowed'}: a lower-case .git/head (${CI ? 'case-insensitive' : 'case-sensitive'} filesystem)`, () => expect(CI ? 'deny' : 'allow', 'echo ref > .git/head; git push'));
+  for (const [why, line] of [
+    ['a file in a worktree directory that cannot move a branch is not a directory destination of a copy', 'echo x > .git/worktrees/w/gitdir; git push'],
+    ['a dot segment elsewhere', 'echo x > .git/./info/exclude; git push'],
+  ]) test(`allowed: ${why}`, () => expect('allow', line));
 });
 
 // R1-B2: a function / trap / alias / shopt in a walked script forgets the names already recorded, but marks no unrelated branch unknown
@@ -224,9 +260,22 @@ describe('#505 over-denial check: a readable sourced file with no git / .git wri
   KEPT('source venv/bin/activate && git push');
   KEPT('. ./env.sh; git push');
   OK('source env.sh; cd /work/repo/sub; git push');
-  test('a sourced file that is never read (missing) marks every branch unknown: a directory entered afterwards is denied', () => {
-    expect('deny', 'source nothere.sh; cd /work/repo/sub; git push', FILES);
+  // #555: production failure: `[ -f .env.local ] && source .env.local; cd /work/repo/sub; git push` was allowed when the optional file existed and denied when it did not (a missing file runs nothing)
+  test('a sourced file that does not exist runs nothing: it marks no branch, a directory entered afterwards is judged on its own branch (allowed)', () => {
+    expect('allow', 'source nothere.sh; cd /work/repo/sub; git push', FILES);
+    expect('allow', '[ -f .env.local ] && source .env.local; cd /work/repo/sub; git push', FILES);
+    expect('allow', 'source ~/.cargo/env 2>/dev/null; git -C /work/repo/sub push', FILES);
   });
+  test('a sourced file whose name is only known at run time still marks every branch unknown (denied)', () => {
+    expect('deny', 'source "$(mktemp)"; cd /work/repo/sub; git push', FILES);
+    expect('deny', 'source ~/.cache/*.sh; cd /work/repo/sub; git push', FILES);
+  });
+  // (R1-B1: `~+` is $PWD, `~-` is $OLDPWD, `~user` a home directory: the shell sources a real file, so only a leading `~/` (or `~`) is spelled as a path the guard knows)
+  for (const w of ['~+/env.sh', '~-/env.sh', '~user/env.sh']) {
+    test(`a sourced ${w} is not a missing file: every branch stays unknown (denied)`, () => {
+      expect('deny', `source ${w}; cd /work/repo/sub; git push`, FILES);
+    });
+  }
   OK('bash build.sh; git push');
   test('but a sourced file that does switch the branch still denies', () => {
     expect('deny', 'source env.sh; git push', { [resolve('/work/repo/env.sh')]: 'git checkout main\n' });
@@ -280,4 +329,32 @@ describe('ordinary work stays allowed', () => {
   OK('a build in a sub directory, then the push', 'cd sub && make; git push');
   OK('a tee into the work tree, then the push', 'npm test | tee out.log; git push');
   OK('a copy into the work tree, then the push', 'cp a.txt b.txt; git push');
+});
+
+// #558: production failure: a -C / --git-dir / --work-tree value spelled like a git subcommand (`git -C worktree checkout main`) was read as that subcommand, so the checkout inside the parentheses raised
+// no branch doubt and the push after it was judged on the branch the directory had on disk
+describe('#558: movesBranch takes the subcommand, not the first mover word (a global option value is skipped)', () => {
+  for (const word of ['worktree', 'branch', 'rebase', 'symbolic-ref']) {
+    test(`denied: (git -C ${word} checkout main); a push after it`, () => expect('deny', `(git -C ${word} checkout main); git push`));
+  }
+  test('denied: --git-dir with a value spelled like a subcommand', () => expect('deny', '(git --git-dir branch checkout main); git push'));
+  test('reference: the same checkout without the odd -C value was already denied', () => expect('deny', '(git -C sub checkout main); git push'));
+});
+
+// #557: production failure: a child script ending with a git READ and an exit (`git config --get user.email >/dev/null || exit 1`) opened a failure group, which at the end of the text marked every branch
+// unknown, so the caller's `git push` on agent/x was refused although nothing moved a branch
+describe('#557: a git read that ends a nested text with an exit opens no failure group', () => {
+  for (const body of [
+    'make\ngit config --get user.email >/dev/null || exit 1\n',
+    'make\ngit symbolic-ref -q HEAD || { echo detached; exit 1; }\n',
+    'make\ngit branch -r | grep -q origin/main || exit 1\n',
+  ]) {
+    test(`allowed: bash build.sh ending ${JSON.stringify(body.split('\n')[1])}`, () => expect('allow', 'bash build.sh; git push', { [BUILD]: body }));
+  }
+  test('denied (a mover still opens the group): a script ending with a checkout that may fail and an exit, a branch it may have switched', () => {
+    expect('deny', 'bash build.sh; git push', { [BUILD]: 'make\ngit checkout agent/missing || { echo no; exit 1; }\n' }, MAIN);
+  });
+  test('denied (a directory change still opens the group): the #505 shape at the end of the text', () => {
+    expect('deny', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' });
+  });
 });

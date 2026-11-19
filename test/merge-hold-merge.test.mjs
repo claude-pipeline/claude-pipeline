@@ -200,6 +200,22 @@ test('--owner-go, an eligible needs-human hold is lifted and the merge command t
   assert.equal(checks(s).length - dryChecks, 1, 'the real run checked the hold once');
 });
 
+// #567: the exact clean-status refusal with a lifted hold that is put back: the hold-restored output wins, so there is NO `retryable` (a fresh "merge" is needed for the hold, not a re-run).
+test('--owner-go, a lifted needs-human hold is put back after the clean-status refusal: holdRestored, no retryable', (t) => {
+  const s = liftWorld();
+  const d = cli(['merge', '--pr', String(PR), '--dry-run', '--owner-go'], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, FAKE_HOLD_CHECK_SEQ: seq(CLEAR) } });
+  assertExit(d, 0, `${d.stderr}${d.stdout}`);
+  const step = d.json.ownerStep;
+  ownerSays(t, 'merge', ['Protected areas and the hold are listed above.', step.areas, step.hold, step.line, step.ready ?? readyLine([PR])].filter(Boolean).join('\n'));
+  const r = goMerge(s, { FAKE_HOLD_CHECK_SEQ: seq(CLEAR), FAKE_MERGE_QUEUED: 'GraphQL: Pull request Pull request is in clean status (enablePullRequestAutoMerge)' });
+  assertExit(r, 1, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.merged, false);
+  assert.equal(r.json.holdRestored, true, 'the needs-human hold is back');
+  assert.equal(r.json.retryable, undefined);
+  assert.equal(r.json.next, undefined);
+  assert.equal(s.mergeCalls().length, 1);
+});
+
 // ---- the gate path (step 1b) ---------------------------------------------------------------------------------------------------
 
 const gateWorld = (opts = {}) => {

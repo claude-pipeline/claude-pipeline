@@ -236,7 +236,8 @@ test('execCodex: only one retry in total: a timeout then capacity, or capacity t
 
   const dir2 = scratch(t);
   const capture2 = join(dir2, 'capture.jsonl');
-  const b = await run(dir2, { PIPELINE_CODEX_TIMEOUT_MS: '500', PIPELINE_CODEX_CAPACITY_RETRY_MS: '0', FAKE_CODEX_FAIL_ONCE: join(dir2, 'failed.flag'), FAKE_CODEX_TURN_FAILED: CAPACITY, FAKE_CODEX_HANG: join(dir2, 'helper.pid'), FAKE_CODEX_CAPTURE: capture2 });
+  // The first run must never be the one that times out, so the timeout is far above process start (#488: wall-clock start-up must not decide the branch). The second run hangs once and is killed.
+  const b = await run(dir2, { PIPELINE_CODEX_TIMEOUT_MS: '5000', PIPELINE_CODEX_CAPACITY_RETRY_MS: '0', FAKE_CODEX_FAIL_ONCE: join(dir2, 'failed.flag'), FAKE_CODEX_TURN_FAILED: CAPACITY, FAKE_CODEX_HANG_ONCE: join(dir2, 'hung.flag'), FAKE_CODEX_CAPTURE: capture2 });
   assert.equal(b.ok, false);
   assert.equal(b.reason, 'unavailable');
   assert.equal(b.timedOut, true);

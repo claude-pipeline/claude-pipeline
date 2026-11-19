@@ -19,7 +19,7 @@ import { codexUsage, codexUsageSuffix } from '../lib/codex-usage.mjs';
 import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import { readModelProofs, reviewBaseRef } from '../lib/review-context.mjs';
 import { testsAdded } from '../lib/diff.mjs';
-import { diffFiles } from '../lib/git.mjs';
+import { diffFiles, refExists } from '../lib/git.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
@@ -100,19 +100,23 @@ export const run = guarded(async (argv, ctx) => {
   }
 
   // A soft signal for the owner's report (never a gate): how many tests the PR adds against how much source it changes. Any failure, or a diff with no changed line, leaves the line out.
-  let testsAddedLine;
-  try {
-    const loaded = await loadConfig(root);
-    if (loaded.ok) {
-      const added = testsAdded(diffFiles(reviewBaseRef(root, loaded.config), 'HEAD', { cwd: root }), loaded.config.integrity.test_globs);
+  // Measured against the PR's own base branch (a stacked PR is not charged for the PR below it); a base ref that is not there falls back to the default branch.
+  const testsAddedFor = async (baseRefName) => {
+    try {
+      const loaded = await loadConfig(root);
+      if (!loaded.ok) return undefined;
+      const own = typeof baseRefName === 'string' && baseRefName !== '' ? reviewBaseRef(root, loaded.config, baseRefName) : null;
+      const baseRef = own !== null && refExists(own, { cwd: root }) ? own : reviewBaseRef(root, loaded.config);
+      const added = testsAdded(diffFiles(baseRef, 'HEAD', { cwd: root }), loaded.config.integrity.test_globs);
       // An empty diff (HEAD already inside the base ref, e.g. after a merge-commit merge) says nothing about the PR: no line rather than a line of zeros.
-      if (added.sourceLines + added.testLines > 0) testsAddedLine = added.line;
-    }
-  } catch { /* the line is left out */ }
+      return added.sourceLines + added.testLines > 0 ? added.line : undefined;
+    } catch { return undefined; /* the line is left out */ }
+  };
   const gh = createGitHub({ cwd: root, env: ctx.env });
-  return guardGh(() => {
+  return guardGh(async () => {
     const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
     const { title } = view;
+    const testsAddedLine = await testsAddedFor(view.baseRefName);
     const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine });
     // The weekly Codex spend rides at the end of the line (agent-log close's pending-line match tolerates it).
     const usage = codexUsage({ env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });

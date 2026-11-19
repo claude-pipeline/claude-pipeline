@@ -19,7 +19,7 @@ import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch, trustedDefaultBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { arbiterFailures, countsTowardCap, finalIsReopenable, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
+import { DEFERRABLE_ACCEPT_BY, arbiterFailures, countsTowardCap, finalIsReopenable, isDeferrableAccept, isOwnerDeferral, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
@@ -110,11 +110,14 @@ function recoverState(root, pr, ctx, gh = createGitHub({ cwd: root, env: ctx.env
 // baseline that is plain local progress, not a superseded copy: it must be published, not quarantined. The chain is a parsed JSON tree, so it cannot cycle and
 // the walk ends on its own, however many times Claude re-ruled (the writer sets no limit). Anything that ends without reaching the published final, or whose
 // steps are not each a valid continuation, stays a superseded copy (fail closed).
-// One step: `cur` replaced `prev`. The owner may rule over a Claude / forced final or a final waiting for a human; Claude may not loosen a protected
-// ACCEPT, and may not overrule the owner. The caller has checked that `prev` is the final `cur` names as the one it replaced.
+// One step: `cur` replaced `prev`. The owner may rule over a Claude / forced final or a final waiting for a human, or DEFER (FOLLOW-UP, with the ownerDeferral mark naming who accepted)
+// an unimplemented arbiter / judge / cache ACCEPT (#559); Claude may not loosen a protected ACCEPT, and may not overrule the owner. The caller has checked that `prev` is the final `cur` names as the one it replaced.
 const validStep = (cur, prev) => {
   const owner = isOwnerRuled({ final: cur });
-  if (owner) return isProtectedFinal({ final: prev }) || prev.needsHuman === true;
+  if (owner) {
+    return isProtectedFinal({ final: prev }) || prev.needsHuman === true
+      || (cur.decision === 'FOLLOW-UP' && prev.decision === 'ACCEPT' && DEFERRABLE_ACCEPT_BY.includes(prev.by) && cur.ownerDeferral?.accepted === prev.by && !isOwnerRuled({ final: prev }) && prev.evidence !== 'test');
+  }
   if (isOwnerRuled({ final: prev })) return false;
   return !(isProtectedFinal({ final: prev }) && prev.decision === 'ACCEPT');
 };
@@ -122,8 +125,10 @@ const replacedBy = (final) => (isOwnerRuled({ final }) ? final.overruled : isPro
 const continuesPublished = (mine, theirs) => {
   const published = theirs.final;
   if (mine.final === undefined || published === undefined || canonicalJson(mine.final) === canonicalJson(published)) return false;
-  if (!isProtectedFinal(theirs) && published.needsHuman !== true) return false;
   const target = canonicalJson(published);
+  // A published final that is neither protected nor waiting for a human (a plain ACCEPT) is continued only by the owner's deferral as the single step onto it.
+  if (!isProtectedFinal(theirs) && published.needsHuman !== true
+    && !(isDeferrableAccept(theirs) && isOwnerDeferral(mine) && isOwnerRuled(mine) && canonicalJson(mine.final.overruled) === target)) return false;
   let cur = mine.final;
   for (;;) {
     const prev = replacedBy(cur);
@@ -162,6 +167,8 @@ function itemIsAhead(i, before) {
   if (savedRulingIsAhead(i, before)) return true;
   const addImplemented = Boolean(i.implemented) && before.implemented === undefined;
   const addFollowup = Boolean(i.followupIssue) && before.followupIssue === undefined;
+  // An owner deferral of the published ACCEPT whose follow-up issue was filed before the ruling was published: the deferral is saved work, the new issue link rides with it.
+  if (addFollowup && !addImplemented && isOwnerDeferral(i) && savedRulingIsAhead({ ...i, followupIssue: undefined }, before)) return true;
   if (!addImplemented && !addFollowup) return false;
   return itemKey({ ...i, ...(addImplemented ? { implemented: undefined } : {}), ...(addFollowup ? { followupIssue: undefined } : {}) }) === itemKey(before);
 }

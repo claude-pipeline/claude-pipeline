@@ -250,6 +250,15 @@ test('R2-F2 stats rounds: the plain-text table prints how many PRs had no review
   assert.match(text, /PRs without a review state: 3/);
 });
 
+// Failure caught: a judge-to-Fable escalation (whole-pr, no conflict proof tried) was counted as an `unknown` resolution refusal, blurring the number the line measures (#539); a whole-pr round with no marker (an old round) stays `unknown`.
+test('analysePr: an escalated whole-pr round with no resolutionIneligible is not a refusal; an unmarked one stays unknown', () => {
+  const round = (n, over) => ({ n, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], ...over });
+  const state = { pr: 7, maxRounds: 9, rounds: [round(1, { reviewBaseKind: 'merge-base' }), round(2, { reviewBaseKind: 'whole-pr', escalated: true }), round(3, { reviewBaseKind: 'whole-pr' }), round(4, { reviewBaseKind: 'whole-pr', escalated: true, resolutionIneligible: 'extra-files' })] };
+  const p = analysePr({ repo: 'acme/widgets', pr: 7, state, record: null });
+  assert.deepEqual(p.rounds.map((r) => [r.n, r.resolutionIneligible]), [[1, null], [2, null], [3, 'unknown'], [4, 'extra-files']]);
+  assert.deepEqual(aggregate([p]).ineligible, { unknown: 1, 'extra-files': 1 });
+});
+
 // Failure caught: a round recorded before `resolutionIneligible` existed is read as "no failure", hiding how often the free resolution round was refused (and why).
 test('analysePr / aggregate: reviewKind and resolutionIneligible per counted round; a round without the field reads as unknown, never as no failure; totals by kind and by reason', () => {
   const round = (n, over) => ({ n, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], ...over });

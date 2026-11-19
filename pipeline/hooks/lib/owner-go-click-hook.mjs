@@ -19,10 +19,17 @@ function pendingLine(p) {
   }
   if (p?.kind === 'merge') return prs.length ? `${said}: if the owner chose to approve, run P merge --pr ${prs[0]} --owner-go now; if they chose not to, stop: nothing is approved` : said;
   if (p?.kind === 'live-db') return `${said} (live-database go): if the owner chose to apply, call the Supabase write (apply_migration or execute_sql) with exactly the SQL shown now, the guard verifies the click then; if they chose not to, stop: nothing is applied`;
+  if (p?.kind === 'round' && p.variant === 'round-v2-follow-up') {
+    // Follow up grants nothing: the session first asks the CLI whether the click was verified, BEFORE it reverts anything (defer-fixes refuses "tree is not back" on that probe and prints followUpClick.state)
+    return where ? `${said} (extra round or follow-up for ${where}): if the owner chose "Yes, one more round", run P codex-review --pr ${prs[0]} --round <the n from round-request> now; if they chose "Follow up (Recommended)", that is NOT a grant and approves no merge: FIRST run P triage defer-fixes once (before reverting anything) and continue only if its followUpClick.state is "instructed"; otherwise stop and ask the owner to type "follow up"; if they chose "No", stop: nothing is approved` : said;
+  }
+  if (p?.kind === 'round' && p.variant === 'round-v2-park') return where ? `${said} (extra round for ${where}): if the owner chose "Yes, one more round", run P codex-review --pr ${prs[0]} --round <the n from round-request> now; if they chose "No, stop and park (Recommended)", stop and park the PR: nothing is approved` : said;
   if (p?.kind === 'round') return where ? `${said} (extra round for ${where}): if the owner chose to approve, run P codex-review --pr ${prs[0]} --round <the n from round-request> now; if they chose not to, stop: nothing is approved` : said;
   if (p?.kind === 'ruling') {
     const quotes = Object.entries(p.quotes ?? {}).filter(([, v]) => typeof v === 'string').map(([label, text]) => `${JSON.stringify(label)} -> --owner-quote ${JSON.stringify(text)}`);
-    return `${said}${where ? ` (ruling for ${where})` : ''}: if the owner chose to approve a ruling, run P triage owner-ruling now${quotes.length ? ` with the --owner-quote of the label the owner chose: ${quotes.join('; ')}` : ''}; if they chose not to, stop: nothing is approved`;
+    // #541: only the declining label (rulingAsk's null action, "Not now") stops; Reject all and Follow-up all are rulings too and run the command, so the line is worded by label, never approve / not approve
+    const run = quotes.length ? `if the owner chose one of these labels, run P triage owner-ruling now with its --owner-quote: ${quotes.join('; ')}` : 'if the owner chose any label other than Not now, run P triage owner-ruling now';
+    return `${said}${where ? ` (ruling for ${where})` : ''}: ${run}; if they chose Not now, stop: nothing is ruled`;
   }
   return said;
 }
@@ -30,6 +37,12 @@ function pendingLine(p) {
 // The line for one click result, in the style of the typed lines (hooks/owner-go.mjs). null prints nothing.
 export function clickLine(result) {
   if (result?.pending) return pendingLine(result.pending);
+  if (result?.instruction === 'follow-up') {
+    const n = Array.isArray(result.prs) ? result.prs.find(Number.isInteger) : undefined;
+    const where = result.repo && n !== undefined ? ` for ${result.repo} #${n}` : '';
+    const steps = `This is an instruction, not a grant: it admits no round and approves no merge. Do "Follow up instead of a round" (owner-merge.md): take the unreviewed commits out, push, verify.quick, ci-wait, then P triage defer-fixes --pr ${n ?? '<N>'} --ids <the open ids from round-request> --fix-head <the head the line named> --reason "<why they are low severity>". It re-checks everything and can refuse; if it does, say why and ask again with P triage round-request --pr ${n ?? '<N>'} --ask.`;
+    return result.replay ? `${HEAD} the owner's click was already received (follow up${where}); do not redo steps already done. ${steps}` : `${HEAD} the owner's click is recorded: follow up${where}. ${steps}`;
+  }
   if (result?.recorded) {
     const r = result.recorded;
     if (r.kind === 'live-db-go') return `${HEAD} the owner's click is recorded: live-database go for ${r.op} ${r.op === 'migration' ? r.name : String(r.sqlSha256).slice(0, 12)} on ${r.projectRef}: call the Supabase write with exactly the SQL shown now`;

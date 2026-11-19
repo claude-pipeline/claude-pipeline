@@ -216,6 +216,19 @@ const BASH_DENY = [
   ['sudo wrapper', 'sudo rm -rf ~/.claude/pipeline'],
   ['xargs wrapper', 'echo ~/.claude/pipeline | xargs rm -rf'],
   ['xargs fan-out from a read-only listing', 'find ~/.claude/pipeline -type f | xargs rm'],
+  // (#563 R1-B2: a wrapper that runs a quoted string keeps its text; only a plain data command's quoted text is blanked)
+  ['env -S runs a quoted string that fans out', "find ~/.claude/pipeline -type f | env -S 'nice xargs rm'"],
+  ['flock -c runs a quoted string that fans out', "find ~/.claude/pipeline -type f | flock f -c 'cat | xargs rm'"],
+  // (#563 R2-F1: a head the parser unwraps but WRAPPER_CMDS lacks, and a shell named behind an unlisted runner, keep their quoted text too)
+  ['noglob env -S runs a quoted string that fans out', "find ~/.claude/pipeline -type f | noglob env -S 'nice xargs rm'"],
+  ['gtimeout runs sh -c with a fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 sh -c 'cat | xargs rm'"],
+  // (#563 R3-F1: every INTERPRETERS name keeps its quoted text, not only the SHELL_NAMES list)
+  ['ash -c runs a quoted fan-out', "find ~/.claude/pipeline -type f | ash -c 'cat | xargs rm'"],
+  ['mksh behind gtimeout runs a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 mksh -c 'cat | xargs rm'"],
+  // (#563 R4-F1: a shell the parser runs but no name list holds (rbash, yash) keeps its quoted text: only a known non-runner is blanked)
+  ['rbash -c runs a quoted fan-out', "find ~/.claude/pipeline -type f | rbash -c 'cat | xargs rm'"],
+  ['yash behind gtimeout runs a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 yash -c 'cat | xargs rm'"],
+  ['xargs inside a substitution in a quoted argument (#563: quoted prose is blanked, a substitution is not)', 'echo "$(find ~/.claude/pipeline -type f | xargs rm)"'],
   ['sh fed by a read-only listing', "find ~/.claude/pipeline -type f -printf 'rm %p\\n' | sh"],
   ['eval of a substitution', 'eval "$(cat ~/.claude/pipeline/VERSION)"'],
   ['assignment then use', 'D=~/.claude/pipeline; rm -rf $D'],
@@ -266,6 +279,9 @@ const BASH_ALLOW = [
   ['pwsh Get-Content', `pwsh -NoProfile -Command "Get-Content ~/.claude/settings.json"`],
   ['PowerShell word in an unrelated path', 'ls /repo/docs/PIPELINE.md'],
   ['pipeline protect without --apply', 'node ~/.claude/pipeline/bin/pipeline.mjs protect --repo .'],
+  // #563, second case: the word `parallel` / `xargs` inside a quoted prose argument (a PR title in `summary --built`, `agent-log publish --line`) is data, not a fan-out command
+  ['summary text that says parallel', 'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 561 --outcome awaiting-owner-merge --built "Load-proof guard timing tests and parallel ubuntu Node 20 and 24 CI jobs"'],
+  ['agent-log line that says parallel', "node ~/.claude/pipeline/bin/pipeline.mjs agent-log publish --line 'Load-proof guard timing tests and parallel ubuntu Node jobs (#477, #243)'"],
   ['a different repo .claude dir', 'cat /repo/.claude/settings.json > /dev/null'],
   ['empty command', ''],
 ];
@@ -1106,6 +1122,20 @@ test('#472 owner-go-click: running the click libraries by hand (a path, program 
     assert.match(r.reason, /runs a JavaScript runtime and is not a plain command line/, cmd);
     assert.match(r.reason, /Run the runtime on a line of its own, or keep the library name off that line/, cmd);
     assert.match(r.reason, /or the output of another command/, cmd);
+  }
+  // (#533: a line with a command that can rename another (REDEF_CMDS) or a bare `commands` word is not flat either; the message names that cause too)
+  for (const cmd of [
+    'source ~/.nvm/nvm.sh && git add pipeline/hooks/lib/owner-go-click.mjs && node scripts/test.mjs x.test.mjs',
+    "trap 'rm -f \"$t\"' EXIT; git add pipeline/hooks/lib/owner-go.mjs; node scripts/x.mjs",
+    'hash -r; git add pipeline/hooks/lib/owner-go-click.mjs; node scripts/x.mjs',
+    'ls commands && git add pipeline/hooks/lib/owner-go-click.mjs && node scripts/x.mjs',
+  ]) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /not a plain command line/, cmd);
+    assert.match(r.reason, /a command that can rename another \(alias, hash, source, eval, trap\)/, cmd);
+    assert.match(r.reason, /anything else that cannot be followed command by command/, cmd);
+    assert.match(r.reason, /Run the runtime on a line of its own/, cmd);
   }
   for (const cmd of [
     'node scripts/test.mjs owner-go-click.test.mjs',

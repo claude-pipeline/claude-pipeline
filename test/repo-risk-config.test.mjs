@@ -322,7 +322,7 @@ const DEPTH1_EXEMPT = new Map([
 // or an unreadable clause; '(side effect)' = a bare `import './x.mjs'`. Checked against every root's import clause, static and dynamic.
 const DEPTH1_NAMES = new Map([
   ['pipeline/lib/codex-usage-kinds.mjs', ['summariseUsage']],
-  ['pipeline/lib/round-ask.mjs', ['askSummary', 'costFrom', 'longReviewOf', 'notCleanReasons', 'openItems', 'processReviewSummary', 'recommendedWords', 'roundsFrom', 'statusLines']],
+  ['pipeline/lib/round-ask.mjs', ['askSummary', 'costFrom', 'issuedRoundVariant', 'longReviewOf', 'notCleanReasons', 'openItems', 'processReviewSummary', 'recommendedWords', 'roundsFrom', 'statusLines']],
   ['pipeline/lib/worktree-prune/inspect.mjs', ['unFirm']],
   ['pipeline/lib/worktree-prune/run.mjs', ['pruneLogDir']],
   ['pipeline/lib/stacks/dev.mjs', ['runDevBind']],

@@ -99,6 +99,9 @@ export const requiredBase = (st, forkPoint) => {
   const last = st?.rounds.at(-1);
   return last && !wholePrOwed(st) ? last.toHead : forkPoint;
 };
+// What `codex-review --plan` prints: `base` is the base the NEXT admitted round must use (requiredBase, the one rule checkBase enforces, so `--base <plan.base>` is admitted); `reviewBase` / `reviewBaseKind` are the
+// start and kind of the range the round actually REVIEWS (a merge from main can make that the fork point or a synthetic merge-tree id: never a value `--base` takes).
+export const planRange = (adm) => ({ base: requiredBase(adm.state, adm.forkPoint), reviewBase: adm.review.base, reviewBaseKind: adm.review.kind });
 export const checkBase = (st, { round, base, forkPoint }) => {
   const last = st?.rounds.at(-1);
   const owed = last !== undefined && wholePrOwed(st);
@@ -232,7 +235,7 @@ export function classifyReview({ state, wholePr, base, forkPoint, trusted, escal
 
 // Phase one. `base` and `head` are full SHAs (head is the checked-out HEAD). Returns the admitted round (opaque to the caller except
 // for these fields): { state, view, slug, ghRepo, forkPoint, level, rated, lane, fable, lightLane, review: {base, kind}, resolution,
-// resolutionOnly, resolutionView, resolutionIneligible, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
+// resolutionOnly, resolutionView, resolutionIneligible, escalated, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
 // hashAtHead, dir } plus the inputs it was given.
 export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   const o = { cwd: root };
@@ -346,7 +349,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
 
   return {
     ...c, state, view, slug, level, rated, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView,
-    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, hashAtHead: currentContentHash(root, config),
+    baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, hashAtHead: currentContentHash(root, config), escalated,
   };
 }
 
@@ -492,7 +495,7 @@ export function planRound(adm, { env = process.env, now = Date.now() } = {}) {
     }
   }
   return {
-    ...decision, round, base: adm.review.base, wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom,
+    ...decision, round, ...planRange(adm), wholePr: adm.wholePr === true, budget, governor, facts, modeOffFrom: route.modeOffFrom,
     ...(effortNote === undefined ? {} : { effortNote }), codexModel: route.codexModel, codexModelFrom: route.codexModelFrom,
   };
 }
@@ -557,7 +560,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       const k = reviewedRoundCount(fresh) + 1;
       const records = ownerGrantedRounds({ repo: adm.ghRepo.slug, pr, k, head });
       const newest = records[0];
-      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts };
+      if (newest !== undefined) ownerGrant = { grantId: grantIdOf(newest), k, quote: newest.prompt, ownerTs: newest.ts, ...(typeof newest.ask?.variant === 'string' ? { askVariant: newest.ask.variant } : {}) }; // askVariant: a click on a new-variant dialog (state version 8, lib/state.mjs); a compat marker, never evidence
       // Every record that covers this head is consumed together (a duplicate "extra round" must not admit a second run after
       // discard-round); the first claimer on the machine wins. A failed claim discards the reviewer's answer.
       claimGrant = () => {
@@ -584,6 +587,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       ...(admission === 'uncounted' ? {} : { admission }), ...(ownerGrant === undefined ? {} : { ownerGrant }),
       ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => i.id) } : {}),
       ...(adm.wholePr ? { wholePr: true } : {}),
+      ...(adm.escalated ? { escalated: true } : {}),
       ...(adm.resolutionOnly ? { resolutionOnly: true, ...adm.resolutionView } : {}),
       ...(reviewer === 'fable' && !adm.baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: adm.lane.sensitivePaths.slice(0, 50) } : {}),
     });

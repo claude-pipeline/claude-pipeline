@@ -20,17 +20,17 @@ import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
 import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
-import { askSummary, longReviewOf, processReviewSummary, recommendedWords, roundsFrom } from '../lib/round-ask.mjs';
+import { askSummary, issuedRoundVariant, longReviewOf, processReviewSummary, recommendedWords, roundsFrom } from '../lib/round-ask.mjs';
 import { postMaxApply, fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
-import { clickNotes, roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
+import { clickNotes, followUpClickState, roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  countsTowardCap, isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
@@ -78,13 +78,15 @@ export const meta = {
     '  -> commit, push and quick-verify first: the grant is for that head. The owner answers `extra round` (or `grant round K`, optionally with #N); the owner-go hook records it, and',
     '     `codex-review --round n` then claims it (see its usage). Exit 1 for label mode (no grant exists), a --pr that is not the review state\'s, a repository off github.com,',
     '     or a round that is already allowed (within review.max_rounds, the automatic extra round, or an open grant for this head)',
-    '  -> --ask (click-to-approve #261): also {ask: {askId, questions}}: a choice question (No | Yes, one more round) whose text is exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same grant a typed `extra round` records; otherwise ask: null and askSkipped (owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
+    '  -> --ask (click-to-approve #261): also {ask: {askId, questions}}: a choice question (its first option is the recommended one, see `dialogVariant` below; the legacy dialog is No | Yes, one more round) whose text is exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same grant a typed `extra round` records; otherwise ask: null and askSkipped (owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
+    '  -> `dialogVariant` = the dialog id the ask issued: the one whose first option is the recommendation the summary names (`round-v2-follow-up`, `round-v2-extra-round`, or `round-v2-park` for a blocking loop); `round-v1` (the plain `No` | `Yes, one more round` dialog) when no recommendation could be computed or the lever `PIPELINE_ROUND_DIALOG=legacy` is set (see Click-to-approve).',
     '  -> --past: {ok, line, k, n, head, past: true, remaining}: the LAST line of the reply that asks the owner to approve a round that ALREADY ran (before owner grants were recorded, so it carries none and review-complete refuses it), `🔂 Approve past review round #N: round K · head <head12> · repo owner/name`',
     '     (n = the round to pass to `state past-round-grant`, head = its full head, remaining: [{n, k}] the other rounds that still need it). It picks the OLDEST published counted round past review.max_rounds + 1 that has a LATER counted round and no owner grant (or one whose',
     '     record is gone). Read-only: state, markers and the PR are untouched. The owner answers `approve round` (or `extra round`, `grant round K`, optionally with #N); the hook records it as kind past-round, which never admits a new round; then run `state past-round-grant --pr N --round n`',
     '     --past --ask (click-to-approve): a past round is approved by typing only, so the reply also carries ask: null and askSkipped: \'a past round is approved by typing\' (no ask is issued; type the closing line as before)',
     '     exit 1 {ok:false, error, reason} BEFORE the owner is asked: label-mode, no-max-rounds, state-pr-mismatch, host, history-unreadable | no-published-history | stale-history (run `pipeline state show --pr N`) | unpublished-history (run `pipeline comment --pr N --kind triage`), or nothing-to-approve',
-    'pipeline triage defer-fixes --pr N --ids ID[,ID…] --fix-head SHA --reason TEXT [--repo DIR]',
+    'pipeline triage defer-fixes --pr N --ids ID[,ID…] --fix-head SHA --reason TEXT [--typed-follow-up] [--repo DIR]',
+    '  -> every answer, a refusal or a success, from the eligibility check on carries followUpClick {state, note[, override]}: what became of the owner\'s click on a "Follow up" button of the round dialog (state none|instructed|waiting|refused|unverified|recorded|declined; a refused or unreadable click on a Follow up button, also one refused at once by the click hook (an Enter under 2 s) and one on an ask a newer ask has replaced, stays `refused` / `unverified` across newer asks until a verified later answer; an unreadable clicked ask or spent marker also gives `unverified`; no click, or a newest ask without a Follow up button and no click in force, is none). A click that was received but could not be verified (refused) or read (unverified) REFUSES the deferral (state untouched): the owner clicked, and nothing here proves it. Ask for the round dialog again and have the owner click again or TYPE "follow up"; only after the owner typed it, pass --typed-follow-up, which lifts just that refusal (echoed as override: "typed"; every other refusal still applies). Run defer-fixes once BEFORE reverting anything after a click you cannot see the result of: it refuses "tree is not back" (expected) and prints followUpClick.state',
     '  -> {ok, deferred: [ids], rounds: [every round number holding a deferred item], published, next?}: closes the round limit without another round when the unreviewed fixes are all LOW severity. Each fix is taken out of the tree FIRST (the caller reverted',
     '     every commit since the last reviewed head, pushed and waited for CI); then those ACCEPTs become FOLLOW-UPs (final.by claude, cause round-cap, the overruled ACCEPT kept, the item-level roundCapDeferral {fixHead, reviewedHead, at}), published at once like claude-ruling.',
     '     Run `followups create --round R` for EACH returned round afterwards (a retry is safe: it de-duplicates by fingerprint). Every deferral is a labelled row of the merge Rulings block, so the owner\'s "merge" binds each one by name',
@@ -127,6 +129,7 @@ export const meta = {
     'pipeline triage owner-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --owner-quote TEXT [--pr N] [--repo DIR]',
     '  -> {ok, round, id, final, published: false, next}; records the OWNER\'s decision (final.by owner, needsHuman false, the exact quote and time, the overruled final kept) for an item that needs a human',
     '  -> only with owner_approval: chat; exit 1 for label mode, an item that is not waiting for a human and has no unimplemented Claude ruling (settled items are not reopened), a missing item, an empty reason or quote, or a --pr that is not the review state\'s',
+    '  -> an UNIMPLEMENTED ACCEPT of the arbiter, the judge or a cached copy of theirs (not a test result, not Claude\'s or a forced final, not already the owner\'s) may also be ruled on, with FOLLOW-UP only: the owner defers the accepted fix to an issue (a typed REJECT or ACCEPT of it is refused, exit 1). The final records ownerDeferral {accepted, ruledAt} and keeps the ACCEPT as overruled; the state is written at format version 7; the item is listed in the Rulings block (`by owner deferral (accepted by arbiter)`) and counted at the final gate (the owner\'s "merge" is still needed); `review-complete` refuses until `followups create` has filed its issue; `state show` keeps the local deferral over the published ACCEPT (local-ahead). The ruling request for such an item says it is ACCEPTED, NOT fixed (`notes` in the output, and the row of the --ask dialog); only ask when the OWNER raised the deferral, and it cannot be undone through the CLI',
     '  -> works on an already published round. ACCEPT still needs the fix and a later review round; FOLLOW-UP is filed by `followups create`; the quote is published in the triage comment and the final gate counts it as ownerMerge (the owner\'s "merge" is still needed)',
     '  -> the quote must be the WHOLE owner prompt that answered a reply ENDING with the line `triage ruling-request` printed (`⚖️ Owner ruling needed #N: ID[, ID…] · content <digest12> · repo owner/name`; the owner-go hook records it; any session, last 24 h; white space and case aside), and that answer must be nothing but decisions, `ID: accept|follow-up|reject` per asked id, the id always written (any other word decides nothing; over 1000 characters is not recorded); exit 1 otherwise, or when gh resolves the repository off github.com',
     '  -> the request is bound to the findings\' text: the digest is recomputed over ALL the ids of the request from the current review state and must equal the recorded one, so a rebuilt review that reuses an id for a changed finding (or a request in the old line shape, with no digest) cannot reuse the ruling; ask again with ruling-request',
@@ -343,8 +346,12 @@ const OWNER_TEXT_MAX = 1000;
 
 // Why this ruling may not be recorded, or null. The command exists for ONE case: the owner confirmed in chat what to do with
 // an item that is waiting for a human. It is not a way to reopen an item somebody already settled.
-function ownerRulingRefusal(item, id, round) {
+function ownerRulingRefusal(item, id, round, decision) {
   if (item === undefined) return `no item ${id} in round ${round}`;
+  // #559: an unimplemented ACCEPT of the arbiter, the judge or the cache is not waiting for a human; the owner may only DEFER it (FOLLOW-UP: the fix goes to an issue). REJECT and ACCEPT stay refused.
+  if (isDeferrableAccept(item)) {
+    return decision === 'FOLLOW-UP' ? null : `${id} does not need a human decision (an owner ruling cannot reopen a settled item); an arbiter/judge ACCEPT that is not fixed yet may only be deferred (FOLLOW-UP) by an owner ruling, not ${decision === 'ACCEPT' ? 're-accepted' : 'rejected'}`;
+  }
   // The owner may rule on an item waiting for a human, or (E6) override a Claude or forced final that is not implemented yet.
   const protectedFinal = isProtectedFinal(item);
   if (item.final?.needsHuman !== true && !protectedFinal) return `${id} does not need a human decision (an owner ruling cannot reopen a settled item)`;
@@ -382,7 +389,7 @@ async function ownerRuling(rest, ctx) {
     const state = requireState(root);
     if (pr !== undefined && state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     const item = findRound(state, n).items.find((i) => i.id === id);
-    const why = ownerRulingRefusal(item, id, n);
+    const why = ownerRulingRefusal(item, id, n, decision);
     if (why) return refuse(why);
     // Phase 3b: the quote must be the owner's words, as the owner-go recorder wrote them down after a reply that asked for this ruling
     // (hooks/lib/owner-go.mjs presentedRuling): before, --owner-quote was the agent's own word. The repository is the one gh resolves on
@@ -403,7 +410,8 @@ async function ownerRuling(rest, ctx) {
     seedBaseline({ ctx, root, pr: prNum, state }); // the `comment --kind triage` that publishes this ruling needs the baseline too
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });
     saveState(root, updateItems(state, n, [ruled]));
-    const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it unless it overrules a published Claude or forced final, or a published final waiting for a human (then it is kept as local-ahead)`;
+    const deferred = isOwnerDeferral(ruled);
+    const next = `run \`pipeline comment --pr ${state.pr ?? pr ?? '<N>'} --kind triage\` now: until the triage comment is re-posted the ruling is only local, and \`pipeline state show\` restores the published state without it unless it overrules a published Claude or forced final, a published final waiting for a human, or a published unimplemented arbiter/judge ACCEPT it defers (then it is kept as local-ahead)${deferred ? `; the deferred fix is NOT in this merge: file its issue now with \`pipeline followups create --round ${n}\` (the review cannot complete until it is filed)` : ''}`;
     return { exitCode: EXIT.OK, output: { ok: true, round: n, id, final: ruled.final, published: false, next } };
   }, pr));
 }
@@ -881,6 +889,7 @@ const contentOfState = (state) => (ids) => {
 };
 
 const oneLine = (x) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
+const deferNote = (item, { id = true } = {}) => `${id ? `${item.id}: ` : ''}ACCEPTED by ${item.final?.ownerDeferral?.accepted ?? item.final?.by}, NOT fixed; follow-up = defer the fix to an issue; only when it is not a regression vs the default branch`;
 
 // The line that ends the reply asking the owner to rule: the CLI writes it, so the agent cannot state a digest of its own choosing.
 async function rulingRequest(rest, ctx) {
@@ -903,11 +912,13 @@ async function rulingRequest(rest, ctx) {
     const { slug, host } = gh.repo();
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
     const line = `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}`;
-    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line } };
+    // F1: an item that is an ACCEPT (not fixed) is said so, in the CLI's own words, so the owner knows "follow-up" defers an accepted fix (the closing line keeps its fixed shape: the owner-go hook parses it).
+    const notes = items.filter((i) => isDeferrableAccept(i) || isOwnerDeferral(i)).map((i) => deferNote(i));
+    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}) } };
     // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
-    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}`), line].join('\n');
+    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}`), line].join('\n');
     const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block });
-    return { exitCode: EXIT.OK, output: { ok: true, line, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
+    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
   }, pr));
 }
 
@@ -1005,8 +1016,9 @@ async function roundRequest(rest, ctx) {
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'trip-wire', k, n, head, tripWire: wire, processReview, ...(longReview === null ? {} : { longReview: { ...longReview, recommended: recommendedWords(shown.recommend, longReview) } }), ...(nextRound === undefined ? {} : { nextRound }), warnings } };
     }
     // (#261) click-to-approve: --ask also writes the dialog's ask file (the question text is exactly the line); it never changes the display fields above.
-    const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line }), ctx }) : {};
-    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, ...shown, ...(nextRound === undefined ? {} : { nextRound }), warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
+    const dialogVariant = issuedRoundVariant({ env: ctx.env ?? process.env, recommend: shown.recommend, longReview }); // the dialog whose first option is the summary's recommendation; the lever PIPELINE_ROUND_DIALOG=legacy narrows it to round-v1; the id issued is named in the output
+    const asked = values.ask === true ? askFields({ gate: clickGate({ config, root, ctx }), parts: roundAsk({ repo: slug, pr, line, variant: dialogVariant }), ctx }) : {};
+    return { exitCode: EXIT.OK, output: { ok: true, line, k, n, head, dialogVariant, ...shown, ...(nextRound === undefined ? {} : { nextRound }), warnings, ...asked, ...(wire.tripped ? { tripWire: wire, processReview } : {}) } };
   }, pr));
 }
 
@@ -1021,14 +1033,17 @@ function tripWireOf({ state, config, root, head, k, shown, gh, longReview }) {
     const wire = roundTripWire(state, { extraRounds: smallest('trip_wire_extra_rounds'), notFalling: smallest('trip_wire_not_falling') });
     if (!wire.tripped) return { wire, processReview: null };
     let fixScope = null;
+    let baseNote;
     try {
       const last = state.rounds.findLast(countsTowardCap);
       if (last !== undefined) {
         const ineligible = mergeInIneligible({ pr: state.pr, gh, root, config });
-        fixScope = fixRoundScope({ files: fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, { cwd: root }).files, configs });
+        const measured = fixRoundFiles({ from: last.toHead, head, baseRef: reviewBaseRef(root, config), ineligible }, { cwd: root });
+        baseNote = measured.baseNote;
+        fixScope = fixRoundScope({ files: measured.files, configs });
       }
     } catch { /* not measured: the line is left out */ }
-    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, nextRound: k, longReview, recommend: shown.recommend }) };
+    return { wire, processReview: processReviewSummary({ rounds: shown.rounds ?? roundsFrom(state), cost: shown.cost ?? null, open: shown.open, notClean: shown.notClean, wire, fixScope, baseNote, nextRound: k, longReview, recommend: shown.recommend }) };
   } catch {
     return { wire: { tripped: false, reviewed: 0, max: null, acceptsByRound: [], reasons: [] }, processReview: null };
   }
@@ -1071,7 +1086,7 @@ function roundAskFields({ root, config, state, pr, gh, head, grants, grantGap, w
 // The rules are triage.mjs#deferEligibility (refusals 1, 2 and 5, on the state) plus the two that need git (3: the tree is back at the reviewed content, 4: --fix-head). Nothing is
 // saved unless all pass. It is published at once, like a Claude ruling: the item changed from ACCEPT/implemented to FOLLOW-UP, which `state show` would not keep as unpublished work.
 async function deferFixes(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, 'fix-head': { type: 'string' }, reason: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, 'fix-head': { type: 'string' }, reason: { type: 'string' }, repo: { type: 'string' }, 'typed-follow-up': { type: 'boolean' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean))];
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
@@ -1100,7 +1115,7 @@ async function deferFixes(rest, ctx) {
     const o = { cwd: root };
     // The owner's typed "extra round" always wins over a deferral, at whatever head it was typed for (the head moved when the fixes were reverted).
     // STRICT lookups (hooks/lib/owner-go.mjs#ownerGrantLookups): a record that cannot be read refuses, it never reads as "no grant".
-    const strict = ownerGrantLookups({ repo: slug, pr });
+    const strict = ownerGrantLookups({ repo: slug, pr, home: ctx.home });
     const grants = asGrants(strict.grants);
     const grantGap = strict.grantGap;
     const diff = reviewedDiff(root, config, state);
@@ -1110,16 +1125,26 @@ async function deferFixes(rest, ctx) {
     const trusted = trustedBaseConfig(root, config);
     if (trusted.problem) return refuse(`severity could not be judged: the trusted base config is unreadable (${asciiLine(trusted.problem, 160)}): fix .claude/pipeline.yml at the default branch's fork point, or ask the owner for an extra round`);
     let eligible;
+    let eligibleError = null;
     try {
       eligible = deferEligibility(state, config, diff.files, { grants, grantGap, baseConfig: trusted.config });
     } catch (err) {
-      return refuse(`severity could not be judged (${asciiLine(err?.message, 160)}): fix the pipeline.yml lists, or ask the owner for an extra round`);
+      eligibleError = err;
     }
-    if (!eligible.eligible) return refuse(`the fixes cannot be deferred: ${eligible.refusals.join('; ')}`, { refusals: eligible.refusals });
+    // What became of the owner's click on a Follow up button (round-v2-follow-up). Read AFTER the strict lookups above (deferEligibility called them, which settled any pending click) and BEFORE any
+    // refusal below is returned, so every answer from here on carries it: a Follow up click grants nothing, so nothing else would stop a deferral whose click was refused or could not be read.
+    const click = followUpClickState({ repo: slug, pr, home: ctx.home });
+    const followUpClick = { state: click.state, note: click.note, ...(values['typed-follow-up'] === true ? { override: 'typed' } : {}) };
+    const refuseWith = (reason, extra = {}) => refuse(reason, { ...extra, followUpClick });
+    if (eligibleError !== null) return refuseWith(`severity could not be judged (${asciiLine(eligibleError?.message, 160)}): fix the pipeline.yml lists, or ask the owner for an extra round`);
+    if (!eligible.eligible) return refuseWith(`the fixes cannot be deferred: ${eligible.refusals.join('; ')}`, { refusals: eligible.refusals });
+    if ((click.state === 'refused' || click.state === 'unverified') && values['typed-follow-up'] !== true) {
+      return refuseWith(`the owner's click on the follow-up dialog could not be verified (${click.reason ?? click.state}): nothing was deferred. Run P triage round-request --pr ${pr} --ask again and ask the owner to click again or to type "follow up"; after a typed "follow up", run defer-fixes again with --typed-follow-up`);
+    }
     const want = [...eligible.ids].sort();
     const got = [...ids].sort();
     if (want.length !== got.length || want.some((id, i) => id !== got[i])) {
-      return refuse(`--ids must be exactly the accepted fixes no round has reviewed (${want.join(', ')}), no more and no fewer (got ${got.join(', ')}); there is no partial defer`);
+      return refuseWith(`--ids must be exactly the accepted fixes no round has reviewed (${want.join(', ')}), no more and no fewer (got ${got.join(', ')}); there is no partial defer`);
     }
     // Refusal 3: the tree is back at the reviewed content (the SAME anchor the coverage check uses).
     refreshBaseRef(root, config);
@@ -1127,18 +1152,18 @@ async function deferFixes(rest, ctx) {
     if (hash !== last.contentHashAtToHead) {
       let merged = false;
       try { merged = Number(git(['rev-list', '--merges', '--count', `${revParse(last.toHead, o)}..HEAD`], o)) > 0; } catch { /* the hint is optional */ }
-      return refuse(`the tree is not back at the last reviewed content (head ${String(last.toHead).slice(0, 12)}): revert every commit made since then (fixes and anything else), push, run quick verify and wait for CI, then run defer-fixes again${merged ? '; the default branch was merged in since that head and moved the content: record that update as a base-only round first (codex-review for the new head, which runs no Codex), then run defer-fixes again' : ''}`);
+      return refuseWith(`the tree is not back at the last reviewed content (head ${String(last.toHead).slice(0, 12)}): revert every commit made since then (fixes and anything else), push, run quick verify and wait for CI, then run defer-fixes again${merged ? '; the default branch was merged in since that head and moved the content: record that update as a base-only round first (codex-review for the new head, which runs no Codex), then run defer-fixes again' : ''}`);
     }
     // Refusal 4: --fix-head is a commit on this branch whose content is NOT the reviewed one (it points the follow-up issues at the removed fix; nothing else depends on it).
     let fixFull;
     try {
       fixFull = revParse(`${fixHead}^{commit}`, o);
     } catch {
-      return refuse(`--fix-head ${asciiLine(fixHead, 60)} is not a commit in this repository`);
+      return refuseWith(`--fix-head ${asciiLine(fixHead, 60)} is not a commit in this repository`);
     }
-    if (!isAncestor(fixFull, 'HEAD', o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is not an ancestor of HEAD`);
+    if (!isAncestor(fixFull, 'HEAD', o)) return refuseWith(`--fix-head ${fixFull.slice(0, 12)} is not an ancestor of HEAD`);
     // The fix descends from the last REVIEWED head: an older head would show the reviewed work in reverse in the issue's `git diff <anchor> <fix>` and the owner-bound Rulings row.
-    if (!isAncestor(revParse(lastReviewed.toHead, o), fixFull, o)) return refuse(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(lastReviewed.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
+    if (!isAncestor(revParse(lastReviewed.toHead, o), fixFull, o)) return refuseWith(`--fix-head ${fixFull.slice(0, 12)} is older than the last reviewed head ${String(lastReviewed.toHead).slice(0, 12)}: pass the head that held the fixes (a descendant of the reviewed head)`);
     // The anchor (the reviewedHead the issue compares against): the NEWEST round, base-only or not, whose head the fix descends from, so the issue shows just the fix whether the default branch
     // was merged in before the fix (that base-only round) or only after the revert (a base-only round the fix does not descend from, so an older one). A head that no longer resolves is skipped.
     // When the default branch was merged in BETWEEN the fix and the revert, no round sits after that merge and above the fix, so that anchor lacks the merge and the issue's compare would show it (#287).
@@ -1174,7 +1199,7 @@ async function deferFixes(rest, ctx) {
     }
     const fixHash = reviewContentHash({ branch: hashBranch(root, config), agentLog: config.agent_log, head: fixFull }, o);
     if ([last, anchor, lastReviewed].some((r) => fixHash === r.contentHashAtToHead)) {
-      return refuse(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
+      return refuseWith(`--fix-head ${fixFull.slice(0, 12)} has the reviewed content, so it is not the head that held the fixes: pass the head the round-request line named`);
     }
     seedBaseline({ ctx, root, pr, state });
     // Format version 3: a pre-deferral pipeline reads version 2 and would drop the deferral rows from the Rulings block and let Claude reopen them (state.mjs SUPPORTED_STATE_VERSION).
@@ -1182,7 +1207,7 @@ async function deferFixes(rest, ctx) {
     saveState(root, next);
     const wanted = new Set(want);
     const rounds = next.rounds.filter((r) => (r.items ?? []).some((i) => wanted.has(i.id))).map((r) => r.n).sort((a, b) => a - b);
-    return { exitCode: EXIT.OK, output: { ok: true, deferred: want, rounds, ...publishRuling({ ctx, root, pr, state: next }), ...(warnings.length ? { warnings } : {}) } };
+    return { exitCode: EXIT.OK, output: { ok: true, deferred: want, rounds, followUpClick, ...publishRuling({ ctx, root, pr, state: next }), ...(warnings.length ? { warnings } : {}) } };
   }, pr));
 }
 

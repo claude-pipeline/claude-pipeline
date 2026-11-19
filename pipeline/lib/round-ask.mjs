@@ -11,6 +11,23 @@ const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 const plural = (n, one, many = `${one}s`) => `${n} ${n === 1 ? one : many}`;
 const BUCKET_WORDS = { BLOCKING: 'BLOCKING', SUGGESTION: 'SUGGESTIONS', WORTH_CONSIDERING: 'WORTH CONSIDERING' };
 const SHOWN = 6;
+// The round dialog variant `round-request --ask` issues (round discipline 2, B2): the one whose first option is the recommended one the summary names. `recommend` is shown.recommend
+// ('follow-up' | 'extra-round' | undefined when the display could not compute it); `longReview` is longReviewOf(). A counted round 6+ blocking loop recommends stopping and parking (a display failure
+// with a blocking loop still has that recommendation); no computed recommendation and no blocking loop -> the legacy dialog, so the dialog and the summary always agree.
+export const ROUND_DIALOG_LEGACY = 'round-v1';
+export function roundDialogVariant(recommend, longReview) {
+  if (longReview?.blockingLoop === true) return 'round-v2-park';
+  if (recommend === 'follow-up') return 'round-v2-follow-up';
+  if (recommend === 'extra-round') return 'round-v2-extra-round';
+  return ROUND_DIALOG_LEGACY;
+}
+// The lever `PIPELINE_ROUND_DIALOG=legacy` (the exact string; anything else does nothing) can only narrow to the legacy dialog and is read at ISSUE time only: verification never reads it.
+export const roundDialogLever = (env) => env?.PIPELINE_ROUND_DIALOG === 'legacy';
+export function issuedRoundVariant({ env, recommend, longReview } = {}) {
+  if (roundDialogLever(env)) return ROUND_DIALOG_LEGACY;
+  return roundDialogVariant(recommend, longReview);
+}
+
 // The counted round (k) from which the ask also shows how the last rounds went (4-5 rounds in, the review is usually a loop the owner should see, not just pay for).
 export const LONG_REVIEW_FROM = 6;
 
@@ -149,15 +166,19 @@ const longReviewLines = (longReview) => {
 };
 
 // The process review the trip-wire (triage.mjs#roundTripWire) asks for before another round (#374 PR B): a prompt, not a gate. `wire` = roundTripWire's answer, `fixScope` = fixRoundScope's (or null
-// when it could not be measured); `longReview` = longReviewOf's answer (or null) and `recommend` the ask's follow-up | extra-round value, for the Recommended: words.
+// when it could not be measured), `baseNote` = fixRoundFiles' note when the measure fell back to the round head (#549; the wording `state fix-scope` shows); `longReview` = longReviewOf's
+// answer (or null) and `recommend` the ask's follow-up | extra-round value, for the Recommended: words.
 // -> { headline, summary }; the headline is the one line the park comment carries (`pipeline comment --kind blocked --reason`). Pure and display only.
-export function processReviewSummary({ rounds, cost, open, notClean, wire, fixScope, nextRound, longReview = null, recommend }) {
+export function processReviewSummary({ rounds, cost, open, notClean, wire, fixScope, baseNote, nextRound, longReview = null, recommend }) {
   const past = Number.isFinite(wire.max) ? Math.max(0, wire.reviewed - wire.max) : 0;
   const share = wire.reviewed > 0 ? Math.round((past / wire.reviewed) * 100) : 0;
   const headline = `Process review before round ${nextRound}: ${wire.reasons.map((r) => asciiLine(r, 160)).join('; ')}`;
   const lines = [headline, 'This is a prompt, not a gate: the owner decides, and the usual extra-round words are still needed.', ...statusLines({ rounds, cost, open: open ?? [], notClean: notClean ?? [] })];
   lines.push(`New accepts per round: ${wire.acceptsByRound.join(', ') || 'none'}. Past the limit: ${past} of ${wire.reviewed} counted rounds (${share}%).`);
-  if (fixScope) lines.push(fixScope.flagged ? `Fix scope since the last review: flagged (${fixScope.reasons.map((r) => asciiLine(r, 120)).join('; ')}).` : `Fix scope since the last review: not flagged (${fixScope.nonTestLines} non-test added lines).`);
+  if (fixScope) {
+    const verdict = fixScope.flagged ? `flagged (${fixScope.reasons.map((r) => asciiLine(r, 120)).join('; ')})` : `not flagged (${fixScope.nonTestLines} non-test added lines)`;
+    lines.push(`Fix scope since the last review: ${verdict}.${typeof baseNote === 'string' ? ` Note: ${asciiLine(baseNote, 500)}.` : ''}`);
+  }
   lines.push(...longReviewLines(longReview));
   const words = recommend === undefined && !longReview?.blockingLoop ? null : recommendedWords(recommend, longReview);
   lines.push(`${words === null ? '' : `Recommended: ${words}. `}Options: file the open items as follow-up issues (triage defer-fixes when it is eligible), split the PR, or run one more round (round-request --after-process-review).`);

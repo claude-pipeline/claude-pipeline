@@ -534,7 +534,7 @@ executable.
   `model_not_found`; it never silently falls back).
   With `owner_approval: chat` Claude now decides those items itself and records why (`pipeline triage claude-ruling`): a dismissal of a BLOCKING or security item, or any REJECT, needs a Codex
   second review that also dismisses it at high confidence, and every such dismissal is shown to you in a Rulings block above the merge request, so your "merge" covers it. You are not asked to type a ruling.
-  If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (`pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
+  If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (an arbiter's accepted fix that is not built yet can be deferred to an issue the same way, follow-up only; `pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
   is recorded on this machine and must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item, reasons in another message; it is published in the triage comment). Then remove `needs-human`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **Repo moved / transferred?** Your earlier "merge", ruling and `extra round` records name the old repository, so `P review-complete` / `P merge` can say an owner grant "cannot be verified". In your own terminal (not in Claude Code) record the move once; GitHub must confirm it, and only records made before the move then count for the new name:
