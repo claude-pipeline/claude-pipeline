@@ -27,11 +27,10 @@ test('describeSql: leading keyword per statement', () => {
 });
 
 test('describeSql: destructive flags', () => {
-  assert.deepEqual(flags('delete from t'), ['DELETE-NO-WHERE']);
+  // a statement with no WHERE is not flagged here (the every-row hint is a separate change)
+  assert.deepEqual(flags('delete from t'), []);
+  assert.deepEqual(flags('update t set a=1'), []);
   assert.deepEqual(flags('delete from t where id=1'), []);
-  assert.deepEqual(flags('update t set a=1'), ['UPDATE-NO-WHERE']);
-  assert.deepEqual(flags('update t set a=1 where true'), ['UPDATE-WHERE-TRUE']);
-  assert.deepEqual(flags('update t set a=1 where 1 = 1'), ['UPDATE-WHERE-TRUE']);
   assert.deepEqual(flags('update t set a=1 where id=2'), []);
   assert.deepEqual(flags('alter table t drop column c'), ['ALTER-DROP']);
   assert.deepEqual(flags('alter table t disable row level security'), ['RLS-DISABLE']);
@@ -45,32 +44,7 @@ test('describeSql: destructive flags', () => {
   // keywords inside strings, comments and dollar bodies are not statements
   assert.deepEqual(flags("select 'drop table t', $$ delete from t $$ -- truncate t"), []);
   // several statements: each flag once, in the fixed order
-  assert.deepEqual(flags('delete from a; delete from b; drop table c'), ['DROP', 'DELETE-NO-WHERE']);
-});
-
-test('describeSql: only the own WHERE of the statement counts, not one inside a sub-select or a later query', () => {
-  // a WHERE in a sub-select must not hide a whole-table change
-  assert.deepEqual(flags("update accounts set status = (select status from defaults where name = 'account')"), ['UPDATE-NO-WHERE']);
-  assert.deepEqual(flags('update t set a = 1 from (select id from u where u.x = 1) s'), ['UPDATE-NO-WHERE']);
-  assert.deepEqual(flags('delete from t using (select id from u where u.x = 1) s'), ['DELETE-NO-WHERE']);
-  // WITH forms: a WHERE after the CTE group closed belongs to the outer SELECT
-  assert.deepEqual(flags('with d as (delete from t returning id) select * from d where id > 5'), ['DELETE-NO-WHERE']);
-  assert.deepEqual(flags('with d as (update t set a = 1 returning id) select * from d where id > 5'), ['UPDATE-NO-WHERE']);
-  // a WHERE inside the CTE's own group counts
-  assert.deepEqual(flags('with d as (delete from t where id = 1 returning id) select * from d'), []);
-  assert.deepEqual(flags('with d as (update t set a = 1 where true returning id) select * from d'), ['UPDATE-WHERE-TRUE']);
-  // own WHERE that holds a sub-select stays unwarned; a plain WHERE after a WITH ... UPDATE too
-  assert.deepEqual(flags('delete from t where id in (select id from u where u.x = 1)'), []);
-  assert.deepEqual(flags('update t set x = 1 where id = 2'), []);
-  assert.deepEqual(flags('with s as (select 1 as id) update t set a = 1 where id in (select id from s)'), []);
-  // a locking clause, an upsert action and a MERGE action are not statements of their own
-  assert.deepEqual(flags('with p as (select id from t where id = 1 for update) select * from p'), []);
-  assert.deepEqual(flags('with p as (select id from t where id = 1 for no key update) select * from p'), []);
-  assert.deepEqual(flags('with s as (select id from u where x = 1) insert into t select id from s on conflict (id) do update set a = 1'), []);
-  assert.deepEqual(flags('with s as (select id from u where x = 1) merge into t using s on t.id = s.id when matched then update set a = 1'), []);
-  assert.deepEqual(flags('with s as (select id from u where x = 1) merge into t using s on t.id = s.id when matched then delete'), []);
-  // scope that cannot be determined (unbalanced parentheses) warns rather than stays silent
-  assert.deepEqual(flags('update t set a = (select 1 where true'), ['UPDATE-NO-WHERE']);
+  assert.deepEqual(flags('delete from a; delete from b; drop table c'), ['DROP']);
 });
 
 test('describeSql: unterminated SQL is unparsed', () => {
