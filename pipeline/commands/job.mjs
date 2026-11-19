@@ -14,7 +14,7 @@ import { escapeArgument } from '../lib/proc.mjs';
 export const meta = {
   summary: 'run a long command detached (start), poll it (wait), or read its state (read)',
   usage: [
-    'pipeline job start [--repo DIR] [--tag TAG] NAME -- CMD...   -> {ok, name, jobDir, pid, runId, tag}; exit 1 {ok:false, refused:true, reason} when a guard denies CMD',
+    'pipeline job start [--repo DIR] [--tag TAG] NAME -- CMD...   -> {ok, name, cwd, jobDir, pid, runId, tag} (cwd = the directory the command runs in: --repo, else the current one); exit 1 {ok:false, refused:true, reason} when a guard denies CMD',
     '  --tag TAG: what the job is about (default: the repo HEAD sha); keep the returned runId and hand it to wait/read as --run-id',
     'pipeline job wait  [--repo DIR] [--run-id ID] NAME [--timeout SEC]   (default 540, max 570) -> {ok, name, state, tag, runId, exitCode?, tail}',
     'pipeline job wait  [--repo DIR] [--run-id ID] --until-done [--max-minutes M] NAME   (M default 60, max 120) -> same shape; BACKGROUND ONLY (Bash run_in_background): a foreground call is killed at 600 s,',
@@ -106,7 +106,7 @@ async function start(rest, ctx) {
     const walked = ctx?.leaseAncestorPid && holderOpts.ancestry === undefined ? { ancestorPid: ctx.leaseAncestorPid } : {};
     const handoff = holderHandoff({ worktree: root, env, ...walked, ...holderOpts });
     const started = startJob(name, quoteCommand(args, platform), { cwd: root, policy, tag: values.tag ?? headOrNull(root), env: handoff });
-    return { exitCode: EXIT.OK, output: { ok: true, ...started } };
+    return { exitCode: EXIT.OK, output: { ok: true, ...started, cwd: root } };
   } catch (err) {
     if (refusal !== null) return { exitCode: EXIT.FAILED, output: { ok: false, refused: true, reason: refusal } };
     const mapped = jobError(err);

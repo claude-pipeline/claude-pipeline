@@ -437,6 +437,7 @@ test('job: start then wait reports done with exit code 0 and the output tail', (
   assert.equal(started.json.ok, true);
   assert.equal(started.json.name, 'ok');
   assert.equal(started.json.jobDir, join(jobsDir(repo), 'ok'));
+  assert.equal(started.json.cwd, repo.dir, 'start says which directory the command runs in (--repo, else the current one)');
   assert.equal(typeof started.json.pid, 'number');
   const waited = cli(repo.dir, ['job', 'wait', 'ok', '--timeout', '30']);
   assertExit(waited, 0, waited.stdout);
