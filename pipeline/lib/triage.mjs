@@ -121,7 +121,8 @@ const regressionAmong = (globs, paths) => regressionOnlyFor(paths.map((p) => ({ 
 // -> { name, waive } | null. `name` is the first glob that matches the item's file: the marker `final.sameOnBase`, set for EVERY arbiter FOLLOW-UP / REJECT on such a file, whatever its
 // bucket, category or scope (so the Rulings block lists it, the filing gate holds a FOLLOW-UP until its issue is filed and the owner's merge is bound to it). `waive` is true only when
 // the BLOCKING-security needsHuman exception may apply: `files` (the PR's WHOLE diff from the merge base, git.mjs#diffFiles entries) holds exactly ONE entry for the file, it is a plain
-// modification (status M: not an added file, a rename or a copy, so the path exists at the merge base and the arbiter could compare it), old and new path are the one clean repo path, and it
+// modification (status M: not an added file, a rename or a copy, so the path exists at the merge base and the arbiter could compare it; not a binary file by git's own numstat verdict (`gitBinary`: --text hides it
+// in `binary`), a symlink or a submodule, which have no text to compare), old and new path are the one clean repo path, and it
 // matches a glob. Anything else: no waiver, today's rule.
 function sameOnBaseOf(item, { globs, files } = {}) {
   if (!Array.isArray(globs) || globs.length === 0 || typeof item.file !== 'string' || item.file === '') return null;
@@ -129,7 +130,7 @@ function sameOnBaseOf(item, { globs, files } = {}) {
   if (hit === undefined) return null;
   const entries = Array.isArray(files) && locationProblem(item.file) === null ? files.filter((f) => entryPaths(f).includes(item.file)) : [];
   const only = entries.length === 1 ? entries[0] : null;
-  const waive = only !== null && only.status === 'M' && only.binary !== true && only.oldPath === item.file && only.newPath === item.file && regressionAmong(globs, entryPaths(only)).length > 0;
+  const waive = only !== null && only.status === 'M' && only.binary !== true && only.gitBinary !== true && only.symlink !== true && only.gitlink !== true && only.oldPath === item.file && only.newPath === item.file && regressionAmong(globs, entryPaths(only)).length > 0;
   return { name: hit, waive };
 }
 
@@ -186,7 +187,7 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
       const sob = f.ruling === 'FOLLOW-UP' ? sameOnBaseOf(f, regression ?? {}) : null;
       const waived = oom?.waive === true || (sob?.waive === true && f.scope === SAME_ON_BASE);
       if (defersBlockingSecurity && !waived) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding', cause: 'security-dismissal' };
-      else final = { ...final, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name }) };
+      else final = { ...final, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(f.scope === SAME_ON_BASE ? { scope: SAME_ON_BASE } : {}) }) };
     }
     const item = {
       id: `R${round}-F${i + 1}`,
@@ -426,7 +427,7 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
       if (dismissesBlockingSecurity && !waived) {
         next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item', cause: 'security-dismissal' };
       } else {
-        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name }) };
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' ? { scope: SAME_ON_BASE } : {}) }) };
       }
     }
     return next;
@@ -997,7 +998,7 @@ const byLabel = (item) => {
   // who reviewed it second is part of the bound Rulings row (R5-5): claude+codex | claude+substitute-opus | claude+substitute-fable
   if (by === 'claude') return item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude';
   if (by === 'arbiter' && typeof item.final?.outOfModel === 'string' && item.final.outOfModel !== '') return `arbiter (outside threat model ${asciiLine(item.final.outOfModel, 40)})`;
-  if (by === 'arbiter' && isSameOnBase(item)) return 'arbiter (same as merge-base)';
+  if (by === 'arbiter' && isSameOnBase(item)) return item.final.scope === SAME_ON_BASE ? 'arbiter (same as merge-base)' : 'arbiter (regression-only path)';
   return typeof by === 'string' && by !== '' ? by : 'unknown';
 };
 // An arbiter dismissal on a file review.regression_only_paths covers (final.sameOnBase, also on a cached copy): listed in the Rulings block, and a FOLLOW-UP needs its issue.

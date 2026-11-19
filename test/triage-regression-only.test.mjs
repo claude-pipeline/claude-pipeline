@@ -50,7 +50,7 @@ test('validateRulings: scope same-on-base is accepted with FOLLOW-UP only, on a 
 test('applyRulings: a BLOCKING security FOLLOW-UP with scope same-on-base on a matched, plainly modified file is final, marked with the glob, no human', () => {
   const it = item();
   const [out] = apply([it], [rule(it)]);
-  assert.deepEqual(out.final, { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'the same code is on the base', sameOnBase: 'pipeline/hooks/**' });
+  assert.deepEqual(out.final, { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'the same code is on the base', sameOnBase: 'pipeline/hooks/**', scope: 'same-on-base' });
 });
 
 test('applyRulings: no regression list, a file outside the globs, or no scope: the same ruling parks for a human as security-dismissal; there is no category restriction when the scope is given', () => {
@@ -83,6 +83,10 @@ test('F4 applyRulings: an added file, a rename (into or inside the matched paths
     'a file matching two entries': [{ file: 'pipeline/hooks/a.mjs' }, [...FILES, entry('pipeline/hooks/b.mjs', { oldPath: 'pipeline/hooks/a.mjs' })]],
     'file not in the diff': [{ file: 'pipeline/hooks/ghost.mjs' }, FILES],
     'binary entry': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { binary: true })]],
+    // R1-B2: --text prints a binary file as text, so `binary` stays false; git's numstat verdict (`gitBinary`) and the entry kind decide
+    'binary by git numstat (shown as text by --text)': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { gitBinary: true })]],
+    'symlink entry': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { symlink: true })]],
+    'submodule entry': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { gitlink: true })]],
     'climbs out': [{ file: 'pipeline/hooks/../../etc/passwd' }, FILES],
     'absolute': [{ file: '/pipeline/hooks/a.mjs' }, FILES],
   };
@@ -114,8 +118,8 @@ test('F2 applyRulings: a SUGGESTION FOLLOW-UP without scope on a matched file is
   assert.deepEqual(out.map((i) => [i.final.decision, i.final.needsHuman, i.final.sameOnBase]), [['FOLLOW-UP', false, 'pipeline/hooks/**'], ['REJECT', false, 'pipeline/hooks/**']]);
   const s = stateOf(out);
   assert.deepEqual(rulingsInventory(s).rows.map((r) => r.split(' · ').slice(0, 5)), [
-    ['R1-S1', 'FOLLOW-UP', 'SUGGESTION', 'maintainability', 'by arbiter (same as merge-base)'],
-    ['R1-S2', 'REJECT', 'WORTH_CONSIDERING', 'design', 'by arbiter (same as merge-base)'],
+    ['R1-S1', 'FOLLOW-UP', 'SUGGESTION', 'maintainability', 'by arbiter (regression-only path)'],
+    ['R1-S2', 'REJECT', 'WORTH_CONSIDERING', 'design', 'by arbiter (regression-only path)'],
   ]);
   assert.match(reviewEligibilityProblems(s).join(';'), /same-on-base follow-up\(s\) without a filed issue: R1-S1 \(run followups create\)/);
   assert.doesNotMatch(reviewEligibilityProblems(s).join(';'), /R1-S2/, 'a REJECT owes no issue');
@@ -155,7 +159,7 @@ const findingItems = (list, opts = {}) => fableFindingItems(list, 1, { regressio
 
 test('fableFindingItems: a same-on-base BLOCKING security finding is final with the marker; without the list, scope, a matched file or a plain modification it is security-dismissal', () => {
   const [a] = findingItems([finding()]);
-  assert.deepEqual(a.final, { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'same on the base', sameOnBase: 'pipeline/hooks/**' });
+  assert.deepEqual(a.final, { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'same on the base', sameOnBase: 'pipeline/hooks/**', scope: 'same-on-base' });
   assert.deepEqual(parked(findingItems([finding()], { regression: null })[0]), HUMAN);
   assert.deepEqual(parked(findingItems([finding({ scope: undefined })])[0]), HUMAN);
   assert.deepEqual(parked(findingItems([finding({ file: 'src/outside.mjs' })])[0]), HUMAN);
@@ -178,6 +182,7 @@ test('F3 sameOnBaseRows: every marked dismissal is one owner row (waived or not,
   const out = apply([waived, sug], [rule(waived), rule(sug, { scope: undefined })]);
   const s = stateOf(out);
   assert.deepEqual(sameOnBaseRows(s).map((r) => r.id), ['R1-B1', 'R1-S1']);
+  assert.match(sameOnBaseRows(s)[1].row, /by arbiter \(regression-only path\)/, 'a ruling without the scope never claims a merge-base comparison (R1-F2)');
   assert.match(sameOnBaseRows(s)[0].row, /^R1-B1 · FOLLOW-UP · BLOCKING · security · by arbiter \(same as merge-base\) · content [0-9a-f]{12} · /);
   assert.deepEqual(sameOnBaseRows(stateOf([item({ id: 'R1-B9', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'x' } })])), []);
   assert.deepEqual(sameOnBaseRows(stateOf([])), []);
