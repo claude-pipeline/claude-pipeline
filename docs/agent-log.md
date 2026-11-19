@@ -266,3 +266,4 @@ full record.
 - 2026-11-19 · #592 · Click-to-approve works on 2.1.323 (harness-added answers), a re-shown request with a hold binds, honest merge-line wording (#585) · risk high · rounds 7 · arbiter 3 · awaiting-owner-merge · Codex 7d: 516 runs (131 high)
 - 2026-11-19 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 10 · arbiter 10 · blocked · Codex 7d: 516 runs (131 high)
 - 2026-11-19 · #622 · Review: opt-in regression-only bar for listed paths (#559 A2) · risk high · rounds 6 · arbiter 6 (fix-verify 2) · blocked · Codex 7d: 516 runs (131 high)
+- 2026-11-19 · #634 · Merge-queue ready: run CI on merge_group; update source is claude-pipeline/claude-pipeline · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 518 runs (131 high)
