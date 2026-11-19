@@ -659,7 +659,8 @@ test('publish: the delete-a-flagged-line hint appears only when the scanner flag
     return r.json.message;
   };
   const withScanner = (mode) => (w) => writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: makeScanner(tmp('cp-log-scanner-'), mode).command } });
-  assert.doesNotMatch(run(withScanner('crash')), hint, 'scanner killed by a signal');
+  // No POSIX signals on Windows: a killed scanner exits 1 there, which reads as "flagged".
+  if (process.platform !== 'win32') assert.doesNotMatch(run(withScanner('crash')), hint, 'scanner killed by a signal');
   assert.doesNotMatch(run((w) => writeScanConfig(w.fake.scanHome, '{ not json')), hint, 'config invalid');
   assert.doesNotMatch(run((w) => writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: ['/no/such/scanner'] } })), hint, 'scanner missing');
   const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
