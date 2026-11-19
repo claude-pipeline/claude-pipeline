@@ -272,6 +272,7 @@ test('review.regression_only_paths: a `!` entry is refused; a glob with a wildca
   const all = { risk: { high_risk_paths: ['src/**', '!src/auth/**'] } };
   assert.ok(has(set(['src/**', '!src/auth/**'], all), 'review.regression_only_paths[1] ("!src/auth/**") is a `!` exclusion'));
   assert.equal(set(['src/**'], all).ok, true, 'the sensitive list may keep its own exclusions');
+  for (const g of ['/!src/**', './!src/**', '\\!src/**']) assert.ok(has(set([g], { risk: { high_risk_paths: ['src/**', '!src/**'] } }), 'is a `!` exclusion'), `${g} normalises to !src/**: an exclusion, never covered by the sensitive exclusion entry`);
   assert.ok(has(set(['src/**'], { risk: { high_risk_paths: ['**'] } }), 'is not covered by'), '** lists no src/** entry');
   assert.ok(has(set(['src/**'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'src/* does not cover src/**');
   assert.ok(has(set(['src/{a,b}.js'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a brace entry is not a literal path');

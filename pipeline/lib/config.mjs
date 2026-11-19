@@ -675,7 +675,8 @@ function checkRegressionOnly(globs, review, risk, errors) {
   if (globs.length > MAX_REGRESSION_ONLY_PATHS) errors.push(`review.regression_only_paths has ${globs.length} entries; at most ${MAX_REGRESSION_ONLY_PATHS}`);
   const sensitive = [...(isStrArray(risk?.high_risk_paths) ? risk.high_risk_paths : []), ...(isStrArray(review?.arbiter_always_paths) ? review.arbiter_always_paths : [])];
   globs.forEach((g, i) => {
-    if (g.startsWith('!')) return errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is a \`!\` exclusion, which this list does not support: list only the paths the bar covers`);
+    const norm = normalizeGlob(g); // what the glob matcher runs with: every check below must judge this form, not the raw text (`/!x` is `!x` once normalised)
+    if (norm.startsWith('!')) return errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is a \`!\` exclusion, which this list does not support: list only the paths the bar covers`);
     try {
       globToRegExp(g);
     } catch (err) {
@@ -683,7 +684,6 @@ function checkRegressionOnly(globs, review, risk, errors) {
     }
     let covered = false;
     try {
-      const norm = normalizeGlob(g); // what the glob matcher runs with: the check must judge this form, not the raw text
       covered = sensitive.some((s) => normalizeGlob(s) === norm) || (!/[*?{]/.test(norm) && matchAny(norm, sensitive, { nocase: true }));
     } catch { /* an unusable sensitive glob is reported by its own list */ }
     if (!covered) errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is not covered by risk.high_risk_paths or review.arbiter_always_paths: add it to one of them, or the bar never applies to it`);
