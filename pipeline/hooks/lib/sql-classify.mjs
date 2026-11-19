@@ -113,19 +113,38 @@ const hasRun = (words, ...run) => {
   return false;
 };
 
-// Is what follows the LAST WHERE a condition that is always true (`true`, `1 = 1`), up to the end or a RETURNING?
-function whereIsTrue(stmt) {
+// The WHERE of the UPDATE/DELETE keyword at `from`: only one at the keyword's own parenthesis depth and inside its own group counts (a WHERE in a
+// sub-select, or after the CTE group closed, belongs to another query). Returns 'none' (no own WHERE, or the scope cannot be determined: unbalanced
+// parentheses), 'true' (the condition is always true: `true`, `1 = 1`, up to the end, the group's end or a RETURNING) or 'ok'.
+function ownWhere(stmt, from) {
+  let depth = 0;
   let at = -1;
-  stmt.forEach((t, k) => { if (t.t === 'word' && t.v.toUpperCase() === 'WHERE') at = k; });
-  if (at < 0) return false;
+  let closed = false;
+  for (let k = from + 1; k < stmt.length; k += 1) {
+    const t = stmt[k];
+    if (t.t === 'punct' && t.v === '(') depth += 1;
+    else if (t.t === 'punct' && t.v === ')') {
+      depth -= 1;
+      if (depth < 0) { closed = true; break; }
+    } else if (depth === 0 && t.t === 'word' && t.v.toUpperCase() === 'WHERE') { at = k; break; }
+  }
+  if (at < 0) return 'none';
   const rest = [];
+  depth = 0;
   for (const t of stmt.slice(at + 1)) {
-    if (t.t === 'word' && t.v.toUpperCase() === 'RETURNING') break;
+    if (t.t === 'punct' && t.v === '(') depth += 1;
+    else if (t.t === 'punct' && t.v === ')') { depth -= 1; if (depth < 0) { closed = true; break; } }
+    if (depth === 0 && t.t === 'word' && t.v.toUpperCase() === 'RETURNING') break;
     rest.push(t.v.toUpperCase());
   }
+  // a depth left open at the end of the statement (outside a closed group) means the parentheses do not balance: scope unknown
+  if (depth > 0 && !closed) return 'none';
   const text = rest.join(' ');
-  return text === 'TRUE' || /^(\d+) = \1$/.test(text) || text === '( TRUE )';
+  return text === 'TRUE' || /^(\d+) = \1$/.test(text) || text === '( TRUE )' ? 'true' : 'ok';
 }
+
+// every UPDATE/DELETE keyword of a statement that starts with it, or (WITH ...) found anywhere in it
+const dmlStarts = (words, kw) => (words[0] === kw ? [0] : words[0] === 'WITH' ? words.flatMap((w, i) => (w === kw ? [i] : [])) : []);
 
 export function describeSql(sql) {
   const tok = tokenizeSql(sql);
@@ -139,12 +158,14 @@ export function describeSql(sql) {
     const has = (w) => words.includes(w);
     if (first === 'DROP') found.add('DROP');
     if (first === 'TRUNCATE') found.add('TRUNCATE');
-    if (first === 'DELETE' || (first === 'WITH' && has('DELETE'))) {
-      if (!has('WHERE') || whereIsTrue(stmt)) found.add('DELETE-NO-WHERE');
+    for (const at of dmlStarts(words, 'DELETE')) {
+      const w = ownWhere(stmt, at);
+      if (w !== 'ok') found.add('DELETE-NO-WHERE');
     }
-    if (first === 'UPDATE' || (first === 'WITH' && has('UPDATE'))) {
-      if (!has('WHERE')) found.add('UPDATE-NO-WHERE');
-      else if (whereIsTrue(stmt)) found.add('UPDATE-WHERE-TRUE');
+    for (const at of dmlStarts(words, 'UPDATE')) {
+      const w = ownWhere(stmt, at);
+      if (w === 'none') found.add('UPDATE-NO-WHERE');
+      else if (w === 'true') found.add('UPDATE-WHERE-TRUE');
     }
     if (first === 'ALTER' && has('DROP')) found.add('ALTER-DROP');
     if (first === 'ALTER' && hasRun(words, 'DISABLE', 'ROW', 'LEVEL', 'SECURITY')) found.add('RLS-DISABLE');
