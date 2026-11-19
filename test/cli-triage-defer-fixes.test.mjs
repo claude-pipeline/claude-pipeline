@@ -554,7 +554,12 @@ function clickHome(w, h2, state) {
   if (state === 'instructed') put(`${id}.spent`, { ...marker, declined: true, instruction: 'follow-up' });
   else if (state === 'unverified') put(`${id}.spent`, 'not json');
   else if (state === 'refused') { put(`${id}.${'c'.repeat(16)}.pending`, '{}'); put(`${id}.${'c'.repeat(16)}.settled`, { v: 1, askId: id, clickId: 'c'.repeat(16), outcome: 'refused', reason: 'not-a-human-answer', settledAt: at }); }
-  else throw new Error(state);
+  else if (state === 'refused-at-once') put(`${id}.${'c'.repeat(16)}.settled`, { v: 1, askId: id, clickId: 'c'.repeat(16), outcome: 'refused', reason: 'too-fast', settledAt: at }); // #613: the hook's own refusal, no pointer
+  else if (state === 'refused-then-newer-ask') { // #619: the refused click is on an ask a newer, unanswered one superseded
+    put(`${id}.${'c'.repeat(16)}.settled`, { v: 1, askId: id, clickId: 'c'.repeat(16), outcome: 'refused', reason: 'too-fast', settledAt: at });
+    const newer = issueAsk({ ...roundAsk({ repo: w.slug, pr: 7, line: roundRequest(7, 3, h2, w.slug), variant: 'round-v2-follow-up' }), home });
+    assert.ok(newer.askId, JSON.stringify(newer));
+  } else throw new Error(state);
   return home;
 }
 const deferIn = (w, home, ids, fixHead, extra = []) => {
@@ -615,4 +620,22 @@ test('defer-fixes: after an instructed Follow up click a sensitive-path finding 
   assert.match(r.output.reason, /not low severity \(.*sensitive path/);
   assert.equal(r.output.followUpClick.state, 'instructed');
   assert.equal(w.stateText(), before, 'nothing saved');
+});
+
+test('defer-fixes: a Follow up click the hook refused at once (#613), or refused on an ask a newer unanswered one replaced (#619), refuses the deferral until --typed-follow-up', async (t) => {
+  // failure caught: an Enter under 2 s (too-fast) is refused before anything is written, or the owner is asked again and the new ask has no click yet, so defer-fixes reads "no click" and files a deferral nobody verified
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  const before = w.stateText();
+  for (const state of ['refused-at-once', 'refused-then-newer-ask']) {
+    const r = await deferIn(w, clickHome(w, h2, state), 'R2-S1', h2);
+    assert.equal(r.exitCode, 1, state);
+    assert.match(r.output.reason, /click on the follow-up dialog could not be verified.*--typed-follow-up/s, state);
+    assert.equal(r.output.followUpClick.state, 'refused', state);
+    assert.match(r.output.followUpClick.note, /too-fast/, state);
+    assert.equal(w.stateText(), before, `${state}: nothing saved`);
+  }
+  const ok = await deferIn(w, clickHome(w, h2, 'refused-at-once'), 'R2-S1', h2, ['--typed-follow-up']);
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
+  assert.equal(ok.output.followUpClick.override, 'typed');
 });
