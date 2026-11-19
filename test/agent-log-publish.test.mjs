@@ -626,3 +626,45 @@ test('publish: a listed repository as the SECOND push URL of origin is scanned t
   assert.equal(r.json.error, 'outbound-scan-blocked');
   assert.equal(scanner.runs().length, 1, 'the listed second push destination was scanned');
 });
+
+// Failure caught: scannerFor returned the first listed name (gh's), so when gh named listed repo A (lenient scanner) and the push went to listed repo B,
+// B's stricter scanner never ran and the line reached B.
+test('publish: when gh names one listed repository and the push goes to another, both scanners must pass', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]); // gh: acme/widgets
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'https://example.test/Listed/Repo.git']);
+  const dir = tmp('cp-log-scanner-');
+  const lenient = makeScanner(join(dir, 'a'), 'clean');
+  const strict = makeScanner(join(dir, 'b'), 'scan');
+  writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: lenient.command }, 'listed/repo': { command: strict.command } });
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(strict.runs().length, 1, "the push destination's own scanner ran");
+  assert.equal(w.onOrigin('branch', '--list', BRANCH).trim(), '', 'nothing was pushed');
+});
+
+// Failure caught: the "delete the flagged line from the queue" hint was printed for every block, so a crashed scanner or a broken config (nothing flagged) told
+// the owner to delete good run-record lines while the publish stayed blocked.
+test('publish: the delete-a-flagged-line hint appears only when the scanner flagged something, not for a crashed scanner or a broken config', () => {
+  const hint = /delete it from/;
+  const run = (setup) => {
+    const w = world();
+    w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+    setup(w);
+    const r = w.run(['publish', '--line', L1]);
+    assertExit(r, 1);
+    assert.equal(r.json.error, 'outbound-scan-blocked');
+    return r.json.message;
+  };
+  const withScanner = (mode) => (w) => writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: makeScanner(tmp('cp-log-scanner-'), mode).command } });
+  assert.doesNotMatch(run(withScanner('crash')), hint, 'scanner killed by a signal');
+  assert.doesNotMatch(run((w) => writeScanConfig(w.fake.scanHome, '{ not json')), hint, 'config invalid');
+  assert.doesNotMatch(run((w) => writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: ['/no/such/scanner'] } })), hint, 'scanner missing');
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+  withScanner('scan')(w);
+  assert.match(w.run(['publish', '--line', planted]).json.message, hint, 'a plain flagged exit keeps the hint');
+});

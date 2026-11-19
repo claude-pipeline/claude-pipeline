@@ -162,7 +162,7 @@ async function publish(rest, ctx, { deprecated = false } = {}) {
       try {
         listed = guardOutbound({ slug: () => [gh.repo().slug, ...pushRemoteSlugs(root)], fields: () => entries.map((e) => ({ kind: 'agent-log line', text: e.line })), env: { ...process.env, ...ctx.env } });
       } catch (err) {
-        if (err instanceof OutboundScanBlocked) throw new Fail(EXIT.FAILED, { ...err.extra, ok: false, error: 'outbound-scan-blocked', message: `${err.message}; the lines stay queued. To drop a flagged line, delete it from ${queuePath(root)} (one JSON line per entry)`, remaining: entries.length });
+        if (err instanceof OutboundScanBlocked) throw new Fail(EXIT.FAILED, { ...err.extra, ok: false, error: 'outbound-scan-blocked', message: `${err.message}; the lines stay queued. ${err.extra?.reason === 'blocked' && err.extra.exited !== undefined ? `To drop a flagged line, delete it from ${queuePath(root)} (one JSON line per entry)` : 'No line was flagged: fix the scanner or its config, and do not delete queued lines'}`, remaining: entries.length });
         if (err instanceof GhError || err instanceof GitError) throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'publish-failed', message: `could not look up the repository to check the outbound scan config (${err.message.slice(0, 300)}); the lines stay queued for the next run`, remaining: entries.length });
         throw err;
       }

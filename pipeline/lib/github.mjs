@@ -584,7 +584,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
 //   - file present but unreadable / not a JSON object -> every write is blocked (we cannot tell which slugs are listed).
 //   - slug listed, command missing / not absolute / not executable / not a list of strings -> that slug's writes are blocked.
 // The scanned text goes on STDIN only (never argv). A block names the field kinds that were scanned and the scanner's exit, and
-// never the scanned text or the scanner's stdout (it may hold the hit); only a masked first line of its stderr is quoted.
+// never the scanned text or any scanner output (stdout and stderr may hold the hit).
 
 export { OutboundScanBlocked };
 
@@ -632,16 +632,11 @@ const isExecutableFile = (p) => {
   }
 };
 
+// `slug` may be a list (the names gh and each git push destination give for one checkout): distinct names, case-insensitively.
+const namesOf = (slug) => [...new Map([slug].flat().map((n) => [String(n).toLowerCase(), n])).values()];
+
 // -> null (slug not listed) or { command: [file, ...args] }. A listed slug with a bad entry throws OutboundScanBlocked.
-// `slug` may be a list (the names gh and the git push destination give for one checkout): the first listed one counts.
 export function scannerFor(cfg, slug) {
-  if (Array.isArray(slug)) {
-    for (const one of slug) {
-      const entry = scannerFor(cfg, one);
-      if (entry !== null) return entry;
-    }
-    return null;
-  }
   const want = String(slug).toLowerCase();
   const keys = Object.keys(cfg).filter((k) => k.toLowerCase() === want);
   if (keys.length === 0) return null;
@@ -671,23 +666,25 @@ export function runScanner({ command, fields, env, timeoutMs = OUTBOUND_SCAN_TIM
   const text = fields.map((f) => `=== outbound field: ${f.kind} ===\n${f.text}\n`).join('');
   const kinds = kindsOf(fields);
   // How the scanner ended, never what it printed: its output can quote the very text it rejected.
-  const block = (how) => new OutboundScanBlocked(`outbound scan blocked this write (scanned: ${kinds}; scanner ${how})`, { reason: 'blocked', kinds });
+  // `exited` is set only for a plain non-zero exit: the scanner ran and flagged something (a timeout, crash or spawn failure flagged nothing).
+  const block = (how, extra) => new OutboundScanBlocked(`outbound scan blocked this write (scanned: ${kinds}; scanner ${how})`, { reason: 'blocked', kinds, ...extra });
   const r = spawnFn(command[0], command.slice(1), { input: text, encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: OUTBOUND_SCAN_MAX_BUFFER, env: env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
   if (r.error) throw block(r.error.code === 'ETIMEDOUT' ? `timed out after ${Math.round(timeoutMs / 1000)}s` : `could not run (${r.error.code ?? 'spawn error'})`);
   if (r.signal) throw block(`was killed by ${r.signal}`);
-  if (r.status !== 0) throw block(`exited ${r.status}`);
+  if (r.status !== 0) throw block(`exited ${r.status}`, { exited: r.status });
 }
 
 // The one entry point. `slug` is a string or a function returning it (resolved only when a config file exists, so an unlisted
-// machine never pays for a lookup; it may also return a list of names, see scannerFor). `fields` is an array or a function returning one. Returns true when a scan ran and passed,
+// machine never pays for a lookup; it may also return a list of names: every listed one is scanned). `fields` is an array or a function returning one. Returns true when a scan ran and passed,
 // false when the slug is not listed; throws OutboundScanBlocked otherwise.
 export function guardOutbound({ slug, fields, env, home = scanHomeOf(env), spawnFn }) {
   const cfg = loadScanConfig(home);
   if (cfg === null) return false;
-  const entry = scannerFor(cfg, typeof slug === 'function' ? slug() : slug);
-  if (entry === null) return false;
+  // Every listed name (gh's and each push URL's) has its own scanner, and all of them must pass: validated first, so a broken entry blocks before any scanner runs.
+  const entries = namesOf(typeof slug === 'function' ? slug() : slug).map((n) => scannerFor(cfg, n)).filter((e) => e !== null);
+  if (entries.length === 0) return false;
   const list = (typeof fields === 'function' ? fields() : fields).filter((f) => typeof f.text === 'string');
-  runScanner({ command: entry.command, fields: list, env, spawnFn });
+  for (const entry of entries) runScanner({ command: entry.command, fields: list, env, spawnFn });
   return true;
 }
 
@@ -696,7 +693,7 @@ export function refuseIfListed({ slug, what, env, home = scanHomeOf(env) }) {
   const cfg = loadScanConfig(home);
   if (cfg === null) return false;
   const name = typeof slug === 'function' ? slug() : slug;
-  if (scannerFor(cfg, name) === null) return false;
+  if (namesOf(name).map((n) => scannerFor(cfg, n)).every((e) => e === null)) return false;
   throw new OutboundScanBlocked(`outbound scan: ${[name].flat().join(' / ')} is a listed repository, and ${what} cannot be scanned (images are not text); attach them outside the public repository`, { reason: 'unscannable' });
 }
 
