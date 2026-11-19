@@ -271,3 +271,4 @@ full record.
 - 2026-11-19 · #634 · Merge-queue ready: run CI on merge_group; update source is claude-pipeline/claude-pipeline · risk high · rounds 3 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 529 runs (139 high)
 - 2026-11-19 · #622 · Review: opt-in regression-only bar for listed paths (#559 A2) · risk high · rounds 7 · arbiter 7 (fix-verify 3) · awaiting-owner-merge · Codex 7d: 529 runs (139 high)
 - 2026-11-19 · #639 · Guard: a sourced dangling symlink is not a missing file (#630) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 533 runs (140 high)
+- 2026-11-19 · #579 · Live-database guard, part 1: database tools + typed go (#262) · risk high · rounds 15 · arbiter 14 (fix-verify 5) · blocked · Codex 7d: 538 runs (140 high)
