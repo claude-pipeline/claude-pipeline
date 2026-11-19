@@ -761,7 +761,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
     const failure = !proofOk && judged.applies === true && typeof judged.error === 'string' ? failureOf(judged.error, floorAdviceFor(judged)) : null;
     const nextState = patchRound(updateItems(state, n, items), n, { arbiter: { ...storedNow, proofOk, transcript: found.jsonlPath, ...(failure ? { failure } : {}) }, modelProof });
     // Version 5 only when a final carries the out-of-model marker: an older CLI must not read a state whose unfiled FOLLOW-UP it would count as done (state.mjs).
-    // Version 8 likewise for a same-on-base marker (final.sameOnBase; the highest version any feature of the state needs wins).
+    // Version 9 likewise for a same-on-base marker (final.sameOnBase; the highest version any feature of the state needs wins).
     const lifted = stateNeedsOutOfModelVersion(nextState) ? withStateVersion(nextState, STATE_VERSION_OUT_OF_MODEL) : nextState;
     saveState(root, stateNeedsSameOnBaseVersion(lifted) ? withStateVersion(lifted, STATE_VERSION_SAME_ON_BASE) : lifted);
 

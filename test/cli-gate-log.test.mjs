@@ -98,6 +98,35 @@ test('summary: the Tests added line is left out when the diff against the base r
   assert.match(JSON.parse(changed.calls().find((c) => c.argv.includes('POST')).stdin).body, /Tests added: 0 files, 0 cases; changed source lines : test lines = 1 : 0/);
 });
 
+// Failure caught: a PR stacked on another PR's branch reported the files and lines of both PRs in its Tests added line, because the diff was measured against the default branch, not the PR's own base.
+test('summary: the Tests added line is measured against the PR base branch (a stacked PR), falling back to the default branch when that ref is missing', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  saveState(repo.dir, summaryState());
+  repo.branch('feat/parent');
+  repo.write('src/parent.js', 'export const p = 1;\nexport const q = 2;\nexport const r = 3;\n');
+  repo.commit('parent work');
+  repo.branch('feat/child');
+  repo.write('src/child.js', 'export const c = 1;\n');
+  repo.commit('child work');
+  const ghFor = (baseRefName) => createFakeGh([
+    { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget', baseRefName } },
+    ME, REPO,
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
+    { match: '^api -X POST repos/acme/widgets/issues/12/comments', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-5' } },
+  ]);
+
+  const stacked = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: ghFor('feat/parent') });
+  assertExit(stacked, 0, stacked.stderr + stacked.stdout);
+  assert.match(stacked.json.testsAdded, /source lines : test lines = 1 : 0$/, 'only the child PR own line');
+
+  const missing = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: ghFor('gone/branch') });
+  assertExit(missing, 0, missing.stderr + missing.stdout);
+  assert.match(missing.json.testsAdded, /source lines : test lines = 4 : 0$/, 'no such base ref: the default branch');
+});
+
 test('summary: the agent-log line ends with the weekly Codex figure (7 days, every repo); codexUsage is in the JSON; the pending line carries it too', () => {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml());

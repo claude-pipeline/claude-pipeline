@@ -33,6 +33,7 @@ test('round-request: the line is byte for byte what the owner-go hook parses, an
   assert.deepEqual(r.json.open.map((i) => [i.id, i.round, i.bucket, i.category, i.severity, i.title, i.file]), [['R2-S1', 2, 'SUGGESTION', 'maintainability', 'low', 'Issue 2', 'src/big.js']]);
   assert.deepEqual(r.json.notClean, ['fixes not re-reviewed (R2-S1)']);
   assert.equal(r.json.recommend, 'follow-up');
+  assert.equal(r.json.dialogVariant, 'round-v2-follow-up', 'Follow up is the first option only when defer-fixes could do it');
   assert.match(r.json.why, /low severity/);
   assert.deepEqual([r.json.discard.anchor, r.json.discard.count, r.json.discard.commits], [h1.slice(0, 12), 1, [`${h2.slice(0, 7)} fix 2`]]);
   assert.match(r.json.summary, /^Rounds: 2 reviewed \(limit 1 \+ the automatic extra round\); this would be round 3\.\n/);
@@ -89,6 +90,7 @@ test('round-request: severity is high for a bug, a BLOCKING item, a sensitive fi
     assertExit(r, 0, name + r.stderr + r.stdout);
     assert.equal(r.json.open[0].severity, 'high', name);
     assert.equal(r.json.recommend, 'extra-round', name);
+    assert.equal(r.json.dialogVariant, 'round-v2-extra-round', `${name}: no Follow up option where defer-fixes would refuse`);
     assert.match(r.json.summary, /Recommended: one more round \(type "extra round"\)\./, name);
     assert.match(r.json.line, /^🔁 /, name);
   }
@@ -429,7 +431,9 @@ test('round-request nextRound: after a clean merge of the default branch the alt
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 1, ownCommits: 1 }, 'synthetic']);
-  assert.match(r.json.nextRound.alternative, /a free base-only recording may then follow \(the default branch merges cleanly; run round-request again after the revert to confirm\) \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)$/);
+  assert.match(r.json.nextRound.alternative, /a free base-only recording may then follow \(the default branch merges cleanly; run round-request again after the revert to confirm; if that still predicts a counted round, the revert did not make it free: do not revert again\) \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)$/);
+  // asciiLine cuts a prediction line at 500 characters: the end of this caveat is what the owner reads before reverting, so it must not be cut.
+  for (const line of r.json.summary.split('\n').filter((l) => l.startsWith('Prediction:'))) assert.ok(!line.endsWith('...'), `a prediction line was cut: ${line}`);
 });
 
 // Failure caught: a clean synthetic base was taken as proof of a free recording, but a merged TOPIC branch keeps its changes in the range after the revert, so the round is counted.
@@ -685,6 +689,7 @@ test('round-request longReview: absent below counted round 6; at round 6 it list
   assert.match(c.json.summary, /^Long review \(this would be counted round 6\)/m);
   assert.match(c.json.summary, /^Blocking loop: no\.$/m);
   assert.ok(['follow-up', 'extra-round'].includes(c.json.recommend));
+  assert.equal(c.json.dialogVariant, c.json.recommend === 'follow-up' ? 'round-v2-follow-up' : 'round-v2-extra-round', 'no blocking loop: the dialog follows the recommendation');
   assert.match(c.json.summary, /^Recommended: (follow up|one more round)/m);
   assert.doesNotMatch(c.json.summary, /stop and park or split/);
 
@@ -698,6 +703,7 @@ test('round-request longReview: absent below counted round 6; at round 6 it list
   assert.match(l.json.summary, /^Blocking loop: yes, each of the last two counted rounds accepted a new BLOCKING item \(round 4: R4-B1; round 5: R5-B1\)\.$/m);
   assert.match(l.json.summary, /^Recommended: stop and park or split \(a dependency-aware split plan, never a carve-out of files\)/m);
   assert.ok(['follow-up', 'extra-round'].includes(l.json.recommend), 'the machine value is unchanged');
+  assert.equal(l.json.dialogVariant, 'round-v2-park', 'a blocking loop: the dialog recommends stopping and parking, as the summary does');
   assert.match(l.json.why, /unlikely to settle it: stop and park, or split/, 'the why says what the Recommended line says');
   assert.doesNotMatch(l.json.why, /Another round is the safe path/);
   assert.equal(l.json.longReview.recommended, 'stop and park or split');

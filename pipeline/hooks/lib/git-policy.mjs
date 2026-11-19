@@ -2471,14 +2471,13 @@ const ranInSubshell = (cmds, i) => cmds[i]?.sep === '|' || nextSep(cmds, i) === 
 const VALUE_BINDERS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'unset', 'let', 'printf', 'select']);
 const STATE_GIT = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree', 'config']);
 // R1-F1: can this git command move a branch (what trackGit records: checkout / switch, a rebase with two positionals, symbolic-ref HEAD <ref>, branch -m / -M, worktree add)? A read (`symbolic-ref --short HEAD`,
-// `config --get`, `branch -r`, `worktree list`) raises no branch doubt. (the words are the command's own, global options included: an option's value counts as a positional, which only over-doubts)
+// `config --get`, `branch -r`, `worktree list`) raises no branch doubt. (#558: the subcommand is the one parseGitGlobal finds after the global options, so a -C / --git-dir value spelled like a subcommand is not read as one)
 const MOVER_SUBS = new Set(['checkout', 'switch', 'branch', 'rebase', 'symbolic-ref', 'worktree']);
-const movesBranch = (argv) => {
-  const at = argv.findIndex((w) => MOVER_SUBS.has(w));
-  if (at < 0) return false;
-  const rest = argv.slice(at + 1);
+const movesBranch = (argv, ctx) => {
+  const { sub, args: rest } = parseGitGlobal(argv, null, {}, ctx);
+  if (!MOVER_SUBS.has(sub)) return false;
   const pos = rest.filter((w) => !w.startsWith('-'));
-  switch (argv[at]) {
+  switch (sub) {
     case 'rebase': return pos.length >= 2;
     case 'symbolic-ref': return pos.length >= 2 && pos.includes('HEAD');
     case 'branch': return rest.some((w) => w === '--move' || /^-[a-zA-Z]*[mM]/.test(w));
@@ -3421,7 +3420,12 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup && failGroup.snap === null) {
       failGroup.snap = { dir, names: [...ctx.branches.entries()].map(([k, e]) => [k, e.name]), unknown: ctx.branchesUnknown === true };
       forgetState();
-    } else if (failGroup && i > failGroup.to) restoreAfterGroup();
+    } else if (failGroup && i > failGroup.to) {
+      // (#554: in a nested text the group's exit ends only that text, so the group may have run when the caller goes on: unless the group is inert (the end-of-text test below) the branches stay unknown)
+      const inert = level === 0 || cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx));
+      restoreAfterGroup();
+      if (!inert) forgetBranches(ctx);
+    }
     settle(c, i); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
     if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, mover: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
     // (R7-F1: a loop's frame is taken once the subshells this command ends or opens are settled, above: the directory, the open subshells and the state it holds are what the loop's FIRST command starts with,
@@ -3460,6 +3464,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const name = baseName(argv[0]);
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
+    let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist: nothing runs)
     if (VAR_BUILTINS.includes(name)) {
       const d = declAttrs(argv);
       for (const [k, v] of d.assigns) {
@@ -3518,7 +3523,11 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
       if (!verdict && splicesOptions(argv)) verdict = checkSplices(c, dir, ctx, level);
       const sf = verdict ? null : scriptFileOf(argv, c.raw, str);
-      if (sf && (name === 'source' || name === '.')) sf.sourced = true;
+      if (sf && (name === 'source' || name === '.')) {
+        sf.sourced = true;
+        const word = sf.candidate || sf.ambiguous || sf.joined ? '' : expandVars(sf.file, ctx);
+        sourceGone = /^[\w./~@+-]+$/.test(word) && (!word.includes('~') || /^~(?:\/|$)/.test(word)) && !word.startsWith('/dev/') && (dir !== null || path.isAbsolute(word) || /^~(?:\/|$)/.test(word)) && !ctx.pathExists(path.resolve(dir ?? ctx.cwd, /^~(?:\/|$)/.test(word) ? ctx.home + word.slice(1) : word));
+      }
       const withPath = (rec) => { if (sourcePathSearch(rec, c.argv, cmds)) { rec.ambiguous = true; rec.words ??= [rec.file]; rec.pathSearch = true; } if (rec.words?.some(isEqualsWord) || rec.pathSearch) rec.pathValues = pathValuesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n) }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
@@ -3564,9 +3573,10 @@ function evalString(str, startDir, ctx, level, child = false) {
     const changedState = argv.length > 0 && stateChanged(ctx, before);
     if (argv.length > 0 && (changesStateWords || changedState)) {
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', ran: how === 'chain' && surelyRan(c), lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', ran: how === 'chain' && surelyRan(c), lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
-      if (changesStateWords && !failGroup && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond, from: i, byDir: DIR_CHANGERS.includes(name) };
+      // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
+      if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond, from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);
         const top = levels?.[levels.length - 1];
@@ -3577,7 +3587,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (SOURCING.includes(name)) {
       // what the sourced file did is not modelled: every later command sees an unknown directory, branch and variables
       // (#505: a file that was read and walked (a git change in it, or a write below .git, was recorded or marked unknown by that walk) leaves the branches as they are; only one never walked -- missing, a name known at run time -- marks every branch unknown)
-      forgetState((ctx.judgedTexts ?? 0) <= judged0);
+      forgetState((ctx.judgedTexts ?? 0) <= judged0 && !sourceGone); // (#555: a missing file marks no branch; a name known at run time, or a file that exists but was not walked, still does)
       for (const k of Object.keys(ctx.vars)) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
       // the check above ran before these became unsure: run it again for what follows (`F=run.sh; source env.sh; bash "$F"`)
       const unsure = unsureVarReachingCommand(cmds.slice(i + 1), ctx);

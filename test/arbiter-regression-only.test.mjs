@@ -1,6 +1,6 @@
 // #559 A2 end to end (the real CLI against a throwaway repo): the Regression-only bar section of the Fable review input and of the Codex prompt, read from the TRUSTED default-branch config
 // (never the PR's own copy), the stored globs and merge base, the same-on-base finding that needs no human (only for a plainly modified file), the Rulings row for every dismissal on a matched file,
-// and state version 8.
+// and state version 9.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -136,7 +136,7 @@ test('R2 trusted config only: the PR adding a path to the bar in its own pipelin
   assert.doesNotMatch(m.input(), /# Regression-only bar/);
 });
 
-test('apply: a same-on-base BLOCKING security finding on a plainly modified file needs no human, is marked, lifts the state to version 8, is a Rulings row and blocks review-complete until filed', (t) => {
+test('apply: a same-on-base BLOCKING security finding on a plainly modified file needs no human, is marked, lifts the state to version 9, is a Rulings row and blocks review-complete until filed', (t) => {
   const w = world(t);
   const needed = w.round1();
   const applied = w.apply(needed, { rulings: [], findings: [finding()] });
@@ -144,7 +144,7 @@ test('apply: a same-on-base BLOCKING security finding on a plainly modified file
   const s = w.state();
   const item = s.rounds[0].items.find((i) => i.id === 'R1-F1');
   assert.deepEqual([item.final.decision, item.final.needsHuman, item.final.sameOnBase], ['FOLLOW-UP', false, 'src/**']);
-  assert.equal(s.version, 8);
+  assert.equal(s.version, 9);
   assert.equal(rulingsInventory(s).rows[0].split(' · ')[4], 'by arbiter (same as merge-base)');
   assert.match(reviewEligibilityProblems(s).join(';'), /same-on-base follow-up\(s\) without a filed issue: R1-F1/);
   const filed = structuredClone(s);

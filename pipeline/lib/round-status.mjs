@@ -153,7 +153,7 @@ export function predictNextRound({ root, config, state, head }) {
     nextRound.alternative = merges === 0
       ? `${revert}; that restores the reviewed content and needs no round`
       : review.kind === 'synthetic' && mergeCommits.every(cleanDefaultMerge)
-        ? `${revert}; a free base-only recording may then follow (the default branch merges cleanly; run round-request again after the revert to confirm)${unlessCounted}`
+        ? `${revert}; a free base-only recording may then follow (the default branch merges cleanly; run round-request again after the revert to confirm; if that still predicts a counted round, the revert did not make it free: do not revert again)${unlessCounted}`
         : `${revert}; that does not make the next round free here: a merge since the last reviewed head is not a clean, unedited merge of the default branch, so a counted round would still follow`;
   }
   const nothingNew = contentRestored && !owed; // contentRestored alone still hides the alternative (a revert was made); the owed whole-PR round keeps the counted prediction

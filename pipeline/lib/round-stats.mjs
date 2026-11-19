@@ -29,7 +29,8 @@ function admissionOf(round, k, max) {
 // What the round actually reviewed (reviewBaseKind) and why the free resolution-only round was refused (the short code on the round, state.mjs#addRound). A round recorded before
 // either field existed reads as 'unknown' (missing telemetry); a whole-PR round with no recorded code is 'unknown' too, never "no failure"; any other kind has no proof to fail (null).
 const kindOf = (r) => (typeof r.reviewBaseKind === 'string' && r.reviewBaseKind !== '' ? r.reviewBaseKind : 'unknown');
-const ineligibleOf = (r) => (typeof r.resolutionIneligible === 'string' && r.resolutionIneligible !== '' ? r.resolutionIneligible : kindOf(r) === 'whole-pr' || kindOf(r) === 'unknown' ? 'unknown' : null);
+// A judge-to-Fable escalation (round.escalated) reviews the whole PR with no proof tried, so it is no refusal either; `unknown` stays for rounds recorded without the field.
+const ineligibleOf = (r) => (typeof r.resolutionIneligible === 'string' && r.resolutionIneligible !== '' ? r.resolutionIneligible : r.escalated === true ? null : kindOf(r) === 'whole-pr' || kindOf(r) === 'unknown' ? 'unknown' : null);
 
 // A decoded triage state that belongs to PR `pr` and whose rounds are numbered (a comment is untrusted text: a round `n` that is not an integer would be printed as it is).
 export const isReadableState = (state, pr) => !!state && state.pr === pr && Array.isArray(state.rounds) && state.rounds.every((r) => Number.isInteger(r?.n));
