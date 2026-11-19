@@ -3,13 +3,16 @@
 // review that reads as clean, whose Rulings rows carry each deferral for the owner's "merge" to bind. Real CLI, real git, fake gh and codex (test/helpers/round-world.mjs).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, realpathSync, rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { grantIdOf, markerPath } from '../pipeline/hooks/lib/owner-go.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { cleanupAtExit, OWNER_ENTRY, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { aFile, findingsOf, low, roundWorld } from './helpers/round-world.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
+import { run as triageRun } from '../pipeline/commands/triage.mjs';
+import { asksDir, issueAsk, roundAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
 
 const defer = (w, ids, fixHead, { reason = 'minor, file it', extra = [] } = {}) =>
   w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', ids, '--fix-head', fixHead, '--reason', reason, ...extra]);
@@ -532,4 +535,84 @@ test('round-request: recommends the extra round, not the follow-up, when the tru
   assert.doesNotMatch(r.json.summary, /say "follow up"/);
   assert.ok(r.json.head && r.json.line.includes('Extra review round needed #7'), 'the ask itself and its line are still produced');
   refused(w, () => defer(w, 'R2-S1', h2), /trusted base config is unreadable/, 'defer-fixes agrees');
+});
+
+// ---- the owner's click on a Follow up button (round-v2-follow-up): defer-fixes reads what became of it, in process with a temp account home (ctx.home) holding the click files ----
+const homes = [];
+process.on('exit', () => { for (const h of homes) rmSync(h, { recursive: true, force: true }); });
+// A temp account home with a follow-up ask for PR 7 and the click state `plant` leaves: instructed (a spent marker), refused / settled-garbage (a settled pointer), unverified (an unreadable spent marker), none.
+function clickHome(w, h2, state) {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'defer-click-')));
+  homes.push(home);
+  if (state === 'none') return home;
+  const issued = issueAsk({ ...roundAsk({ repo: w.slug, pr: 7, line: roundRequest(7, 3, h2, w.slug), variant: 'round-v2-follow-up' }), home });
+  assert.ok(issued.askId, JSON.stringify(issued));
+  const id = issued.askId;
+  const at = new Date().toISOString();
+  const marker = { v: 1, askId: id, clickId: 'c'.repeat(16), toolUseId: 'toolu_x', answeredAt: at, dialogSha256: 'd'.repeat(64) };
+  const put = (name, body) => writeFileSync(join(asksDir(home), name), typeof body === 'string' ? body : `${JSON.stringify(body)}\n`);
+  if (state === 'instructed') put(`${id}.spent`, { ...marker, declined: true, instruction: 'follow-up' });
+  else if (state === 'unverified') put(`${id}.spent`, 'not json');
+  else if (state === 'refused') { put(`${id}.${'c'.repeat(16)}.pending`, '{}'); put(`${id}.${'c'.repeat(16)}.settled`, { v: 1, askId: id, clickId: 'c'.repeat(16), outcome: 'refused', reason: 'not-a-human-answer', settledAt: at }); }
+  else throw new Error(state);
+  return home;
+}
+const deferIn = (w, home, ids, fixHead, extra = []) => {
+  const env = { ...process.env, ...w.fake.env, PIPELINE_LOCK_DIR: join(w.scratch, 'locks'), ...floorEnv() };
+  return triageRun(['defer-fixes', '--pr', '7', '--ids', ids, '--fix-head', fixHead, '--reason', 'minor, file it', ...extra], { cwd: w.repo.dir, env, home, managedPaths: [] });
+};
+
+test('defer-fixes: followUpClick is on every answer; a refused or unreadable Follow up click refuses (state untouched), --typed-follow-up lifts only that; instructed and none proceed', async (t) => {
+  // failure caught: a deferral saved after an owner click on Follow up that was never verified (the click grants nothing, so no other rule stops it), or a refusal that hides what became of the click
+  const w = roundWorld(t);
+  const { h2 } = w.atCap(); // the fix is still in the tree: the probe shape
+  const before = w.stateText();
+  const probe = async (state, extra = []) => deferIn(w, clickHome(w, h2, state), 'R2-S1', h2, extra);
+  const none = await probe('none');
+  assert.equal(none.exitCode, 1);
+  assert.match(none.output.reason, /tree is not back/);
+  assert.equal(none.output.followUpClick.state, 'none', 'no click: the typed words are the owner\'s, as today');
+  const inst = await probe('instructed');
+  assert.match(inst.output.reason, /tree is not back/, 'the pre-revert probe: the expected refusal carries the state');
+  assert.equal(inst.output.followUpClick.state, 'instructed');
+  for (const bad of ['refused', 'unverified']) {
+    const r = await probe(bad);
+    assert.equal(r.exitCode, 1, bad);
+    assert.match(r.output.reason, /click on the follow-up dialog could not be verified.*round-request --pr 7 --ask.*--typed-follow-up/s, bad);
+    assert.equal(r.output.followUpClick.state, bad);
+    const lifted = await probe(bad, ['--typed-follow-up']);
+    assert.match(lifted.output.reason, /tree is not back/, `${bad}: only the click refusal is lifted, every other refusal still applies`);
+    assert.deepEqual([lifted.output.followUpClick.state, lifted.output.followUpClick.override], [bad, 'typed']);
+  }
+  assert.equal(w.stateText(), before, 'nothing saved by any refusal');
+  // reverted: an instructed click proceeds, with the state printed
+  const h3 = w.revert(h2);
+  assert.ok(h3);
+  const done = await deferIn(w, clickHome(w, h2, 'instructed'), 'R2-S1', h2);
+  assert.equal(done.exitCode, 0, JSON.stringify(done.output));
+  assert.deepEqual([done.output.deferred, done.output.followUpClick.state], [['R2-S1'], 'instructed']);
+});
+
+test('defer-fixes: a refused Follow up click then the owner\'s typed "follow up": --typed-follow-up completes the deferral and echoes the override', async (t) => {
+  // failure caught: a refused click that can never be recovered from (the owner typed the words, and the escape is missing), or an escape that is not recorded in the answer
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  const stuck = await deferIn(w, clickHome(w, h2, 'refused'), 'R2-S1', h2);
+  assert.equal(stuck.exitCode, 1);
+  const ok = await deferIn(w, clickHome(w, h2, 'refused'), 'R2-S1', h2, ['--typed-follow-up']);
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
+  assert.deepEqual([ok.output.followUpClick.state, ok.output.followUpClick.override], ['refused', 'typed']);
+});
+
+test('defer-fixes: after an instructed Follow up click a sensitive-path finding is still refused (the click grants nothing and lifts no severity rule), with the click state printed', async (t) => {
+  // failure caught: a verified Follow up click read as permission, so an accepted fix on a high_risk path is filed away as a follow-up without the extra round the severity rule demands
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  w.config({ yml: 'risk:\n  high_risk_paths: ["src/big.js"]\n' });
+  const before = w.stateText();
+  const r = await deferIn(w, clickHome(w, h2, 'instructed'), 'R2-S1', h2);
+  assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+  assert.match(r.output.reason, /not low severity \(.*sensitive path/);
+  assert.equal(r.output.followUpClick.state, 'instructed');
+  assert.equal(w.stateText(), before, 'nothing saved');
 });

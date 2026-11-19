@@ -16,10 +16,10 @@ import { arbiterItem, claudeItem, comment, markerBody, publishedComments, ruling
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { evaluateOwnerGo, localContentHash, reviewCheck, reviewCompletionCheck } from '../pipeline/lib/finalgate.mjs';
 import { rulingsBlock } from '../pipeline/lib/triage.mjs';
-import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
+import { SUPPORTED_STATE_VERSION, addRound, decodeFromComment, emptyState, loadState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { withReviewLock } from '../pipeline/lib/review-context.mjs';
-import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
+import { assertPublishedHistory, pastRoundHistoryProblem, readPublished, reviewContentHash } from '../pipeline/lib/review-publish.mjs';
 
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
 const ITEMS = 'abcdef012345';
@@ -456,4 +456,33 @@ test('E2: a writer holding the review lock first makes `P merge --owner-go` refu
   assert.match(r.json.reasons.join(' '), /nothing was changed/);
   assert.deepEqual(s.writes(), []);
   assertExit(s.go(), 0);
+});
+
+// ---- a state from a NEWER pipeline (version above SUPPORTED_STATE_VERSION): every reader and gate refuses, none hands the state on ---------------------------------
+
+test('state version SUPPORTED + 1: loadState, the published reader, both history checks, the final gate and `merge --dry-run` each refuse; none returns a state', async () => {
+  // failure caught: an install older than the writer reading a version-8 state (a round whose grant came from a click variant it cannot re-verify) as if it were its own, and merging or republishing over it
+  const newer = (st) => ({ ...st, version: SUPPORTED_STATE_VERSION + 1 });
+  const w = await checkWorld();
+  const bad = newer(w.st);
+  const theirs = gh([comment(1, triageComment(bad))]);
+  assert.equal(decodeFromComment(triageComment(bad)), null, 'a published newer state decodes to nothing');
+  const p = readPublished(theirs, PR);
+  assert.deepEqual([p.state, p.undecodable], [null, true]);
+  assert.throws(() => assertPublishedHistory({ gh: theirs, pr: PR, state: w.st }), (e) => e.output?.error === 'history-unreadable');
+  const past = pastRoundHistoryProblem({ local: w.st, published: p, pr: PR });
+  assert.deepEqual([past.problem?.error, past.diff], ['history-unreadable', null]);
+  // the final gate: a newer PUBLISHED state with a good local one, and a newer LOCAL state
+  refusal(await w.check(theirs), /no readable review state/);
+  const dir = w.repo.dir;
+  saveState(dir, bad);
+  assert.throws(() => loadState(dir), new RegExp(`version ${SUPPORTED_STATE_VERSION + 1}.*supports.*${SUPPORTED_STATE_VERSION}`));
+  refusal(await w.check(), /local review state is unreadable/);
+  // merge --dry-run: the same newer state on both sides is a blocker, not a mergeable PR
+  const s = world({ items: [claudeItem()] });
+  s.set(s.items, { state: newer(s.state) });
+  const d = s.dry();
+  assert.deepEqual([d.code, d.json.wouldMerge], [1, false], d.stdout);
+  assert.match(d.json.blockers.map((b) => b.detail).join(' '), new RegExp(`review-complete: the local review state is unreadable.*format version ${SUPPORTED_STATE_VERSION + 1}`));
+  assert.deepEqual(s.mergeCalls(), []);
 });
