@@ -45,7 +45,7 @@ Details of steps 2–5: `reference/build.md`.
 2. ONE `implementer` dispatch builds the whole change (tasks in order, tests first, `verify.quick`, the commit trailer, "return immediately when done"); more only for a big change; continue THE SAME agent before a fresh dispatch.
 3. `verify.quick` after each dispatch and before every push; red ⇒ implementer, max 3 fix cycles, then stop (outcome `blocked`).
 4. Draft PR: `git push -u origin agent/<slug>`, `gh pr create --draft`; body opens with `## In plain English`; one keyword per issue (`Closes #170. Closes #171.`). Then book every call made before the PR existed, e.g. the build implementer (`reference/cost-booking.md`).
-5. `mkdir -p .review`, then `P risk|hardstops|integrity --base origin/<default_branch> --head HEAD` (`hardstops` > `.review/hardstops.json`); note any `blocking` / `ownerMerge` item or integrity violation (3.3 depends on it). The review runs either way.
+5. `mkdir -p .review`, then `P risk`, `P hardstops` (> `.review/hardstops.json`) and `P integrity`, each with `--base origin/<default_branch> --head HEAD`; note any `blocking` / `ownerMerge` item or integrity violation (3.3 depends on it). The review still runs.
 
 ## 2. Review rounds (max `review.max_rounds`, plus the one extra round `P state outcome` calls `extraRound`, plus one per owner `extra round`)
 
