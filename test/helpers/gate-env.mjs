@@ -17,21 +17,38 @@ const bin = join(dirname(fileURLToPath(import.meta.url)), '..', '..', 'pipeline'
 export const PR = 12;
 // The merge commands take a per-PR lock: the CLI runs get a private lock directory and machine id, never the developer's real ones.
 export const LOCK_DIR = mkdtempSync(join(tmpdir(), 'gate-env-locks-'));
+// The agent-log line ends with the weekly Codex figure from the account's usage ledger: these tests (and the in-process summary runs, which read
+// process.env) get an empty ledger of their own, never the developer's real one or one other test files fill.
+process.env.PIPELINE_CODEX_USAGE_FILE = join(LOCK_DIR, 'codex-usage.jsonl');
 export const AGENT_LOG = 'docs/agent-log.md';
 export const STEPS = ['install', 'typecheck', 'lint', 'unit', 'build'];
 export const MERGE_SHA = 'c'.repeat(40);
 // The base tip GitHub's compare reports (base_commit): update-branch's merge commit must have it as second parent.
 export const BASE_SHA = '9'.repeat(40);
+export const QUEUE_AWARE_SHA = '5'.repeat(40); // the commit a test base's .claude/merge-queue-aware names (ghEntries `queueAware`)
 export const ME = { match: '^api user', stdout: 'me\n' };
 export const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
+
+// The environment of a spawned CLI: the caller's, minus what would make the child act for the LAUNCHING session. A suite run inside a Claude Code session (or inside a
+// `P job` started from one) inherits that session's review-lease variables; with them the child CLI takes a lease of the account (under that session's identity, in its
+// folder) instead of running as a plain test. Only a test that asks for them (in `env`) gets them. `node --test` marks its test processes with NODE_TEST_CONTEXT, which is what
+// keeps a checkout's CLI from taking leases (review-lease-wiring.mjs leasesOffForTests); a run without process isolation (`--test-isolation=none`, an in-process runner)
+// leaves it unset, so the child gets the mark here. Exported for test/gate-env-hermetic.test.mjs.
+export function cliEnv(fake, env = {}) {
+  const ambient = { ...process.env };
+  for (const k of ['PIPELINE_LEASE_HOLDER', 'PIPELINE_REVIEW_LEASE_DIR', 'PIPELINE_ADMISSION_WAIT_MS']) delete ambient[k];
+  ambient.NODE_TEST_CONTEXT ??= 'child-v8';
+  // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
+  return { ...ambient, PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_LOCK_DIR: LOCK_DIR, PIPELINE_MACHINE_ID: 'gate-env-test-machine', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+}
 
 // Spawns the real CLI inside `dir` against a fake gh. PIPELINE_* switches of the caller are scrubbed so a developer
 // running this inside a pipeline session cannot change the outcome.
 export function cli(args, { dir, fake, env = {} }) {
-  // PIPELINE_MERGEABLE_PAUSE_MS shortens the 2 s wait between `mergeable: UNKNOWN` re-reads (it can never lengthen it).
-  const base = { ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_LOCK_DIR: LOCK_DIR, PIPELINE_MACHINE_ID: 'gate-env-test-machine', ...(fake?.env ?? {}), ...createFakeCodex().env, ...env };
+  const base = cliEnv(fake, env);
   for (const k of ['PIPELINE_OFF', 'PIPELINE_ADMIN', 'PIPELINE_MERGE_WAIT_MS', 'PIPELINE_MERGE_POLL_MS']) if (!(k in env)) delete base[k];
-  const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000 });
+  // stdin is closed, never a pipe or the session's terminal: no child can wait on input.
+  const r = spawnSync(process.execPath, [bin, ...args], { cwd: dir, env: base, encoding: 'utf8', timeout: 120_000, stdio: ['ignore', 'pipe', 'pipe'] });
   let json = null;
   try {
     json = r.stdout ? JSON.parse(r.stdout) : null;
@@ -112,6 +129,25 @@ export function ghEntries(o) {
     // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.
     // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
     UPDATE_REPLIES[o.update ?? 'accepted'],
+    // `queueAware`: the commit the base's .claude/merge-queue-aware names (GitHub's contents API); absent = no such file (404). `queueAwareFile: 'error'` = GitHub cannot answer (502).
+    // `queueAwareIn`: whether the PR head contains that commit (the compare of it with the head): true (default) = ahead, false = diverged, 'error' = GitHub cannot answer, 'unknown' = GitHub does not know the commit (404).
+    // `queueAwareOnBase`: whether the BASE branch itself contains it (the compare of it with the base): true (default) = ahead, false = diverged, 'error' = GitHub cannot answer, 'unknown' = GitHub does not know the commit (404).
+    // These come BEFORE the generic compare below, which would answer a compare of any pair alike.
+    o.queueAwareFile === 'error'
+      ? { match: 'contents/.claude/merge-queue-aware', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : o.queueAware === undefined
+        ? { match: 'contents/.claude/merge-queue-aware', code: 1, stderr: 'gh: Not Found (HTTP 404)' }
+        : { match: 'contents/.claude/merge-queue-aware', stdoutJson: ['file', 'base64', Buffer.from(`# the commit that taught scripts/merge-pr.mjs the merge queue\n${o.queueAware}\n`).toString('base64')] },
+    ...(o.queueAware !== undefined ? [o.queueAwareOnBase === 'error'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : o.queueAwareOnBase === 'unknown'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, code: 1, stderr: 'gh: Not Found (HTTP 404)' }
+      : { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.main\\?`, stdoutJson: { status: o.queueAwareOnBase === false ? 'diverged' : 'ahead', behind_by: 0, ahead_by: 1, base: BASE_SHA } }] : []),
+    ...(o.queueAware !== undefined ? [o.queueAwareIn === 'error'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, code: 1, stderr: 'gh: Server Error (HTTP 502)' }
+      : o.queueAwareIn === 'unknown'
+      ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, code: 1, stderr: 'gh: Not Found (HTTP 404)' }
+      : { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, stdoutJson: { status: o.queueAwareIn === false ? 'diverged' : 'ahead', behind_by: 0, ahead_by: 1, base: BASE_SHA } }] : []),
     { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: o.compareBase ?? BASE_SHA } },
     // `commitParents`: { <sha>: [parent shas] } for GET commits/<sha> (the update-branch result is bound to its parents).
     ...Object.entries(o.commitParents ?? {}).map(([commit, parents]) => ({ match: `commits/${commit} --jq`, stdoutJson: parents })),
@@ -123,10 +159,10 @@ export function ghEntries(o) {
         ? { match: '^pr checks 12 .*--required$', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
         : { match: '^pr checks 12 .*--required$', stdoutJson: o.requiredCi ?? ci },
     { match: '^pr checks 12 ', stdoutJson: ci },
-    // The live merge-queue read (gh.queueState): off unless a test says `queue: true`; `queue: 'error'` = GitHub cannot answer.
+    // The live merge-queue read (gh.queueState): off unless a test says `queue: true`; `queue: 'error'` = GitHub cannot answer; `queueEntry` = the PR's live entry ({ id, state, position, enqueuedAt, headCommit }).
     o.queue === 'error'
       ? { match: 'QueueState', code: 1, stderr: 'gh: Server Error (HTTP 502)' }
-      : { match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', state: pr.state, headRefOid: o.prHead, isMergeQueueEnabled: o.queue === true, mergeCommit: null, mergeQueueEntry: null } } } } },
+      : { match: 'QueueState', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_node12', state: pr.state, headRefOid: o.prHead, isMergeQueueEnabled: o.queue === true, mergeCommit: null, mergeQueueEntry: o.queueEntry ?? null } } } } },
     { match: '^auth status', code: 0 },
     ME,
     REPO,

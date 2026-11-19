@@ -460,3 +460,69 @@ test('a nested retrying() shares the outermost cap', () => {
   assert.throws(() => gh.retrying(() => gh.listComments(4, { retry: true })), GhError);
   assert.equal(waits.reduce((a, b) => a + b, 0), 100_000);
 });
+
+// ---- #268: the creator issue scan ---------------------------------------------------------------------------
+
+function scanGh(reply = { code: 0, stdout: '[]', stderr: '', timedOut: false }) {
+  const calls = [];
+  const ghFn = (args, opts) => {
+    calls.push({ args, timeoutMs: opts.timeoutMs });
+    if (args[0] === 'repo') return { code: 0, stdout: JSON.stringify(REPO_VIEW), stderr: '', timedOut: false };
+    if (args[0] === 'api' && String(args[1]).includes('/issues?creator=')) return reply;
+    return { code: 0, stdout: '{}', stderr: '', timedOut: false };
+  };
+  return { calls, gh: createGitHub({ cwd, ghFn }) };
+}
+const scanCall = (calls) => calls.find((c) => String(c.args[1] ?? '').includes('/issues?creator='));
+
+test('listIssuesByCreator: per_page=100, no since by default, and a 180 s timeout for this call only', () => {
+  const { calls, gh } = scanGh();
+  gh.listIssuesByCreator({ creator: 'me' });
+  const c = scanCall(calls);
+  assert.deepEqual(c.args, ['api', 'repos/acme/widgets/issues?creator=me&state=all&per_page=100', '--paginate']);
+  assert.equal(c.timeoutMs, 180_000);
+  gh.listIssues({ label: 'x' });
+  gh.viewer();
+  const others = calls.filter((x) => x !== c);
+  assert.ok(others.length >= 3 && others.every((x) => x.timeoutMs === 60_000), JSON.stringify(others.map((x) => [x.args[0], x.timeoutMs])));
+});
+
+test('listIssuesByCreator: since is URL-encoded into the query; the listing helpers elsewhere keep per_page=30', () => {
+  const { calls, gh } = scanGh();
+  gh.listIssuesByCreator({ creator: 'me', state: 'all', since: '2026-11-09T23:30:00Z' });
+  assert.equal(scanCall(calls).args[1], 'repos/acme/widgets/issues?creator=me&state=all&per_page=100&since=2026-11-09T23%3A30%3A00Z');
+  const comments = scanGh({ code: 0, stdout: '[]', stderr: '', timedOut: false });
+  comments.gh.listComments(5);
+  assert.ok(comments.calls.some((c) => /issues\/5\/comments$/.test(String(c.args[1]))), 'comments are untouched');
+});
+
+test('listIssuesByCreator: a 180 s timeout and a mid-pagination failure are GhErrors', () => {
+  assert.throws(() => scanGh({ code: 124, stdout: '[{"number":1}]', stderr: '', timedOut: true }).gh.listIssuesByCreator({ creator: 'me' }), GhError);
+  assert.throws(() => scanGh({ code: 1, stdout: '[{"number":1}]', stderr: 'HTTP 502', timedOut: false }).gh.listIssuesByCreator({ creator: 'me', since: '2026-11-09T23:30:00Z' }), GhError);
+});
+
+// #396: writeSummaryComment holds the id of its own fresh read, so the write PATCHes that id; the comments are listed once (the read), not again for the write.
+test('writeSummaryComment PATCHes the id it read: no second listing of the comments; with no comment yet it creates one', async () => {
+  const { writeSummaryComment, readSummaryComment } = await import('../pipeline/lib/summary-comment.mjs');
+  const { MARKERS } = await import('../pipeline/lib/render.mjs');
+  const listings = (fake) => fake.lines().filter((l) => l.includes('issues/4/comments --paginate')).length;
+  const a = mk([
+    REPO, ME,
+    comments(
+      { id: 10, body: `${MARKERS.summary}\nold`, user: { login: 'me' } },
+      { id: 12, body: `${MARKERS.summary}\nnewer`, user: { login: 'me' } },
+      { id: 13, body: `${MARKERS.summary}\nsomeone else's`, user: { login: 'other' } },
+    ),
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/12 ', stdoutJson: { id: 12, html_url: 'https://x/12' } },
+  ]);
+  const existing = readSummaryComment(a.gh, 4);
+  assert.equal(listings(a.fake), 1);
+  const r = writeSummaryComment(a.gh, 4, { sections: 'new sections', existing });
+  assert.deepEqual([r.id, r.action], [12, 'updated']);
+  assert.equal(listings(a.fake), 1, 'the write did not list the comments again');
+  assert.ok(a.fake.lines().some((l) => l.includes('-X PATCH repos/acme/widgets/issues/comments/12 ')));
+
+  const b = mk([REPO, ME, comments(), { match: '^api -X POST repos/acme/widgets/issues/4/comments ', stdoutJson: { id: 99, html_url: 'https://x/99' } }]);
+  const created = writeSummaryComment(b.gh, 4, { sections: 'first' });
+  assert.equal(created.action, 'created');
+});

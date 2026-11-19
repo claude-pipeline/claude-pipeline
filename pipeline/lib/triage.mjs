@@ -4,6 +4,9 @@
 import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
 import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
+import { isSensitivePath, threatModelsFor } from './risk.mjs';
+import { RISK_LEVELS, isSubstituteRound, maxRiskOf, secondReviewerOf } from './state.mjs';
+import { wholePrOwed } from './review-route.mjs';
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
@@ -76,6 +79,8 @@ export function validateRulings(json, itemIds, { review = false } = {}) {
     if (!oneOf(r.ruling, DECISIONS)) errors.push(`${r.id}: ruling must be one of ${DECISIONS.join('|')}`);
     if (!oneOf(r.confidence, CONFIDENCES)) errors.push(`${r.id}: confidence must be one of ${CONFIDENCES.join('|')}`);
     if (typeof r.reasoning !== 'string') errors.push(`${r.id}: reasoning must be a string`);
+    if (r.scope !== undefined && r.scope !== OUT_OF_MODEL) errors.push(`${r.id}: scope must be "${OUT_OF_MODEL}" when given`);
+    else if (r.scope !== undefined && r.ruling !== 'FOLLOW-UP') errors.push(`${r.id}: scope is only allowed with ruling FOLLOW-UP`);
   }
   if (review) errors.push(...findingErrors(json.findings));
   else if (json.findings !== undefined) errors.push('findings are only accepted in a Fable review round');
@@ -84,11 +89,34 @@ export function validateRulings(json, itemIds, { review = false } = {}) {
 
 // ---- Fable review rounds --------------------------------------------------------------------
 
+// ---- threat models (review.threat_models, read from the trusted default-branch config; #374) ---------------------------------------------------------
+// The one value `scope` may take on a ruling or a Fable finding: it says the item lies outside the threat model the arbiter's input stated for its file.
+export const OUT_OF_MODEL = 'out-of-model';
+const modelsAmong = (models, paths) => threatModelsFor(paths.map((p) => ({ path: p })), { review: { threat_models: Array.isArray(models) ? models : [] } });
+
+// -> { name, waive } | null. `name` is the first model (config order) whose paths match the item's file: the marker `final.outOfModel`, set for every validated
+// out-of-model FOLLOW-UP on such a file (so the filing gate sees it), whatever its bucket. `waive` is true only when the BLOCKING-security needsHuman
+// exception may apply: (a) the file is a clean repo path that resolves to exactly ONE entry of the reviewed diff (`files`, git.mjs#diffFiles entries),
+// (b) every path of that entry (old and new) matches one model (a rename out of the model is a human's), (c) the category is literally `security`
+// (auth, permissions, data-integrity and data-loss keep their security-dismissal). Anything else: no waiver, today's rule.
+function outOfModelOf(item, { models, files }) {
+  if (!Array.isArray(models) || models.length === 0 || typeof item.file !== 'string' || item.file === '') return null;
+  const hit = modelsAmong(models, [item.file])[0];
+  if (hit === undefined) return null;
+  const entries = Array.isArray(files) && locationProblem(item.file) === null ? files.filter((f) => entryPaths(f).includes(item.file)) : [];
+  if (item.category === 'security' && entries.length === 1) {
+    const paths = entryPaths(entries[0]);
+    const whole = models.find((m) => modelsAmong([m], paths).length === 1 && paths.every((p) => modelsAmong([m], [p]).length === 1));
+    if (whole !== undefined) return { name: whole.name, waive: true };
+  }
+  return { name: hit.name, waive: false };
+}
+
 // What Fable may raise on its own. A finding it raises is something to do, so it is ACCEPT (fix it here) or FOLLOW-UP (an
 // issue), never REJECT. The cap keeps a runaway answer from flooding the triage comment.
 export const FABLE_FINDINGS_MAX = 20;
 const FINDING_DECISIONS = ['ACCEPT', 'FOLLOW-UP'];
-const FINDING_KEYS = ['bucket', 'category', 'title', 'file', 'line', 'detail', 'ruling', 'confidence', 'reasoning'];
+const FINDING_KEYS = ['bucket', 'category', 'title', 'file', 'line', 'detail', 'ruling', 'confidence', 'reasoning', 'scope'];
 const FINDING_TEXT_MAX = 4000;
 
 function findingErrors(findings) {
@@ -112,6 +140,8 @@ function findingErrors(findings) {
     if (!Number.isInteger(f.line) || f.line < 0) errors.push(`${at}.line must be an integer >= 0`);
     if (!oneOf(f.ruling, FINDING_DECISIONS)) errors.push(`${at}.ruling must be one of ${FINDING_DECISIONS.join('|')}`);
     if (!oneOf(f.confidence, CONFIDENCES)) errors.push(`${at}.confidence must be one of ${CONFIDENCES.join('|')}`);
+    if (f.scope !== undefined && f.scope !== OUT_OF_MODEL) errors.push(`${at}.scope must be "${OUT_OF_MODEL}" when given`);
+    else if (f.scope !== undefined && f.ruling !== 'FOLLOW-UP') errors.push(`${at}.scope is only allowed with ruling FOLLOW-UP`);
   });
   return errors;
 }
@@ -120,7 +150,8 @@ function findingErrors(findings) {
 // PROVEN answer: an unproven one adds nothing (the round stays Fable-pending, see fablePendingRounds). Low confidence, or
 // deferring a BLOCKING security / data finding to a follow-up, goes to a human exactly like an arbiter ruling would.
 // `fingerprintFor(finding)` gives the cache fingerprint (it reads the code at head, so it is the caller's).
-export function fableFindingItems(findings, round, { transcript = null, fingerprintFor = () => null } = {}) {
+// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules.
+export function fableFindingItems(findings, round, { transcript = null, fingerprintFor = () => null, models = [], diffFiles = null } = {}) {
   if (!Number.isInteger(round) || round < 1) throw new Error(`invalid round ${String(round)}`);
   const errors = findingErrors(findings);
   if (errors.length > 0) throw new Error(`invalid findings: ${errors.join('; ')}`);
@@ -128,7 +159,11 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
     const defersBlockingSecurity = f.bucket === 'BLOCKING' && SECURITY_CATEGORIES.includes(f.category) && f.ruling === 'FOLLOW-UP';
     let final = { decision: f.ruling, by: 'arbiter', needsHuman: false, reason: f.reasoning };
     if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
-    else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding', cause: 'security-dismissal' };
+    else {
+      const oom = f.scope === OUT_OF_MODEL && f.ruling === 'FOLLOW-UP' ? outOfModelOf(f, { models, files: diffFiles }) : null;
+      if (oom !== null && (oom.waive || !defersBlockingSecurity)) final = { ...final, outOfModel: oom.name };
+      else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding', cause: 'security-dismissal' };
+    }
     const item = {
       id: `R${round}-F${i + 1}`,
       round,
@@ -149,7 +184,7 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
   });
 }
 
-// A round recorded with `fableRequired` (codex-review: risk.mjs#reviewLane said fable) is reviewed by ONE Fable pass that
+// A round recorded with `fableRequired` (codex-review: risk.mjs#rateBranch / reviewLane said fable; a low-risk or size-only-medium PR gets the judge) is reviewed by ONE Fable pass that
 // rules on every Codex item and reviews the diff itself. Until that pass is PROVEN (`arbiter.proofOk === true`) the round
 // is not reviewed, even when Codex found nothing: the Fable pass is the second review, not a dispute tie-break.
 // The Fable steps that stopped on the floor or a stale terminal and have not been proven since (round.arbiter.failure, written by arbiter.mjs).
@@ -322,7 +357,8 @@ export function finalizeWithoutArbiter(items, opts = {}) {
 // fails closed.
 // `proofCause` names why an unproven answer is unproven when it is not the plain model-proof failure ('stale-model': the proof failed on the
 // Fable floor alone).
-export function applyRulings(items, rulings, { proofOk, transcript, proofCause } = {}) {
+// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules.
+export function applyRulings(items, rulings, { proofOk, transcript, proofCause, models = [], diffFiles = null } = {}) {
   const list = Array.isArray(rulings) ? rulings : (rulings?.rulings ?? []);
   const byId = new Map(list.map((r) => [r.id, r]));
   return items.map((item) => {
@@ -359,10 +395,13 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause }
       };
     } else if (r.confidence === 'low') {
       next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
-    } else if (dismissesBlockingSecurity) {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item', cause: 'security-dismissal' };
     } else {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning };
+      const oom = r.scope === OUT_OF_MODEL && r.ruling === 'FOLLOW-UP' ? outOfModelOf(item, { models, files: diffFiles }) : null;
+      if (dismissesBlockingSecurity && !(oom?.waive === true)) {
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item', cause: 'security-dismissal' };
+      } else {
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }) };
+      }
     }
     return next;
   });
@@ -375,7 +414,9 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause }
 // stale-model (the Fable that answered is older than this machine's floor) and stale-terminal (this terminal runs an older Claude Code build than
 // the installed one) are malfunctions too: restart the terminal, update Claude Code, and run the review again.
 export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge', 'stale-model', 'stale-terminal'];
-const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security'];
+// 'round-cap': an accepted fix taken out of the PR at the round limit and filed as a follow-up (applyRoundCapDefer). A judgement the owner can re-make, not a malfunction.
+export const ROUND_CAP_CAUSE = 'round-cap';
+const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security', ROUND_CAP_CAUSE];
 // The reason strings of states written before `cause` existed.
 const LEGACY_CAUSES = [
   [/^model-proof failed/, 'model-proof'],
@@ -422,6 +463,8 @@ const RERUN = 're-run the judge/arbiter (\`arbiter needed\`) so it answers again
 // Why a second review (Codex) may not be run for this item, or null. Not for what is settled, built, already reviewed, or a malfunction.
 export function secondReviewRefusal(item) {
   if (!isObject(item)) return 'no item given';
+  // A deferral is a Claude dismissal, but a second review must not reopen it (it would spend Codex on what only the owner's typed ruling can change).
+  if (isRoundCapDeferral(item)) return `${item.id} was deferred past the round limit (its fix is out of the PR and filed as a follow-up): only the owner's typed ruling can reopen it`;
   if (item.implemented === true) return `${item.id} is already implemented`;
   if (item.secondReview !== undefined) return `${item.id} already has a second review`;
   if (!finalIsReopenable(item)) {
@@ -436,13 +479,16 @@ export function claudeRulingRefusal(item, decision, { secondReview } = {}) {
   if (!isObject(item)) return 'no item given';
   const id = item.id;
   if (!DECISIONS.includes(decision)) return `decision must be one of ${DECISIONS.join('|')}`;
+  // A fix deferred past the round limit is the owner's to reopen (owner-ruling); Claude's own ruling never touches it.
+  if (isRoundCapDeferral(item)) return `${id} was deferred past the round limit (its fix is out of the PR and filed as a follow-up): only the owner's typed ruling can reopen it`;
   if (item.implemented === true) return `${id} is already implemented`;
   if (claudeFinalIsAccept(item)) {
     return decision === 'ACCEPT'
       ? `${id} is already ACCEPT`
       : `${id} is ACCEPT by Claude or a second review: Claude cannot loosen it; only the owner's typed ruling can`;
   }
-  if (!finalIsReopenable(item)) {
+  // A post-limit FOLLOW-UP (applyPostMaxDefault) may be tightened back to ACCEPT, never any other way (secondReviewRefusal keeps finalIsReopenable: a second review does not reopen it).
+  if (!finalIsReopenable(item) && !(decision === 'ACCEPT' && isPostMaxFinal(item))) {
     return `${id} is not waiting for a human decision and is not a Claude dismissal (settled finals are not reopened)`;
   }
   if (decision === 'ACCEPT') return null;
@@ -473,6 +519,51 @@ export function applyClaudeRuling(item, { decision, reason, ruledAt }) {
     claude: { ruledAt, cause: needsHumanCause(item), critical: isCriticalDismissal(item, decision), overruled: structuredClone(item.final) },
   };
   return next;
+}
+
+// ---- deferring accepted fixes past the round limit (plan 2026-11-11-round-discipline-one-implementer.md, Item 1b) ---------------------------------
+// The item-level mark `roundCapDeferral` ({ fixHead, reviewedHead, at }) outlives any later ruling (an owner ruling replaces `final`, not this), so the Rulings
+// inventory keeps listing the item and the result cache never reuses it.
+export const isRoundCapDeferral = (item) => isObject(item?.roundCapDeferral);
+// Still the deferral Claude's CLI wrote (not yet re-ruled by the owner).
+const isDeferralFinal = (item) => item?.final?.claude?.cause === ROUND_CAP_CAUSE;
+// Only an ACCEPT the judge or the arbiter made may be deferred: never a test result, Claude's or a second review's final, the owner's word, or a cached copy.
+export const DEFERRABLE_BY = Object.freeze(['judge', 'arbiter']);
+
+// Why this item's accepted fix may not be deferred, or null (the item-level rules; the severity and the state-wide rules are deferEligibility's).
+export function roundCapDeferRefusal(item) {
+  if (!isObject(item)) return 'no item given';
+  const id = item.id;
+  if (item.final?.decision !== 'ACCEPT' || item.final.needsHuman === true) return `${id} is not an accepted fix`;
+  if (item.implemented !== true) return `${id} is accepted but its fix is not implemented`;
+  if (isOwnerRuled(item)) return `${id} was ruled by the owner: only the owner's typed ruling can loosen it`;
+  if (isProtectedFinal(item)) return `${id} was ruled by Claude or forced by a second review: it cannot be loosened`;
+  if (!DEFERRABLE_BY.includes(item.final.by)) return `${id} was accepted by ${item.final.by ?? 'unknown'}, not by the judge or the arbiter`;
+  if (isRoundCapDeferral(item)) return `${id} was already deferred`;
+  return null;
+}
+
+// The deferral: the accepted fix is out of the tree, so the item is a FOLLOW-UP again (the issue is filed by `followups create`). `implemented` and
+// `implementedVia` go: nothing was built that a round would have to confirm. Throws on anything refused.
+export function applyRoundCapDefer(item, { reason, ruledAt, fixHead, reviewedHead }) {
+  const refusal = roundCapDeferRefusal(item);
+  if (refusal) throw new Error(refusal);
+  const { implementedVia: _via, implementedAfterRound: _mark, ...rest } = structuredClone(item);
+  return {
+    ...rest,
+    implemented: false,
+    final: {
+      decision: 'FOLLOW-UP', by: 'claude', needsHuman: false, reason,
+      claude: { ruledAt, cause: ROUND_CAP_CAUSE, critical: false, overruled: structuredClone(item.final), fixHead, reviewedHead },
+    },
+    roundCapDeferral: { fixHead, reviewedHead, at: ruledAt },
+  };
+}
+
+// The state with those items deferred (each in its own round), nothing else touched.
+export function deferItemsInState(state, ids, params) {
+  const wanted = new Set(ids);
+  return { ...state, rounds: (state.rounds ?? []).map((r) => ({ ...r, items: (r.items ?? []).map((i) => (wanted.has(i.id) ? applyRoundCapDefer(i, params) : i)) })) };
 }
 
 // Codex's answer to the second-review packet: {items:[{id, decision, confidence, reasoning}]}, strict like second-review.schema.json (no extra keys; every
@@ -523,12 +614,15 @@ export function settleSecondReview(item, verdict) {
 export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }) {
   if (!DECISIONS.includes(decision)) throw new Error(`decision must be one of ${DECISIONS.join('|')}`);
   // The owner may rule on an item waiting for a human, and (E6) on a Claude or forced final that is not implemented yet: the typed
-  // override is the one path that may loosen what Claude settled.
-  if (item.final?.needsHuman !== true && !(isProtectedFinal(item) && item.implemented !== true)) {
+  // override is the one path that may loosen what Claude settled. A third case (#559): an UNIMPLEMENTED ACCEPT of the arbiter, the judge or the cache may be
+  // deferred, FOLLOW-UP only (the fix goes to an issue and the item is bound to the owner's merge); the owner cannot reject or re-accept it here.
+  const deferrable = decision === 'FOLLOW-UP' && isDeferrableAccept(item);
+  if (!deferrable && item.final?.needsHuman !== true && !(isProtectedFinal(item) && item.implemented !== true)) {
     throw new Error(isProtectedFinal(item) ? `${item.id} is already implemented; an owner ruling cannot reopen it` : `${item.id} needs no human decision`);
   }
   const next = structuredClone(item);
   next.final = { decision, by: 'owner', needsHuman: false, reason, ownerQuote, ruledAt, overruled: structuredClone(item.final) };
+  if (deferrable) next.final.ownerDeferral = { accepted: item.final.by, ruledAt };
   return next;
 }
 
@@ -537,9 +631,13 @@ export function applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt }
 // else cannot reuse the ruling. Only the finding text is hashed (the fields of codex.mjs assignIds and of fableFindingItems, whose
 // reasoning is item.arbiter.reasoning), never a decision field (final, owner-ruling results, implemented), so applying one ruling of
 // a request leaves the digest of the others alone. First 12 hex of sha256 over one tuple per item, sorted by id.
+const DEFERS_ACCEPTED_FIX = 'defers-accepted-fix';
 export function rulingContentDigest(items) {
   const tuples = [...items]
-    .map((i) => [String(i.id).toUpperCase(), i.source, i.bucket, i.category, i.title, i.file, i.line, i.detail, i.codexReasoning, i.arbiter?.reasoning].map((v) => v ?? null))
+    .map((i) => [String(i.id).toUpperCase(), i.source, i.bucket, i.category, i.title, i.file, i.line, i.detail, i.codexReasoning, i.arbiter?.reasoning].map((v) => v ?? null)
+      // An ACCEPTED fix the owner is asked to defer (or already deferred) is a different question from the same text waiting for a human: an answer recorded for the one cannot
+      // rule the other. Only these items carry the marker, so every other digest is byte-identical, and it holds once one id of a multi-id request is applied.
+      .concat(isDeferrableAccept(i) || isOwnerDeferral(i) ? [DEFERS_ACCEPTED_FIX] : []))
     .sort((a, b) => (a[0] < b[0] ? -1 : a[0] > b[0] ? 1 : 0));
   return createHash('sha256').update(JSON.stringify(tuples)).digest('hex').slice(0, 12);
 }
@@ -548,6 +646,18 @@ export function rulingContentDigest(items) {
 export const isOwnerRuled = (item) => typeof item.final?.ownerQuote === 'string' && item.final.ownerQuote !== '';
 
 export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
+
+// ---- owner deferral of an accepted fix (#559) -----------------------------------------------
+// An ACCEPT nobody implemented may leave the merge by the owner's typed word: FOLLOW-UP only (a REJECT of an arbiter ACCEPT stays refused). The final keeps the ACCEPT as `overruled`
+// and carries `ownerDeferral`; the mark, not `by`, is the key everywhere, because the result cache rewrites `by` to 'cache'.
+export const DEFERRABLE_ACCEPT_BY = Object.freeze(['arbiter', 'judge', 'cache']);
+// An open ACCEPT the owner may defer: made by the arbiter, the judge or a cached copy of theirs; not a test result (the cache keeps that as final.evidence 'test'), not Claude's or a
+// forced final, not the owner's own, not a round-limit deferral; and not fixed.
+// A cached test ACCEPT written before the cache kept `evidence` has only the reason prefix applyTestResult wrote (same pattern as LEGACY_CAUSES): read as test evidence.
+const isTestAccept = (final) => final.evidence === 'test' || (final.by === 'cache' && typeof final.reason === 'string' && final.reason.startsWith('test confirmed: '));
+export const isDeferrableAccept = (item) => item?.final?.decision === 'ACCEPT' && item.final.needsHuman !== true && item.implemented !== true
+  && DEFERRABLE_ACCEPT_BY.includes(item.final.by) && !isTestAccept(item.final) && !isOwnerRuled(item) && !isProtectedFinal(item) && !isRoundCapDeferral(item);
+export const isOwnerDeferral = (item) => isObject(item?.final?.ownerDeferral);
 
 // ---- cache and light lane -------------------------------------------------------------------
 
@@ -558,13 +668,15 @@ export const ownerRuledItems = (state) => allItems(state).filter(isOwnerRuled);
 // A dismissal (REJECT / FOLLOW-UP) of a security, auth, permissions or data category is never reused, whatever the
 // bucket: those are looked at every time, unless the OWNER ruled on it (its final keeps the ownerQuote): asking again would make
 // the owner rule twice on the same finding, and the copy still counts as ownerMerge at the final gate. An entry without bucket and category (a hand-built cache) is not reused.
-export function reuseRuled(items, ruledCache) {
+// `round` (the number of the round the copies belong to): a carried fix is recorded as made before that round (`implementedAfterRound` = round - 1), see markedBefore.
+export function reuseRuled(items, ruledCache, { round } = {}) {
   return items.map((item) => {
     const next = structuredClone(item);
     if (next.final || !next.fingerprint) return next;
     if (!Object.hasOwn(ruledCache, next.fingerprint)) return next;
     const { bucket, category, followupIssue, implemented, ...final } = structuredClone(ruledCache[next.fingerprint]);
     if (bucket !== next.bucket || category !== next.category) return next;
+    if (final.claude?.cause === ROUND_CAP_CAUSE) return next; // (a cache written by hand, or by a copy that kept it)
     const dismissal = final.decision === 'REJECT' || final.decision === 'FOLLOW-UP';
     if (dismissal && SECURITY_CATEGORIES.includes(next.category) && !isOwnerRuled({ final })) return next;
     next.final = { ...final, by: 'cache' };
@@ -575,8 +687,28 @@ export function reuseRuled(items, ruledCache) {
     // unimplemented ACCEPT that `mark-implemented` can never clear. Never for a BLOCKING or security / data finding: raised
     // again on unchanged code, that is evidence the fix may be missing, so it stays open (and parks for a human) instead.
     const carriesFix = next.bucket !== 'BLOCKING' && !SECURITY_CATEGORIES.includes(next.category);
-    if (final.decision === 'ACCEPT' && implemented === true && carriesFix) next.implemented = true;
+    if (final.decision === 'ACCEPT' && implemented === true && carriesFix) {
+      next.implemented = true;
+      if (Number.isInteger(round)) next.implementedAfterRound = round - 1;
+    }
     return next;
+  });
+}
+
+// A finding raised again after its fix was deferred past the round limit (same fingerprint as an item with roundCapDeferral whose follow-up issue is filed): the new
+// item links that issue (followupIssue) and says so (`reraisedDeferral`, shown in the triage comment), so `followups create` reuses the issue instead of filing a second one.
+// Only an item with no issue of its own is touched; the newest deferral wins. Pure: returns copies.
+export function linkDeferredFollowups(items, priorItems) {
+  const deferred = new Map();
+  for (const p of priorItems ?? []) {
+    if (!isRoundCapDeferral(p) || typeof p.fingerprint !== 'string' || p.fingerprint === '') continue;
+    const issue = typeof p.followupIssue === 'string' ? p.followupIssue : p.followupIssue?.url;
+    if (typeof issue === 'string' && issue !== '') deferred.set(p.fingerprint, { id: p.id, issue });
+  }
+  return items.map((item) => {
+    const hit = typeof item?.fingerprint === 'string' ? deferred.get(item.fingerprint) : undefined;
+    if (hit === undefined || item.followupIssue || isRoundCapDeferral(item)) return item;
+    return { ...structuredClone(item), followupIssue: hit.issue, reraisedDeferral: { id: hit.id, issue: hit.issue } };
   });
 }
 
@@ -587,6 +719,8 @@ export function ruledCacheFrom(items) {
   for (const item of items) {
     // A light-lane rejection is a default ("not triaged"), not a ruling: nobody looked at it.
     if (item.fingerprint && item.final && !item.final.needsHuman && item.final.by !== 'light-lane') {
+      // A fix deferred past the round limit is never reused as a settled dismissal: the same text in a later round is looked at again.
+      if (isDeferralFinal(item)) continue;
       // A Claude or forced dismissal of a BLOCKING or security item (or one that was critical when ruled) is looked at again, never reused (E10).
       if (isProtectedFinal(item) && item.final.decision !== 'ACCEPT'
         && (item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category) || item.final.claude?.critical === true)) continue;
@@ -597,6 +731,8 @@ export function ruledCacheFrom(items) {
       cache[item.fingerprint] = {
         ...structuredClone(item.final), bucket: item.bucket, category: item.category, ...(issue ? { followupIssue: issue } : {}),
         ...(fixed ? { implemented: true } : {}),
+        // A test result stays a test result through the cache (it is not an ACCEPT the owner may defer).
+        ...(item.final.by === 'test' || isTestAccept(item.final) ? { evidence: 'test' } : {}),
       };
     }
   }
@@ -637,7 +773,8 @@ const grantsOf = (grants, k) => {
   }
 };
 const coversHead = (g, head) => head === undefined || (typeof head === 'string' && head.startsWith(g.head));
-const grantedRetained = (state) => (state?.rounds ?? []).filter((r) => countsTowardCap(r) && typeof r.ownerGrant?.grantId === 'string').length;
+// A grant with `past: true` is the owner's approval of a round that ALREADY ran (`state past-round-grant`): it admits nothing, so it lifts no limit and is not counted here.
+const grantedRetained = (state) => (state?.rounds ?? []).filter((r) => countsTowardCap(r) && typeof r.ownerGrant?.grantId === 'string' && r.ownerGrant.past !== true).length;
 
 // The counted ordinal (1-based) the automatic extra round took, or null. It is the counted round at max + 1 that no owner grant admitted:
 // recorded `admission: 'auto-extra'`, or (a state written before admission was recorded) no admission and no ownerGrant.
@@ -645,7 +782,7 @@ export function autoExtraOrdinal(state) {
   const max = state?.maxRounds;
   if (!Number.isFinite(max)) return null;
   const r = (state?.rounds ?? []).filter(countsTowardCap)[max];
-  if (r === undefined || r.ownerGrant !== undefined) return null;
+  if (r === undefined || (r.ownerGrant !== undefined && r.ownerGrant.past !== true)) return null;
   return r.admission === 'auto-extra' || r.admission === undefined ? max + 1 : null;
 }
 
@@ -663,7 +800,7 @@ const roundsAwaitingFixReview = (rounds) => {
   return out;
 };
 
-const isNewAccept = (item) => item.final?.decision === 'ACCEPT' && item.final.by !== 'cache';
+export const isNewAccept = (item) => item.final?.decision === 'ACCEPT' && item.final.by !== 'cache';
 const isUnimplementedAccept = (item) => item.final?.decision === 'ACCEPT' && !item.implemented;
 const isOpenBlocking = (item) => item.bucket === 'BLOCKING' && (!item.final || isUnimplementedAccept(item));
 
@@ -678,6 +815,11 @@ const unresolved = (item) => !item.final || item.final.needsHuman || isOpenBlock
 // Clean needs: nothing pending, needing a human, open, or accepted-but-unfixed anywhere; nothing
 // newly accepted in the LAST round (its fixes still need a round to review them); and the last
 // round reviewed exactly the content that exists now (coverageValid).
+// Which Claude stands in for Codex on a round Codex refused: Fable when the PR EVER had high risk (maxRisk; a shrinking diff never brings Opus back), else
+// Opus. An unreadable risk fails toward the stronger reviewer.
+export const substituteAgentFor = (maxRisk) => (RISK_LEVELS.includes(maxRisk) && maxRisk !== 'high' ? 'substitute-opus' : 'substitute-fable');
+
+// substituteRounds: the rounds a substitute reviewed first (state.mjs isSubstituteRound); maxRisk: the highest risk the PR ever had (state.mjs maxRiskOf).
 export function roundOutcome(state, { grants, head } = {}) {
   const rounds = state?.rounds ?? [];
   const last = rounds.at(-1);
@@ -738,6 +880,7 @@ export function roundOutcome(state, { grants, head } = {}) {
   return {
     clean, openBlocking, newAccepted, needsHuman, pending, unimplemented, reachedMax, extraRound, effectiveMaxRounds, coverageValid, fablePending,
     grantedRound, autoExtraOrdinal: autoOrd,
+    substituteRounds: rounds.filter(isSubstituteRound).map((r) => r.n), maxRisk: maxRiskOf(state),
   };
 }
 
@@ -796,13 +939,38 @@ const TITLE_MAX = 60;
 const WHY_MAX = 140;
 // Printable ASCII only (anything else becomes ?), white space collapsed, cut with "..." at max: a row is one line of one fixed shape, and a
 // finding's text can never add a separator (the middle dot is not ASCII), a line or a quote of its own.
-const asciiLine = (s, max) => {
+export const asciiLine = (s, max) => {
   const text = String(s ?? '').replace(/\s+/g, ' ').trim().replace(/[^\x20-\x7e]/g, '?');
   return text.length > max ? `${text.slice(0, max - 3)}...` : text;
 };
+// The issue number of a filed follow-up (a URL ending /issues/N), or null.
+const issueNumber = (issue) => /\/issues\/(\d{1,9})$/.exec(typeof issue === 'string' ? issue : issue?.url ?? '')?.[1] ?? null;
+// The "why" of a row. A deferral Claude's CLI wrote says what happened in the CLI's own words (never the agent's reason, which stays in the state and the triage
+// comment): who accepted the fix, that it is out of this merge, and the issue. Anything else, and a deferral the owner re-ruled, shows the final's reason.
+function rowWhy(item) {
+  if (isOwnerDeferral(item)) {
+    const issue = issueNumber(item.followupIssue);
+    return `owner deferral of ${deferredBy(item)} ACCEPT; NOT fixed in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
+  }
+  if (isPostMaxFinal(item)) {
+    const pmx = item.final.postMax;
+    const issue = issueNumber(item.followupIssue);
+    return `accepted by ${pmx.by === 'judge' ? 'judge' : 'arbiter'} in round ${asciiLine(pmx.ordinal, 6)} past limit ${asciiLine(pmx.max, 6)}; NOT fixed in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
+  }
+  if (!(isRoundCapDeferral(item) && isDeferralFinal(item))) return item.final.reason;
+  const accepted = item.final.claude.overruled?.by;
+  const issue = issueNumber(item.followupIssue);
+  return `deferred past the round limit; accepted by ${accepted === 'arbiter' ? 'arbiter' : 'judge'}; fix ${String(item.roundCapDeferral.fixHead ?? '').slice(0, 12)} removed, NOT in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
+}
+// Who made the ACCEPT the owner deferred (a fixed word, never the final's free text).
+const deferredBy = (item) => (DEFERRABLE_ACCEPT_BY.includes(item.final?.ownerDeferral?.accepted) ? item.final.ownerDeferral.accepted : 'unknown');
 const byLabel = (item) => {
   const by = item.final?.by;
-  if (by === 'claude') return item.secondReview !== undefined ? 'claude+codex' : 'claude';
+  if (isOwnerDeferral(item)) return `owner deferral (accepted by ${deferredBy(item)})`;
+  if (by === 'claude' && isRoundCapDeferral(item)) return 'claude (round limit)';
+  // who reviewed it second is part of the bound Rulings row (R5-5): claude+codex | claude+substitute-opus | claude+substitute-fable
+  if (by === 'claude') return item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude';
+  if (by === 'arbiter' && typeof item.final?.outOfModel === 'string' && item.final.outOfModel !== '') return `arbiter (outside threat model ${asciiLine(item.final.outOfModel, 40)})`;
   return typeof by === 'string' && by !== '' ? by : 'unknown';
 };
 const isCriticalItem = (item) => item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category);
@@ -812,7 +980,7 @@ const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 // that was carried into later rounds is one dismissal, not several).
 function inventoryEntries(state) {
   const dismissed = allItems(state)
-    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && isCriticalItem(i))
+    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i) || isPostMaxFinal(i) || isOwnerDeferral(i)))
     .map((i) => ({ item: i, id: String(i.id) }))
     .sort(byIdAsc);
   const listed = new Set();
@@ -823,9 +991,11 @@ function inventoryEntries(state) {
     if (fp !== null) listed.add(fp);
     kept.push(entry);
   }
-  return kept.sort(byIdAsc).map(({ item, id }) => ({ item, id, row: [
+  // Deferral rows (a fix taken out at the round limit, an ACCEPT turned into a FOLLOW-UP past it, an ACCEPT the owner deferred) are their own group, after the critical rows; within a group by id.
+  const group = (item) => (isRoundCapDeferral(item) || isPostMaxFinal(item) || isOwnerDeferral(item) ? 1 : 0);
+  return kept.sort((a, b) => group(a.item) - group(b.item) || byIdAsc(a, b)).map(({ item, id }) => ({ item, id, row: [
     id, item.final.decision, item.bucket, asciiLine(item.category, 40) || '-', `by ${byLabel(item)}`, `content ${rulingContentDigest([item])}`,
-    `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(item.final.reason, WHY_MAX)}`,
+    `"${asciiLine(String(item.title ?? '').replace(/"/g, "'"), TITLE_MAX)}"`, `why: ${asciiLine(rowWhy(item), WHY_MAX)}`,
   ].join(' · ') }));
 }
 
@@ -843,6 +1013,159 @@ export function rulingsDigest(state) {
   return rows.length === 0 ? 'none' : createHash('sha256').update(rows.join('\n')).digest('hex');
 }
 
+// ---- the substitute inventory (plan 2026-11-11-codex-substitute-reviewer R4-1) --------------------------------------------------------------
+// Every review a Claude stand-in did instead of Codex: each substitute FIRST review (a round) and each substitute SECOND review (an item whose
+// secondReview.by starts with `substitute`). ONE list, read by the final gate's review check, the owner-go scan, review-complete and the merge routes,
+// so none of them can disagree about whether a PR carries one. [{ round | item, agent, evidence, models }], rounds first (by number), then items (by id).
+const strOrNull = (v) => (typeof v === 'string' && v !== '' ? v : null);
+// (the proof keeps models as an object keyed by model id, like modelProof.models; a list is read the same way)
+const modelsOf = (v) => [...new Set((Array.isArray(v) ? v : v !== null && typeof v === 'object' ? Object.keys(v) : []).filter((m) => typeof m === 'string' && m !== ''))].sort();
+export function substituteInventory(state) {
+  const rounds = (Array.isArray(state?.rounds) ? state.rounds : []).filter(isSubstituteRound)
+    .map((r) => ({ round: r.n, agent: strOrNull(r.substitute?.agent) ?? 'substitute', evidence: strOrNull(r.substitute?.evidence), models: modelsOf(r.substitute?.models ?? r.substitute?.proof?.models) }))
+    .sort((a, b) => a.round - b.round);
+  const seen = new Set();
+  const items = [];
+  for (const item of allItems(state)) {
+    const sr = item?.secondReview;
+    if (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute')) continue;
+    // a cached copy of a ruled item carries its secondReview into later rounds: one review, listed once
+    const key = typeof item.fingerprint === 'string' && item.fingerprint !== '' ? `${item.fingerprint}|${sr.by}` : `${String(item.id)}|${sr.by}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    items.push({ item: String(item.id), agent: sr.by, evidence: strOrNull(sr.evidence), models: modelsOf(sr.models ?? sr.proof?.models) });
+  }
+  items.sort((a, b) => (a.item < b.item ? -1 : a.item > b.item ? 1 : 0));
+  return [...rounds, ...items];
+}
+
+// sha256 hex of the inventory; 'none' when the PR has no substitute review. The marker's `substituteDigest` and the owner item both come from it.
+export function substituteDigest(state) {
+  const inv = substituteInventory(state);
+  return inv.length === 0 ? 'none' : createHash('sha256').update(JSON.stringify(inv)).digest('hex');
+}
+
+// The owner-merge item line (`<kind> <area> <sha12>`: areasOf reads the second word, the owner-go hook binds the digest of the lines); null without substitute reviews.
+export function substituteItemLine(state) {
+  const digest = substituteDigest(state);
+  return digest === 'none' ? null : `review-substitute substitute ${digest.slice(0, 12)}`;
+}
+
+// What the marker records beside the digest: { rounds, agents, models }; null without substitute reviews. `rounds` are the first-review rounds only.
+export function substituteSummary(state) {
+  const inv = substituteInventory(state);
+  if (inv.length === 0) return null;
+  return {
+    rounds: inv.filter((e) => e.round !== undefined).map((e) => e.round),
+    agents: [...new Set(inv.map((e) => e.agent))].sort(),
+    models: [...new Set(inv.flatMap((e) => e.models))].sort(),
+  };
+}
+
+// Why ONE recorded substitute review (a round's `substitute`, or the {agent, proof} of a second review) does not stand as proof: [string], one per problem, each led by `label`.
+// The agent is one of the two pinned ones and is the strength the risk needed (`risk`: where the highest risk so far was high needs substitute-fable; a stronger agent than needed is
+// fine), the proof names its transcript, the models in it are the agent's family (claude-opus-* / claude-fable-*), effort is high, and a Fable is not below the floor (`gate` = { threshold,
+// allow } as for staleFableRounds: a floor raised between the apply and the merge makes the review stale).
+// `floorOk`: a later whole-PR pass at or above the floor replaced this review's Fable (staleFableRounds' supersession rule): its Fable being old is then no problem. `pr` names the fix.
+function substituteProofIssues(sub, risk, gate, label, { floorOk = false, pr } = {}) {
+  const out = [];
+  const why = (text) => out.push(`${label}: ${text}`);
+  if (sub === null || typeof sub !== 'object' || Array.isArray(sub)) { why('marked as a substitute review but records no substitute proof'); return out; }
+  if (sub.agent !== 'substitute-opus' && sub.agent !== 'substitute-fable') { why(`agent ${JSON.stringify(sub.agent ?? null)} is not substitute-opus or substitute-fable`); return out; }
+  if (sub.agent === 'substitute-opus' && substituteAgentFor(risk) === 'substitute-fable') why('the PR was high-risk at this review, which needs substitute-fable, but substitute-opus reviewed it');
+  const proof = sub.proof;
+  const models = modelsOf(proof?.models);
+  if (proof === null || typeof proof !== 'object' || typeof proof.transcript !== 'string' || proof.transcript === '') why('no proof transcript recorded');
+  else if (models.length === 0) why('the proof records no model');
+  else {
+    const family = sub.agent === 'substitute-fable' ? /^claude-fable(-|$)/ : /^claude-opus(-|$)/;
+    const wrong = models.filter((m) => !family.test(m));
+    if (wrong.length > 0) why(`${sub.agent} was proven with ${wrong.join(', ')}, not a ${sub.agent === 'substitute-fable' ? 'Fable' : 'Opus'}`);
+    if (sub.agent === 'substitute-fable' && wrong.length === 0) {
+      const { stale, current } = fableModelsOf({ modelProof: { models: Object.fromEntries(models.map((m) => [m, 1])) } }, gate);
+      if (!floorOk && (stale.length > 0 || current.length === 0)) why(`its Fable ${stale.join(', ') || models.join(', ')} is below the Fable floor ${gate.threshold}: run \`pipeline state fable-refresh${pr === undefined ? '' : ` --pr ${pr}`}\` (one extra Fable pass that re-reviews the whole PR with the current Fable; it is not counted against review.max_rounds)`);
+    }
+  }
+  if (String(proof?.effort ?? '') !== 'high') why(`effort ${JSON.stringify(proof?.effort ?? null)} is not high`);
+  return out;
+}
+
+// Why a recorded substitute review does not stand as proof, or []. Re-judged from the state at every gate (a state file is just JSON): every substitute FIRST review (a round) and every
+// substitute SECOND review (an item whose secondReview.by starts with `substitute`), by the same rules (substituteProofIssues). The risk a round needed: the highest known up to and
+// including it, else (no risk recorded) the PR's, failing toward the stronger reviewer; a second review is judged at the round that first holds it (a cached copy in a later round is
+// the same review, listed once as in the inventory). [string] one per problem.
+export function substituteProofProblems(state, gate = DEFAULT_GATE) {
+  const out = [];
+  const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
+  const judged = new Set();
+  let seen;
+  for (const r of rounds) {
+    const known = RISK_LEVELS.includes(r?.risk);
+    if (known) seen = seen === undefined || RISK_LEVELS.indexOf(r.risk) > RISK_LEVELS.indexOf(seen) ? r.risk : seen;
+    const risk = seen ?? maxRiskOf(state);
+    const floorOk = rounds.some((later) => later.n > r.n && supersedes(later, gate));
+    if (isSubstituteRound(r)) out.push(...substituteProofIssues(r.substitute, risk, gate, `round ${r.n}`, { floorOk, pr: state?.pr }));
+    for (const item of Array.isArray(r?.items) ? r.items : []) {
+      const sr = item?.secondReview;
+      if (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute')) continue;
+      const key = typeof item.fingerprint === 'string' && item.fingerprint !== '' ? `${item.fingerprint}|${sr.by}` : `${String(item.id)}|${sr.by}`;
+      if (judged.has(key)) continue;
+      judged.add(key);
+      out.push(...substituteProofIssues({ agent: sr.by, proof: sr.proof }, risk, gate, `second review of ${String(item.id)}`, { floorOk, pr: state?.pr }));
+    }
+  }
+  return out;
+}
+
+// The rounds holding a substitute-fable review (a round's own, or a second review first held there) whose Fable is below the floor and that no LATER whole-PR pass at or above
+// it replaced: [{ round, models }] in round order. Like staleFableRounds for the arbiter's pass: `state fable-refresh` is the way out (its whole-PR Fable pass supersedes them),
+// and the historical substitute inventory stays as recorded.
+export function staleSubstituteFableRounds(state, gate = DEFAULT_GATE) {
+  const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
+  const staleOf = (sub) => {
+    if (sub?.agent !== 'substitute-fable') return [];
+    const models = modelsOf(sub.proof?.models);
+    if (models.length === 0 || models.some((m) => !/^claude-fable(-|$)/.test(m))) return [];
+    return fableModelsOf({ modelProof: { models: Object.fromEntries(models.map((m) => [m, 1])) } }, gate).stale;
+  };
+  const out = [];
+  const judged = new Set();
+  for (const r of rounds) {
+    const stale = new Set(isSubstituteRound(r) ? staleOf(r.substitute) : []);
+    for (const item of Array.isArray(r?.items) ? r.items : []) {
+      const sr = item?.secondReview;
+      if (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute')) continue;
+      const key = typeof item.fingerprint === 'string' && item.fingerprint !== '' ? `${item.fingerprint}|${sr.by}` : `${String(item.id)}|${sr.by}`;
+      if (judged.has(key)) continue;
+      judged.add(key);
+      for (const m of staleOf({ agent: sr.by, proof: sr.proof })) stale.add(m);
+    }
+    if (stale.size === 0 || rounds.some((later) => later.n > r.n && supersedes(later, gate))) continue;
+    out.push({ round: r.n, models: [...stale].sort() });
+  }
+  return out;
+}
+
+// A high-risk PR whose substitute rounds are Opus alone: nothing since reviewed the WHOLE PR at the strength its risk needs. Either the rise to high came after an Opus
+// round and no whole-PR round followed (review-route.mjs#wholePrOwed), or maxRisk is high with an Opus round and no whole-PR round after the last of them. null = fine.
+export function substituteEscalationProblem(state) {
+  if (maxRiskOf(state) !== 'high') return null;
+  const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
+  const lastOpus = rounds.findLastIndex((r) => isSubstituteRound(r) && r.substitute?.agent !== 'substitute-fable');
+  if (lastOpus < 0) return null;
+  if (!wholePrOwed(state) && rounds.slice(lastOpus + 1).some((r) => r?.wholePr === true)) return null;
+  const opus = rounds.filter((r) => isSubstituteRound(r) && r.substitute?.agent !== 'substitute-fable').map((r) => r.n);
+  return `this PR is high-risk but its substitute review round(s) ${opus.join(', ')} were Opus and no whole-PR round (Codex or substitute-fable) has run since: run a whole-PR review round (pipeline state outcome shows base), then review-complete`;
+}
+
+// Why review-complete and every gate route refuse a PR that holds substitute reviews, or null: { error: 'substitute-escalation' | 'substitute-unproven', reason }.
+export function substituteRefusal(state, gate = DEFAULT_GATE) {
+  const escalation = substituteEscalationProblem(state);
+  if (escalation !== null) return { error: 'substitute-escalation', reason: escalation };
+  const problems = substituteProofProblems(state, gate);
+  return problems.length === 0 ? null : { error: 'substitute-unproven', reason: `a substitute review is not proven: ${problems.join('; ')}` };
+}
+
 // `Rulings <digest first 12>` then the rows, one per line; '' when there are none.
 export function rulingsBlock(state) {
   const { rows } = rulingsInventory(state);
@@ -858,9 +1181,218 @@ export function reviewEligibilityProblems(state) {
   const rounds = state?.rounds ?? [];
   const noIssue = allItems(state).filter((i) => isClaudeRuled(i) && i.final?.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
   if (noIssue.length > 0) problems.push(`Claude-ruled follow-up(s) without a filed issue: ${noIssue.join(', ')} (run followups create, or rule them ACCEPT)`);
+  // An arbiter FOLLOW-UP ruled outside a threat model (final.outOfModel) leaves the merge only through its issue, like the Claude-ruled one above (#374). Only here: roundOutcome is untouched.
+  const noModelIssue = allItems(state).filter((i) => typeof i.final?.outOfModel === 'string' && i.final.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
+  if (noModelIssue.length > 0) problems.push(`out-of-model follow-up(s) without a filed issue: ${noModelIssue.join(', ')} (run followups create)`);
+  // A post-limit FOLLOW-UP (final.postMax: an ACCEPT the judge or arbiter made, turned into a follow-up by review.post_max_suggestions) leaves the merge only through its issue. Only here: roundOutcome is untouched.
+  const noPostMaxIssue = allItems(state).filter((i) => isPostMaxFinal(i) && !i.followupIssue).map((i) => i.id);
+  if (noPostMaxIssue.length > 0) problems.push(`post-limit follow-up(s) without a filed issue: ${noPostMaxIssue.join(', ')} (run followups create)`);
+  // An ACCEPT the owner deferred (final.ownerDeferral, also on a cached copy) leaves the merge only through its issue.
+  const noDeferralIssue = allItems(state).filter((i) => isOwnerDeferral(i) && i.final?.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
+  if (noDeferralIssue.length > 0) problems.push(`owner-deferred follow-up(s) without a filed issue: ${noDeferralIssue.join(', ')} (run followups create)`);
   const unconfirmed = rounds.flatMap((r) => (r.items ?? [])
     .filter((i) => i.implementedVia === 'other-files' && !rounds.some((later) => later.n > r.n && Array.isArray(later.confirmFixed) && later.confirmFixed.includes(i.id)))
     .map((i) => i.id));
   if (unconfirmed.length > 0) problems.push(`fix(es) made outside the file the finding names, not yet confirmed by a later review round: ${unconfirmed.join(', ')} (run another codex-review round)`);
   return problems;
+}
+
+// ---- severity of an open item, and whether the round limit may be closed by deferring the fixes (plan Item 1a / 1b) ---------------------------------------
+// ONE predicate for the ask (`triage round-request`, display only) and the command (`triage defer-fixes`, which decides). An item is LOW only when ALL hold, else HIGH
+// (fail closed): a known non-BLOCKING bucket and a category on the allowlist (a bug is never low); not marked fixed through other files; not in the file of any BLOCKING or
+// security ACCEPT; its location resolves to exactly one file of the reviewed diff; and that file (old and new path) is on no risk.high_risk_paths / review.arbiter_always_paths
+// glob. hard_stops.paths is NOT consulted (owner 2026-11-11: with it a repository whose hard stops cover everything could never defer). A config error throws (TypeError):
+// defer-fixes refuses on it, round-request shows the items as high with a warning.
+export const LOW_SEVERITY_CATEGORIES = Object.freeze(['performance', 'maintainability', 'testing', 'design', 'docs', 'other']);
+
+// A location the review can trust: repo-relative POSIX, nothing that climbs out, no drive letter, no leading ./ (git prints none).
+const locationProblem = (file) => {
+  if (typeof file !== 'string' || file === '') return 'it names no file';
+  if (file.includes('\\') || file.startsWith('/') || /^[A-Za-z]:/.test(file)) return `its location (${asciiLine(file, 60)}) is not repo-relative`;
+  if (file.split('/').some((seg) => seg === '' || seg === '.' || seg === '..')) return `its location (${asciiLine(file, 60)}) is not a clean repo path`;
+  return null;
+};
+const entryPaths = (f) => [...new Set([f?.oldPath, f?.newPath, f?.path].filter((p) => typeof p === 'string' && p !== ''))];
+
+// An unsettled BLOCKING / security item may still end up accepted, so the same-file test counts it as accepted: no final yet (the arbiter is still owed it), a final that waits for a human, or a
+// judge dismissal a settle test can still overturn (final by the judge, not ACCEPT, disputedBug and settleTest.possible, no test result yet: `triage settle` may make it an ACCEPT by test).
+const settleTestable = (i) => i.final.by === 'judge' && i.final.decision !== 'ACCEPT' && i.judge?.disputedBug === true && i.judge.settleTest?.possible === true && (i.test?.status ?? 'none') === 'none';
+const unsettledHold = (i) => isObject(i) && (!isObject(i.final) || i.final.needsHuman === true || settleTestable(i));
+// Why an unsettledHold item holds its file, for the refusal text.
+const holdWhy = (i) => (!isObject(i.final)
+  ? 'it still awaits a ruling'
+  : i.final.needsHuman === true ? 'it waits for a human' : 'the judge dismissed it, but a settle test is still possible: run `triage settle` to decide it');
+// -> { level: 'low' | 'high', reasons: [why it is high] }. `files` = the PR's reviewed diff (git.mjs#diffFiles entries); null/undefined = unknown, so high.
+export function itemSeverity(item, { state, config, files, baseConfig } = {}) {
+  const high = (reason) => ({ level: 'high', reasons: [reason] });
+  if (!isObject(item)) return high('not a review item');
+  if (!BUCKETS.includes(item.bucket)) return high(`unknown bucket ${asciiLine(item.bucket, 30)}`);
+  if (item.bucket === 'BLOCKING') return high('it is a BLOCKING finding');
+  if (!LOW_SEVERITY_CATEGORIES.includes(item.category)) return high(`category ${asciiLine(item.category, 30) || 'unknown'} is not a low-severity kind`);
+  if (item.implementedVia === 'other-files') return high('its fix was made in other files than the one it names');
+  const bad = locationProblem(item.file);
+  if (bad) return high(bad);
+  if (!Array.isArray(files)) return high('the reviewed diff is not known');
+  const hits = files.filter((f) => entryPaths(f).includes(item.file));
+  if (hits.length === 0) return high(`${asciiLine(item.file, 60)} is not a file of the reviewed diff`);
+  if (hits.length > 1) return high(`${asciiLine(item.file, 60)} is ambiguous in the reviewed diff`);
+  // The same file under either side of a rename: the entry resolved above names both paths, and a finding at the other one is in this file too.
+  const sameFile = entryPaths(hits[0]);
+  const sameFileSerious = allItems(state).filter((i) => sameFile.includes(i.file) && (i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category)));
+  if (sameFileSerious.some((i) => i.final?.decision === 'ACCEPT' && i.final.needsHuman !== true)) return high(`${asciiLine(item.file, 60)} also holds an accepted BLOCKING or security finding`);
+  const unsettled = sameFileSerious.find(unsettledHold);
+  if (unsettled !== undefined) return high(`${asciiLine(item.file, 60)} also holds ${asciiLine(unsettled.id, 40)}, a BLOCKING or security item not settled yet (${holdWhy(unsettled)}), which may still be accepted`);
+  // The union of the working-tree and the default branch's committed sensitive lists (callers pass baseConfig; a PR must not shrink its own list).
+  if (isSensitivePath(hits[0], config) || (baseConfig && isSensitivePath(hits[0], baseConfig))) return high(`${asciiLine(item.file, 60)} is on a sensitive path`);
+  return { level: 'low', reasons: [] };
+}
+
+const idList = (ids) => ids.join(', ');
+// Was this implemented item's fix made before the last counted round? `implementedAfterRound` (the newest round number when it was marked) is below that round's number.
+const markedBefore = (item, rounds) => {
+  const counted = rounds.filter(countsTowardCap).at(-1);
+  return Number.isInteger(item.implementedAfterRound) && counted !== undefined && counted.n > item.implementedAfterRound;
+};
+
+// May the round limit be closed by taking the accepted fixes OUT and filing them as follow-ups? Refusals 1, 2 and 5 of `defer-fixes`, evaluated on this state as if the tree were
+// already back at the reviewed content (refusals 3 and 4 need git and are the command's). Pure. `grants` = k -> the owner's open extra-round records for counted round k at ANY head
+// (a function, as roundOutcome takes it): an unspent grant for the next round always wins over a deferral, and a lookup that fails (or a `grantGap` of 'provenance') refuses.
+// -> { eligible, refusals: [plain words], ids: [the accepts a round would have to review], severities: [{ id, level, reasons }] }. Throws (TypeError) on a config error.
+export function deferEligibility(state, config, files, { grants, grantGap, baseConfig } = {}) {
+  const refusals = [];
+  const rounds = state?.rounds ?? [];
+  const last = rounds.at(-1);
+  if (last === undefined) return { eligible: false, refusals: ['no review round is recorded'], ids: [], severities: [] };
+  if (!hasContentHash(last.contentHashAtToHead)) refusals.push('the last review round records no content hash');
+  const o = roundOutcome({ ...state, currentContentHash: last.contentHashAtToHead });
+  const reviewed = reviewedRoundCount(state);
+  // Refusal 1: the limit is reached for good, and nothing else is open.
+  if (!Number.isFinite(state?.maxRounds)) refusals.push('review.max_rounds is not set, so there is no limit to defer past');
+  else if (reviewed < state.maxRounds) refusals.push(`the round limit (${state.maxRounds}) is not reached yet`);
+  else if (o.extraRound) refusals.push('the automatic extra round is still available: run it');
+  for (const [list, what] of [[o.fablePending.map(String), 'a Fable pass is owed for round(s)'], [o.pending, 'items still pending:'], [o.needsHuman, 'items wait for a human:'], [o.openBlocking, 'open BLOCKING items:'], [o.unimplemented, 'accepted items not implemented:']]) {
+    if (list.length > 0) refusals.push(`${what} ${idList(list)}`);
+  }
+  const k = reviewed + 1;
+  // Unlike roundOutcome (no readable grant = no round), here the permissive reading is "no grant", so what cannot be read refuses: a lookup that throws or answers
+  // with anything but a list, and a record the owner may have typed but whose provenance could not be confirmed (`grantGap`: k -> 'none' | 'provenance' | 'ok').
+  // Both callers pass the STRICT lookups (owner-go.mjs ownerGrantLookups: any skipped read throws); in the round-request ask a failure there is a warning and an 'extra-round' recommendation, never a missing line.
+  let granted = [];
+  let unreadable = false;
+  if (typeof grants === 'function') {
+    try {
+      const found = grants(k);
+      if (Array.isArray(found)) granted = found;
+      else {
+        unreadable = true;
+        refusals.push(`the owner's extra-round records for round ${k} could not be read (the lookup answered with something other than a list): ask the owner for an extra round`);
+      }
+    } catch (err) {
+      unreadable = true;
+      refusals.push(`the owner's extra-round records for round ${k} could not be read (${asciiLine(err?.message, 120)}): ask the owner for an extra round`);
+    }
+  }
+  if (granted.length > 0) refusals.push(`the owner granted extra round ${k} (unspent): run it, a typed "extra round" always wins`);
+  else if (typeof grantGap === 'function' && !unreadable) {
+    let gap;
+    try {
+      gap = grantGap(k);
+    } catch (err) {
+      refusals.push(`the owner's extra-round records for round ${k} could not be checked (${asciiLine(err?.message, 120)}): ask the owner for an extra round`);
+    }
+    if (gap === 'provenance') refusals.push(`an extra round is recorded for round ${k} but cannot be confirmed as typed by the owner: it may still be the owner's, so ask the owner for an extra round instead of deferring`);
+  }
+  // Refusal 2: exactly the accepts no round has reviewed, each low and each the judge's or the arbiter's.
+  const ids = o.newAccepted;
+  const byId = new Map(allItems(state).map((i) => [i.id, i]));
+  if (ids.length === 0) refusals.push('no accepted fix is waiting for a review round, so there is nothing to defer');
+  const severities = [];
+  for (const id of ids) {
+    const item = byId.get(id);
+    const sev = itemSeverity(item, { state, config, files, baseConfig });
+    severities.push({ id, ...sev });
+    if (sev.level !== 'low') refusals.push(`${id} is not low severity (${sev.reasons.join('; ')})`);
+    const why = roundCapDeferRefusal(item);
+    if (why) refusals.push(why);
+  }
+  // Refusal 2b: every OTHER implemented accept, in ANY round, must be provably fixed before the last reviewed (counted) round: the state records when it was marked
+  // (`implementedAfterRound`, the newest round number then; set by `state mark-implemented`, and by reuseRuled for a carried copy), and a later counted round reviewed a head that holds the fix.
+  // Nothing makes an earlier round's accept fixed before the next round starts (a final can turn ACCEPT after it, a judge's accept can be left open), so a fix marked AFTER the last reviewed
+  // round is out of the tree once every commit since that head is reverted while the state still says implemented, and the review would read clean without it. A mark with no
+  // record (a state from before the field) cannot be proven: it refuses, and the extra round runs as before.
+  const asked = new Set(ids);
+  for (const i of allItems(state)) {
+    if (i.final?.decision === 'ACCEPT' && i.implemented === true && !asked.has(i.id) && !markedBefore(i, rounds)) {
+      refusals.push(`${i.id} is an accepted ${i.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(i.category) ? 'BLOCKING or security ' : ''}fix marked implemented that is not proven to be in the last reviewed head (it was marked after that round, or the state does not say when): taking the fixes out would drop it, so run the round`);
+    }
+  }
+  // Refusal 5: the state with those fixes deferred must read as a clean review (nothing left but the issues still to file).
+  if (refusals.length === 0) {
+    const proposed = deferItemsInState(state, ids, { reason: 'dry run', ruledAt: new Date(0).toISOString(), fixHead: 'dry', reviewedHead: 'dry' });
+    const filed = { ...proposed, rounds: proposed.rounds.map((r) => ({ ...r, items: (r.items ?? []).map((i) => (isRoundCapDeferral(i) && !i.followupIssue ? { ...i, followupIssue: 'dry-run' } : i)) })) };
+    const after = roundOutcome({ ...filed, currentContentHash: last.contentHashAtToHead });
+    if (!after.clean) refusals.push('the review would still not be clean after the fixes are taken out');
+    const problems = reviewEligibilityProblems(filed);
+    if (problems.length > 0) refusals.push(problems.join('; '));
+  }
+  return { eligible: refusals.length === 0, refusals, ids, severities };
+}
+
+// ---- past the limit, a low-severity ACCEPT becomes a FOLLOW-UP (#374 PR B, review.post_max_suggestions) ------------------------------------------------
+// 'follow-up' only when EVERY config given (working tree, fork point, trusted default branch) says so: 'review' in any, a config that cannot be read (null) or one without the key, is off.
+export const postMaxPolicy = (configs) => (Array.isArray(configs) && configs.length > 0 && configs.every((c) => c?.review?.post_max_suggestions === 'follow-up') ? 'follow-up' : 'review');
+
+// A settled FOLLOW-UP that applyPostMaxDefault made (final.postMax), still the judge's / arbiter's word (or a cached copy of it): not the owner's, not Claude's, not waiting for a human.
+export const isPostMaxFinal = (item) => isObject(item?.final?.postMax) && item.final.decision === 'FOLLOW-UP' && item.final.needsHuman !== true && !isProtectedFinal(item) && !isOwnerRuled(item);
+
+// `ordinal`: the counted ordinal of the round these items belong to (fix-verify.mjs#countedOrdinal; an uncounted round gets the counted rounds before it); `max`: review.max_rounds.
+// Only a round past max + 1 is touched: the first round past the limit (the automatic extra round, or the owner's first grant when there was none) keeps its ACCEPTs; later owner-granted rounds are
+// affected. Only an ACCEPT the judge or arbiter made on a SUGGESTION / WORTH_CONSIDERING item that itemSeverity rates LOW (a low-severity category, a location that resolves to one file of the reviewed
+// diff, no accepted (or still unsettled / waiting for a human) BLOCKING / security item in that file, no sensitive path under the working-tree or the trusted config), not yet implemented; never a bug, security item or BLOCKING one, a test
+// result, a cached copy, Claude's, the owner's or a forced final. `severity` = { state, round, config, files, baseConfig } as itemSeverity takes them (`round`: the number of the round `items` belong
+// to, whose items in `state` are replaced by `items` so this round's own accepts count); none given, an unreadable diff or config (null) or a config error (itemSeverity throws) keeps the ACCEPT.
+export function applyPostMaxDefault(items, { policy, ordinal, max, severity } = {}) {
+  if (policy !== 'follow-up' || !Number.isInteger(ordinal) || !Number.isInteger(max) || ordinal <= max + 1) return items;
+  let view = null;
+  if (isObject(severity) && isObject(severity.state)) {
+    const ids = new Set(items.map((i) => i?.id));
+    // The unsettled-item hold is itemSeverity's own (unsettledHold). Only items already in the state at this point: a BLOCKING accepted in a LATER round on the same file is not caught (a suggestion already turned into a FOLLOW-UP is not revisited).
+    view = { ...severity.state, rounds: (severity.state.rounds ?? []).map((r) => ({ ...r, items: r?.n === severity.round ? [...(r.items ?? []).filter((i) => !ids.has(i?.id)), ...items] : (r?.items ?? []) })) };
+  }
+  const lowSeverity = (item) => {
+    if (view === null || !isObject(severity.config) || !isObject(severity.baseConfig)) return false;
+    try {
+      return itemSeverity(item, { state: view, config: severity.config, files: severity.files, baseConfig: severity.baseConfig }).level === 'low';
+    } catch {
+      return false;
+    }
+  };
+  return items.map((item) => {
+    const final = item?.final;
+    if (!isObject(final) || final.decision !== 'ACCEPT' || final.needsHuman === true || !DEFERRABLE_BY.includes(final.by)) return item;
+    if (item.implemented === true || isProtectedFinal(item) || isOwnerRuled(item)) return item;
+    if (item.bucket !== 'SUGGESTION' && item.bucket !== 'WORTH_CONSIDERING') return item;
+    if (!LOW_SEVERITY_CATEGORIES.includes(item.category)) return item;
+    if (!lowSeverity(item)) return item;
+    return { ...structuredClone(item), final: { ...structuredClone(final), decision: 'FOLLOW-UP', postMax: { from: 'ACCEPT', by: final.by, ordinal, max }, reason: `past review.max_rounds (round ${ordinal}, limit ${max}): ${final.reason}` } };
+  });
+}
+
+// ---- the round trip-wire (#374 PR B): a prompt, not a gate ---------------------------------------------------------------------------------------------
+// New ACCEPTs (not cached copies) per COUNTED round, in order. Trips when the PR has reviewed max + extraRounds counted rounds, or when at least `notFalling` past-limit rounds accepted
+// at least as many new items as the round before AND some (zero accepts is not "not falling": nothing was found). Past the limit only; no finite maxRounds never trips.
+// -> { tripped, reviewed, max, acceptsByRound, reasons }
+export function roundTripWire(state, { extraRounds, notFalling }) {
+  const counted = (state?.rounds ?? []).filter(countsTowardCap);
+  const acceptsByRound = counted.map((r) => (r.items ?? []).filter(isNewAccept).length);
+  const reviewed = counted.length;
+  const max = state?.maxRounds;
+  const reasons = [];
+  if (Number.isFinite(max)) {
+    if (reviewed >= max + extraRounds) reasons.push(`${reviewed} counted rounds reached review.max_rounds ${max} + ${extraRounds} (review.trip_wire_extra_rounds)`);
+    let flat = 0;
+    for (let k = max; k < reviewed; k += 1) if (k >= 1 && acceptsByRound[k] > 0 && acceptsByRound[k] >= acceptsByRound[k - 1]) flat += 1;
+    if (flat >= notFalling) reasons.push(`${flat} past-limit round(s) accepted at least as many new items as the round before (review.trip_wire_not_falling ${notFalling}): ${acceptsByRound.join(', ')}`);
+  }
+  return { tripped: reasons.length > 0, reviewed, max: Number.isFinite(max) ? max : null, acceptsByRound, reasons };
 }

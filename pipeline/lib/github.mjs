@@ -12,6 +12,10 @@ import { makeRetrier } from './gh-retry.mjs';
 // A hung gh must never hang the pipeline: a call that outlives this is a failure.
 const CALL_TIMEOUT_MS = 60_000;
 const PER_PAGE = 30;
+// The follow-up creator scan pages through every issue and PR an account ever opened in the repo (#268): 100 per page,
+// and its own, longer limit for that one paginated call. Every other call keeps CALL_TIMEOUT_MS.
+const SCAN_PER_PAGE = 100;
+const SCAN_TIMEOUT_MS = 180_000;
 
 // ---- GraphQL: paged pull request lists -----------------------------------------------------------
 // Page size 20: a bigger page can trip GitHub's node limit on heavy queries.
@@ -92,7 +96,7 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
   let repoIdCache; // undefined = not read yet
   let viewerCache = null;
 
-  const exec = (args, { input } = {}) => ghFn(args, { cwd, env, input, timeoutMs: CALL_TIMEOUT_MS });
+  const exec = (args, { input, timeoutMs = CALL_TIMEOUT_MS } = {}) => ghFn(args, { cwd, env, input, timeoutMs });
   const retrying = makeRetrier({ exec: (args) => exec(args), env, retry });
   const failure = (r, args) => {
     const err = new GhError({ code: r.code, stderr: r.stderr, args, timedOut: r.timedOut, overBuffer: r.overBuffer === true });
@@ -251,9 +255,12 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
     // Every issue `creator` opened, open AND closed by default, whatever its page and WHATEVER ITS LABELS: the follow-up
     // dedupe must still see an issue the owner promoted (relabelled agent-suggestion -> agent-build) or closed. This is the
     // REST list, not the search API, which lags behind a just-created issue. It returns pull requests too; they are dropped.
-    listIssuesByCreator({ creator, state = 'all' }) {
-      const args = ['api', `repos/${self.repo().slug}/issues?creator=${encodeURIComponent(creator)}&state=${encodeURIComponent(state)}&per_page=${PER_PAGE}`, '--paginate'];
-      const r = ok(args);
+    // `since` (a UTC ISO instant) keeps only issues UPDATED at or after it, so a caller that knows when its issues can first
+    // exist skips years of history; a promoted or closed issue was updated later still, so it stays in view.
+    listIssuesByCreator({ creator, state = 'all', since }) {
+      const bound = since === undefined ? '' : `&since=${encodeURIComponent(since)}`;
+      const args = ['api', `repos/${self.repo().slug}/issues?creator=${encodeURIComponent(creator)}&state=${encodeURIComponent(state)}&per_page=${SCAN_PER_PAGE}${bound}`, '--paginate'];
+      const r = ok(args, { timeoutMs: SCAN_TIMEOUT_MS });
       let list;
       try {
         list = parseConcatenatedJson(r.stdout);
@@ -309,6 +316,18 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
       return retry ? retrying(run) : run();
     },
 
+    // Edits the comment the caller already found (id from its own fresh read of the newest viewer-authored marker comment): no second listing (#396).
+    // The same marker rule as upsertComment: the body must start with it, or the next run could not find the comment again.
+    // `{ retry: true }` waits out a rate limit (the PATCH is idempotent); off by default, as for upsertComment.
+    updateComment(id, marker, body, { retry = false } = {}) {
+      if (!String(body).startsWith(marker)) throw new Error('comment body must start with its marker, or the next run could not find it');
+      const run = () => {
+        const r = api('PATCH', `repos/${self.repo().slug}/issues/comments/${id}`, { body });
+        return { id: r.id, url: r.html_url, action: 'updated' };
+      };
+      return retry ? retrying(run) : run();
+    },
+
     // Always a NEW comment, never an edit: for append-only evidence (run events) that no later writer may overwrite.
     createComment(n, body) {
       const r = api('POST', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, { body });
@@ -338,6 +357,22 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
         throw new GhError({ code: 0, stderr: `compare reply has no base tip: ${JSON.stringify(body).slice(0, 200)}`, args });
       }
       return { status: body.status ?? null, behindBy: body.behind_by, aheadBy: body.ahead_by, baseSha: body.base };
+    },
+
+    // A file of the repository at a ref (a branch, tag or sha), from GitHub's contents API: never the local checkout and never the PR branch unless
+    // that is the ref asked. -> { found: true, text } | { found: false, why } (404: no such file or ref; a directory or a body that is not a base64 file
+    // is "not found" too: there is no file to read). Any other failure (5xx, network, timeout) THROWS: the caller must tell "absent" from "could not look".
+    fileAt(path, ref) {
+      const args = ['api', `repos/${self.repo().slug}/contents/${encodePath(path)}?ref=${encodeURIComponent(ref)}`, '--jq', '[.type, .encoding, .content]'];
+      const r = exec(args);
+      if (r.code !== 0 || r.timedOut) {
+        const known = r.timedOut || r.overBuffer ? null : classifyApiError(r);
+        if (known?.status === 404) return { found: false, why: `${path} does not exist at ${ref}` };
+        throw failure(r, args);
+      }
+      const reply = parse(r, args);
+      if (!Array.isArray(reply) || reply[0] !== 'file' || reply[1] !== 'base64' || typeof reply[2] !== 'string') return { found: false, why: `${path} at ${ref} is not a readable file` };
+      return { found: true, text: Buffer.from(reply[2], 'base64').toString('utf8') };
     },
 
     // The parent SHAs of a commit, in order (for a merge commit: first the branch it was made on, then what was merged in).
@@ -453,6 +488,18 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
       const e = data?.enqueuePullRequest?.mergeQueueEntry;
       if (!e || typeof e !== 'object') throw queueError('enqueuePullRequest returned no queue entry');
       return { id: queueField(e.id, 'string', 'the queue entry id'), state: queueField(e.state, 'string', 'the queue entry state'), position: queueField(e.position, 'number', 'the queue entry position') };
+    },
+
+    // Turns a ready PR back to draft (`pipeline redraft`): the node id, then one GraphQL mutation whose answer carries the new state AND whether
+    // auto-merge is armed on the PR (so there is no read-after-write lag to wait out). -> { isDraft, autoMergeArmed }. Throws GhError on any
+    // refusal or an answer without the pull request.
+    convertToDraft(n) {
+      const id = self.prNodeId(n);
+      const args = ['api', 'graphql'];
+      const data = self.graphql('mutation ConvertToDraft($pullRequestId:ID!){convertPullRequestToDraft(input:{pullRequestId:$pullRequestId}){pullRequest{isDraft autoMergeRequest{enabledAt}}}}', { pullRequestId: id });
+      const p = data?.convertPullRequestToDraft?.pullRequest;
+      if (!p || typeof p !== 'object') throw new GhError({ code: 0, stderr: 'convertPullRequestToDraft returned no pull request', args });
+      return { isDraft: p.isDraft === true, autoMergeArmed: p.autoMergeRequest !== null && p.autoMergeRequest !== undefined };
     },
 
     // Takes the PR out of the queue (the owner's stop conditions, the pipeline's confirmed dequeue).

@@ -3,7 +3,7 @@
 A global **build → verify → review → merge → production check** pipeline for Claude Code. Once a
 repo is onboarded, asking Claude to build or fix something runs the build and review unattended: a
 branch and worktree, the change plus tests, a quick local check, a draft pull request, a cross-model
-review loop (Codex finds, a Sonnet judge triages low-risk PRs, a Fable pass rules on and reviews every medium/high-risk or sensitive PR), then CI (the full proof) on the
+review loop (Codex finds, a Sonnet judge triages low-risk PRs (and medium ones that are medium only for their size; `review.size_only_medium_reviewer`), a Fable pass rules on and reviews every other medium/high-risk or sensitive PR. Set `risk.ignore_hard_stop_rules` and `review.size_only_medium_reviewer` only after the installed pipeline is updated AND `pipeline vendor` has re-copied `risk.mjs` and `config.mjs` into the project (older validators reject unknown keys)), then CI (the full proof) on the
 exact commit. You merge: the agent hands you the exact merge request and never merges itself. Nothing reaches `main` without proof, and anything sensitive stops for you.
 
 Design: [`docs/specs/2026-10-01-claude-pipeline-design.md`](docs/specs/2026-10-01-claude-pipeline-design.md) ·
@@ -17,13 +17,14 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | Piece | What it does |
 |---|---|
 | skills `review`, `verify`, `pipeline-setup` | the process: review builds the change and runs the cross-model review, then asks you to merge; verify runs the quick check; pipeline-setup onboards a repo |
-| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` (Fable) | the judgment; models are pinned in the agent files and proven from transcripts |
+| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `substitute-opus` / `substitute-fable` (read-only stand-ins for Codex on a round it could not review: `pipeline substitute`), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
-| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
+| hook `owner-go` (UserPromptSubmit; PostToolUse on `AskUserQuestion`) | records your click on a merge / extra-round / ruling dialog the pipeline issued (`--ask`; only a human click Claude Code stamps as yours counts, see docs/cli.md `owner-go`), and records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
+| hook `update-notice` (SessionStart, 5 s) | prints one line at the start of a session when the automatic update has something to say (see Automatic updates); it only reads a small status file, never touches the network, and never blocks a session; non-blocking |
 | hook `stack-session-end` (SessionEnd, 10 s) | when a session ends (not on `/clear`) it starts a detached worker that decides whether that session's stacks can be stopped; non-blocking |
 | settings allow entries | `Bash(node ~/.claude/pipeline/bin/pipeline.mjs:*)` so pipeline calls don't prompt |
 
@@ -33,7 +34,7 @@ refuse to overwrite skills or agents it didn't install, and lets `--check` repor
 - **Fail-closed guards.** The two guard hooks are started through a small loader, not directly. If
   the hook file cannot be loaded (deleted, half-written, a syntax error) the loader blocks the
   tool call with exit 2 instead of letting Claude Code treat the crash as "allowed". The
-  `owner-go` recorder and the `stack-dev-bind` and `stack-session-end` hooks are the exceptions: they never block anything. `stack-register` is fail-closed like the guards.
+  `owner-go` recorder and the `stack-dev-bind`, `stack-session-end` and `update-notice` hooks are the exceptions: they never block anything. `stack-register` is fail-closed like the guards.
 - **Complete-install marker.** The installer writes the manifest with `"complete": false` first and
   flips it to `true` as its very last step, so an install that was interrupted (or whose later
   steps failed) is never mistaken for a good one. `--check`, `pipeline version` and the session
@@ -58,8 +59,9 @@ cd ~/Claude/claude-pipeline
 ./install.sh --check               # drift report only; exit 1 if anything differs; never writes
 ```
 
-- **Update:** the install is a copy, so a merged change reaches your sessions only after you
-  update it. Once the pipeline is installed, the normal path is one command in your own terminal
+- **Update:** the install is a copy, so a merged change reaches your sessions only after it is
+  updated: by you, or by the optional scheduled job (see Automatic updates below). Once the
+  pipeline is installed, the manual path is one command in your own terminal
   (not a Claude session):
   ```sh
   node ~/.claude/pipeline/bin/pipeline.mjs update
@@ -118,6 +120,101 @@ Two things tell you where an install stands:
   A stamp with a flag or `+unknown` is never treated as "current": `update --check` exits 1, and
   `pipeline vendor --check` warns that a vendored `VERSION` carrying one does not prove which commit its files came from.
 - **`pipeline update --check`** compares your install with upstream `main` on demand, with exit codes (see above).
+
+### Automatic updates
+
+Optional. A small job on your machine checks `main` every few minutes and installs it for you, but
+only when no review is running, so a review is never cut off halfway. The manual `update` keeps
+working exactly as before.
+
+- **The `pupdate` shortcut.** Put this in your own `~/.zshrc` (the installer never edits your
+  dotfiles):
+  ```sh
+  alias pupdate='PATH="/opt/homebrew/bin:$PATH" node "$HOME/.claude/pipeline/bin/pipeline.mjs" update'
+  ```
+  `pupdate --check` reports, `pupdate` updates. Like `update`, it refuses inside a Claude session.
+- **Turning it on (once per machine, owner only).**
+  1. Run `pupdate` once, in a plain terminal, so the installed copy is the first one that has this
+     feature. Nothing can switch it on before that.
+  2. Run `node ~/.claude/pipeline/bin/pipeline.mjs update schedule --install`, again in your own
+     terminal: it is refused inside Claude Code, because it arranges for the guard hooks to be
+     replaced unattended. `--every N` sets the minutes between runs: 5, 10, 15, 20, 30 or 60
+     (default 15). Running it again with another `--every` replaces the job.
+  3. `update schedule --status` shows whether the job is installed; `update schedule --remove` takes
+     it away. Both run anywhere, including inside Claude Code. `./install.sh --uninstall` removes the
+     job itself (when it uninstalls your own `~/.claude`), so nothing keeps firing against a missing
+     pipeline; `update schedule --remove` still works on its own.
+
+  On a Mac the job is the LaunchAgent `com.claude-pipeline.auto-update` (it also runs when loaded,
+  so a Mac that slept catches up). On Linux or WSL it is one crontab line. Native Windows is not
+  supported (`unsupported-platform`). The job runs the **installed** pipeline; `git` and `gh` must
+  be on your `PATH` when you install it, and its log is `~/.local/state/pipeline/cron-auto-update.log`.
+- **What one run does.**
+  - Up to date: nothing, and no message.
+  - Behind `main`: downloads it, then installs it **only if no review is running**. If one is, it
+    writes nothing, logs one line saying what is live, and tries again next run.
+  - If the installed copy changed while the download ran (an edit of yours, a manual update), it
+    installs nothing and looks again next run.
+  - **Never touched automatically:** an install that is modified, incomplete (an interrupted
+    install), ahead of `main` or diverged from it. The job cannot tell an interrupted install from
+    one you edited on purpose, so it leaves it alone and tells you the exact command to run
+    yourself.
+  - After an install it runs the installer's own check. If that fails you get one message with the
+    drift, and that version of `main` is not retried (the next `main` is). The hold only ends once
+    the install looks right and a fresh check of that version passes.
+  - If the installer cannot even look (its scan of live work overran its time limit, or another
+    update or a review start holds the admission lock) the update waits and retries; the session
+    line and the log say so, never "a review is running". You get one message if that happens three
+    runs in a row.
+- **What counts as "a review is running".** The installer looks, under a lock, for any of these:
+  - a *review lease*: while you are in a Claude session, every pipeline command that touches a
+    worktree's review (`codex-review`, `merge`, `verify`, `summary` and so on; the list is in
+    `docs/cli.md`) records that the session is working on it. `summary` (the stop ritual) or an
+    ended run closes it. A lease stops counting when the session is gone, after `/clear` or a
+    resume (same process, new session id), or after 6 hours with no pipeline command; a detached
+    `P job` still running in the worktree keeps it alive (whatever its age), and a lease closed while a job still runs ends with that job. A pipeline command typed in a plain terminal takes a lease too, for exactly as long as it runs: a small
+    `proc-<pid>-…` file that is removed when the command ends, fails, is interrupted (Ctrl-C) or is terminated. Such a lease counts as dead only when the process is
+    proven gone (`ps` shows no such pid, or another process started under it, or the pid no longer exists); if that cannot be checked (no `ps`, a lease from
+    another machine) it counts as live, never as "old", so a stuck one needs you: the 24-hour message names the file to delete once you know no pipeline command is running
+    in a terminal, or points at the `leases` command (read only: lists what is live, unreadable and, with `--all`, dead). A command typed in a terminal while an update is
+    swapping waits up to 20 seconds, then stops with "retry in a minute"; one that started across the swap stops with `updated-while-starting`; a read-only home stops
+    leased commands with `review-lease-unwritable`. Rolling back to an older pipeline makes these files unreadable to it, which counts as live (it waits until the
+    command ends or you delete the file). Programs a command started (Codex, a verify step) are not tracked: they load nothing from the install;
+  - a `P job` that is still running (or just starting) in a worktree of a repo this machine knows;
+  - a held review, merge or queue lock, or a merge command that outlived its run;
+  - a merge-queue record that is not finished;
+  - anything it cannot read, or cannot finish looking at within two minutes: that counts as
+    "live", never as "safe".
+
+  While it swaps files it also holds a separate lock, so a review command that starts in that
+  moment waits (up to 20 seconds); if the swap is still going, the command stops without doing
+  anything: `update-in-progress`, "retry in a minute".
+- **When it tells you.** A banner on a Mac, a line in the job's log and a line in
+  `~/.local/state/pipeline/pipeline-update-notices.log`, only when you have to act or something was
+  installed:
+  - after an install: "pipeline updated to <sha7> (<PR title>)";
+  - a blocked install (modified, incomplete, ahead, diverged), a failed check, or any other
+    failure: once per reason and `main` sha, with the command to run;
+  - a temporary problem (GitHub cannot be reached to look up or compare `main`, or another install
+    holds the install lock): only on the third run in a row; one good run ends the count;
+  - waiting for a review for more than 24 hours: once per wait, naming what is live. The clock
+    starts at the first deferral; if the system clock jumps backwards the count starts again.
+    When the installer could not look at all (an unreadable repository list, a jobs folder it cannot
+    list, git failing in a repository), every blocker is a scan error and the message reads "could not
+    check for running reviews: <what could not be read>" instead of naming a review; fix that file or
+    repository.
+- **The status file and the line at session start.** Every run writes
+  `~/.claude/pipeline-state/update-status.json` (state `current`, `behind`, `deferred-by-review`,
+  `blocked-modified` or `failed`; when it last checked; the installed and `main` shas; the command
+  to run). The `update-notice` hook reads only that file when a session starts and prints one line,
+  nothing when you are current:
+  - `pipeline update available — installs automatically when no review is running`
+  - `pipeline update waiting on a review in <repo> #N` (or just the repo, or `a running review`)
+  - `pipeline update waiting: could not check for running reviews — run pupdate --scheduled in your own terminal to see why` (every blocker is a scan error, not a review)
+  - `pipeline update needs you: run pupdate` (blocked or failed)
+- **A stated limit.** The swap replaces the guard hooks one by one. A guard hook that Claude Code
+  starts in the instant its own file is being swapped is **refused** (the loader fails closed,
+  exit 2), never allowed: the tool call that triggered it fails and can simply be retried.
 
 ### The Fable floor
 
@@ -255,6 +352,10 @@ head you did not review (the receipt names the head the event carried).
   `PIPELINE_GH`, `PIPELINE_CODEX`, `PIPELINE_VERCEL`, `PIPELINE_TEST_MODE` or `PIPELINE_UPDATE_REMOTE` on a `pipeline.mjs` command;
   the installed CLI ignores those five seam variables altogether (they exist for the test suite).
   The stack-stop seams `PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE`, `PIPELINE_STACKS_DEADLINE_MS` and `PIPELINE_INSTALL_WORKER_WAIT_MS` follow a stricter rule: an installed copy ignores them always; in the repo checkout they count only when `PIPELINE_STACKS_HOME` points somewhere other than the default `~/.claude/pipeline-state/stacks` **and** `PIPELINE_STACKS_ONLY` names the projects that isolated run may touch.
+- **What blocks a change to a guard.** A guard change is held back only for (a) allowing on the branch what `main` denies, (b) missing a command an agent would plausibly write unprompted,
+  (c) denying an everyday command, or (d) failing open on a timeout for plausible input. A deliberately evasive construction (non-default shell options, a crafted sourced file) is not a merge blocker: it goes
+  to a follow-up issue (#373). A repo can state this as `review.threat_models` (see "Review threat models and the late fix-verify lane"): the arbiter and
+  Codex then judge security findings on the matching paths within that model, and a security finding outside it becomes a follow-up issue, never a merge block.
 - **Your chat "merge" is checked locally.** The owner-go hook records only prompts you type (Claude Code never runs it for
   the model or a subagent), and `P merge` and guard-git trust only those records. But the agent runs as your OS user and with
   your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
@@ -282,17 +383,45 @@ head you did not review (the receipt names the head the event carried).
 
 ## Project settings and environment
 
+**Substitute review (Codex quota spent).** When Codex stops on its usage limit, or a small fix-check meets the PR's `review.codex_round_budget` (default 6) or the weekly `review.codex_budget.hard` (default 90 %), a read-only Claude agent reviews that round instead: `substitute-opus`, `substitute-fable` once the PR was ever high risk (`review.substitute.mode` auto|off, `min_wait_minutes`, `max_packet_mb`; `review.effort.small_fix`, `small_fix_lines`). Only your typed "merge" accepts such a PR (the `substitute` area; never the gated route, never label mode). A review state that holds one is version 4: run `pipeline update` on every machine before the first substitute round, and finish or park those PRs before rolling the pipeline back (an older CLI cannot read them). `pipeline codex-status` shows the weekly use and the PRs waiting for Codex (`--usage`: where the tokens went); a new session says "Codex is back" once the outage is over.
+
 `.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Three keys deserve a
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
 violations no longer fail CI, the review skill stops before the merge, lists them in a PR comment and merges when you say
 "merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
-required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.review_check`
+required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.merge_checks` (optional list: checks your own merge command also requires although branch protection does not; `pipeline ci-wait` waits for them when they report, like required checks, and reports one that never reports as `notOwed`; `protect` ignores them), `ci.review_check`
 (default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
-names the head's content hash, and every required-check list includes it; turn it on together with branch protection)
+names the head's content hash, and every required-check list includes it; turn it on together with branch protection), `ci.draft_while_iterating` (default `false`; `true` makes `pipeline redraft` turn a ready PR back to draft before a fix push, so
+the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts, lists
+`ready_for_review` and `converted_to_draft` in its `pull_request` types (a bare `pull_request:` gets neither) and puts one PR's
+runs in one concurrency group with `cancel-in-progress`)
 and `ci.approvers` (logins whose approval labels count; required for org-owned repos, otherwise approvals
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
+
+### Review threat models and the late fix-verify lane (opt-in)
+
+Six `review` keys. The first three are inert until you set them; `review.post_max_suggestions` defaults to off, while the trip-wire pair is ON by default in chat mode (see below):
+
+| Key | Default | What it does |
+|---|---|---|
+| `review.threat_models` | `[]` | Up to 10 `{name, paths, text}` (name `/^[a-z0-9-]{1,40}$/`, unique; `paths` non-empty globs; `text` up to 4000 characters). For a PR that touches a matching path, the Fable arbiter's input carries the model, and so does the Codex (or substitute) prompt on a Fable-lane round only (on a judge or light round nothing would route a downgraded finding to an issue or a human). A security finding (category `security`) on a matching file that lies outside the model is ruled FOLLOW-UP with `scope: "out-of-model"`: an issue is filed (the review is not complete until it is) and the merge block lists it ("arbiter (outside threat model NAME)"). It is never a REJECT, and bugs, broken behaviour, data loss, auth and permission problems keep their usual route. |
+| `review.fix_verify_after_round` | `null` (off) | `1..10`: counted rounds past this ordinal may get the narrow `arbiter-fix` brief even on `risk.high_risk_paths` / `review.arbiter_always_paths` files (never past a hard-stop hit other than a P-path, a size driver or a flagged fix scope). |
+| `review.fix_round_max_lines` | `150` | Non-test added lines a late fix round may have, and a new non-test source file, before the round falls back to the full brief. Computed live from the round diff. `pipeline state fix-scope --round R` measures a fix round with the same limit before the push; the review skill asks the owner when it is flagged (own PR / plan first / push as is). |
+| `review.post_max_suggestions` | `review` (off) | `follow-up` or `review`. With `follow-up`, past `review.max_rounds` (counted round > max + 1: the first round past the limit, the automatic extra round or the owner's first grant when there was none, is exempt; later owner-granted rounds are affected) a low-severity SUGGESTION / WORTH CONSIDERING (category performance, maintainability, testing, design, docs or other) that the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP: an issue is filed (the review is not complete until it is), the merge block lists it ("accepted by X in round k past limit m; NOT fixed in this merge; issue #N"), and Claude may tighten it back to ACCEPT with `claude-ruling` (never loosen it). Never a BLOCKING, security or bug item, nor one that fails the `defer-fixes` severity test (a location outside the reviewed diff, a file that also holds an accepted, still-undecided, human-owed or judge-dismissed-but-still-settle-testable BLOCKING or security item (as of the conversion: one accepted in a later round is not caught), a sensitive path in either the working-tree or the trusted config, an unreadable diff), and never the owner's, Claude's or a cached ruling. `review` in any of the working-tree, fork-point or trusted default-branch config (or an unreadable one) keeps it off. |
+| `review.trip_wire_extra_rounds` | `3` | `1..10`: once a PR has reviewed `review.max_rounds` + this many counted rounds, `triage round-request` stops with `trip-wire` and a process review (status, new accepts per round, past-limit share) instead of printing another round line. |
+| `review.trip_wire_not_falling` | `2` | `1..5`: past-limit rounds whose new-ACCEPT count did not fall below the round before (and was above zero) that trip the same stop. The smaller value of the two configs applies. |
+
+Every ask for one more round also carries display-only text: a `nextRound` prediction (what the round would be: base-only, resolution-only or a counted whole-PR round, why the free resolution round was refused, and the no-round alternative of reverting own commits after a clean review), a worded `Recommended: follow up | one more round | stop and park or split` line, and from counted round 6 a `longReview` (the last three rounds' findings and a blocking-loop flag). `codex-review --plan` and `round codex` show `reviewKind` and `resolutionIneligible`; `stats rounds` totals them by kind and by reason; `pipeline summary` adds a soft "Tests added" line. None of it decides anything.
+
+The trip-wire is a prompt, not a gate: it is ON by default in chat mode (every installation gets it on update), the owner answers it, and `triage round-request --after-process-review` prints the usual round line afterwards (still returning `tripWire`); the owner still has to type "extra round". Past-limit rounds have always needed that word, so the wire only adds a look at the whole process first. It uses the existing run-record outcome `blocked` with `detail: process-review`, no new outcome. `review.post_max_suggestions` and a state that carries a post-limit FOLLOW-UP raise the state format to version 6: an older CLI refuses such a state ("update the pipeline") instead of treating the unfiled follow-up as complete. Rollback: finish or re-run review of affected PRs on the new CLI (or `pipeline state discard-round` the rounds) before downgrading, then remove the keys.
+
+Threat models and the late lane are read from the TRUSTED config (the default branch's, at the fork point `risk.mjs#trustedBase` pins on the round), and the late lane also needs the working-tree and fork-point configs to agree (strictest wins): a PR cannot loosen its own review by editing `pipeline.yml`. If the trusted config is unavailable, no model applies and the full brief runs, as before. The fix-verify choice (late lane or not) also reads the trusted config on every round, and when that config is unavailable (a stacked PR's parent branch can cause that by moving `default_branch` in its `pipeline.yml`) the round gets the full brief, never the narrow one; and any hard stop, sensitive path or risk it finds forces the full brief: for a PR to the default branch that is the same commit as the fork-point config, so nothing changes there, but for a stacked PR it stops a parent branch's relaxed `pipeline.yml` from admitting the medium-effort brief.
+
+**Install order.** An installed pipeline or vendored `config.mjs` older than this release rejects a `pipeline.yml` with these keys. (1) Merge and install this release (`pipeline update`); (2) `pipeline vendor --check`, and `pipeline vendor` on drift; (3) only then set the keys, in a later PR (the settings take effect from the next PR on, since the fork-point config is read).
+
+**Roll back.** Remove the three keys from `.claude/pipeline.yml` first (the review then behaves as before). An arbiter ruling that carries `outOfModel` lifts that PR's review state to version 5, which an older CLI refuses to read: finish or re-run the review of such a PR on the new CLI (or `pipeline state discard-round` the affected round) before you downgrade. To revert this release alone, `git revert` its commits after that; states without an out-of-model ruling stay at their old version and read fine.
 
 ### Merge hold (opt-in)
 
@@ -405,7 +534,7 @@ executable.
   `model_not_found`; it never silently falls back).
   With `owner_approval: chat` Claude now decides those items itself and records why (`pipeline triage claude-ruling`): a dismissal of a BLOCKING or security item, or any REJECT, needs a Codex
   second review that also dismisses it at high confidence, and every such dismissal is shown to you in a Rulings block above the merge request, so your "merge" covers it. You are not asked to type a ruling.
-  If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (`pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
+  If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (an arbiter's accepted fix that is not built yet can be deferred to an issue the same way, follow-up only; `pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
   is recorded on this machine and must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item, reasons in another message; it is published in the triage comment). Then remove `needs-human`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **Repo moved / transferred?** Your earlier "merge", ruling and `extra round` records name the old repository, so `P review-complete` / `P merge` can say an owner grant "cannot be verified". In your own terminal (not in Claude Code) record the move once; GitHub must confirm it, and only records made before the move then count for the new name:
@@ -418,16 +547,17 @@ executable.
 ## Developing this repo
 
 ```sh
-npm test                          # node:test, no dependencies (node scripts/test.mjs [name-filter…])
+npm test                          # node:test, no dependencies (node scripts/test.mjs [name-filter | exact.test.mjs …]; a name ending .test.mjs matches that file only; a name of either kind that matches no file exits 2)
 node scripts/verify.mjs           # the pipeline's own verify; writes .verify/report.json
 node pipeline/bin/pipeline.mjs --help
 ```
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (Node 20 and 24) and Windows (Node 24),
 plus an installer round trip into a throwaway Claude home with a space in its path. Its job names
-`test (ubuntu)` and `test (windows)` are this repo's required checks. The Windows suite runs as three
-parallel shards (`node scripts/test.mjs --shard I/3`, named `test (windows 1/3)` to `3/3`); `test (windows)`
-is the aggregate that is green only when all three succeeded.
+`test (ubuntu)` and `test (windows)` are this repo's required checks, and both are aggregates. The Ubuntu suite runs once
+per Node version in parallel (`test (ubuntu node 20)` and `test (ubuntu node 24)`); `test (ubuntu)` is green only when both
+succeeded. The Windows suite runs as three parallel shards (`node scripts/test.mjs --shard I/3`, named `test (windows 1/3)`
+to `3/3`); `test (windows)` is the aggregate that is green only when all three succeeded.
 
 The repo is onboarded to itself (`.claude/pipeline.yml`) with **every path a hard-stop**, so a
 change to the pipeline never auto-merges: the review skill builds, checks and reviews it, then hands you a

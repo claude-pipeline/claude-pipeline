@@ -93,7 +93,7 @@ test('F1b 87: a sourced file whose command may bind a name (zsh binders, functio
     assert.equal(files('F=ok.sh; source set.sh; bash $F', fs).decision, 'deny', b);
   }
   // (data commands, name setters and cds the file does stay modelled)
-  for (const calm of ['echo hi', 'set -eu', 'export G=1', 'G=2', 'print -r -- hi', 'printf "%s" x', 'cd sub', 'ls >/dev/null; test -d sub', 'print $F']) {
+  for (const calm of ['echo hi', 'set -eu', 'export G=1', 'G=2', 'print -r -- hi', 'printf "%s" x', 'cd ./sub', 'ls >/dev/null; test -d sub', 'print $F']) {
     const fs = fakeFs(PROJ, { 'set.sh': `${calm}\n`, 'evil.sh': BAD_WRITE, 'ok.sh': 'echo ok' }, DIRS);
     assert.equal(files('F=ok.sh; source set.sh; bash $F', fs).decision, 'allow', calm);
   }
@@ -106,7 +106,151 @@ test('F1b 88: a named descriptor redirection rebinds the script-directory name; 
   for (const pre of ['ls {HERE}>/dev/null', 'ls {HERE}</dev/null', 'ls {HERE}>>/dev/null', 'ls {HERE} >/dev/null', 'ls {HERE}>&2', 'cat <&0 {HERE}</dev/null', 'HERE+=x', 'ls >/dev/null {HERE}>/dev/null']) {
     assert.equal(files(`${CC}/scripts/restart.sh`, ccFs(pre)).decision, 'deny', pre);
   }
-  assert.equal(files(`${CC}/scripts/restart.sh`, ccFs('ls {OTHER}>/dev/null; ls >/dev/null')).decision, 'allow');
+  // (#352 R21-F2: any non-leading {fd} word now refuses the line it is on, another name too; a script without one is still allowed)
+  assert.equal(files(`${CC}/scripts/restart.sh`, ccFs('ls {OTHER}>/dev/null; ls >/dev/null')).decision, 'deny');
+  assert.equal(files(`${CC}/scripts/restart.sh`, ccFs('ls >/dev/null; ls >/dev/null')).decision, 'allow');
+});
+
+// (#352 R21-F1: a LEADING `{F}>file` word is a redirect with no command word, so it is in no argv: the name it binds is still read, also by files-policy, which has no ctlBroken fallback)
+test('#352 R21-F1: a leading named descriptor redirection rebinds the name for files-policy and for a script git-policy judges', () => {
+  const fs = fakeFs(PROJ, {}, [...DIRS, '.review']);
+  for (const pre of ['{F}>/dev/null true', '{F}>/dev/null', '{F}>/dev/null X=1', '{F}\\\n>/dev/null true', '{F}</dev/null true']) {
+    assert.equal(files(`F=x; ${pre}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', pre);
+  }
+  assert.equal(files("F=x; true; echo '{}' > .review/round-$F/arbiter-output.json", fs).decision, 'allow');
+  const CL = 'cl' + 'ose';
+  const labels = (n) => (n === '5' ? [] : ['pipeline-pause']);
+  for (const body of [`{k}>/dev/null true; gh issue ${CL} $k\n`, `{k}>/dev/null; gh issue ${CL} $k\n`, `exec {k}>/dev/null; gh issue ${CL} $k\n`]) {
+    assert.equal(git('export k=5; zsh run.sh', { 'run.sh': body }, { issueLabels: labels }).decision, 'deny', body);
+  }
+  assert.equal(git('export k=5; zsh run.sh', { 'run.sh': `true; gh issue ${CL} $k\n` }, { issueLabels: labels }).decision, 'allow');
+});
+
+// (#352 R22: bash >= 4.3 takes an array element as the descriptor name (`{F[0]}>f` assigns the number to F[0], so $F changes); a leading `{k}>f` followed by an assignment is the command `{k}` in
+// sh / bash 3.2, so the assignment never ran there and an inherited value stays)
+test('#352 R22: a subscripted named descriptor rebinds its array, and an assignment after a leading {k}>f is not believed', () => {
+  const fs = fakeFs(PROJ, {}, [...DIRS, '.review']);
+  for (const pre of ['{F[0]}>/dev/null true', '{F[0]}>/dev/null', 'ls {F[0]}>/dev/null', 'exec {F[1]}>/dev/null']) {
+    assert.equal(files(`F=x; ${pre}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', pre);
+  }
+  for (const body of ['{k}>/dev/null F=x', '{k}>/dev/null export F=x', '{k[0]}>/dev/null F=x']) {
+    const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
+    assert.equal(files('export F=22; sh run.sh', sfs).decision, 'deny', body);
+  }
+  const CL = 'cl' + 'ose';
+  const labels = (n) => (n === '5' ? [] : ['pipeline-pause']);
+  for (const body of [`{k[0]}>/dev/null; gh issue ${CL} $k\n`, `ls {k[0]}>/dev/null; gh issue ${CL} $k\n`]) {
+    assert.equal(git('export k=5; bash run.sh', { 'run.sh': body }, { issueLabels: labels }).decision, 'deny', body);
+  }
+  // unchanged: a script that assigns plainly
+  const ok = fakeFs(PROJ, { 'run.sh': "F=x\necho '{}' > /tmp/round-$F.json\n" }, [...DIRS, '.review']);
+  assert.equal(files('export F=22; sh run.sh', ok).decision, 'allow');
+});
+
+// (#352 R23: a nested or quoted subscript in a named descriptor (`{F[a[0]]}>f`, `{F['0']}>f`) rebinds F like `{F[0]}>f` (B1, F1); a bare `{` / `}` word that is no command splits the word groups, so
+// the words after it (`echo { F=x }`, `: { F=x }`, `{k}>f { F=x }`) are read as an assignment that never ran (F2): the line is refused)
+test('#352 R23-B1, R23-F1, R23-F2: nested / quoted subscripted descriptors rebind; an assignment after a bare { or } argument is not believed', () => {
+  const fs = fakeFs(PROJ, {}, [...DIRS, '.review']);
+  for (const pre of ['{F[a[0]]}>/dev/null', '{F[a[0]]}>/dev/null true', "{F['0']}>/dev/null true", '{F["0"]}>/dev/null', "ls {F[$'0']}>/dev/null", "exec {F['1']}>/dev/null"]) {
+    assert.equal(files(`F=x; ${pre}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', pre);
+  }
+  for (const body of ['{k}>/dev/null { F=x }', ': { F=x }', 'echo { F=x }', 'echo } F=x', "{k['0']}>/dev/null F=x"]) {
+    const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
+    assert.equal(files('export F=22; sh run.sh', sfs).decision, 'deny', body);
+  }
+  // (#352 R24-F2: a subscript is arithmetic, quotes removed: `exec {a["F=22"]}>f` assigns F, also a name the script inherited. R26-F1: the inherited F is harmless (x) and the
+  // subscript sets the round number, so in the script form only the subscript refusal denies the quoted spellings (the unquoted `{a[F=22]}` is also caught by the arithmetic-
+  // assignment scan). The one-line form is denied by an older rule as well: a line with a named descriptor word makes every name it assigns unknown (F=x here), so it pins the
+  // outcome, not the refusal)
+  for (const body of ['exec {a["F=22"]}>/dev/null', 'exec {a[F=22]}>/dev/null', "exec {a['F=22']}>/dev/null"]) {
+    const sfs = fakeFs(PROJ, { 'run.sh': `${body}\necho '{}' > .review/round-$F/arbiter-output.json\n` }, [...DIRS, '.review']);
+    assert.equal(files('export F=x; bash run.sh', sfs).decision, 'deny', body);
+    assert.equal(files(`F=x; ${body}; echo '{}' > .review/round-$F/arbiter-output.json`, fs).decision, 'deny', body);
+  }
+  // (#352 R25-B1: a plain-name subscript evaluates the name's value as arithmetic: `i='F=22'`, `exec {a[i]}>f` assigns F. The script form (F and i inherited) is denied only by the
+  // subscript refusal; the one-line form, as above, by the named-descriptor rule as well)
+  assert.equal(files("F=x; i='F=22'; exec {a[i]}>/dev/null; echo '{}' > .review/round-$F/arbiter-output.json", fs).decision, 'deny');
+  const ifs = fakeFs(PROJ, { 'run.sh': "exec {a[i]}>/dev/null\necho '{}' > .review/round-$F/arbiter-output.json\n" }, [...DIRS, '.review']);
+  assert.equal(files("export F=x i='F=22'; bash run.sh", ifs).decision, 'deny');
+  // (R26-F1 control: the same script shape with a plain-number subscript is allowed, so the denies above come from the subscript, not from the write)
+  const cfs = fakeFs(PROJ, { 'run.sh': "exec {a[0]}>/dev/null\necho '{}' > .review/round-$F/arbiter-output.json\n" }, [...DIRS, '.review']);
+  assert.equal(files("export F=x i='F=22'; bash run.sh", cfs).decision, 'allow');
+  const dfs = fakeFs(PROJ, { 'run.sh': "exec {a[0]}>/dev/null\necho '{}' > /tmp/round-$F.json\n" }, [...DIRS, '.review']);
+  assert.equal(files('export F=22; bash run.sh', dfs).decision, 'allow');
+  // unchanged: a real brace group assigns
+  const ok = fakeFs(PROJ, { 'run.sh': "{ F=x; }\necho '{}' > /tmp/round-$F.json\n" }, [...DIRS, '.review']);
+  assert.equal(files('export F=22; sh run.sh', ok).decision, 'allow');
+});
+
+// (#352, merge of main: main's AUTO_CD reading took the `{k}` of `exec {k}>f` for a command word that could be a directory, so a script that opens a named descriptor was judged as if it
+// could cd anywhere. The word right before `<` / `>` is a descriptor (zsh, bash >= 4.1) or the command `{k}` (sh, bash 3.2: no AUTO_CD); only zsh with IGNORE_BRACES reads it as a word,
+// which runs a cd only into a directory of that name, there or made on the line)
+test('#352 merge: a named descriptor word is no AUTO_CD directory unless a directory of that name is there or made', () => {
+  const body = (pre) => `${pre}\necho '{}' > .review/round-$F/arbiter-output.json\n`;
+  for (const pre of ['exec {k}>/dev/null', 'exec {a[0]}>/dev/null', '{k}>/dev/null']) {
+    const sfs = fakeFs(PROJ, { 'run.sh': body(pre) }, [...DIRS, '.review']);
+    assert.equal(files('export F=x; bash run.sh', sfs).decision, 'allow', pre);
+  }
+  // (a directory of that name, or one the script makes, keeps the AUTO_CD reading: refused)
+  for (const [pre, dirs] of [['exec {k}>/dev/null', ['{k}']], ['exec {a[0]}>/dev/null', ['{a0}']], ["mkdir '{k}'\nexec {k}>/dev/null", []]]) {
+    const sfs = fakeFs(PROJ, { 'run.sh': body(pre) }, [...DIRS, '.review', ...dirs]);
+    assert.equal(files('export F=x; bash run.sh', sfs).decision, 'deny', `${pre} with ${dirs}`);
+  }
+  // (a quoted word is a command word, as before)
+  const qfs = fakeFs(PROJ, { 'run.sh': body('"{k}" >/dev/null') }, [...DIRS, '.review']);
+  assert.equal(files('export F=x; bash run.sh', qfs).decision, 'deny');
+});
+
+// (R32 redesign: zsh print is no longer judged read-only by files-policy at all: it is handled as on main, so every row below is a deny. The rows that were allows (print as echo) and the rows that
+// were denies for an option that binds, feeds history or a descriptor, prompt-expands, or makes print a printf stay as regression rows)
+test('#352 merge: zsh print is not judged read-only (R32 redesign; main\'s behaviour)', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  // (these were allows: zsh print is not judged read-only (R32 redesign; main's behaviour))
+  for (const p of ['print "a $Y"', 'print -r -- "a $Y"', 'print -l "a $Y" b', 'print -- -s "a $Y"', 'print -C 2 "a $Y" b', 'print -C2 "a $Y"', 'print -f \'%s\' "a $Y"', 'print -x 4 -- -s "a $Y"', 'print -f \'%s\\n\' "a[$Y]"', 'print -rf \'%s %b\' "a $Y" b']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  for (const p of ['print -s "a $Y"', 'print -S "a $Y"', 'print -z "a $Y"', 'print -u3 "a $Y"', 'print -rP "a $Y"', 'print -p "a $Y"', 'print -v V "a $Y"',
+    // (R28-F2: an option that takes a value (-C -f -x -X -u -v) given it in the next word does not end the options: the scan goes on past the value)
+    'print -C 1 -u3 "a $Y"', 'print -f \'%s\' -P "a $Y"', 'print -x 4 -z "a $Y"', 'print -C 1 -s "a $Y"', 'print -rC 1 -s "a $Y"', 'print -X 2 -S "a $Y"', 'print -Cf -s "a $Y"',
+    // (R29-F3: zsh's print -f is printf: a numeric conversion reads its operand as arithmetic and runs the substitution in a subscript; any format that converts a number, or one only
+    // known at run time, is no read-only call. An option word only known at run time may be any option.)
+    'print -f \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -f%d \'a[$(rm -rf .claude; echo 0)]\'', 'print -rf \'%*s\' \'a[$(rm -rf .claude; echo 0)]\' x',
+    'print -f "$FMT" "a $Y"', 'print -f \'%d\' "a $Y"', 'print $O "a $Y"', 'print "$Y" "a $Y"', 'print -r "${O}x" "a $Y"',
+    // (R30-B1: a run-time part ANYWHERE in an option word, not only at its start: -"$O" with O=f is -f)
+    'print -"$O" \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -$O \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -x$(echo f) \'%d\' \'a[$(rm -rf .claude; echo 0)]\'', 'print -r"$O" x "a $Y"',
+    // (R30-F1: the value word of -C / -x / -X is part of the option area: an unquoted substitution there splits into `-f %d`)
+    'print -C $(echo 1 -f %d) \'a[$(rm -rf .claude; echo 0)]\'', 'print -x $=N \'a[$(rm -rf .claude; echo 0)]\'', 'print -X ${=N} x "a $Y"', 'print -C "$N" "a $Y"', 'print -rC $N "a $Y"',
+    // (R30-F2: a glob-spelled word of the option area becomes any option when a file of that name is there: -?%d -> -f%d)
+    'print -?%d \'a[$(rm -rf .claude; echo 0)]\'', 'print * \'a[$(rm -rf .claude; echo 0)]\'', 'print -l -?%d "a $Y"', 'print -C 2 * "a $Y"']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  // (R30 allow twins, were allows: zsh print is not judged read-only (R32 redesign; main's behaviour): a literal value word, a glob after `--` or after the first operand, a quoted glob, and runtime words that are plain operands)
+  for (const p of ['print -l -- *.md "a $Y"', 'print -r -- * "a $Y"', 'print x *.md "a $Y"', 'print -l x* "a $Y"', 'print -r \'*\' "a $Y"', 'print -rl -- "-$O" x']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  // (main's behaviour, still allows: print is not judged read-only, and these lines hold no word that reads as a path to write under the cd that is only known at run time)
+  for (const p of ['print -- "$Y"', 'print -C 2 a b', 'print -C 2 -- "$Y" x', 'print -f \'%s\\n\' a b', 'print hello world']) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'allow', p);
+  const script = '#!/bin/zsh\nexport PATH="$HOME/.npm-global/bin:$PATH"\ncd "$X" || exit 1\nprint "starting $(date)"\n';
+  const zfs = fakeFs(PROJ, { 'run.sh': script }, DIRS);
+  // (run.sh was allowed when run by zsh: zsh print is not judged read-only (R32 redesign; main's behaviour))
+  assert.equal(files(`${PROJ}/run.sh`, zfs).decision, 'deny', 'run by zsh: ' + "zsh print is not judged read-only (R32 redesign; main's behaviour)");
+  assert.equal(files('zsh run.sh', zfs).decision, 'deny', 'zsh run.sh');
+  assert.equal(files('bash run.sh', zfs).decision, 'deny', 'run by bash: print may be a program on the moved PATH');
+});
+
+// (R31 rows, kept as regression rows: print's option area ended only at a word certain to be one non-option word; any other word may vanish (`(N)`) or ADD option words (`(P:-f%d:)`). R32 redesign:
+// zsh print is not judged read-only at all, so the former allows below are denies too. R32-F1/F2/F3: a vanishing glob as the -C / -x / -X value, a quoted rc-expand `"x${^@}"` that vanishes when
+// empty, and a brace range `{-...}x` that zsh expands to `-x .x` were all bypasses of the option-area rule)
+test('#352 R31 / R32: print is not judged read-only (R32 redesign; main\'s behaviour)', () => {
+  const fs = fakeFs(PROJ, {}, DIRS);
+  const SUB = '\'a[$(rm -rf .claude; echo 1)]\'';
+  for (const p of [`a=(0); cd "$X" || exit 1; print zzz_no_match*(N) -f%d ${SUB}`, // (R31-B1)
+    `cd "$X" || exit 1; print p*(P:-f%d:) ${SUB}`, 'cd "$X" || exit 1; print x*(P[-P]) "a $Y"', `cd "$X" || exit 1; print p*(e:'reply=(-f%d y)':) ${SUB}`, // (R31-F1)
+    `cd "$X" || exit 1; print x* -f%d ${SUB}`, `cd "$X" || exit 1; print x$Y -f%d ${SUB}`, `cd "$X" || exit 1; print x$(echo) -f%d ${SUB}`,
+    `cd "$X" || exit 1; print x[a] -f%d ${SUB}`, `cd "$X" || exit 1; print -l x* -f%d ${SUB}`, 'cd "$X" || exit 1; print -r ?x "a $Y"', 'cd "$X" || exit 1; print x* x*(N) "a $Y"', 'cd "$X" || exit 1; print x#-f%d "a $Y"',
+    'cd "$X" || exit 1; print x~y "a $Y"', 'cd "$X" || exit 1; print ~ "a $Y"', 'cd "$X" || exit 1; print x* -s "a $Y"']) assert.equal(files(p, fs).decision, 'deny', p);
+  // (R32 shapes, each a live bypass of the option-area rule: a vanishing glob as the -x value, "x${^@}" with no positional parameters, a brace range zsh expands to `-x .x`)
+  for (const p of [`print -x zzz* 8 -f%d ${SUB}`, `print "x\${^@}" -f%d ${SUB}`, `print {-...}f%s%d ${SUB}`]) assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  // (these were allows: zsh print is not judged read-only (R32 redesign; main's behaviour))
+  for (const p of ['print "a $Y"', 'print "starting $(date)"', 'print -l -- *.md', 'print -- x*(N) "a $Y"', 'print -r -- x* "a $Y"', 'print -l \'x*\' "a $Y"', 'print -l - x* "a $Y"',
+    // (a glob word that starts with a plain literal character and holds only * ? [..] is transparent: it can only vanish or become names starting with that character, so the scan goes on past it)
+    'print -l x* "a $Y"', 'print x*', 'print x[a] "a $Y"', 'print x* "a $Y" -f%d', 'print x? x* -C2 "a $Y"', 'print x* -r "a $Y"']) {
+    assert.equal(files(`cd "$X" || exit 1; ${p}`, fs).decision, 'deny', p);
+  }
 });
 
 // ---- the second pass of a stale line spends what the first one left ------------------------------------------------------------------------------------------

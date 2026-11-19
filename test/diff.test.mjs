@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
-import { parseUnifiedDiff, diffStats, parseHunkHeader, unquoteCPath } from '../pipeline/lib/diff.mjs';
+import { parseUnifiedDiff, diffStats, parseHunkHeader, testsAdded, unquoteCPath } from '../pipeline/lib/diff.mjs';
 
 // Fixtures are real `git diff -M --unified=0 --no-color --no-ext-diff` output saved as text, so tests never run git.
 const fixture = (name) => readFileSync(new URL(`./fixtures/diffs/${name}.diff`, import.meta.url), 'utf8');
@@ -295,4 +295,33 @@ test('unquoteCPath rejects trailing text and input that is not a quoted token', 
   assert.throws(() => unquoteCPath('"a"x'), /trailing/);
   assert.throws(() => unquoteCPath('abc"'), /not a quoted/);
   assert.throws(() => unquoteCPath(''), /not a quoted/);
+});
+
+// Failure caught: the soft `Tests added` line of `pipeline summary` miscounts (a source file read as a test, a non-case line counted as a case), so the owner reads a wrong test-to-source ratio.
+test('testsAdded: counts test files that gained lines, added test-case calls, and changed source lines against test lines', () => {
+  const diff = [
+    'diff --git a/src/a.js b/src/a.js', '--- a/src/a.js', '+++ b/src/a.js', '@@ -1,1 +1,3 @@', '-old', '+new1', '+new2', "+it('looks like a case but is source', () => {});",
+    'diff --git a/test/a.test.mjs b/test/a.test.mjs', '--- a/test/a.test.mjs', '+++ b/test/a.test.mjs', '@@ -5,0 +6,4 @@',
+    "+test('one', () => {});", "+  it.each([1])('two', () => {});", '+  assert.ok(true);', "+// test('a comment')", '',
+  ].join('\n');
+  const r = testsAdded(parseUnifiedDiff(diff), ['test/**']);
+  assert.deepEqual([r.files, r.cases, r.sourceLines, r.testLines], [1, 2, 4, 4]);
+  assert.equal(r.line, 'Tests added: 1 files, 2 cases; changed source lines : test lines = 4 : 4');
+  assert.equal(testsAdded([], ['test/**']).line, 'Tests added: 0 files, 0 cases; changed source lines : test lines = 0 : 0');
+});
+
+// Failure caught: a Playwright spec (one describe, hooks, settings, two tests) is reported as 4+ cases in the `Tests added` line because test.describe / test.beforeEach / test.use / test.setTimeout count as cases; skip/todo stubs are declared cases and still count; conditional (runIf/skipIf), expected-failure and Vitest `for` cases are declared cases too, so a spec made of them is not reported as 0.
+test('testsAdded: counts only case-making calls, not test.describe, hooks, test.use, test.setTimeout or test.step', () => {
+  // The focus/skip suffixes are spliced in so the test-integrity scan does not read these fixture strings as skipped or focused tests.
+  const [only, skip, todo, fixme, runIf, skipIf, failing] = ['only', 'skip', 'todo', 'fixme', 'runIf', 'skipIf', 'failing'];
+  const diff = [
+    'diff --git a/e2e/a.spec.ts b/e2e/a.spec.ts', '--- a/e2e/a.spec.ts', '+++ b/e2e/a.spec.ts', '@@ -0,0 +1,18 @@',
+    "+test.describe('group', () => {", '+  test.use({ locale: "en" });', '+  test.setTimeout(5000);', '+  test.describe.configure({ mode: "serial" });',
+    '+  test.beforeEach(async () => {});', '+  test.afterEach(async () => {});', '+  test.beforeAll(async () => {});', '+  test.afterAll(async () => {});',
+    "+  test('one', async () => { await test.step('s', async () => {}); });", `+  test.${only}('two', async () => {});`, `+  test.${skip}('three', async () => {});`,
+    `+  test.describe.${skip}.each([1])('x', () => {});`, `+  it.${todo}('four');`, `+  test.${fixme}('five', async () => {});`,
+    `+  it.${runIf}(true)('six', () => {});`, `+  test.${skipIf}(false)('seven', async () => {});`, `+  it.${failing}('eight', () => {});`, "+  it.for([1])('nine', () => {});", '',
+  ].join('\n');
+  const r = testsAdded(parseUnifiedDiff(diff), ['e2e/**']);
+  assert.equal(r.cases, 9);
 });

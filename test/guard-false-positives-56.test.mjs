@@ -81,12 +81,12 @@ test('#56 repro 5/6 and the chained shapes: one assignment that may not run is j
   for (const cmd of [
     'cd $W && S=abc; node /tmp/a.mjs $S', // (repro 5)
     'for f in a b; do F=/tmp/$f; node a.mjs $F; done', // (repro 6)
-    'cd sub && F=src/a.ts; sed -n 1,9p $F',
+    'cd ./sub && F=src/a.ts; sed -n 1,9p $F',
     'true && P=src/a.ts && node -e "console.log(1)" $P',
     'if true; then S=src; fi; node a.mjs $S/a.ts',
     'cd d && SK=src; bash $SK/../ok.sh',
     'true || X=a; bash $X',
-    'cd src && T=a.ts; cp $T /tmp/a.bak && sed -i.bak s/a/b/ $T',
+    'cd ./src && T=a.ts; cp $T /tmp/a.bak && sed -i.bak s/a/b/ $T',
   ]) allowBoth(cmd, SPEC);
 });
 
@@ -96,7 +96,7 @@ test('#56: the same shapes with a value that names a bad script stay refused (th
     'true && X=run.sh; bash $X',
     'true || X=run.sh; bash $X',
     'if true; then S=run; fi; bash $S.sh',
-    'cd sub && SK=..; bash $SK/run.sh',
+    'cd ./sub && SK=..; bash $SK/run.sh',
     'while true; do X=run.sh; done; bash $X',
   ]) denyBoth(cmd, SPEC);
   // git / gh read the value too: the reading where it did not run leaves an unknown push argument
@@ -550,6 +550,18 @@ test('#56 Fable review of 2edea61: a zsh precommand modifier, an option carrying
   assert.equal(git('k=5; echo hi; gh issue close $k', fsx, { issueLabels: labels }).decision, 'allow');
   assert.equal(git('for n in 5; do noglob echo x; gh issue close $n; done', fsx, { issueLabels: labels }).decision, 'allow');
   allowBoth('for f in src/a.ts a.mjs; do cp $f /tmp/x/; done', SPEC);
+});
+
+// (#352 R20-F3: a line continuation inside the named-fd redirect still binds the name, like the plain line above)
+test('#352 R20-F3: exec {k}\\<newline>>/dev/null rebinds k as exec {k}>/dev/null does', () => {
+  const labels = (n) => (n === '7' || n === '10' ? ['pipeline-pause'] : []);
+  const fsx = fakeFs(GIT_ROOT, {}, DIRS);
+  assert.equal(git('k=5; exec {k}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  assert.equal(git('k=5; exec {k}\\\n>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  assert.equal(git('k=5; exec {k\\\n}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  // (push security review of 5f7cdd12: a leading {k}>f word is skipped from argv, and still rebinds k)
+  assert.equal(git('k=5; {k}>/dev/null true; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
+  assert.equal(git('k=5; {k}>/dev/null; gh issue close $k', fsx, { issueLabels: labels }).decision, 'deny');
 });
 
 test('#56 replay of 96848c2: template text the shell never expands, and zsh flags that cannot assign, are no indirect expansion', () => {

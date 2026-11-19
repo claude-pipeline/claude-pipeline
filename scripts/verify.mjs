@@ -25,7 +25,10 @@ const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..');
 const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.yml (names the dedicated Supabase and its lock)
 
 // ---- EDIT THIS: the steps for this project ----------------------------------------------------------------------------
-// claude-pipeline's own verify: the full node:test suite (quick = the CLI/skills/docs/config agreement tests, < 1 s).
+// claude-pipeline's own verify: the full node:test suite. Quick = exactly the files named in quickCmd (skills-commands,
+// docs-facts, config, stacks-config, cli, test-runner, triage-claude (pins the state version) and repo-risk-config (pins the DEPTH1 names), all by exact
+// name; a name that matches no file exits 2); about 4 s of CPU plus ~7 s for repo-risk-config. cli-triage-claude also pins the state version (its
+// "newer format" test) but costs ~2 min of CPU, so it stays CI-only.
 // The installer round trip is CI-only (.github/scripts/installer-round-trip.sh): install.mjs refuses to run inside a
 // Claude Code session, which is where this script usually runs.
 // name      unique, letters/digits/./_/- (it names the log file)
@@ -42,7 +45,7 @@ const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.
 //           and `log` (default: the reason) is written to .verify/logs/<step>.log. `git` is the report's git block. It must
 //           fail closed: a throw or any other answer runs the step and records `skipCheck: skip check failed: <why>`.
 const STEPS = [
-  { name: 'tests', cmd: 'node scripts/test.mjs', quick: true, quickCmd: 'node scripts/test.mjs skills-commands docs-facts config' },
+  { name: 'tests', cmd: 'node scripts/test.mjs', quick: true, quickCmd: 'node scripts/test.mjs skills-commands.test.mjs docs-facts.test.mjs config.test.mjs stacks-config.test.mjs cli.test.mjs test-runner.test.mjs triage-claude.test.mjs repo-risk-config.test.mjs' },
 ];
 // ---- end of the project-specific part ---------------------------------------------------------------------------------
 
@@ -189,7 +192,8 @@ function gitInfo(root, defaultBranch) {
   const o = { cwd: root };
   const safe = (fn) => { try { return fn(); } catch { return null; } };
   const head = safe(() => headSha(o));
-  const baseRef = `origin/${defaultBranch}`;
+  // fully qualified: an abbreviated `origin/<b>` resolves through refs/tags and refs/heads before refs/remotes (#454)
+  const baseRef = `refs/remotes/origin/${defaultBranch}`;
   const base = safe(() => revParse(baseRef, o));
   return {
     head,

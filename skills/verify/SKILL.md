@@ -54,6 +54,7 @@ no pipeline; I can't certify it end-to-end. Want me to run pipeline-setup?"
   permission model: the right roles are **allowed** and the wrong roles are **denied**, executed
   as real session roles (Supabase: pgTAP in `supabase/tests/` with `set local role
   authenticated` + `request.jwt.claims`, never a privileged connection). Synthetic fixtures only.
+- **Test rules** — the implementer's test rules decide which tests exist (each names the production failure it catches; extend an existing file first); verify asks for no more than those.
 - **Bug fix** — write the failing test first, run it, and keep the failing output. Then fix,
   and show the same test passing.
 - **New behaviour** — at least one new test that would fail without the change.

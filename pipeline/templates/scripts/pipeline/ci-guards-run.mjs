@@ -61,7 +61,7 @@ import { loadConfig } from './lib/config.mjs';
 import { APPROVAL_LABELS, REVIEW_STATES, VERDICT_STATES, checkGuardVerdict, parseRunUrl, verdictArtifactName, withinRunWindow } from './lib/guard-provenance.mjs';
 import { git, revParse, reviewContentHash } from './lib/git.mjs';
 import { gh as defaultGh, GhError } from './lib/proc.mjs';
-import { REVIEW_COMPLETE_MARKER, REVIEW_CONTEXT, latestReviewComment } from './lib/review-marker.mjs';
+import { REVIEW_COMPLETE_MARKER, REVIEW_CONTEXT, formatSubstituteRounds, latestReviewComment } from './lib/review-marker.mjs';
 
 export const CONTEXTS = { integrity: 'Test integrity', hardstops: 'Hard-stop scan' };
 // The third status, `Cross-model review`, only with ci.review_check (base config). Why: the review loop ends by posting a
@@ -300,7 +300,9 @@ export async function runOrchestrator({ env = process.env, cwd = process.cwd(), 
     if (hash !== r.contentHash) {
       return { state: 'failure', description: `the content changed since the review (reviewed ${r.contentHash.slice(0, 8)}, head is ${hash.slice(0, 8)}): review it again` };
     }
-    return { state: 'success', description: `reviewed at ${r.head.slice(0, 8)}: ${r.rounds} round(s), Codex ${r.codexModel}${r.modelProofDigest ? ', Fable' : ''}` };
+    // (cosmetic) a Claude stand-in reviewed instead of Codex for some rounds: the marker says so (review-marker.mjs `substitute`); an older parser drops the field and prints the codexModel only
+    const sub = r.substitute?.rounds?.length > 0 ? `, ${formatSubstituteRounds(r.substitute.rounds)}` : '';
+    return { state: 'success', description: `reviewed at ${r.head.slice(0, 8)}: ${r.rounds} round(s), Codex ${r.codexModel}${r.modelProofDigest ? ', Fable' : ''}${sub}` };
   }
 
   let pass = await evaluatePass();

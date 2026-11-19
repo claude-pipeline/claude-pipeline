@@ -71,3 +71,50 @@ test('R1-F2: two rate-limited operations on one gh instance never sleep more tha
   const total = waits.reduce((a, b) => a + b, 0);
   assert.ok(total <= 100_000, `slept ${total} ms in total`);
 });
+
+// After main's #396 the summary writer edits the comment it just read (updateComment) instead of upserting: the retry choice must reach that path too,
+// or `P summary` / `comment --kind summary` / `checkpoint` stop waiting out a limit once the comment exists, and the recorder must still never sleep on it.
+const SUMMARY = '<!-- claude-pipeline:summary -->';
+const mkExisting = () => {
+  const calls = [];
+  const waits = [];
+  const ghFn = (args) => {
+    const line = args.join(' ');
+    calls.push(line);
+    if (args[0] === 'repo') return okJson(REPO_VIEW);
+    if (line === 'api user -q .login') return { code: 0, stdout: 'me\n', stderr: '' };
+    if (line.includes('comments --paginate')) return okJson([{ id: 12, body: `${SUMMARY}\n\nold`, user: { login: 'me' }, html_url: 'u12' }]);
+    if (line.startsWith('pr view')) return okJson({ headRefName: 'feat/x', baseRefName: 'main', headRefOid: 'a'.repeat(40) });
+    if (line.startsWith('api -X')) return limitedReply;
+    throw new Error(`unexpected ${line}`);
+  };
+  const gh = createGitHub({ cwd: '/tmp/x', env: {}, ghFn, retry: { sleep: (ms) => waits.push(ms), log: () => {}, now: () => 0 } });
+  const patches = () => calls.filter((c) => c.startsWith('api -X PATCH')).length;
+  return { gh, waits, patches };
+};
+
+test('updateComment retries only with { retry: true }', () => {
+  const off = mkExisting();
+  assert.throws(() => off.gh.updateComment(12, SUMMARY, `${SUMMARY}\nx`));
+  assert.equal(off.patches(), 1);
+  assert.deepEqual(off.waits, []);
+  const on = mkExisting();
+  assert.throws(() => on.gh.updateComment(12, SUMMARY, `${SUMMARY}\nx`, { retry: true }));
+  assert.ok(on.patches() > 1, 'opted in: waits and tries again');
+  assert.ok(on.waits.reduce((a, b) => a + b, 0) <= 100_000);
+});
+
+test('writeRunRecord (via writeSummaryComment) passes retry to updateComment when the comment exists; the run recorder never sleeps on it', () => {
+  const seen = [];
+  const existing = { viewer: () => 'me', listComments: () => [{ id: 7, body: `${SUMMARY}\n\nold`, user: { login: 'me' } }] };
+  const gh = { ...existing, updateComment: (id, m, b, opts) => { seen.push([id, opts]); return { id, url: 'u', action: 'updated' }; } };
+  writeSummaryComment(gh, 4, { sections: 'x', retry: true });
+  writeSummaryComment(gh, 4, { sections: 'x' });
+  assert.deepEqual(seen, [[7, { retry: true }], [7, undefined]]);
+
+  const { gh: real, waits, patches } = mkExisting();
+  const recorder = createRunRecorder({ gh: real, pr: 4 });
+  assert.equal(recorder.update({ inFlight: { kind: 'merge', host: 'h', startedAt: new Date(0).toISOString(), maxMinutes: 30 } }, { initialStep: 'gate' }), null);
+  assert.equal(patches(), 1, 'one edit attempt');
+  assert.deepEqual(waits, []);
+});

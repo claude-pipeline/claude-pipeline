@@ -20,13 +20,73 @@ const RENAME_WAIT_MS = 50;
 const STRAY_TMP = /^state\.json\..+\.tmp$/;
 const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 
-// The newest state format this code understands. A state with a higher `version` was written by a newer pipeline (a Claude ruling or a
-// second review: those, and only those, write version 2; every other state stays 1): loadState refuses it and decodeFromComment reads it
-// as no state, so an older reader never rules from a state it cannot fully see.
-export const SUPPORTED_STATE_VERSION = 2;
+// The newest state format this code understands. A state with a higher `version` was written by a newer pipeline: loadState refuses it and
+// decodeFromComment reads it as no state, so an older reader never rules from a state it cannot fully see. Version 2: a Claude ruling or a
+// second review wrote it. Version 3: `triage defer-fixes` wrote it (a deferral is a Claude dismissal an installation from before this change
+// would leave out of the Rulings block and let Claude reopen). Version 4: the state holds a substitute-reviewed round or second review (a Claude stand-in for
+// Codex while its quota was spent) or a budget / governor decision: a pipeline from before the substitute would read it as an ordinary Codex review.
+// Every other state stays 1. (The plan 2026-11-11-codex-substitute-reviewer called this "3"; main had already used 3 for the deferral.)
+// Version 5: an arbiter ruling or Fable finding carries `final.outOfModel` (a FOLLOW-UP ruled outside a review.threat_models model: an older installation would not hold the
+// review back until its issue is filed). Version 6: a final carries `postMax` (an ACCEPT turned into a FOLLOW-UP past review.max_rounds, #374 PR B): a pipeline of version 5 has no filing gate for it.
+// Version 7: a final carries `ownerDeferral` (an arbiter / judge ACCEPT the owner deferred to a follow-up, #559): a pipeline of version 6 would not hold the review back until its issue is filed,
+// and would quarantine the owner's step on `state show`.
+// Version 8 (round discipline 2, PR B): a round's `ownerGrant` carries `askVariant` (the owner's grant came from a click on a new-variant round dialog): an older pipeline cannot re-verify such a grant (it does
+// not know the variant), so it must refuse the state loudly instead of misreading it.
+// A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
+export const SUPPORTED_STATE_VERSION = 8;
+export const STATE_VERSION_CLAUDE = 2;
+export const STATE_VERSION_DEFERRAL = 3;
+export const STATE_VERSION_SUBSTITUTE = 4;
+export const STATE_VERSION_OUT_OF_MODEL = 5;
+export const STATE_VERSION_POST_MAX = 6;
+export const STATE_VERSION_OWNER_DEFERRAL = 7;
+// Does any final of the state carry the owner-deferral mark (the original and a cached copy alike)? Then the writer lifts the state to STATE_VERSION_OWNER_DEFERRAL (and only then).
+export const stateNeedsOwnerDeferralVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => isPlainObject(i?.final?.ownerDeferral)));
+export const STATE_VERSION_CLICK_DIALOG = 8;
+// Does any round's owner grant carry the click-dialog variant marker? Then the writer lifts the state to STATE_VERSION_CLICK_DIALOG (and only then: legacy-click and typed grants keep their version).
+export const stateNeedsClickDialogVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => typeof r?.ownerGrant?.askVariant === 'string');
+// Does any final of the state carry the post-max marker? Then the writer lifts the state to STATE_VERSION_POST_MAX (and only then: a plain state keeps its version and round-trips unchanged).
+export const stateNeedsPostMaxVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => isPlainObject(i?.final?.postMax)));
+// Does any final of the state carry the out-of-model marker? Then the writer lifts the state to STATE_VERSION_OUT_OF_MODEL (and only then: ordinary PRs stay readable by old CLIs).
+export const stateNeedsOutOfModelVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => typeof i?.final?.outOfModel === 'string' && i.final.outOfModel !== ''));
+// The state at (at least) `version`: a writer never lowers the version a state already carries.
+export const withStateVersion = (state, version) => ({ ...state, version: Math.max(Number.isFinite(state?.version) ? state.version : 1, version) });
 const newerThanSupported = (state) => Number.isFinite(state.version) && state.version > SUPPORTED_STATE_VERSION;
 
 const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// ---- substitute rounds and the sticky risk --------------------------------------------------------------------------------------------------
+// A round reviewed first by the substitute (Claude) instead of Codex.
+export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute' || isPlainObject(round?.substitute);
+// Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
+export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
+const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
+// The lowest version that may hold this state, the HIGHEST any feature in it needs: 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
+// 4 when it holds a substitute round / second review or a governor / budget decision, else 1.
+export function requiredStateVersion(state) {
+  if (stateNeedsClickDialogVersion(state)) return STATE_VERSION_CLICK_DIALOG;
+  if (stateNeedsOwnerDeferralVersion(state)) return STATE_VERSION_OWNER_DEFERRAL;
+  if (stateNeedsPostMaxVersion(state)) return STATE_VERSION_POST_MAX;
+  if (stateNeedsOutOfModelVersion(state)) return STATE_VERSION_OUT_OF_MODEL;
+  const rounds = Array.isArray(state?.rounds) ? state.rounds : [];
+  const needs = rounds.some((r) => isSubstituteRound(r) || isPlainObject(r?.governor) || isPlainObject(r?.budget) || (Array.isArray(r?.items) && r.items.some(isSubstituteSecondReview)));
+  return needs ? STATE_VERSION_SUBSTITUTE : 1;
+}
+const withRequiredVersion = (state) => {
+  const need = requiredStateVersion(state);
+  return need > 1 ? withStateVersion(state, need) : state;
+};
+
+export const RISK_LEVELS = Object.freeze(['low', 'medium', 'high']);
+const isRisk = (v) => RISK_LEVELS.includes(v);
+export const higherRisk = (a, b) => (RISK_LEVELS.indexOf(b) > RISK_LEVELS.indexOf(a) ? b : a);
+// The highest risk the PR ever had (it only goes up, so a shrinking diff never brings the cheaper reviewer back). `state.risk` is overwritten each round
+// and shown as-is; agent choice and every gate use this. A state from before `maxRisk` existed starts it from state.risk and every round's recorded
+// risk, and from 'high' when none of them is readable (fail toward the stronger reviewer).
+export function maxRiskOf(state) {
+  const known = [state?.maxRisk, state?.risk, ...(Array.isArray(state?.rounds) ? state.rounds.map((r) => r?.risk) : [])].filter(isRisk);
+  return known.length === 0 ? 'high' : known.reduce(higherRisk);
+}
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
 export function emptyState({ repo, pr, branch, risk, lightLane = false, maxRounds = 3 }) {
@@ -109,7 +169,7 @@ export function saveState(dir, state, { rename = renameSync, sleep = sleepSync }
   const file = stateFile(dir);
   const tmp = `${file}.${process.pid}.${randomBytes(4).toString('hex')}.tmp`;
   try {
-    const data = `${JSON.stringify(state, null, 2)}\n`;
+    const data = `${JSON.stringify(withRequiredVersion(state), null, 2)}\n`;
     const fd = openSync(tmp, 'w');
     try {
       writeSync(fd, data);
@@ -126,7 +186,7 @@ export function saveState(dir, state, { rename = renameSync, sleep = sleepSync }
 
 // base64 never contains "--", so the payload cannot terminate the HTML comment early.
 export function encodeForComment(state) {
-  return `<!-- claude-pipeline:state:${gzipSync(Buffer.from(JSON.stringify(state))).toString('base64')} -->`;
+  return `<!-- claude-pipeline:state:${gzipSync(Buffer.from(JSON.stringify(withRequiredVersion(state)))).toString('base64')} -->`;
 }
 
 // Bad data of any kind yields null, never an exception: resume must fall back to a fresh review,
@@ -164,19 +224,47 @@ export function decodeFromComment(body) {
 // confirmFixed: the ids of accepted items marked implemented through other files (item.implementedVia 'other-files') that this round's prompt
 // asked Codex to confirm; recorded only when there are some, so an ordinary round is unchanged. review-complete needs every such item to appear
 // in the confirmFixed of a LATER round (triage.mjs#reviewEligibilityProblems).
+// firstReviewer: 'substitute' when the Claude stand-in reviewed the round instead of Codex; substitute: { agent, models, reason, resetAt, outageAt, proof ... }
+// (no codexModel then). wholePr: the round reviewed the whole PR (reviewBase is its merge base), patchSha256: sha256 of the patch it reviewed. risk: this round's
+// risk assessment (the state's maxRisk is the highest of them). governor / budget: the Codex-spend decision that sent the round to the substitute, or (governor)
+// that lowered a Codex round's effort. effort: the effort a Codex round ran at.
+// Any of substitute / governor / budget makes the saved state version 4 (STATE_VERSION_SUBSTITUTE).
+// resolutionIneligible: the short code (history-nonmerge, extra-files, ...) of why a conflict resolution was tried and refused, so the round reviewed the whole PR (a counted
+// round); telemetry for `stats rounds` only. An older installation ignores an unknown round key (no per-round validation, rounds are copied as they are), so no version bump.
+// A round recorded before this field existed has none: stats reads a whole-PR round without it as `unknown`, never as "no failure".
+// escalated: true on a round that reviewed the whole PR because the judge lane now needs Fable (not because a conflict resolution was refused); stats then reads a whole-PR round with no
+// resolutionIneligible as no refusal. Telemetry only, no version bump (same reason as resolutionIneligible).
+// trustedConfigSha: the commit whose committed .claude/pipeline.yml is the TRUSTED config of this round (the default branch's fork point, risk.mjs#trustedBase), which
+// review.threat_models are read from; null = pinned as unavailable (no model applies). Absent only on a round written before it existed (arbiter needed then pins it once).
 export function addRound(state, {
   n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
+  firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort, trustedConfigSha, resolutionIneligible, escalated,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
   if (state.rounds.some((r) => r.n === n)) throw new Error(`round ${n} already exists in the review state`);
   const counted = baseOnly !== true && resolutionOnly !== true && fableRefresh !== true;
   const how = ownerGrant === undefined ? admission : 'owner';
-  return {
+  // maxRisk: what the state knew (legacy states: maxRiskOf, fail toward high) raised by this round; a brand-new state with no risk anywhere records none.
+  const seen = state.rounds.length > 0 || isRisk(state.maxRisk) || isRisk(state.risk) ? maxRiskOf(state) : undefined;
+  const maxRisk = [seen, risk].filter(isRisk).reduce((a, b) => higherRisk(a, b), undefined) ?? undefined;
+  return withRequiredVersion({
     ...state,
+    ...(maxRisk === undefined ? {} : { maxRisk }),
     rounds: [...state.rounds, {
       n, fromHead, toHead, ...(reviewBase === undefined ? {} : { reviewBase, reviewBaseKind }), contentHashAtToHead,
       ...(forkPoint === undefined ? {} : { forkPoint }), ...(codexModel === undefined ? {} : { codexModel }),
       ...(promptSha256 === undefined ? {} : { promptSha256 }),
+      ...(isRisk(risk) ? { risk } : {}),
+      ...(firstReviewer === undefined ? {} : { firstReviewer }),
+      ...(substitute === undefined ? {} : { substitute: structuredClone(substitute) }),
+      ...(wholePr === true ? { wholePr: true } : {}),
+      ...(patchSha256 === undefined ? {} : { patchSha256 }),
+      ...(typeof effort === 'string' ? { effort } : {}),
+      ...(governor === undefined ? {} : { governor: structuredClone(governor) }),
+      ...(budget === undefined ? {} : { budget: structuredClone(budget) }),
+      ...(trustedConfigSha === undefined ? {} : { trustedConfigSha }),
+      ...(typeof resolutionIneligible === 'string' && resolutionIneligible !== '' ? { resolutionIneligible } : {}),
+      ...(escalated === true ? { escalated: true } : {}),
       ...(baseOnly === true ? { baseOnly: true } : {}),
       ...(fableRefresh === true ? { fableRefresh: true } : {}),
       ...(Array.isArray(confirmFixed) && confirmFixed.length > 0 ? { confirmFixed: [...confirmFixed] } : {}),
@@ -192,7 +280,7 @@ export function addRound(state, {
       ...(fableRequired === true ? { fableRequired: true, fableReasons: [...(fableReasons ?? [])], sensitivePaths: [...(sensitivePaths ?? [])] } : {}),
       items: structuredClone(items),
     }],
-  };
+  });
 }
 
 // Replace items of round n by id and keep the rest, so a caller can pass either the whole
@@ -212,5 +300,5 @@ export function updateItems(state, n, items) {
     }
   }
   const rounds = state.rounds.map((r, i) => (i === at ? { ...r, items: merged } : r));
-  return { ...state, rounds };
+  return withRequiredVersion({ ...state, rounds });
 }

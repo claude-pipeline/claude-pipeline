@@ -1,13 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, utimesSync,
+  chmodSync, mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, realpathSync, utimesSync,
 } from 'node:fs';
+import fs from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
 import { tmpdir } from 'node:os';
-import { join, dirname } from 'node:path';
+import { join, dirname, sep } from 'node:path';
 import { spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
-import { startJob, waitJob, readJob, acquireStartLock } from '../pipeline/lib/jobs.mjs';
+import { startJob, waitJob, readJob, jobMayBeRunning, acquireStartLock } from '../pipeline/lib/jobs.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const jobsUrl = pathToFileURL(join(here, '..', 'pipeline', 'lib', 'jobs.mjs')).href;
@@ -102,6 +104,105 @@ test('the same name cannot start twice while running; after it finishes it resta
   assert.match(second.tail, /second-run/);
   assert.doesNotMatch(second.tail, /first-run/);
   assert.doesNotMatch(readFileSync(join(jobDirOf(cwd, 'dup'), 'log'), 'utf8'), /first-run/);
+});
+
+// R17-F1: clearOldJobDir deletes the old run's files one at a time (rmSync, in the filesystem's order). A reader holding run A must never find a half-deleted directory whose
+// meta.json still names A, so meta.json goes first. The delete leaves the same files whatever its order, so the order is what is observed: what is in the directory the moment
+// rmSync is first called on it or on a file in it (fs.rmSync is wrapped for the call, and the ESM bindings are synced).
+test('startJob moves the old run\'s meta.json aside before the recursive delete starts: a half-deleted directory never names run A', async (t) => {
+  const cwd = scratch(t);
+  start('half', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'half');
+  const seen = [];
+  const real = fs.rmSync;
+  fs.rmSync = (target, ...rest) => {
+    if (target === dir || String(target).startsWith(dir + sep)) seen.push({ meta: existsSync(join(dir, 'meta.json')), exit: existsSync(join(dir, 'exit.json')) });
+    return real(target, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.rmSync = real; syncBuiltinESMExports(); });
+  start('half', node("console.log('second-run')"), { cwd });
+  fs.rmSync = real;
+  syncBuiltinESMExports();
+  assert.deepEqual(seen[0], { meta: false, exit: true }, 'the old directory was cleared, meta.json first: it is gone before the first delete of anything in it');
+  assert.ok(seen.every((s) => s.meta === false), 'meta.json never came back');
+  assert.equal((await waitJob('half', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+});
+
+// R1-F1: an interrupted clear (killed between the rename and the delete, or the delete failed) leaves the tombstone and the old run's other files; the next start of the SAME job heals it.
+test('a leftover job directory holding only the tombstone (meta.cleared.json) and old files is cleared by the next start of that job', async (t) => {
+  const cwd = scratch(t);
+  start('healed', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('healed', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'healed');
+  fs.renameSync(join(dir, 'meta.json'), join(dir, 'meta.cleared.json'));
+  assert.equal(existsSync(join(dir, 'meta.json')), false);
+  assert.equal(readJob('healed', { cwd }).state, 'missing', 'a reader sees no job in the half-cleared directory');
+  start('healed', node("console.log('second-run')"), { cwd });
+  const r = await waitJob('healed', { cwd, timeoutMs: 20_000, ...FAST });
+  assert.equal(r.state, 'done');
+  assert.match(r.tail, /second-run/);
+  assert.doesNotMatch(r.tail, /first-run/);
+  assert.equal(existsSync(join(dir, 'meta.cleared.json')), false, 'the tombstone is gone');
+  // A tombstone naming another job is not ours: the directory is refused, not deleted.
+  start('other', node("console.log('x')"), { cwd });
+  await waitJob('other', { cwd, timeoutMs: 20_000, ...FAST });
+  const odir = jobDirOf(cwd, 'other');
+  fs.renameSync(join(odir, 'meta.json'), join(odir, 'meta.cleared.json'));
+  const meta = readJson(join(odir, 'meta.cleared.json'));
+  writeFileSync(join(odir, 'meta.cleared.json'), JSON.stringify({ ...meta, name: 'not-other' }));
+  assert.throws(() => start('other', node("console.log('y')"), { cwd }), /refusing to replace/);
+});
+
+// R2-B2: the tombstone must outlive every other file of the old run: a delete that fails part way (the real one removes entries in directory order) may not leave a directory with neither meta file.
+test('a clear whose delete fails on another file keeps the tombstone; the next start of that job heals it', async (t) => {
+  const cwd = scratch(t);
+  start('partial', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('partial', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const dir = jobDirOf(cwd, 'partial');
+  const tomb = join(dir, 'meta.cleared.json');
+  const real = fs.rmSync;
+  // Fails on any file of the old run except the tombstone; a recursive delete of the whole directory removes the tombstone first (its worst directory order), then fails.
+  fs.rmSync = (target, ...rest) => {
+    if (target === dir) { real(tomb, { force: true }); throw new Error('simulated delete failure'); }
+    if (typeof target === 'string' && target.startsWith(dir + sep) && target !== tomb) throw new Error('simulated delete failure');
+    return real(target, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.rmSync = real; syncBuiltinESMExports(); });
+  assert.throws(() => start('partial', node("console.log('second-run')"), { cwd }), /simulated delete failure/);
+  fs.rmSync = real;
+  syncBuiltinESMExports();
+  assert.equal(existsSync(tomb), true, 'the tombstone is still there');
+  assert.equal(existsSync(join(dir, 'meta.json')), false);
+  start('partial', node("console.log('second-run')"), { cwd });
+  const r = await waitJob('partial', { cwd, timeoutMs: 20_000, ...FAST });
+  assert.equal(r.state, 'done');
+  assert.match(r.tail, /second-run/);
+  assert.doesNotMatch(r.tail, /first-run/);
+  assert.equal(existsSync(tomb), false, 'the tombstone is gone');
+});
+
+// #537: Node ignores maxRetries without recursive, so the tombstone delete must pass both to survive a transient Windows EBUSY/EPERM like its neighbours.
+test('the tombstone delete retries like the other deletes of the clear (recursive + maxRetries)', async (t) => {
+  const cwd = scratch(t);
+  start('retry', node("console.log('first-run')"), { cwd });
+  assert.equal((await waitJob('retry', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
+  const tomb = join(jobDirOf(cwd, 'retry'), 'meta.cleared.json');
+  const opts = [];
+  const real = fs.rmSync;
+  fs.rmSync = (target, ...rest) => {
+    if (target === tomb) opts.push(rest[0]);
+    return real(target, ...rest);
+  };
+  syncBuiltinESMExports();
+  t.after(() => { fs.rmSync = real; syncBuiltinESMExports(); });
+  start('retry', node("console.log('second-run')"), { cwd });
+  fs.rmSync = real;
+  syncBuiltinESMExports();
+  assert.deepEqual(opts, [{ recursive: true, force: true, maxRetries: 3 }]);
+  assert.equal((await waitJob('retry', { cwd, timeoutMs: 20_000, ...FAST })).state, 'done');
 });
 
 test('a policy refusal throws and starts nothing', async (t) => {
@@ -689,4 +790,105 @@ test('tail edge cases: no trailing newline, empty log, no log', (t) => {
   assert.equal(readJob('nonl', { cwd }).tail, 'a\nb');
   assert.equal(readJob('empty', { cwd }).tail, '');
   assert.equal(readJob('nolog', { cwd }).tail, '');
+});
+
+// R2-B1: jobMayBeRunning fails closed on a meta.json that readJob reads as 'missing'.
+test('jobMayBeRunning: a running job is live; corrupt or unreadable meta.json is live unless exit.json is readable; no meta.json is not a job', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  assert.equal(jobMayBeRunning('j', { cwd }).running, false, 'an empty folder');
+  assert.equal(jobMayBeRunning('never', { cwd }).running, false, 'no folder');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid }));
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'readable record, live runner');
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
+  assert.equal(jobMayBeRunning('j', { cwd }).running, false, 'finished');
+  rmSync(join(dir, 'exit.json'));
+  writeFileSync(join(dir, 'meta.json'), '{ nope');
+  assert.deepEqual(readJob('j', { cwd }), { state: 'missing' }, 'readJob keeps its behaviour');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'corrupt meta.json');
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 0, finishedAt: new Date().toISOString() }));
+  assert.equal(jobMayBeRunning('j', { cwd }).running, false, 'corrupt meta.json, readable exit.json');
+  assert.throws(() => jobMayBeRunning('bad name!', { cwd }), /invalid job name/);
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    rmSync(join(dir, 'exit.json'));
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid }));
+    chmodSync(join(dir, 'meta.json'), 0o000);
+    try { assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'unreadable meta.json'); } finally { chmodSync(join(dir, 'meta.json'), 0o600); }
+  }
+});
+
+// R3-B1: jobMayBeRunning validates the SHAPE of both records: valid JSON that is not a record ({} / [] / 1) is as unusable as a corrupt file.
+const deadRunnerPid = () => spawnSync(process.execPath, ['-e', '']).pid; // a process that has run and exited
+const goodMeta = (extra = {}) => JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: process.pid, ...extra });
+
+test('R3-B1: a meta.json that is valid JSON but not a record (or lacks runnerPid and startedAt) may be running, and says why', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  for (const body of ['{}', '[]', '1', '"x"', 'true', JSON.stringify({ name: 'j', startedAt: 'not a date' }), JSON.stringify({ name: 'j', startedAt: 1 })]) {
+    writeFileSync(join(dir, 'meta.json'), body);
+    const r = jobMayBeRunning('j', { cwd });
+    assert.equal(r.running, true, `meta.json ${body}`);
+    assert.equal(r.why, 'meta.json', `meta.json ${body}`);
+  }
+});
+
+// R4-F2: a runnerPid counts only as a positive 32-bit integer; null / absent counts only with a parseable startedAt. Anything else is an unusable record.
+test('R4-F2: a meta.json whose runnerPid has the wrong type or range is unusable (running, why meta.json) even with an old, parseable startedAt', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  const old = new Date(Date.now() - 3600_000).toISOString();
+  for (const pid of ['4242', 1.5, -7, 0, 1099511627776, 2147483648, true, [], {}]) {
+    writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: old, runnerPid: pid }));
+    assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true, why: 'meta.json' }, `runnerPid ${JSON.stringify(pid)}`);
+  }
+});
+
+test('R4-F2: a valid positive dead runnerPid is still not running; a null / absent runnerPid is judged by startedAt as before', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  const old = new Date(Date.now() - 3600_000).toISOString();
+  writeFileSync(join(dir, 'meta.json'), goodMeta({ runnerPid: deadRunnerPid(), startedAt: old }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'valid dead pid');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: old, runnerPid: null }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'null runnerPid, old startedAt: past the grace period');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: old }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'absent runnerPid, old startedAt');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: new Date().toISOString(), runnerPid: null }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true }, 'null runnerPid, started a moment ago: inside the grace period');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', runId: 'r', startedAt: 'never', runnerPid: null }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true, why: 'meta.json' }, 'null runnerPid, unparseable startedAt');
+});
+
+test('R3-B1: an exit.json that is not a record with a parseable finishedAt does not prove the job finished', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'meta.json'), goodMeta({ runnerPid: deadRunnerPid() }));
+  for (const body of ['{}', '[]', '1', 'null', '{ nope', JSON.stringify({ code: 0 }), JSON.stringify({ code: 0, finishedAt: 'never' })]) {
+    writeFileSync(join(dir, 'exit.json'), body);
+    const r = jobMayBeRunning('j', { cwd });
+    assert.equal(r.running, true, `exit.json ${body} (runner dead)`);
+    assert.equal(r.why, 'exit.json', `exit.json ${body}`);
+  }
+  writeFileSync(join(dir, 'meta.json'), '{}');
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'malformed meta and malformed exit');
+});
+
+test('R3-B1: well-formed records keep their meaning: a dead runner is not running, a well-formed exit.json is done, a live runner is running', (t) => {
+  const cwd = scratch(t);
+  const dir = jobDirOf(cwd, 'j');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'meta.json'), goodMeta({ runnerPid: deadRunnerPid() }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'well-formed meta, dead runner');
+  writeFileSync(join(dir, 'exit.json'), JSON.stringify({ code: 1, finishedAt: new Date().toISOString() }));
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: false }, 'well-formed exit');
+  rmSync(join(dir, 'exit.json'));
+  writeFileSync(join(dir, 'meta.json'), goodMeta());
+  assert.deepEqual(jobMayBeRunning('j', { cwd }), { running: true }, 'live runner');
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ name: 'j', startedAt: new Date().toISOString() }));
+  assert.equal(jobMayBeRunning('j', { cwd }).running, true, 'no runnerPid, started a moment ago: inside the grace period');
 });

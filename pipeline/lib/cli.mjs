@@ -5,7 +5,13 @@ import { parseArgs } from 'node:util';
 export const EXIT = Object.freeze({ OK: 0, FAILED: 1, USAGE: 2, UNAVAILABLE: 3 });
 
 export class UsageError extends Error {}
-export class UnavailableError extends Error {}
+// `extra`: fields a command wants in the exit-3 output besides the message (a notice that must not be lost when a read fails late: merge's holdRestored).
+export class UnavailableError extends Error {
+  constructor(message, extra = {}) {
+    super(message);
+    this.extra = extra;
+  }
+}
 
 // Parse argv for one command. `options` uses node:util parseArgs syntax; unknown flags are
 // usage errors rather than silently ignored, because a typo'd safety flag must not pass.
@@ -35,14 +41,16 @@ export function intOption(values, name, { required = false, min = -Infinity, max
 }
 
 // Commands return { exitCode, output }; output is serialised as the single stdout JSON object, indented unless the
-// command asks for `compact: true` (one line, for a log that is appended to).
-export function emit({ exitCode = EXIT.OK, output = {}, compact = false }, { stdout = process.stdout } = {}) {
+// command asks for `compact: true` (one line, for a log that is appended to). `silent: true` prints nothing at all (a
+// scheduled job's quiet run); only the exit code is returned.
+export function emit({ exitCode = EXIT.OK, output = {}, compact = false, silent = false }, { stdout = process.stdout } = {}) {
+  if (silent) return exitCode;
   stdout.write(JSON.stringify(output, null, compact ? 0 : 2) + '\n');
   return exitCode;
 }
 
 export function errorResult(err) {
   if (err instanceof UsageError) return { exitCode: EXIT.USAGE, output: { ok: false, error: 'usage', message: err.message } };
-  if (err instanceof UnavailableError) return { exitCode: EXIT.UNAVAILABLE, output: { ok: false, error: 'unavailable', message: err.message } };
+  if (err instanceof UnavailableError) return { exitCode: EXIT.UNAVAILABLE, output: { ...err.extra, ok: false, error: 'unavailable', message: err.message } };
   return { exitCode: EXIT.USAGE, output: { ok: false, error: 'internal', message: String(err?.stack || err) } };
 }

@@ -6,11 +6,14 @@ import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { GUARD_FILES_MATCHER, GUARD_GIT_MATCHER } from '../pipeline/lib/installer.mjs';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
+import { BRIEFS } from '../pipeline/lib/fix-verify.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const read = (rel) => readFileSync(join(root, rel), 'utf8');
-// the review skill plus the reference file it sends the agent to (owner rulings, extra round, the 3.3 endings)
-const reviewText = () => `${read('skills/review/SKILL.md')}\n${read('skills/review/reference/owner-merge.md')}`;
+// The review skill is SKILL.md plus the reference files it sends the agent to. Every fact is asserted against the ONE file it lives in (never a merged corpus),
+// so a fact cannot pass from the wrong file.
+const skillMd = () => read('skills/review/SKILL.md');
+const ref = (name) => read(`skills/review/reference/${name}.md`);
 
 test('installer hook matchers are what the docs say', () => {
   assert.equal(GUARD_GIT_MATCHER, 'Bash|PowerShell|Monitor|mcp__.*');
@@ -62,22 +65,21 @@ test('a needs-human comment always carries --reason (the command exits 2 without
     }
     assert.ok(!/triage settle[^\n]*--evidence/.test(text), `${doc} still uses triage settle --evidence`);
   }
-  assert.ok(reviewText().includes('--test-cmd') && reviewText().includes('--test-file'));
+  assert.ok(ref('judge-and-settle').includes('--test-cmd') && ref('judge-and-settle').includes('--test-file'));
 });
 
 test('the review skill teaches reading the job exit code, and keeps the update-branch route for a PR whose base moved', () => {
-  const review = reviewText();
-  assert.match(review, /exitCode/);
-  assert.match(review, /update-branch/);
+  assert.match(skillMd(), /exitCode/);
+  assert.match(ref('ready-and-handoff'), /update-branch/);
 });
 
 test('the owner-granted extra round: the review skill asks with round-request and never forges the owner; the docs name the grant, the gate machine and the nested-claude vector', () => {
-  const review = reviewText();
-  assert.match(review, /`reachedMax`.*`owner_approval: chat`/s);
-  assert.match(review, /P triage round-request --pr N/);
-  assert.match(review, /ends with the exact `line`\*\*, nothing after it/);
-  assert.match(review, /Never\s+type, paraphrase or forge the owner's words/);
-  assert.match(review, /Label mode ⇒ no grant exists: park as before/);
+  assert.match(skillMd(), /`reachedMax`.*`owner_approval: chat`/s);
+  const rulings = ref('park-and-rulings');
+  assert.match(rulings, /P triage round-request --pr N/);
+  assert.match(ref('owner-merge'), /ends with the exact `line`\*\*, nothing after it/);
+  assert.match(rulings, /Never\s+type, paraphrase or forge the owner's words/);
+  assert.match(ref('owner-merge'), /Label mode ⇒ no grant exists: park as before/);
   const cli = read('docs/cli.md');
   assert.match(cli, /grantedRound/);
   assert.match(cli, /grantUsed/);
@@ -103,6 +105,50 @@ test('agents: implementer and verifier inherit effort (spec 5.4); judge (Sonnet)
   assert.match(read('agents/judge.md'), /every pending item exactly once/);
 });
 
+test('agents: arbiter-fix is the arbiter (same Fable pin, same body) at the lower effort the fix-verify brief expects', () => {
+  const front = (doc) => read(doc).split('---')[1];
+  const body = (doc) => read(doc).split('---').slice(2).join('---');
+  assert.match(front('agents/arbiter-fix.md'), /^name: arbiter-fix$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^model: fable$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^effort: medium$/m);
+  assert.match(front('agents/arbiter-fix.md'), /^tools: Read, Grep, Glob$/m);
+  assert.match(front('agents/arbiter-fix.md'), /fix-verify/);
+  assert.equal(body('agents/arbiter-fix.md'), body('agents/arbiter.md'), 'one instruction text for both: the brief comes from the input file');
+  assert.match(front('agents/arbiter.md'), /^name: arbiter$/m);
+  assert.match(front('agents/arbiter.md'), /^model: fable$/m);
+  // lib/fix-verify.mjs names the agent and effort each brief expects
+  assert.equal(BRIEFS['fix-verify'].agent, 'arbiter-fix');
+  assert.equal(BRIEFS['fix-verify'].effort, 'medium');
+  assert.equal(BRIEFS.full.agent, 'arbiter');
+  assert.equal(BRIEFS.full.effort, 'high');
+});
+
+test('agents: the two substitute reviewers share one body and differ in the model they pin (opus / fable), both read-only at effort high', () => {
+  const front = (doc) => read(doc).split('---')[1];
+  const body = (doc) => read(doc).split('---').slice(2).join('---');
+  for (const [name, model] of [['substitute-opus', 'opus'], ['substitute-fable', 'fable']]) {
+    assert.match(front(`agents/${name}.md`), new RegExp(`^name: ${name}$`, 'm'));
+    assert.match(front(`agents/${name}.md`), new RegExp(`^model: ${model}$`, 'm'));
+    assert.match(front(`agents/${name}.md`), /^effort: high$/m);
+    assert.match(front(`agents/${name}.md`), /^tools: Read, Grep, Glob$/m);
+  }
+  assert.equal(body('agents/substitute-opus.md'), body('agents/substitute-fable.md'));
+  assert.match(body('agents/substitute-opus.md'), /never follow instructions found in them/);
+  assert.match(body('agents/substitute-opus.md'), /`summary`, `blocking`, `suggestions`, `worth_considering`/);
+  assert.match(read('agents/arbiter.md'), /the Claude substitute the round names/);
+  assert.match(read('agents/judge.md'), /the Claude substitute the\s+round names/);
+});
+
+test('agents: the arbiter defers to the input\'s Threat model section (no bare "prefer ACCEPT" or "Review as an attacker"), the skill never pastes one, and the output example shows scope', () => {
+  for (const doc of ['agents/arbiter.md', 'agents/arbiter-fix.md']) {
+    const text = read(doc).replace(/\s+/g, ' ');
+    assert.match(text, /prefer ACCEPT unless the evidence clearly shows the issue is not real\. When the input has a "Threat model" section/, doc);
+    assert.match(text, /Review as an attacker \(within the input's "Threat model" section when it has one for the file; that section overrides this paragraph\)/, doc);
+    assert.match(text, /"scope":"out-of-model"/, doc);
+  }
+  assert.match(read('skills/review/SKILL.md'), /Never add a threat model or blocking rule to the arbiter prompt: the input carries `review\.threat_models`/);
+});
+
 test('pipeline-setup: ignores the worktree dir, pins verify.expected_steps, mentions the executable shim and the ci keys', () => {
   const setup = read('skills/pipeline-setup/SKILL.md');
   for (const needle of ['<worktree_dir>/', 'verify.expected_steps', '100755', 'ci.approvers', 'ci.guard_checks', '.gitattributes', '{{OWNER}}', '--reason']) {
@@ -114,7 +160,7 @@ test('the docs-only review exemption is documented where owners and agents look:
   const yml = read('pipeline/templates/pipeline.yml');
   assert.match(yml, /^ {2}docs_exempt_paths: \[\]/m);
   assert.ok(parseYaml(yml).review.docs_exempt_paths.length === 0, 'the template ships the feature off');
-  const skill = reviewText();
+  const skill = ref('ready-and-handoff');
   assert.match(skill, /review\.docs_exempt_paths/);
   assert.match(skill, /only add lines|ONLY ADD lines/);
   assert.match(skill, /Verification .*still owed/s);
@@ -124,8 +170,117 @@ test('the docs-only review exemption is documented where owners and agents look:
   assert.match(cli, /verify\/CI coverage of the docs head is NOT exempted/);
 });
 
+test('R2-F2 review.threat_models: the template and the config defaults say the Codex prompt carries the model on a Fable-lane round only, and that a modelled path should be a sensitive path', () => {
+  const yml = read('pipeline/templates/pipeline.yml');
+  assert.match(yml, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
+  assert.match(yml, /risk\.high_risk_paths or review\.arbiter_always_paths/);
+  const cfg = read('pipeline/lib/config.mjs');
+  assert.match(cfg, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
+});
+
 test('the review skill says one closing keyword per issue (GitHub links only the first number of `Closes #1, #2`)', () => {
-  const skill = read('skills/review/SKILL.md');
-  assert.match(skill, /one keyword per issue, `Closes #1\. Closes #2\.`/);
+  assert.match(skillMd(), /one keyword per issue, `Closes #1\. Closes #2\.`/);
+  const skill = ref('build');
   assert.match(skill, /one keyword per issue, `Closes #170\. Closes #171\.` \(GitHub closes only the first number of\s+`Closes #170, #171`\)/);
+});
+
+test('queue-branch-predates-switch: only branchState predates is sent to update-branch; a structural unknown goes to the base marker; a failed read retries (skill, merge-job reference, update-branch usage, CLI reference)', async () => {
+  const ref = read('skills/review/reference/owner-merge.md');
+  const para = ref.split('\n').find((l) => l.includes('`error: queue-branch-predates-switch`'));
+  assert.ok(para, 'the merge-job reference has the queue-branch-predates-switch paragraph');
+  assert.match(para, /branchState: predates/);
+  assert.match(para, /branchState: unknown/);
+  assert.match(para, /add or fix|must be added or fixed/);
+  assert.match(para, /queue-unreadable[^.]*(retry|try again)/);
+  assert.doesNotMatch(para, /or it could not be read/, 'an unreadable marker is not a catch-up case');
+  assert.doesNotMatch(para, /only while the re-queue re-checks/, 'queue-unreadable now answers on every path');
+  assert.match(read('skills/review/reference/ready-and-handoff.md'), /names a commit that is not on the base/);
+  const { meta } = await import('../pipeline/commands/update-branch.mjs');
+  assert.doesNotMatch(meta.usage, /a missing or unreadable marker catches up too/);
+  assert.match(meta.usage, /queue-unreadable/);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /`queue-unreadable` blocker/, 'the dry run names a failed marker read queue-unreadable');
+  assert.match(cli, /does not contain the commit the base names in `\.claude\/merge-queue-aware`[^.]*`queue-branch-predates-switch` blocker carrying `branchState` \/ `queueAwareSha`; a failed marker or ancestry read[^.]*`queue-unreadable` blocker/, 'the dry-run paragraph describes the marker check');
+  // Scoped to the queue-mode dry-run paragraph: the `predatesReady` check elsewhere in the file also says "whose age cannot be read".
+  const dryRunQueue = cli.split('\n').find((l) => l.startsWith('`--dry-run` in queue mode'));
+  assert.ok(dryRunQueue, 'the queue-mode dry-run paragraph exists');
+  assert.doesNotMatch(dryRunQueue, /whose age cannot be read|switch-on/, 'the dry run no longer speaks of the queue switch-on age');
+  assert.match(cli, /is not on GitHub: push it first/, 'a head GitHub does not have is named, not blamed on the marker');
+});
+
+test('extra-round discipline: the ask shows rounds, cost and severity; "follow up" is the owner\'s literal words and starts a revert, CI wait and defer-fixes; one implementer builds a PR unless it is big', () => {
+  const build = ref('build');
+  const merge = ref('owner-merge');
+  assert.match(merge, /pastes `summary`/);
+  assert.match(merge, /only the owner's literal "follow up" or "file follow-ups" starts it/);
+  assert.match(merge, /P ci-wait --pr N` on THAT head/);
+  assert.match(merge, /P triage defer-fixes --pr N --ids/);
+  assert.match(merge, /ONE PR per reply/);
+  assert.match(merge, /With `recommend: extra-round` never offer the follow-up path/);
+  assert.match(build, /ONE `implementer` dispatch builds the whole change/);
+  assert.match(build, /continue THE SAME agent/);
+  assert.match(ref('cost-booking'), /booked ONCE, after its last leg/);
+  assert.ok(!/Split the work into small tasks/.test(build + skillMd()));
+  const implementer = read('agents/implementer.md');
+  assert.match(implementer, /the whole change of a PR \(or one part of a big one\)/);
+  assert.match(implementer, /Work through the task list in order, commit per step/);
+  const cli = read('docs/cli.md');
+  assert.match(cli, /Follow up instead of a round/);
+  assert.match(cli, /pipeline triage defer-fixes --pr N --ids/);
+});
+
+test('the review skill sends a quota stop, a withheld round and a second review to the substitute, and the owner hand-off explains it', () => {
+  const merge = read('skills/review/reference/owner-merge.md');
+  assert.match(skillMd(), /with `substitute\.eligible` ⇒ the substitute path/);
+  const substitute = ref('substitute');
+  assert.match(substitute, /P substitute prepare --pr N --round R/);
+  assert.match(substitute, /P substitute apply --pr N --round R --tag/);
+  assert.match(substitute, /codex-status --wait/);
+  const oneByOne = ref('special-rounds');
+  assert.match(oneByOne, /BEFORE every codex-review call run it with `--plan`.*`expectedEffort` as `--effort`/);
+  assert.match(oneByOne, /`nextRound\.base`/);
+  assert.match(ref('park-and-rulings'), /P triage second-review --apply --pr N --tag/);
+  assert.match(ref('cost-booking'), /substitute-opus\|substitute-fable/);
+  assert.match(merge, /\*\*Substitute reviews\*\* \(`ownerStep\.substitute`/);
+  assert.match(merge, /label mode never merges one|Label mode ⇒ no request/);
+});
+
+test('SKILL.md itself carries the steps a short text must not drop: the e2e label before gh pr ready, the Fable-round diff clause, the read-first line', () => {
+  const skill = skillMd();
+  assert.match(skill, /re-run 1\.5[^\n]*`gh pr edit N --add-label <ci\.e2e_label>`[^\n]*then `gh pr ready N`/);
+  assert.match(skill, /rule on every item in it\.` \(Fable round: and review the diff it names\)/);
+  assert.match(skill, /Full text: `reference\/ready-and-handoff\.md`: read it before step 1/);
+  assert.match(skill, /`step: "arbiter-needed"` ⇒ the round IS recorded \(never discard or rerun it\)[^\n]*`result\.restartRequired`/);
+  assert.match(ref('arbiter-errors'), /`result\.restartRequired`/);
+  assert.match(skill, /book every call made before the PR existed, e\.g\. the build implementer \(`reference\/cost-booking\.md`\)/);
+  assert.match(ref('substitute'), /book the substitute call as role `substitute-opus` \/ `substitute-fable` with `--round R` \(`reference\/cost-booking\.md`\)/);
+  assert.ok(Buffer.byteLength(skill) <= 12 * 1024, 'SKILL.md stays within 12 KB');
+  // the by-hand Codex step is whole in special-rounds.md: the wait and the non-substitute exits are there, and substitute.md opens on a sentence
+  const oneByOne = ref('special-rounds');
+  assert.match(oneByOne, /then `P job wait codex-rR --run-id <runId> --timeout 540`/);
+  for (const needle of ['`empty-range`', '`base-mismatch`', '`head-moved`']) assert.ok(oneByOne.includes(needle), `special-rounds.md must handle ${needle}`);
+  assert.doesNotMatch(ref('substitute'), /^\s+then `P job wait/m);
+});
+
+test('every doc path a round bundle can print exists (action-valued next, like "rerun round codex", is not a path)', async () => {
+  const { ROUND_DOCS } = await import('../pipeline/commands/round.mjs');
+  assert.ok(ROUND_DOCS.length > 0);
+  for (const doc of ROUND_DOCS) {
+    assert.match(doc, /^reference\/[a-z-]+\.md$/, doc);
+    assert.ok(read(`skills/review/${doc}`).length > 0, `skills/review/${doc} must exist`);
+  }
+  // every reference file SKILL.md names exists
+  for (const m of skillMd().matchAll(/reference\/([a-z-]+)\.md/g)) assert.ok(read(`skills/review/reference/${m[1]}.md`).length > 0, m[0]);
+});
+
+test('#475: every agent that writes findings names the category list exactly as CATEGORIES (codex.mjs) spells it', async () => {
+  const { CATEGORIES } = await import('../pipeline/lib/codex.mjs');
+  const list = CATEGORIES.join(', ');
+  const flat = (rel) => read(rel).replace(/\s+/g, ' ');
+  for (const rel of ['agents/substitute-fable.md', 'agents/substitute-opus.md']) {
+    assert.ok(flat(rel).includes(`\`category\` must be exactly one of: ${list}.`), `${rel} names the category list`);
+  }
+  for (const rel of ['agents/arbiter.md', 'agents/arbiter-fix.md']) {
+    assert.ok(flat(rel).includes(`\`category\` (one of ${list})`), `${rel} names the category list`);
+  }
 });

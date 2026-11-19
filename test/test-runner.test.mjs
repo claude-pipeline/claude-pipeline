@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -231,4 +231,101 @@ test('scripts/shard-weights.mjs: no run id, or a non-numeric one, is a usage err
     assert.match(r.stderr, /usage/);
   }
   assert.equal(readFileSync(file, 'utf8'), before);
+});
+
+// ---- name selection ------------------------------------------------------------------------------------------------
+// The quick check lists `cli.test.mjs`: an argument ending in .test.mjs names exactly one file (a substring `cli` would
+// also pick every *-cli test), other arguments stay substring filters.
+
+const pool = ['cli.test.mjs', 'ci-wait-cli.test.mjs', 'cli-review.test.mjs', 'config.test.mjs', 'docs-facts.test.mjs'];
+
+test('selectTestFiles: an argument ending in .test.mjs selects exactly that file, not the files that contain it', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['cli.test.mjs']), { names: ['cli.test.mjs'], missing: [] });
+  assert.deepEqual(selectTestFiles(pool, ['ci-wait-cli.test.mjs']).names, ['ci-wait-cli.test.mjs']);
+});
+
+test('selectTestFiles: other arguments keep the substring match, and exact and substring arguments combine', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['cli']).names, ['cli.test.mjs', 'ci-wait-cli.test.mjs', 'cli-review.test.mjs']);
+  assert.deepEqual(selectTestFiles(pool, ['config', 'cli.test.mjs']).names, ['cli.test.mjs', 'config.test.mjs']);
+  assert.deepEqual(selectTestFiles(pool, []).names, pool);
+});
+
+test('selectTestFiles: an exact .test.mjs argument that names no file is reported as missing', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['config', 'clii.test.mjs']), { names: ['config.test.mjs'], missing: ['clii.test.mjs'] });
+  // a .test.mjs argument is never a substring: `ci.test.mjs` does not match ci-wait-cli.test.mjs
+  assert.deepEqual(selectTestFiles(pool, ['ci.test.mjs']), { names: [], missing: ['ci.test.mjs'] });
+});
+
+test('selectTestFiles: a substring argument that matches no file is reported as missing; a matching one is not', async () => {
+  const { selectTestFiles } = await import('../scripts/lib/select-tests.mjs');
+  assert.deepEqual(selectTestFiles(pool, ['config', 'no-such-substring']), { names: ['config.test.mjs'], missing: ['no-such-substring'] });
+  assert.deepEqual(selectTestFiles(pool, ['config', 'docs']), { names: ['config.test.mjs', 'docs-facts.test.mjs'], missing: [] });
+  // both kinds at once, in argument order
+  assert.deepEqual(selectTestFiles(pool, ['nope', 'clii.test.mjs']).missing, ['nope', 'clii.test.mjs']);
+});
+
+test('scripts/test.mjs: an unknown exact .test.mjs name is exit 2 naming it, even when other arguments match', () => {
+  for (const argv of [['no-such-file.test.mjs'], ['test-runner', 'no-such-file.test.mjs']]) {
+    const r = spawnSync(process.execPath, [runner, ...argv], { encoding: 'utf8', env: nestedEnv() });
+    assert.equal(r.status, 2, `${argv}: exit ${r.status}, stderr ${r.stderr}`);
+    assert.match(r.stderr, /no-such-file\.test\.mjs \(exact file name\)/);
+    assert.doesNotMatch(r.stdout, /^# tests/m, 'no test ran');
+  }
+});
+
+test('scripts/test.mjs: a substring that matches nothing is exit 2 naming it, even when other arguments match', () => {
+  for (const [argv, label] of [
+    [['zzz-no-such-substring'], /zzz-no-such-substring \(substring filter\)/],
+    [['config.test.mjs', 'no-such-substring-xyz'], /no-such-substring-xyz \(substring filter\)/],
+  ]) {
+    const r = spawnSync(process.execPath, [runner, ...argv], { encoding: 'utf8', env: nestedEnv() });
+    assert.equal(r.status, 2, `${argv}: exit ${r.status}, stderr ${r.stderr}`);
+    assert.match(r.stderr, label);
+    assert.doesNotMatch(r.stdout, /^# tests/m, 'no test ran');
+  }
+});
+
+test('verify --quick lists exact .test.mjs files only, each present in test/ (a renamed file must not quietly drop out)', () => {
+  const src = readFileSync(join(root, 'scripts', 'verify.mjs'), 'utf8');
+  const quick = /quickCmd: '([^']*)'/.exec(src)?.[1] ?? '';
+  const args = quick.split(/\s+/).slice(quick.split(/\s+/).indexOf('scripts/test.mjs') + 1).filter(Boolean);
+  assert.ok(args.length > 0, `no arguments after scripts/test.mjs in "${quick}"`);
+  for (const a of args) {
+    assert.ok(a.endsWith('.test.mjs'), `${a} must be an exact .test.mjs name, not a substring`);
+    assert.ok(existsSync(join(root, 'test', a)), `test/${a} does not exist`);
+  }
+  assert.ok(args.includes('cli.test.mjs'), 'a bare `cli` would also run every *-cli test');
+  assert.ok(args.includes('test-runner.test.mjs'), 'the quick check must test its own file selection');
+  assert.ok(!args.includes('worktree-prune-config-fallback.test.mjs'), 'the slow prune fallback test is not a quick check');
+});
+
+// ---- #472 Task 1: pending clicks are settled by the readers, so a test must never settle the owner's real ones ------------------------------
+// Already recorded clicks still count; PIPELINE_CLICK_SETTLE=off only stops pending clicks from becoming records through the readers. Strict lookups still see unresolved round clicks,
+// so setting it never widens what is approved.
+
+test('the test runner gives every test file PIPELINE_CLICK_SETTLE=off, whatever the caller had set', () => {
+  for (const before of [undefined, 'on', '']) {
+    const env = nestedEnv();
+    if (before === undefined) delete env.PIPELINE_CLICK_SETTLE; else env.PIPELINE_CLICK_SETTLE = before;
+    const r = spawnSync(process.execPath, [runner, 'runner-env-probe.test.mjs'], { encoding: 'utf8', env });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout, /PROBE PIPELINE_CLICK_SETTLE=off\b/, `caller had ${JSON.stringify(before)}`);
+  }
+});
+
+test('test/helpers/owner-go.mjs sets PIPELINE_CLICK_SETTLE=off when it is imported', () => {
+  const helper = join(root, 'test', 'helpers', 'owner-go.mjs');
+  const child = join(root, 'test', 'helpers', 'print-settle-env.mjs');
+  for (const before of [undefined, 'on']) {
+    const env = nestedEnv();
+    if (before === undefined) delete env.PIPELINE_CLICK_SETTLE; else env.PIPELINE_CLICK_SETTLE = before;
+    const r = spawnSync(process.execPath, [child, helper], { encoding: 'utf8', env });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(r.stdout.trim(), 'SETTLE=off', `caller had ${JSON.stringify(before)}`);
+  }
+  const control = spawnSync(process.execPath, [child, join(root, 'pipeline', 'hooks', 'lib', 'owner-go.mjs')], { encoding: 'utf8', env: (() => { const e = nestedEnv(); delete e.PIPELINE_CLICK_SETTLE; return e; })() });
+  assert.equal(control.stdout.trim(), 'SETTLE=(unset)', 'the library itself never sets it: only tests do');
 });

@@ -50,6 +50,11 @@ export function writeSummaryComment(gh, pr, { record, sections, existing, retry 
   if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
   if (useRecord) parts.push(encodeRecord(useRecord));
   const body = parts.join('\n').trimEnd();
-  const posted = retry ? gh.upsertComment(pr, MARKERS.summary, body, { retry: true }) : gh.upsertComment(pr, MARKERS.summary, body);
+  // `current` is a fresh read of the newest own marker comment: edit that id instead of listing every comment again (#396); no comment yet (or a gh without updateComment): the upsert creates it.
+  // `retry` reaches the write only (both are safe to re-run: the PATCH is idempotent, the upsert re-lists before it writes).
+  const opts = retry ? [{ retry: true }] : [];
+  const posted = current.id != null && typeof gh.updateComment === 'function'
+    ? gh.updateComment(current.id, MARKERS.summary, body, ...opts)
+    : gh.upsertComment(pr, MARKERS.summary, body, ...opts);
   return { ...posted, record: useRecord };
 }
