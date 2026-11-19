@@ -1332,7 +1332,13 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
 
   w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   w.repo.commit('fix');
-  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1']);
+  // --pr N (like discard-round): a PR the state does not belong to is refused before anything is marked; the right one (or none) marks
+  const beforeMark = w.stateText();
+  const wrongPr = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1', '--pr', '8']);
+  assertExit(wrongPr, 2);
+  assert.equal(wrongPr.json.error, 'state-pr-mismatch');
+  assert.equal(w.stateText(), beforeMark, 'a mismatched --pr marks nothing');
+  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1', '--pr', '7']);
   assertExit(marked, 0);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items, []);
   assert.equal(w.item('R1-B1').implemented, true);
