@@ -265,6 +265,20 @@ test('F3 review.regression_only_paths: a glob covered by neither risk.high_risk_
   assert.ok(has(validateConfig({ ...minimal(), review: { regression_only_paths: ['src/a.js'] } }), 'is not covered by'));
 });
 
+// R1-B1: each entry is matched alone, so a `!` entry would never exclude anything while its positive sibling still waived the excluded file.
+// R1-B3: a glob wider than its cover (`src/**` under `src/*`) was accepted because matchAny read it as the literal text; a wildcard entry must be listed verbatim.
+test('review.regression_only_paths: a `!` entry is refused; a glob with a wildcard or brace is covered only when listed verbatim (a literal path may be matched)', () => {
+  const set = (regression_only_paths, extra) => validateConfig({ ...minimal(), ...extra, review: { regression_only_paths, ...(extra.review ?? {}) } });
+  const all = { risk: { high_risk_paths: ['src/**', '!src/auth/**'] } };
+  assert.ok(has(set(['src/**', '!src/auth/**'], all), 'review.regression_only_paths[1] ("!src/auth/**") is a `!` exclusion'));
+  assert.equal(set(['src/**'], all).ok, true, 'the sensitive list may keep its own exclusions');
+  assert.ok(has(set(['src/**'], { risk: { high_risk_paths: ['**'] } }), 'is not covered by'), '** lists no src/** entry');
+  assert.ok(has(set(['src/**'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'src/* does not cover src/**');
+  assert.ok(has(set(['src/{a,b}.js'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a brace entry is not a literal path');
+  assert.equal(set(['src/**'], { risk: { high_risk_paths: ['src/**'] } }).ok, true, 'verbatim');
+  assert.equal(set(['src/a.js'], { risk: { high_risk_paths: ['src/*'] } }).ok, true, 'a literal path is matched');
+});
+
 test('review.fix_verify_after_round: null or an integer 1..10; review.fix_round_max_lines: a positive integer', () => {
   const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
   for (const v of [null, 1, 3, 10]) assert.equal(set('fix_verify_after_round', v).ok, true, String(v));
