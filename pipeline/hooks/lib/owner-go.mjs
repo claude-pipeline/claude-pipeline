@@ -915,9 +915,13 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
   } else {
     return 'missing';
   }
+  // #418: the harness writes a hidden note (isMeta, none of the provenance fields: an opened image, an attachment) under the prompt's own id; it is no second prompt. An entry with
+  // any provenance field counts, so a forged twin of the owner's prompt still reads as two. (When every match is such a note, they are judged as before.)
   const found = [];
-  const scan = scanBackwards(file, (e) => { if (match.is(e)) found.push(e); return found.length >= 2; }, match.wants, { chunkBytes, capBytes });
+  const real = [];
+  const scan = scanBackwards(file, (e) => { if (match.is(e)) { found.push(e); if (!(e.isMeta === true && !hasProvenanceField(e))) real.push(e); } return real.length >= 2; }, match.wants, { chunkBytes, capBytes });
   if (scan === null || found.length === 0) return 'missing';
+  if (real.length > 0) found.splice(0, found.length, ...real);
   if (found.length > 1) return 'synthetic';
   if (found[0].promptSource === 'queued') return 'synthetic'; // (#191 B2, every record kind: a queued answer may land on an ask newer than what the owner had on screen; #189 refused only a promoted ask's)
   const source = entrySource(found[0]);

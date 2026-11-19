@@ -816,6 +816,23 @@ test('#128 Codex #145 P1: a transcript is evidence only under ~/<HOME_CONFIG_DIR
 });
 
 // Fix round item 4: the default home is the ACCOUNT's (os.userInfo), never $HOME, which the agent can point at a folder it writes.
+// #418: Claude Code writes a hidden note (isMeta, no provenance field) with the SAME promptId when Read opens an image in the granted turn.
+test('#418 promptProvenance: an isMeta image note sharing the owner prompt\'s promptId does not make the grant synthetic; a second real prompt entry still does', () => {
+  const root = tmp();
+  const at = (entries) => {
+    const f = join(root, '.claude/projects/-repo/s.jsonl');
+    mkdirSync(join(f, '..'), { recursive: true });
+    writeFileSync(f, entries.map((e) => `${JSON.stringify(e)}\n`).join(''));
+    return { transcript_path: f, prompt_id: 'pid-img' };
+  };
+  const owner = promptEntry('extra round', OWNER_META, 'pid-img');
+  const note = { type: 'user', isMeta: true, promptId: 'pid-img', message: { content: [{ type: 'text', text: '[Image: original 1440x6616, displayed at 1440x1600]' }] } };
+  assert.equal(promptProvenance(at([owner, said('ok'), note]), { env: {}, home: root }), 'owner', 'a meta image note after the typed prompt');
+  assert.equal(promptProvenance(at([owner, note, { ...note, uuid: 'n2' }]), { env: {}, home: root }), 'owner', 'two image notes');
+  assert.equal(promptProvenance(at([owner, promptEntry('extra round', OWNER_META, 'pid-img')]), { env: {}, home: root }), 'synthetic', 'a forged second typed entry');
+  assert.equal(promptProvenance(at([owner, { ...note, promptSource: 'system' }]), { env: {}, home: root }), 'synthetic', 'a meta entry that carries provenance still counts');
+});
+
 test('#128 isTranscriptFile / promptProvenance / transcriptConfigDirs: the default home is the account home, not $HOME', () => {
   const savedHome = process.env.HOME;
   const savedProfile = process.env.USERPROFILE;
