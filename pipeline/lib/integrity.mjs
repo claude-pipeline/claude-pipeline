@@ -152,7 +152,8 @@ function skipOrOnlyAdded(files, isTest) {
     if (f.status === 'D' || !isTest(f.path)) continue;
     const sql = matchAny(f.path, SQL_FILE);
     for (const l of f.added) {
-      if (SKIP_PATTERNS.some((re) => re.test(l.text)) || (sql && SQL_SKIP_RE.test(l.text))) out.push(violation('skip-or-only-added', f.path, l.line, l.text));
+      // A .sql test is pgTAP: only its own skip/todo calls count. The JS patterns (pending( ...) would flag a description that merely says "pending (".
+      if (sql ? SQL_SKIP_RE.test(l.text) : SKIP_PATTERNS.some((re) => re.test(l.text))) out.push(violation('skip-or-only-added', f.path, l.line, l.text));
     }
   }
   return out;
