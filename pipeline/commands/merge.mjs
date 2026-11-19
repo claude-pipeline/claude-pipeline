@@ -17,7 +17,7 @@ import { proofLine } from '../lib/run-record.mjs';
 import { createRunRecorder, inFlightSince, resumedRunState } from '../lib/run-progress.mjs';
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
-import { substituteInventory } from '../lib/triage.mjs';
+import { capLowItems, substituteInventory } from '../lib/triage.mjs';
 import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, holdDigest, readyLine } from '../hooks/lib/owner-go.mjs';
 import { clickNotes, mergeAsk, mergeManyAsk } from '../hooks/lib/owner-go-click.mjs';
 import { askFields, clickConfigRefusal, clickGate } from '../lib/click-ask.mjs';
@@ -878,7 +878,9 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     try {
       // Belt and braces: a PR the gate lists any owner-merge item for is never the low-risk path, whatever risk the review state recorded.
       const noOwnerItems = Number(live?.ownerMerge ?? 0) === 0 && Number(gate?.ownerMerge ?? 0) === 0 && (live?.ownerItems ?? 'none') === 'none';
-      lowRisk = !ownerGo && noOwnerItems && loadState(root, { cleanup: false })?.risk === 'low';
+      const reviewState = loadState(root, { cleanup: false });
+      // A PR holding an accept that review.cap_low_accepts deferred unapplied is never the low-risk path (owner 2026-11-19): the owner says "merge" and the Rulings block lists those rows.
+      lowRisk = !ownerGo && noOwnerItems && reviewState?.risk === 'low' && capLowItems(reviewState).length === 0;
     } catch { /* an unreadable review state is not a low-risk one */ }
     // --owner-go: the live scan's digest, and for protected areas the Areas line to print right above the Head line (areas: that line, areaIds: the ids).
     if (!lowRisk) {

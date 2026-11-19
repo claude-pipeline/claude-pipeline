@@ -955,6 +955,7 @@ function rowWhy(item) {
   if (isPostMaxFinal(item)) {
     const pmx = item.final.postMax;
     const issue = issueNumber(item.followupIssue);
+    if (pmx.rule === CAP_LOW_RULE) return `accepted by ${pmx.by === 'judge' ? 'judge' : 'arbiter'} in round ${asciiLine(pmx.ordinal, 6)} at limit ${asciiLine(pmx.max, 6)}; deferred unapplied, NOT fixed in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
     return `accepted by ${pmx.by === 'judge' ? 'judge' : 'arbiter'} in round ${asciiLine(pmx.ordinal, 6)} past limit ${asciiLine(pmx.max, 6)}; NOT fixed in this merge; ${issue ? `issue #${issue}` : 'issue not filed yet'}`;
   }
   if (!(isRoundCapDeferral(item) && isDeferralFinal(item))) return item.final.reason;
@@ -1254,26 +1255,9 @@ const markedBefore = (item, rounds) => {
   return Number.isInteger(item.implementedAfterRound) && counted !== undefined && counted.n > item.implementedAfterRound;
 };
 
-// May the round limit be closed by taking the accepted fixes OUT and filing them as follow-ups? Refusals 1, 2 and 5 of `defer-fixes`, evaluated on this state as if the tree were
-// already back at the reviewed content (refusals 3 and 4 need git and are the command's). Pure. `grants` = k -> the owner's open extra-round records for counted round k at ANY head
-// (a function, as roundOutcome takes it): an unspent grant for the next round always wins over a deferral, and a lookup that fails (or a `grantGap` of 'provenance') refuses.
-// -> { eligible, refusals: [plain words], ids: [the accepts a round would have to review], severities: [{ id, level, reasons }] }. Throws (TypeError) on a config error.
-export function deferEligibility(state, config, files, { grants, grantGap, baseConfig } = {}) {
+// The owner's typed "extra round" for counted round k always wins over a deferral, and what cannot be read refuses (shared by deferEligibility and capLowDeferral). -> [plain-words refusals].
+function grantRefusals(k, grants, grantGap) {
   const refusals = [];
-  const rounds = state?.rounds ?? [];
-  const last = rounds.at(-1);
-  if (last === undefined) return { eligible: false, refusals: ['no review round is recorded'], ids: [], severities: [] };
-  if (!hasContentHash(last.contentHashAtToHead)) refusals.push('the last review round records no content hash');
-  const o = roundOutcome({ ...state, currentContentHash: last.contentHashAtToHead });
-  const reviewed = reviewedRoundCount(state);
-  // Refusal 1: the limit is reached for good, and nothing else is open.
-  if (!Number.isFinite(state?.maxRounds)) refusals.push('review.max_rounds is not set, so there is no limit to defer past');
-  else if (reviewed < state.maxRounds) refusals.push(`the round limit (${state.maxRounds}) is not reached yet`);
-  else if (o.extraRound) refusals.push('the automatic extra round is still available: run it');
-  for (const [list, what] of [[o.fablePending.map(String), 'a Fable pass is owed for round(s)'], [o.pending, 'items still pending:'], [o.needsHuman, 'items wait for a human:'], [o.openBlocking, 'open BLOCKING items:'], [o.unimplemented, 'accepted items not implemented:']]) {
-    if (list.length > 0) refusals.push(`${what} ${idList(list)}`);
-  }
-  const k = reviewed + 1;
   // Unlike roundOutcome (no readable grant = no round), here the permissive reading is "no grant", so what cannot be read refuses: a lookup that throws or answers
   // with anything but a list, and a record the owner may have typed but whose provenance could not be confirmed (`grantGap`: k -> 'none' | 'provenance' | 'ok').
   // Both callers pass the STRICT lookups (owner-go.mjs ownerGrantLookups: any skipped read throws); in the round-request ask a failure there is a warning and an 'extra-round' recommendation, never a missing line.
@@ -1302,6 +1286,29 @@ export function deferEligibility(state, config, files, { grants, grantGap, baseC
     }
     if (gap === 'provenance') refusals.push(`an extra round is recorded for round ${k} but cannot be confirmed as typed by the owner: it may still be the owner's, so ask the owner for an extra round instead of deferring`);
   }
+  return refusals;
+}
+
+// May the round limit be closed by taking the accepted fixes OUT and filing them as follow-ups? Refusals 1, 2 and 5 of `defer-fixes`, evaluated on this state as if the tree were
+// already back at the reviewed content (refusals 3 and 4 need git and are the command's). Pure. `grants` = k -> the owner's open extra-round records for counted round k at ANY head
+// (a function, as roundOutcome takes it): an unspent grant for the next round always wins over a deferral, and a lookup that fails (or a `grantGap` of 'provenance') refuses.
+// -> { eligible, refusals: [plain words], ids: [the accepts a round would have to review], severities: [{ id, level, reasons }] }. Throws (TypeError) on a config error.
+export function deferEligibility(state, config, files, { grants, grantGap, baseConfig } = {}) {
+  const refusals = [];
+  const rounds = state?.rounds ?? [];
+  const last = rounds.at(-1);
+  if (last === undefined) return { eligible: false, refusals: ['no review round is recorded'], ids: [], severities: [] };
+  if (!hasContentHash(last.contentHashAtToHead)) refusals.push('the last review round records no content hash');
+  const o = roundOutcome({ ...state, currentContentHash: last.contentHashAtToHead });
+  const reviewed = reviewedRoundCount(state);
+  // Refusal 1: the limit is reached for good, and nothing else is open.
+  if (!Number.isFinite(state?.maxRounds)) refusals.push('review.max_rounds is not set, so there is no limit to defer past');
+  else if (reviewed < state.maxRounds) refusals.push(`the round limit (${state.maxRounds}) is not reached yet`);
+  else if (o.extraRound) refusals.push('the automatic extra round is still available: run it');
+  for (const [list, what] of [[o.fablePending.map(String), 'a Fable pass is owed for round(s)'], [o.pending, 'items still pending:'], [o.needsHuman, 'items wait for a human:'], [o.openBlocking, 'open BLOCKING items:'], [o.unimplemented, 'accepted items not implemented:']]) {
+    if (list.length > 0) refusals.push(`${what} ${idList(list)}`);
+  }
+  refusals.push(...grantRefusals(reviewed + 1, grants, grantGap));
   // Refusal 2: exactly the accepts no round has reviewed, each low and each the judge's or the arbiter's.
   const ids = o.newAccepted;
   const byId = new Map(allItems(state).map((i) => [i.id, i]));
@@ -1336,6 +1343,107 @@ export function deferEligibility(state, config, files, { grants, grantGap, baseC
     if (problems.length > 0) refusals.push(problems.join('; '));
   }
   return { eligible: refusals.length === 0, refusals, ids, severities };
+}
+
+// ---- the last allowed round accepted only low fixes: they go to follow-ups unapplied (review.cap_low_accepts, Floor A of the accept floor plan 2026-11-19) -----------------------------
+// At the last allowed counted round (reviewed === max_rounds), when EVERY fix the round newly accepted is low severity and none is built, the extra confirm round would only review fixes for
+// low findings. `triage cap-defer` (the first step of `round publish`) turns those ACCEPTs into FOLLOW-UPs before anything is published or built; the issues are filed by `followups create`.
+// Computed only: no caller names an item, a reason or a policy. The final carries the existing post-limit marker (`postMax`) with `rule: 'cap-low'`, so every reader of that marker already enforces
+// the filing gate, the Rulings row and the "Claude may only tighten it back to ACCEPT" rule.
+export const CAP_LOW_RULE = 'cap-low';
+// 'defer' only when EVERY config given (working tree, trusted default branch) says so: 'extra-round' in any, or a config that cannot be read (null), is off (a PR can switch it off, never on).
+export const capLowPolicy = (configs) => (Array.isArray(configs) && configs.length > 0 && configs.every((c) => c?.review?.cap_low_accepts === 'defer') ? 'defer' : 'extra-round');
+// A settled FOLLOW-UP `cap-defer` made, still the judge's / arbiter's word (a cached copy of it included: the original has `by` judge / arbiter, a copy `cache`).
+export const isCapLowFinal = (item) => isPostMaxFinal(item) && item.final.postMax.rule === CAP_LOW_RULE;
+// The cap-low deferrals the state holds, one per id: [{ n, item }] (n = the round the item is in). A cached copy (by 'cache') is not one: it is the same finding carried into a later round.
+export const capLowItems = (state) => (state?.rounds ?? []).flatMap((r) => (r.items ?? []).filter((i) => isCapLowFinal(i) && i.final.by !== 'cache').map((item) => ({ n: r.n, item })));
+
+// Why this newly accepted item may not be deferred at the limit, or null (the item-level rules; the severity and the state-wide ones are capLowDeferral's).
+function capDeferRefusal(item) {
+  if (!isObject(item)) return 'no item given';
+  const id = item.id;
+  if (item.final?.decision !== 'ACCEPT' || item.final.needsHuman === true) return `${id} is not an accepted fix`;
+  if (item.implemented === true) return `${id} is already implemented`;
+  if (isOwnerRuled(item)) return `${id} was ruled by the owner: only the owner's typed ruling can loosen it`;
+  if (isProtectedFinal(item)) return `${id} was ruled by Claude or forced by a second review: it cannot be loosened`;
+  if (!DEFERRABLE_BY.includes(item.final.by)) return `${id} was accepted by ${item.final.by ?? 'unknown'}, not by the judge or the arbiter`;
+  if (isTestAccept(item.final)) return `${id} is an accept a test result made, not an opinion`;
+  if (isRoundCapDeferral(item)) return `${id} was already deferred`;
+  if (item.bucket !== 'SUGGESTION' && item.bucket !== 'WORTH_CONSIDERING') return `${id} is not a SUGGESTION or WORTH_CONSIDERING item`;
+  return null;
+}
+
+// The item as a cap-low FOLLOW-UP (nothing was built, so there is nothing to undo). `max`: review.max_rounds, `at`: the ISO instant. Throws on an item capDeferRefusal refuses.
+export function applyCapLowDeferral(item, { max, at }) {
+  const refusal = capDeferRefusal(item);
+  if (refusal) throw new Error(refusal);
+  const final = structuredClone(item.final);
+  return {
+    ...structuredClone(item),
+    final: {
+      ...final, decision: 'FOLLOW-UP', postMax: { from: 'ACCEPT', by: final.by, ordinal: max, max, rule: CAP_LOW_RULE, at },
+      reason: `at the round limit (round ${max} of ${max}), only low-severity fixes accepted: deferred unapplied: ${final.reason}`,
+    },
+  };
+}
+export const capDeferItemsInState = (state, ids, params) => {
+  const wanted = new Set(ids);
+  return { ...state, rounds: (state.rounds ?? []).map((r) => ({ ...r, items: (r.items ?? []).map((i) => (wanted.has(i.id) ? applyCapLowDeferral(i, params) : i)) })) };
+};
+
+// May the accepts of the last allowed round be deferred unapplied? Pure. `grants` / `grantGap` as deferEligibility takes them (the STRICT lookups: an unspent grant for round max + 1, an unreadable lookup or a
+// 'provenance' gap refuses, "grant wins"). `baseConfig`: the trusted default-branch config, whose sensitive-path lists and review.max_rounds the PR cannot shrink. `policy`: capLowPolicy of every config.
+// All or nothing: one non-low accept, anything open, or a state that is not exactly "limit reached, only these unbuilt accepts left" refuses and the extra round reviews the fixes as before.
+// -> { apply, ids: [the accepts a round would have to review], refusals: [plain words], severities: [{ id, level, reasons }] }. Throws (TypeError) on a config error.
+export function capLowDeferral(state, { config, baseConfig, files, grants, grantGap, policy } = {}) {
+  const none = (refusals) => ({ apply: false, ids: [], refusals, severities: [] });
+  if (policy !== 'defer') return none(['review.cap_low_accepts is not `defer` in every config (the working tree and the trusted default-branch one)']);
+  const rounds = state?.rounds ?? [];
+  const last = rounds.at(-1);
+  if (last === undefined) return none(['no review round is recorded']);
+  if (!hasContentHash(last.contentHashAtToHead)) return none(['the last review round records no content hash']);
+  const max = state?.maxRounds;
+  if (!Number.isInteger(max)) return none(['review.max_rounds is not set, so there is no limit']);
+  const reviewed = reviewedRoundCount(state);
+  if (reviewed !== max) return none([`the last allowed round is not the one just reviewed (${reviewed} counted rounds of ${max})`]);
+  const refusals = [];
+  // The review's own round limit comes from the working-tree config: a PR must not lower it to reach this lever.
+  if (!isObject(baseConfig)) refusals.push('the trusted default-branch config is unreadable, so the round limit cannot be checked');
+  else if (!(max >= baseConfig.review?.max_rounds)) refusals.push(`the review's round limit (${max}) is lower than the default branch's (${baseConfig.review?.max_rounds})`);
+  const o = roundOutcome({ ...state, currentContentHash: last.contentHashAtToHead });
+  for (const [list, what] of [[o.fablePending.map(String), 'a Fable pass is owed for round(s)'], [o.pending, 'items still pending:'], [o.needsHuman, 'items wait for a human:'], [o.openBlocking, 'open BLOCKING items:']]) {
+    if (list.length > 0) refusals.push(`${what} ${idList(list)}`);
+  }
+  // Exactly the accepts no round has reviewed are the unbuilt ones: an older unbuilt accept (or a built one nobody reviewed) is not what this lever is for.
+  const ids = o.newAccepted;
+  if (ids.length === 0) refusals.push('no accepted fix is waiting for a review round, so there is nothing to defer');
+  const asked = new Set(ids);
+  const stray = o.unimplemented.filter((id) => !asked.has(id));
+  if (stray.length > 0) refusals.push(`accepted items not implemented that this round did not accept: ${idList(stray)}`);
+  const built = ids.filter((id) => !o.unimplemented.includes(id));
+  if (built.length > 0) refusals.push(`already implemented: ${idList(built)}`);
+  const held = roundsAwaitingFixReview(rounds).flatMap((r) => r.items ?? []).filter((i) => isObject(i?.final) && settleTestable(i));
+  if (held.length > 0) refusals.push(`${held.map((i) => i.id).join(', ')}: the judge dismissed it, but a settle test is still possible, which may make it an accepted fix`);
+  refusals.push(...grantRefusals(reviewed + 1, grants, grantGap));
+  const byId = new Map(allItems(state).map((i) => [i.id, i]));
+  const severities = [];
+  for (const id of ids) {
+    const item = byId.get(id);
+    const sev = itemSeverity(item, { state, config, files, baseConfig });
+    severities.push({ id, ...sev });
+    if (sev.level !== 'low') refusals.push(`${id} is not low severity (${sev.reasons.join('; ')})`);
+    const why = capDeferRefusal(item);
+    if (why) refusals.push(why);
+  }
+  // The state with those accepts deferred must read as a clean review (nothing left but the issues still to file).
+  if (refusals.length === 0) {
+    const proposed = capDeferItemsInState(state, ids, { max, at: new Date(0).toISOString() });
+    const filed = { ...proposed, rounds: proposed.rounds.map((r) => ({ ...r, items: (r.items ?? []).map((i) => (isCapLowFinal(i) && !i.followupIssue ? { ...i, followupIssue: 'dry-run' } : i)) })) };
+    if (!roundOutcome({ ...filed, currentContentHash: last.contentHashAtToHead }).clean) refusals.push('the review would still not be clean after the fixes are deferred');
+    const problems = reviewEligibilityProblems(filed);
+    if (problems.length > 0) refusals.push(problems.join('; '));
+  }
+  return { apply: refusals.length === 0, ids, refusals, severities };
 }
 
 // ---- past the limit, a low-severity ACCEPT becomes a FOLLOW-UP (#374 PR B, review.post_max_suggestions) ------------------------------------------------
