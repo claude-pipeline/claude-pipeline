@@ -667,7 +667,7 @@ function checkThreatModels(models, errors) {
 }
 
 // review.regression_only_paths: at most MAX_REGRESSION_ONLY_PATHS usable globs. `risk` = the risk section: the waiver only reaches a file the Fable lane reviews, so each glob must be
-// covered by risk.high_risk_paths or review.arbiter_always_paths of the same config (the glob listed there verbatim, or, for an entry with no wildcard or brace, a literal path one of them matches).
+// covered by risk.high_risk_paths or review.arbiter_always_paths of the same config (the glob listed there verbatim, or, for an entry with no wildcard, brace or trailing slash (glob.mjs reads `dir/` as `dir/**`), a literal path one of them matches).
 // A `!` exclusion entry is refused: each entry is matched on its own, so it could never cancel another one.
 export const MAX_REGRESSION_ONLY_PATHS = 20;
 function checkRegressionOnly(globs, review, risk, errors) {
@@ -683,7 +683,7 @@ function checkRegressionOnly(globs, review, risk, errors) {
     }
     let covered = false;
     try {
-      covered = sensitive.includes(g) || (!/[*?{]/.test(g) && matchAny(g, sensitive, { nocase: true }));
+      covered = sensitive.includes(g) || (!/[*?{]/.test(g) && !g.replaceAll('\\', '/').endsWith('/') && matchAny(g, sensitive, { nocase: true }));
     } catch { /* an unusable sensitive glob is reported by its own list */ }
     if (!covered) errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is not covered by risk.high_risk_paths or review.arbiter_always_paths: add it to one of them, or the bar never applies to it`);
   });
