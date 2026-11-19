@@ -184,7 +184,7 @@ pipeline codex-review --pr N --round R --base SHA --head SHA --plan [--repo DIR]
     base-only rounds and resolution-only rounds (below) never count toward the cap
   exit 2 {error:stale-history | unpublished-history | history-unreadable} for a COUNTED round, before Codex runs (read again under the final lock): the PR's triage comment is the
     published history. stale-history: this copy lacks a published round or owner grant (run `pipeline state show --pr N`); unpublished-history: this copy holds rounds the PR
-    lacks, an earlier publish failed (run `pipeline comment --pr N --kind triage`); history-unreadable: the comment holds no readable state. No triage comment: no check
+    lacks, an earlier publish failed (run `pipeline comment --pr N --kind triage`); history-unreadable: the comment holds no readable state (newerFormat: a newer pipeline wrote it, run `pipeline update`). No triage comment: no check
   reviewer: fable (medium/high risk, except medium for size only, or a sensitive path: risk.high_risk_paths, review.arbiter_always_paths) records the round as fableRequired
     (the Fable pass must run: arbiter needed/apply) and gives Codex an attacker's brief for the sensitive files; judge otherwise. Once fable, always fable.
     The judge also reviews a medium PR that is medium ONLY for its size (no hard-stop hit of any kind, no sensitive path, base branch = the default branch) unless
