@@ -48,6 +48,25 @@ test('describeSql: destructive flags', () => {
   assert.deepEqual(flags('delete from a; delete from b; drop table c'), ['DROP', 'DELETE-NO-WHERE']);
 });
 
+test('describeSql: only the own WHERE of the statement counts, not one inside a sub-select or a later query', () => {
+  // a WHERE in a sub-select must not hide a whole-table change
+  assert.deepEqual(flags("update accounts set status = (select status from defaults where name = 'account')"), ['UPDATE-NO-WHERE']);
+  assert.deepEqual(flags('update t set a = 1 from (select id from u where u.x = 1) s'), ['UPDATE-NO-WHERE']);
+  assert.deepEqual(flags('delete from t using (select id from u where u.x = 1) s'), ['DELETE-NO-WHERE']);
+  // WITH forms: a WHERE after the CTE group closed belongs to the outer SELECT
+  assert.deepEqual(flags('with d as (delete from t returning id) select * from d where id > 5'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('with d as (update t set a = 1 returning id) select * from d where id > 5'), ['UPDATE-NO-WHERE']);
+  // a WHERE inside the CTE's own group counts
+  assert.deepEqual(flags('with d as (delete from t where id = 1 returning id) select * from d'), []);
+  assert.deepEqual(flags('with d as (update t set a = 1 where true returning id) select * from d'), ['UPDATE-WHERE-TRUE']);
+  // own WHERE that holds a sub-select stays unwarned; a plain WHERE after a WITH ... UPDATE too
+  assert.deepEqual(flags('delete from t where id in (select id from u where u.x = 1)'), []);
+  assert.deepEqual(flags('update t set x = 1 where id = 2'), []);
+  assert.deepEqual(flags('with s as (select 1 as id) update t set a = 1 where id in (select id from s)'), []);
+  // scope that cannot be determined (unbalanced parentheses) warns rather than stays silent
+  assert.deepEqual(flags('update t set a = (select 1 where true'), ['UPDATE-NO-WHERE']);
+});
+
 test('describeSql: unterminated SQL is unparsed', () => {
   assert.deepEqual(describeSql("select 'abc"), { unparsed: true });
 });
