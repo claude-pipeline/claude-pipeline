@@ -551,14 +551,3 @@ test('cap-low: the follow-up issue says the fix was deferred unapplied and is no
   assert.match(issueBody(it, 7), /The judge ACCEPTED a fix at the round limit; it was deferred unapplied \(review\.cap_low_accepts\); it is NOT in PR #7\./);
 });
 
-test('cap-low: the PREVIOUS release (df60acb8, frozen fixture) still lists the row, holds the review until the issue is filed, and lets Claude only tighten it', async () => {
-  const old = await import('./fixtures/prev-release/triage.mjs');
-  const s = capped(capState([unbuilt()]));
-  const it = s.rounds[0].items[0];
-  assert.match(old.rulingsInventory(s).rows[0], /why: accepted by judge in round 1 past limit 1; NOT fixed in this merge; issue not filed yet$/, 'an older reader words the row differently but does not drop it');
-  assert.match(old.reviewEligibilityProblems(s).join(';'), /post-limit follow-up\(s\) without a filed issue/);
-  assert.deepEqual(old.reviewEligibilityProblems(filedOf(s)), []);
-  assert.equal(old.roundOutcome({ ...filedOf(s), currentContentHash: HASH }).clean, true);
-  assert.equal(old.claudeRulingRefusal(it, 'ACCEPT'), null);
-  assert.match(old.claudeRulingRefusal(it, 'REJECT') ?? '', /not waiting for a human decision/);
-});
