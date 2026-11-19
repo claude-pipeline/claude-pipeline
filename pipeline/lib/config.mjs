@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
-import { globToRegExp, matchAny } from './glob.mjs';
+import { globToRegExp, matchAny, normalizeGlob } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { isUniversalHardStopPath } from './hardstops.mjs';
 import { showFile } from './git.mjs';
@@ -124,6 +124,10 @@ export const DEFAULTS = deepFreeze({
     // (list a modelled path in risk.high_risk_paths or review.arbiter_always_paths to have it apply to every PR touching it). A security finding
     // outside a model is FOLLOW-UP, not merge-blocking. Empty = off (today's behaviour).
     threat_models: [],
+    // Up to 20 globs (set in the TRUSTED default-branch config; each must also be covered by risk.high_risk_paths or review.arbiter_always_paths there, or it never applies): on a
+    // Fable-lane round, the arbiter judges a finding on a matching file by "is it worse than at the merge base?": the same weakness already on the base is a FOLLOW-UP
+    // (scope same-on-base, filed as an issue and bound to the owner's merge), a regression stays merge-blocking. Empty = off (today's behaviour).
+    regression_only_paths: [],
     // null (off) or 1..10: counted review rounds past this ordinal may use the narrow fix-verify brief even on sensitive paths (never
     // on a hard-stop hit other than an ignored P-path/R4-config, a size driver, or a flagged fix scope). Both configs must set it.
     fix_verify_after_round: null,
@@ -220,7 +224,7 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'fix_verify_after_round', 'fix_round_max_lines', 'post_max_suggestions', 'cap_low_accepts', 'trip_wire_extra_rounds', 'trip_wire_not_falling'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'regression_only_paths', 'fix_verify_after_round', 'fix_round_max_lines', 'post_max_suggestions', 'cap_low_accepts', 'trip_wire_extra_rounds', 'trip_wire_not_falling'],
   review_codex_budget: ['soft', 'hard'],
   review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
   threat_model: ['name', 'paths', 'text'],
@@ -666,6 +670,30 @@ function checkThreatModels(models, errors) {
   });
 }
 
+// review.regression_only_paths: at most MAX_REGRESSION_ONLY_PATHS usable globs. `risk` = the risk section: the waiver only reaches a file the Fable lane reviews, so each glob must be
+// covered by risk.high_risk_paths or review.arbiter_always_paths of the same config (the glob listed there verbatim, or, for an entry with no wildcard or brace, a literal path one of them matches; both sides are read as glob.mjs reads a glob: `dir/` is `dir/**`, a leading `/` or `./` is dropped).
+// A `!` exclusion entry is refused: each entry is matched on its own, so it could never cancel another one.
+export const MAX_REGRESSION_ONLY_PATHS = 20;
+function checkRegressionOnly(globs, review, risk, errors) {
+  if (!isStrArray(globs)) return errors.push('review.regression_only_paths must be an array of strings');
+  if (globs.length > MAX_REGRESSION_ONLY_PATHS) errors.push(`review.regression_only_paths has ${globs.length} entries; at most ${MAX_REGRESSION_ONLY_PATHS}`);
+  const sensitive = [...(isStrArray(risk?.high_risk_paths) ? risk.high_risk_paths : []), ...(isStrArray(review?.arbiter_always_paths) ? review.arbiter_always_paths : [])];
+  globs.forEach((g, i) => {
+    const norm = normalizeGlob(g); // what the glob matcher runs with: every check below must judge this form, not the raw text (`/!x` is `!x` once normalised)
+    if (norm.startsWith('!')) return errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is a \`!\` exclusion, which this list does not support: list only the paths the bar covers`);
+    try {
+      globToRegExp(g);
+    } catch (err) {
+      return errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is not a usable glob (${err.message})`);
+    }
+    let covered = false;
+    try {
+      covered = sensitive.some((s) => normalizeGlob(s) === norm) || (!/[*?{]/.test(norm) && matchAny(norm, sensitive, { nocase: true }));
+    } catch { /* an unusable sensitive glob is reported by its own list */ }
+    if (!covered) errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is not covered by risk.high_risk_paths or review.arbiter_always_paths: add it to one of them, or the bar never applies to it`);
+  });
+}
+
 function checkSmokeChecks(checks, errors) {
   if (!Array.isArray(checks)) return errors.push('smoke_checks must be an array');
   checks.forEach((item, i) => {
@@ -771,6 +799,7 @@ export function validateConfig(obj) {
     checkPosInt(review.light_lane_max_lines, 'review.light_lane_max_lines', errors);
     checkStrArray(review.arbiter_always_paths, 'review.arbiter_always_paths', errors);
     checkThreatModels(review.threat_models, errors);
+    checkRegressionOnly(review.regression_only_paths, review, isObj(config.risk) ? config.risk : null, errors);
     if (review.fix_verify_after_round !== null && !inRange(review.fix_verify_after_round, 1, 10)) errors.push('review.fix_verify_after_round must be null or an integer 1..10');
     checkPosInt(review.fix_round_max_lines, 'review.fix_round_max_lines', errors);
     if (!POST_MAX_POLICIES.includes(review.post_max_suggestions)) errors.push(`review.post_max_suggestions must be one of ${POST_MAX_POLICIES.join('|')}`);

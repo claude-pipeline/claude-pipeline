@@ -4,7 +4,7 @@
 import { createHash } from 'node:crypto';
 import { CATEGORIES } from './codex.mjs';
 import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
-import { isSensitivePath, threatModelsFor } from './risk.mjs';
+import { isSensitivePath, regressionOnlyFor, threatModelsFor } from './risk.mjs';
 import { RISK_LEVELS, isSubstituteRound, maxRiskOf, secondReviewerOf } from './state.mjs';
 import { wholePrOwed } from './review-route.mjs';
 
@@ -79,7 +79,7 @@ export function validateRulings(json, itemIds, { review = false } = {}) {
     if (!oneOf(r.ruling, DECISIONS)) errors.push(`${r.id}: ruling must be one of ${DECISIONS.join('|')}`);
     if (!oneOf(r.confidence, CONFIDENCES)) errors.push(`${r.id}: confidence must be one of ${CONFIDENCES.join('|')}`);
     if (typeof r.reasoning !== 'string') errors.push(`${r.id}: reasoning must be a string`);
-    if (r.scope !== undefined && r.scope !== OUT_OF_MODEL) errors.push(`${r.id}: scope must be "${OUT_OF_MODEL}" when given`);
+    if (r.scope !== undefined && !SCOPES.includes(r.scope)) errors.push(`${r.id}: scope must be "${OUT_OF_MODEL}" or "${SAME_ON_BASE}" when given`);
     else if (r.scope !== undefined && r.ruling !== 'FOLLOW-UP') errors.push(`${r.id}: scope is only allowed with ruling FOLLOW-UP`);
   }
   if (review) errors.push(...findingErrors(json.findings));
@@ -92,6 +92,9 @@ export function validateRulings(json, itemIds, { review = false } = {}) {
 // ---- threat models (review.threat_models, read from the trusted default-branch config; #374) ---------------------------------------------------------
 // The one value `scope` may take on a ruling or a Fable finding: it says the item lies outside the threat model the arbiter's input stated for its file.
 export const OUT_OF_MODEL = 'out-of-model';
+// The other value (review.regression_only_paths, #559): the finding is on a file the bar covers and exists identically at the merge base, so it is no regression of this PR.
+export const SAME_ON_BASE = 'same-on-base';
+const SCOPES = [OUT_OF_MODEL, SAME_ON_BASE];
 const modelsAmong = (models, paths) => threatModelsFor(paths.map((p) => ({ path: p })), { review: { threat_models: Array.isArray(models) ? models : [] } });
 
 // -> { name, waive } | null. `name` is the first model (config order) whose paths match the item's file: the marker `final.outOfModel`, set for every validated
@@ -110,6 +113,26 @@ function outOfModelOf(item, { models, files }) {
     if (whole !== undefined) return { name: whole.name, waive: true };
   }
   return { name: hit.name, waive: false };
+}
+
+// review.regression_only_paths: the globs of `globs` matching these paths, in config order.
+const regressionAmong = (globs, paths) => regressionOnlyFor(paths.map((p) => ({ path: p })), { review: { regression_only_paths: Array.isArray(globs) ? globs : [] } });
+
+// -> { name, waive } | null. `name` is the first glob that matches the item's file: the marker `final.sameOnBase`, set for EVERY arbiter FOLLOW-UP / REJECT on such a file, whatever its
+// bucket, category or scope (so the Rulings block lists it, the filing gate holds a FOLLOW-UP until its issue is filed and the owner's merge is bound to it). `waive` is true only when
+// the BLOCKING-security needsHuman exception may apply: `files` (the PR's WHOLE diff from the merge base, git.mjs#diffFiles entries) holds exactly ONE entry for the file, it is a plain
+// modification (status M: not an added file, a rename or a copy, so the path exists at the merge base and the arbiter could compare it; not a binary file by git's own numstat verdict (`gitBinary`: --text hides it
+// in `binary`), a symlink or a submodule, which have no text to compare; and the cited line is not one the PR itself ADDS in that whole-PR diff: a weakness it added in an earlier round is no
+// pre-existing one), old and new path are the one clean repo path, and it
+// matches a glob. Anything else: no waiver, today's rule.
+function sameOnBaseOf(item, { globs, files } = {}) {
+  if (!Array.isArray(globs) || globs.length === 0 || typeof item.file !== 'string' || item.file === '') return null;
+  const hit = regressionAmong(globs, [item.file])[0];
+  if (hit === undefined) return null;
+  const entries = Array.isArray(files) && locationProblem(item.file) === null ? files.filter((f) => entryPaths(f).includes(item.file)) : [];
+  const only = entries.length === 1 ? entries[0] : null;
+  const waive = only !== null && only.status === 'M' && only.binary !== true && only.gitBinary !== true && only.symlink !== true && only.gitlink !== true && !(Array.isArray(only.added) && only.added.some((a) => a.line === item.line)) && only.oldPath === item.file && only.newPath === item.file && regressionAmong(globs, entryPaths(only)).length > 0;
+  return { name: hit, waive };
 }
 
 // What Fable may raise on its own. A finding it raises is something to do, so it is ACCEPT (fix it here) or FOLLOW-UP (an
@@ -140,7 +163,7 @@ function findingErrors(findings) {
     if (!Number.isInteger(f.line) || f.line < 0) errors.push(`${at}.line must be an integer >= 0`);
     if (!oneOf(f.ruling, FINDING_DECISIONS)) errors.push(`${at}.ruling must be one of ${FINDING_DECISIONS.join('|')}`);
     if (!oneOf(f.confidence, CONFIDENCES)) errors.push(`${at}.confidence must be one of ${CONFIDENCES.join('|')}`);
-    if (f.scope !== undefined && f.scope !== OUT_OF_MODEL) errors.push(`${at}.scope must be "${OUT_OF_MODEL}" when given`);
+    if (f.scope !== undefined && !SCOPES.includes(f.scope)) errors.push(`${at}.scope must be "${OUT_OF_MODEL}" or "${SAME_ON_BASE}" when given`);
     else if (f.scope !== undefined && f.ruling !== 'FOLLOW-UP') errors.push(`${at}.scope is only allowed with ruling FOLLOW-UP`);
   });
   return errors;
@@ -150,8 +173,9 @@ function findingErrors(findings) {
 // PROVEN answer: an unproven one adds nothing (the round stays Fable-pending, see fablePendingRounds). Low confidence, or
 // deferring a BLOCKING security / data finding to a follow-up, goes to a human exactly like an arbiter ruling would.
 // `fingerprintFor(finding)` gives the cache fingerprint (it reads the code at head, so it is the caller's).
-// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules.
-export function fableFindingItems(findings, round, { transcript = null, fingerprintFor = () => null, models = [], diffFiles = null } = {}) {
+// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules. `regression` = { globs, files } (review.regression_only_paths in force and the
+// whole PR's diff from the merge base, see sameOnBaseOf); none = today's rules.
+export function fableFindingItems(findings, round, { transcript = null, fingerprintFor = () => null, models = [], diffFiles = null, regression = null } = {}) {
   if (!Number.isInteger(round) || round < 1) throw new Error(`invalid round ${String(round)}`);
   const errors = findingErrors(findings);
   if (errors.length > 0) throw new Error(`invalid findings: ${errors.join('; ')}`);
@@ -161,8 +185,12 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
     if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
     else {
       const oom = f.scope === OUT_OF_MODEL && f.ruling === 'FOLLOW-UP' ? outOfModelOf(f, { models, files: diffFiles }) : null;
-      if (oom !== null && (oom.waive || !defersBlockingSecurity)) final = { ...final, outOfModel: oom.name };
-      else if (defersBlockingSecurity) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'would defer a blocking security/data finding', cause: 'security-dismissal' };
+      const sob = f.ruling === 'FOLLOW-UP' ? sameOnBaseOf(f, regression ?? {}) : null;
+      const waived = oom?.waive === true || (sob?.waive === true && f.scope === SAME_ON_BASE);
+      // a same-on-base claim the whole-PR diff disproves (sob.waive false) waits for a human whatever the bucket or category (the arbiter files its own findings as SUGGESTION), and never stores the scope
+      const contradicted = f.scope === SAME_ON_BASE && sob !== null && sob.waive !== true;
+      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, or a line the PR adds)', cause: 'security-dismissal' };
+      else final = { ...final, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(f.scope === SAME_ON_BASE ? { scope: SAME_ON_BASE } : {}) }) };
     }
     const item = {
       id: `R${round}-F${i + 1}`,
@@ -357,8 +385,8 @@ export function finalizeWithoutArbiter(items, opts = {}) {
 // fails closed.
 // `proofCause` names why an unproven answer is unproven when it is not the plain model-proof failure ('stale-model': the proof failed on the
 // Fable floor alone).
-// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules.
-export function applyRulings(items, rulings, { proofOk, transcript, proofCause, models = [], diffFiles = null } = {}) {
+// `models` / `diffFiles`: the threat models in force and the reviewed diff (see outOfModelOf); none = today's rules. `regression` = { globs, files }: see fableFindingItems.
+export function applyRulings(items, rulings, { proofOk, transcript, proofCause, models = [], diffFiles = null, regression = null } = {}) {
   const list = Array.isArray(rulings) ? rulings : (rulings?.rulings ?? []);
   const byId = new Map(list.map((r) => [r.id, r]));
   return items.map((item) => {
@@ -397,10 +425,14 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
       next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
     } else {
       const oom = r.scope === OUT_OF_MODEL && r.ruling === 'FOLLOW-UP' ? outOfModelOf(item, { models, files: diffFiles }) : null;
-      if (dismissesBlockingSecurity && !(oom?.waive === true)) {
-        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'would dismiss a blocking security/data item', cause: 'security-dismissal' };
+      const sob = r.ruling === 'FOLLOW-UP' || r.ruling === 'REJECT' ? sameOnBaseOf(item, regression ?? {}) : null;
+      const waived = oom?.waive === true || (sob?.waive === true && r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP');
+      // see fableFindingItems: a same-on-base claim the diff disproves parks for a human whatever the bucket or category
+      const contradicted = r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' && sob !== null && sob.waive !== true;
+      if ((dismissesBlockingSecurity && !waived) || contradicted) {
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, or a line the PR adds)', cause: 'security-dismissal' };
       } else {
-        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }) };
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' ? { scope: SAME_ON_BASE } : {}) }) };
       }
     }
     return next;
@@ -972,8 +1004,11 @@ const byLabel = (item) => {
   // who reviewed it second is part of the bound Rulings row (R5-5): claude+codex | claude+substitute-opus | claude+substitute-fable
   if (by === 'claude') return item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude';
   if (by === 'arbiter' && typeof item.final?.outOfModel === 'string' && item.final.outOfModel !== '') return `arbiter (outside threat model ${asciiLine(item.final.outOfModel, 40)})`;
+  if (by === 'arbiter' && isSameOnBase(item)) return item.final.scope === SAME_ON_BASE ? 'arbiter (same as merge-base)' : 'arbiter (regression-only path)';
   return typeof by === 'string' && by !== '' ? by : 'unknown';
 };
+// An arbiter dismissal on a file review.regression_only_paths covers (final.sameOnBase, also on a cached copy): listed in the Rulings block, and a FOLLOW-UP needs its issue.
+export const isSameOnBase = (item) => typeof item?.final?.sameOnBase === 'string' && item.final.sameOnBase !== '';
 const isCriticalItem = (item) => item.bucket === 'BLOCKING' || SECURITY_CATEGORIES.includes(item.category);
 const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 
@@ -981,7 +1016,7 @@ const byIdAsc = (a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 // that was carried into later rounds is one dismissal, not several).
 function inventoryEntries(state) {
   const dismissed = allItems(state)
-    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i) || isPostMaxFinal(i) || isOwnerDeferral(i)))
+    .filter((i) => (i.final?.decision === 'REJECT' || i.final?.decision === 'FOLLOW-UP') && i.final.needsHuman !== true && (isCriticalItem(i) || isRoundCapDeferral(i) || isPostMaxFinal(i) || isOwnerDeferral(i) || isSameOnBase(i)))
     .map((i) => ({ item: i, id: String(i.id) }))
     .sort(byIdAsc);
   const listed = new Set();
@@ -1007,6 +1042,10 @@ export function rulingsInventory(state) {
 
 // The inventory rows of the dismissals CLAUDE made (final.by 'claude', or a cached copy carrying final.claude): [{ id, row }]. The gated merge route counts each as an owner item (E3).
 export const claudeRulingRows = (state) => inventoryEntries(state).filter((e) => isClaudeRuled(e.item)).map(({ id, row }) => ({ id, row }));
+
+// The inventory rows of the arbiter dismissals on a regression-only file (final.sameOnBase): [{ id, row }]. The gated merge route counts each as an owner item (#559 A2 F3), whether or not the
+// scope waived a human: the owner's "merge" is bound to the row, so a changed ruling needs a new word.
+export const sameOnBaseRows = (state) => inventoryEntries(state).filter((e) => isSameOnBase(e.item)).map(({ id, row }) => ({ id, row }));
 
 // sha256 hex of the rows joined by a newline; 'none' when there are no rulings.
 export function rulingsDigest(state) {
@@ -1185,6 +1224,9 @@ export function reviewEligibilityProblems(state) {
   // An arbiter FOLLOW-UP ruled outside a threat model (final.outOfModel) leaves the merge only through its issue, like the Claude-ruled one above (#374). Only here: roundOutcome is untouched.
   const noModelIssue = allItems(state).filter((i) => typeof i.final?.outOfModel === 'string' && i.final.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
   if (noModelIssue.length > 0) problems.push(`out-of-model follow-up(s) without a filed issue: ${noModelIssue.join(', ')} (run followups create)`);
+  // An arbiter FOLLOW-UP on a regression-only file (final.sameOnBase, review.regression_only_paths) leaves the merge only through its issue (#559). Only here: roundOutcome is untouched.
+  const noSameIssue = allItems(state).filter((i) => isSameOnBase(i) && i.final.decision === 'FOLLOW-UP' && !i.followupIssue).map((i) => i.id);
+  if (noSameIssue.length > 0) problems.push(`same-on-base follow-up(s) without a filed issue: ${noSameIssue.join(', ')} (run followups create)`);
   // A post-limit FOLLOW-UP (final.postMax: an ACCEPT the judge or arbiter made, turned into a follow-up by review.post_max_suggestions) leaves the merge only through its issue. Only here: roundOutcome is untouched.
   const noPostMaxIssue = allItems(state).filter((i) => isPostMaxFinal(i) && !i.followupIssue).map((i) => i.id);
   if (noPostMaxIssue.length > 0) problems.push(`post-limit follow-up(s) without a filed issue: ${noPostMaxIssue.join(', ')} (run followups create)`);

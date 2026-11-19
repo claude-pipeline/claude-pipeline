@@ -241,6 +241,49 @@ test('review.threat_models: valid entries are kept in order; invalid ones are re
   assert.ok(has(withModels([{ ...model(), x: 1 }]), 'unknown key: review.threat_models[0].x'));
 });
 
+test('review.regression_only_paths: default off; a list of at most 20 usable globs each covered by risk.high_risk_paths or review.arbiter_always_paths; anything else is refused naming the key', () => {
+  assert.deepEqual(validateConfig(minimal()).config.review.regression_only_paths, []);
+  assert.deepEqual(DEFAULTS.review.regression_only_paths, []);
+  const set = (regression_only_paths, extra = {}) => validateConfig({ ...minimal(), ...extra, review: { regression_only_paths, ...(extra.review ?? {}) } });
+  const inHighRisk = { risk: { high_risk_paths: ['pipeline/hooks/**', 'pipeline/lib/**'] } };
+  assert.equal(set(['pipeline/hooks/**'], inHighRisk).ok, true, 'listed in high_risk_paths');
+  assert.equal(set(['pipeline/lib/x.mjs'], inHighRisk).ok, true, 'a literal path a high_risk glob matches');
+  assert.equal(set(['src/a.js'], { review: { arbiter_always_paths: ['src/a.js'] } }).ok, true, 'listed in arbiter_always_paths');
+  assert.deepEqual(set(['pipeline/hooks/**'], inHighRisk).config.review.regression_only_paths, ['pipeline/hooks/**']);
+  for (const bad of ['x/**', [1], { a: 1 }, null]) assert.ok(has(set(bad, inHighRisk), 'review.regression_only_paths'), JSON.stringify(bad));
+  assert.ok(has(set(['a/' + '**/'.repeat(40) + 'b'], inHighRisk), 'review.regression_only_paths[0]'), 'an unusable glob');
+  const many = Array.from({ length: 21 }, (_, i) => `pipeline/lib/f${i}.mjs`);
+  assert.ok(has(set(many, inHighRisk), 'at most 20'));
+  assert.equal(set(many.slice(0, 20), inHighRisk).ok, true);
+});
+
+// F3: a glob the Fable lane never reviews would make the waiver dead text: the reviewer would judge it by the ordinary bar while the owner believes the regression-only one applies.
+test('F3 review.regression_only_paths: a glob covered by neither risk.high_risk_paths nor review.arbiter_always_paths of the same config is a config error', () => {
+  const r = validateConfig({ ...minimal(), risk: { high_risk_paths: ['pipeline/lib/**'] }, review: { regression_only_paths: ['pipeline/hooks/**'], arbiter_always_paths: ['docs/**'] } });
+  assert.equal(r.ok, false);
+  assert.ok(has(r, 'review.regression_only_paths[0] ("pipeline/hooks/**") is not covered by risk.high_risk_paths or review.arbiter_always_paths'), r.errors.join('; '));
+  assert.ok(has(validateConfig({ ...minimal(), review: { regression_only_paths: ['src/a.js'] } }), 'is not covered by'));
+});
+
+// R1-B1: each entry is matched alone, so a `!` entry would never exclude anything while its positive sibling still waived the excluded file.
+// R1-B3: a glob wider than its cover (`src/**` under `src/*`) was accepted because matchAny read it as the literal text; a wildcard entry must be listed verbatim.
+test('review.regression_only_paths: a `!` entry is refused; a glob with a wildcard or brace is covered only when listed verbatim (a literal path may be matched)', () => {
+  const set = (regression_only_paths, extra) => validateConfig({ ...minimal(), ...extra, review: { regression_only_paths, ...(extra.review ?? {}) } });
+  const all = { risk: { high_risk_paths: ['src/**', '!src/auth/**'] } };
+  assert.ok(has(set(['src/**', '!src/auth/**'], all), 'review.regression_only_paths[1] ("!src/auth/**") is a `!` exclusion'));
+  assert.equal(set(['src/**'], all).ok, true, 'the sensitive list may keep its own exclusions');
+  for (const g of ['/!src/**', './!src/**', '\\!src/**']) assert.ok(has(set([g], { risk: { high_risk_paths: ['src/**', '!src/**'] } }), 'is a `!` exclusion'), `${g} normalises to !src/**: an exclusion, never covered by the sensitive exclusion entry`);
+  assert.ok(has(set(['src/**'], { risk: { high_risk_paths: ['**'] } }), 'is not covered by'), '** lists no src/** entry');
+  assert.ok(has(set(['src/**'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'src/* does not cover src/**');
+  assert.ok(has(set(['src/{a,b}.js'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a brace entry is not a literal path');
+  assert.ok(has(set(['src/'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a trailing slash is src/**, not a literal path');
+  assert.ok(has(set(['src\\'], { risk: { high_risk_paths: ['src/*'] } }), 'is not covered by'), 'a trailing backslash is the same');
+  assert.ok(has(set(['/x'], { risk: { high_risk_paths: ['*/x'] } }), 'is not covered by'), 'a leading slash is dropped at run time: /x is the file x, which */x does not match');
+  assert.equal(set(['src/'], { risk: { high_risk_paths: ['src/'] } }).ok, true, 'verbatim');
+  assert.equal(set(['src/**'], { risk: { high_risk_paths: ['src/**'] } }).ok, true, 'verbatim');
+  assert.equal(set(['src/a.js'], { risk: { high_risk_paths: ['src/*'] } }).ok, true, 'a literal path is matched');
+});
+
 test('review.fix_verify_after_round: null or an integer 1..10; review.fix_round_max_lines: a positive integer', () => {
   const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
   for (const v of [null, 1, 3, 10]) assert.equal(set('fix_verify_after_round', v).ok, true, String(v));

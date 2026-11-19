@@ -158,6 +158,22 @@ export function resolutionBaseNote(resolution) {
   ];
 }
 
+// review.regression_only_paths of the TRUSTED default-branch config, for a Fable-lane round and the files it touches (owner-committed, so plain text). `regressionOnly` = { globs, forkPoint } or
+// null/empty: then nothing is added, so an ordinary prompt is byte-identical. The reviewer KEEPS the bucket and category it would give and only SAYS, in its reasoning, whether the problem is the same
+// on the merge base or a regression: the arbiter alone applies the bar (a reviewer that downgraded a finding here would hide it from the Rulings block and the filing gate).
+export function regressionOnlyLines(regressionOnly) {
+  const globs = (Array.isArray(regressionOnly?.globs) ? regressionOnly.globs : []).map(oneLine).filter(Boolean);
+  if (globs.length === 0) return [];
+  assertRev('regressionOnly.forkPoint', regressionOnly.forkPoint);
+  return [
+    '',
+    '## Regression-only bar',
+    `The repository owner reviews the paths below by whether this PR makes things WORSE than the merge base (\`${regressionOnly.forkPoint}\`). For each finding on a file matching them, read that file at the merge base (\`git show ${regressionOnly.forkPoint}:<path>\`) and say in your reasoning either "same on base" (the same weakness is already there, unchanged) or "regression" (this PR adds or worsens it). A file this PR adds or renames has no merge-base version: say "regression".`,
+    'Do NOT change the bucket or category because a finding is the same on base: report it as you otherwise would. A later reviewer decides what to do with it. Every other file is reviewed as above.',
+    `Paths: ${globs.join(', ')}`,
+  ];
+}
+
 // rulesRef: where the project rules are read from. Defaults to base, but the caller should pass the PR's merge base: a
 // later round's base already contains the PR's own edits.
 // baseKind 'synthetic': base is a tree id (the last reviewed head plus the base branch merged in), so the range excludes the base
@@ -171,7 +187,7 @@ export function resolutionBaseNote(resolution) {
 // brief naming them (at most SENSITIVE_LIMIT, as data in a fence: a file name is chosen by the change author).
 // confirmFixed: [{ id, title, file, detail }] of accepted items marked implemented through other files (state.mjs addRound documents
 // round.confirmFixed); the prompt asks whether each is really fixed ("## Confirm fixed", data in fences). Nothing is added when empty.
-export function buildReviewPrompt({ pr, title, body, base, head, risk, round, lightLane, priorRulings = [], rulesRef = base, largeBinaries = [], baseKind, sensitivePaths = [], resolution, confirmFixed = [], threatModels = [] }) {
+export function buildReviewPrompt({ pr, title, body, base, head, risk, round, lightLane, priorRulings = [], rulesRef = base, largeBinaries = [], baseKind, sensitivePaths = [], resolution, confirmFixed = [], threatModels = [], regressionOnly = null }) {
   assertRev('base', base);
   assertRev('rulesRef', rulesRef);
   assertRev('head', head);
@@ -225,6 +241,7 @@ export function buildReviewPrompt({ pr, title, body, base, head, risk, round, li
     );
     for (const m of models) lines.push('', `Model ${oneLine(m.name)} (paths: ${m.paths.map(oneLine).join(', ')}):`, String(m.text).trim());
   }
+  lines.push(...regressionOnlyLines(regressionOnly));
   if (resolving) lines.push(...resolutionSection(resolution, { base, head }));
   lines.push(
     '',
@@ -284,7 +301,8 @@ export const SECOND_REVIEW_SCHEMA_PATH = fileURLToPath(new URL('../schemas/secon
 // The packet for `pipeline triage second-review`: BLIND by construction. It carries the original finding and the evidence the CLI itself recorded
 // (a test it ran), nothing a judge, the arbiter or Claude concluded about it: the caller passes only those fields, and the item's `final`, `judge`,
 // `arbiter` and `secondReview` never reach this function. Every text the finding or the PR author wrote is fenced as untrusted data.
-export function buildSecondReviewPrompt({ pr, title, risk, head, items }) {
+// regressionOnly: { globs, forkPoint } for a Fable-lane round with a finding on a matched file (see regressionOnlyLines), else null: the packet is then byte-identical.
+export function buildSecondReviewPrompt({ pr, title, risk, head, items, regressionOnly = null }) {
   assertRev('head', head);
   if (!isPositiveInt(pr)) throw new Error(`invalid pr ${JSON.stringify(pr)}: expected a positive integer`);
   if (!Array.isArray(items) || items.length === 0) throw new Error('items: expected at least one finding');
@@ -324,6 +342,7 @@ export function buildSecondReviewPrompt({ pr, title, risk, head, items }) {
     }
   }
   lines.push(
+    ...regressionOnlyLines(regressionOnly),
     '',
     '## How to answer',
     'For EACH finding above, exactly once, give:',
