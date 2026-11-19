@@ -49,9 +49,14 @@ export function clickLine(result) {
     if (r.kind === 'ruling') return `${HEAD} the owner's click is recorded: ruling recorded for ${r.repo} #${r.pr}: ${(r.ids ?? []).join(', ')} (pass --owner-quote ${JSON.stringify(String(r.prompt ?? ''))})`;
     if (r.kind === 'extra-round') return `${HEAD} the owner's click is recorded: extra round for ${r.repo} #${r.pr} counted round ${r.k} head ${String(r.head).slice(0, 12)}: run P codex-review --pr ${r.pr} --round <the n from round-request>`;
     const reqs = Array.isArray(r.requests) ? r.requests : [];
-    const shown = reqs.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${String(q.head).slice(0, 12)} items ${q.items}`);
     const runs = reqs.filter((q) => q.repo).map((q) => `P merge --pr ${q.pr} --owner-go`);
-    return `${HEAD} the owner's click is recorded: "merge" for ${shown.length ? shown.join('; ') : 'no Head/items/repo request in the ask'}${runs.length ? ` — run ${runs.join(' and ')} now` : ''}`;
+    // (#585) "recorded" only when the record is usable: a request with a repo is the only kind `P merge --owner-go` accepts. (Defensive: bindAnswer refuses an empty or repo-less request before a click is recorded.)
+    if (runs.length === 0) {
+      const prs = Array.isArray(r.prs) ? r.prs.filter(Number.isInteger).map((n) => `#${n}`).join(', ') : '';
+      return `${HEAD} the owner's click binds nothing: no ${prs ? 'Head/items/repo request was bound in the ask' : 'merge request was bound in the ask'}${prs ? ` (PRs ${prs})` : ''}: run the dry run again (P merge --pr N --dry-run --owner-go) and end a reply with its closing lines, then ask the owner to type "merge"`;
+    }
+    const shown = reqs.map((q) => `${q.repo ?? '(no repo: approves nothing)'} #${q.pr} head ${String(q.head).slice(0, 12)} items ${q.items}`);
+    return `${HEAD} the owner's click is recorded: "merge" for ${shown.join('; ')} — run ${runs.join(' and ')} now`;
   }
   if (result?.declined !== undefined) return `${HEAD} the owner chose ${JSON.stringify(String(result.declined))}: nothing is approved; stop and say what stays open`;
   if (result?.refused) return `${HEAD} the click could not be verified (${result.refused}): ask the owner to type the closing words instead`;

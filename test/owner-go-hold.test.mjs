@@ -1,13 +1,13 @@
 // The needs-human hold the owner's "merge" lifts (plan 2026-11-05-chat-merge-protected, rev 4 items 2a, 5; review note 6), recorder and parser side:
 // a canonical `Hold <id> by <login> at <ISO>` line directly above a Head line that carries `· hold <id>`, the lift wording on the 🔀 line, and a record that
-// approvalGap matches against the LIVE hold exactly. Any Hold-shaped line that is not consumed exactly so makes the whole reply bind nothing.
+// approvalGap matches against the LIVE hold exactly. Any Hold-shaped line that is not consumed exactly so makes the whole reply bind nothing, except (#585) an earlier line that is an identical copy of a Hold line the terminal block consumed (a re-shown request).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
 import { readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { ownerSays } from './helpers/owner-go.mjs';
-import { approvalGap, areasBlock, ownerGoDir, areasDigest, holdBlock, holdDigest, LIFT_PHRASE, presentedRequests, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
+import { approvalGap, areasBlock, ownerGoDir, areasDigest, holdBlock, holdDigest, LIFT_PHRASE, presentedRequests, readyLine, rulingsBlockDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 
 const A = 'a'.repeat(40);
 const B = 'b'.repeat(40);
@@ -90,9 +90,85 @@ test('parser: a Hold line with prose between it and the Head line binds nothing 
   assert.equal(presentedRequests(reply('Areas R1-a', 'prose', head(A), readyLine([7]))).requests.length, 1, 'an Areas line with prose still binds without areas (PR 1)');
 });
 
-test('parser: a Hold line EARLIER in the reply (not in the terminal block) binds nothing', () => {
+test('parser: a Hold line EARLIER in the reply (not in the terminal block) binds nothing, unless it is an identical copy of the Hold line the block consumed (#585)', () => {
   nothing(reply(holdLine(), 'Some text.', head(A), readyLine([7])));
-  nothing(reply(holdLine(), 'Some text.', holdLine(), head(A, { hold: HOLD.id }), READY));
+  assert.equal(presentedRequests(reply(holdLine(), 'Some text.', holdLine(), head(A, { hold: HOLD.id }), READY)).requests.length, 1, 'an identical copy shows the owner the same event');
+});
+
+// #585: a re-shown request (the closing lines written again after a dialog, in the same turn) holds the Hold line twice. An earlier Hold line that is the SAME text as the Hold line the terminal
+// block consumed names the same GitHub event, so it voids nothing; any other canonical-prefix Hold line above the block still voids the reply.
+test('parser (#585): an earlier Hold line that is an identical copy of the consumed one does not void the request; anything else still does', () => {
+  const RUL = ['Rulings 0123456789ab', 'R1-B1 · dismissed: not a bug'];
+  const bound = (text, why) => {
+    const r = presentedRequests(text);
+    assert.equal(r.requests.length, 1, why ?? text);
+    return r.requests[0];
+  };
+  const block = [holdLine(), head(A, { hold: HOLD.id }), READY];
+  const once = bound(reply(...block), 'the block once');
+  const twice = bound(reply(...block, ...block), 'the block twice: the terminal one binds');
+  assert.deepEqual(twice, once);
+  assert.equal(twice.hold, HOLD.id);
+  assert.equal(twice.holdBlock, holdDigest(HOLD));
+  bound(reply(holdLine(), 'The hold was placed by the owner.', ...block), 'the earlier copy with prose between it and its Head');
+  bound(reply(holdLine(), 'Some text.', holdLine(), head(A, { hold: HOLD.id }), READY), 'prose, then the one block');
+  bound(reply(holdLine(), ...RUL, holdLine(), head(A, { hold: HOLD.id }), READY), 'an identical copy directly above the Rulings header');
+  // spaces and tabs around the line are not part of its text; nothing else is
+  bound(reply(`  \t${holdLine()} \t `, 'Some text.', holdLine(), head(A, { hold: HOLD.id }), READY), 'spaces and tabs at the ends of the earlier copy');
+  // another event: any difference in the id, login, time, PR prefix, case, spacing or rest voids the whole reply
+  const other = [
+    ['id', holdBlock({ ...HOLD, id: 'LE_other' })], ['login', holdBlock({ ...HOLD, login: 'someone' })], ['time', holdBlock({ ...HOLD, at: '2026-11-05T08:31:00Z' })],
+    ['PR prefix', `#7 ${holdBlock(HOLD)}`], ['case', holdBlock(HOLD).toLowerCase()], ['internal spacing', holdBlock(HOLD).replace(' by ', '  by ')], ['malformed rest', `${holdBlock(HOLD)} extra`],
+    ['non-breaking space at the end', `${holdBlock(HOLD)} `], ['vertical tab at the end', `${holdBlock(HOLD)}\v`],
+  ];
+  for (const [what, line] of other) nothing(reply(line, 'Some text.', ...block), `an earlier Hold line that differs in the ${what}`);
+  // nothing consumed it: the identical line only ABOVE, the terminal block has no Hold line / no hold field
+  nothing(reply(holdLine(), 'Some text.', head(A), readyLine([7])), 'the terminal block holds no Hold line');
+  nothing(reply(holdLine(), 'Some text.', head(A), readyLine([7], { lift: false })), 'a plain request');
+  // directly above the block (no prose between): it becomes part of the block, two Hold lines in a row
+  nothing(reply(holdLine(), ...block), 'two Hold lines in a row');
+  // a first block with no 🔀 line of its own, right above the second: two Head lines for the PR
+  nothing(reply(holdLine(), head(A, { hold: HOLD.id }), ...block), 'a duplicate Head for the PR');
+});
+
+test('parser (#585): the several-PR form: an identical `#N Hold` copy is tolerated, a copy with another prefix or of a Hold line nothing consumed is not', () => {
+  const ready = '🔀 Ready to merge #7, #8 and lift their needs-human holds — say "merge"';
+  const hold8 = { ...HOLD, id: 'LE_eight' };
+  const both = [holdLine(HOLD, 7), head(A, { pr: 7, hold: HOLD.id }), holdLine(hold8, 8), head(B, { pr: 8, hold: hold8.id }), ready];
+  assert.equal(presentedRequests(reply(...both)).requests.length, 2);
+  assert.equal(presentedRequests(reply(...both, 'Some text.', ...both)).requests.length, 2, 'both blocks twice');
+  assert.equal(presentedRequests(reply(holdLine(HOLD, 7), 'Some text.', ...both)).requests.length, 2, 'an identical copy of #7\'s Hold line');
+  nothing(reply(holdLine(HOLD, 8), 'Some text.', ...both), '#7\'s Hold line copied with #8\'s prefix');
+  nothing(reply(holdBlock(HOLD), 'Some text.', ...both), '#7\'s Hold line copied without its prefix');
+  // an unlisted PR's block and a duplicate-PR block: their Hold lines were consumed by nothing, so a copy above voids the reply
+  const unlisted = [holdLine(hold8, 8), head(B, { pr: 8, hold: hold8.id }), holdLine(HOLD, 7), head(A, { pr: 7, hold: HOLD.id }), readyLine([7], { lift: true })];
+  assert.equal(presentedRequests(reply(...unlisted)).requests.length, 1, 'the unlisted #8 pair neither binds nor forbids');
+  nothing(reply(holdLine(hold8, 8), 'Some text.', ...unlisted), 'a copy of the unlisted PR\'s Hold line');
+  const dup = [holdLine(), head(A, { hold: HOLD.id }), holdLine(), head(A, { hold: HOLD.id }), READY];
+  nothing(reply(holdLine(), 'Some text.', ...dup), 'a copy of a duplicate-PR block\'s Hold line');
+});
+
+test('parser (#585): CRLF replies bind with an identical copy above; a lone carriage return in the copy does not', () => {
+  const block = [holdLine(), head(A, { hold: HOLD.id }), READY];
+  const crlf = (...lines) => lines.join('\r\n');
+  assert.equal(presentedRequests(crlf(...block, ...block)).requests.length, 1, 'CRLF: the split removes the line ends');
+  assert.equal(presentedRequests(crlf(holdLine(), 'Some text.', ...block)).requests.length, 1);
+  nothing(`${holdLine()}\r\r\nSome text.\n${block.join('\n')}`, 'a lone \\r at the end of the earlier copy');
+  nothing(reply(holdLine().replace(' by ', '\rby '), 'Some text.', ...block), 'a lone \\r inside the earlier copy');
+});
+
+test('parser (#585): the full re-shown shape, Rulings + Areas + Hold + Head + 🔀 twice, binds the terminal block with its rulings digest and areas', () => {
+  const RUL = ['Rulings 0123456789ab', 'R1-B1 · dismissed: not a bug', 'R2-S3 · dismissed: fixed'];
+  const block = [...RUL, 'Areas R1-a', holdLine(), head(A, { hold: HOLD.id }), READY];
+  const once = presentedRequests(reply(...block)).requests[0];
+  assert.ok(once?.rulings && once.areas && once.hold, JSON.stringify(once));
+  const twice = presentedRequests(reply(...block, ...block));
+  assert.deepEqual(twice.requests, [once]);
+  assert.equal(once.rulings, rulingsBlockDigest(RUL.join('\n')));
+  assert.equal(once.areas, areasDigest(['R1-a']));
+  assert.deepEqual(presentedRequests(reply(...block, 'Some text.', ...block)).requests, [once]);
+  // an Areas line left above does not matter to this rule (it is plain prose there), but a Hold copy that differs still voids the whole reply
+  nothing(reply(...block.map((l) => (l.startsWith('Hold ') ? holdBlock({ ...HOLD, login: 'other' }) : l)), ...block), 'the first block names another actor');
 });
 
 test('parser: Hold above Areas (wrong order) binds nothing', () => {

@@ -9,8 +9,9 @@
 // because a hook-filled answer could carry source user_temporary and annotations {} like a click, with only its reasonCode (hook:PreToolUse, a person's is unknown) telling them apart. On 2.1.323
 // a dialog that comes with prefilled answers (the model's own `answers`, or a PreToolUse hook answering "ask" or returning only updatedInput) is not submitted by Claude Code: it waits for a
 // person (the owner's 2026-11-16T13:42Z full run: open 56-59 s until the recording script cancelled it, an error result with no answer and no stamp). The whole-object check stays as defence in depth, and the
-// model's own `answers` is refused by the tool-use shape check below. The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for, and whose `answers` / `annotations` / `afkTimeoutMs` Claude Code adds itself on 2.1.323 and are never read: the entry lands 100-200 ms after the
-// hook starts). Hooks that could still answer the dialog are the dialog-hook check's business (B5, hookCheck below, T2): this file takes it as an injected function.
+// model's own `answers` is refused by the tool-use shape check below (and, when the model's tool_use is already in the transcript at capture, before any pointer is written). The transcript is the evidence, never the PostToolUse hook input (which the recorder only polls the transcript for: the entry lands 100-200 ms after the
+// hook starts). (#585) On 2.1.323 that hook input is inferred, from the transcript evidence of three live clicks (no hook payload was captured), to carry the permission component's `answers` and `annotations` next to the model's `questions`:
+// capture accepts those two keys by SHAPE only and never reads their values; it no longer refuses a PreToolUse `updatedInput.answers` that a person then confirms, which hookCheck (dialog hooks approved) and the HUMAN_DECISION stamp cover. Hooks that could still answer the dialog are the dialog-hook check's business (B5, hookCheck below, T2): this file takes it as an injected function.
 // What binds is the question TEXT: it is the typed path's closing block, so the answer goes through the SAME parsers the typed prompt does (approvalBinding, roundBinding, rulingBinding in
 // owner-go.mjs), and the ask file supplies only what a typed prompt cannot: one-time use, supersession, expiry, the dialog hash and the issue-time hook fingerprint.
 // Write order (#472). On 2.1.322 the answer's entry is in the transcript within 100-200 ms of the PostToolUse hook starting, so recordClick finds it by polling and records at once. On 2.1.323 it is written
@@ -623,16 +624,42 @@ const clickFile = (askId, clickId, ext, home) => (ASK_ID_RE.test(String(askId)) 
 // and the ask file when a consumer reads, through the same clickEvidence and admitClick core. The one thing the pointer carries that the transcript cannot is the dialog-hook check's result
 // (`hookLayersSha256`, taken at the click: hooks that could answer the dialog are checked when the dialog is answered, not when someone reads), plus `capturedAt` for the time rules; both are taken
 // on the PostToolUse hook's word (guard-files refuses a tool write to owner-go/** and a direct hand-run of the click libraries: a path, program text, a stdin program; a script file that imports them is the residual named at the top of this file,
-// and it skips only this dialog-hook result). What is refused here, no pointer: a tool_input that is
-// not one canonical question of this ask (a key beyond questions / metadata / the three Claude Code adds itself, another dialog: only ever an EARLIER refusal, the tool_response is never read), an expired, superseded or already spent ask, and hooks that
-// are unchecked, offending or changed since the ask.
-// On 2.1.323 the PostToolUse tool_input of AskUserQuestion is the permission dialog's updatedInput, { ...input, answers, annotations, ...(afkTimeoutMs && { afkTimeoutMs }) }: a genuine click always carries
-// `answers` and `annotations` there. Their VALUES are never read (the transcript is the evidence); the transcript's own tool_use input stays questions / metadata only (clickEvidence), which is what
-// refuses the model's prefilled `answers`.
-const HOOK_INPUT_KEYS = new Set(['questions', 'metadata', 'answers', 'annotations', 'afkTimeoutMs']);
+// and it skips only this dialog-hook result).
+// What is refused here, no pointer: a tool_input that is not one canonical question of this ask (keys beyond questions / metadata / answers / annotations, a malformed answers / annotations, another dialog:
+// only ever an EARLIER refusal, the tool_response is never read), a model-prefilled tool_use that is already in the transcript, an expired, superseded or already spent ask, and hooks that are unchecked, offending or changed since the ask.
+// (#585) On Claude Code 2.1.323 the PostToolUse tool_input is, from the transcript evidence of three live clicks (no hook payload was captured: the key names are an inference, a wrong guess shows in the `tool-use-shape: keys ...`
+// reason), the input AFTER the permission component filled it: `questions` plus `answers` and `annotations`. Capture therefore accepts those two keys, checks only their SHAPE and never reads their VALUES: nothing here is decided by
+// them, settlePendingClicks reads the transcript. This also no longer refuses a PreToolUse `updatedInput.answers` that a person then confirms; that case is covered by hookCheck (dialog hooks approved) and the HUMAN_DECISION stamp at
+// settle time, and a model-prefilled `answers` is refused at settle (clickEvidence's tool-use shape) and, when its tool_use is already in the transcript, here before any pointer is written.
+const HOOK_INPUT_KEYS = ['questions', 'metadata', 'answers', 'annotations'];
+const KEY_NAME_RE = /^[A-Za-z_][A-Za-z0-9_]{0,31}$/;
+// The reason for a hook tool_input that is not the shape above, or null. Names the unexpected keys (bounded: at most 4, a name that is not a plain identifier shows as `?`) so a harness change is visible in the hook line.
+function hookInputShape(shown) {
+  if (!isObj(shown)) return 'tool-use-shape';
+  const extra = Object.keys(shown).filter((k) => !HOOK_INPUT_KEYS.includes(k));
+  if (extra.length > 0) return `tool-use-shape: keys ${extra.slice(0, 4).map((k) => (KEY_NAME_RE.test(k) ? k : '?')).join(',')}`;
+  if (!Array.isArray(shown.questions) || shown.questions.length !== 1) return 'tool-use-shape';
+  const question = shown.questions[0]?.question;
+  if (Object.hasOwn(shown, 'answers') && (!isObj(shown.answers) || !Object.entries(shown.answers).every(([k, v]) => k === question && typeof v === 'string'))) return 'tool-use-shape: answers';
+  if (Object.hasOwn(shown, 'annotations') && !isObj(shown.annotations)) return 'tool-use-shape: annotations';
+  return null;
+}
+// (#585) The model's own tool_use entry for this id, when it is already in the transcript, must have the shape clickEvidence demands (keys within questions / metadata, one question): a model-prefilled `answers` is refused before a
+// pointer is written. Entry absent (or the transcript unreadable): not refused here, settle still refuses it.
+function modelInputRefused(transcriptPath, toolUseId) {
+  const uses = [];
+  const scan = scanBackwards(transcriptPath, (e) => {
+    if (e?.type === 'assistant') for (const b of blocksOf(e)) if (b?.type === 'tool_use' && b.id === toolUseId) uses.push(b);
+    return false;
+  }, (line) => line.includes(toolUseId), SCAN);
+  if (scan === null || uses.length === 0) return false;
+  return uses.some((b) => b.name !== 'AskUserQuestion' || !isObj(b.input) || !Object.keys(b.input).every((k) => k === 'questions' || k === 'metadata') || !Array.isArray(b.input.questions) || b.input.questions.length !== 1);
+}
 async function captureClick({ input, ask, askId, session, toolUseId, transcriptPath, cwd, home, now, hookCheck }) {
   const shown = input.tool_input;
-  if (!isObj(shown) || !Object.keys(shown).every((k) => HOOK_INPUT_KEYS.has(k)) || !Array.isArray(shown.questions) || shown.questions.length !== 1) return { refused: 'tool-use-shape' };
+  const shape = hookInputShape(shown);
+  if (shape !== null) return { refused: shape };
+  if (modelInputRefused(transcriptPath, toolUseId)) return { refused: 'tool-use-shape' };
   const dialog = canonicalDialog(shown.questions[0]);
   if (dialog === null) return { refused: 'dialog-not-canonical' };
   if (sha256(JSON.stringify(dialog)) !== ask.dialogSha256) return { refused: 'dialog-differs' };
