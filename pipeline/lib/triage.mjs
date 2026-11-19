@@ -1422,6 +1422,12 @@ export function capLowDeferral(state, { config, baseConfig, files, grants, grant
   if (stray.length > 0) refusals.push(`accepted items not implemented that this round did not accept: ${idList(stray)}`);
   const built = ids.filter((id) => !o.unimplemented.includes(id));
   if (built.length > 0) refusals.push(`already implemented: ${idList(built)}`);
+  // Every OTHER implemented accept must be proven in the last reviewed head too (as deferEligibility, refusal 2b): a fix marked after that round can be reverted while the state says implemented.
+  for (const i of allItems(state)) {
+    if (i.final?.decision === 'ACCEPT' && i.implemented === true && !asked.has(i.id) && !markedBefore(i, rounds)) {
+      refusals.push(`${i.id} is an accepted fix marked implemented that is not proven to be in the last reviewed head (it was marked after that round, or the state does not say when): taking the deferral would hide it, so run the round`);
+    }
+  }
   const held = roundsAwaitingFixReview(rounds).flatMap((r) => r.items ?? []).filter((i) => isObject(i?.final) && settleTestable(i));
   if (held.length > 0) refusals.push(`${held.map((i) => i.id).join(', ')}: the judge dismissed it, but a settle test is still possible, which may make it an accepted fix`);
   refusals.push(...grantRefusals(reviewed + 1, grants, grantGap));

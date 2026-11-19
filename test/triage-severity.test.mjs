@@ -508,6 +508,18 @@ test('cap-low: one non-low accept, or anything else open, defers nothing (the ex
   assert.equal(cap(capState([low1]), { baseConfig: null }).apply, false, 'the trusted config unreadable');
 });
 
+test('cap-low: an earlier accept marked implemented AFTER the last counted round is not proven in the reviewed head, so nothing is deferred (a revert would drop the BLOCKING fix behind a clean review)', () => {
+  // Failure caught: R1's BLOCKING fix is marked built after round 2 reviewed (out of order), then reverted to restore round 2's content; round 2's one low accept would be deferred and the review would read clean without that fix.
+  const blocking = item({ id: 'R1-B1', round: 1, bucket: 'BLOCKING', category: 'bug', file: 'src/new.js', implemented: true, implementedAfterRound: 2 });
+  const low = unbuilt({ id: 'R2-S1', round: 2, file: 'src/a.js' });
+  const state = capState([], { maxRounds: 2, rounds: [round(1, [blocking]), round(2, [low])] });
+  const v = cap(state, { baseConfig: { ...BASE, review: { ...BASE.review, max_rounds: 2 } } });
+  assert.equal(v.apply, false);
+  assert.match(v.refusals.join(';'), /R1-B1 is an accepted (BLOCKING or security )?fix marked implemented that is not proven/);
+  const proven = capState([], { maxRounds: 2, rounds: [round(1, [{ ...blocking, implementedAfterRound: 1 }]), round(2, [low])] });
+  assert.equal(cap(proven, { baseConfig: { ...BASE, review: { ...BASE.review, max_rounds: 2 } } }).apply, true, 'a fix marked before round 2 still defers the low accept');
+});
+
 test('cap-low: only exactly at the limit; an unreadable hash, an under-limit or an over-limit state refuses', () => {
   const x = unbuilt();
   assert.equal(cap(capState([x], { maxRounds: 2 })).apply, false, 'reviewed < max');
