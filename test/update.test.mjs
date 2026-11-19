@@ -417,15 +417,15 @@ test('update warns when the install is not an ancestor of main', async () => {
 
 test('the upstream constants', () => {
   assert.equal(UPSTREAM_HOST, 'github.com');
-  assert.equal(UPSTREAM_REPO, 'ianjamila/claude-pipeline');
-  assert.equal(UPSTREAM_URL, 'https://github.com/ianjamila/claude-pipeline');
+  assert.equal(UPSTREAM_REPO, 'claude-pipeline/claude-pipeline');
+  assert.equal(UPSTREAM_URL, 'https://github.com/claude-pipeline/claude-pipeline');
 });
 
 test('mainSha: gh first (pinned host + repo), then git ls-remote; both failing names both reasons', () => {
   const { sha, bare } = remote();
   const ok = ghFor(sha);
   assert.deepEqual(mainSha({ env: envFor(ok), home: scratch('cp-upd-mshome') }), { ok: true, sha, via: 'gh' });
-  assert.deepEqual(ok.lines(), [`api --hostname github.com repos/ianjamila/claude-pipeline/commits/main --jq .sha`]);
+  assert.deepEqual(ok.lines(), [`api --hostname github.com repos/claude-pipeline/claude-pipeline/commits/main --jq .sha`]);
 
   const down = createFakeGh([{ match: '.*', stderr: 'HTTP 502', code: 1 }]);
   assert.deepEqual(mainSha({ env: envFor(down, { PIPELINE_UPDATE_REMOTE: bare }), home: scratch('cp-upd-mshome') }), { ok: true, sha, via: 'git' });
@@ -454,7 +454,7 @@ test('compare: short shas are accepted and the answer carries the full ones; the
   const head = 'b'.repeat(40);
   const fake = createFakeGh([{ match: 'compare/', stdoutJson: cmp('ahead', base, head) }]);
   assert.deepEqual(compare('aaaaaaa', 'bbbbbbb', { env: envFor(fake) }), { status: 'ahead', baseSha: base, headSha: head });
-  assert.deepEqual(fake.lines(), [`api --hostname github.com repos/ianjamila/claude-pipeline/compare/aaaaaaa...bbbbbbb`]);
+  assert.deepEqual(fake.lines(), [`api --hostname github.com repos/claude-pipeline/claude-pipeline/compare/aaaaaaa...bbbbbbb`]);
 });
 
 test('compare: a truncated commit list does not pass for the head; a full-length head still resolves', () => {

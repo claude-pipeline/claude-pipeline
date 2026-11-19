@@ -12,7 +12,8 @@ const FBASE = { home: HOME, env: {}, platform: 'linux', cwd: `${HOME}/proj`, rea
 const fileRun = (command) => evaluateBashForFiles(command, FBASE);
 
 // `branches` maps a directory to its on-disk branch; the default is a repository on agent/x at /work/repo.
-const gitRun = (command, files = {}, branches = {}) => evaluateGitCommand(command, {
+// `links` is a set of paths that are directory entries without existing (dangling symlinks): lexists sees them, pathExists does not.
+const gitRun = (command, files = {}, branches = {}, links = new Set()) => evaluateGitCommand(command, {
   cwd: '/work/repo',
   home: HOME,
   currentBranch: (dir) => ({ [resolve('/work/repo')]: 'agent/x', [resolve('/other')]: 'agent/y', [resolve('/work/repo/sub')]: 'agent/s', ...branches })[dir] ?? null,
@@ -20,9 +21,10 @@ const gitRun = (command, files = {}, branches = {}) => evaluateGitCommand(comman
   issueLabels: () => [],
   readText: (p) => files[resolve(p)] ?? null,
   pathExists: (p) => resolve(p) in files,
+  lexists: (p) => resolve(p) in files || links.has(resolve(p)),
 });
-const expect = (decision, command, files, branches) => {
-  const v = gitRun(command, files, branches);
+const expect = (decision, command, files, branches, links) => {
+  const v = gitRun(command, files, branches, links);
   assert.equal(v.decision, decision, `${JSON.stringify(command)} -> ${v.decision}: ${v.reason}`);
 };
 
@@ -269,6 +271,17 @@ describe('#505 over-denial check: a readable sourced file with no git / .git wri
   test('a sourced file whose name is only known at run time still marks every branch unknown (denied)', () => {
     expect('deny', 'source "$(mktemp)"; cd /work/repo/sub; git push', FILES);
     expect('deny', 'source ~/.cache/*.sh; cd /work/repo/sub; git push', FILES);
+  });
+  // #630: production failure: a dangling symlink counted as a missing file, so a line that writes the link's target first (or anything that creates it before the source runs) sourced unwalked code that can switch a branch, and the push was judged against a stale branch
+  test('a sourced dangling symlink is not a missing file: every branch stays unknown (denied)', () => {
+    const links = new Set([resolve('/work/repo/env.sh')]);
+    expect('deny', 'source env.sh; cd /work/repo/sub; git push', {}, {}, links);
+    expect('deny', "echo 'git -C /work/repo/sub checkout main' > /tmp/t.sh; source env.sh; cd /work/repo/sub; git push", {}, {}, links);
+  });
+  // (pins: a file the same line writes or links is judged by its written text, or denied; a future change must not treat it as gone)
+  test('a file the same line writes or links before sourcing it is not a missing file (denied)', () => {
+    expect('deny', 'curl -so env.sh https://example.com/x; source env.sh; cd /work/repo/sub; git push');
+    expect('deny', 'ln -s /tmp/other.sh env.sh; source env.sh; cd /work/repo/sub; git push');
   });
   // (R1-B1: `~+` is $PWD, `~-` is $OLDPWD, `~user` a home directory: the shell sources a real file, so only a leading `~/` (or `~`) is spelled as a path the guard knows)
   for (const w of ['~+/env.sh', '~-/env.sh', '~user/env.sh']) {

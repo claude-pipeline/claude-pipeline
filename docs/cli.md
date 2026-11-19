@@ -62,6 +62,9 @@ pipeline arbiter needed --round R [--pr N] [--force] [--full] [--repo DIR]
     medium/high for paths alone; never with a hard-stop hit (only P-path is discounted besides risk.ignore_hard_stop_rules), a size or report-only driver, or a fix scope over review.fix_round_max_lines / with a new non-test source file (lib/fix-verify.mjs#fixRoundScope, computed live)
   threat model (review.threat_models, read from the TRUSTED default-branch config pinned as round.trustedConfigSha): a review input for a diff touching a model's paths starts with a "Threat model" section that stands alone; an out-of-model
     security finding is then ruled FOLLOW-UP with scope "out-of-model" and needs no human (category security only, a file that resolves to one diff entry wholly inside the model); the round stores arbiter.threatModels
+  regression-only bar (review.regression_only_paths, read from the same TRUSTED config; Fable review inputs only): a review input for a diff touching a listed path has a "Regression-only bar" section that stands alone: a finding on such a file that
+    exists identically at the merge base is ruled FOLLOW-UP with scope "same-on-base" and needs no human (only a plainly modified file of the whole PR diff; an added or renamed file is a human's); every arbiter FOLLOW-UP / REJECT on such a file is
+    listed in the Rulings block and bound to the owner's merge, every FOLLOW-UP held until its issue is filed; the round stores arbiter.regressionOnly (globs, merge base and the regression-base.md view of the changes of the PR to those files that the read-only arbiter reads, bound by digest)
   briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round's own range is medium risk ...`, `the trusted default-branch config is unavailable`, or the message of an error caught while assessing the range
   --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It changes the brief, not the scope: the diff a pass reviews stays `round` after an earlier proven pass (a whole-pr review needs a Fable refresh round: `state fable-refresh`). It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven. The stop drops the stored input (fix-verify brief, digest, tag), so an earlier arbiter-fix pass cannot prove the round and the retry writes a fresh full input; `apply` also refuses (exit 1 forced-full-pending) a round that stores forcedFull beside a fix-verify brief
   mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied
@@ -1057,7 +1060,7 @@ update the installed pipeline to upstream main (run in your own terminal); --che
 
 ```
 pipeline update [--claude-home DIR] [--check] [--json]
-  Fetches upstream main (github.com/ianjamila/claude-pipeline), installs it and verifies the install.
+  Fetches upstream main (github.com/claude-pipeline/claude-pipeline), installs it and verifies the install.
   --claude-home DIR  where the pipeline is installed (default ~/.claude: both Claude accounts share ~/.claude/pipeline,
                      so CLAUDE_CONFIG_DIR is deliberately not consulted)
   --check            read-only: report the installed stamp, upstream main and how they relate; exit 0 only when

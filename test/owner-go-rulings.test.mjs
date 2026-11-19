@@ -397,6 +397,32 @@ test('gated route: a Claude dismissal is an owner item (ownerMerge, review-rulin
   assert.match(noIssue.detail, /without a filed issue/);
 });
 
+// F3 (#559 A2). Failure caught: a BLOCKING security finding the arbiter waived as "same as the merge base" (no human, no Claude) rides along on the owner's merge unseen, because only
+// Claude-made dismissals counted as owner items at the gated route.
+test('gated route: an arbiter dismissal marked sameOnBase (a waived BLOCKING security FOLLOW-UP, or a plain REJECT) is an owner item with its own review-ruling line; an unmarked one adds nothing; a changed ruling changes the item', async () => {
+  const waived = arbiterItem({ id: 'R1-B3', fingerprint: 'fp-3', bucket: 'BLOCKING', category: 'security', title: 'Unchecked path', followupIssue: 'https://github.com/acme/widgets/issues/9',
+    final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'same code on the base', sameOnBase: 'src/**' } });
+  const got = await reviewOf([waived]);
+  assert.equal(got.ok, true, got.detail);
+  assert.equal(got.ownerMerge, 1);
+  assert.match(got.ownerItems[0], /^review-ruling R1-B3 [0-9a-f]{12}$/);
+  assert.match(got.detail, /1 same-as-merge-base ruling\(s\).*owner-merge: R1-B3/);
+  const row = rulingsBlock(rulingState({ hash: 'h', items: [waived] })).split('\n')[1];
+  assert.equal(got.ownerItems[0].split(' ')[2], createHash('sha256').update(row).digest('hex').slice(0, 12), 'bound to the Rulings row');
+  const both = await reviewOf([claudeItem(), waived]);
+  assert.equal(both.ownerMerge, 2);
+  assert.deepEqual(both.ownerItems.map((l) => l.split(' ')[1]), ['R1-B1', 'R1-B3']);
+  const unmarked = await reviewOf([arbiterItem({ id: 'R1-B3', fingerprint: 'fp-3', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'same code on the base' }, followupIssue: 'https://github.com/acme/widgets/issues/9' })]);
+  assert.equal(unmarked.ownerMerge, undefined);
+  const changed = await reviewOf([{ ...waived, final: { ...waived.final, reason: 'another reason' } }]);
+  assert.notEqual(changed.ownerItems[0], got.ownerItems[0], 'a changed reason is a changed row');
+  const moved = await reviewOf([{ ...waived, final: { ...waived.final, decision: 'REJECT' } }]);
+  assert.notEqual(moved.ownerItems[0], got.ownerItems[0]);
+  const unfiled = await reviewOf([{ ...waived, followupIssue: null }]);
+  assert.equal(unfiled.ok, false);
+  assert.match(unfiled.detail, /same-on-base follow-up\(s\) without a filed issue: R1-B3/);
+});
+
 test('gated route: the final gate counts the Claude dismissal; a changed ruling after the owner said "merge" is refused by the owner-item compare; the record needs no Rulings block', async (t) => {
   const s = scenario({ state: null });
   saveState(s.repo.dir, rulingState({ hash: s.hash, items: [claudeItem()] }));

@@ -154,6 +154,15 @@ export function threatModelsFor(files, config) {
     && files.some((f) => pathsOf(f).some((p) => matches(p, m.paths))));
 }
 
+// review.regression_only_paths: the globs that match any old OR new path of a changed file (diffFiles entries), in config order, each once. Pure and total like threatModelsFor:
+// no config, no list or a malformed one means none (today's behaviour); a bad `files` is a TypeError.
+export function regressionOnlyFor(files, config) {
+  if (!Array.isArray(files)) throw new TypeError('regressionOnlyFor: files must be an array');
+  const list = config?.review?.regression_only_paths;
+  if (!Array.isArray(list)) return [];
+  return list.filter((g) => typeof g === 'string' && files.some((f) => pathsOf(f).some((p) => matches(p, [g]))));
+}
+
 // Which reviewer follows Codex. `fable`: one Fable pass per round that rules on every Codex item AND reviews the diff itself
 // (agents/arbiter.md), for a medium or high PR or one touching a sensitive path (risk.high_risk_paths or
 // review.arbiter_always_paths, matched like high_risk_paths). `judge`: the Sonnet judge, for everything else.

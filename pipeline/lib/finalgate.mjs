@@ -24,7 +24,7 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { claudeRulingRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
+import { claudeRulingRows, sameOnBaseRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
 import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
@@ -697,12 +697,18 @@ export function reviewCheck({ root, config, pr, repo, diff, hash, hashError, own
   const shownRuled = (i) => `${i.id} "${clip(String(i.final.ownerQuote).replace(/\s+/g, ' ').trim(), OWNER_QUOTE_SHOWN)}"${isOwnerDeferral(i) ? ` (defers ${['arbiter', 'judge', 'cache'].includes(i.final.ownerDeferral.accepted) ? i.final.ownerDeferral.accepted : 'unknown'} ACCEPT, not fixed)` : ''}`;
   // E3: a dismissal CLAUDE made (not the arbiter, the judge or a test) is an owner item too: the owner's "merge" is bound to its inventory row, so a changed ruling needs a new word.
   const claudeRulings = claudeRulingRows(state);
-  if (claudeRulings.length > 0) {
-    const claudeItems = claudeRulings.map(({ id, row }) => `review-ruling ${id} ${createHash('sha256').update(row).digest('hex').slice(0, 12)}`);
+  // #559 A2 F3: an arbiter dismissal on a review.regression_only_paths file (final.sameOnBase: "same as the merge base", waived or not) is an owner item too, bound to its inventory row like a Claude one.
+  // A row Claude made AND marked is one item, not two.
+  const sameRulings = sameOnBaseRows(state).filter((r) => !claudeRulings.some((c) => c.id === r.id));
+  if (claudeRulings.length > 0 || sameRulings.length > 0) {
+    const rowItems = (rows) => rows.map(({ id, row }) => `review-ruling ${id} ${createHash('sha256').update(row).digest('hex').slice(0, 12)}`);
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map(shownRuled);
     const ruledNote = ruled.length > 0 ? `; ${ruled.length} owner-ruled item(s), owner-merge: ${shown.join('; ')}${ruled.length > OWNER_RULED_SHOWN ? '; ...' : ''}` : '';
-    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${ruledNote}; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${claudeRulings.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${claudeRulings.length > OWNER_RULED_SHOWN ? ', ...' : ''}${subNote}${grantNote}`,
-      ruled.length + claudeRulings.length + subItems.length, [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...claudeItems, ...subItems]);
+    const idsNote = (rows) => `${rows.slice(0, OWNER_RULED_SHOWN).map((c) => c.id).join(', ')}${rows.length > OWNER_RULED_SHOWN ? ', ...' : ''}`;
+    const claudeNote = claudeRulings.length > 0 ? `; ${claudeRulings.length} Claude-made dismissal(s), owner-merge: ${idsNote(claudeRulings)}` : '';
+    const sameNote = sameRulings.length > 0 ? `; ${sameRulings.length} same-as-merge-base ruling(s) (review.regression_only_paths), owner-merge: ${idsNote(sameRulings)}` : '';
+    return check('review', true, `review valid for content ${short(hash)}${exemptNote}${bypassNote}${ruledNote}${claudeNote}${sameNote}${subNote}${grantNote}`,
+      ruled.length + claudeRulings.length + sameRulings.length + subItems.length, [...ruled.map((i) => `review ${i.id} ${createHash('sha256').update(String(i.final.ownerQuote)).digest('hex').slice(0, 12)}`), ...rowItems(claudeRulings), ...rowItems(sameRulings), ...subItems]);
   }
   if (ruled.length > 0) {
     const shown = ruled.slice(0, OWNER_RULED_SHOWN).map(shownRuled).join('; ');
