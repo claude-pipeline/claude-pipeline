@@ -1185,3 +1185,11 @@ test('ci.merge_checks defaults to [] (frozen), must be an array of strings, and 
   // ci-wait waits for them, but branch protection / `protect` / the final gate list must not start requiring them
   assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: false, merge_checks: ['Replay from zero'] }), ['build']);
 });
+
+test('review.cap_low_accepts: defaults to defer; defer|extra-round only (a typo must not silently turn the deferral on or off)', () => {
+  assert.equal(validateConfig(minimal()).config.review.cap_low_accepts, 'defer');
+  assert.equal(DEFAULTS.review.cap_low_accepts, 'defer');
+  const set = (v) => validateConfig({ ...minimal(), review: { cap_low_accepts: v } });
+  for (const v of ['defer', 'extra-round']) assert.equal(set(v).ok, true, v);
+  for (const v of ['off', 'follow-up', '', 1, null, true]) assert.ok(set(v).errors?.some((e) => e.includes('review.cap_low_accepts must be one of defer|extra-round')), String(v));
+});

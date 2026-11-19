@@ -729,3 +729,19 @@ test('cap-defer: accepts carried by a later resolution-only round are deferred t
   assert.deepEqual([pub.json.capDeferral.applied, pub.json.capDeferral.rounds, pub.json.outcome.clean, pub.json.outcome.capDeferred], [false, [2], true, ['R1-S1', 'R2-S1']]);
   assert.equal(issuePosts(w), 2, 'one issue per item, none twice');
 });
+
+test('cap-defer: a publish that fails AFTER the deferral was saved (GitHub write down) is retried by rerunning round publish: the deferral stands, one comment, one issue', (t) => {
+  const w = capWorld(t);
+  w.fake.setFail({ write: true });
+  const first = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assert.notEqual(first.code, 0);
+  assert.deepEqual([first.json.step, first.json.ran], ['comment', ['cap-defer']]);
+  assert.equal(w.item('R1-S1').final.postMax.rule, 'cap-low', 'saved locally before the comment failed');
+  w.fake.setFail({});
+  w.prHead(w.head);
+  const again = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assertExit(again, 0, again.stderr + again.stdout);
+  assert.deepEqual([again.json.capDeferral.applied, again.json.capDeferral.ids, again.json.outcome.clean], [false, ['R1-S1'], true]);
+  assert.equal(w.fake.comments().length, 1);
+  assert.equal(issuePosts(w), 1);
+});
