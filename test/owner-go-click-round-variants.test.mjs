@@ -14,7 +14,7 @@ import { HEAD, ITEMS, REPO, world } from './helpers/click-world.mjs';
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { STATE_VERSION_CLICK_DIALOG, SUPPORTED_STATE_VERSION, requiredStateVersion, withStateVersion } from '../pipeline/lib/state.mjs';
 import { clickLine } from '../pipeline/hooks/lib/owner-go-click-hook.mjs';
-import { issuedRoundVariant } from '../pipeline/lib/round-ask.mjs';
+import { issuedRoundVariant, roundDialogVariant } from '../pipeline/lib/round-ask.mjs';
 
 const GHEAD = 'abcdef0123456789abcdef0123456789abcdef01';
 const LINE = roundRequest(58, 4, GHEAD, REPO);
@@ -414,9 +414,21 @@ test('hook lines: a Follow-up instruction says it is no grant and names defer-fi
   assert.equal(pend(undefined), pend('round-v2-extra-round'), 'legacy and the extra-round variant keep today\'s wording');
 });
 
-test('the lever and the issued variant: B1 issues the legacy dialog whatever the environment says; only the exact value "legacy" is read at all', () => {
-  // failure caught: B1 issuing a dialog the installed verifier on another machine cannot read yet (every ask stays round-v1 until B2)
-  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'legacy' }, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env }), 'round-v1');
+test('roundDialogVariant and the lever: the first option follows the summary\'s recommendation (a blocking loop wins, no recommendation and no loop is legacy); only the exact value "legacy" narrows', () => {
+  // failure caught: a dialog whose "(Recommended)" label disagrees with the summary's Recommended: line (e.g. a grant-first dialog after a display failure), or a lever that does not narrow / narrows on a near-miss
+  const loop = { blockingLoop: true };
+  const calm = { blockingLoop: false };
+  assert.equal(roundDialogVariant('follow-up', calm), 'round-v2-follow-up');
+  assert.equal(roundDialogVariant('follow-up', null), 'round-v2-follow-up');
+  assert.equal(roundDialogVariant('extra-round', calm), 'round-v2-extra-round');
+  assert.equal(roundDialogVariant('follow-up', loop), 'round-v2-park');
+  assert.equal(roundDialogVariant('extra-round', loop), 'round-v2-park');
+  assert.equal(roundDialogVariant(undefined, loop), 'round-v2-park', 'a display failure with a blocking loop still recommends stopping');
+  assert.equal(roundDialogVariant(undefined, calm), 'round-v1');
+  assert.equal(roundDialogVariant(undefined, null), 'round-v1', 'a display failure with no loop: the legacy dialog, no recommendation');
+  assert.equal(roundDialogVariant('park', calm), 'round-v1', 'an unknown recommendation is no recommendation');
+  assert.equal(issuedRoundVariant({ env: { PIPELINE_ROUND_DIALOG: 'legacy' }, recommend: 'follow-up', longReview: loop }), 'round-v1');
+  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env, recommend: 'follow-up' }), 'round-v2-follow-up');
 });
 
 test('followUpClickState: an older unreadable ask with a click stays unverified until a newer follow-up ask of the PR has a verified click after it, then the newer click decides', async (t) => {
