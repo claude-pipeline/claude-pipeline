@@ -88,7 +88,7 @@ function world(t, { baseYml = yml(), prYml, parentYml, prBase = 'main' } = {}) {
   };
   return w;
 }
-const finding = (over = {}) => ({ bucket: 'BLOCKING', category: 'security', title: 'unchecked path', file: 'src/a.js', line: 12, detail: 'the same unchecked path is on the base', ruling: 'FOLLOW-UP', confidence: 'high', reasoning: 'same on base', scope: 'same-on-base', ...over });
+const finding = (over = {}) => ({ bucket: 'BLOCKING', category: 'security', title: 'unchecked path', file: 'src/a.js', line: 5, detail: 'the same unchecked path is on the base', ruling: 'FOLLOW-UP', confidence: 'high', reasoning: 'same on base', scope: 'same-on-base', ...over });
 const prompt = (w) => readFileSync(join(w.repo.dir, '.review', ['round', 1].join('-'), 'prompt.md'), 'utf8');
 
 test('review input: a listed path touched by the diff adds a standing-alone Regression-only bar section (before the review section) naming the merge base, and stores the globs and the merge base', (t) => {
@@ -98,10 +98,18 @@ test('review input: a listed path touched by the diff adds a standing-alone Regr
   assert.match(text, /\n# Regression-only bar \(from \.claude\/pipeline\.yml on the base branch\)\n/);
   assert.ok(text.indexOf('# Regression-only bar') < text.indexOf('# Fable review, round 1'));
   assert.match(text, /OVERRIDES "Review as an attacker", "prefer ACCEPT"/);
-  assert.ok(text.includes(`git show ${w.base}:<path>`), 'the merge base is named');
+  // R1-F1: the arbiter has no shell, so the merge-base view is a file in the round directory, named with its digest in the digest-bound input
+  assert.doesNotMatch(text, /git show/);
+  const regressionOnly = w.state().rounds[0].arbiter.regressionOnly;
+  const { basePath, baseDigest } = regressionOnly;
+  assert.ok(text.includes(`${basePath} (sha256 ${baseDigest})`), 'the merge-base view is named with its digest');
+  const view = readFileSync(basePath, 'utf8');
+  assert.match(view, new RegExp(`${w.base}\\.\\.${w.head}`));
+  assert.match(view, /## src\/a\.js \(status M\)[^]*-12: export const v12 = 12;[^]*\+12: export const v12 = compute\(x\.y\);/);
+  assert.match(view, /## src\/new\.js \(status A/);
   assert.match(text, /"scope": "same-on-base"/);
   assert.match(text, /Paths: src\/\*\*/);
-  assert.deepEqual(w.state().rounds[0].arbiter.regressionOnly, { globs: ['src/**'], forkPoint: w.base });
+  assert.deepEqual([regressionOnly.globs, regressionOnly.forkPoint], [['src/**'], w.base]);
 });
 
 // Failure caught: an empty key changing every arbiter input (and so every digest) of a repo that never turned the bar on.
@@ -142,6 +150,22 @@ test('apply: a same-on-base BLOCKING security finding on a plainly modified file
   const filed = structuredClone(s);
   filed.rounds[0].items[0].followupIssue = 'https://github.com/o/r/issues/5';
   assert.deepEqual(reviewEligibilityProblems(filed), []);
+});
+
+// R1-F1. Failure caught: a weakness this PR itself added (line 12 is a line the PR changed) ruled "same on base" by an arbiter that could not see the merge base, and merged without a human.
+test('apply: a same-on-base ruling on a line the PR itself adds is never waived; the merge-base view file is bound to the input (edited -> the proof fails)', (t) => {
+  const w = world(t);
+  const needed = w.round1();
+  const applied = w.apply(needed, { rulings: [], findings: [finding({ line: 12 })] });
+  assertExit(applied, 0, applied.stdout);
+  const item = w.state().rounds[0].items.find((i) => i.id === 'R1-F1');
+  assert.deepEqual([item.final.needsHuman, item.final.cause], [true, 'security-dismissal']);
+  const w2 = world(t);
+  const n2 = w2.round1();
+  writeFileSync(w2.state().rounds[0].arbiter.regressionOnly.basePath, '# edited\n');
+  const bad = w2.apply(n2, { rulings: [], findings: [finding()] });
+  assert.notEqual(bad.code, 0);
+  assert.match(bad.stdout, /regression-base\.md no longer matches the digest/);
 });
 
 // F4. Failure caught: new code in a file the PR adds, ruled "same as base" (the base never held it), merged without a human.

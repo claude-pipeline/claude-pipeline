@@ -85,6 +85,7 @@ test('F4 applyRulings: an added file, a rename (into or inside the matched paths
     'binary entry': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { binary: true })]],
     // R1-B2: --text prints a binary file as text, so `binary` stays false; git's numstat verdict (`gitBinary`) and the entry kind decide
     'binary by git numstat (shown as text by --text)': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { gitBinary: true })]],
+    'line the PR itself adds (R1-F1 backstop)': [{ file: 'pipeline/hooks/a.mjs', line: 4 }, [entry('pipeline/hooks/a.mjs', { added: [{ line: 4, text: 'x' }] })]],
     'symlink entry': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { symlink: true })]],
     'submodule entry': [{ file: 'pipeline/hooks/a.mjs' }, [entry('pipeline/hooks/a.mjs', { gitlink: true })]],
     'climbs out': [{ file: 'pipeline/hooks/../../etc/passwd' }, FILES],

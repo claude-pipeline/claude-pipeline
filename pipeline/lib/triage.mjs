@@ -122,7 +122,8 @@ const regressionAmong = (globs, paths) => regressionOnlyFor(paths.map((p) => ({ 
 // bucket, category or scope (so the Rulings block lists it, the filing gate holds a FOLLOW-UP until its issue is filed and the owner's merge is bound to it). `waive` is true only when
 // the BLOCKING-security needsHuman exception may apply: `files` (the PR's WHOLE diff from the merge base, git.mjs#diffFiles entries) holds exactly ONE entry for the file, it is a plain
 // modification (status M: not an added file, a rename or a copy, so the path exists at the merge base and the arbiter could compare it; not a binary file by git's own numstat verdict (`gitBinary`: --text hides it
-// in `binary`), a symlink or a submodule, which have no text to compare), old and new path are the one clean repo path, and it
+// in `binary`), a symlink or a submodule, which have no text to compare; and the cited line is not one the PR itself ADDS in that whole-PR diff: a weakness it added in an earlier round is no
+// pre-existing one), old and new path are the one clean repo path, and it
 // matches a glob. Anything else: no waiver, today's rule.
 function sameOnBaseOf(item, { globs, files } = {}) {
   if (!Array.isArray(globs) || globs.length === 0 || typeof item.file !== 'string' || item.file === '') return null;
@@ -130,7 +131,7 @@ function sameOnBaseOf(item, { globs, files } = {}) {
   if (hit === undefined) return null;
   const entries = Array.isArray(files) && locationProblem(item.file) === null ? files.filter((f) => entryPaths(f).includes(item.file)) : [];
   const only = entries.length === 1 ? entries[0] : null;
-  const waive = only !== null && only.status === 'M' && only.binary !== true && only.gitBinary !== true && only.symlink !== true && only.gitlink !== true && only.oldPath === item.file && only.newPath === item.file && regressionAmong(globs, entryPaths(only)).length > 0;
+  const waive = only !== null && only.status === 'M' && only.binary !== true && only.gitBinary !== true && only.symlink !== true && only.gitlink !== true && !(Array.isArray(only.added) && only.added.some((a) => a.line === item.line)) && only.oldPath === item.file && only.newPath === item.file && regressionAmong(globs, entryPaths(only)).length > 0;
   return { name: hit, waive };
 }
 
