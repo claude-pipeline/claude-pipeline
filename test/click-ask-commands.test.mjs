@@ -2,7 +2,7 @@
 // (run(argv, ctx)) with a temp account home (ctx.home, the same seam `pipeline owner-go` has) so the asks, the dialog-hook list and the owner-go folder are never the developer's real ones.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cli, ghEntries, PR, REPO, scenario, ymlFor } from './helpers/gate-env.mjs';
@@ -10,7 +10,7 @@ import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { toPosix } from '../pipeline/lib/paths.mjs';
 import { presentedRequests, presentedRoundRequest, presentedRuling, readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
-import { asksDir, readAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { asksDir, issueAsk, readAsk, roundAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { run as mergeRun, dryRunMany, withAsk } from '../pipeline/commands/merge.mjs';
 import { run as triageRun } from '../pipeline/commands/triage.mjs';
 
@@ -277,6 +277,35 @@ test('triage round-request --ask: the question is the title and exactly the prin
   assert.deepEqual(q.options.map((o) => o.label), ['No', 'Yes, one more round']);
   assert.equal(presentedRoundRequest(q.question).pr, PR);
   assert.equal(readAsk(r.output.ask.askId, { home }).ask.kind, 'round');
+});
+
+test('triage round-request --ask: the issued ask is still the legacy one byte for byte (v 1, no variant key, dialogVariant round-v1) with and without PIPELINE_ROUND_DIALOG=legacy; a reader from before the variants takes it and refuses a v 2 ask', async () => {
+  // failure caught: B1 issuing an ask an installed pipeline on another machine (pre-variants readAsk: `a.v !== 1` refuses) cannot read, so the owner's click records nothing; or the lever changing what is issued
+  const s = triageWorld();
+  const home = newHome();
+  const KEYS = ['v', 'askId', 'kind', 'repo', 'prs', 'dialog', 'dialogSha256', 'actions', 'issuedAt', 'hookLayersSha256'];
+  // the structural part of the readAsk predicate as it was before the variants (`a?.v !== 1` refuses); the installed-dialog check is not part of what this pins
+  const oldReaderTakes = (a) => a?.v === 1 && typeof a.askId === 'string' && ['merge', 'merge-many', 'round', 'ruling'].includes(a.kind) && typeof a.repo === 'string' && Array.isArray(a.prs) && typeof a.actions === 'object' && typeof a.dialog === 'object' && typeof a.dialogSha256 === 'string' && typeof a.issuedAt === 'string';
+  const fileOf = (askId) => JSON.parse(readFileSync(join(asksDir(home), `${askId}.json`), 'utf8'));
+  const issued = [];
+  let line;
+  for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'legacy' }]) {
+    const r = await triageRun(['round-request', '--pr', String(PR), '--ask'], { cwd: s.repo.dir, env: { ...baseEnv(s), ...env }, home, managedPaths: [] });
+    assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+    assert.equal(r.output.dialogVariant, 'round-v1');
+    line = r.output.line;
+    const raw = fileOf(r.output.ask.askId);
+    assert.deepEqual(Object.keys(raw), KEYS, 'the legacy key set, in the legacy order');
+    assert.equal(raw.v, 1);
+    assert.equal(oldReaderTakes(raw), true, 'a pre-variants reader accepts what the lever and the default issue');
+    assert.deepEqual(r.output.ask.questions[0].options.map((o) => o.label), ['No', 'Yes, one more round']);
+    issued.push({ ...raw, askId: 'x', issuedAt: 'x', dialogSha256: 'x', dialog: { ...raw.dialog, question: raw.dialog.question.replace(raw.askId, 'x') } }); // (the id is in the question text and so in its hash)
+  }
+  assert.deepEqual(issued[0], issued[1], 'the lever changes nothing in what is issued');
+  const v2 = issueAsk({ ...roundAsk({ repo: 'acme/widgets', pr: PR, line, variant: 'round-v2-extra-round' }), home });
+  assert.ok(v2.askId, JSON.stringify(v2));
+  assert.equal(fileOf(v2.askId).v, 2);
+  assert.equal(oldReaderTakes(fileOf(v2.askId)), false, 'a v 2 ask is what a pre-variants reader refuses (so nothing issues one before the verifier is everywhere)');
 });
 
 test('triage round-request --ask: label mode refuses as before (no ask); click off and an unapproved hook give ask null + askSkipped', async () => {
