@@ -218,6 +218,26 @@ test('P cost --from-transcript: the transcript usage is booked, explicit amounts
   assertExit(costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/missing.jsonl']), 2);
 });
 
+// A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
+test('P cost --from-transcript: booking a continued agent\'s transcript again books only the new usage (total = the whole transcript once)', () => {
+  const s = scenario();
+  const msg = (id, n) => `${JSON.stringify({ message: { id, model: 'claude-sonnet-4-5', usage: { input_tokens: n, output_tokens: 2 * n, cache_read_input_tokens: 3 * n, cache_creation_input_tokens: 4 * n } } })}\n`;
+  s.repo.write('.review/agent-a1.jsonl', msg('m1', 10));
+  const first = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
+  assertExit(first, 0);
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5));
+  const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl', '--output', '1']);
+  assertExit(second, 0);
+  const t = second.json.cost.total;
+  assert.deepEqual([t.input, t.output, t.cacheRead, t.cacheWrite, t.calls], [15, 31, 45, 60, 2], 'the whole transcript once, plus the hand output');
+  assert.equal(t.usd, (() => { const sc = scenario(); sc.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5)); return costCli(sc, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']).json.cost.total.usd; })(), 'USD too');
+  // a third booking with nothing new adds no tokens
+  withComment(s, existing(written(s)));
+  const third = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
+  assert.deepEqual([third.json.cost.total.input, third.json.cost.total.output], [15, 31]);
+});
+
 test('P cost: USD from list prices (--model, transcript models); --usd wins; tokens with no price warn', () => {
   const s = scenario();
   const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--input', '1000000', '--model', 'sonnet']);

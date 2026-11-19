@@ -91,6 +91,38 @@ export function addCostEntry(cost, entry) {
   return next;
 }
 
+// A transcript already booked for this PR (an agent continued by SendMessage is booked after each leg): only what it gained since the last booking is new. `booking` = { key, usage }, usage the
+// transcript's WHOLE totals ({input, output, cacheRead, cacheWrite, usd, byPrice}); the ledger cost.transcripts[key] keeps what was booked. Returns { cost, entry } with the entry's amounts reduced by the
+// booked ones (never below 0; hand amounts the caller added on top stay) and the ledger set to the whole totals. The ledger keeps the last MAX_TRANSCRIPTS keys.
+const MAX_TRANSCRIPTS = 200;
+export function deductBookedTranscript(cost, entry, booking) {
+  const key = String(booking?.key ?? '');
+  if (!/^[\w.-]{1,120}$/.test(key)) throw new Error('transcript key must be a plain file name');
+  const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
+  const ledger = isPlainObject(next.transcripts) ? next.transcripts : {};
+  const before = isPlainObject(ledger[key]) ? ledger[key] : null;
+  const usage = booking.usage;
+  const sub = (now, was) => Math.max(0, (Number(now) || 0) - (Number(was) || 0));
+  const out = { ...entry };
+  if (before) {
+    for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = sub(entry[k], before[k]);
+    out.usd = Math.round(sub(entry.usd, before.usd) * 1e6) / 1e6;
+    if (isPlainObject(entry.byPrice)) {
+      out.byPrice = {};
+      for (const [price, b] of Object.entries(entry.byPrice)) {
+        const was = isPlainObject(before.byPrice?.[price]) ? before.byPrice[price] : {};
+        const d = Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'messages'].map((k) => [k, sub(b[k], was[k])]));
+        if (d.messages > 0 || d.input + d.output + d.cacheRead + d.cacheWrite5m + d.cacheWrite1h > 0) out.byPrice[price] = d;
+      }
+    }
+  }
+  delete ledger[key];
+  ledger[key] = { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, usd: usage.usd, byPrice: structuredClone(usage.byPrice ?? {}) };
+  for (const old of Object.keys(ledger).slice(0, Math.max(0, Object.keys(ledger).length - MAX_TRANSCRIPTS))) delete ledger[old];
+  next.transcripts = ledger;
+  return { cost: next, entry: out };
+}
+
 export function addSessions(cost, ids) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
   for (const id of ids ?? []) {
