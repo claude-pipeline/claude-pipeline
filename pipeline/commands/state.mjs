@@ -20,7 +20,7 @@ import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch, trustedDefaultBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { DEFERRABLE_ACCEPT_BY, arbiterFailures, countsTowardCap, finalIsReopenable, isDeferrableAccept, isOwnerDeferral, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
-import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
+import { newerFormatText, pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   adoptPublishedGrants, roundDir, stateExtends, withStateLock,
@@ -298,6 +298,9 @@ async function showLocked(values, n, pr, root, ctx) {
     }
     const found = await recoverState(root, pr, ctx, gh);
     state = found.state;
+    if (!state && found.newerFormat) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', newerFormat: true, message: `cannot rebuild the review state from PR #${pr}: ${newerFormatText(found.newerFormat)}` });
+    }
     if (!state) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: `no local review state and no triage comment with state on PR #${pr}` });
     }
@@ -320,6 +323,7 @@ async function showLocked(values, n, pr, root, ctx) {
       warnings.push(`GitHub unavailable: the local review state was not compared with the published triage comment (${String(err.message).split('\n')[0].slice(0, 200)})`);
       source = 'local-unverified';
     }
+    if (found?.newerFormat) warnings.push(`the local review state was not compared with the published triage comment: ${newerFormatText(found.newerFormat)}`);
     // The PR moving off this copy's baseline by owner grants alone (another checkout published one) is not a change of decisions: the grants are adopted below,
     // and, whatever else this copy holds that the PR lacks, the PR then differs from what this copy last saw by those grants only.
     const seen = found?.state ? readBaseline(root, pr) : null;

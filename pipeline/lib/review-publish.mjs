@@ -17,7 +17,7 @@ import path from 'node:path';
 import { EXIT } from './cli.mjs';
 import { Fail } from './cmd-common.mjs';
 import { MARKERS, triageComment } from './render.mjs';
-import { decodeFromComment } from './state.mjs';
+import { SUPPORTED_STATE_VERSION, decodeFromComment, newerFormatInComment } from './state.mjs';
 import { REVIEW_COMPLETE_MARKER, latestReviewComment } from './review-marker.mjs';
 import { canonicalJson, compareHistory, historyDiff, historyPreserved, reviewDir, sha256, stateExtends, writeJson } from './review-context.mjs';
 
@@ -29,6 +29,7 @@ const startsWithAny = (c, markers) => typeof c?.body === 'string' && markers.som
  * Reads the PR's comments once. -> {
  *   state: the newest VIEWER-authored triage comment's state for this PR, or null; hash: reviewContentHash(state) or null,
  *   undecodable: such a comment exists but holds no readable state for this PR,
+ *   newerFormat: { version } when that comment is a state FOR THIS PR written by a newer pipeline (version above SUPPORTED_STATE_VERSION), else null; undecodable stays true then,
  *   history: the viewer ever posted a triage or review-complete comment (the review skill has run for this PR),
  *   marker: latestReviewComment(...) over the viewer's comments ({found:false} | {found, comment, record, reason}) }
  * Only comments of ours count: a quoted or forged marker in someone else's comment (or in the middle of ours) must never become the state.
@@ -43,6 +44,8 @@ export function readPublished(gh, pr) {
   const newest = triage.at(-1);
   const decoded = newest ? decodeFromComment(newest.body) : null;
   const state = decoded && decoded.pr === pr ? decoded : null;
+  const newerRaw = state === null && newest ? newerFormatInComment(newest.body) : null;
+  const newerFormat = newerRaw !== null && newerRaw.pr === pr ? { version: newerRaw.version } : null;
   const meLower = String(me).toLowerCase();
   const marker = latestReviewComment(
     comments.map((c) => ({ id: c.id, by: c.user?.login, at: c.created_at, updated: c.updated_at, body: c.body })),
@@ -52,6 +55,7 @@ export function readPublished(gh, pr) {
     state,
     hash: state ? reviewContentHash(state) : null,
     undecodable: newest !== undefined && state === null,
+    newerFormat,
     history: mine.some((c) => startsWithAny(c, [MARKERS.triage, REVIEW_COMPLETE_MARKER])),
     marker,
   };
@@ -92,6 +96,9 @@ export function establishBaseline({ gh, root, pr, state, published }) {
 
 // ---- the swap -------------------------------------------------------------------------------------------------------------------------
 
+// What to do about a triage comment a newer pipeline wrote: never publish over it or restore from it, update this install.
+export const newerFormatText = ({ version }) => `the PR's triage comment was written by a newer pipeline (state version ${version}; this install reads up to ${SUPPORTED_STATE_VERSION}): run \`pipeline update\` first, then try again; publishing from here would erase its review history`;
+
 const RETRY_SHOW = (pr) => `run \`pipeline state show --pr ${pr}\` to restore the published state here, then redo this decision`;
 
 const roundsText = (ns) => `round${ns.length === 1 ? '' : 's'} ${ns.join(', ')}`;
@@ -103,6 +110,7 @@ export const lossText = ({ lostRounds, lostGrants }) => [
 
 /**
  * Publishes `state` as the PR's triage comment, under the caller's review lock. -> { action: 'created' | 'updated' | 'unchanged', id?, url? }.
+ * Throws Fail(EXIT.FAILED, {ok:false, error:'newer-format', reason}) BEFORE any write when the PR's triage comment holds a state of a newer version than this install reads (history it cannot see).
  * Throws Fail(EXIT.FAILED, {ok:false, error:'stale-publication', reason}) when the PR holds a different state than this copy last published
  * (or, with no usable baseline for this PR, one this copy does not extend: a state from an older CLI is still allowed to move forward). Throws GhError
  * when GitHub fails (the caller decides: exit 3, or "local result stands").
@@ -111,6 +119,7 @@ export const lossText = ({ lostRounds, lostGrants }) => [
  */
 export function publishTriage({ gh, root, pr, state, replaceGrants = [] }) {
   const published = readPublished(gh, pr);
+  if (published.newerFormat) throw new Fail(EXIT.FAILED, { ok: false, error: 'newer-format', reason: newerFormatText(published.newerFormat), pr });
   const mine = reviewContentHash(state);
   if (published.state !== null && published.hash !== mine) {
     // Before the baseline question, and on both paths: a baseline equal to the PR's hash proves only that this copy saw it, not that it kept it.
@@ -154,6 +163,7 @@ export function publishTriage({ gh, root, pr, state, replaceGrants = [] }) {
 export function assertPublishedHistory({ gh, pr, state }) {
   const published = readPublished(gh, pr);
   if (published.undecodable) {
+    if (published.newerFormat) throw new Fail(EXIT.USAGE, { ok: false, error: 'history-unreadable', newerFormat: true, message: newerFormatText(published.newerFormat) });
     throw new Fail(EXIT.USAGE, {
       ok: false, error: 'history-unreadable',
       message: `the PR's triage comment holds no readable review state, so the published history cannot be compared with this copy: look at the triage comment on PR #${pr}; if it is damaged, publish this copy's state with \`pipeline comment --pr ${pr} --kind triage\``,
@@ -188,6 +198,7 @@ export function assertPublishedHistory({ gh, pr, state }) {
  */
 export function pastRoundHistoryProblem({ local, published, pr, tolerateGrants = false }) {
   if (published.undecodable) {
+    if (published.newerFormat) return { diff: null, problem: { error: 'history-unreadable', message: newerFormatText(published.newerFormat) } };
     return { diff: null, problem: { error: 'history-unreadable', message: `the PR's triage comment holds no readable review state, so the published history cannot be compared with this copy: look at the triage comment on PR #${pr}` } };
   }
   if (published.state === null) {

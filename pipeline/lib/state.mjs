@@ -195,10 +195,10 @@ export function encodeForComment(state) {
   return `<!-- claude-pipeline:state:${gzipSync(Buffer.from(JSON.stringify(withRequiredVersion(state)))).toString('base64')} -->`;
 }
 
-// Bad data of any kind yields null, never an exception: resume must fall back to a fresh review,
-// not crash on someone's edited comment. The LAST marker wins so that quoted or forged markers
-// earlier in a body cannot override the real one the pipeline writes at the end.
-export function decodeFromComment(body) {
+// The state in the comment's LAST marker, or null for bad data of any kind (never an exception): resume must fall back to a fresh review,
+// not crash on someone's edited comment. The LAST marker wins so that quoted or forged markers earlier in a body cannot override the real one
+// the pipeline writes at the end. Its version is NOT judged here (decodeFromComment / newerFormatInComment do).
+function decodeLastMarker(body) {
   if (typeof body !== 'string') return null;
   const matches = [...body.matchAll(STATE_MARKER)];
   if (matches.length === 0) return null;
@@ -207,10 +207,23 @@ export function decodeFromComment(body) {
     const state = JSON.parse(raw.toString('utf8'));
     // Anything that is not recognisably a review state (an array of rounds, a real PR number) is
     // treated as garbage, so a hand-edited comment cannot feed resume a half-made state.
-    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 && !newerThanSupported(state) ? state : null;
+    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 ? state : null;
   } catch {
     return null;
   }
+}
+
+// A state of a version this installation does not read is null here, like any other bad data (newerFormatInComment tells the two apart).
+export function decodeFromComment(body) {
+  const state = decodeLastMarker(body);
+  return state !== null && !newerThanSupported(state) ? state : null;
+}
+
+// The comment's last marker holds a real review state written by a NEWER pipeline: { version, pr }; null for anything else (damaged, readable, no marker).
+// Publishing over it would erase history this install cannot read, so callers refuse and say "update the pipeline", never "restore" or "publish".
+export function newerFormatInComment(body) {
+  const state = decodeLastMarker(body);
+  return state !== null && newerThanSupported(state) ? { version: state.version, pr: state.pr } : null;
 }
 
 // reviewBase / reviewBaseKind: what the round was actually diffed against (see git.mjs#effectiveReviewBase); baseOnly: the
