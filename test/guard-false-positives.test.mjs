@@ -468,6 +468,8 @@ test('7a: a per-command `PATH=x cmd` prefix is not a second assignment of $PATH 
   for (const cmd of ['PATH=/x; PATH=/y; echo $PATH | sh', 'F=a; F=b; bash $F', 'cd /work/repo && F=run.sh eval "bash $F"', 'f() { echo; }; cd /work/repo && PATH=/x:$PATH gh pr view 1']) {
     assert.equal(gitOf(cmd).decision, 'deny', cmd);
   }
+  // (a prefix on `export` persists: B is main afterwards; the command's own words read the F of the line, not the prefix's: node runs a.mjs)
+  for (const cmd of ['B=agent/x; B=main export B; git push origin "$B"', 'F=a.mjs; F=b.mjs node $F', 'F=a.sh; F=b.sh node $F']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
   assert.equal(gitOf('PATH=/evil:$PATH git push origin main').decision, 'deny');
   assert.equal(gitOf('cd /work/repo && PATH=/evil:$PATH git push origin main').decision, 'deny');
 });
@@ -480,6 +482,8 @@ test('11: `while read p` in a pipe stage binds p once, like `while read pid a b`
   // deny controls: a value read at run time still cannot be a command word, nor a pushed ref
   assert.equal(gitOf('echo push | while read G; do $G push origin main; done').decision, 'deny');
   assert.equal(gitOf('git branch -r | while read b; do git push origin $b; done').decision, 'deny');
+  // a value read at run time that reaches eval or a shell's script stays unknown
+  for (const cmd of ['cat commands.txt | while read cmd; do eval "$cmd"; done', 'while read f; do bash "$f"; done < list']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
   // (outside a loop, a name assigned elsewhere, or a read with options stays unknown)
   for (const cmd of ['read f; echo hi | sh -c $f', 'f=a; ls | while read f; do ps -p $f; done; bash $f', 'ls | while read -p x f; do ps -p $f; done']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
 });

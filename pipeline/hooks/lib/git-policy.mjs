@@ -2516,13 +2516,15 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
       const plainRead = baseName(c.argv[0]) === 'read' && (c.loops?.length ?? 0) > 0 && c.argv.slice(1).every((a) => /^(?:-r|[A-Za-z_][A-Za-z0-9_]*)$/.test(a));
       for (const a of c.argv.slice(1)) {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(a);
-        if (m) bump(m[1], plainRead ? 1 : 2);
+        if (m) bump(m[1], plainRead && readLandsAsData(cmds, m[1]) ? 1 : 2);
       }
     }
     for (const k of implicitBindsOf(c)) implicit.add(k); // (`read` sets REPLY, `getopts` OPTARG, `[[ =~ ]]` MATCH, `k[0]=`, `$_` …: see implicitBindsOf)
     // (a prefix assignment, `PATH=x gh pr view 1`, sets the name in that command's own environment only (withPrefixEnv judges the command with it): it is no assignment of this shell,
     // unless the command evaluates words in this shell or the line defines a function, which sees it, as before. Replay 11-19: `cd d && PATH=/opt/homebrew/bin:$PATH gh pr view 1` was refused)
-    if (!(c.argv.length > 0 && topLevelLocal && readsOnlyData(c))) for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
+    // (R1: only when the name is read by no other word of the line (`B=main export B` leaves B set here, and `F=b.mjs node $F` expands the $F of the line, not the prefix's), and not on a builtin whose prefix persists)
+    const prefixLocal = c.argv.length > 0 && topLevelLocal && readsOnlyData(c) && !PREFIX_PERSISTS.has(baseName(c.argv[0]));
+    for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k]) && (!prefixLocal || readElsewhere(cmds, k, c))) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
       // Why: -L / -R / -Z / -i change the value the text gives (width cut, arithmetic): unknown too. -l / -u are applied where the value is recorded; declared
@@ -2571,6 +2573,26 @@ function bindsRunTimeName(c) {
   if (!VALUE_BINDERS.has(nm)) return false;
   if (nm === 'printf' && !words.some((w) => /^-[A-Za-z]*v/.test(w))) return false;
   return words.some((w) => DYNAMIC.test(w));
+}
+// R1: builtins whose prefix assignment outlives the command (bash: `B=main export B` leaves B set; POSIX mode: all the special builtins).
+const PREFIX_PERSISTS = new Set(['export', ':', 'set', 'unset', 'shift', 'return', 'exit', 'break', 'continue', 'times']);
+const wordReads = (w, k) => { for (const m of String(w).matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)) if (m[1] === k) return true; return false; };
+const wordsOf = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')];
+// Is $k read by a word of the line other than the value of the prefix `k=` of `own` itself?
+const readElsewhere = (cmds, k, own) => cmds.some((d) => [...d.argv, ...Object.entries(d.env ?? {}).filter(([ek]) => !(d === own && ek === k)).map(([, ev]) => ev), ...(d.redirects ?? []).map((r) => r.target ?? '')].some((w) => wordReads(w, k)));
+// Commands that run one of their words as code or a script (or hand it on to a command): the shells and eval / source (EVALUATES_HERE), the interpreters, awk / sed programs, wrappers.
+const CODE_TAKERS = new Set(['node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'php', 'lua', 'tsx', 'ts-node', 'bunx', 'pnpx', 'npx', 'awk', 'gawk', 'mawk', 'nawk', 'sed', 'env', 'xargs', 'nohup', 'time', 'timeout', 'nice', 'sudo', 'find', 'watch']);
+// R1: a plain loop `read NAME` gives NAME one value only known at run time, judged where it lands (see collectAssignments): only a data argument qualifies. A value that is a command word, reaches
+// eval / source or a shell's or interpreter's script / code position, or a name the shell, git or gh read for themselves stays unknown (unsure).
+function readLandsAsData(cmds, k) {
+  if (SPECIAL_NAMES.test(k)) return false;
+  for (const c of cmds) {
+    if (!c.argv.length) continue;
+    if (wordReads(c.argv[0], k)) return false;
+    const nm = baseName(c.argv[0]);
+    if ((EVALUATES_HERE.has(nm) || CODE_TAKERS.has(nm)) && wordsOf(c).some((w) => wordReads(w, k))) return false;
+  }
+  return true;
 }
 // Every `$NAME` / `${NAME…}` the line's words, prefixes and redirections read.
 function namesReadOn(cmds) {
