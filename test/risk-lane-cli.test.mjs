@@ -124,6 +124,9 @@ test('codex-review: the judge PR that gains a hit in round 2 escalates, and that
   const round = w.state().rounds[1];
   assert.equal(round.fableRequired, true);
   assert.deepEqual([round.reviewBase, round.reviewBaseKind], [w.base, 'whole-pr']);
+  // Failure caught: `stats rounds` counted this whole-PR round as an `unknown` conflict-resolution refusal, because nothing on the round said it was a judge-to-Fable escalation (#539).
+  assert.equal(round.escalated, true);
+  assert.equal(w.state().rounds[0].escalated, undefined);
 });
 
 test('codex-review: a PR once on Fable stays on Fable, whatever a later round rates', (t) => {

@@ -142,13 +142,14 @@ function reportFromState(root, state, round) {
   };
 }
 
+// resolutionIneligible: codex-review prints the proof's refusal as code plus detail; the report carries the short code only, as the recorded round does (reportFromState).
 function reportFromOutput(json) {
   return {
     ok: true,
     codex: {
       counts: json.counts, codexPath: json.path,
       ...(json.baseOnly ? { baseOnly: true } : {}), ...(json.resolutionOnly ? { resolutionOnly: true } : {}),
-      ...(typeof json.reviewKind === 'string' ? { reviewKind: json.reviewKind } : {}), ...(typeof json.resolutionIneligible === 'string' ? { resolutionIneligible: json.resolutionIneligible } : {}),
+      ...(typeof json.reviewKind === 'string' ? { reviewKind: json.reviewKind } : {}), ...(typeof json.resolutionIneligible === 'string' ? { resolutionIneligible: json.resolutionIneligible.split(':')[0] } : {}),
     },
     reviewer: json.reviewer,
     ...(Array.isArray(json.warnings) && json.warnings.length > 0 ? { warnings: json.warnings } : {}),

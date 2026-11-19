@@ -429,7 +429,9 @@ test('round-request nextRound: after a clean merge of the default branch the alt
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [{ merges: 1, ownCommits: 1 }, 'synthetic']);
-  assert.match(r.json.nextRound.alternative, /a free base-only recording may then follow \(the default branch merges cleanly; run round-request again after the revert to confirm\) \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)$/);
+  assert.match(r.json.nextRound.alternative, /a free base-only recording may then follow \(the default branch merges cleanly; run round-request again after the revert to confirm; if that still predicts a counted round, the revert did not make it free: do not revert again\) \(unless the reviewer escalates from judge to Fable, or the PR does not target the default branch: then it is a counted round, whole-PR when the reviewer escalates\)$/);
+  // asciiLine cuts a prediction line at 500 characters: the end of this caveat is what the owner reads before reverting, so it must not be cut.
+  for (const line of r.json.summary.split('\n').filter((l) => l.startsWith('Prediction:'))) assert.ok(!line.endsWith('...'), `a prediction line was cut: ${line}`);
 });
 
 // Failure caught: a clean synthetic base was taken as proof of a free recording, but a merged TOPIC branch keeps its changes in the range after the revert, so the round is counted.

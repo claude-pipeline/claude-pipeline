@@ -464,6 +464,19 @@ test('every JSON of a call for an already recorded round carries pickedUp: true,
   assert.equal(r.json.pickedUp, true);
 });
 
+// Failure caught: a whole-PR fallback round read from the job's output reports `history-nonmerge: <detail>` while the same round read back from the state reports `history-nonmerge`, so the two paths of `round codex` disagree.
+test('the report from the job output carries the short resolutionIneligible code, as the report from the state does', { skip: process.platform === 'win32' }, async (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const emit = emitter(w);
+  assertExit(w.codex(1, findingsOf([], [low()])), 0);
+  const outJson = JSON.stringify({ ok: true, counts: { blocking: 0, suggestions: 1, worth_considering: 0 }, reviewer: 'judge', path: 'x/round-1', reviewKind: 'whole-pr', resolutionIneligible: 'history-nonmerge: commit abc1234 is not a merge' });
+  startJob(w, tagOf(w, w.base, w.head), emit(0, outJson, true));
+  const r = await adopt(w, emit);
+  assert.equal(r.code, 0, r.out);
+  assert.equal(r.json.codex.codexPath, 'x/round-1', 'the report came from the job output, not the state');
+  assert.equal(r.json.codex.resolutionIneligible, 'history-nonmerge');
+});
+
 test('reviewer fable WITH an arbiter record: arbiter needed is not called (the record is untouched) and the state is reported', (t) => {
   const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
   assertExit(rc(w, [], ok(w)), 0);
