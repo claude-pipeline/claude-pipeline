@@ -170,9 +170,9 @@ review:
   #                              # never the PR's own): a security finding outside it is ruled FOLLOW-UP (an issue is filed), not merge-blocking. Bugs and broken behaviour are unaffected.
   #                              # A judge or light round never sees the model, so a modelled path should also be listed in risk.high_risk_paths or review.arbiter_always_paths if the model
   #                              # is meant to apply to every PR touching it. name /^[a-z0-9-]{1,40}$/, text <= 4000 chars.
-  # regression_only_paths: []  # up to 20 globs, each also listed in risk.high_risk_paths or review.arbiter_always_paths (else a config error). For a PR touching one, the Fable arbiter judges a
+  # regression_only_paths: []  # up to 20 globs, each also listed in risk.high_risk_paths or review.arbiter_always_paths (else a config error; so is an entry a later `!` exclusion there fully cancels). For a PR touching one, the Fable arbiter judges a
   #                              # finding on it by "is it worse than the merge base?": the same weakness already there is FOLLOW-UP (scope same-on-base, an issue is filed, the owner's merge is bound to
-  #                              # it), a regression stays merge-blocking. Codex and the substitute keep their buckets. Read from the default branch's config, never the PR's own: set it only after
+  #                              # it; a finding with no line is never waived), a regression stays merge-blocking. Codex and the substitute keep their buckets. Read from the default branch's config, never the PR's own: set it only after
   #                              # `pipeline vendor --check` shows the runner knows the key.
   #                              # Like every new key, set it only after the installed pipeline and the vendored CI runner know it (`pipeline vendor --check`). Empty = off.
   # fix_verify_after_round: null  # null (off) | 1..10: counted review rounds past this one may use the narrow fix-verify brief even on sensitive / high-risk paths (never on a hard-stop hit
