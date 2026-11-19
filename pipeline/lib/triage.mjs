@@ -513,7 +513,9 @@ export function claudeRulingRefusal(item, decision, { secondReview } = {}) {
   if (!DECISIONS.includes(decision)) return `decision must be one of ${DECISIONS.join('|')}`;
   // A fix deferred past the round limit is the owner's to reopen (owner-ruling); Claude's own ruling never touches it.
   if (isRoundCapDeferral(item)) return `${id} was deferred past the round limit (its fix is out of the PR and filed as a follow-up): only the owner's typed ruling can reopen it`;
-  if (item.implemented === true) return `${id} is already implemented`;
+  // #424: an ACCEPT that waits for a human only because of its confidence (or a malfunction) and was built anyway: Claude may confirm it (nothing is loosened, only the flag clears).
+  const builtAccept = item.implemented === true && decision === 'ACCEPT' && item.final?.decision === 'ACCEPT' && item.final.needsHuman === true;
+  if (item.implemented === true && !builtAccept) return `${id} is already implemented`;
   if (claudeFinalIsAccept(item)) {
     return decision === 'ACCEPT'
       ? `${id} is already ACCEPT`

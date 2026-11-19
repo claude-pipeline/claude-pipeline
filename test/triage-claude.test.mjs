@@ -159,6 +159,13 @@ test('claudeRulingRefusal: the table of what Claude alone may not do', () => {
   // implemented
   assert.match(refusal(waiting('low-confidence', { implemented: true }), 'ACCEPT'), /implemented/);
   assert.match(refusal({ ...rule(sug(), 'FOLLOW-UP'), implemented: true }, 'ACCEPT'), /implemented/);
+  // #424: a low-confidence ACCEPT that was built anyway may be confirmed by Claude (only ACCEPT, only while the final is an ACCEPT waiting for a human)
+  const builtAccept = waiting('low-confidence', { implemented: true, final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' } });
+  assert.equal(refusal(builtAccept, 'ACCEPT'), null, 'implemented low-confidence ACCEPT');
+  assert.match(refusal(builtAccept, 'FOLLOW-UP'), /implemented/, 'a dismissal of a built item stays refused');
+  assert.match(refusal(builtAccept, 'REJECT'), /implemented/);
+  const confirmed = applyClaudeRuling(builtAccept, { decision: 'ACCEPT', reason: 'built and re-reviewed', ruledAt: RULED_AT });
+  assert.deepEqual([confirmed.final.decision, confirmed.final.needsHuman, confirmed.final.by, confirmed.implemented], ['ACCEPT', false, 'claude', true]);
 
   // loosening an ACCEPT, Claude or forced
   const claudeAccept = rule(sug(), 'ACCEPT');
