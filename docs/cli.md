@@ -72,6 +72,9 @@ pipeline arbiter needed --round R [--pr N] [--force] [--full] [--repo DIR]
     medium/high for paths alone; never with a hard-stop hit (only P-path is discounted besides risk.ignore_hard_stop_rules), a size or report-only driver, or a fix scope over review.fix_round_max_lines / with a new non-test source file (lib/fix-verify.mjs#fixRoundScope, computed live)
   threat model (review.threat_models, read from the TRUSTED default-branch config pinned as round.trustedConfigSha): a review input for a diff touching a model's paths starts with a "Threat model" section that stands alone; an out-of-model
     security finding is then ruled FOLLOW-UP with scope "out-of-model" and needs no human (category security only, a file that resolves to one diff entry wholly inside the model); the round stores arbiter.threatModels
+  regression-only bar (review.regression_only_paths, read from the same TRUSTED config; Fable review inputs only): a review input for a diff touching a listed path has a "Regression-only bar" section that stands alone: a finding on such a file that
+    exists identically at the merge base is ruled FOLLOW-UP with scope "same-on-base" and needs no human (only a plainly modified file of the whole PR diff; an added or renamed file is a human's); every arbiter FOLLOW-UP / REJECT on such a file is
+    listed in the Rulings block and bound to the owner's merge, every FOLLOW-UP held until its issue is filed; the round stores arbiter.regressionOnly (globs, merge base and the regression-base.md view of the changes of the PR to those files that the read-only arbiter reads, bound by digest)
   briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round's own range is medium risk ...`, `the trusted default-branch config is unavailable`, or the message of an error caught while assessing the range
   --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven. The stop drops the stored input (fix-verify brief, digest, tag), so an earlier arbiter-fix pass cannot prove the round and the retry writes a fresh full input; `apply` also refuses (exit 1 forced-full-pending) a round that stores forcedFull beside a fix-verify brief
   mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied
@@ -1068,7 +1071,7 @@ update the installed pipeline to upstream main (run in your own terminal); --che
 
 ```
 pipeline update [--claude-home DIR] [--check] [--json]
-  Fetches upstream main (github.com/ianjamila/claude-pipeline), installs it and verifies the install.
+  Fetches upstream main (github.com/claude-pipeline/claude-pipeline), installs it and verifies the install.
   --claude-home DIR  where the pipeline is installed (default ~/.claude: both Claude accounts share ~/.claude/pipeline,
                      so CLAUDE_CONFIG_DIR is deliberately not consulted)
   --check            read-only: report the installed stamp, upstream main and how they relate; exit 0 only when
@@ -1338,3 +1341,39 @@ The spec table was written before the build; the CLI that shipped differs as fol
 | `agent-log --line` (docs-only PR) | `agent-log queue --line` and `agent-log publish [--line]` (appends to the orphan branch `pipeline-agent-log`; `stage` is a deprecated alias that commits nothing) |
 | not listed | `artifacts push`, `followups create`, `hardstops`, `integrity`, `job start\|wait\|read`, `protect`, `review-complete`, `state show\|outcome\|mark-implemented\|record-followup\|set-outcome`, `triage settle\|light-lane\|owner-ruling`, `vendor`, `version`, `leases` |
 | `risk` returns `files[]`, `stats` | `risk` returns `level, reasons, lightLane, changedLines, fileCount, hardStops, base, head, mergeBase` |
+
+## db-refs
+
+the owner's registry of Supabase projects for the live-database guard: show it; set / remove a project, add / remove a trusted MCP server (owner only, own terminal)
+
+```
+pipeline db-refs show   -> {ok, file, refs: [{ref, name, repo, kind}], servers, missing?} : READ-ONLY, runs anywhere; exit 0, or 1 when the file is unreadable or invalid (every Supabase write is then refused)
+pipeline db-refs set --ref <20 lowercase letters/digits> --name "<label>" --repo <owner/name> [--dev]   (a duplicate ref replaces its entry)
+pipeline db-refs remove --ref <ref>
+pipeline db-refs server add <segment> | server remove <segment>   (an MCP server name the owner trusts for Supabase: the part between mcp__ and the tool name)
+  Every hosted project is LIVE unless declared --dev here; a project that is not listed is live too, with the name `unregistered project <ref>`.
+  Only a server on the built-in list (plugin_supabase_supabase, supabase) or one added with `server add` may carry a go-bound write; a --dev declaration exempts a call only on a server the owner added.
+  Owner only: the changing subcommands are refused inside Claude Code (exit 2 `refused`); run them in your own terminal (`node ~/.claude/pipeline/bin/pipeline.mjs db-refs set …`).
+```
+
+## live-db
+
+live-database guard: build the block the owner is shown before a live Supabase change (present), print the catalog look-up SQL that needs no go (catalog)
+
+```
+pipeline live-db present --op migration --pr <N> --file supabase/migrations/<f>.sql --project <ref> --summary "<one line>"
+  -> {ok, block, sqlSha256, name} : refuses unless the working-tree file equals HEAD:<file>, HEAD is the PR head on GitHub, the bytes are valid (UTF-8, no CR/NUL, no fence line, at most 300 lines) and the project is live.
+     End your reply with `block` (its last line is the ask) and wait for the owner to type `go migration <name>`; then call apply_migration with name = <name> and query = the file text, unchanged.
+  -> --ask (click-to-approve): also {ask: {askId, questions}}: a choice question (Yes, apply <name> | Not yet) whose text is the title and then exactly `block`, written as an ask file (one-time use, expires after 24 h); after the block, pass `ask.questions` to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same go the typed `go migration <name>` records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued): the owner types the go as before
+pipeline live-db present --op data --project <ref> --sql-file <path> --summary "<one line>"
+  -> {ok, block, sqlSha256, sql} : the SQL is canonicalised (BOM and trailing whitespace stripped; CR, NUL, a fence line, a line with trailing spaces, over 60 lines or 4000 characters are refused: make it a migration). Pass `sql` verbatim as execute_sql query; the owner types `go data <sha12>`.
+  -> --ask on a data fix: the same dialog (Yes, run <sha12> | Not yet), when the checkout has an origin remote; otherwise ask: null and askSkipped.
+pipeline live-db catalog <kind> [args…]   -> {ok, sql} : the only execute_sql text a live project takes without a go; pass sql verbatim. kinds: tables <schema> · columns <schema> <table> · function-def <schema> <name> · view-def <schema> <view> · policies <schema> <table> · indexes <schema> <table> · triggers <schema> <table> · table-grants <schema> <table> · constraints <schema> <table> · extensions · setting <guc>
+  arguments are lower-case names (a-z 0-9 _, up to 63 characters); setting takes one of: server_version server_version_num search_path statement_timeout lock_timeout idle_in_transaction_session_timeout max_connections timezone default_transaction_isolation row_security shared_preload_libraries
+```
+
+### Live database guard (#262)
+
+Every hosted Supabase project counts as live unless the owner declared it `dev` with `pipeline db-refs set --dev` (protected owner state, written only from the owner's own terminal). On a live project the Supabase MCP read tools pass; `execute_sql` passes without a go only as one of the fixed `pipeline live-db catalog` templates; every other `execute_sql` and every `apply_migration` needs the owner's go for exactly that query: a CLICK on the dialog `live-db present --ask` returns (the question is the title and then exactly the block; the owner-go hook records a human click as the same go the typed words record, verified from the transcript when the write is attempted, and only when the reply right before the dialog ends with that same block, as for a typed go), or the TYPED go (`go migration <name>` / `go data <sha12>`), which stays as the fallback when `ask` is null or a click could not be verified. Either is recorded only against the block `live-db present` prints (rebuilt byte for byte by the recorder). One go = one apply, consumed at the attempt; a failed apply needs a new go after a read-only look at the live state. A go expires after 2 hours. A PR with two migrations needs two block/go cycles. Only the built-in Supabase servers (`plugin_supabase_supabase`, `supabase`) and servers the owner adds with `db-refs server add` can carry a go-bound write.
+
+Ships here: the Supabase MCP guard, the typed go, the click and the registry. NOT yet: the agent-run command-line refusals (the `supabase` CLI and Management API rule, and the psql-family refusals: psql, the `pg_dump` family, `usql`, the pg utilities such as `dropdb` / `createdb`, and the `PG*` environment rules) ship in separate PRs; #262 stays open until then. It is a tripwire, not a boundary: the boundary is the agent not holding prod credentials. Residuals: keystroke injection (`osascript` / `tmux send-keys`) yields a typed prompt; a staged script editing `db-refs.json`; MCP config files are not protected.

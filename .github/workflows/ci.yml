@@ -14,6 +14,13 @@
 # concurrency group (below), so redrafting cancels a suite that is still running, and its own run skips because the PR is a draft
 # by then. Each aggregate skips on exactly the same condition as its jobs, never on anything else. Push to main is unchanged.
 #
+# Merge queue: the repo's default branch can use GitHub's merge queue, which builds a temporary commit (head + the queued PRs
+# ahead) on a gh-readonly-queue/... branch and waits for the required checks on it. `merge_group` (types: checks_requested) is the
+# trigger that runs this workflow there, so "test (ubuntu)" and "test (windows)" report on the queue commit. A merge_group event has
+# no pull_request payload, so every `github.event_name != 'pull_request' || ...` condition below is true for it: the full suite runs,
+# nothing is skipped as a draft, the aggregates report success or failure (never skipped), and the tested-tree step (push only) does
+# not run. Its concurrency group is its own queue ref, which no other run shares, and only pull_request runs ever cancel.
+#
 # Every step runs under bash (Git Bash on Windows) so one script serves both runners. The
 # installer runs into a throwaway Claude home whose path contains a space, then --check must
 # report no drift, a second install must be a no-op, and --uninstall must leave no pipeline files.
@@ -33,6 +40,9 @@ on:
     types: [opened, synchronize, reopened, ready_for_review, converted_to_draft]
   push:
     branches: [main]
+  # GitHub's merge queue asks for the required checks on its temporary commit with this event; without it the queue never gets a result.
+  merge_group:
+    types: [checks_requested]
 
 permissions:
   contents: read
@@ -41,6 +51,8 @@ permissions:
   pull-requests: read
 
 concurrency:
+  # On merge_group, github.ref is the queue's temporary branch (refs/heads/gh-readonly-queue/main/pr-<N>-<sha>): one group per queue entry,
+  # so one entry's run never cancels or waits behind another's. Only a pull_request run is cancelled when superseded.
   group: ci-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 

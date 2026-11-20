@@ -368,7 +368,7 @@ test('followUpClickState: every state of the newest round ask, read-only (instru
 
 test('a Yes click on any variant is a grant the defer-fixes / codex-review lookups see; the state it lands in is version 8 and its askVariant is cross-checked', async (t) => {
   // failure caught: a new-variant grant invisible to the grant lookups (a deferral would go past it), or a saved round whose grant an older pipeline would misread because the state kept its old version
-  assert.equal(SUPPORTED_STATE_VERSION, 8);
+  assert.equal(SUPPORTED_STATE_VERSION, 9);
   assert.equal(STATE_VERSION_CLICK_DIALOG, 8);
   for (const id of V2) {
     const w = world(t, { parts: parts(id), answer: YES[id] });

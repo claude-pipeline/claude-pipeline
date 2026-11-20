@@ -611,6 +611,7 @@ test('schemas on disk list exactly the enums the validators enforce', () => {
   const rItem = r.properties.rulings.items;
   assert.deepEqual(rItem.properties.ruling.enum, DECISIONS);
   assert.deepEqual(rItem.properties.confidence.enum, CONFIDENCES);
+  assert.deepEqual(rItem.properties.scope.enum, ['out-of-model', 'same-on-base'], 'a scope the validator accepts but the schema forbids would be refused by the model\'s own output check');
   assert.deepEqual([...rItem.required].sort(), ['confidence', 'id', 'reasoning', 'ruling']);
   assert.deepEqual(r.required, ['rulings']);
 });

@@ -21,6 +21,8 @@ import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
+import { evaluateSupabaseMcp, isSupabaseTool } from './live-db-guard.mjs';
+import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
@@ -59,6 +61,8 @@ const PROTECTED_REL = [
   '.claude/settings.local.json',
   // #58: the owner's recorded chat "merge" (hooks/lib/owner-go.mjs): only the owner-go hook writes it (typed words, and clicks: a pending click, its settled outcome, round tickets; #472), P merge and the guard read it. The guard refuses running the recorder or the click libraries by hand (OWNER_GO_RECORDER)
   '.claude/pipeline-state/owner-go',
+  // #262 (live-database guard): the owner's registry of Supabase projects (hooks/lib/db-refs.mjs): which project is dev, the live projects' display names and the MCP servers the owner trusts. Only the owner writes it, from their own terminal (`pipeline db-refs set`)
+  '.claude/pipeline-state/db-refs.json',
   // cp #256: the machine-wide Codex outage record (status.json: the last quota stop and the PRs waiting for Codex; only pipeline commands write it) and Codex's own session
   // logs (the weekly-usage figure is read from them, so an agent may not write them)
   '.claude/pipeline-state/codex',
@@ -874,10 +878,12 @@ function physicalTargets(target, ctx) {
 
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 // #472: and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs): run by hand with an injected check they would write a pending click with a made-up capture-time hook result.
-const OWNER_GO_RECORDER = /(?:^|\/)hooks\/(?:lib\/)?owner-go(?:-click(?:-hook)?)?\.mjs$/i;
-const OWNER_GO_WORD = /owner-go(?:-click(?:-hook)?)?\.mjs/i;
+// #262: and the live-database go recorder (lib/live-db-go.mjs): run by hand it would write a "typed go" the owner never typed. ONE alternation feeds both expressions, so the path check and the word / stdin checks cannot drift apart.
+const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go`;
+const OWNER_GO_RECORDER = new RegExp(String.raw`(?:^|/)hooks/(?:lib/)?(?:${OWNER_GO_LIBS})\.mjs$`, 'i');
+const OWNER_GO_WORD = new RegExp(String.raw`(?:${OWNER_GO_LIBS})\.mjs`, 'i');
 
-const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json and the owner-go records (~/.claude/pipeline-state/owner-go) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
+const PROTECTED_MSG = 'skills, agents, ~/.claude/pipeline, ~/.claude/settings.json, the owner-go records (~/.claude/pipeline-state/owner-go) and the database registry (~/.claude/pipeline-state/db-refs.json) can only be changed by the owner with PIPELINE_ADMIN=1; a repo\'s review state (.review/state.json, .review/round-<n>/, final-gate.json, substitute-attempts.json, *-smoke.json, prod-before.json, published-baseline.json) only by the pipeline commands that write it (pipeline state, codex-review, triage, arbiter, final-gate …)';
 
 // MCP servers (a filesystem server, any other server's write tools, a browser or IDE that runs code) reach the
 // same files without Edit/Write. Their tool_input has no fixed shape, so values are picked out by key name.
@@ -916,7 +922,20 @@ function mcpFields(ti) {
   return { paths: paths.slice(0, 500), contents, values: values.slice(0, 2000) };
 }
 
+// #262: a Supabase MCP tool is judged by every generic rule below first, then by the live-database rules (lib/live-db-guard.mjs), LAST: the rules there consume the owner's go, so no other
+// rule may deny the same call after it (a go is spent at the attempt).
 function evaluateMcp(tool, ti, input, opts) {
+  const generic = evaluateMcpGeneric(tool, ti, input, opts);
+  if (generic.decision === 'deny' || !tool.startsWith('mcp__')) return generic;
+  const home = opts.home || os.homedir();
+  if (!isSupabaseTool(tool, readDbRefs(home))) return generic;
+  if ((opts.env ?? process.env).PIPELINE_ADMIN === '1') return allow();
+  return evaluateSupabaseMcp(tool, ti, {
+    home, sessionId: input?.session_id, transcriptPath: input?.transcript_path, now: opts.now, io: opts.liveDbIo,
+  });
+}
+
+function evaluateMcpGeneric(tool, ti, input, opts) {
   const last = tool.split('__').pop();
   if ((opts.env ?? process.env).PIPELINE_ADMIN === '1') return allow();
   if (MCP_READ_ONLY.test(last)) return allow();
@@ -2587,7 +2606,7 @@ function psOperand(raw) {
 }
 function pipelineToolInRaw(raw, ctx) {
   if (ctx.platform !== 'win32' || ctx.shell !== 'powershell') return false;
-  if (/owner-go/i.test(raw)) return false;
+  if (/owner-go|live-db-go/i.test(raw)) return false;
   const operand = psOperand(raw);
   if (operand === null || !PS_PLAIN_PATH.test(operand)) return false;
   if (/(?:^|[\\/])\.{1,2}(?:[\\/]|$)/.test(operand)) return false;
@@ -3929,6 +3948,22 @@ function findInstaller(cmds, raw, dirs, ctx, opts) {
 
 const PROTECT_APPLY_RAW = /\bpipeline(?:\.mjs)?["']?\s[^;&|\n]*\bprotect\b[^;&|\n]*--apply\b/i;
 
+// #262: `pipeline db-refs set|remove|server …` edits the registry that decides which databases count as live: an agent line running anything of it but `show` is refused
+// (the command also refuses itself inside Claude Code; this is the same rule at the guard, so the refusal comes before the run).
+const DB_REFS_RAW = /\bpipeline(?:\.mjs)?["']?\s[^;&|\n]*\bdb-refs\b(?!\s+show\b)/i;
+
+function findDbRefsWrite(cmds, raw) {
+  for (const c of cmds) {
+    const i = c.argv.findIndex((a) => PIPELINE_BIN_NAMES.has(baseOf(a)));
+    if (i >= 0) {
+      const rest = c.argv.slice(i + 1);
+      const at = rest.indexOf('db-refs');
+      if (at >= 0 && rest[at + 1] !== 'show') return true;
+    } else if (c.raw.includes('\\') && DB_REFS_RAW.test(toPosix(c.raw))) return true;
+  }
+  return !!cmds.truncated && DB_REFS_RAW.test(toPosix(raw));
+}
+
 function findProtectApply(cmds, raw) {
   for (const c of cmds) {
     const i = c.argv.findIndex((a) => PIPELINE_BIN_NAMES.has(baseOf(a)));
@@ -5089,6 +5124,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // 3 and 4: installers and `protect --apply`
   const installer = findInstaller(cmds, raw, dirs, ctx, opts);
   if (installer) return deny(installer);
+  if (findDbRefsWrite(cmds, raw)) return deny('pipeline db-refs changes which databases count as live; only the owner may run it, from their own terminal (`pipeline db-refs show` is allowed)');
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');
 
   // 6: the job runner executes its inner command on the agent's behalf
