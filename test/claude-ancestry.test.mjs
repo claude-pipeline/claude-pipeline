@@ -12,6 +12,10 @@ test('isClaudeCodeProcess: the claude binary by any path, or a JS runtime runnin
   assert.equal(isClaudeCodeProcess({ comm: 'node', args: 'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume' }), true);
   assert.equal(isClaudeCodeProcess({ comm: '/usr/local/bin/node', args: '/usr/local/bin/node /home/u/.claude/local/claude' }), true);
   assert.equal(isClaudeCodeProcess({ comm: 'bun', args: 'bun /x/claude-code/cli.js' }), true);
+  // Node 24 on Linux: ps comm is MainThread, so a Claude Code parent was missed (CI Node 24 failure).
+  assert.equal(isClaudeCodeProcess({ comm: 'MainThread', args: 'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js' }), true);
+  assert.equal(isClaudeCodeProcess({ comm: 'MainThread', args: 'node scripts/test.mjs' }), false);
+  assert.equal(isClaudeCodeProcess({ comm: 'MainThread' }), false);
   // A background job's processes rename themselves (`claude bg-spare`, `claude bg-pty-host`).
   for (const comm of ['claude bg-spare', 'claude bg-pty-host', '/Users/u/.local/bin/claude bg-spare']) assert.equal(isClaudeCodeProcess({ comm }), true, comm);
   for (const info of [{ comm: 'Claude' }, { comm: 'claude-helper' }, { comm: 'claude bg' }, { comm: 'claude bg-' }, { comm: 'claude bg-spare x' }, { comm: 'claude foo' }, { comm: 'Claude bg-spare' }, { comm: 'node', args: 'node scripts/test.mjs' }, { comm: 'zsh' }, { comm: 'node' }, null, {}]) {

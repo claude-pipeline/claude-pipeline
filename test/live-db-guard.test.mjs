@@ -9,7 +9,7 @@ import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { OWNER_ENTRY, linesOf } from './helpers/owner-go.mjs';
-import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
+import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { buildBlock, liveDbGoOutcome, sha256Of } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { LIVE_DB_CONSUMED_REL, claimLiveDbGo, evaluateSupabaseMcp, isSupabaseTool } from '../pipeline/hooks/lib/live-db-guard.mjs';
 import { buildCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
@@ -28,9 +28,7 @@ const STATE = (home) => join(home, '.claude', 'pipeline-state');
 async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'cp-live-db-guard-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  const own = { home, env: {}, hasClaudeCodeAncestor: () => false };
-  await runDbRefs(['set', '--ref', REF, '--name', 'EagleWatch prod', '--repo', 'acme/widgets'], own);
-  await runDbRefs(['set', '--ref', DEV, '--name', 'Scratch', '--repo', 'acme/widgets', '--dev'], own);
+  seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live' }, { ref: DEV, name: 'Scratch', repo: 'acme/widgets', kind: 'dev' }] });
   const repo = createTmpRepo();
   repo.git(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
   repo.write(FILE, SQL);
@@ -148,13 +146,13 @@ test('dev refs are exempt only on a server the owner listed', async (t) => {
   const s = await scene(t);
   const call = (tool) => evaluateSupabaseMcp(tool, { project_id: DEV, name: 'x', query: 'drop table t' }, s.ctx).decision;
   assert.equal(call(`${TOOL}apply_migration`), 'deny');
-  await runDbRefs(['server', 'add', 'mine'], { home: s.home, env: {}, hasClaudeCodeAncestor: () => false });
+  runOwnerCli(s.home, ['server', 'add', 'mine']);
   assert.equal(call('mcp__mine__apply_migration'), 'allow');
 });
 
 test('a server the owner listed is a Supabase server for every tool name; another vendor\'s tools stay untouched', async (t) => {
   const s = await scene(t);
-  await runDbRefs(['server', 'add', 'mine'], { home: s.home, env: {}, hasClaudeCodeAncestor: () => false });
+  runOwnerCli(s.home, ['server', 'add', 'mine']);
   const state = { servers: ['mine'] };
   assert.equal(isSupabaseTool('mcp__mine__merge_branch', state), true);
   assert.equal(isSupabaseTool('mcp__mine__merge_branch'), false);
@@ -193,7 +191,7 @@ test('a registry that cannot be read denies every write and still allows reads',
 
 test('a registry that cannot be read or is invalid denies a generic write on any server; a missing registry leaves other vendors alone', async (t) => {
   const s = await scene(t);
-  await runDbRefs(['server', 'add', 'mine'], { home: s.home, env: {}, hasClaudeCodeAncestor: () => false });
+  runOwnerCli(s.home, ['server', 'add', 'mine']);
   const file = (tool_name, tool_input) => evaluateFileTool({ tool_name, tool_input, cwd: s.repo.dir, session_id: s.session, transcript_path: s.transcript }, { home: s.home, env: {}, platform: process.platform, now: () => NOW });
   const registry = join(STATE(s.home), 'db-refs.json');
   writeFileSync(registry, JSON.stringify({ v: 1, refs: [{ ref: 'bad', name: 'x', kind: 'dev' }], servers: ['mine'] }));
