@@ -13,7 +13,7 @@ import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { CATEGORIES, categoryNotes, fingerprint, largeBinaryNote, normalizeFindingCategories, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
-import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, revParse, showFile } from '../lib/git.mjs';
+import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, headSha, reviewPatch, revParse, showFile } from '../lib/git.mjs';
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, countedOrdinal, expectationOf, fixRoundCandidate, fixRoundScope, postMaxSettings } from '../lib/fix-verify.mjs';
@@ -527,7 +527,11 @@ async function neededLocked(values, n, root, ctx) {
   if (regression) {
     try { regression = { ...regression, ...writeRegressionBase(round, root, regression) }; } catch { regression = null; }
   }
-  const body = [...(review ? [...(tm.section ? [tm.section.join('\n')] : []), ...(regression ? [regressionSection(regression).join('\n')] : []), reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
+  // The arbiter reads files in this checkout when it wants more context: after HEAD moved past the reviewed head they may hold later code than the round reviewed.
+  const moved = typeof round.toHead === 'string' && headSha({ cwd: root }) !== round.toHead
+    ? [`NOTE: the repository is checked out at a later commit than this round's reviewed head ${round.toHead.slice(0, 12)}; rule on the diff and excerpts given: a file read from the repository may hold later code, so do not rest a ruling on code that is in neither.`, '']
+    : [];
+  const body = [...moved, ...(review ? [...(tm.section ? [tm.section.join('\n')] : []), ...(regression ? [regressionSection(regression).join('\n')] : []), reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
   const digest = sha256(body);
   const digest8 = digest.slice(0, 8);
   const tag = `pipeline-arbiter R${n} ${digest8}`;

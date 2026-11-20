@@ -2982,6 +2982,19 @@ test('triage settle: the CLI runs the test; the command, file, exit code and hea
   assert.equal(w.item('R1-B1').final.needsHuman, false, 'a non-security dismissal by test is final');
 });
 
+test('triage settle: production code changed after the round\'s reviewed head refuses before the test runs (settle-head-moved), nothing recorded', (t) => {
+  const w = disputedWorld(t);
+  w.repo.write('src/b.js', `${bFile}export const later = 1;\n`); // a later fix: it could make the settle test pass and give round 1's finding a REJECT
+  w.repo.commit('fix after the reviewed head');
+  const snapshot = w.stateText();
+  const r = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.match(r.json.next, /^arbiter needed --pr 7 --round 1/);
+  assert.equal(w.stateText(), snapshot, 'nothing recorded, nothing run');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
 test('triage settle: a passing test cannot confirm a bug, a failing test cannot disprove one (state untouched)', (t) => {
   const w = disputedWorld(t);
   const before = () => w.stateText();
