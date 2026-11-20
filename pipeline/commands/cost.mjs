@@ -2,6 +2,7 @@
 // one spend (an agent dispatch, a review call) in the run record's cost section, so `P summary` can show tokens and USD
 // by phase and role. `--retry` counts a retry; `--session ID` names a Claude session of this run (its guard denies are
 // counted at `P summary`). Display only: like every run-record write, a failure is a warning, never a decision.
+import { createHash } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
@@ -98,8 +99,13 @@ export const run = guarded(async (argv, ctx) => {
       ...(Object.keys(byPrice).length ? { byPrice, priceTable: PRICE_TABLE_DATE } : {}),
     };
     bucketed = complete && Object.keys(byPrice).length > 0;
-    // A transcript booked before for this PR (an agent continued by SendMessage) books only what it gained since: the run record keeps what was booked per file name.
-    if (values['from-transcript'] && values.usd === undefined) patch.cost.transcript = { key: basename(values['from-transcript']), usage: fromFile };
+    // A transcript booked before for this PR (an agent continued by SendMessage) books only what it gained since: the run record keeps what was booked per transcript. The key is a sanitised, clipped
+    // file name plus a short hash of the resolved path (two different files of one name stay apart; never the raw path, which would put the home folder into the PR comment) and always passes run-cost's shape check.
+    if (values['from-transcript'] && values.usd === undefined) {
+      const file = resolve(root, values['from-transcript']);
+      const hash = createHash('sha256').update(file).digest('hex').slice(0, 12);
+      patch.cost.transcript = { key: `${basename(file).replace(/[^\w.-]/g, '_').slice(0, 100)}-${hash}`, usage: fromFile };
+    }
   }
   if (values.retry) patch.cost.retries = 1;
   if (values.session?.length) patch.cost.sessions = values.session;
