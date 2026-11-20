@@ -2250,6 +2250,23 @@ test('item 5: inline node -e / -p that only reads a review file is allowed; a wr
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
+// R1-B1 (#737): readFileSync takes a path and at most a plain string (an encoding). Failure caught: `readFileSync('.review/state.json', {flag:'w+'})` is allowed, and `w+` truncates the protected file before reading it
+// (so does the same options object held in a variable, or spread in).
+test('R1-B1: readFileSync with an options object (inline, held in a variable or spread) is refused; a path with an optional encoding string is allowed', () => {
+  for (const cmd of [
+    `node -e "require('fs').readFileSync('.review/state.json', {flag:'w+'})"`,
+    `node -e "const o={flag:'w+'};require('fs').readFileSync('.review/state.json',o)"`,
+    `node -e "const o={flag:'w+'};const fs=require('fs');fs.readFileSync('.review/state.json',o)"`,
+    `node -e "require('fs').readFileSync('.review/state.json', ...[{flag:'w+'}])"`,
+    `node -e "require('fs').readFileSync('.review/state.json', 'utf8', {flag:'w+'})"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e "console.log(require('fs').readFileSync('.review/state.json'))"`,
+    `node -e "console.log(require('fs').readFileSync(require('path').join('.review','state.json'), 'utf8'))"`,
+    `node -e 'console.log(require("fs").readFileSync(".review/state.json", "utf8").length)'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
 // Items 5b/10 (refused: `node -e 'const r=require("./.review/risk.json");console.log((r.items||[]).length)'` and the double-quoted twin on .review/round-18/codex.json): the arithmetic gate (#266 R7-F3) must not read
 // the parentheses or a `let` of a JavaScript program that is the whole single- or double-quoted word after node -e / -p. Everything else keeps the gate: `$((`, `$[`, a lone `_` (zsh reads it as the last word of the
 // previous command), `((` / let in shell code, a program word with an unquoted part, a `$` or backtick inside a double-quoted program, and a `node -e` that is only text inside another quoted string.

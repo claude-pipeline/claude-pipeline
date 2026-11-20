@@ -4026,6 +4026,31 @@ const INLINE_NODE_WORDS = /[`$]|[)\]]\s*\(|\?\.\s*\(|\b(?:new|import|process|Ref
 const INLINE_NODE_BARE = new Set(['require', 'readFileSync', 'existsSync', 'readdirSync', 'String', 'Number', 'Boolean', 'if', 'for', 'while', 'switch', 'catch']);
 const INLINE_NODE_QUALIFIED = new Set(['JSON.parse', 'JSON.stringify', 'console.log', 'console.error', 'Object.keys', 'Object.values', 'Object.entries', 'Array.isArray']);
 const INLINE_NODE_METHODS = new Set(['readFileSync', 'existsSync', 'readdirSync', 'map', 'filter', 'find', 'some', 'every', 'forEach', 'reduce', 'sort', 'flat', 'join', 'split', 'slice', 'includes', 'startsWith', 'endsWith', 'trim', 'match', 'test', 'toFixed', 'padStart', 'padEnd']);
+// R1-B1 (#737): readFileSync(PATH) or readFileSync(PATH, 'encoding'): the second argument, when there is one, is a plain string literal. An options object (inline, held in a variable, spread in) can carry `flag: 'w+'`, which truncates the file it
+// reads. `args` is the text after the opening parenthesis; a closing parenthesis that never comes, a spread, or an unquoted `/` (a regex literal the scan could misread) is not read-only.
+function readFileSyncArgsPlain(args) {
+  const parts = [''];
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === "'" || ch === '"') {
+      const end = args.indexOf(ch, i + 1);
+      if (end < 0 || args.slice(i, end).includes('\\')) return false;
+      parts[parts.length - 1] += args.slice(i, end + 1);
+      i = end;
+      continue;
+    }
+    if (ch === '/' || (ch === '.' && args.startsWith('...', i))) return false;
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (depth === 0) return ch === ')' && parts.length <= 2 && (parts.length === 1 || /^\s*(?:'[^']*'|"[^"]*")\s*$/.test(parts[1]));
+      depth--;
+    }
+    if (ch === ',' && depth === 0) parts.push('');
+    else parts[parts.length - 1] += ch;
+  }
+  return false;
+}
 function inlineNodeReadOnly(prog) {
   if (INLINE_NODE_WORDS.test(prog) || WRITE_HINT.test(prog.replace(/[<>=]/g, ' '))) return false; // (a write name is refused even as a callback: .map(fs.unlinkSync))
   if (/\brequire\b(?!\s*\(\s*(?:'[^'\\]*'|"[^"\\]*")\s*\))/.test(prog)) return false; // (every `require` is a call with one plain string)
@@ -4035,6 +4060,7 @@ function inlineNodeReadOnly(prog) {
   }
   for (const r of prog.matchAll(/([\p{L}_][\p{L}\p{N}_]*(?:\s*\.\s*[\p{L}_][\p{L}\p{N}_]*)*)\s*\(/gu)) {
     const before = prog.slice(0, r.index).trimEnd();
+    if (/(?:^|\.)readFileSync$/.test(r[1].replace(/\s+/g, '')) && !readFileSyncArgsPlain(prog.slice(r.index + r[0].length))) return false;
     if (before.endsWith('.')) { // (a method after something: `).readFileSync(`, `/x/.test(`, `?.(` is no allowed shape)
       if (before.endsWith('?.') || !INLINE_NODE_METHODS.has(r[1].split(/\s*\.\s*/).at(-1))) return false;
       continue;
