@@ -54,7 +54,7 @@ export const meta = {
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
     'pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd CMD --test-file FILE [--repo DIR]',
     '  -> the CLI runs CMD in the repo itself (free-text evidence is not accepted): bug-disproved needs exit 0, bug-confirmed needs a failing exit; FILE must be a committed, clean test file at HEAD named in CMD',
-    '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented, or (error settle-head-moved, next `arbiter needed --pr N --round R --force`) when HEAD is past the round\'s reviewed head with a change to a file that is not a test file',
+    '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented, or (error settle-head-moved, next `arbiter needed --pr N --round R --force`) when the tree differs from the round\'s reviewed head in a file that is not a test file, or a tracked file that is not a test file has uncommitted changes',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
     'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]',
@@ -267,22 +267,29 @@ function settleRefusal(item, id) {
   return null;
 }
 
-// A settle test runs in this checkout. When HEAD moved past round R's reviewed head with a change to anything but test files, a pass or fail could come from
-// that later production code and would then speak for R's finding: refused, and the item goes to the arbiter (which rules on the recorded diff).
+// A settle test runs in this checkout, so what it reads must be round R's reviewed code: refused (and the item goes to the arbiter, which rules on the recorded diff) when
+// (1) HEAD is another commit than R's reviewed head and the two trees differ in anything but test files (a direct two-tree diff: a HEAD that is not a descendant of the
+// reviewed head can lack its production change while the merge base shows only the test), or (2) a tracked file that is not a test file has staged or unstaged changes.
+const changedPaths = (args, root) => git(['diff', '--name-only', '--no-renames', '-z', ...args], { cwd: root }).split('\0').filter((p) => p !== '');
+
 function settleHeadMoved(root, config, round, id, pr) {
-  if (typeof round.toHead !== 'string' || headSha({ cwd: root }) === round.toHead) return null;
   const globs = config.integrity?.test_globs ?? [];
-  let changed;
+  const code = (args) => changedPaths(args, root).filter((p) => !matchAny(p, globs));
   try {
-    changed = diffFiles(round.toHead, 'HEAD', { cwd: root }).flatMap((f) => [f.newPath, f.oldPath]).filter((p) => typeof p === 'string');
+    if (typeof round.toHead === 'string' && headSha({ cwd: root }) !== round.toHead) {
+      const moved = code([revParse(round.toHead, { cwd: root }), 'HEAD', '--']);
+      if (moved.length > 0) return refusedSettle(id, round, pr, `production code changed after round ${round.n}'s reviewed head ${round.toHead.slice(0, 12)} (${moved.slice(0, 3).join(', ')})`);
+    }
+    const dirty = code(['HEAD', '--']);
+    if (dirty.length > 0) return refusedSettle(id, round, pr, `uncommitted change to a file that is not a test file (${dirty.slice(0, 3).join(', ')})`);
   } catch (err) {
     if (!(err instanceof GitError)) throw err;
-    changed = ['(the range from the reviewed head cannot be read)'];
+    return refusedSettle(id, round, pr, `the change from round ${round.n}'s reviewed head cannot be read`);
   }
-  const code = changed.filter((p) => !matchAny(p, globs));
-  if (code.length === 0) return null;
-  return { ok: false, error: 'settle-head-moved', id, round: round.n, reason: `production code changed after round ${round.n}'s reviewed head ${round.toHead.slice(0, 12)} (${code.slice(0, 3).join(', ')}): a settle run cannot speak for round ${round.n}'s finding`, next: `arbiter needed --pr ${pr} --round ${round.n} --force` };
+  return null;
 }
+
+const refusedSettle = (id, round, pr, what) => ({ ok: false, error: 'settle-head-moved', id, round: round.n, reason: `${what}: a settle run cannot speak for round ${round.n}'s finding`, next: `arbiter needed --pr ${pr} --round ${round.n} --force` });
 
 // The pipeline runs the proving test itself; nothing the agent types is evidence. Throws Fail (exit 1) when the test
 // cannot be trusted as proof; otherwise returns what was run.
@@ -339,6 +346,10 @@ async function settle(rest, ctx) {
     const { round, item } = findItem(state, id);
     const reason = settleRefusal(item, id);
     if (reason) return { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } };
+    // The test ran at proof.head: HEAD, or the files it read, may have changed during the run (it ran without the lock).
+    if (headSha({ cwd: root }) !== proof.head) return { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason: `HEAD moved while the test ran (it ran at ${proof.head.slice(0, 12)}): nothing was recorded` } };
+    const moved = settleHeadMoved(root, config, round, id, state.pr);
+    if (moved) return { exitCode: EXIT.FAILED, output: moved };
     const settled = applyTestResult(item, result, proof.evidence, proof);
     saveState(root, updateItems(state, round.n, [settled]));
     return { exitCode: EXIT.OK, output: { ok: true, id, round: round.n, test: settled.test, final: settled.final } };

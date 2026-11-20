@@ -2995,6 +2995,31 @@ test('triage settle: production code changed after the round\'s reviewed head re
   assert.equal(w.item('R1-B1').test, undefined);
 });
 
+test('triage settle: a HEAD that is not a descendant of the reviewed head and lacks its production change refuses (settle-head-moved), though only a test differs from the merge base', (t) => {
+  const w = disputedWorld(t);
+  w.repo.git(['reset', '-q', '--hard', w.base]); // HEAD forks from round 1's reviewed head: the reviewed fix (src/a.js, src/big.js) is not in it
+  const args = settleArgs(w, 'R1-B1', 'bug-disproved'); // the only change from the merge base is the proving test
+  const snapshot = w.stateText();
+  const r = w.cli(args);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.equal(w.stateText(), snapshot, 'nothing recorded');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
+test('triage settle: an uncommitted change to a tracked production file refuses (settle-head-moved): the run would read code the reviewed head does not have', (t) => {
+  const w = disputedWorld(t);
+  const args = settleArgs(w, 'R1-B1', 'bug-disproved'); // the proving test is committed
+  w.repo.write('src/b.js', `${bFile}export const wip = 1;\n`); // a fix in the file the test imports, not committed
+  const snapshot = w.stateText();
+  const r = w.cli(args);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.match(r.json.reason, /src\/b\.js/);
+  assert.equal(w.stateText(), snapshot, 'nothing recorded');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
 test('triage settle: a passing test cannot confirm a bug, a failing test cannot disprove one (state untouched)', (t) => {
   const w = disputedWorld(t);
   const before = () => w.stateText();
