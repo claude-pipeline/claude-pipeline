@@ -3,7 +3,7 @@
 //   round codex   --pr N --round R [--base B] [--head H] [--max-minutes 60]   Codex's round, start to finish. Run it in the BACKGROUND
 //                 (Bash run_in_background): it waits for the Codex job, so the controller is woken once. codex-review --plan, job start,
 //                 the wait, the result, and (a Fable round with no arbiter record) `arbiter needed`.
-//   round publish --pr N --round R                                              the publish half of a round: triage comment, follow-up
+//   round publish --pr N --round R                                              the publish half of a round: cap-low deferral, triage comment, follow-up
 //                 issues, the comment again (issue links), the accepted items, state outcome.
 //
 // Each step is the existing command, run as its own CLI process, so it keeps its own admission, lock, lease and JSON; a failing step's JSON
@@ -43,8 +43,9 @@ export const meta = {
     '     a job that exited 0 while the state records round R at another base:head (round discarded and recorded again during the wait) is exit 1 identity-mismatch with next `state show --pr N`: nothing reported, never `arbiter needed`',
     '  the command exits early when the process that started it is gone (the job keeps running; rerun it)',
     'pipeline round publish --pr N --round R [--repo DIR]',
-    '  -> exit 0 {ok, accepted:{ids, path, count}, followups:[{id, issue}], held:[ids], warnings, outcome}; outcome is `state outcome` verbatim, needsHuman included (published first, then read)',
-    '  steps, in order: comment --pr N --kind triage · followups create --round R · comment --pr N --kind triage · state show --round R --accepted · state outcome',
+    '  -> exit 0 {ok, capDeferral:{applied, ids, refusals, rounds}, accepted:{ids, path, count}, followups:[{id, issue}], held:[ids], warnings, outcome}; outcome is `state outcome` verbatim, needsHuman included (published first, then read)',
+    '  steps, in order: triage cap-defer --pr N --round R · comment --pr N --kind triage · followups create --round R (and once more for each other round capDeferral.rounds names) · comment --pr N --kind triage · state show --round R --accepted · state outcome',
+    '  capDeferral = `triage cap-defer` verbatim: at the last allowed round, accepts that are ALL low severity are turned into follow-up issues UNAPPLIED (review.cap_low_accepts): applied true when it did so now, ids = every deferred item of the state (also on a rerun, when applied is false), rounds = the rounds still to file; accepted.ids then excludes them: no implementer for them. A refusal is applied false and never stops the bundle',
     '  identity: .review/state.json is for PR N and records round R, else exit 1 identity-mismatch before anything runs',
     '  the first failing step stops it: {ok:false, step, ran:[steps done], error, result:<that step\'s JSON>} with that step\'s exit code; every step is repeat-safe, so the recovery is to run it again',
   ].join('\n'),
@@ -374,6 +375,7 @@ function finishFromState({ root, ctx, pr, round, state, report }) {
 
 // The publish steps, in the skill's order (publish first, outcome after). `state show` takes NO --pr: with it the command reaches GitHub and can quarantine .review/.
 export const publishSteps = (pr, round) => [
+  ['cap-defer', ['triage', 'cap-defer', '--pr', String(pr), '--round', String(round)]],
   ['comment', ['comment', '--pr', String(pr), '--kind', 'triage']],
   ['followups', ['followups', 'create', '--round', String(round)]],
   ['comment-links', ['comment', '--pr', String(pr), '--kind', 'triage']],
@@ -395,7 +397,9 @@ async function roundPublish(rest, ctx) {
   const steps = publishSteps(pr, round);
   const ran = [];
   const results = {};
-  for (const [id, args] of steps) {
+  // The cap-low deferral may sit in a round other than R (a resolution-only round recorded after the cap round, whose own accepts count too): its issues are filed in that round, once, right after R's.
+  for (let i = 0; i < steps.length; i += 1) {
+    const [id, args] = steps[i];
     const r = step(root, args, ctx);
     if (r.code !== EXIT.OK) {
       const result = r.json ?? { ok: false, error: 'no-json', stdout: r.stdout.slice(0, 2000), stderr: r.stderr.slice(0, 2000) };
@@ -406,6 +410,11 @@ async function roundPublish(rest, ctx) {
     }
     results[id] = r.json;
     ran.push(id);
+    if (id === 'cap-defer') {
+      const more = (Array.isArray(r.json.rounds) ? r.json.rounds : []).filter((n) => Number.isInteger(n) && n !== round);
+      const at = steps.findIndex(([name]) => name === 'followups') + 1;
+      steps.splice(at, 0, ...more.map((n) => [`followups-${n}`, ['followups', 'create', '--round', String(n)]]));
+    }
   }
 
   const items = Array.isArray(results.accepted.items) ? results.accepted.items : [];
@@ -415,14 +424,16 @@ async function roundPublish(rest, ctx) {
 
   // The issue links come from the state the follow-up step just wrote (created, reused and skipped alike).
   const after = readState(root);
-  const followups = (after?.rounds.find((r) => r.n === round)?.items ?? [])
+  const filedRounds = new Set(ran.filter((id) => id.startsWith('followups')).map((id) => (id === 'followups' ? round : Number(id.slice('followups-'.length)))));
+  const followups = (after?.rounds.filter((r) => filedRounds.has(r.n)).flatMap((r) => r.items ?? []) ?? [])
     .filter((i) => i.final?.decision === 'FOLLOW-UP' && typeof i.followupIssue === 'string')
     .map((i) => ({ id: i.id, issue: i.followupIssue }));
-  const warnings = ['comment', 'followups', 'comment-links', 'accepted'].flatMap((id) => (Array.isArray(results[id].warnings) ? results[id].warnings : []));
+  const warnings = ['cap-defer', 'comment', ...ran.filter((id) => id.startsWith('followups')), 'comment-links', 'accepted'].flatMap((id) => (Array.isArray(results[id].warnings) ? results[id].warnings : []));
   return {
     exitCode: EXIT.OK,
     output: {
       ok: true,
+      capDeferral: { applied: results['cap-defer'].applied === true, ids: results['cap-defer'].ids ?? [], refusals: results['cap-defer'].refusals ?? [], rounds: results['cap-defer'].rounds ?? [] },
       accepted: { ids: items.map((i) => i.id), path: file, count: results.accepted.count ?? items.length },
       followups,
       held: Array.isArray(results.followups.held) ? results.followups.held : [],

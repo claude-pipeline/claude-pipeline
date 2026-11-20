@@ -19,7 +19,7 @@ import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch, trustedDefaultBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
-import { DEFERRABLE_ACCEPT_BY, arbiterFailures, countsTowardCap, finalIsReopenable, isDeferrableAccept, isOwnerDeferral, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
+import { DEFERRABLE_ACCEPT_BY, arbiterFailures, capLowItems, countsTowardCap, finalIsReopenable, isDeferrableAccept, isOwnerDeferral, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
@@ -42,7 +42,8 @@ export const meta = {
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
     '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict',
-    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, rounds, reviewedRounds, maxRounds, roundStats: {rounds: [{n, items, byBucket}], reRaised, ruledReRaised}, wholePrOwed, nextRound:{round, base, wholePrOwed}[, base][, warnings]}; exit 0 whether or not clean',
+    'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, capDeferred, rounds, reviewedRounds, maxRounds, roundStats: {rounds: [{n, items, byBucket}], reRaised, ruledReRaised}, wholePrOwed, nextRound:{round, base, wholePrOwed}[, base][, warnings]}; exit 0 whether or not clean',
+    '  capDeferred: [ids] = the accepts `triage cap-defer` turned into follow-ups unapplied at the last allowed round (review.cap_low_accepts; final.postMax.rule cap-low), read from the state, so it also answers after a retry: name those issues in the hand-off, they are NOT in the PR',
     '  warnings: [the untrusted-anchor sentence] when the default branch could not be anchored on the remote (the hashes are then measured from the PR-editable default_branch; fix: `git remote set-head origin -a`)',
     '  wholePrOwed: true (with base: the PR\'s merge base) when an Opus substitute round came before the PR\'s risk rose to high and no whole-PR round since: the next round must start at that base and reviews the whole PR',
     '    (codex-review rejects any other base). nextRound.base is the base to pass (the merge base when wholePrOwed, else the last round\'s toHead); the effort and route of that round: pipeline codex-review --plan',
@@ -514,7 +515,7 @@ async function outcome(rest, ctx) {
   const nextBase = owed && forkPoint !== null ? forkPoint : state.rounds.at(-1)?.toHead ?? null;
   return {
     exitCode: EXIT.OK,
-    output: { ok: true, ...result, ...(untrusted === null ? {} : { warnings: [untrusted] }), roundStats: roundStats(state), wholePrOwed: owed, ...(owed && forkPoint !== null ? { base: forkPoint } : {}), nextRound: { round: state.rounds.length + 1, base: nextBase, wholePrOwed: owed }, arbiterFailures: arbiterFailures(state), followupsPending: followupsPending(state), currentContentHash: hash, rounds: state.rounds.length, reviewedRounds: reviewedRoundCount(state), maxRounds: state.maxRounds },
+    output: { ok: true, ...result, ...(untrusted === null ? {} : { warnings: [untrusted] }), roundStats: roundStats(state), wholePrOwed: owed, ...(owed && forkPoint !== null ? { base: forkPoint } : {}), nextRound: { round: state.rounds.length + 1, base: nextBase, wholePrOwed: owed }, arbiterFailures: arbiterFailures(state), followupsPending: followupsPending(state), capDeferred: capLowItems(state).map((c) => c.item.id), currentContentHash: hash, rounds: state.rounds.length, reviewedRounds: reviewedRoundCount(state), maxRounds: state.maxRounds },
   };
 }
 

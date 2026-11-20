@@ -136,6 +136,9 @@ export const DEFAULTS = deepFreeze({
     // 'review' (off) | 'follow-up': past review.max_rounds (counted ordinal > max + 1: the first round past the limit (the automatic extra round, or the owner's first grant when there was none) is exempt, later owner-granted rounds are affected) a low-severity SUGGESTION / WORTH CONSIDERING
     // the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP (filed as an issue; Claude may tighten it back). 'review' in ANY config (working tree, fork point or the trusted default-branch one; an unreadable one counts) keeps it off.
     post_max_suggestions: 'review',
+    // 'defer' (default) | 'extra-round': at the LAST allowed counted round (review.max_rounds), when every fix the round accepted is low severity and none is built yet, `triage cap-defer` (run first by
+    // `round publish`) turns those ACCEPTs into follow-up issues unapplied instead of building them and paying the extra confirm round. 'extra-round' in ANY config (working tree or the trusted default-branch one; an unreadable one counts) keeps it off: a PR can switch it off, never on.
+    cap_low_accepts: 'defer',
     // The round trip-wire (chat mode, at `triage round-request`): once the PR has reviewed max_rounds + trip_wire_extra_rounds counted rounds, or trip_wire_not_falling rounds
     // past the limit accepted at least as many new items as the round before (and some), the ask becomes a process-review prompt first. The smaller value of the two configs applies.
     trip_wire_extra_rounds: 3,
@@ -221,7 +224,7 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'regression_only_paths', 'fix_verify_after_round', 'fix_round_max_lines', 'post_max_suggestions', 'trip_wire_extra_rounds', 'trip_wire_not_falling'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'regression_only_paths', 'fix_verify_after_round', 'fix_round_max_lines', 'post_max_suggestions', 'cap_low_accepts', 'trip_wire_extra_rounds', 'trip_wire_not_falling'],
   review_codex_budget: ['soft', 'hard'],
   review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
   threat_model: ['name', 'paths', 'text'],
@@ -551,6 +554,7 @@ function checkProduction(p, errors) {
 export const RISK_IGNORABLE_RULES = Object.freeze(['P-path', 'R4-config']);
 export const SIZE_ONLY_REVIEWERS = Object.freeze(['judge', 'fable']);
 export const POST_MAX_POLICIES = Object.freeze(['follow-up', 'review']);
+export const CAP_LOW_POLICIES = Object.freeze(['defer', 'extra-round']);
 
 function checkIgnoreRules(rules, errors) {
   if (!Array.isArray(rules)) return errors.push('risk.ignore_hard_stop_rules must be an array');
@@ -848,6 +852,7 @@ export function validateConfig(obj) {
     if (review.fix_verify_after_round !== null && !inRange(review.fix_verify_after_round, 1, 10)) errors.push('review.fix_verify_after_round must be null or an integer 1..10');
     checkPosInt(review.fix_round_max_lines, 'review.fix_round_max_lines', errors);
     if (!POST_MAX_POLICIES.includes(review.post_max_suggestions)) errors.push(`review.post_max_suggestions must be one of ${POST_MAX_POLICIES.join('|')}`);
+    if (!CAP_LOW_POLICIES.includes(review.cap_low_accepts)) errors.push(`review.cap_low_accepts must be one of ${CAP_LOW_POLICIES.join('|')}`);
     if (!inRange(review.trip_wire_extra_rounds, 1, 10)) errors.push('review.trip_wire_extra_rounds must be an integer 1..10');
     if (!inRange(review.trip_wire_not_falling, 1, 5)) errors.push('review.trip_wire_not_falling must be an integer 1..5');
     if (!SIZE_ONLY_REVIEWERS.includes(review.size_only_medium_reviewer)) errors.push(`review.size_only_medium_reviewer must be one of ${SIZE_ONLY_REVIEWERS.join('|')}`);

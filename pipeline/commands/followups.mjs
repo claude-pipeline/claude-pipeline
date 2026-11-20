@@ -6,7 +6,7 @@ import { defuseMarkdown } from '../lib/codex.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
-import { isOwnerDeferral } from '../lib/triage.mjs';
+import { isCapLowFinal, isOwnerDeferral } from '../lib/triage.mjs';
 import { createHash } from 'node:crypto';
 import { allItems, findRound, oneLine, requireState, withStateLock } from '../lib/review-context.mjs';
 
@@ -77,6 +77,10 @@ export function issueBody(item, pr) {
   // An ACCEPT the owner deferred (also a cached copy of it): a fix was accepted, and it is left out of this PR by the owner's typed ruling.
   if (isOwnerDeferral(item)) {
     lines.push(`The ${item.final.ownerDeferral.accepted === 'judge' ? 'judge' : item.final.ownerDeferral.accepted === 'cache' ? 'review' : 'arbiter'} ACCEPTED a fix for this finding and the owner deferred it to this issue (typed ruling); it is NOT in PR #${pr}.`, '');
+  }
+  // An ACCEPT deferred unapplied at the last allowed round (review.cap_low_accepts, final.postMax.rule cap-low): nothing was built.
+  if (isCapLowFinal(item)) {
+    lines.push(`The ${item.final.postMax.by === 'judge' ? 'judge' : 'arbiter'} ACCEPTED a fix at the round limit; it was deferred unapplied (review.cap_low_accepts); it is NOT in PR #${pr}.`, '');
   }
   if (where) lines.push(`Location: \`${oneLine(where)}\``, '');
   // A fix deferred past the round limit (triage defer-fixes) was written and taken out again: say where it is. No cherry-pick claim: the fix head may hold other work.

@@ -279,3 +279,28 @@ test('analysePr / aggregate: reviewKind and resolutionIneligible per counted rou
   assert.deepEqual(t.ineligible, { 'history-nonmerge': 1, unknown: 2 });
   assert.match(renderTable({ since: '2026-11-01', repos: ['acme/widgets'], totals: t, prs: [p], withoutState: 0 }), /Why a conflict resolution was not reviewed alone: history-nonmerge 1, unknown 2/);
 });
+
+// ---- cap-low deferral stats (review.cap_low_accepts): what fired, what was tightened back, what would have fired ---------------------------------------------------------------
+const capLow = (id, over = {}) => ({ ...acc(id), final: { decision: 'FOLLOW-UP', by: 'judge', postMax: { from: 'ACCEPT', by: 'judge', ordinal: 1, max: 1, rule: 'cap-low' } }, ...over });
+
+test('analysePr: cap-low deferrals are counted over EVERY round (an uncounted resolution-only round included), once per id, a cached copy and an old post-limit item not at all; tightened-back ones are capDeferReopened', () => {
+  const tightened = { ...acc('R1-S3'), final: { decision: 'ACCEPT', by: 'claude', claude: { overruled: { decision: 'FOLLOW-UP', postMax: { rule: 'cap-low' } } } } };
+  const state = stateOf([
+    round(1, [capLow('R1-S1'), capLow('R1-S2', { final: { decision: 'FOLLOW-UP', by: 'cache', postMax: { rule: 'cap-low' } } }), tightened]),
+    round(2, [capLow('R2-S1'), capLow('R2-S1')], { resolutionOnly: true }),
+    round(3, [acc('R3-S1', 'SUGGESTION', { final: { decision: 'FOLLOW-UP', by: 'judge', postMax: { from: 'ACCEPT', by: 'judge', ordinal: 4, max: 1 } } })], { admission: 'auto-extra' }),
+  ]);
+  const p = analysePr({ repo: 'acme/widgets', pr: 7, state, record: null });
+  assert.deepEqual([p.capDeferredItems, p.capDeferReopened, p.rounds[0].capDeferred, p.rounds[1].capDeferred], [2, 1, 2, undefined], 'R1-S1 and R2-S1 only, attributed to the cap round');
+  const t = aggregate([p, analysePr({ repo: 'acme/widgets', pr: 8, state: stateOf([round(1, [acc('R1-S1')]), round(2, [], { admission: 'auto-extra' })]), record: null })]);
+  assert.deepEqual([t.capDeferredPrs, t.capDeferredItems, t.capDeferReopened], [1, 2, 1]);
+  assert.match(renderTable({ since: '2026-11-01', repos: ['acme/widgets'], totals: t, prs: [p], withoutState: 0 }), /Cap-low deferral .*PRs 1 · items 2 · tightened back to ACCEPT 1/);
+});
+
+test('analysePr: capLowNotDeferred is a PR whose last allowed round accepted only low items, nothing was deferred, and an automatic extra round followed', () => {
+  const ran = analysePr({ repo: 'a/b', pr: 1, state: stateOf([round(1, [acc('R1-S1')]), round(2, [], { admission: 'auto-extra' })]), record: null });
+  const heavy = analysePr({ repo: 'a/b', pr: 2, state: stateOf([round(1, [acc('R1-B1', 'BLOCKING', { category: 'bug' })]), round(2, [], { admission: 'auto-extra' })]), record: null });
+  const deferredPr = analysePr({ repo: 'a/b', pr: 3, state: stateOf([round(1, [capLow('R1-S1')])]), record: null });
+  assert.deepEqual([ran.capLowNotDeferred, heavy.capLowNotDeferred, deferredPr.capLowNotDeferred], [true, false, false]);
+  assert.equal(aggregate([ran, heavy, deferredPr]).capLowNotDeferred, 1);
+});
