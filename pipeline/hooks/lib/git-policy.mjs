@@ -23,8 +23,7 @@ import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
-// (an exit written bare: no wrapper in front of it (shell-parse's `wrapped`; `spawn` for a find -exec / launcher). Only that one is proof the shell left: `command exit 1` (zsh), `noglob exit 1` (bash) and `/usr/bin/time exit 1` are
-// not found or run a child, and the line goes on. Used where a `|| exit` is trusted to prove a redirected or loop-body move happened)
+// (what proves the shell left on a `|| exit`: shell-parse's plainExit, which also refuses a wrapped / spawned exit)
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
 const GUARD_LABELS = ['needs-human', 'pipeline-blocked', 'awaiting-review', 'pipeline-pause', 'pipeline-rollback'];

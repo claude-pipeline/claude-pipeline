@@ -369,7 +369,7 @@ describe('#352: a pipeline stage that is a { } group or an if is parsed, not giv
 // (zsh runs the external cd), and dash's plain `time cd D` (no `time` keyword) leave the shell in /work/main in at least one real shell, while the guard moved to /work/repo and judged the push there: it ran in main (allowed on main for all
 // of them; `>/dev/null time cd D && P` is the same line with a redirect first). The change is UNKNOWN, not "child's" (bash really moves) and not "refused" (`\time make` is everyday).
 const gitMain = (command, cwd = '/work/main') => evaluateGitCommand(command, {
-  cwd, home: HOME, currentBranch: (d) => ({ '/work/main': 'main', '/work/repo': 'agent/x' })[d] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false,
+  cwd, home: HOME, currentBranch: (d) => ({ [resolve('/work/main')]: 'main', [resolve('/work/repo')]: 'agent/x' })[d] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false,
 });
 describe('T2: a cd behind time / command leaves the directory unknown', () => {
   const PUSH_CMD = 'git push origin HEAD';
