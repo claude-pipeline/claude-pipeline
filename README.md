@@ -514,7 +514,7 @@ Rollout: the config rejects unknown keys, so set these in a repo only after ever
 | Variable | Meaning |
 |---|---|
 | `PIPELINE_OFF=1` | review and verify stand down for the session |
-| `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session, and bypasses the live-database guard (Supabase MCP writes) |
+| `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session, and bypasses the live-database guard (Supabase MCP writes, `supabase` CLI and Management API lines) |
 | `PIPELINE_MACHINE_ID` | stable id for this machine in the lock files (default: one generated once) |
 | `PIPELINE_SMOKE_BYPASS_KEY` | secret value of the `smoke_bypass_header` header (see "Smoke firewall bypass header"); read only by `scripts/pipeline/smoke.mjs`, never printed |
 | `PIPELINE_SMOKE_PORT` | the e2e smoke server's port; printed by `supabase-local env`, read by `playwright.smoke.config.ts` |
