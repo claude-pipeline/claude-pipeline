@@ -221,6 +221,12 @@ const ALLOWED = [
   'test -f x && rg -n api.supabase.com x',
   // R1-F1: the pipeline CLI as the program that runs takes prose (bare bin, or node and its script)
   'pipeline summary --pr 1 --built "Owner runs supabase db push after merge"',
+  // R3-F3: prose that starts with the word Supabase and has a subcommand name (test, status, logs, start) later is not a call: the gate walks the words after the token and a plain word ends the walk
+  'claude -p "Supabase must be running before the test"',
+  'cnotify "supabase stack failed to start"',
+  "osascript -e 'display notification \"Supabase is ready for the test\"'",
+  "sh -c 'claude -p \"Supabase must be running before the test\"'",
+  'claude -p "Notes for the owner\nSupabase output is noisy in the logs"',
 ];
 
 const DENIED = [
@@ -502,6 +508,24 @@ const DENIED = [
   'supabase db push --db-url "postgresql://u@127.0.0.1:5432/p?host=db.x.supabase.co"',
   'supabase db push --db-url "postgresql://u@127.0.0.1:5432/p?sslmode=disable&host=x"',
   'supabase db push --db-url "postgresql://u@127.0.0.1:5432/p?sslmode=disable&sslmode=require"',
+  // R3-F1: a word after the token that can become a subcommand (an expansion, a glob, a brace group) inside a quoted command string
+  "doppler run --command 'supabase $SUB'",
+  "doppler run --command 'SUB=db; supabase $SUB push'",
+  "nix-shell --run 'supabase {db,push}'",
+  "doppler run --command 'supabase d? push'",
+  'doppler run --command "supabase \\"\\$@\\""',
+  // R3-F2: a redirect between the token and the head is not a command end; nor is a separator inside a substitution
+  "doppler run --command 'supabase 2>&1 db push'",
+  "doppler run --command 'supabase &>/dev/null db push'",
+  "doppler run --command 'supabase > out.log db push'",
+  "doppler run --command 'supabase --workdir $(git rev-parse --show-toplevel || pwd) db push'",
+  "nix-shell --run 'supabase --workdir `pwd | cat` db push'",
+  // the escaped space of a value, one quote level down, stays one value
+  'sh -c \'doppler run --command "supabase --workdir /my\\ app db push"\'',
+  // R3 hardening: the token as the inner shell reads it (a quote pair or a backslash inside the word) is still a token
+  "doppler run --command 'supa\\base db push'",
+  'sh -c "su\'\'pabase db push"',
+  'doppler run --command "su\'\'pabase db push"',
 ];
 
 for (const line of ALLOWED) test(`allowed: ${line}`, () => {
