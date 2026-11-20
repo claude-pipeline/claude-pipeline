@@ -405,20 +405,39 @@ test('a recorded round picked up from its finished job says so (pickedUp: true);
   assert.equal(again.json.pickedUp, true);
 });
 
-test('a recorded round is not picked up once HEAD moved past its toHead: head-moved-since-round, exit 1, nothing reported or run', (t) => {
-  const w = roundWorld(t, { max: 3 });
+// The next action after a moved HEAD: a round whose rulings are not all in must be finished first (round R+1 would be admitted with R untriaged).
+function movedHead(w, edit) {
   assertExit(rc(w, [], ok(w)), 0);
+  if (edit) w.edit(edit);
   w.repo.write('src/fix.js', 'export const fix = 1;\n');
-  const h2 = w.repo.commit('fix');
-  w.prHead(h2);
+  w.prHead(w.repo.commit('fix'));
   const before = w.stateText();
   const r = rc(w, []);
   assertExit(r, 1, r.stdout + r.stderr);
   assert.equal(r.json.error, 'head-moved-since-round');
   assert.equal(r.json.pickedUp, true);
-  assert.equal(r.json.next, "round codex --pr 7 --round 2", 'the action is the next round, not a rerun of this one');
   assert.equal('codex' in r.json, false, 'the old result was not reported');
   assert.equal(w.stateText(), before);
+  return r.json;
+}
+
+test('a recorded round is not picked up once HEAD moved past its toHead: head-moved-since-round, exit 1; a FINISHED round points to the next round', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const j = movedHead(w, (s) => { for (const i of s.rounds[0].items) i.final = { decision: 'ACCEPT', by: 'judge', needsHuman: false, reason: 'ok' }; });
+  assert.equal(j.next, 'round codex --pr 7 --round 2');
+});
+
+test('head-moved-since-round on a judge round whose items have no ruling yet: next finishes round 1 (the judge step), never starts round 2', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const j = movedHead(w);
+  assert.match(j.next, /^triage validate --round 1 --from-tag /);
+  assert.doesNotMatch(j.next, /round codex/);
+});
+
+test('head-moved-since-round on a Fable round without a proven arbiter pass: next is arbiter needed for that round, never round 2', (t) => {
+  const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
+  const j = movedHead(w, (s) => { for (const i of s.rounds[0].items) i.final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'ok' }; delete s.rounds[0].arbiter; });
+  assert.equal(j.next, 'arbiter needed --pr 7 --round 1');
 });
 
 // R1-B1 / R1-B2: round 1 is recorded at A and its job is still running when the command reads it (HEAD is A: adopted); the state or HEAD then changes during the wait.
