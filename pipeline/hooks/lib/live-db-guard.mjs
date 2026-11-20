@@ -200,7 +200,7 @@ const NON_LITERAL = /[\s$`*?[\]{}()~\\<>|;&'"!#]/;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
 // a literal postgres URI whose host (after WHATWG parsing) is exactly localhost / 127.0.0.1 / ::1, with no query string
-function localDbUrl(v) {
+export function localDbUrl(v) {
   if (v.includes('?') || (v.match(/@/g) ?? []).length > 1) return false;
   let u;
   try { u = new URL(v); } catch { return false; }

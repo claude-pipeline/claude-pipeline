@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { findLiveDbCli, localDbUrl } from '../pipeline/hooks/lib/live-db-guard.mjs';
 
 const DEV = 'zyxwvutsrq9876543210';
 const LIVE = 'abcdefghij0123456789';
@@ -151,6 +152,55 @@ const ALLOWED = [
   'git grep -n xargs -- supabase',
   'cd supabase && which parallel',
   'rg -n xargs docs | rg api.supabase.com',
+  // Part B: each row is an everyday command the guard would refuse wrongly (a false refusal makes an agent stop and hand the owner a line that was never dangerous)
+  // B6/B7: xargs / parallel are refused only when a real supabase TOKEN is on the line, not a path or package name that holds the word
+  'grep -l x supabase/migrations/*.sql | xargs -n1 basename',
+  'git ls-tree -r origin/main --name-only supabase/migrations | xargs -n1 basename',
+  "ls supabase/migrations | xargs -I{} sh -c 'grep -l x supabase/migrations/{}'",
+  'rg -l "@supabase/supabase-js" src | xargs npx prettier --write',
+  // B4: global flags before the subcommand
+  'supabase --workdir /x db reset',
+  'supabase --debug --workdir /x migration list --local',
+  'supabase --debug db push --local',
+  // B5: db query (CLI 2.x and 3.x), a real --read-only passes whatever the target (owner 2026-11-20), --remote forms
+  'supabase db query --linked --read-only "select 1"',
+  'supabase db query --remote --read-only -f q.sql',
+  'supabase db query --local "select 1"',
+  'supabase db query --db-url "$DATABASE_URL" --read-only "select 1"',
+  'supabase db query --linked -f q.sql --read-only',
+  `supabase db push --remote=${DEV}`,
+  'supabase db push --remote=postgresql://postgres:postgres@127.0.0.1:54322/postgres',
+  'supabase db advisors --local',
+  'supabase test new foo',
+  // B6: a local URI with sslmode only
+  './node_modules/.bin/supabase gen types typescript --db-url "postgresql://postgres:postgres@127.0.0.1:56182/postgres?sslmode=disable"',
+  // B1 (Rev 2): the wrapper words the parser strips are not the data command's operands
+  'env rg supabase db',
+  'timeout 30 git diff -- supabase db',
+  'sudo -u x rg -n supabase db',
+  // B2: sed stays plain data unless the line holds a supabase token + a head
+  "sed -i '' 's/supabase db push/supabase db reset/' README.md",
+  // B9 (F3): a variable-held PATH to a program is not a supabase call
+  '$GIT status',
+  '"$HOME/.cargo/bin/cargo" test',
+  '$HOME/.bun/bin/bun test',
+  // B8 (F5): a glob that names no head
+  "npx eslint 'src/**/*.ts' supabase",
+  "npx eslint supabase 'src/**/*.ts'",
+  "uv pip install supabase 'httpx[http2]'",
+  // B10 (F1/F4): a quoted argument with parentheses, commas or prose is not a command
+  'node -e "console.log(foo(a, b))"',
+  'python3 -c "print(max(1, 2))"',
+  "jq 'map(select(.a == 1))' x.json",
+  'claude -p "call foo(a, b) twice"',
+  'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 1 --built "Added helper parse(a, b) and tests"',
+  'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 1 --built "Owner runs supabase db push after merge"',
+  // B1 (F2): find's own prefix is data
+  'find supabase -type d -name functions -exec ls {} \\;',
+  "find supabase -name '*.sql' -exec grep -l storage {} +",
+  // B3: git is data only for a known subcommand
+  'git status supabase db',
+  'git -C supabase log --oneline',
 ];
 
 const DENIED = [
@@ -191,7 +241,6 @@ const DENIED = [
   `supabase db push --local --project-ref ${DEV}`,
   'supabase frobnicate',
   'supabase db frobnicate',
-  'supabase --debug db push --local',
   `supabase functions deploy x --project-ref ${LIVE}`,
   'supabase functions deploy x --project-ref abcdefghij9999999999',
   `supabase functions deploy x --project-ref ${DEV} --project-ref ${DEV}`,
@@ -349,6 +398,59 @@ const DENIED = [
   'pnpm -w supabase db push',
   'npx dotenv -- supabase whoami',
   'rg -n api.supabase.com | sort -o /tmp/x',
+  // Part B: each row is a way an agent could run a live-database command past the guard (or a refusal the plan documents as accepted)
+  // B2: sed runs programs (its e command), so xargs sed fed a supabase line is a program builder
+  "printf -- '-e\\ne supabase db push\\n' | xargs sed -n x",
+  "echo 'supabase.exe db push' | xargs env",
+  // B3: git runs a command through bisect run / rebase -x
+  'git bisect run supabase db push',
+  'git rebase -x "supabase db push" main',
+  // B10: a runner that takes the command as one quoted string
+  'doppler run --command "supabase db push"',
+  'doppler run --command="supabase db push"',
+  'infisical run --command "supabase db push"',
+  "nix-shell --run 'supabase db push'",
+  'doppler run --command "pnpm supabase db push"',
+  "ssh ci 'cd app && yarn supabase db push'",
+  `doppler run --command "${'true; '.repeat(501)}supabase db push"`,
+  // E7 (accepted false refusals): prose with a separator or a substitution followed by a supabase command
+  'claude -p "Check migrations; supabase db push is forbidden"',
+  "claude -p 'Owner step: run `supabase db push --linked` after merge'",
+  "claude -p 'run (supabase db push) later'",
+  // B8: a glob in the head slot can be any subcommand
+  'npx dotenv -- supabase d? push',
+  "npx prettier --check supabase '*'",
+  // B9: the binary run through a variable
+  '$SB db push',
+  '"$(command -v supabase)" db push',
+  '$SB --workdir /x db push',
+  // B4: a global flag does not make the line safe
+  'supabase --workdir /x db push',
+  'supabase --debug db push',
+  // B5: db query (a real --read-only is the only pass without a local proof) and --remote
+  'supabase db query "delete from t"',
+  'supabase db query --linked "select 1"',
+  'supabase db query --linked --read-only=false "x"',
+  'supabase db query --linked -- --read-only',
+  'supabase db query --linked --read-only --read-only "x"',
+  'supabase db query --linked --file --read-only "x"',
+  `supabase db query --linked --read-only --db-url ${LOCAL} "x"`,
+  'supabase db query --linked --read-only --remote "x"',
+  'supabase db query --db-url "$A" --db-url "$B" --read-only "x"',
+  'supabase db push --linked --read-only',
+  'supabase db reset --linked --read-only',
+  'supabase db push --remote',
+  'supabase db push --remote=${LIVE}',
+  `supabase db push --remote=${LIVE}`,
+  `supabase db reset --remote=${LIVE}`,
+  `supabase db push --remote=${DEV} --linked`,
+  'supabase migration up --remote=postgresql://u@db.x.supabase.co/postgres',
+  'supabase db advisors --linked',
+  'supabase logs --linked',
+  // B6: a libpq parameter other than sslmode can move the host
+  'supabase db push --db-url "postgresql://u@127.0.0.1:5432/p?host=db.x.supabase.co"',
+  'supabase db push --db-url "postgresql://u@127.0.0.1:5432/p?sslmode=disable&host=x"',
+  'supabase db push --db-url "postgresql://u@127.0.0.1:5432/p?sslmode=disable&sslmode=require"',
 ];
 
 for (const line of ALLOWED) test(`allowed: ${line}`, () => {
@@ -373,6 +475,30 @@ test('a target flag after `--` or in an option value slot is refused with its ow
     assert.equal(v.decision, 'deny', line);
     assert.match(v.reason, /follows `--` or an option that may take it as its value; put the target flag first/);
   }
+});
+
+// B6: an agent could point a "local" URI at a remote host through a libpq parameter; sslmode alone is safe
+test('localDbUrl accepts a query made only of one sslmode and nothing else', () => {
+  const base = 'postgresql://postgres:postgres@127.0.0.1:54322/postgres';
+  assert.equal(localDbUrl(base), true);
+  assert.equal(localDbUrl(`${base}?sslmode=disable`), true);
+  assert.equal(localDbUrl(`${base}?sslmode=verify-full`), true);
+  for (const bad of ['?host=db.x.supabase.co', '?sslmode=disable&host=x', '?sslmode=disable&sslmode=require', '?hostaddr=1.2.3.4', '?service=x', '?options=-c', '?sslmode=', '?sslmode=dis%61ble', '?SSLMODE=disable&host=x', '?']) {
+    assert.equal(localDbUrl(`${base}${bad}`), false, bad);
+  }
+  assert.equal(localDbUrl('postgresql://u@db.x.supabase.co/postgres?sslmode=disable'), false);
+});
+
+// B1: the parsed argv judged as data must not silence a typed reading whose own words are not the argv's (an agent could hide a launcher in words the parser rewrote)
+test('a typed reading that does not end with the parsed argv is judged as non-data', () => {
+  const state = { ok: true, refs: [] };
+  const cmd = (argv, typed) => { const c = { argv, raw: typed.join(' '), env: {}, redirects: [] }; Object.defineProperty(c, 'typed', { value: typed, enumerable: false }); return c; };
+  // the parser reads `rg supabase db push` (data), the words typed were something that rewrote into it
+  assert.match(String(findLiveDbCli([cmd(['rg', 'supabase', 'db', 'push'], ['runit', '--as', 'rg', 'x', 'supabase', 'db', 'push'])], '', state)), /live database/);
+  // a plain stripped wrapper prefix (`env`) is not a reason to refuse an operand of the data command
+  assert.equal(findLiveDbCli([cmd(['rg', 'supabase', 'db'], ['env', 'rg', 'supabase', 'db'])], '', state), null);
+  // a stripped prefix that itself carries a call is refused
+  assert.match(String(findLiveDbCli([cmd(['rg', 'x'], ['supabase', 'db', 'push', 'rg', 'x'])], '', state)), /live database/);
 });
 
 test('the admin switch bypasses the rule', () => {
