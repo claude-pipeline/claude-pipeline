@@ -3,10 +3,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { join } from 'node:path';
-import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, appendFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, rmSync, symlinkSync, writeFileSync, appendFileSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import {
-  git, mergeBase, mergeTree, mergeTreeDetailed, effectiveReviewBase, resolutionReviewBase, ensureReviewBase, reviewPatch, revParse, ReviewBaseUnavailable,
+  git, mergeBase, mergeTree, mergeTreeDetailed, effectiveReviewBase, resolutionReviewBase, conflictReviewBase, ensureReviewBase, reviewPatch, revParse, ReviewBaseUnavailable,
 } from '../pipeline/lib/git.mjs';
 import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, SearchCap, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
@@ -1041,4 +1041,340 @@ test('ensureReviewBase: merge=text on a conflicted path is unavailable, and the 
       return true;
     });
   } finally { clone.cleanup(); }
+});
+
+// ---------- conflictReviewBase (the counted 'conflict' round, #423) ----------
+
+const cdecide = ({ from, o }, head, baseRef = 'main') => conflictReviewBase({ from, forkPoint: mergeBase('main', head, o), head, baseRef }, o);
+const cOk = (r) => assert.ok(!r.unavailable && r.base, `expected admitted, got ${JSON.stringify(r)}`);
+const cNo = (r, code, mention) => {
+  assert.ok(typeof r.unavailable === 'string' && r.unavailable.startsWith(code), `expected ${code}, got ${JSON.stringify(r)}`);
+  if (mention) assert.ok(r.unavailable.includes(mention), `expected the reason to name ${mention}: ${r.unavailable}`);
+};
+const patchOf = (s, r, head) => git(['diff', r.base, head], s.o);
+const mergeLeavingMarkers = (repo) => { try { repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']); } catch { /* the conflict is the point */ } };
+const readWork = (repo, p) => readFileSync(join(repo.dir, p), 'utf8');
+const twelve = (tag, k) => T(...Array.from({ length: 12 }, (_, i) => (i === k ? `${tag} edited` : `line ${i}`)));
+const GAP = ['mid1', 'mid2', 'mid3', 'mid4', 'mid5', 'mid6', 'mid7', 'mid8'];
+const twoBlockRepo = () => conflictRepo({
+  base: { 'f.txt': T('top', 'x1', ...GAP, 'x2', 'bottom') },
+  ours: { 'f.txt': T('top', 'o1', ...GAP, 'o2', 'bottom') },
+  theirs: { 'f.txt': T('top', 't1', ...GAP, 't2', 'bottom') },
+});
+const firstBlock = /<{7} [^\n]*\n[\s\S]*?>{7} [^\n]*\n/;
+const markerBlob = (s, p) => {
+  const d = mergeTreeDetailed(revParse(s.from, s.o), revParse('main', s.o), s.o);
+  return git(['cat-file', 'blob', `${d.tree}:${p}`], s.o);
+};
+
+test('conflictReviewBase: a content conflict resolved with a typed line plus an own commit after the merge: the base is the marker tree, the patch shows both, and main-only changes stay out', () => {
+  // Prevents: the next round reviewing the whole PR (or main's own commits) after a conflicting merge, or hiding the typed line.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'main-only.txt': T('m') },
+    ours: { 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'f.txt': T('top', 't', 'bottom'), 'main-only.txt': T('m2') },
+  });
+  resolveMerge(s.repo, { 'f.txt': T('top', 'typed by the resolver', 'bottom') });
+  s.repo.write('own.txt', T('an own commit after the merge'));
+  const head = s.repo.commit('own commit');
+  const r = cdecide(s, head);
+  cOk(r);
+  assert.deepEqual(r.conflicted, ['f.txt']);
+  assert.equal(r.conflictedCount, 1);
+  assert.deepEqual(r.records, []);
+  const patch = patchOf(s, r, head);
+  assert.match(patch, /^\+typed by the resolver$/m);
+  assert.match(patch, /^\+\+\+ b\/own\.txt$/m);
+  assert.doesNotMatch(patch, /main-only/);
+  assert.equal(git(['cat-file', 'blob', `${r.base}:main-only.txt`], s.o), T('m2'));
+});
+
+test('conflictReviewBase: the #2395 shape with no own commit: the content resolution is in the patch and the moved file has a file-location record naming where head put it', () => {
+  // Prevents: an (almost) empty patch that hides a file a directory rename moved under the PR's feet.
+  const s = conflictRepo({
+    base: { 'dir/y': twelve('y', -1), 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'dir/x': twelve('x', -1), 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'dir/y': null, 'new/y': twelve('y', -1), 'f.txt': T('top', 't', 'bottom') },
+  });
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  const r = cdecide(s, head);
+  cOk(r);
+  assert.deepEqual(r.conflicted.sort(), ['f.txt', 'new/x']);
+  assert.match(patchOf(s, r, head), /^ f\.txt|^\+\+\+ b\/f\.txt$/m);
+  assert.equal(r.records.length, 1);
+  const [rec] = r.records;
+  assert.equal(rec.path, 'new/x');
+  assert.ok(rec.types.includes('CONFLICT (directory rename suggested)'), JSON.stringify(rec.types));
+  assert.ok(rec.messages.length > 0 && rec.messages.every((m) => !m.includes('\n') && m.length <= 300), JSON.stringify(rec.messages));
+  assert.deepEqual(Object.keys(rec.stages), ['2']);
+  const ours = git(['rev-parse', `${s.from}:dir/x`], s.o).trim();
+  assert.equal(rec.stages[2].oid, ours);
+  assert.deepEqual(rec.head, { mode: '100644', oid: ours });
+  assert.equal(rec.headEquals, 'ours');
+  assert.deepEqual(rec.heads, [{ path: 'new/x', mode: '100644', oid: ours }, { path: 'dir/x', absent: true }]);
+});
+
+test('conflictReviewBase: modify/delete where head keeps the PR\'s file, and a binary conflict keeping ours, each get a record (they are not in the patch)', () => {
+  // Prevents: a deleted-on-main file or a kept binary choice that no reviewer can see because git already wrote it into the marker tree.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'del.txt': T('d'), 'b.dat': Buffer.from('a\0x\n') },
+    ours: { 'f.txt': T('top', 'o', 'bottom'), 'del.txt': T('d modified by the PR'), 'b.dat': Buffer.from('a\0o\n') },
+    theirs: { 'f.txt': T('top', 't', 'bottom'), 'del.txt': null, 'b.dat': Buffer.from('a\0t\n') },
+  });
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  const r = cdecide(s, head);
+  cOk(r);
+  const del = r.records.find((x) => x.path === 'del.txt');
+  const bin = r.records.find((x) => x.path === 'b.dat');
+  assert.ok(del && bin, JSON.stringify(r.records));
+  assert.ok(del.types.includes('CONFLICT (modify/delete)'));
+  assert.deepEqual(Object.keys(del.stages).sort(), ['1', '2']);
+  assert.equal(del.headEquals, 'ours');
+  assert.ok(bin.types.includes('CONFLICT (binary)'));
+  assert.equal(bin.headEquals, 'ours');
+  assert.ok(!r.records.some((x) => x.path === 'f.txt'), 'a plain text conflict is shown by the patch, not a record');
+});
+
+test('conflictReviewBase: head keeps the markers of a text conflict (a real merge\'s or a pasted trial blob\'s) -> evidence', () => {
+  // Prevents: a conflict "resolved" by committing its markers hiding behind a patch that only shows the other file's resolution.
+  const mk = () => conflictRepo({
+    base: { 'a.txt': T('top', 'x', 'bottom'), 'b.txt': T('top', 'x', 'bottom') },
+    ours: { 'a.txt': T('top', 'o', 'bottom'), 'b.txt': T('top', 'o', 'bottom') },
+    theirs: { 'a.txt': T('top', 't', 'bottom'), 'b.txt': T('top', 't', 'bottom') },
+  });
+  const real = mk();
+  mergeLeavingMarkers(real.repo);
+  assert.match(readWork(real.repo, 'b.txt'), /^<{7} HEAD$/m, 'a real merge labels its markers HEAD / main');
+  real.repo.write('a.txt', T('top', 'o', 'bottom'));
+  cNo(cdecide(real, real.repo.commit('merge main, b.txt keeps its markers')), 'evidence', 'b.txt');
+
+  const pasted = mk();
+  const blob = markerBlob(pasted, 'b.txt');
+  assert.match(blob, /^<{7} [0-9a-f]{40}/m, 'the trial tree labels its markers with full commit ids');
+  const head = resolveMerge(pasted.repo, { 'a.txt': T('top', 'o', 'bottom'), 'b.txt': blob });
+  cNo(cdecide(pasted, head), 'evidence', 'b.txt');
+});
+
+test('conflictReviewBase: one file with two separated blocks: the first resolved and the second committed with its markers -> evidence; both resolved -> admitted', () => {
+  // Prevents: one resolved block hiding another left as committed markers (the patch is non-empty either way).
+  const probe = twoBlockRepo();
+  const d = mergeTreeDetailed(revParse(probe.from, probe.o), revParse('main', probe.o), probe.o);
+  assert.ok(d.conflicts[0].types.includes('Auto-merging') && d.conflicts[0].types.includes('CONFLICT (contents)'), JSON.stringify(d.conflicts[0].types));
+
+  const half = twoBlockRepo();
+  mergeLeavingMarkers(half.repo);
+  half.repo.write('f.txt', readWork(half.repo, 'f.txt').replace(firstBlock, T('o1')));
+  cNo(cdecide(half, half.repo.commit('first block resolved only')), 'evidence', 'f.txt');
+
+  const both = twoBlockRepo();
+  mergeLeavingMarkers(both.repo);
+  both.repo.write('f.txt', readWork(both.repo, 'f.txt').replace(firstBlock, T('o1')).replace(firstBlock, T('t2')));
+  cOk(cdecide(both, both.repo.commit('both blocks resolved')));
+});
+
+test('conflictReviewBase: an add/add text conflict is a record, and one left as its trial-tree markers is evidence', () => {
+  // Prevents: an add/add file (no base stage) treated as a plain text conflict, or its unresolved markers passing because it has a record.
+  const mk = () => conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'n.txt': T('o'), 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'n.txt': T('t'), 'f.txt': T('top', 't', 'bottom') },
+  });
+  const ok = mk();
+  const head = resolveMerge(ok.repo, { 'n.txt': T('o', 'typed'), 'f.txt': T('top', 'o', 'bottom') });
+  const r = cdecide(ok, head);
+  cOk(r);
+  const rec = r.records.find((x) => x.path === 'n.txt');
+  assert.ok(rec, JSON.stringify(r.records));
+  assert.deepEqual(Object.keys(rec.stages).sort(), ['2', '3']);
+  assert.equal(rec.headEquals, 'none');
+
+  const bad = mk();
+  const blob = markerBlob(bad, 'n.txt');
+  cNo(cdecide(bad, resolveMerge(bad.repo, { 'n.txt': blob, 'f.txt': T('top', 'o', 'bottom') })), 'evidence', 'n.txt');
+});
+
+test('conflictReviewBase: a path both sides changed that a merge driver resolves silently -> attribute naming it', () => {
+  // Prevents: a union driver quietly merging a file the conflict list never names, so no review shows how it came out.
+  const s = conflictRepo({
+    base: { 'a.txt': T('top', 'x', 'bottom'), 'b.txt': T('top', 'x', 'bottom') },
+    ours: { 'a.txt': T('top', 'o', 'bottom'), 'b.txt': T('top', 'o', 'bottom') },
+    theirs: { 'a.txt': T('top', 't', 'bottom'), 'b.txt': T('top', 't', 'bottom') },
+  });
+  const head = resolveMerge(s.repo, { 'a.txt': T('top', 'o', 'bottom'), 'b.txt': T('top', 'o', 'bottom') });
+  cOk(cdecide(s, head)); // the same conflict is admitted without the driver
+  infoAttributes(s.repo.dir, 'b.txt merge=union');
+  const r = cdecide(s, head);
+  cNo(r, 'attribute', 'b.txt');
+});
+
+test('conflictReviewBase: the PR renames old->new and edits it, main edits old, merge=union on new, another file conflicts -> attribute naming new', () => {
+  // Prevents: a driver on a rename destination escaping the check because the conflict list and main's side only name the old path.
+  const s = conflictRepo({
+    base: { 'old.txt': twelve('base', -1), 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'old.txt': null, 'new.txt': twelve('pr', 3), 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'old.txt': twelve('main', 9), 'f.txt': T('top', 't', 'bottom') },
+  });
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  cOk(cdecide(s, head));
+  infoAttributes(s.repo.dir, 'new.txt merge=union');
+  cNo(cdecide(s, head), 'attribute', 'new.txt');
+});
+
+test('conflictReviewBase: a clean trial merge -> no-conflict; more than 50 conflicted paths -> too-many-conflicts', () => {
+  // Prevents: a 'conflict' round with nothing to show, and an evidence list cut at 50 entries.
+  const clean = conflictRepo({ base: { 'a.txt': T('x') }, ours: { 'b.txt': T('y') }, theirs: { 'c.txt': T('z') } });
+  clean.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']);
+  cNo(cdecide(clean, revParse('HEAD', clean.o)), 'no-conflict');
+
+  const names = Array.from({ length: 51 }, (_, i) => `f${i}.txt`);
+  const files = (v) => Object.fromEntries(names.map((n) => [n, T('top', v, 'bottom')]));
+  const many = conflictRepo({ base: files('x'), ours: files('o'), theirs: files('t') });
+  cNo(cdecide(many, resolveMerge(many.repo, files('o'))), 'too-many-conflicts');
+});
+
+test('conflictReviewBase: history: a foreign-branch merge then an ordinary commit, a rewritten branch whose old head still resolves, and an octopus merge are all refused', () => {
+  // Prevents: a merge of some other branch (or a rewrite) anywhere in the chain hiding its changes inside the "own changes" slice.
+  const base = () => conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
+  const foreign = base();
+  const baseSha = mergeBase('main', 'HEAD', foreign.o);
+  foreign.repo.git(['branch', 'topic', baseSha]);
+  foreign.repo.checkout('topic');
+  foreign.repo.write('topic.txt', T('topic'));
+  foreign.repo.commit('topic work');
+  foreign.repo.checkout('feat');
+  foreign.repo.git(['merge', '--no-ff', '-q', '-m', 'merge topic', 'topic']);
+  foreign.repo.write('own.txt', T('own'));
+  foreign.repo.commit('own commit after the foreign merge');
+  cNo(cdecide(foreign, resolveMerge(foreign.repo, { 'f.txt': T('top', 'o', 'bottom') })), 'history');
+
+  const rewritten = base();
+  rewritten.repo.git(['checkout', '-q', '-b', 'alt', mergeBase('main', 'HEAD', rewritten.o)]);
+  rewritten.repo.write('f.txt', T('top', 'o2', 'bottom'));
+  rewritten.repo.commit('the branch, rewritten');
+  cNo(cdecide(rewritten, resolveMerge(rewritten.repo, { 'f.txt': T('top', 'o2', 'bottom') })), 'history');
+
+  const octopus = conflictRepo({ base: { 'f.txt': T('x') }, ours: { 'f.txt': T('o') }, theirs: { 'g.txt': T('g') } });
+  octopus.repo.git(['branch', 'other2', mergeBase('main', 'HEAD', octopus.o)]);
+  octopus.repo.checkout('other2');
+  octopus.repo.write('h.txt', T('h'));
+  octopus.repo.commit('h');
+  octopus.repo.checkout('feat');
+  octopus.repo.git(['merge', '-q', '-m', 'octopus', 'main', 'other2']);
+  cNo(cdecide(octopus, revParse('HEAD', octopus.o)), 'history');
+});
+
+test('conflictReviewBase: a symlink conflict, and a file/directory conflict, are evidence failures', () => {
+  // Prevents: a link target or a directory swap judged by a text diff of a path that is not a regular file.
+  const sl = createTmpRepo();
+  symlinkSync('x-target', join(sl.dir, 'l'));
+  sl.commit('base');
+  sl.branch('feat');
+  rmSync(join(sl.dir, 'l'));
+  symlinkSync('o-target', join(sl.dir, 'l'));
+  const from = sl.commit('reviewed');
+  sl.checkout('main');
+  rmSync(join(sl.dir, 'l'));
+  symlinkSync('t-target', join(sl.dir, 'l'));
+  sl.commit('main moves');
+  sl.checkout('feat');
+  try { sl.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']); } catch { /* conflict */ }
+  rmSync(join(sl.dir, 'l'));
+  symlinkSync('o-target', join(sl.dir, 'l'));
+  const head = sl.commit('resolved');
+  cNo(cdecide({ from, o: { cwd: sl.dir } }, head), 'evidence');
+
+  const fd = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom') },
+    ours: { n: T('a file'), 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'n/m': T('a directory'), 'f.txt': T('top', 't', 'bottom') },
+  });
+  cNo(cdecide(fd, resolveMerge(fd.repo, { 'f.txt': T('top', 'o', 'bottom') })), 'evidence');
+});
+
+// What git 2.39's ort stages for the directory cases (observed on real repos, not assumed): a PR-added file inside a directory main
+// RENAMED becomes a staged entry at its new path with the type 'CONFLICT (directory rename suggested)' (stage 2 only). A directory
+// SPLIT (main moves lib/ into a/ and b/) stages nothing for the PR's file: only a message of type 'CONFLICT(directory rename unclear
+// split)' (no space) that names the directory; an existing file in the way of an implicit rename is the same: a
+// 'CONFLICT (file in way of directory rename)' message naming two clean, unstaged paths. Those messages must fail E, not pass as info.
+test('conflictReviewBase: a directory split and a file in the way of a directory rename (messages that stage no conflicted path) -> evidence; a rename colliding with an add/add file is a record', () => {
+  // Prevents: an ort message about a path the conflict list does not stage being read as informational, hiding a moved or blocked file.
+  const split = conflictRepo({
+    base: { 'lib/a.js': twelve('a', -1), 'lib/b.js': twelve('b', -1), 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'lib/new.js': twelve('new', -1), 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'lib/a.js': null, 'a/a.js': twelve('a', -1), 'lib/b.js': null, 'b/b.js': twelve('b', -1), 'f.txt': T('top', 't', 'bottom') },
+  });
+  const d = mergeTreeDetailed(revParse(split.from, split.o), revParse('main', split.o), split.o);
+  assert.ok(d.messages.some((m) => m.type === 'CONFLICT(directory rename unclear split)'), JSON.stringify(d.messages.map((m) => m.type)));
+  cNo(cdecide(split, resolveMerge(split.repo, { 'f.txt': T('top', 'o', 'bottom') })), 'evidence', 'lib');
+
+  const way = conflictRepo({
+    base: { 'dir/y': twelve('y', -1), 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'dir/x': twelve('x1', -1), 'new/x': twelve('x3', -1), 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'dir/y': null, 'new/y': twelve('y', -1), 'f.txt': T('top', 't', 'bottom') },
+  });
+  cNo(cdecide(way, resolveMerge(way.repo, { 'f.txt': T('top', 'o', 'bottom') })), 'evidence', 'new/x');
+
+  const collide = conflictRepo({
+    base: { 'dir/y': twelve('y', -1), 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'dir/x': twelve('x1', -1), 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'dir/y': null, 'new/y': twelve('y', -1), 'new/x': twelve('x2', -1), 'f.txt': T('top', 't', 'bottom') },
+  });
+  const head = resolveMerge(collide.repo, { 'new/x': T('typed collision resolution'), 'f.txt': T('top', 'o', 'bottom') });
+  const r = cdecide(collide, head);
+  cOk(r);
+  const rec = r.records.find((x) => x.path === 'new/x');
+  assert.ok(rec && rec.types.includes('CONFLICT (directory rename suggested)') && rec.heads.some((h) => h.path === 'new/x'), JSON.stringify(r.records));
+});
+
+test('conflictReviewBase: records-only with an empty patch (a lone modify/delete where head keeps ours) -> evidence: records-only', () => {
+  // Prevents: a counted conflict round whose patch is empty, i.e. nothing for the reviewer to read.
+  const s = conflictRepo({ base: { 'del.txt': T('d') }, ours: { 'del.txt': T('d modified by the PR') }, theirs: { 'del.txt': null } });
+  const head = resolveMerge(s.repo, {});
+  assert.equal(patchOf(s, { base: mergeTreeDetailed(revParse(s.from, s.o), revParse('main', s.o), s.o).tree }, head), '');
+  cNo(cdecide(s, head), 'evidence: records-only');
+});
+
+// ---------- ensureReviewBase for a 'conflict' round ----------
+
+const conflictRoundFixture = () => {
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'z.txt': T(...Array.from({ length: 30 }, (_, i) => `z${i}`)) },
+    ours: { 'f.txt': T('top', 'o', 'bottom'), 'z.txt': T(...Array.from({ length: 30 }, (_, i) => (i === 4 ? 'z4 by the PR' : `z${i}`))) },
+    theirs: { 'f.txt': T('top', 't', 'bottom'), 'z.txt': T(...Array.from({ length: 30 }, (_, i) => (i === 25 ? 'z25 by main' : `z${i}`))) },
+  });
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  const r = cdecide(s, head);
+  cOk(r);
+  const round = { reviewBase: r.base, reviewBaseKind: 'conflict', fromHead: s.from, toHead: head, forkPoint: mergeBase('main', head, s.o), conflicted: r.conflicted };
+  return { s, r, head, round };
+};
+
+test('ensureReviewBase (conflict): a fresh clone rebuilds the same tree id; another id, a missing fromHead, or an attribute on a both-sides path outside the stored list is review-base-unavailable', () => {
+  // Prevents: reviewing against a different tree on another machine, or a driver on a path the stored 50-path display list does not hold.
+  const { s, r, round } = conflictRoundFixture();
+  assert.equal(ensureReviewBase(round, s.o), r.base);
+  const unavailable = (e) => e instanceof ReviewBaseUnavailable && e.code === 'review-base-unavailable';
+
+  const clone = cloneOf(s.repo);
+  try {
+    assert.notEqual(run('git', ['cat-file', '-e', r.base], { cwd: clone.dir }).code, 0, 'the clone must lack the marker tree');
+    assert.equal(ensureReviewBase(round, { cwd: clone.dir }), r.base);
+  } finally { clone.cleanup(); }
+
+  const other = cloneOf(s.repo);
+  try {
+    assert.throws(() => ensureReviewBase({ ...round, reviewBase: 'a'.repeat(40) }, { cwd: other.dir }), unavailable);
+  } finally { other.cleanup(); }
+
+  const missing = cloneOf(s.repo);
+  try {
+    assert.throws(() => ensureReviewBase({ ...round, fromHead: 'f'.repeat(40) }, { cwd: missing.dir }), unavailable);
+  } finally { missing.cleanup(); }
+
+  const attr = cloneOf(s.repo);
+  try {
+    mkdirSync(join(attr.dir, '.git', 'info'), { recursive: true });
+    writeFileSync(join(attr.dir, '.git', 'info', 'attributes'), 'z.txt conflict-marker-size=9\n');
+    assert.throws(() => ensureReviewBase(round, { cwd: attr.dir }), (e) => unavailable(e) && /z\.txt/.test(e.message));
+  } finally { attr.cleanup(); }
 });

@@ -12,7 +12,7 @@ import { openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs'
 import { join } from 'node:path';
 import { run } from './proc.mjs';
 import { parseUnifiedDiff } from './diff.mjs';
-import { MAX_BLOCKS, SearchCap, checkSelection, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
+import { MAX_BLOCKS, SearchCap, checkSelection, committedBlock, isMarkerLine, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
 
 // Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
 export const NETWORK_TIMEOUT_MS = 120_000;
@@ -197,7 +197,8 @@ export function mergeTreeDetailed(base, head, o) {
 //   - otherwise a trial merge of forkPoint into `from` ("what was reviewed, plus the new base") is the base; the head differs
 //     from it only by the PR's own later changes (kind 'synthetic', a tree id; `git diff <tree>..<commit>` accepts one);
 //   - a conflicting merge, or a git without merge-tree --write-tree, falls back to `forkPoint`: the whole PR against the new
-//     base, which still never shows the base branch's code (kind 'whole-pr').
+//     base, which still never shows the base branch's code (kind 'whole-pr'). (Review rounds try resolutionReviewBase and
+//     conflictReviewBase before accepting this fallback; the callers that only measure keep it.)
 // -> { base, kind }
 export function effectiveReviewBase({ from, forkPoint }, o) {
   if (isAncestor(forkPoint, from, o)) return { base: from, kind: 'previous' };
@@ -380,6 +381,229 @@ export function resolutionReviewBase({ from, forkPoint, head, baseRef }, o) {
   }
 }
 
+// ---------- 'conflict' round: the PR's own changes after a conflicting merge, plus evidence of each conflict's resolution (#423) ----------
+
+const MAX_OWN_HISTORY = 200;
+const MAX_DISPLAY_CONFLICTS = 50;
+const MAX_RECORD_MESSAGE = 300;
+// Modes that are never judged by a text diff: a link target, a submodule commit, or a directory where a file was.
+const NON_FILE_MODES = new Set(['120000', '160000', '040000']);
+
+// H: head's first-parent chain back to `from` holds only ordinary (one-parent) commits and two-parent merges whose second parent is on
+// `baseRef`. The WHOLE chain is walked: a foreign merge, an octopus merge or a rewrite anywhere in it could carry changes the "own
+// changes" slice would then hide. All shas are full. -> { commits, merges } or throws Ineligible.
+function walkOwnHistory({ from, head, baseRef }, o) {
+  const entries = new Map();
+  for (const line of git(['rev-list', '--first-parent', '--parents', head, `^${from}`], o).split('\n')) {
+    if (line === '') continue;
+    const [sha, ...parents] = line.split(' ');
+    entries.set(sha, parents);
+  }
+  if (entries.size > MAX_OWN_HISTORY) throw fail('history', `${entries.size} commits since the last reviewed head`);
+  let merges = 0;
+  for (let cur = head; cur !== from; ) {
+    const parents = entries.get(cur);
+    if (!parents) throw fail('history', 'the last reviewed head is not on the first-parent chain of HEAD');
+    if (parents.length === 0) throw fail('history', `${cur} is a root commit`);
+    if (parents.length > 2) throw fail('history', `${cur} merges ${parents.length} parents`);
+    if (parents.length === 2) {
+      if (!isAncestor(parents[1], baseRef, o)) throw fail('history', `${cur} merges ${parents[1]}, which is not on ${displayRef(baseRef)}`);
+      merges++;
+    }
+    cur = parents[0];
+  }
+  return { commits: entries.size, merges };
+}
+
+// null, or why head's history since `from` is not "the PR's own commits plus merges of the protected branch" (rule H; also used by
+// round-status to decide whether a count of own changes can be trusted). from / head / baseRef are any revs.
+export function ownHistoryProblem({ from, head, baseRef }, o) {
+  try {
+    assertRef(baseRef, ['rev-list', baseRef]);
+    walkOwnHistory({ from: revParse(`${assertRef(from, ['rev-parse', from])}^{commit}`, o), head: revParse(`${assertRef(head, ['rev-parse', head])}^{commit}`, o), baseRef }, o);
+    return null;
+  } catch (err) {
+    if (err instanceof Ineligible) return err.message;
+    if (err instanceof GitError) return `git-error: ${err.message.slice(0, 300)}`;
+    throw err;
+  }
+}
+
+// `git diff --raw -z -M` from the merge base to one side: Map <merge-base path> -> [destination paths], so a renamed file is the same
+// key on both sides. A hit rename limit (git says so on stderr) throws: a rename it skipped could hide a destination from rule A.
+function changesByBasePath(baseCommit, side, o) {
+  const args = [
+    ...STABLE_CONFIG, '-c', 'diff.renameLimit=7000', 'diff', '--raw', '-z', '-M', '--no-abbrev', '--no-color', '--no-ext-diff', '--no-textconv', '--no-relative',
+    '--ignore-submodules=none', assertRef(baseCommit, ['diff', baseCommit]), assertRef(side, ['diff', side]),
+  ];
+  const r = exec(args, o);
+  if (r.code !== 0) throw new GitError({ args, code: r.code, stderr: r.stderr });
+  if (/rename/i.test(r.stderr ?? '')) throw fail('attribute', 'git reported that rename detection hit its limit');
+  const parts = r.stdout.split('\0');
+  const out = new Map();
+  for (let i = 0; i < parts.length; ) {
+    if (parts[i] === '') { i++; continue; }
+    const m = /^:(\d+) (\d+) [0-9a-f]+ [0-9a-f]+ ([A-Z])(\d*)$/.exec(parts[i]);
+    if (!m) throw new GitError({ args, code: 0, stderr: `unexpected raw diff entry: ${parts[i]}` });
+    const renamed = m[3] === 'R' || m[3] === 'C';
+    const [a, b] = renamed ? [parts[i + 1], parts[i + 2]] : [parts[i + 1], parts[i + 1]];
+    if (a === undefined || b === undefined) throw new GitError({ args, code: 0, stderr: 'truncated raw diff entry' });
+    const key = m[3] === 'C' ? b : a;
+    out.set(key, [...(out.get(key) ?? []), b]);
+    i += renamed ? 3 : 2;
+  }
+  return out;
+}
+
+// `git ls-tree -z --full-tree <tree> -- <paths>` -> Map path -> { mode, oid } (a path that is not in the tree is not in the map).
+function treeEntries(tree, paths, o) {
+  const out = new Map();
+  for (let i = 0; i < paths.length; i += 200) {
+    const chunk = paths.slice(i, i + 200);
+    const parts = git(['ls-tree', '-z', '--full-tree', assertRef(tree, ['ls-tree', tree]), '--', ...chunk], o).split('\0');
+    for (const part of parts) {
+      if (part === '') continue;
+      const m = /^(\d{6}) \w+ ([0-9a-f]{40,64})\t([^]+)$/.exec(part);
+      if (!m) throw new GitError({ args: ['ls-tree', '-z'], code: 0, stderr: `unexpected ls-tree entry: ${part.slice(0, 80)}` });
+      out.set(m[3], { mode: m[1], oid: m[2] });
+    }
+  }
+  return out;
+}
+
+const sameEntry = (a, b) => (a === undefined || b === undefined ? a === b : a.mode === b.mode && a.oid === b.oid);
+const entryOf = (e) => (e === undefined ? { absent: true } : { mode: e.mode, oid: e.oid });
+
+function conflictChecks({ from, forkPoint, head, baseRef }, o) {
+  if (!supportsMergeTreeWrite(o)) throw fail('git-too-old', 'merge-tree --write-tree needs git 2.38');
+  assertRef(baseRef, ['rev-list', baseRef]);
+  const [fromSha, forkSha, headFull] = [from, forkPoint, head].map((x) => revParse(`${assertRef(x, ['rev-parse', x])}^{commit}`, o));
+
+  const { merges } = walkOwnHistory({ from: fromSha, head: headFull, baseRef }, o);
+  if (merges === 0) throw fail('history', 'no merge of the base branch since the last reviewed head');
+
+  const merged = mergeTreeDetailed(fromSha, forkSha, o);
+  if (merged.clean || merged.conflicts.length === 0) throw fail('no-conflict', merged.clean ? 'the trial merge is clean' : 'merge-tree reported a conflict but listed no conflicted file');
+  if (merged.conflicts.length > MAX_DISPLAY_CONFLICTS) throw fail('too-many-conflicts', `${merged.conflicts.length} conflicted paths`);
+  const conflicted = merged.conflicts.map((c) => c.path);
+  const known = new Set(conflicted);
+
+  // A: no merge-affecting attribute on any path a driver could have resolved silently: every merge-base path BOTH sides changed (with
+  // each side's rename destination), every conflicted path and every path an ort message names.
+  const baseCommit = mergeBase(fromSha, forkSha, o);
+  const ours = changesByBasePath(baseCommit, fromSha, o);
+  const theirs = changesByBasePath(baseCommit, forkSha, o);
+  const attrPaths = new Set([...conflicted, ...merged.messages.flatMap((m) => m.paths)]);
+  for (const [key, dests] of ours) {
+    if (!theirs.has(key)) continue;
+    attrPaths.add(key);
+    for (const d of [...dests, ...theirs.get(key)]) attrPaths.add(d);
+  }
+  const attr = attributeProblem([...attrPaths], o);
+  if (attr) throw fail('attribute', attr);
+
+  // E: what ort wrote into the marker tree must be visible to the reviewer. Observed on git 2.39 (real repos, not assumed):
+  //  - a text conflict stages 1, 2 and 3 and its resolution shows in the patch (marker tree..head);
+  //  - a PR-added file inside a directory main RENAMED is staged (stage 2 only) at its new path with the type 'CONFLICT (directory rename
+  //    suggested)' and a message naming the new and the old path: a record, whose `heads` show where head put it;
+  //  - a directory SPLIT stages nothing for the PR's file: one message of type 'CONFLICT(directory rename unclear split)' (no space) naming
+  //    the directory; a file in the way of an implicit directory rename is 'CONFLICT (file in way of directory rename)' naming two clean
+  //    paths. Neither names a staged path, so both fail E instead of passing as information (only 'Auto-merging' is informational);
+  //  - a file/directory conflict stages the file as `<path>~<sha>` and the message names the directory path (mode 040000 in head: refused).
+  for (const m of merged.messages) {
+    if (m.type === 'Auto-merging') continue;
+    if (!m.paths.some((p) => known.has(p))) throw fail('evidence', `${m.type} names no conflicted file: ${shortList(m.paths)}`);
+  }
+  const named = new Set([...conflicted, ...merged.messages.filter((m) => m.type !== 'Auto-merging').flatMap((m) => m.paths)]);
+  const headEntries = treeEntries(headFull, [...named], o);
+  const treeEntriesAt = treeEntries(merged.tree, conflicted, o);
+  const tick = makeBudget(o?.resolutionSearchBudget);
+  const labels = { ours: fromSha, theirs: forkSha };
+  const records = [];
+  for (const c of merged.conflicts) {
+    const types = c.types.filter((t) => t !== 'Auto-merging');
+    if (types.length === 0) throw fail('evidence', `no message names the conflict at ${c.path}`);
+    const headEntry = headEntries.get(c.path);
+    for (const e of [c.stages[1], c.stages[2], c.stages[3], headEntry]) {
+      if (e && NON_FILE_MODES.has(e.mode)) throw fail('evidence', `${c.path} is a ${e.mode} entry (link, submodule or directory)`);
+    }
+    const [s1, s2, s3] = [1, 2, 3].map((n) => c.stages[n]);
+    const textMode = (e) => e !== undefined && TEXT_MODES.has(e.mode);
+    const isText = types.length === 1 && types[0] === 'CONFLICT (contents)' && textMode(s1) && textMode(s2) && textMode(s3);
+
+    // The block rule: no conflict block of the marker blob may survive in head's blob, whatever label its markers carry (a real merge
+    // writes HEAD / the branch name, the trial tree writes full commit ids). A text conflict must have blocks and every one resolved;
+    // any other path whose marker blob has blocks (add/add, a rename collision) is held to the same rule.
+    const treeEntry = treeEntriesAt.get(c.path);
+    let blocks = null;
+    let marked = false;
+    if (treeEntry && textMode(treeEntry)) {
+      const marker = catBlob(treeEntry.oid, o);
+      marked = splitLines(marker).some((l) => l.startsWith('<') && isMarkerLine(l));
+      if ((isText || marked) && s2 && s3 && textMode(s2) && textMode(s3) && !marker.includes('\0')) {
+        const [t2, t3] = [s2, s3].map((e) => catBlob(e.oid, o));
+        if (![marker, t2, t3].some((t) => t.includes('\0') || t.includes('�'))) {
+          const parsed = parseConflictBlocks(splitLines(marker), splitLines(t2), splitLines(t3), tick, labels);
+          if (parsed.reason === 'too-many-blocks') throw fail('evidence', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
+          if (!parsed.reason) blocks = parsed.blocks;
+        }
+      }
+    }
+    if (isText && (blocks === null || blocks.length === 0)) throw fail('evidence', `the conflict blocks of ${c.path} could not be read`);
+    if (!isText && marked && blocks === null) throw fail('evidence', `the conflict markers of ${c.path} could not be read`);
+    if (blocks && blocks.length > 0 && headEntry) {
+      const text = catBlob(headEntry.oid, o);
+      if (text.includes('�')) throw fail('evidence', `${c.path} (head) is not valid UTF-8`);
+      const left = committedBlock(splitLines(text), blocks);
+      if (left >= 0) throw fail('evidence', `${c.path} still has conflict block ${left + 1} with its markers`);
+    }
+    if (isText) continue;
+
+    const heads = [];
+    const seen = new Set();
+    for (const p of [c.path, ...merged.messages.filter((m) => m.type !== 'Auto-merging' && m.paths.includes(c.path)).flatMap((m) => m.paths)]) {
+      if (seen.has(p)) continue;
+      seen.add(p);
+      const e = headEntries.get(p);
+      if (e && e.mode === '040000') throw fail('evidence', `${p} is a directory in head`);
+      heads.push(e ? { path: p, mode: e.mode, oid: e.oid } : { path: p, absent: true });
+    }
+    const candidates = [['ours', s2], ['theirs', s3], ['base', s1], ['tree', treeEntry]];
+    const headEquals = candidates.find(([, e]) => sameEntry(headEntry, e))?.[0] ?? 'none';
+    if (blocks && blocks.length > 0 && headEquals === 'tree') throw fail('evidence', `${c.path} is left as the trial merge wrote it, markers included`);
+    const stages = {};
+    for (const n of [1, 2, 3]) if (c.stages[n]) stages[n] = { ...c.stages[n] };
+    for (const e of Object.values(stages)) {
+      if (gitOrNull(['cat-file', '-e', assertRef(e.oid, ['cat-file', '-e', e.oid])], 1, o) === null) throw fail('export', `${e.oid} (${c.path}) is not readable in this clone`);
+    }
+    // messages: cut only after every path was read from the structured fields above
+    const messages = merged.messages.filter((m) => m.type !== 'Auto-merging' && m.paths.includes(c.path))
+      .map((m) => m.text.replace(/\s+/g, ' ').trim().slice(0, MAX_RECORD_MESSAGE));
+    records.push({ path: c.path, types, messages, stages, head: entryOf(headEntry), headEquals, heads });
+  }
+  if (revParse(`${headFull}^{tree}`, o) === merged.tree) throw fail('evidence', 'records-only: head equals the marker tree, so there is no patch to review');
+  return { base: merged.tree, conflicted, conflictedCount: conflicted.length, records };
+}
+
+// The base for a counted 'conflict' round (the free resolution proof refused): the marker tree of a trial merge of the last reviewed
+// head `from` with the base branch `forkPoint`, which `head` differs from by the PR's own changes plus how each text conflict was
+// resolved. Admitted only where the evidence is complete (rules H, A, E, X in docs/plans/2026-11-20-round-diff-after-conflicting-merge.md):
+// every conflicted text file's resolution is in the patch, every other conflict has a record of what git staged and what head kept.
+// -> { base: <marker tree id>, conflicted: [<= 50 paths], conflictedCount, records: [{ path, types, messages, stages, head, headEquals, heads }] }
+//  | { unavailable: 'git-too-old' | 'no-conflict' | 'too-many-conflicts: …' | 'history: …' | 'attribute: …' | 'evidence: …' | 'export: …' | 'git-error: …' }
+// The caller falls back to the whole-PR range on `unavailable`.
+export function conflictReviewBase({ from, forkPoint, head, baseRef }, o) {
+  try {
+    return conflictChecks({ from, forkPoint, head, baseRef }, o);
+  } catch (err) {
+    if (err instanceof Ineligible) return { unavailable: err.message };
+    if (err instanceof SearchCap) return { unavailable: 'evidence: the block check exceeded its step budget' };
+    if (err instanceof RangeError) return { unavailable: 'evidence: the block check ran out of stack' };
+    if (err instanceof GitError) return { unavailable: `git-error: ${err.message.slice(0, 300)}` };
+    throw err;
+  }
+}
+
 export class ReviewBaseUnavailable extends Error {
   constructor(message) {
     super(message);
@@ -388,15 +612,17 @@ export class ReviewBaseUnavailable extends Error {
   }
 }
 
-// The tree a 'synthetic' or 'resolution' round was diffed against exists only where it was made. On another clone it is
+// The tree a 'synthetic', 'resolution' or 'conflict' round was diffed against exists only where it was made. On another clone it is
 // rebuilt with the same forced merge config from the round's own commits, and only the SAME tree id is accepted: a different
 // id means this checkout merges differently (conflict style, attributes), and quietly diffing against another tree would be a
-// different review. -> the base to diff from. Other kinds, and rounds without a recorded base, are returned as they are.
+// different review. A tree that IS in this clone is returned as it is: the admission rules (a 'conflict' round's attribute and evidence
+// rules too) re-run only when the tree object is missing, i.e. past the early return below.
+// -> the base to diff from. Other kinds, and rounds without a recorded base, are returned as they are.
 export function ensureReviewBase(round, o) {
   const id = round.reviewBase;
   if (id === undefined) return round.fromHead;
   const kind = round.reviewBaseKind;
-  if (kind !== 'synthetic' && kind !== 'resolution') return id;
+  if (kind !== 'synthetic' && kind !== 'resolution' && kind !== 'conflict') return id;
   if (gitOrNull(['cat-file', '-e', assertRef(id, ['cat-file', '-e', id])], 1, o) !== null) return id;
   const unavailable = (why) => new ReviewBaseUnavailable(
     `review-base-unavailable: the ${kind} review base ${id} is not in this clone and could not be rebuilt (${why}). `
@@ -411,6 +637,12 @@ export function ensureReviewBase(round, o) {
       const attr = attributeProblem(round.conflicted ?? [], o);
       if (attr) throw unavailable(attr);
       rebuilt = mergeTreeDetailed(fromFull, forkFull, o).tree;
+    } else if (kind === 'conflict') {
+      // The full admission again, on the recomputed complete conflict set (not the stored display list); the ancestor test for the
+      // merges' second parents uses the round's own fork point.
+      const found = conflictReviewBase({ from: fromFull, forkPoint: forkFull, head: round.toHead, baseRef: forkFull }, o);
+      if (found.unavailable) throw unavailable(found.unavailable);
+      rebuilt = found.base;
     } else {
       rebuilt = mergeTree(fromFull, forkFull, o).tree;
     }

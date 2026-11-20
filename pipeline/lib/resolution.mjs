@@ -334,3 +334,28 @@ export function checkSelection(parsed, headLines, tick = makeBudget()) {
   if (sawMarker && !sawOther) return { ok: false, reason: 'marker-line' };
   return { ok: false, reason: sawOther || sawMarker ? 'not-selection' : 'outside-edit' };
 }
+
+// Label-independent: does any conflict block of the marker blob survive in a head blob (`headLines`) with its markers? A block survives
+// when its ours body, a `=======` line and its theirs body sit between an opening and a closing marker line of ANY label (the trial
+// tree writes full commit ids, a real merge writes HEAD / the branch name). The terminator of a body line is compared loosely, so git's
+// added newline after a side's last line cannot hide a block. -> the index of the first surviving block, or -1.
+export function committedBlock(headLines, blocks) {
+  const H = headLines;
+  const same = (a, b) => a === b || a.replace(/\n$/, '') === b.replace(/\n$/, '');
+  const opens = [];
+  H.forEach((l, i) => { if (OPEN.test(l)) opens.push(i); });
+  const body = (at, lines) => {
+    for (let k = 0; k < lines.length; k++) if (at + k >= H.length || !same(H[at + k], lines[k])) return -1;
+    return at + lines.length;
+  };
+  for (let b = 0; b < blocks.length; b++) {
+    for (const i of opens) {
+      const a = body(i + 1, blocks[b].ours);
+      if (a < 0 || a >= H.length || !SEP.test(H[a])) continue;
+      const t = body(a + 1, blocks[b].theirs);
+      if (t < 0 || t >= H.length || !CLOSE.test(H[t])) continue;
+      return b;
+    }
+  }
+  return -1;
+}
