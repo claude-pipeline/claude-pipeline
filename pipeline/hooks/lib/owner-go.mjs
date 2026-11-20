@@ -915,11 +915,11 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
   } else {
     return 'missing';
   }
-  // #418: the harness writes a hidden note (isMeta, none of the provenance fields: an opened image, an attachment) under the prompt's own id; it is no second prompt. An entry with
-  // any provenance field counts, so a forged twin of the owner's prompt still reads as two. (When every match is such a note, they are judged as before.)
+  // #418: the harness writes a hidden note (isMeta, entrypoint cli and no promptSource / origin / turnOrigin: an opened image, an attachment) under the prompt's own id; it is no second prompt.
+  // An entry with unplaced provenance (unplacedProvenance) counts, so a forged twin of the owner's prompt still reads as two. (When every match is such a note, they are judged as before.)
   const found = [];
   const real = [];
-  const scan = scanBackwards(file, (e) => { if (match.is(e)) { found.push(e); if (!(e.isMeta === true && !hasProvenanceField(e))) real.push(e); } return real.length >= 2; }, match.wants, { chunkBytes, capBytes });
+  const scan = scanBackwards(file, (e) => { if (match.is(e)) { found.push(e); if (!(e.isMeta === true && !unplacedProvenance(e))) real.push(e); } return real.length >= 2; }, match.wants, { chunkBytes, capBytes });
   if (scan === null || found.length === 0) return 'missing';
   if (real.length > 0) found.splice(0, found.length, ...real);
   if (found.length > 1) return 'synthetic';

@@ -826,7 +826,8 @@ test('#418 promptProvenance: an isMeta image note sharing the owner prompt\'s pr
     return { transcript_path: f, prompt_id: 'pid-img' };
   };
   const owner = promptEntry('extra round', OWNER_META, 'pid-img');
-  const note = { type: 'user', isMeta: true, promptId: 'pid-img', message: { content: [{ type: 'text', text: '[Image: original 1440x6616, displayed at 1440x1600]' }] } };
+  // the real shape (Claude Code 2.1.258): entrypoint cli and userType external on every line, turnCompanion true, no promptSource / origin
+  const note = { type: 'user', isMeta: true, promptId: 'pid-img', entrypoint: 'cli', userType: 'external', turnCompanion: true, message: { content: [{ type: 'text', text: '[Image: original 1440x6616, displayed at 1440x1600]' }] } };
   assert.equal(promptProvenance(at([owner, said('ok'), note]), { env: {}, home: root }), 'owner', 'a meta image note after the typed prompt');
   assert.equal(promptProvenance(at([owner, note, { ...note, uuid: 'n2' }]), { env: {}, home: root }), 'owner', 'two image notes');
   assert.equal(promptProvenance(at([owner, promptEntry('extra round', OWNER_META, 'pid-img')]), { env: {}, home: root }), 'synthetic', 'a forged second typed entry');
