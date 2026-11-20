@@ -100,9 +100,15 @@ test('case: nested patterns that fail after a substitution cannot multiply the w
   for (const b of builds) for (const k of [25, 60]) {
     let t = 'true';
     for (let j = 0; j < k; j++) t = b(t);
-    const { r: cs, ms } = cpuTimed(() => simpleCommands(t));
-    assert.ok(ms < 5000, `finished in reasonable time (${k} levels): ${Math.round(ms)} ms of CPU`);
-    assert.equal(cs.truncated, true);
+    // The cap is on CPU time, but a busy runner still inflates it (5288 ms once on ubuntu Node 20, which has no per-thread clock, so GC and helper threads count). Noise only ever adds
+    // time (see helpers/timing.mjs), so the cap must be met by the FASTEST of up to 3 runs: a real regression (uncharged retries: ~40 s at 25 levels) is slow on every run and still fails.
+    let best = Infinity;
+    for (let run = 0; run < 3 && best >= 5000; run++) {
+      const timed = cpuTimed(() => simpleCommands(t));
+      best = Math.min(best, timed.ms);
+      assert.equal(timed.r.truncated, true);
+    }
+    assert.ok(best < 5000, `finished in reasonable time (${k} levels): ${Math.round(best)} ms of CPU (best of up to 3)`);
   }
 });
 
