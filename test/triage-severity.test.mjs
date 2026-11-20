@@ -472,7 +472,7 @@ test('cap-low: a low-only last round defers; the review is held until the issues
   assert.deepEqual(reviewEligibilityProblems(filedOf(after)), []);
   assert.match(rulingsInventory(after).rows[0], /why: accepted by judge in round 1 at limit 1; deferred unapplied, NOT fixed in this merge; issue not filed yet$/);
   assert.match(rulingsInventory(filedOf(after)).rows[0], /issue #9$/);
-  assert.equal(requiredStateVersion(after), 6, 'v6-v8 readers load it');
+  assert.equal(requiredStateVersion(after), 10, 'a v9 reader (no cap-low owner-approval rule) must refuse it');
 });
 
 test('cap-low: a state without the rule keeps its Rulings row text byte for byte (the digest an older install wrote stays valid)', () => {

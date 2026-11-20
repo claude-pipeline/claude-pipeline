@@ -659,7 +659,7 @@ test('cap-defer: round publish defers the unbuilt low accept, files its issue, r
   assert.deepEqual([r.json.capDeferral.applied, r.json.capDeferral.ids, r.json.accepted.count, r.json.outcome.clean, r.json.outcome.capDeferred], [true, ['R1-S1'], 0, true, ['R1-S1']]);
   assert.deepEqual(r.json.followups.map((f) => f.id), ['R1-S1']);
   const item = w.item('R1-S1');
-  assert.deepEqual([item.final.decision, item.final.postMax.rule, item.implemented === true, w.state().version], ['FOLLOW-UP', 'cap-low', false, 6]);
+  assert.deepEqual([item.final.decision, item.final.postMax.rule, item.implemented === true, w.state().version], ['FOLLOW-UP', 'cap-low', false, 10]);
   assert.equal(issuePosts(w), 1);
   assert.ok(JSON.parse(w.fake.calls().find((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues `)).stdin).body.includes('deferred unapplied'));
   // the retry: the state already holds it, so nothing is applied, the skill still sees the ids (F6), and no second issue is filed

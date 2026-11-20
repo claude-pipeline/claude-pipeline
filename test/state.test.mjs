@@ -18,6 +18,7 @@ import {
   STATE_VERSION_SUBSTITUTE,
   STATE_VERSION_OUT_OF_MODEL,
   STATE_VERSION_CLICK_DIALOG,
+  STATE_VERSION_CAP_LOW,
   STATE_VERSION_POST_MAX,
   STATE_VERSION_OWNER_DEFERRAL,
   STATE_VERSION_SAME_ON_BASE,
@@ -579,7 +580,7 @@ test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOf
   assert.equal(stateNeedsOutOfModelVersion(marked), true);
   const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
   assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
-  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_SAME_ON_BASE);
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CAP_LOW);
   assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
   assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
   assert.equal(stateNeedsOutOfModelVersion(null), false);

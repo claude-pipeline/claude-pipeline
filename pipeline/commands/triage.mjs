@@ -19,7 +19,7 @@ import { hashBranch, regressionOnlyFor } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
-import { STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_POST_MAX, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
+import { STATE_VERSION_CAP_LOW, STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { askSummary, issuedRoundVariant, longReviewOf, processReviewSummary, recommendedWords, roundsFrom } from '../lib/round-ask.mjs';
 import { postMaxApply, fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
@@ -101,7 +101,7 @@ export const meta = {
     '     Takes no ids, reason or policy: it is computed. review.cap_low_accepts (default defer) must be defer in the working-tree AND the trusted default-branch config; the PR\'s review.max_rounds must not be below the trusted one; an unspent owner grant for the next round (any head), an unreadable grant lookup or a record whose provenance cannot be confirmed refuses ("a typed extra round wins");',
     '     it also refuses on a dirty working tree, when the tree is not at the last round\'s reviewed content, with the default branch not anchored on the remote, and when the PR\'s published review state already holds round R (decided once, before anything is shown)',
     '  -> applied true: the accepts are FOLLOW-UPs (final.postMax {from: ACCEPT, by, ordinal: max, max, rule: cap-low, at}; the post-limit marker, so the filing gate, the Rulings row and "Claude may only tighten it back to ACCEPT" apply). Run `followups create --round R` for EACH round in `rounds` (every round holding a cap-low item without an issue; a retry is safe).',
-    '     ids = every cap-low item of the state (also on a rerun, when applied is false because it was already done). A refusal is exit 0 with applied false + refusals (the step never stops a bundle); exit 1 for a --pr / --round that is not the review state\'s (identity-mismatch). Only with owner_approval: chat (label mode: applied false). Writes review state format version 6',
+    '     ids = every cap-low item of the state (also on a rerun, when applied is false because it was already done). A refusal is exit 0 with applied false + refusals (the step never stops a bundle); exit 1 for a --pr / --round that is not the review state\'s (identity-mismatch). Only with owner_approval: chat (label mode: applied false). Writes review state format version 10',
     'pipeline triage claude-ruling --round R --id ID --decision ACCEPT|FOLLOW-UP|REJECT --reason TEXT --pr N [--repo DIR]',
     '  -> {ok, round, id, final, published, next?}; records CLAUDE\'s decision (final.by claude, needsHuman false, the overruled final and the cause kept) for an item waiting for a human, or tightens a Claude dismissal',
     '  -> only with owner_approval: chat; exit 1 for label mode, a --pr that is not the review state\'s, an empty reason or one over 1000 characters, or a ruling the rules refuse (state untouched)',
@@ -1284,7 +1284,7 @@ async function capDefer(rest, ctx) {
       const shown = (published.state?.rounds ?? []).flatMap((r) => (r.items ?? []).map((i) => i?.id)).filter((id) => verdict.ids.includes(id));
       if (shown.length > 0) return no(`${shown.join(', ')} is already published with its accept: it is not deferred after the fact`);
       seedBaseline({ ctx, root, pr, state });
-      const next = withStateVersion(capDeferItemsInState(state, verdict.ids, { max: state.maxRounds, at: new Date().toISOString() }), STATE_VERSION_POST_MAX);
+      const next = withStateVersion(capDeferItemsInState(state, verdict.ids, { max: state.maxRounds, at: new Date().toISOString() }), STATE_VERSION_CAP_LOW);
       saveState(root, next);
       return report(true, [], next);
     } catch (err) {
