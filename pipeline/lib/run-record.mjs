@@ -166,6 +166,21 @@ export function bindRecord(record, { repo, pr, branch }) {
   return reasons;
 }
 
+// The ONE decision both callers (baseRecordFor, recordForOutcome) share on a record that may not match the live PR:
+//  - { record, warnings: [] }: it belongs to this PR;
+//  - { record: <it, repo set to the live slug>, warnings: [moved] }: the repo is the ONLY mismatch (same pr and branch), so the repo was renamed or
+//    transferred and this is still the PR's own summary comment: every field (booked cost, sessions, step, resumed ...) is carried over (#641);
+//  - { record: null, warnings: [does not belong] }: another PR / branch (or no recorded repo to compare): the caller starts a fresh record.
+export function adoptRecord(record, live) {
+  const reasons = bindRecord(record, live);
+  if (reasons.length === 0) return { record, warnings: [] };
+  const repoOnly = reasons.length === 1 && reasons[0].startsWith('repo:') && typeof record.repo === 'string' && record.repo !== '';
+  if (repoOnly) {
+    return { record: { ...record, repo: live.repo }, warnings: [`the repo moved (the run record said ${JSON.stringify(record.repo)}, the PR is in ${JSON.stringify(live.repo)}): carried the run record over`] };
+  }
+  return { record: null, warnings: [`the existing run record does not belong to this PR (${reasons.join('; ')}); started a new one`] };
+}
+
 const text = (v, max) => clip(String(v ?? '').trim(), max);
 
 // ---- verify proofs (T2): where each deferrable verify step was proved when the PR merged -----------------------------------
@@ -300,19 +315,18 @@ export function applyCheckpoint(record, patch, { host, now }) {
 }
 
 // The record to write when `P summary` / `P comment --kind summary` ends a run. An existing record is kept (and updated)
-// when it belongs to this PR; otherwise a fresh one is made from what the caller knows. An outcome that is not in
+// when it belongs to this PR, or when only the repo differs (a rename / transfer: kept whole, bound to the live slug, adoptRecord);
+// otherwise a fresh one is made from what the caller knows. An outcome that is not in
 // OUTCOMES is still shown in the comment, but never enters the record: it only adds a warning.
 export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, outcome, detail, agentLogLine, host, now, sessions, guardBlocks, guardBySession }) {
   const warnings = [];
   let base = existing;
   let carriedResumed = null;
   if (base) {
-    const mismatch = bindRecord(base, { repo, pr, branch });
-    if (mismatch.length) {
-      warnings.push(`the existing run record does not belong to this PR (${mismatch.join('; ')}); started a new one`);
-      carriedResumed = base.resumed ?? null; // (a rename / transfer must not clear the merge gate's resumed mark: it is still this PR's summary comment)
-      base = null;
-    }
+    const adopted = adoptRecord(base, { repo, pr, branch });
+    warnings.push(...adopted.warnings);
+    if (!adopted.record) carriedResumed = base.resumed ?? null; // (a branch rename must not clear the merge gate's resumed mark: it is still this PR's summary comment)
+    base = adopted.record;
   }
   base ??= emptyRecord({ repo, pr, branch, baseRef });
   const patch = {};

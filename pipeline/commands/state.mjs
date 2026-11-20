@@ -51,14 +51,15 @@ export const meta = {
     '  grantedRound {k, grantId, head, quote}: the owner\'s open extra-round grant for the next counted round and the checked-out HEAD (chat mode, an owner',
     '  record younger than 24 h, not yet used) - it lifts reachedMax and effectiveMaxRounds by one; null otherwise. autoExtraOrdinal: the counted round the',
     '  automatic extra round took, or null',
-    'pipeline state fix-scope --round R [--head HEAD] [--repo DIR]',
+    'pipeline state fix-scope --round R [--head HEAD] [--pr N] [--repo DIR]',
     '  -> {ok, round, from, head, fixScope: {nonTestLines, newFiles, newExports, limit, flagged, reasons}, flagged, reasons, advisory, warnings, baseKind, baseNote?}: what the fix commits since round R (R\'s reviewed head .. HEAD, or --head) add, measured',
     '     from the base the next review round would use (#490: what the default branch brought in with a clean merge since R is left out), and never stored. baseKind (\'previous\' | \'synthetic\' | \'round-head\') says which base was used;',
     '     it falls back to the round head (baseKind \'round-head\', with baseNote saying why) for a stacked PR, an unanchored default branch (both exact: the review round does the same), a conflicting merge, or when GitHub cannot be read (may over-count; retry',
     '     when GitHub answers). It does a best-effort fetch of origin/<default branch> and one `gh pr view` read, so "read-only" means it writes no review state. flagged = more non-test added lines than the smaller review.fix_round_max_lines of the working-tree and fork-point configs, or a new non-test SOURCE file (not a document / review.docs_exempt_paths file);',
     '     a file counts as a test only when the working-tree, fork-point and trusted configs ALL classify it so (a renamed file is new unless both paths are tests). New exports are advisory text only.',
     '     The review skill runs it before the push and asks the owner (own PR / plan first / push as is) when flagged; it is a prompt, never a gate. Exit 2 {error: no-round | not-descendant | bad-head}',
-    'pipeline state mark-implemented --ids a,b [--repo DIR]',
+    'pipeline state mark-implemented --ids a,b [--pr N] [--repo DIR]',
+    '  --pr N (here and on fix-scope, as on discard-round): when given it must be the PR the review state belongs to, else exit 2 {error:state-pr-mismatch} before anything is changed; absent it is ignored',
     '  -> exit 2 {error:no-code-change} unless the branch content differs from what the accepting round reviewed',
     '     and a non-test file changed since (a test file counts for a testing finding or the finding\'s own file)',
     '  -> a forced or Claude-ruled ACCEPT whose named file is empty or was not changed is still marked, with implementedVia \'other-files\': the next codex-review',
@@ -374,6 +375,15 @@ async function showLocked(values, n, pr, root, ctx) {
   };
 }
 
+// `--pr N` on a command that works on the local state (like discard-round): when given it must be the PR the state belongs to, else exit 2 state-pr-mismatch before anything is changed;
+// absent, it is ignored.
+function assertStatePr(values, state) {
+  const pr = intOption(values, 'pr', { min: 1 });
+  if (pr !== undefined && state.pr !== pr) {
+    throw new Fail(EXIT.USAGE, { ok: false, error: 'state-pr-mismatch', message: `.review/state.json belongs to PR #${state.pr}, not #${pr}` });
+  }
+}
+
 // ---- discard-round --------------------------------------------------------------------------
 
 // An interrupted round (Codex ran, the loop stopped before the triage comment) is thrown away and re-run under the same
@@ -431,11 +441,12 @@ const untrustedAnchor = (root, config) => trustedDefaultBranch(root, config).unt
 // What the fix commits made since round R's reviewed head add (lib/fix-verify.mjs#fixRoundScope, the measure chooseBrief takes live): read-only, nothing is stored (a stored copy could go stale
 // under the next commit). The limit is the smallest of the working-tree, fork-point and trusted configs; a config that cannot be read counts as the defaults (never as "no limit").
 async function fixScope(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { round: { type: 'string' }, head: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { round: { type: 'string' }, head: { type: 'string' }, pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const n = intOption(values, 'round', { required: true, min: 1 });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   const state = requireState(root);
+  assertStatePr(values, state);
   const round = (state.rounds ?? []).find((r) => r.n === n);
   if (round === undefined) throw new Fail(EXIT.USAGE, { ok: false, error: 'no-round', message: `round ${n} is not in the review state` });
   const o = { cwd: root };
@@ -578,13 +589,14 @@ const notWritten = (paths) => (paths.length === 0 ? ''
   : ` (their current content was not written by an ordinary commit of this PR — it came from a merge or from the default branch: ${paths.slice(0, 3).join(', ')}; commit any further change to those files after the merge, or fix another file)`);
 
 async function markImplemented(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { ids: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { ids: { type: 'string' }, pr: { type: 'string' }, repo: { type: 'string' } }, { allowPositionals: false });
   const ids = [...new Set(requireOption(values, 'ids').split(',').map((s) => s.trim()).filter(Boolean))];
   if (ids.length === 0) throw new UsageError('--ids must list at least one item id');
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
   return withStateLock(root, ctx, () => {
     let state = requireState(root);
+    assertStatePr(values, state);
     // Resolve every id first so a typo cannot leave the state half-updated.
     const found = ids.map((id) => findItem(state, id));
     for (const { item } of found) {

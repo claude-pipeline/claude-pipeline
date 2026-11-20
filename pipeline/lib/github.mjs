@@ -4,9 +4,13 @@
 // means (preflight reads it as "pause is open", a merge gate reads it as "do not merge"). JSON
 // bodies are sent on stdin (`--input -`) so no model- or diff-derived text is ever shell-quoted.
 import { gh, GhError } from './proc.mjs';
-import { UnavailableError, UsageError } from './cli.mjs';
+import { OutboundScanBlocked, UnavailableError, UsageError } from './cli.mjs';
 import { repoRoot, repoSlug } from './repo.mjs';
-import { resolve } from 'node:path';
+import { accountHome } from './paths.mjs';
+import { seamValue } from './seams.mjs';
+import { accessSync, constants, readFileSync, statSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { isAbsolute, join as joinPath, resolve } from 'node:path';
 
 // A hung gh must never hang the pipeline: a call that outlives this is a failure.
 const CALL_TIMEOUT_MS = 60_000;
@@ -114,10 +118,19 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
   };
   const getJson = (args, opts) => parse(ok(args, opts), args);
 
+  // Outbound text guard (see "outbound text guard" below): for a repository listed in the machine-local scan config, every text a write sends is scanned
+  // first, and a scanner that is not clean blocks the write (OutboundScanBlocked, never a GhError). Nothing listed (no config file): a no-op that
+  // does not even look the repository up. `fields` may be a function, so an unlisted machine does not build the text list either.
+  const scanOut = (fields) => guardOutbound({ slug: () => self.repo().slug, fields, env: env ? { ...process.env, ...env } : process.env });
+  const labelText = (name, description) => [{ kind: 'label name', text: String(name) }, { kind: 'label description', text: String(description ?? '') }];
+
   // GET, or a write whose JSON body goes on stdin. An empty reply (204) is null.
   const api = (method, path, body) => {
     const args = method === 'GET' ? ['api', path] : ['api', '-X', method, path];
-    if (body !== undefined) args.push('--input', '-');
+    if (body !== undefined) {
+      if (method !== 'GET') scanOut(() => fieldsOfJson(body));
+      args.push('--input', '-');
+    }
     const r = ok(args, body === undefined ? {} : { input: JSON.stringify(body) });
     return r.stdout.trim() === '' ? null : parse(r, args);
   };
@@ -152,6 +165,24 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     return list;
   };
 
+  // The GraphQL call itself, unscanned. graphql() adds the outbound guard for mutations; the built-in id-only mutations (enqueue, dequeue, convert to draft) call this directly.
+  const graphqlRun = (query, variables = {}) => {
+    const args = ['api', 'graphql', '-f', `query=${query}`];
+    for (const [k, v] of Object.entries(variables)) {
+      if (v === undefined || v === null) continue;
+      args.push(typeof v === 'string' ? '-f' : '-F', `${k}=${v}`);
+    }
+    const body = parse(ok(args), args);
+    if (Array.isArray(body?.errors) && body.errors.length > 0) {
+      const message = body.errors.map((e) => String(e?.message ?? e)).join('; ').slice(0, 300);
+      throw new GhError({ code: 0, stderr: `GraphQL error: ${message}`, args });
+    }
+    if (body?.data === undefined || body.data === null) {
+      throw new GhError({ code: 0, stderr: 'GraphQL reply has no data', args });
+    }
+    return body.data;
+  };
+
   const self = {
     api,
 
@@ -181,11 +212,17 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     prLabels: (n) => (getJson(['pr', 'view', prNumber(n), '--json', 'labels']).labels ?? []).map((l) => l.name),
 
     // The pipeline's own transitions. The global hook stops agents doing some of these directly; that is intended.
+    // Label add / remove / delete, update-branch, enqueue, dequeue and convert-to-draft carry only ids, a sha or the name of a label that already
+    // exists, never free text: they are not scanned, so a scanner or config fault can never keep a PR in the merge queue or stop a hold being restored.
     addLabels(n, labels) {
-      if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--add-label', l])]);
+      if (labels.length) {
+        ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--add-label', l])]);
+      }
     },
     removeLabels(n, labels) {
-      if (labels.length) ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
+      if (labels.length) {
+        ok(['pr', 'edit', prNumber(n), ...labels.flatMap((l) => ['--remove-label', l])]);
+      }
     },
 
     // REST DELETE of one label of a PR (not `pr edit`): `P merge --owner-go` lifts the needs-human hold the owner's "merge" named with it
@@ -197,20 +234,11 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // POST a GraphQL query through `gh api graphql`: strings go as -f (never type-coerced, so a repo called "123" stays a
     // string), numbers and booleans as -F. A reply with `errors` (or without `data`) is a failure, never partial data.
     graphql(query, variables = {}) {
-      const args = ['api', 'graphql', '-f', `query=${query}`];
-      for (const [k, v] of Object.entries(variables)) {
-        if (v === undefined || v === null) continue;
-        args.push(typeof v === 'string' ? '-f' : '-F', `${k}=${v}`);
+      // A mutation writes: its text (inline literals included) and every string variable are scanned. A query only reads.
+      if (/\bmutation\b/i.test(query)) {
+        scanOut(() => [{ kind: 'graphql mutation', text: query }, ...Object.entries(variables).filter(([, v]) => typeof v === 'string').map(([k, v]) => ({ kind: `graphql variable ${k}`, text: v }))]);
       }
-      const body = parse(ok(args), args);
-      if (Array.isArray(body?.errors) && body.errors.length > 0) {
-        const message = body.errors.map((e) => String(e?.message ?? e)).join('; ').slice(0, 300);
-        throw new GhError({ code: 0, stderr: `GraphQL error: ${message}`, args });
-      }
-      if (body?.data === undefined || body.data === null) {
-        throw new GhError({ code: 0, stderr: 'GraphQL reply has no data', args });
-      }
-      return body.data;
+      return graphqlRun(query, variables);
     },
 
     // Follows pageInfo until the end. `visit(nodes)` returns true to stop early. A cursor that does not advance is an error
@@ -271,8 +299,8 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     },
 
     listLabels: () => getJson(['label', 'list', '--json', 'name,color,description', '--limit', '200']),
-    createLabel: ({ name, color, description }) => ok(['label', 'create', name, '--color', color, '--description', description]),
-    editLabel: ({ name, color, description }) => ok(['label', 'edit', name, '--color', color, '--description', description]),
+    createLabel: ({ name, color, description }) => (scanOut(() => labelText(name, description)), ok(['label', 'create', name, '--color', color, '--description', description])),
+    editLabel: ({ name, color, description }) => (scanOut(() => labelText(name, description)), ok(['label', 'edit', name, '--color', color, '--description', description])),
 
     listComments(n) {
       return commentList(['api', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, '--paginate']);
@@ -463,7 +491,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     enqueue(n, sha) {
       if (typeof sha !== 'string' || !/^[0-9a-f]{40}$/.test(sha)) throw new TypeError(`invalid head sha: ${JSON.stringify(sha)}`);
       const id = self.prNodeId(n);
-      const data = self.graphql('mutation Enqueue($pullRequestId:ID!,$expectedHeadOid:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$pullRequestId,expectedHeadOid:$expectedHeadOid}){mergeQueueEntry{id state position}}}', { pullRequestId: id, expectedHeadOid: sha });
+      const data = graphqlRun('mutation Enqueue($pullRequestId:ID!,$expectedHeadOid:GitObjectID!){enqueuePullRequest(input:{pullRequestId:$pullRequestId,expectedHeadOid:$expectedHeadOid}){mergeQueueEntry{id state position}}}', { pullRequestId: id, expectedHeadOid: sha });
       const e = data?.enqueuePullRequest?.mergeQueueEntry;
       if (!e || typeof e !== 'object') throw queueError('enqueuePullRequest returned no queue entry');
       return { id: queueField(e.id, 'string', 'the queue entry id'), state: queueField(e.state, 'string', 'the queue entry state'), position: queueField(e.position, 'number', 'the queue entry position') };
@@ -475,7 +503,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     convertToDraft(n) {
       const id = self.prNodeId(n);
       const args = ['api', 'graphql'];
-      const data = self.graphql('mutation ConvertToDraft($pullRequestId:ID!){convertPullRequestToDraft(input:{pullRequestId:$pullRequestId}){pullRequest{isDraft autoMergeRequest{enabledAt}}}}', { pullRequestId: id });
+      const data = graphqlRun('mutation ConvertToDraft($pullRequestId:ID!){convertPullRequestToDraft(input:{pullRequestId:$pullRequestId}){pullRequest{isDraft autoMergeRequest{enabledAt}}}}', { pullRequestId: id });
       const p = data?.convertPullRequestToDraft?.pullRequest;
       if (!p || typeof p !== 'object') throw new GhError({ code: 0, stderr: 'convertPullRequestToDraft returned no pull request', args });
       return { isDraft: p.isDraft === true, autoMergeArmed: p.autoMergeRequest !== null && p.autoMergeRequest !== undefined };
@@ -484,7 +512,7 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // Takes the PR out of the queue (the owner's stop conditions, the pipeline's confirmed dequeue).
     dequeue(n) {
       const id = self.prNodeId(n);
-      const data = self.graphql('mutation Dequeue($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', { id });
+      const data = graphqlRun('mutation Dequeue($id:ID!){dequeuePullRequest(input:{id:$id}){mergeQueueEntry{id}}}', { id });
       if (!data?.dequeuePullRequest || typeof data.dequeuePullRequest !== 'object') throw queueError('dequeuePullRequest returned no answer');
     },
 
@@ -509,7 +537,8 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     // told apart by their message; anything else (403, 404, 5xx, an unrecognised 422) throws, so it can never read as success.
     updateBranch(n, expectedHeadSha) {
       const args = ['api', '-X', 'PUT', `repos/${self.repo().slug}/pulls/${prNumber(n)}/update-branch`, '--input', '-'];
-      const r = exec(args, { input: JSON.stringify({ expected_head_sha: expectedHeadSha }) });
+      const body = { expected_head_sha: expectedHeadSha };
+      const r = exec(args, { input: JSON.stringify(body) });
       if (r.code === 0 && !r.timedOut) return { result: 'accepted' };
       let message = '';
       try {
@@ -540,6 +569,132 @@ export function createGitHub({ cwd, env, ghFn = gh } = {}) {
     },
   };
   return self;
+}
+
+// ---- outbound text guard (layer 2) --------------------------------------------------------------
+// Lives in this file (a high-risk path of its own) rather than a new module: it decides whether a write goes out at all.
+// Before the pipeline posts text to a repo that is LISTED in the machine-local scan config, that
+// text goes to a scanner command on its stdin, and anything but a clean exit 0 blocks the write (fail closed).
+//
+//   <account home>/.claude/pipeline-local/outbound-scan.json     { "<owner/name>": { "command": ["/abs/path/scanner", "arg", ...] } }
+//
+// The file lives on the machine, never in a repo tree, so a branch cannot drop it. The account home is the OS user database's
+// (paths.mjs accountHome), not $HOME; PIPELINE_OUTBOUND_SCAN_HOME is a test seam (seams.mjs: ignored by an installed copy).
+//   - file absent                      -> no slug is listed: nothing is scanned, behaviour is exactly as before.
+//   - file present but unreadable / not a JSON object -> every write is blocked (we cannot tell which slugs are listed).
+//   - slug listed, command missing / not absolute / not executable / not a list of strings -> that slug's writes are blocked.
+// The scanned text goes on STDIN only (never argv). A block names the field kinds that were scanned and the scanner's exit, and
+// never the scanned text or any scanner output (stdout and stderr may hold the hit).
+
+export { OutboundScanBlocked };
+
+export const OUTBOUND_SCAN_TIMEOUT_MS = 60_000;
+const OUTBOUND_SCAN_MAX_BUFFER = 1024 * 1024;
+
+export const scanHomeOf = (env) => seamValue('PIPELINE_OUTBOUND_SCAN_HOME', env) ?? accountHome();
+export const scanConfigPath = (home) => joinPath(home, '.claude', 'pipeline-local', 'outbound-scan.json');
+
+// -> null when the file does not exist (nothing is listed), else the parsed object. Anything else throws OutboundScanBlocked.
+export function loadScanConfig(home) {
+  const file = scanConfigPath(home);
+  let text;
+  try {
+    text = readFileSync(file, 'utf8');
+  } catch (err) {
+    if (err?.code === 'ENOENT' || err?.code === 'ENOTDIR') return null;
+    throw new OutboundScanBlocked(`outbound scan: ${file} exists but cannot be read (${err?.code ?? 'error'}); every write is blocked until it is fixed`, { reason: 'config-unreadable' });
+  }
+  let cfg;
+  try {
+    cfg = JSON.parse(text);
+  } catch {
+    throw new OutboundScanBlocked(`outbound scan: ${file} is not valid JSON; every write is blocked until it is fixed`, { reason: 'config-invalid' });
+  }
+  if (cfg === null || typeof cfg !== 'object' || Array.isArray(cfg)) {
+    throw new OutboundScanBlocked(`outbound scan: ${file} must be a JSON object keyed by owner/name; every write is blocked until it is fixed`, { reason: 'config-invalid' });
+  }
+  // A key that can never equal a `gh repo view` name (a URL, a trailing .git or space, no owner) would list nothing while looking listed: block instead.
+  for (const key of Object.keys(cfg)) {
+    if (!/^[A-Za-z0-9._-]+\/[A-Za-z0-9._-]+$/.test(key) || key.endsWith('.git')) {
+      throw new OutboundScanBlocked(`outbound scan: ${file} has the key ${JSON.stringify(key)}, which is not an owner/name; every write is blocked until it is fixed`, { reason: 'config-invalid' });
+    }
+  }
+  return cfg;
+}
+
+const isExecutableFile = (p) => {
+  try {
+    if (!statSync(p).isFile()) return false;
+    accessSync(p, constants.X_OK);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+// `slug` may be a list (the names gh and each git push destination give for one checkout): distinct names, case-insensitively.
+const namesOf = (slug) => [...new Map([slug].flat().map((n) => [String(n).toLowerCase(), n])).values()];
+
+// -> null (slug not listed) or { command: [file, ...args] }. A listed slug with a bad entry throws OutboundScanBlocked.
+export function scannerFor(cfg, slug) {
+  const want = String(slug).toLowerCase();
+  const keys = Object.keys(cfg).filter((k) => k.toLowerCase() === want);
+  if (keys.length === 0) return null;
+  const bad = (why) => new OutboundScanBlocked(`outbound scan: ${slug} is listed but ${why}; its writes are blocked`, { reason: 'scanner-missing' });
+  if (keys.length > 1) throw bad('the config lists it more than once (differing only in case)');
+  const entry = cfg[keys[0]];
+  const command = entry?.command;
+  if (!Array.isArray(command) || command.length === 0 || !command.every((c) => typeof c === 'string' && c !== '')) throw bad('its "command" is not a non-empty list of strings');
+  if (!isAbsolute(command[0])) throw bad('its scanner path is not absolute');
+  if (!isExecutableFile(command[0])) throw bad('its scanner is missing or not executable');
+  return { command };
+}
+
+// Every outbound text of one write: [{ kind, text }]. `kind` is a short field kind ("title", "body", "label name"), named in a block.
+// A JSON body is walked: every string value, at any depth, is a field of its own (kind = its top-level key).
+export function fieldsOfJson(value, kind = 'body', out = [], top = true) {
+  if (typeof value === 'string') out.push({ kind, text: value });
+  else if (Array.isArray(value)) for (const v of value) fieldsOfJson(v, kind, out, false);
+  else if (value !== null && typeof value === 'object') for (const [k, v] of Object.entries(value)) fieldsOfJson(v, top ? k : kind, out, false);
+  return out;
+}
+
+const kindsOf = (fields) => [...new Set(fields.map((f) => f.kind))].join(', ') || 'none';
+
+// Runs `scanner` over `fields`. Returns on exit 0; throws OutboundScanBlocked on anything else.
+export function runScanner({ command, fields, env, timeoutMs = OUTBOUND_SCAN_TIMEOUT_MS, spawnFn = spawnSync }) {
+  const text = fields.map((f) => `=== outbound field: ${f.kind} ===\n${f.text}\n`).join('');
+  const kinds = kindsOf(fields);
+  // How the scanner ended, never what it printed: its output can quote the very text it rejected.
+  // `exited` is set only for a plain non-zero exit: the scanner ran and flagged something (a timeout, crash or spawn failure flagged nothing).
+  const block = (how, extra) => new OutboundScanBlocked(`outbound scan blocked this write (scanned: ${kinds}; scanner ${how})`, { reason: 'blocked', kinds, ...extra });
+  const r = spawnFn(command[0], command.slice(1), { input: text, encoding: 'utf8', timeout: timeoutMs, killSignal: 'SIGKILL', maxBuffer: OUTBOUND_SCAN_MAX_BUFFER, env: env ?? process.env, stdio: ['pipe', 'pipe', 'pipe'], windowsHide: true });
+  if (r.error) throw block(r.error.code === 'ETIMEDOUT' ? `timed out after ${Math.round(timeoutMs / 1000)}s` : `could not run (${r.error.code ?? 'spawn error'})`);
+  if (r.signal) throw block(`was killed by ${r.signal}`);
+  if (r.status !== 0) throw block(`exited ${r.status}`, { exited: r.status });
+}
+
+// The one entry point. `slug` is a string or a function returning it (resolved only when a config file exists, so an unlisted
+// machine never pays for a lookup; it may also return a list of names: every listed one is scanned). `fields` is an array or a function returning one. Returns true when a scan ran and passed,
+// false when the slug is not listed; throws OutboundScanBlocked otherwise.
+export function guardOutbound({ slug, fields, env, home = scanHomeOf(env), spawnFn }) {
+  const cfg = loadScanConfig(home);
+  if (cfg === null) return false;
+  // Every listed name (gh's and each push URL's) has its own scanner, and all of them must pass: validated first, so a broken entry blocks before any scanner runs.
+  const entries = namesOf(typeof slug === 'function' ? slug() : slug).map((n) => scannerFor(cfg, n)).filter((e) => e !== null);
+  if (entries.length === 0) return false;
+  const list = (typeof fields === 'function' ? fields() : fields).filter((f) => typeof f.text === 'string');
+  for (const entry of entries) runScanner({ command: entry.command, fields: list, env, spawnFn });
+  return true;
+}
+
+// For what cannot be scanned at all (images): refused for a listed slug, allowed otherwise. -> false when not listed.
+export function refuseIfListed({ slug, what, env, home = scanHomeOf(env) }) {
+  const cfg = loadScanConfig(home);
+  if (cfg === null) return false;
+  const name = typeof slug === 'function' ? slug() : slug;
+  if (namesOf(name).map((n) => scannerFor(cfg, n)).every((e) => e === null)) return false;
+  throw new OutboundScanBlocked(`outbound scan: ${[name].flat().join(' / ')} is a listed repository, and ${what} cannot be scanned (images are not text); attach them outside the public repository`, { reason: 'unscannable' });
 }
 
 // ---- helpers shared by the gh-backed commands -------------------------------------------------

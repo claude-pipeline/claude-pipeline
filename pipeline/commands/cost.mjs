@@ -17,7 +17,7 @@ export const meta = {
     'pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|verifier|controller|other',
     '              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]',
     '  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
-    '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB);',
+    '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped);',
     '  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.',
   '  --round R: the review round the call served (judge or arbiter of round R, and the implementer that fixes round R\'s accepts); the entry is also added to cost.byRound[R],',
   '  which the extra-round ask uses to name what the last round cost. Build-phase calls pass none.',
@@ -29,13 +29,25 @@ export const meta = {
 
 const MAX_TRANSCRIPT_BYTES = 50 * 1024 * 1024;
 
-function transcriptUsage(file, root, defaultModel) {
+const sleepSync = (ms) => { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); };
+
+// Right after an agent returns its transcript file can lag a moment behind (not on disk yet): a missing file is looked for again a few times (5 looks, 0.5 s apart, ~2 s) before it fails.
+// A last line still being written is skipped by usageFromTranscript (a half line is not JSON), never an error.
+export function transcriptUsage(file, root, defaultModel, { sleep = sleepSync, tries = 5, delayMs = 500 } = {}) {
   const abs = resolve(root, file);
   let size;
-  try {
-    size = statSync(abs).size;
-  } catch (err) {
-    throw new UsageError(`--from-transcript: cannot read ${file} (${err.code ?? err.message})`);
+  for (let attempt = 1; ; attempt++) {
+    try {
+      size = statSync(abs).size;
+      break;
+    } catch (err) {
+      if (err.code === 'ENOENT' && attempt < tries) {
+        sleep(delayMs);
+        continue;
+      }
+      const cause = err.code === 'ENOENT' ? ` after ${attempt} tries over ~${Math.round(((attempt - 1) * delayMs) / 100) / 10} s: the agent's transcript may not be on disk yet (it can lag a moment behind the agent's return): run this again in a few seconds, or check the path` : '';
+      throw new UsageError(`--from-transcript: cannot read ${file} (${err.code ?? err.message})${cause}`);
+    }
   }
   if (size > MAX_TRANSCRIPT_BYTES) throw new UsageError(`--from-transcript: ${file} is ${size} bytes, at most ${MAX_TRANSCRIPT_BYTES} allowed`);
   return usageFromTranscript(readFileSync(abs, 'utf8'), { defaultModel });

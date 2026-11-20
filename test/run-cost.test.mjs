@@ -15,6 +15,8 @@ import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
 } from '../pipeline/lib/run-record.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { transcriptUsage } from '../pipeline/commands/cost.mjs';
+import { UsageError } from '../pipeline/lib/cli.mjs';
 
 const NOW = Date.parse('2026-10-14T10:00:00Z');
 const rec = () => emptyRecord({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main' });
@@ -136,6 +138,24 @@ test('readGuardLog: malformed lines are skipped and counted, never trusted or th
   writeFileSync(file, [logLine('s1'), '{not json', '', JSON.stringify({ session: 42 }), '[]', 'null', logLine('s1')].join('\n'));
   const r = readGuardLog(file, ['s1']);
   assert.deepEqual([r.blocks, r.skipped], [2, 4]);
+});
+
+// Failure caught: `P cost --from-transcript` run right after an agent returns exited 2 (cannot read ... ENOENT) because the transcript was not on disk yet; one more look a moment later finds it.
+test('transcriptUsage: a transcript that is not on disk yet is read again a few times before the read fails, and the failure names the likely cause', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-transcript-'));
+  const file = join(dir, 'agent.jsonl');
+  const line = JSON.stringify({ message: { id: 'm1', model: 'claude-sonnet-5-5', usage: { input_tokens: 7, output_tokens: 3 } } });
+  const sleeps = [];
+  const late = transcriptUsage(file, dir, undefined, { sleep: (ms) => { sleeps.push(ms); if (sleeps.length === 2) writeFileSync(file, `${line}\n{"message":{"id":"m2","usa`); }, tries: 5, delayMs: 500 });
+  assert.equal(sleeps.length, 2, 'two waits, then it was there');
+  assert.deepEqual([late.input, late.output, late.messages], [7, 3, 1], 'a half-written last line is skipped, the rest counts');
+
+  const never = [];
+  assert.throws(
+    () => transcriptUsage(join(dir, 'missing.jsonl'), dir, undefined, { sleep: (ms) => never.push(ms), tries: 4, delayMs: 500 }),
+    (err) => err instanceof UsageError && /cannot read .*missing\.jsonl \(ENOENT\)/.test(err.message) && /not be on disk yet/.test(err.message) && /4 tries/.test(err.message),
+  );
+  assert.equal(never.length, 3, 'tries - 1 waits, never after the last look');
 });
 
 test('usageFromTranscript: sums message.usage, counting a streamed message id once', () => {
