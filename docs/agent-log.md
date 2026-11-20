@@ -287,3 +287,4 @@ full record.
 - 2026-11-20 · #665 · Regression-only bar for the guard files (#559 A3); refuse a cancelled entry (#640); no waiver without a line (#631) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 595 runs (161 high)
 - 2026-11-20 · #653 · Main skips re-testing a commit the merge queue already passed (tested-tree accepts merge_group runs) · risk high · rounds 2 · arbiter 1 · awaiting-owner-merge · Codex 7d: 597 runs (161 high)
 - 2026-11-20 · #667 · Guard: read the repo's pipeline config once per check (fixes 'took too long'); 3 more false refusals · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 597 runs (161 high)
+- 2026-11-20 · #638 · Floor A: low-only fixes accepted at the round limit go to follow-up issues unapplied (cap-low deferral) · risk high · rounds 5 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 601 runs (161 high)
