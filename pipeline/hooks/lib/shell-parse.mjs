@@ -2876,6 +2876,8 @@ class Parser {
         this.ctlOpen(kind, kind !== 'fn' && segNeg(seg), seg);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
+        // (`coproc { exit 1; }`: the group runs in a background subshell, so an exit in it leaves no shell: its level carries `co` for git-policy's settle, as the `coproc exit 1` word group does with `wrapped`)
+        if (kind !== 'fn' && seg.words.some((w) => w.text === 'coproc' && w.qa < 0)) this.ctx.up[this.ctx.up.length - 1].co = true;
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
@@ -3584,7 +3586,10 @@ class Parser {
         argv.push(w.text);
       }
     }
-    return this.process(argv, env, seg, false);
+    const cmd = this.process(argv, env, seg, false);
+    // (a leading `coproc` was stripped above: its command runs in a background subshell, so it is wrapped for git-policy's bareExit just as `command` / `noglob` are)
+    if (cmd && words.slice(0, i).some((w) => w.text === 'coproc' && w.qa < 0)) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
+    return cmd;
   }
 
   // Replaces argv[0] by its backslash-preserving spelling when the word was a Windows path (C:\Git\git.exe).
@@ -3602,10 +3607,12 @@ class Parser {
     let fan = null; // the xargs / parallel that built this command from stdin text
     const runnerDirs = [];
     let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
+    let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see git-policy's bareExit)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
       if (!un) break;
+      wrapped = true;
       if (PACKAGE_RUNNERS.has(base(a[0]))) {
         viaRunner = true;
         // (R1-B6: `npx --prefix sub tool`, `npm exec --prefix sub tool`: the bin is looked up from that directory too; every directory option among the words counts, a tool's own --prefix included: more places, never fewer)
@@ -3646,6 +3653,7 @@ class Parser {
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
+    if (cmd && wrapped) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
     if (cmd && (seg.negated || segNeg(seg))) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
