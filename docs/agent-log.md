@@ -295,3 +295,4 @@ full record.
 - 2026-11-20 · #697 · Codex review model default: gpt-6.2-astra · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 627 runs (167 high)
 - 2026-11-20 · #668 · Refuse to publish over a newer-format triage comment (#612) · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 627 runs (167 high)
 - 2026-11-20 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 16 · arbiter 14 (fix-verify 1) · merged · Codex 7d: 637 runs (170 high)
+- 2026-11-20 · #700 · Git guard walk follow-ups: aliases as child text, quiet redirects, cd -P, unknown-dir switch, loop exit · risk high · rounds 5 · arbiter 5 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 639 runs (171 high)
