@@ -4010,6 +4010,8 @@ const INTERP_PROGRAM = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|p
 // Program text that names a protected path next to something that writes, moves or deletes.
 const WRITE_WORDS = String.raw`write|append|unlink|\brm\b|rmSync|rmtree|rmdir|rename|copy|\bcp(?:Sync)?\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|extractall|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install`;
 const WRITE_HINT = new RegExp(`${WRITE_WORDS}|open\\s*\\(`, 'i');
+// Item 5: what WRITE_HINT cannot see in an inline node program (it is no file the guard can read twice): a child process, openSync(…), code or a name built at run time (eval, Function, a computed call, string pieces joined by +)
+const INLINE_NODE_RISK = /child_process|open\w*\s*\(|\beval\b|\bFunction\b|\]\s*\(|['"`]\s*\+|\+\s*['"`]/;
 
 // `bash f.sh`, `source f`, `./f`, `node f.mjs`, `python f.py`: the file is read (up to 1 MB) and judged like the same text
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
@@ -6076,7 +6078,13 @@ function evaluateBashForFilesFrame(command, opts) {
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
   const harmless = assignmentOnlyHarmless(cmds, ctx, ctx.frames.indexOf(frame) === 0);
-  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c));
+  // Item 5 (guard false refusals): `node -e / -p PROGRAM` is judged like a program file (judgeFoundScript): the protected name is a refusal only next to a write word (WRITE_HINT) or child_process.
+  // Not this route (judged as before): another option, a redirect, an assignment value that names a protected path, a run-time part ($ or a backtick) in the words, or an argument word that names one.
+  const readsInlineNode = (c) => /^node(?:js)?$/.test(baseOf(c.argv[0] ?? '')) && /^(?:-e|-p|--eval|--print)$/.test(c.argv[1] ?? '') && c.argv.length >= 3
+    && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && !Object.values(c.env ?? {}).some((v) => m.rawHit(v, dirs))
+    && !c.argv.slice(1).some((w) => /[$`]/.test(w)) && !c.argv.slice(3).some((w) => tokenHit(w)) && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
+    && !((m.rawHit(c.argv[2], dirs, true) || m.pathHit(c.argv[2], dirs, true)) && (WRITE_HINT.test(c.argv[2]) || INLINE_NODE_RISK.test(c.argv[2])));
+  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c) && !readsInlineNode(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
     // #295: a command that is read-only in itself, refused only because the line's heredoc text holds an expansion that can evaluate (ctx.heredocPlants, R5-F3): say so, not "is not a read-only command"

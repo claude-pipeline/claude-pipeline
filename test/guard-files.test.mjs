@@ -2249,3 +2249,29 @@ test('items 3/4: cp / sed -i / mv of a ~/.claude/scripts file are allowed; the s
     'cp /tmp/a ~/.claude/projects/../pipeline/x',
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
+
+// Item 5 (refused: `node -e "const s=require('./.review/state.json');console.log(Object.keys(s))"`, 141 times in a month): an inline node program is judged like a program file:
+// naming a protected path is a refusal only next to a write (or child_process); reading and printing it is not a write.
+test('item 5: inline node -e / -p that only reads a review file is allowed; a write, a child process or a redirect on the same names stays refused', () => {
+  for (const cmd of [
+    `node -e "const s=require('./.review/state.json');console.log(Object.keys(s))"`,
+    `node -e "const a=require('./.review/round-3/accepted.json');console.log(a.length)"`,
+    `node -p "require('/repo/.review/hardstops.json').items.length"`,
+    `node -e "console.log(JSON.parse(require('fs').readFileSync('.review/state.json','utf8')).pr)"`,
+    `node -e 'console.log(require("fs").readFileSync("/work/wt/.review/hardstops.json","utf8").length)'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    `node -e "require('fs').writeFileSync('.review/state.json','{}')"`,
+    `node -e "require('fs').writeFileSync('/home/u/.claude/pipeline/x','{}')"`,
+    `node -e "require('fs').rmSync('.review/state.json')"`,
+    `node -e "require('fs').appendFileSync('.review/state.json','x')"`,
+    `node -e "require('fs').openSync('.review/state.json','w')"`,
+    `node -e "require('child_process').execSync('node x.js .review/state.json')"`,
+    `node -e "console.log(require('./.review/state.json'))" > .review/state.json`,
+    `node -e "console.log(1)" >> /home/u/.claude/pipeline/x`,
+    `node -e "const f=process.argv[1];require('fs').writeFileSync(f,'x')" .review/state.json`,
+    `node -e "console.log(require('./.review/state.json'), $(cat /tmp/x))"`,
+    `node -e "require('fs')['wri'+'teFileSync']('.review/state.json','{}')"`,
+    `node -e "eval(process.argv[1]);require('./.review/state.json')" 'x'`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
