@@ -847,3 +847,25 @@ test('R1-B1: a package script or a runner bin run after a cd behind builtin / co
   allows('cd packages/app && npm test (plain cd, harmless manifest)', 'cd packages/app && npm test', quiet);
   denies('cd packages/app && npm test (plain cd, pretest pushes main)', 'cd packages/app && npm test', lifecycle, /./);
 });
+
+// ---- review round 1 (#761): R1-B2 / R1-B3, the child a `coproc` starts is the one construct that follows it, whole ----
+// From /work/repo (on agent/x). Why: only the `{` right after `coproc` is the child's boundary, so a nested `{ cd main; }` inside it is a plain group and the child goes on in main (the merge base refused the
+// push there; the nested group's closer put the parent's directory back and the push was judged on agent/x). And `coproc if cd main && P; then :; fi` runs the whole `if` in the child: its cd moves the child for the
+// push chained to it (the merge base refused that too; marking the first command as spawned made the cd be ignored).
+test('R1-B2: a brace group nested in `coproc { }` is a plain group, the child stays where its cd put it', () => {
+  refused('coproc { { cd main; }; P; }', `coproc { { cd /work/main; }; ${PH}; }`, IN_MAIN, '/work/repo');
+  refused('coproc NAME { { cd main; }; P; }', `coproc NAME { { cd /work/main; }; ${PH}; }`, DIRS, '/work/repo');
+  refused('coproc { { { cd main; }; }; P; }', `coproc { { { cd /work/main; }; }; ${PH}; }`, IN_MAIN, '/work/repo');
+  // (still the child's: its own cd never reaches the parent, nested or not)
+  accepted('coproc { { cd main; }; }; P (the parent stays on repo)', `coproc { { cd /work/main; }; }; ${PH}`, '/work/repo');
+  accepted('coproc { { cd repo; }; P; } from main', `coproc { { cd /work/repo; }; ${PH}; }`);
+});
+
+test('R1-B3: a compound after `coproc` is the child whole: a cd in it moves the commands chained inside it, never the parent', () => {
+  refused('coproc if cd main && P; then :; fi', `coproc if cd /work/main && ${PH}; then :; fi`, IN_MAIN, '/work/repo');
+  refused('coproc if cd main; then P; fi', `coproc if cd /work/main; then ${PH}; fi`, DIRS, '/work/repo');
+  refused('coproc while cd main && P; do break; done', `coproc while cd /work/main && ${PH}; do break; done`, IN_MAIN, '/work/repo');
+  accepted('coproc if cd main; then :; fi; P (the parent stays on repo)', `coproc if cd /work/main; then :; fi; ${PH}`, '/work/repo');
+  accepted('coproc if cd repo && P; then :; fi from main', `coproc if cd /work/repo && ${PH}; then :; fi`);
+  refused('coproc if cd repo; then :; fi; P from main (the parent stays in main)', `coproc if cd /work/repo; then :; fi; ${PH}`, IN_MAIN);
+});

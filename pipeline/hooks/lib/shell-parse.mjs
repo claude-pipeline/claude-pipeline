@@ -2860,8 +2860,8 @@ class Parser {
       else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
       const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
       if (q < 0 && cmdPos && (text === 'then' || text === 'do' || text === 'elif')) this.ctlSetCond(text === 'do' ? 'loop' : 'if', text === 'elif');
-      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg), seg, text); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
-      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg), seg); seg.ctl = { ...seg.ctl, cond: true }; }
+      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg), seg, text); this.coChild(seg); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
+      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg), seg); this.coChild(seg); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
       else if (q < 0 && cmdPos && text === '}') {
@@ -2883,8 +2883,9 @@ class Parser {
         this.ctlOpen(kind, kind !== 'fn' && segNeg(seg), seg);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
-        // (`coproc { exit 1; }`: the group runs in a background subshell, so an exit in it leaves no shell: its level carries `co` for git-policy's settle, as the `coproc exit 1` word group does with `wrapped`)
-        if (kind !== 'fn' && seg.words.some((w) => w.text === 'coproc' && w.qa < 0)) this.ctx.up[this.ctx.up.length - 1].co = true;
+        // (`coproc { exit 1; }`: the group runs in a background subshell, so an exit in it leaves no shell: its level carries `co` for git-policy's settle, as the `coproc exit 1` word group does with `wrapped`. R1-B2: only the `{` right
+        // after `coproc` (or its NAME) is that boundary; a group nested in it is a plain one)
+        if (kind !== 'fn') this.coChild(seg);
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
@@ -3363,6 +3364,14 @@ class Parser {
     } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; this.ctx.loops = loops; this.ctx.up = up; this.ctx.upHold = upHold; this.ctx.lead = lead; }
   }
 
+  // R1-B2 / R1-B3: the construct just opened (a `{` group, an if, a loop) is the child a `coproc` right before it starts (`coproc [NAME] CONSTRUCT`): its level carries `co`, so what it does is judged inside it and the parent goes on
+  // where it was, as after a subshell. Not one the words before it only contain (`coproc { { cd d; }; }`: the inner group).
+  coChild(seg) {
+    const w = seg.words;
+    const co = (x) => x?.text === 'coproc' && x.qa < 0;
+    if (co(w[w.length - 1]) || (co(w[w.length - 2]) && /^[A-Za-z_]\w*$/.test(w[w.length - 1].text))) this.ctx.up[this.ctx.up.length - 1].co = true;
+  }
+
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
   ctlOpen(kind, neg = false, seg = null, head = null) {
     // (each level copies the list of enclosing levels below: past MAX_NEST levels the line is given up on, as nested $( ) is, so 50 000 `{ ` cannot take gigabytes)
@@ -3596,8 +3605,13 @@ class Parser {
       }
     }
     const cmd = this.process(argv, env, seg, false);
-    // (a leading `coproc` was stripped above: its command runs in a background child process, like env / nohup: it is `spawn`ed (its cd moves that child, nothing it does is certain) and wrapped (no plainExit))
-    if (cmd && words.slice(0, i).some((w) => w.text === 'coproc' && w.qa < 0)) { Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false }); Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false }); }
+    // (a leading `coproc` was stripped above: its command runs in a background child process, like env / nohup: it is `spawn`ed (its cd moves that child, nothing it does is certain) and wrapped (no plainExit). R1-B3: not when a
+    // compound follows it (`coproc if cd D && P; then …`): the whole compound is the child, its level carries `co` (coChild), and the commands in it are judged as the group's are, so only `wrapped`)
+    const coAt = words.slice(0, i).findIndex((w) => w.text === 'coproc' && w.qa < 0);
+    if (cmd && coAt >= 0) {
+      Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
+      if (!words.slice(coAt + 1, i).some((w) => ['if', 'while', 'until'].includes(w.text) && w.qa < 0)) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
+    }
     return cmd;
   }
 
