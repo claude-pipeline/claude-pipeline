@@ -427,11 +427,29 @@ test('a recorded round is not picked up once HEAD moved past its toHead: head-mo
   assert.equal(j.next, 'round codex --pr 7 --round 2');
 });
 
-test('head-moved-since-round on a judge round whose items have no ruling yet: next finishes round 1 (the judge step), never starts round 2', (t) => {
+test('head-moved-since-round on a judge round whose items have no judge and no ruling yet: next is a judge-step pointer, not a command (no <d8> placeholder), never round 2', (t) => {
   const w = roundWorld(t, { max: 3 });
   const j = movedHead(w);
-  assert.match(j.next, /^triage validate --round 1 --from-tag /);
-  assert.doesNotMatch(j.next, /round codex/);
+  assert.match(j.next, /^judge step for round 1: /);
+  assert.doesNotMatch(j.next, /<d8>|round codex|triage validate/);
+});
+
+test('head-moved-since-round on a judge round whose items were judged but have no ruling (left for the arbiter): next is arbiter needed, not another validate', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const j = movedHead(w, (s) => { for (const i of s.rounds[0].items) i.judge = { decision: 'REJECT', confidence: 'high', reasoning: 'x' }; });
+  assert.equal(j.next, 'arbiter needed --pr 7 --round 1');
+});
+
+test('head-moved-since-round on a base-only round of a Fable PR (no items, no arbiter proof, no fableRequired): next is round 2, not an arbiter pass the round cannot produce', (t) => {
+  const w = roundWorld(t, { max: 3, yml: 'risk:\n  high_risk_paths: ["src/a.js"]\n' });
+  const j = movedHead(w, (s) => {
+    assert.equal(s.reviewer, 'fable');
+    s.rounds[0].items = [];
+    s.rounds[0].baseOnly = true;
+    delete s.rounds[0].fableRequired;
+    delete s.rounds[0].arbiter;
+  });
+  assert.equal(j.next, 'round codex --pr 7 --round 2');
 });
 
 test('head-moved-since-round on a Fable round without a proven arbiter pass: next is arbiter needed for that round, never round 2', (t) => {
