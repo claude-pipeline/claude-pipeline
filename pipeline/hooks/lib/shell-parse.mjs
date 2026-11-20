@@ -3586,6 +3586,7 @@ class Parser {
         argv.push(w.text);
       }
     }
+    seg.typed = words.slice(i).map((w) => w.text); // (the command's words as typed, before any wrapper is unwrapped: see the `typed` property of process)
     const cmd = this.process(argv, env, seg, false);
     // (a leading `coproc` was stripped above: its command runs in a background subshell, so it is wrapped for git-policy's bareExit just as `command` / `noglob` are)
     if (cmd && words.slice(0, i).some((w) => w.text === 'coproc' && w.qa < 0)) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
@@ -3605,11 +3606,13 @@ class Parser {
     // script such a wrapper started (`env -C D sh -c '…'`) runs in D or wherever the script's own cd took it: unknown, null)
     let chdir = chdir0 !== undefined ? chdir0 : this.ctx.chdirInherit !== undefined ? null : undefined;
     let fan = null; // the xargs / parallel that built this command from stdin text
+    let fanRuns = false; // (xargs / parallel is the command that runs, with or without a command to build: a bare `parallel` has none, `unwrap` gives nothing)
     const runnerDirs = [];
     let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
     let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see git-policy's bareExit)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
     for (let guard = 0; guard < 32 && a.length; guard++) {
+      if (base(a[0]) === 'xargs' || base(a[0]) === 'parallel') fanRuns = true;
       const un = unwrap(a);
       if (!un) break;
       wrapped = true;
@@ -3651,10 +3654,13 @@ class Parser {
     const headDyn = a.length > 0 && (a[0].startsWith('$') || a[0].includes('$(') || a[0].includes('`'));
     if (headDyn) this.ctx.dynamicHead = true; // (kept apart from the other causes of ctx.dynamic: see dynamicOther in simpleCommands)
     const cmd = emit(this.ctx, a, env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
+    // typed: the words the command was typed with (a quoted string, a substitution and a heredoc body stay one word; comments are not words; leading NAME=value words are not in it), wrappers included. Not enumerable
+    if (cmd && seg.typed) Object.defineProperty(cmd, 'typed', { value: seg.typed, enumerable: false });
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
     if (cmd && wrapped) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
+    if (cmd && fanRuns) Object.defineProperty(cmd, 'fan', { value: true, enumerable: false }); // (R11-F2: xargs / parallel is the command that runs, not a word among the arguments: the live-database guard)
     if (cmd && (seg.negated || segNeg(seg))) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
     if (bashAlso) for (const sh of ['bash', 'sh']) emit(this.ctx, [sh, ...bashAlso], env, seg.raw, seg.depth, [], seg.sep, seg.afterClose);
