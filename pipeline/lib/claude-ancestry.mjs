@@ -40,7 +40,8 @@ const REUSE_SKEW_MS = 2000;
 // background job had no Claude ancestor, so the stack hooks refused its private stacks ("no Claude Code process above
 // the hook"). The nearest match wins, so a job is owned by its bg-spare process.
 const CLAUDE_COMM = /^claude(?:\.exe)?(?: bg-[a-z]+(?:-[a-z]+)*)?$/;
-const RUNTIME = /^(?:node|nodejs|bun|deno)(?:\.exe)?$/i;
+// Node 24 on Linux renames the main thread, so `ps -o comm=` shows MainThread instead of node.
+const RUNTIME = /^(?:(?:node|nodejs|bun|deno)(?:\.exe)?$|MainThread$)/i;
 // `node …/@anthropic-ai/claude-code/cli.js`, `bun …/claude-code/cli.js`, `bun run /x/claude`, `node "C:\Program Files\x\claude"`
 // (the closing quote after the name is allowed).
 const CLAUDE_ARGS = /@anthropic-ai[\\/]claude-code|[\\/]claude-code[\\/](?:cli|bin)[\w.-]*|[\\/]claude(?:\.exe)?(?=["']?(?:\s|$))/;
