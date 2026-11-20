@@ -244,8 +244,8 @@ const makesNoRequest = (c) => {
 // the first words of every supabase subcommand and alias (`supabase --help` of CLI 2.122; re-check on a CLI update), plus those the tables below do not carry
 const SUB_HEADS = new Set([...[...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]), 'migrations', 'experimental', 'issue', 'feedback']);
 const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
-// the longest head a glob word could stand for (`network-x` stands for the `network-*` family): a pattern that must consume more characters than that is no head
-const GLOB_HEAD_MAX = Math.max(...[...SUB_HEADS, 'network-x'].map((h) => h.length));
+// the longest head a glob word could stand for, the `network-*` family by its real names (`supabase --help` of CLI 2.122; `network-restrictions` is the longest, 20): a pattern that must consume more characters than that is no head
+const GLOB_HEAD_MAX = Math.max(...[...SUB_HEADS, 'network-bans', 'network-restrictions'].map((h) => h.length));
 // B7: a supabase TOKEN in a line's text = `supabase` (optionally `npm:` / `nixpkgs#` before, `-cli` / `@version` / .exe .cmd .bat after) as the LAST path component of a word: not followed by `/ . _ -` or a word character
 // (`supabase/migrations/x.sql`, `SUPABASE_URL`, `supabase.from(`, `supabase.com`, `@supabase/supabase-js` are not tokens; `supabase`, `./node_modules/.bin/supabase`, `'supabase db push'` are)
 const SB_TOKEN_SRC = String.raw`(?<![\w.@-])(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\\s'"]*)?(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`;

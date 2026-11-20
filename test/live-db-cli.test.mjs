@@ -643,6 +643,8 @@ test('a short glob with a POSIX bracket class or a leading ] after a supabase to
     "doppler run --command 'supabase d[[:alpha:]] push --linked'",
     `doppler run --command 'supabase d[${'b'.repeat(70)}[:alpha:]] push --linked'`,
     'x supabase [!]x]b push',
+    // the bound counts the real `network-*` heads: `network-restrictions` is the longest (20)
+    "doppler run --command 'supabase n?twork-restrictions update'",
   ]) assert.equal(verdict(line).decision, 'deny', line);
 });
 
