@@ -290,3 +290,4 @@ full record.
 - 2026-11-20 · #638 · Floor A: low-only fixes accepted at the round limit go to follow-up issues unapplied (cap-low deferral) · risk high · rounds 5 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 601 runs (161 high)
 - 2026-11-20 · #668 · Refuse to publish over a newer-format triage comment (#612) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 603 runs (162 high)
 - 2026-11-20 · #676 · Pipeline fixes: synthetic-grant image note, low-confidence confirm, cost double-count, ci-wait --wait-others, publish retry · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 607 runs (163 high)
+- 2026-11-20 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 16 · arbiter 14 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 623 runs (165 high)
