@@ -2,7 +2,9 @@
 // and the preflight hint. Every test uses a scratch home; the account's real file is never touched.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { UsageError } from '../pipeline/lib/cli.mjs';
@@ -13,6 +15,8 @@ import { runPreflight } from '../pipeline/lib/preflight.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, createFakeCodex, fullProtection, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
+import { noClaudeSession } from './helpers/no-claude-session.mjs';
+import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 
 const REF = 'abcdefghij0123456789';
 const REF2 = 'zyxwvutsrq9876543210';
@@ -27,7 +31,7 @@ const ownerCtx = (home, over = {}) => ({ home, env: {}, hasClaudeCodeAncestor: (
 
 test('set / show / remove round-trip; a duplicate ref replaces its entry; the file is 0600', async (t) => {
   const home = scratchHome(t);
-  const set = (args) => run(['set', ...args], ownerCtx(home));
+  const set = (args) => runOwnerCli(home, ['set', ...args]);
   let r = await set(['--ref', REF, '--name', 'EagleWatch prod', '--repo', 'eaglewatch-ph/eaglewatch']);
   assert.equal(r.exitCode, 0);
   r = await set(['--ref', REF2, '--name', 'Scratch', '--repo', 'o/r', '--dev']);
@@ -41,7 +45,7 @@ test('set / show / remove round-trip; a duplicate ref replaces its entry; the fi
   if (process.platform !== 'win32') assert.equal(statSync(dbRefsFile(home)).mode & 0o777, 0o600);
   await set(['--ref', REF2, '--name', 'Renamed', '--repo', 'o/r']);
   assert.deepEqual((await run(['show'], ownerCtx(home))).output.refs.map((e) => [e.ref, e.name, e.kind]), [[REF, 'EagleWatch prod', 'live'], [REF2, 'Renamed', 'live']]);
-  r = await run(['remove', '--ref', REF], ownerCtx(home));
+  r = runOwnerCli(home, ['remove', '--ref', REF]);
   assert.equal(r.exitCode, 0);
   assert.deepEqual((await run(['show'], ownerCtx(home))).output.refs.map((e) => e.ref), [REF2]);
   assert.equal(existsSync(`${dbRefsFile(home)}.tmp`), false);
@@ -49,11 +53,11 @@ test('set / show / remove round-trip; a duplicate ref replaces its entry; the fi
 
 test('server add / remove keeps a de-duplicated list; show names the built-in servers', async (t) => {
   const home = scratchHome(t);
-  await run(['server', 'add', 'my_db'], ownerCtx(home));
-  await run(['server', 'add', 'my_db'], ownerCtx(home));
+  runOwnerCli(home, ['server', 'add', 'my_db']);
+  runOwnerCli(home, ['server', 'add', 'my_db']);
   assert.deepEqual((await run(['show'], ownerCtx(home))).output.servers, ['my_db']);
   assert.ok((await run(['show'], ownerCtx(home))).output.builtinServers.includes('plugin_supabase_supabase'));
-  await run(['server', 'remove', 'my_db'], ownerCtx(home));
+  runOwnerCli(home, ['server', 'remove', 'my_db']);
   assert.deepEqual((await run(['show'], ownerCtx(home))).output.servers, []);
   await assert.rejects(() => run(['server', 'add', 'bad name!'], ownerCtx(home)), UsageError);
   await assert.rejects(() => run(['server', 'add'], ownerCtx(home)), UsageError);
@@ -70,8 +74,8 @@ test('the changing subcommands refuse inside Claude Code (CLAUDECODE=1 and a Cla
   for (const a of [['remove', '--ref', REF], ['server', 'add', 'x']]) assert.equal((await run(a, ownerCtx(home, { env: { CLAUDECODE: '1' } }))).exitCode, 2, a.join(' '));
   assert.equal(existsSync(dbRefsFile(home)), false);
   assert.equal((await run(['show'], ownerCtx(home, { env: { CLAUDECODE: '1' } }))).exitCode, 0);
-  // the owner's admin switch lifts the refusal (same as every owner-only command); it is only read here
-  assert.equal((await run(args, ownerCtx(home, { env: { [SWITCH]: '1', CLAUDECODE: '1' } }))).exitCode, 0);
+  // the owner's admin switch lifts the refusal (same as every owner-only command); the write runs in a child as the owner (the writer checks the real environment)
+  assert.equal(runOwnerCli(home, args, { CLAUDECODE: '1' }).exitCode, 0);
 });
 
 test('usage errors: a bad ref, name or repo, an option on the wrong subcommand, an unknown subcommand', async (t) => {
@@ -153,6 +157,87 @@ test('guard: an agent line running `pipeline db-refs set|remove|server` is refus
   for (const cmd of [`${PIPE} db-refs show`, `${PIPE} preflight`, 'git commit -m "pipeline db-refs set"']) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// #683: the registry writer library gets the recorders' run / import protection. Catches: an agent running `node -e "import('…/db-refs.mjs')…writeDbRefs(…)"` and
+// rewriting which databases count as live, while the same shapes for live-db-go.mjs are already refused.
+const WLIB = '/home/u/.claude/pipeline/hooks/lib/db-refs.mjs';
+test('guard (#683): running or importing db-refs.mjs by hand is refused at every check site; reading it, `db-refs show`, committing it and its own test stay open', () => {
+  for (const cmd of [
+    `node ${WLIB}`,
+    `${WLIB}`,
+    `node -e "import('${WLIB}').then((m) => m.writeDbRefs(require('os').homedir(), {refs: []}))"`,
+    `node --input-type=module <<'EOF'\nimport { writeDbRefs } from '${WLIB}';\nEOF`,
+    `node --input-type=module <<< "import '${WLIB}'"`,
+    `echo "import '${WLIB}'" | node --input-type=module`,
+    'node ./pipeline/commands/db-refs.mjs',
+    'node ./pipeline/hooks/lib/db-refs.mjs',
+    'node /repo/pipeline/hooks/lib/db-refs.mjs',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`cat ${WLIB}`, `${PIPE} db-refs show`, 'git add pipeline/hooks/lib/db-refs.mjs', 'node --test test/db-refs.test.mjs']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// #683: the writer itself refuses inside Claude Code (real environment, real process tree): the hook cannot see a scratch file that imports the library.
+// Catches: `node scratch.mjs` importing writeDbRefs and replacing the registry (the hook allows it by design). Real child processes, disposable home.
+const WRITER_LIB = fileURLToPath(new URL('../pipeline/hooks/lib/db-refs.mjs', import.meta.url));
+const SESSION = ['CLAUDE', 'CODE'].join('');
+function writerScene(t) {
+  const home = realpathSync.native(scratchHome(t));
+  const scratch = join(home, 'scratch.mjs');
+  writeFileSync(scratch, [
+    `import { writeDbRefs } from ${JSON.stringify(pathToFileURL(WRITER_LIB).href)};`,
+    `writeDbRefs(${JSON.stringify(join(home, 'disk-home'))}, { refs: [{ ref: ${JSON.stringify(REF)}, name: 'n', repo: 'o/r', kind: 'live' }] });`,
+  ].join('\n'));
+  const diskHome = join(home, 'disk-home');
+  return { home, scratch, diskHome, folder: join(diskHome, '.claude', 'pipeline-state'), file: dbRefsFile(diskHome) };
+}
+const childRun = (scene, env, parent) => spawnSync(process.execPath, parent ? [parent, scene.scratch] : [scene.scratch], { env, encoding: 'utf8' });
+const withoutSession = () => { const e = { ...process.env }; delete e[SESSION]; delete e[SWITCH]; return e; };
+const inSession = () => { const e = { ...process.env, [SESSION]: '1' }; delete e[SWITCH]; return e; };
+
+test('writeDbRefs (#683): CLAUDECODE=1 refuses, naming the owner\'s terminal, and creates no registry folder or file', { skip: process.platform === 'win32' }, (t) => {
+  const s = writerScene(t);
+  const r = childRun(s, inSession());
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /owner's own terminal/);
+  assert.equal(existsSync(s.folder), false);
+});
+
+test('writeDbRefs (#683): CLAUDECODE=1 with an existing registry refuses and leaves the bytes identical', { skip: process.platform === 'win32' }, (t) => {
+  const s = writerScene(t);
+  seedRegistry(s.diskHome, { refs: [{ ref: REF2, name: 'keep', repo: 'o/r', kind: 'live' }] });
+  const before = readFileSync(s.file);
+  assert.notEqual(childRun(s, inSession()).status, 0);
+  assert.deepEqual(readFileSync(s.file), before);
+});
+
+test('writeDbRefs (#683): with the session marker removed, a Claude Code process among the ancestors still refuses (ancestry only)', { skip: process.platform === 'win32' }, (t) => {
+  const s = writerScene(t);
+  const dir = join(s.home, 'claude-code');
+  mkdirSync(dir, { recursive: true });
+  const parent = join(dir, 'cli.js');
+  writeFileSync(parent, "const { spawnSync } = require('node:child_process');\nconst r = spawnSync(process.execPath, [process.argv[2]], { stdio: 'inherit' });\nprocess.exit(r.status ?? 1);\n");
+  const r = childRun(s, withoutSession(), parent);
+  assert.notEqual(r.status, 0);
+  assert.match(r.stderr, /owner's own terminal/);
+  assert.equal(existsSync(s.folder), false);
+});
+
+test('writeDbRefs (#683): no Claude Code ancestor and no marker writes, including first creation of the folder', { skip: process.platform === 'win32' }, (t) => {
+  const s = writerScene(t);
+  const env = { ...process.env, ...noClaudeSession() };
+  delete env[SESSION];
+  delete env[SWITCH];
+  const r = childRun(s, env);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readDbRefs(s.diskHome).refs[0].ref, REF);
+});
+
+test('writeDbRefs (#683): the owner\'s admin switch writes even inside a session, including first creation of the folder', { skip: process.platform === 'win32' }, (t) => {
+  const s = writerScene(t);
+  const r = childRun(s, { ...process.env, [SESSION]: '1', [SWITCH]: '1' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(readDbRefs(s.diskHome).refs[0].ref, REF);
+});
+
 // ---- preflight hint -----------------------------------------------------------------------------------------------------------
 
 function healthy(env = {}) {
@@ -182,7 +267,7 @@ test('preflight: a repo with supabase/migrations and no db-refs file gets the re
   const r1 = await runPreflight({ cwd: repo.dir, env });
   assert.equal(hint(r1).length, 1, JSON.stringify(r1.warnings));
   assert.match(hint(r1)[0], /pipeline db-refs set --ref/);
-  await run(['set', '--ref', REF, '--name', 'x', '--repo', 'o/r'], ownerCtx(home));
+  seedRegistry(home, { refs: [{ ref: REF, name: 'x', repo: 'o/r', kind: 'live' }] });
   assert.equal(hint(await runPreflight({ cwd: repo.dir, env })).length, 0);
   const plain = repoWith(false);
   rmSync(dbRefsFile(home));

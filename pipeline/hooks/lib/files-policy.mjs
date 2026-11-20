@@ -879,7 +879,8 @@ function physicalTargets(target, ctx) {
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 // #472: and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs): run by hand with an injected check they would write a pending click with a made-up capture-time hook result.
 // #262: and the live-database go recorder (lib/live-db-go.mjs): run by hand it would write a "typed go" the owner never typed. ONE alternation feeds both expressions, so the path check and the word / stdin checks cannot drift apart.
-const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go`;
+// #683: and the database registry writer (lib/db-refs.mjs, commands/db-refs.mjs): run by hand it would rewrite which databases count as live. A scratch file that imports it is stopped by the writer itself, not by this text scan.
+const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go|db-refs`;
 const OWNER_GO_RECORDER = new RegExp(String.raw`(?:^|/)hooks/(?:lib/)?(?:${OWNER_GO_LIBS})\.mjs$`, 'i');
 const OWNER_GO_WORD = new RegExp(String.raw`(?:${OWNER_GO_LIBS})\.mjs`, 'i');
 
@@ -5444,7 +5445,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
     if (runs && c.argv.some((w) => OWNER_GO_WORD.test(toPosix(expandRefs(w, ctx))))) {
-      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
+      return deny('the owner-go recorder records the owner\'s chat "merge" (and the database registry writer rewrites which databases count as live); only Claude Code runs them, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
     }
     // #472 (R1-B1, R2): a runtime that reads its program from stdin (`node --input-type=module <<EOF`, `node - <<< …`, `node /dev/stdin`, `echo … | node`) names no file in its words, so the check above cannot see what it imports.
     // Decided from the command's OWN stdin source, not from the shape of its words (`--input-type module` and `- x` are ordinary words that still run stdin): a heredoc, a here-string or a `< <(…)` on it, or the receiving
@@ -5463,10 +5464,10 @@ function evaluateBashForFilesFrame(command, opts) {
       // (R4-F1: the text AS WRITTEN decides: a name the line gave a value and then rebinds at run time (`P=x true; read -r P …`) expands to its stale value and would hide the `$`)
       if (known && !own.some((t) => /[$`]/.test(t)) && !known.some((t) => /[$`]/.test(t))) {
         if (known.some((t) => OWNER_GO_WORD.test(t))) {
-          return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
+          return deny('a program read from stdin that names the owner-go recorder, its click libraries or the database registry writer is refused: they record the owner\'s chat "merge" or click, or rewrite the registry of live databases, and only Claude Code runs them, on the owner\'s own prompt or answer');
         }
       } else if (wholeLineTexts(cmds, raw).some((t) => OWNER_GO_WORD.test(toPosix(expandRefs(t, ctx))))) {
-        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor, a command that can rename another (alias, hash, source, eval, trap), anything else that cannot be followed command by command, or the output of another command may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
+        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor, a command that can rename another (alias, hash, source, eval, trap), anything else that cannot be followed command by command, or the output of another command may feed it), and it names an owner-go recorder, click library or the database registry writer: they record the owner\'s chat "merge" or click, or rewrite the registry of live databases, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
       }
     }
   }
