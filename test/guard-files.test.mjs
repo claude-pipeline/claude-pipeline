@@ -2396,6 +2396,12 @@ test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a wri
     assert.equal(bash(`${name}=$(${P})`), 'deny', name);
   }
   assert.equal(bash(`result=$(${P})`), 'allow'); // (a plain name that only starts like one of them is still a plain variable)
+  // R1-F2 (#737): a name the hook's own environment already holds (an exported lower-case variable: npm_config_prefix, http_proxy) is not a plain variable: assigning it changes what the next program sees.
+  // Failure caught: `npm_config_prefix=$(echo ~/.claude/pipeline); npm install -g x` allowed, and npm then installs into the protected folder.
+  const seeded = { env: { npm_config_prefix: '/usr/local' } };
+  assert.equal(bash('npm_config_prefix=$(echo ~/.claude/pipeline); npm install -g x', seeded), 'deny');
+  assert.equal(bash(`npm_config_prefix=$(${P})`, seeded), 'deny');
+  assert.equal(bash(`npm_config_prefix=$(${P})`), 'allow'); // (the same name, not exported: a plain variable)
 });
 
 // cp #691 (refused: a 250 KB DRMed proof script run from a checkout that has a .review folder, "where it is could not be worked out in the time allowed"): the alias scan read a program only up to 200 KB and refused the

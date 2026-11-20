@@ -6168,7 +6168,7 @@ function evaluateBashForFilesFrame(command, opts) {
     return depth === 0;
   };
   const assignsSubstitution = (c) => c.argv.length === 0 && !(c.redirects ?? []).length && Object.keys(c.env ?? {}).length > 0
-    && Object.entries(c.env).every(([k, v]) => /^[a-z][a-z0-9_]*$/.test(k) && !TIED_NAMES.test(k) && wholeSubstitution(v));
+    && Object.entries(c.env).every(([k, v]) => /^[a-z][a-z0-9_]*$/.test(k) && !TIED_NAMES.test(k) && !Object.hasOwn(ctx.env ?? {}, k) && wholeSubstitution(v)); // (a name the hook's environment holds: main's rule, assignmentOnlyHarmless)
   const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c) && !readsInlineNode(c) && !assignsSubstitution(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
