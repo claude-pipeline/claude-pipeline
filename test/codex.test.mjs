@@ -1137,3 +1137,18 @@ test('F8: every alias is a spelling variant of one canonical name: its target is
   // the folded forms of the security-class names stay themselves
   for (const name of SECURITY_CLASS) assert.equal(normalizeFindingCategories({ blocking: [{ category: name.toUpperCase().replace('-', ' ') }] }).json.blocking[0].category, name);
 });
+
+test('buildReviewPrompt baseKind conflict: states the marker-tree base, excludes the base branch\'s commits, asks to justify dropped base-branch lines, fences the conflicted paths and one line per record; a missing conflict.from throws', () => {
+  // Failure caught: a reviewer told it sees the whole PR (or not told that a moved / deleted file is only in the records) after a conflicting merge.
+  const sha = (c) => c.repeat(40);
+  const rec = { path: 'new/x', types: ['CONFLICT (directory rename suggested)'], messages: ['CONFLICT (file location): dir/x added'], stages: { 2: { mode: '100644', oid: 'a'.repeat(40) } }, head: { mode: '100644', oid: 'a'.repeat(40) }, headEquals: 'ours', heads: [{ path: 'new/x', mode: '100644', oid: 'a'.repeat(40) }, { path: 'dir/x', absent: true }] };
+  const conflict = { from: sha('c'), forkPoint: sha('d'), conflicted: ['src/a.js', 'new/x'], conflictedCount: 2, records: [rec] };
+  const p = buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'conflict', conflict });
+  assert.match(p, /NOT a commit of the branch: it is the last reviewed head/);
+  assert.match(p, /the base branch's own commits are excluded because they were reviewed in their own pull requests/);
+  assert.match(p, /report as BLOCKING a dropped base-branch line/);
+  assert.match(p, /```conflicted paths\nsrc\/a\.js\nnew\/x\n```/);
+  assert.match(p, /```conflict records\nnew\/x \| types: CONFLICT \(directory rename suggested\) \| stage1 absent, stage2 100644 a{40}, stage3 absent \| head: 100644 a{40} \| head equals: ours \| head at named paths: new\/x = 100644 a{40}; dir\/x = absent \| git said: CONFLICT \(file location\): dir\/x added\n```/);
+  assert.match(p, /git cat-file -p <oid>/);
+  assert.throws(() => buildReviewPrompt({ pr: 5, title: 't', body: 'b', base: sha('a'), head: sha('b'), baseKind: 'conflict', conflict: { ...conflict, from: undefined } }), /conflict\.from/);
+});

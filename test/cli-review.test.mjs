@@ -3975,7 +3975,8 @@ test('codex-review: a resolution-only round is not capped after the extra confir
   assert.equal(capped.json.error, 'round-cap');
 });
 
-test('codex-review: PR work after the conflict merge is NOT eligible: whole-pr, counted, resolutionIneligible says why', (t) => {
+// Failure caught: after a conflicting main merge plus an own commit, the whole PR (main's changes included) is reviewed and the typed resolution drowns in it.
+test('codex-review: PR work after the conflict merge is not a resolution-only round but a counted conflict round on the PR\'s own changes, resolutionIneligible says why', (t) => {
   const w = worldIgnoringReview(t);
   assertExit(w.codex(1, findingsOf()), 0);
   conflictKeepingOurs(w);
@@ -3986,11 +3987,13 @@ test('codex-review: PR work after the conflict merge is NOT eligible: whole-pr, 
   assert.equal(r.json.resolutionOnly, undefined);
   assert.match(r.json.resolutionIneligible, /^history-nonmerge/);
   const round = w.state().rounds[1];
-  assert.deepEqual([round.reviewBaseKind, round.resolutionOnly, round.conflicted], ['whole-pr', undefined, undefined]);
+  assert.deepEqual([round.reviewBaseKind, round.resolutionOnly, round.conflicted, round.conflictedCount, round.records], ['conflict', undefined, ['src/a.js'], 1, []]);
   assert.equal(round.resolutionIneligible, 'history-nonmerge', 'the short proof-failure code is stored on the round (stats rounds reads it); the detail is not');
-  assert.equal(r.json.reviewKind, 'whole-pr');
+  assert.equal(r.json.reviewKind, 'conflict');
   assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 2, 'counted');
   assert.match(patchOf(w, 2), /src\/c\.js/);
+  assert.doesNotMatch(patchOf(w, 2), /from-main\.js/, 'main\'s own file is not in the patch');
+  assert.match(w.captured()[1].stdin, /trial-merged with the base branch as it is now/);
 });
 
 // Failure caught: the controller (and the owner's ask) cannot see BEFORE a round why it would be a counted whole-PR round, so a merge of main plus one own commit looks free.
@@ -4006,7 +4009,8 @@ test('codex-review --plan: shows reviewKind, and resolutionIneligible for a whol
   const head2 = w.repo.commit('later pr commit');
   const counted = planAt(head2);
   assertExit(counted, 0, counted.stderr + counted.stdout);
-  assert.equal(counted.json.plan.reviewKind, 'whole-pr');
+  assert.equal(counted.json.plan.reviewKind, 'conflict');
+  assert.ok(counted.json.plan.protected.includes('conflict-merge'), JSON.stringify(counted.json.plan.protected));
   assert.match(counted.json.plan.resolutionIneligible, /^history-nonmerge/);
   assert.equal(counted.json.plan.resolutionOnly, undefined);
   assert.equal(w.state().rounds.length, 1, '--plan records no round');

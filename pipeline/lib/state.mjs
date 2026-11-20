@@ -235,7 +235,8 @@ export function newerFormatInComment(body) {
 // reviewBase / reviewBaseKind: what the round was actually diffed against (see git.mjs#effectiveReviewBase); baseOnly: the
 // round only merged the base branch in, so Codex did not run. Each is recorded only when given.
 // resolutionOnly: the round is only how a conflict with the base branch was resolved (git.mjs#resolutionReviewBase); it is a
-// real review but does not count toward the round cap. conflicted (at most 50 paths) / conflictedCount / blocks (at most 50:
+// real review but does not count toward the round cap. reviewBaseKind 'conflict' (git.mjs#conflictReviewBase): a COUNTED round on the PR's own changes plus the evidence of how each
+// conflict was resolved; it keeps conflicted / conflictedCount and records (the conflicts that are not plain text) the same way and has no resolutionOnly. conflicted (at most 50 paths) / conflictedCount / blocks (at most 50:
 // { path, block, droppedTheirs }, dropped blocks first) describe that resolution, with blockCount / blocksWithDrops /
 // droppedTheirsTotal counted over ALL blocks (the stored list may be cut); ensureReviewBase needs conflicted to rebuild the base elsewhere.
 // fableRefresh: the round only re-runs the Fable pass on a head whose Fable proof is below MIN_FABLE (commands/state.mjs fable-refresh): no Codex, no items of its own
@@ -262,7 +263,7 @@ export function newerFormatInComment(body) {
 // trustedConfigSha: the commit whose committed .claude/pipeline.yml is the TRUSTED config of this round (the default branch's fork point, risk.mjs#trustedBase), which
 // review.threat_models are read from; null = pinned as unavailable (no model applies). Absent only on a round written before it existed (arbiter needed then pins it once).
 export function addRound(state, {
-  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
+  n, fromHead, toHead, contentHashAtToHead, items, reviewBase, reviewBaseKind, baseOnly, resolutionOnly, conflicted, conflictedCount, records, blocks, blockCount, blocksWithDrops, droppedTheirsTotal, forkPoint, codexModel, promptSha256, fableRequired, fableReasons, sensitivePaths, admission, ownerGrant, confirmFixed, fableRefresh,
   firstReviewer, substitute, wholePr, patchSha256, risk, governor, budget, effort, trustedConfigSha, resolutionIneligible, escalated,
 }) {
   if (!Array.isArray(items)) throw new Error(`round ${n}: items must be an array`);
@@ -301,6 +302,10 @@ export function addRound(state, {
           blocks: structuredClone(blocks ?? []),
           ...(Number.isInteger(blockCount) ? { blockCount, blocksWithDrops, droppedTheirsTotal } : {}),
         }
+        : {}),
+      // A 'conflict' round (git.mjs#conflictReviewBase): the conflicted paths (at most 50), their count and the records of the conflicts that are not plain text; ensureReviewBase re-runs the full admission from the round's commits, not from these.
+      ...(reviewBaseKind === 'conflict' && reviewBase !== undefined
+        ? { conflicted: structuredClone(conflicted ?? []), conflictedCount: conflictedCount ?? (conflicted ?? []).length, records: structuredClone(records ?? []) }
         : {}),
       ...(fableRequired === true ? { fableRequired: true, fableReasons: [...(fableReasons ?? [])], sensitivePaths: [...(sensitivePaths ?? [])] } : {}),
       items: structuredClone(items),

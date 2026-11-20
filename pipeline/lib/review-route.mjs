@@ -7,12 +7,13 @@
 //   3  governor hard (>= codex_budget.hard) and the round is a SMALL fix-check       -> substitute, evidence 'governor'
 //   4  the per-PR Codex budget is used up and the round is a SMALL fix-check          -> substitute, evidence 'budget'
 //   5  otherwise                                       -> Codex; effort is lowered to review.effort.small_fix for a small fix-check or when the governor is soft
-// Protected rounds: round 1, the first round after a maxRisk rise, a round with confirmFixed items, a resolution-only round, a whole-PR round that is owed.
+// Protected rounds: round 1, the first round after a maxRisk rise, a round with confirmFixed items, a resolution-only round, a 'conflict' round (the PR's own changes
+// after a conflicting merge with the base branch: it carries conflict resolutions nobody has read yet), a whole-PR round that is owed.
 // A SMALL fix-check (R5-4): the reviewed range is at most review.effort.small_fix_lines changed lines, adds no new file and touches no sensitive path
 // (risk.high_risk_paths, review.arbiter_always_paths). Any other non-protected round stays on Codex however much was spent.
 import { RISK_LEVELS, higherRisk, isSubstituteRound } from './state.mjs';
 
-export const PROTECTED_KINDS = Object.freeze(['round-1', 'post-rise', 'confirm-fixed', 'resolution-only', 'whole-pr']);
+export const PROTECTED_KINDS = Object.freeze(['round-1', 'post-rise', 'confirm-fixed', 'resolution-only', 'conflict-merge', 'whole-pr']);
 
 const isRisk = (v) => RISK_LEVELS.includes(v);
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
@@ -91,12 +92,13 @@ export function wholePrOwed(state) {
 }
 
 // Which protected kinds apply to the next round? `risen`: this round's own assessment is above the PR's maxRisk so far.
-export function protectedKindsFor({ state, round, resolutionOnly = false, confirmCount = 0, risen = false }) {
+export function protectedKindsFor({ state, round, resolutionOnly = false, conflictRound = false, confirmCount = 0, risen = false }) {
   const kinds = [];
   if (round === 1 || (state?.rounds ?? []).length === 0) kinds.push('round-1');
   if (risen || lastRoundRaisedRisk(state)) kinds.push('post-rise');
   if (confirmCount > 0) kinds.push('confirm-fixed');
   if (resolutionOnly) kinds.push('resolution-only');
+  if (conflictRound) kinds.push('conflict-merge');
   if (wholePrOwed(state)) kinds.push('whole-pr');
   return kinds;
 }

@@ -397,9 +397,9 @@ test('round-request nextRound: a main merge with a provable conflict resolution 
   w.repo.commit('own commit after the merge');
   const counted = ask(w);
   assertExit(counted, 0, counted.stderr + counted.stdout);
-  assert.deepEqual([counted.json.nextRound.kind, counted.json.nextRound.sinceReviewed], ['whole-pr', { merges: 1, ownCommits: 1 }]);
+  assert.deepEqual([counted.json.nextRound.kind, counted.json.nextRound.sinceReviewed], ['conflict', { merges: 1, ownCommits: 1 }]);
   assert.match(counted.json.nextRound.resolutionIneligible, /^history-nonmerge/);
-  assert.match(counted.json.summary, /^Prediction: the next round would be a counted whole-PR round; the conflict resolution could not be reviewed alone \(history-nonmerge/m);
+  assert.match(counted.json.summary, /^Prediction: the next round would be a counted round on the PR's own changes since the last reviewed head and its conflict resolutions \(the default branch's commits left out\)[^\n]*\.$/m);
 });
 
 // Failure caught: the alternative promised a free recording after a CONFLICTING merge; the conflict keeps the PR whole-PR and the reverted commits stay in the history, so the round is counted.
@@ -412,7 +412,7 @@ test('round-request nextRound: after a conflicting merge the alternative does no
   mergeConflictingMain(w);
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.deepEqual([r.json.nextRound.previousClean, r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [true, { merges: 1, ownCommits: 1 }, 'whole-pr']);
+  assert.deepEqual([r.json.nextRound.previousClean, r.json.nextRound.sinceReviewed, r.json.nextRound.kind], [true, { merges: 1, ownCommits: 1 }, 'conflict']);
   assert.match(r.json.nextRound.alternative, /that does not make the next round free here: .* a counted round would still follow$/);
   assert.doesNotMatch(r.json.nextRound.alternative, /free base-only recording/);
 });

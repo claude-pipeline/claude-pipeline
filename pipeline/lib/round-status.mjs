@@ -1,7 +1,7 @@
 // The review's status as the owner reads it: how many rounds ran, what they cost, which items are open and how serious, why the review is not clean. One gatherer
 // feeds both the extra-round ask (`triage round-request`) and the park comment (`comment --kind needs-human`), so the two cannot drift. Display only: nothing here decides
 // anything. Untrusted text (titles, categories) goes through asciiLine inside round-ask.mjs.
-import { diffFiles, git, isAncestor, mergeBase, mergeTree, resolutionReviewBase, revParse } from './git.mjs';
+import { conflictReviewBase, diffFiles, git, isAncestor, mergeBase, mergeTree, resolutionReviewBase, revParse } from './git.mjs';
 import { trustedBase } from './risk.mjs';
 import { diffStats } from './diff.mjs';
 import { costFrom, notCleanReasons, openItems, roundsFrom, statusLines } from './round-ask.mjs';
@@ -120,6 +120,7 @@ export function predictNextRound({ root, config, state, head }) {
   const { review, resolutionIneligible } = classifyReview({
     state, wholePr: owed, base, forkPoint, trusted: true,
     tryResolution: () => resolutionReviewBase({ from: base, forkPoint, head: headFull, baseRef }, o),
+    tryConflict: () => conflictReviewBase({ from: base, forkPoint, head: headFull, baseRef }, o),
   }, o);
   const baseOnly = review.kind === 'synthetic' && git(['diff', '--name-only', `${review.base}..${headFull}`], o) === '';
   const kind = baseOnly ? 'base-only' : review.kind;
@@ -163,6 +164,7 @@ export function predictNextRound({ root, config, state, head }) {
     resolution: `resolution-only: a real review of the conflict resolution, not counted, no owner grant${unlessCounted}`,
     previous: 'a counted round on the commits since the last reviewed head',
     synthetic: 'a counted round on the changes since the last reviewed head (the new default branch merged into it)',
+    conflict: "a counted round on the PR's own changes since the last reviewed head and its conflict resolutions (the default branch's commits left out)",
     'merge-base': 'a counted whole-PR round',
     'whole-pr': 'a counted whole-PR round',
   }[kind] ?? `a ${kind} round`;
