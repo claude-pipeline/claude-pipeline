@@ -476,6 +476,12 @@ const commandText = (w) => (w.startsWith('--') && w.includes('=') ? w.slice(w.in
 // the pipeline's own CLI takes prose in --built / --summary / --reason / --owner-quote / --line / --body (copied verbatim, F4); sed's script text is a residual (F7)
 const PIPELINE_BINS = new Set(['pipeline.mjs', 'pipeline']);
 const isPipelineBin = (argv) => argv.slice(0, 8).some((a) => PIPELINE_BINS.has(commandName(a)));
+// the word that IS the program of an inline interpreter (`node -e|--eval|-p|--print CODE`, `--eval=CODE`, `python|python3|pythonX.Y -c CODE`): JavaScript / Python source, not a shell line, so it is not reparsed (owner 2026-11-20; a shell's `-c` stays read). Its residual is in docs/cli.md
+const isInlineProgram = (words, i) => {
+  const n = commandName(words[0]);
+  if (n === 'node') return ['-e', '--eval', '-p', '--print'].includes(words[i - 1]) || /^--(?:eval|print)=/.test(words[i]);
+  return /^python(?:\d+(?:\.\d+)?)?$/.test(n) && words[i - 1] === '-c';
+};
 const NESTED_UNREAD = 'a quoted command string the guard could not read whole';
 const MAX_REPARSE_DEPTH = 2;
 
@@ -493,7 +499,8 @@ function reparsedRefusal(text, state, reparse, depth) {
     } else why = variableHeadRefusal(words, state);
     if (why) return why;
     if (isDataWords(words) || commandName(words[0]) === 'sed') continue;
-    for (const w of words) {
+    for (const [i, w] of words.entries()) {
+      if (isInlineProgram(words, i)) continue;
       // (a word that is the whole text just read -- the parser lists a `$(…)` word as its own command -- reads the same again: its commands are already judged)
       if (!SB_TOKEN_HEAD.test(w) || commandText(w) === text) continue;
       if (depth >= MAX_REPARSE_DEPTH) return NESTED_UNREAD;
@@ -544,8 +551,9 @@ export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv, rep
     }
     // B10: a quoted word that holds a command line is read again (a data command, sed and the pipeline's own CLI take prose)
     if (data || commandName(c.argv[0]) === 'sed' || isPipelineBin(c.argv)) continue;
-    for (const w of wordsOf(c)) {
-      if (!SB_TOKEN_HEAD.test(w)) continue;
+    const own = wordsOf(c);
+    for (const [i, w] of own.entries()) {
+      if (!SB_TOKEN_HEAD.test(w) || isInlineProgram(own, i)) continue;
       const why = reparse ? reparsedRefusal(commandText(w), state, reparse, 1) : NESTED_UNREAD;
       if (why) return refuse(why);
     }

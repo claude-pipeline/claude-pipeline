@@ -202,6 +202,11 @@ const ALLOWED = [
   "eval \"$(supabase status -o env | grep -E '^(API_URL|SERVICE_ROLE_KEY)=')\"",
   '$NPM test',
   "Q=sqlite3; $Q db '.shell x'",
+  // B10 (owner 2026-11-20): the program text of node -e / python -c is code, not a shell line; an agent editing a note with a program that mentions a supabase command would be refused
+  "node -e 'const fs=require(\"fs\"); let t=fs.readFileSync(\"n.md\",\"utf8\"); t=t.replace(\"x\", \"owner runs supabase db push after merge\"); fs.writeFileSync(\"n.md\", t)'",
+  'node --eval="console.log(\'run supabase db reset; then supabase start\')"',
+  "node -p 'JSON.stringify({ step: \"supabase test db\" })'",
+  'python3 -c "print(\'owner step: supabase db push --linked\')"',
   // B3: git is data only for a known subcommand
   'git status supabase db',
   'git -C supabase log --oneline',
@@ -421,6 +426,10 @@ const DENIED = [
   'claude -p "Check migrations; supabase db push is forbidden"',
   "claude -p 'Owner step: run `supabase db push --linked` after merge'",
   "claude -p 'run (supabase db push) later'",
+  // B10: a shell's -c is a real call and stays read (only node / python program text is skipped)
+  "sh -c 'cd x && supabase db push'",
+  'zsh -c "supabase db push --linked"',
+  'bash -c "supabase db push"',
   // B8: a glob in the head slot can be any subcommand
   'npx dotenv -- supabase d? push',
   "npx prettier --check supabase '*'",
