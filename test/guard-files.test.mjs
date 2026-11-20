@@ -2325,6 +2325,12 @@ test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a wri
     `path=$(${P})`,
     `OUT=$(${P})`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
+  // Every zsh special lower-case parameter, and the families by name (`*_functions` hook arrays, zsh*, zle*, dis_*), is a name the shell reads: assigning one a substitution is no plain variable.
+  // Failure caught: `precmd_functions=$(...)` allowed, then the planted function name runs before the next prompt.
+  for (const name of ['precmd_functions', 'chpwd_functions', 'zshexit_functions', 'reply', 'match', 'mbegin', 'psvar', 'watch', 'pipestatus', 'status', 'argv', 'dirstack', 'funcstack', 'userdirs', 'nameddirs', 'terminfo', 'region_highlight', 'prompt', 'cdpath', 'zsh_eval_context', 'zle_highlight', 'dis_aliases', 'dis_builtins', 'langinfo', 'epochtime', 'usernames', 'mapfile', 'compstate', 'history', 'options', 'commands', 'functions']) {
+    assert.equal(bash(`${name}=$(${P})`), 'deny', name);
+  }
+  assert.equal(bash(`result=$(${P})`), 'allow'); // (a plain name that only starts like one of them is still a plain variable)
 });
 
 // cp #691 (refused: a 250 KB DRMed proof script run from a checkout that has a .review folder, "where it is could not be worked out in the time allowed"): the alias scan read a program only up to 200 KB and refused the

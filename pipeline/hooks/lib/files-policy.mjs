@@ -6120,7 +6120,8 @@ function evaluateBashForFilesFrame(command, opts) {
     && inlineNodeReadOnly(c.argv[2]);
   // Item 7b (guard false refusals): `out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait …)`: an assignment that gives plain lower-case names (no shell variable the shell reads: PATH, IFS, the zsh `path` family ...) nothing but ONE whole
   // command substitution is judged as the command inside it, which is a command of the line like any other (judged above and below: `out=$(rm …)` is still refused as rm). A value with any other text, a redirect, and every other name keep the rule above.
-  const TIED_NAMES = /^(?:path|cdpath|fpath|manpath|mailpath|module_path|watch|fignore|histchars|psvar|argv|status|pipestatus|prompt|signals|options|commands|aliases|functions|parameters|keymaps|widgets)$/;
+  // (zsh's documented special lower-case parameters, and the families by name: the `*_functions` hook arrays, `zsh*`, `zle*` and `dis_*`)
+  const TIED_NAMES = /^(?:reply|match|mbegin|mend|psvar|signals|watch|fignore|mailpath|histchars|pipestatus|status|argv|dirstack|funcstack|funcfiletrace|funcsourcetrace|functrace|userdirs|nameddirs|widgets|keymaps|historywords|jobdirs|jobstates|jobtexts|modules|parameters|options|commands|aliases|galiases|saliases|builtins|reswords|functions|terminfo|termcap|errnos|sysparams|patchars|region_highlight|prompt|path|fpath|cdpath|manpath|module_path|langinfo|epochtime|usernames|mapfile|compstate|history|.*_functions|zsh.*|zle.*|dis_.*)$/;
   const wholeSubstitution = (v) => {
     const s = String(v).replace(/^"([^"]*)"$/, '$1');
     if (!s.startsWith('$(') || s.startsWith('$((') || !s.endsWith(')') || /`/.test(s)) return false;
