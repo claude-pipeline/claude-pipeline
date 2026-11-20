@@ -2267,6 +2267,36 @@ test('R1-B1: readFileSync with an options object (inline, held in a variable or 
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// R1-B2 (#737): a function taken from the fs module and not called (passed to reduce / map, held in a variable, destructured, put in an object) is called later by something the call scan does not see. Failure caught:
+// `['w'].reduce(require('fs').openSync, '.review/state.json')` is allowed and truncates the protected file. The fs module may only be used as a direct call to readFileSync / existsSync / readdirSync, or held in a
+// `const NAME = require('fs')` whose every later use is one of those calls (the same goes for the `fs` global that node -e predefines, and for the globals that reach it by name).
+test('R1-B2: an uncalled fs function (callback, alias, destructuring, object member) is refused; direct readFileSync / existsSync / readdirSync calls stay allowed', () => {
+  for (const cmd of [
+    `node -e "['w'].reduce(require('fs').openSync, '.review/state.json')"`,
+    `node -e "['.review/state.json'].map(require('fs').openSync)"`,
+    `node -e "['.review/state.json'].reduce(require('fs').linkSync)"`,
+    `node -e "const fs=require('fs');['.review/state.json'].map(fs.openSync)"`,
+    `node -e "['.review/state.json'].map(fs.openSync)"`,
+    `node -e "['.review/state.json'].reduce(fs.linkSync)"`,
+    `node -e "const readFileSync=require('fs').openSync;readFileSync('.review/state.json','w')"`,
+    `node -e "const {openSync:readFileSync}=require('fs');readFileSync('.review/state.json','w')"`,
+    `node -e "const o={map:require('fs').openSync};o.map('.review/state.json','w')"`,
+    `node -e "const fs=require('fs');const g=fs;['.review/state.json'].map(g.openSync)"`,
+    `node -e "const fs=require('fs'), g=fs.openSync;g('.review/state.json','w')"`,
+    `node -e "let fs=require('fs');fs=fs.openSync;fs('.review/state.json','w')"`,
+    `node -e "['.review/state.json'].map(this['f'+'s'].openSync)"`,
+    `node -e "['.review/state.json'].map(global['f'+'s'].openSync)"`,
+    `node -e "console.log(require('./.review/state.json'));['x'].map(vm.runInThisContext)"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('fs').readFileSync('.review/round-3/accepted.json','utf8'))"`,
+    `node -e "const fs=require('fs');console.log(JSON.parse(fs.readFileSync('/abs/.review/hardstops.json','utf8')))"`,
+    `node -e 'const fs=require("node:fs");console.log(fs.existsSync(".review/state.json"), fs.readdirSync(".review").length)'`,
+    `node -e "console.log(fs.readFileSync('.review/state.json','utf8').length)"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
 // Items 5b/10 (refused: `node -e 'const r=require("./.review/risk.json");console.log((r.items||[]).length)'` and the double-quoted twin on .review/round-18/codex.json): the arithmetic gate (#266 R7-F3) must not read
 // the parentheses or a `let` of a JavaScript program that is the whole single- or double-quoted word after node -e / -p. Everything else keeps the gate: `$((`, `$[`, a lone `_` (zsh reads it as the last word of the
 // previous command), `((` / let in shell code, a program word with an unquoted part, a `$` or backtick inside a double-quoted program, and a `node -e` that is only text inside another quoted string.

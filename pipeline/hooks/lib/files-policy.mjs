@@ -4022,7 +4022,7 @@ const WRITE_WORDS = String.raw`write|append|unlink|\brm\b|rmSync|rmtree|rmdir|re
 const WRITE_HINT = new RegExp(`${WRITE_WORDS}|open\\s*\\(`, 'i');
 // Item 5: an inline node -e / -p program that can only READ is described by an ALLOWLIST (no write-hint blocklist can name everything node can do): no run-time part, no word that reaches the process or loads code, every call on a short read-only list,
 // `require(` with one literal module. A program that is anything else keeps the rule for any text that names a protected file.
-const INLINE_NODE_WORDS = /[`$]|[)\]]\s*\(|\?\.\s*\(|\b(?:new|import|process|Reflect|globalThis|binding|eval|Function|child_process)\b/;
+const INLINE_NODE_WORDS = /[`$]|[)\]]\s*\(|\?\.\s*\(|\b(?:new|import|process|Reflect|globalThis|global|this|vm|binding|eval|Function|child_process)\b/;
 const INLINE_NODE_BARE = new Set(['require', 'readFileSync', 'existsSync', 'readdirSync', 'String', 'Number', 'Boolean', 'if', 'for', 'while', 'switch', 'catch']);
 const INLINE_NODE_QUALIFIED = new Set(['JSON.parse', 'JSON.stringify', 'console.log', 'console.error', 'Object.keys', 'Object.values', 'Object.entries', 'Array.isArray']);
 const INLINE_NODE_METHODS = new Set(['readFileSync', 'existsSync', 'readdirSync', 'map', 'filter', 'find', 'some', 'every', 'forEach', 'reduce', 'sort', 'flat', 'join', 'split', 'slice', 'includes', 'startsWith', 'endsWith', 'trim', 'match', 'test', 'toFixed', 'padStart', 'padEnd']);
@@ -4057,6 +4057,26 @@ function inlineNodeReadOnly(prog) {
   for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'([^'\\]*)'|"([^"\\]*)")\s*\)/g)) {
     const mod = r[1] ?? r[2];
     if (!(['fs', 'node:fs', 'path', 'node:path'].includes(mod) || mod.endsWith('.json'))) return false;
+  }
+  // R1-B2 (#737): the fs module is used only as a direct call to readFileSync / existsSync / readdirSync (`require('fs').readFileSync(`), or held in `const NAME = require('fs')` (nothing else follows it) whose every later use is such a call; the `fs`
+  // node -e predefines is held the same way. A function taken from it and not called (`.map(fs.openSync)`, `const readFileSync = require('fs').openSync`, `const {openSync: x} = require('fs')`, `{m: require('fs').openSync}`) is called later by something the call scan does not see.
+  const fsCall = /^\s*\.\s*(?:readFileSync|existsSync|readdirSync)\s*\(/;
+  const fsOwn = []; // (text ranges that are the require itself or its declaration)
+  const fsNames = new Set(['fs']);
+  for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'(?:node:)?fs'|"(?:node:)?fs")\s*\)/g)) {
+    const end = r.index + r[0].length;
+    fsOwn.push([r.index, end]);
+    if (fsCall.test(prog.slice(end))) continue;
+    const decl = /(?<![\p{L}\p{N}_$.])(?:const|let|var)\s+([\p{L}_][\p{L}\p{N}_]*)\s*=\s*$/u.exec(prog.slice(0, r.index));
+    if (!decl || !/^\s*(?:;|$)/.test(prog.slice(end))) return false;
+    fsNames.add(decl[1]);
+    fsOwn.push([decl.index, r.index]);
+  }
+  for (const name of fsNames) {
+    for (const o of prog.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_$])${name}(?![\\p{L}\\p{N}_$])`, 'gu'))) {
+      if (fsOwn.some(([x, y]) => o.index >= x && o.index < y)) continue;
+      if (!fsCall.test(prog.slice(o.index + name.length))) return false;
+    }
   }
   for (const r of prog.matchAll(/([\p{L}_][\p{L}\p{N}_]*(?:\s*\.\s*[\p{L}_][\p{L}\p{N}_]*)*)\s*\(/gu)) {
     const before = prog.slice(0, r.index).trimEnd();
