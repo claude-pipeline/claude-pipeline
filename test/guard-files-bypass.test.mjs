@@ -281,6 +281,8 @@ table('admin/hook switch built from pieces', [
   `python3 -c "d['disable'+'AllHooks']=True"`,
   'X=PIPELINE_ADMIN; export $X=1',
   'N=PIPELINE_ADMIN; env $N=1 claude',
+  // R3-F1: ANSI-C \UHHHHHHHH decodes to a letter (zsh / bash), so the name is built from pieces
+  "env $'PIPELINE_\\U00000041DMIN=1' claude",
 ], 'deny');
 
 table('variable', [
