@@ -366,6 +366,9 @@ test('splitArgs: operators are ordinary characters and quoted pieces glue to nei
 test('splitArgs: line continuation and ANSI-C quoting', () => {
   assert.deepEqual(splitArgs('a \\\nb'), ['a', 'b']);
   assert.deepEqual(splitArgs("$'a\\tb' c"), ['a\tb', 'c']);
+  // R3-F1: \UHHHHHHHH (1 to 8 hex digits) is a character; a code point past U+10FFFF stays literal text instead of throwing
+  assert.deepEqual(splitArgs("$'\\U00000073 \\U73 \\U1F600'"), ['s s \u{1F600}']);
+  assert.deepEqual(splitArgs("$'\\UFFFFFFFF'"), ['\\UFFFFFFFF']);
 });
 
 // ---- robustness additions ----------------------------------------------------------------------

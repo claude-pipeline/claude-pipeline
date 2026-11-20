@@ -2292,6 +2292,9 @@ test('R1-B2: an uncalled fs function (callback, alias, destructuring, object mem
     `node -e "['.review/state.json'].forEach(f\\u0073.unlinkSync)"`,
     `node -e "['w'].reduce(f\\u{73}.openSync,'.review/state.json')"`,
     `node -e "['.review/state.json'].forEach(f\\u{73}.unl\\u0069nkSync)"`,
+    // R3-F1: the ANSI-C spelling \UHHHHHHHH (zsh and bash decode 1 to 8 hex digits) hides the same names
+    `node -e $'["w"].reduce(f\\U00000073.openSync,".review/state.json")'`,
+    `node -e $'[".review/state.json"].forEach(f\\U73.unl\\U69nkSync)'`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     `node -e "console.log(require('fs').readFileSync('.review/state.json','utf8').split('\\n').length)"`,
