@@ -74,6 +74,32 @@ describe('#410: a cd whose only || alternative leaves the shell surely succeeded
   ]);
 });
 
+// Shell-parser follow-ups C1, T1 / F9 (#447, #485): the narrowing reads the ONE exit rule (shell-parse's plainExit). Why: `cd X || nohup exit 1` (a child), `command exit 1` / `noglob exit 1` / `builtin exit 1` / `- exit 1` /
+// `env exit 1` (a shell may find no such command and go on), and `exit 99999999999999999999` (bash 5.3: "numeric argument required", the shell goes on) leave no shell when the cd failed, so the find ran in /home/u. The control
+// (the bare exit narrows, the bare `;` does not) shows the fixture reads the exit form; the function / trap / coproc / time rows already deny on main (no teeth, kept as rows).
+describe('F9 / F2: only a current-shell exit makes the code after `cd X || exit` follow a successful cd (files guard)', () => {
+  decide('allow', [
+    ['control: cd X || exit 1 narrows', `${P} || exit 1; find . -delete`],
+    ['exit 255 (the biggest 3-digit status) still narrows', `${P} || exit 255; find . -delete`],
+    ['the failure group with a plain exit still narrows', `${P} || { echo no; exit 1; }; find . -delete`],
+  ]);
+  decide('deny', [
+    ['control: cd X; write is read against home', `${P}; find . -delete`],
+    ...['nohup', 'command', 'noglob', 'builtin', '-', 'env'].map((w) => [`cd X || ${w} exit 1 (allowed on main)`, `${P} || ${w} exit 1; find . -delete`]),
+    ...['nohup', 'command'].map((w) => [`cd X || { echo no; ${w} exit 1; } (allowed on main)`, `${P} || { echo no; ${w} exit 1; }; find . -delete`]),
+    ['cd X || exit 99999999999999999999 (allowed on main)', `${P} || exit 99999999999999999999; find . -delete`],
+    ['cd X || exit 9223372036854775808 (allowed on main)', `${P} || exit 9223372036854775808; find . -delete`],
+    ['cd X || { echo no; exit 99999999999999999999; } (allowed on main)', `${P} || { echo no; exit 99999999999999999999; }; find . -delete`],
+    // (no teeth: denied on main already)
+    ['cd X || coproc exit 1', `${P} || coproc exit 1; find . -delete`],
+    ['cd X || coproc { exit 1; }', `${P} || coproc { exit 1; }; find . -delete`],
+    ['cd X || time exit 1', `${P} || time exit 1; find . -delete`],
+    ['cd X || function g { exit 1; }', `${P} || function g { exit 1; }; find . -delete`],
+    ['cd X || g() { exit 1; }', `${P} || g() { exit 1; }; find . -delete`],
+    ['cd X || trap \'exit 1\' EXIT', `${P} || trap 'exit 1' EXIT; find . -delete`],
+  ]);
+});
+
 describe('#411: a brace group entered by & runs in this shell (only the command before the & is the job)', () => {
   decide('allow', [
     ['the group cd carries out of the group', 'a & { true; cd /tmp; } && find . -delete'],

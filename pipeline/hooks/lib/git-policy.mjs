@@ -25,7 +25,6 @@ import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLine
 
 // (an exit written bare: no wrapper in front of it (shell-parse's `wrapped`; `spawn` for a find -exec / launcher). Only that one is proof the shell left: `command exit 1` (zsh), `noglob exit 1` (bash) and `/usr/bin/time exit 1` are
 // not found or run a child, and the line goes on. Used where a `|| exit` is trusted to prove a redirected or loop-body move happened)
-const bareExit = (c) => c?.wrapped !== true && c?.spawn !== true;
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
 const GUARD_LABELS = ['needs-human', 'pipeline-blocked', 'awaiting-review', 'pipeline-pause', 'pipeline-rollback'];
@@ -2073,8 +2072,8 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
   let own = Infinity;
   for (let j = loop.start; j < loop.end; j++) own = Math.min(own, cmds[j].grp?.length ?? 0);
   const { up: ownUp, depth: ownLoops } = loopOwnLevel(cmds, loop);
-  // (a command in a subshell of the body, in a text a new process runs, or one a wrapper started does not move this shell, nor continue its loop: one in a text the loop is itself in does, R10-B1)
-  const elsewhere = (x) => (x.grp?.length ?? 0) > own || x.spawn || x.up?.some((u) => u.proc && !ownUp.includes(u));
+  // (a command in a subshell of the body, in a text a new process runs, in a `coproc { }` group (a background child) or one a wrapper started does not move this shell, nor continue its loop: one in a text the loop is itself in does, R10-B1)
+  const elsewhere = (x) => (x.grp?.length ?? 0) > own || x.spawn || x.up?.some((u) => (u.proc || u.co === true) && !ownUp.includes(u));
   // (a level between the loop and the command is surely entered when the command is: a { } group with no redirection that can fail on its closer (listed as a command of no words in the group, after its
   // last one), an eval text whose eval has none; an if / case branch, a loop or function body is not (the command's ctl / loops say so))
   const entered = (u, k) => {
@@ -3332,16 +3331,17 @@ function evalString(str, startDir, ctx, level, child = false) {
       const op = own.sep === '|' ? ((deeper ? own.lead : own.pipeLead) ?? ';') : own.sep; // (a level's entry holds it as `lead`, a command as `pipeLead`: see emit)
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
-      if (op === '||' && plainExit(c) && !((x.redir || x.loopOnly) && !bareExit(c)) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
+      if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
         if (!deeper) return exits(x);
         // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
         // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
-        // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above). A redirected / loop-body move is not proven by an exit in a `coproc { }` level: it runs in a background subshell (`co`))
+        // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above). No move is proven by an exit in a `coproc { }` level BELOW the move's own level: it runs in a background subshell (`co`, like `sub`);
+        // an exit in the same group as the cd (`coproc { cd X || exit 1; P; }`) is that child's own and proves it for the commands of that child)
         const between = c.up.slice(x.up.length);
         let k = i + 1;
         while (cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].up?.length ?? 0) > x.up.length) { if ((cmds[k].redirects ?? []).length > 0) break; k++; }
         const closerRedir = cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].redirects ?? []).length > 0;
-        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.sep === '||' && !((x.redir || x.loopOnly) && e.co === true)) && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
+        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.co !== true && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
       if (op === '||' || x.cond) forget(x);
       return false;
@@ -3399,9 +3399,10 @@ function evalString(str, startDir, ctx, level, child = false) {
     while (levels.length > k) {
       const l = levels.pop();
       const outer = levels[levels.length - 1];
-      if (l.e.kind === 'sub' || l.e.proc) {
+      if (l.e.kind === 'sub' || l.e.co === true || l.e.proc) {
         // (a directory a text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'. A subshell's own snapshot is the directory the line goes on in, whatever a text inside it did: R10-F5)
-        if (l.e.kind === 'sub' || (dir !== null && !hazard)) dir = l.dir;
+        // (`coproc { … }` is a subshell too: it runs in a background child, so the parent goes on where it was, and a branch it switched may not have been yet: unknown)
+        if (l.e.kind === 'sub' || l.e.co === true || (dir !== null && !hazard)) dir = l.dir;
         if (l.state) { forgetNames(l.mover); aliasesUnsure(l.al); } // (#352 R11-B1: an alias it (re)defined is unsure too: the level may not have run, as for a change that is not certain)
       }
       else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
@@ -3634,7 +3635,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
       // (an exit behind a wrapper (`env exit 1`, `command exit 1`, `/usr/bin/time exit 1`) may leave no shell: it proves nothing about the redirected move)
-      const redirOnly = how === 'redir' && c.sep !== '&&' && bareExit(cmds[exitOfGroup(i)]);
+      const redirOnly = how === 'redir' && c.sep !== '&&';
       if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly), from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);

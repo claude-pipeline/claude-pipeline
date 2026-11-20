@@ -237,8 +237,10 @@ const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string'
 const envLong = (name) => (ENV_LONG.includes(name) ? name : (ENV_LONG.filter((o) => o.startsWith(name)).length === 1 ? ENV_LONG.find((o) => o.startsWith(name)) : null));
 // Does this command surely LEAVE the shell when it runs (so what follows a `cd DIR || <it>` ran after a cd that worked)? Only a plain `exit`, alone or with ONE literal number (#425 R1, #427): `return` at top level is an error
 // and the shell goes on; a redirection on the exit may fail before it runs (the caller reads a redirection on a group's closer); `exit 1 2` is refused ("too many arguments") and a run-time word may split into two.
-// One rule for the files guard (cd narrowing) and the git guard (orExits).
-export const plainExit = (c) => c.argv[0] === 'exit' && (c.redirects ?? []).length === 0 && (c.argv.length === 1 || (c.argv.length === 2 && /^\d+$/.test(c.argv[1])));
+// F2: the number is at most 3 digits (bash 5.3: `exit 99999999999999999999` is "numeric argument required" and the shell goes on). A wrapper (`command exit 1`: zsh may find no such command; `nohup`, `env`,
+// `coproc exit 1`: a child; `time`, `builtin`, `noglob`) may leave no shell either: `wrapped` / `spawn` are no current-shell exit. A `coproc { exit 1; }` group is judged by its level (git-policy settle: `co`).
+// One rule for the files guard (cd narrowing) and the git guard (settle, orExits, the group proof exitFollows, the snapshot restore).
+export const plainExit = (c) => c.argv[0] === 'exit' && c.wrapped !== true && c.spawn !== true && (c.redirects ?? []).length === 0 && (c.argv.length === 1 || (c.argv.length === 2 && /^\d{1,3}$/.test(c.argv[1])));
 // The shape events of a command list (see simpleCommands), by `at`: Map at -> [event].
 export function shapeAt(shape) {
   const evAt = new Map();
@@ -3587,8 +3589,8 @@ class Parser {
       }
     }
     const cmd = this.process(argv, env, seg, false);
-    // (a leading `coproc` was stripped above: its command runs in a background subshell, so it is wrapped for git-policy's bareExit just as `command` / `noglob` are)
-    if (cmd && words.slice(0, i).some((w) => w.text === 'coproc' && w.qa < 0)) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
+    // (a leading `coproc` was stripped above: its command runs in a background child process, like env / nohup: it is `spawn`ed (its cd moves that child, nothing it does is certain) and wrapped (no plainExit))
+    if (cmd && words.slice(0, i).some((w) => w.text === 'coproc' && w.qa < 0)) { Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false }); Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false }); }
     return cmd;
   }
 
@@ -3607,7 +3609,7 @@ class Parser {
     let fan = null; // the xargs / parallel that built this command from stdin text
     const runnerDirs = [];
     let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
-    let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see git-policy's bareExit)
+    let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see plainExit. A leading `coproc` is also `spawn`, below)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
