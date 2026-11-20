@@ -10,4 +10,4 @@ Old 2.2 and 2.3.
    and the pending ids. Then `P triage validate --round R --from-tag "pipeline-judge R<R> <d8>"` (exit 2 `not-found`: wait, retry once; exit 1: reinvoke once
    with the `errors`; `not-found` / invalid twice ⇒ park, cause `judge:not-found` / `judge:invalid`). A disputed bug with a settle test: implementer writes and commits the test only, then
    `P triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd "<cmd>" --test-file <file>` (the CLI runs it itself). `bug-confirmed` makes the item
-   ACCEPT: fixed and marked implemented in step 5, like any accepted item.
+   ACCEPT: fixed and marked implemented in step 5, like any accepted item. Exit 1 `settle-head-moved` (production code differs from round R's reviewed head, or is uncommitted): run its `next` (the arbiter rules on the recorded diff) instead.

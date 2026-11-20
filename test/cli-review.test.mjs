@@ -1069,7 +1069,7 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
     '## R1-S1', '## R1-S2', 'SUGGESTION', 'maintainability', 'Rename helper', 'src/b.js:3',
     'Codex detail:', 'x is dereferenced before it is checked', 'Codex reasoning:', 'compute(x.y) throws',
     'REJECT (confidence high) - judge: REJECT R1-S1', 'REJECT (confidence low)', 'Test result: none',
-    'Code at HEAD, src/b.js lines 1-8:', 'export const w3 = 3;',
+    `Code at the reviewed head ${w.head.slice(0, 12)}, src/b.js lines 1-8:`, 'export const w3 = 3;',
   ]) assert.ok(text.includes(needle), `missing ${needle}`);
   assert.ok(!text.includes('## R1-B1') && !text.includes('## R1-W1'), 'only items that need the arbiter are in the input');
 
@@ -1078,7 +1078,22 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.digest, r.json.digest, 'deterministic for unchanged state');
 });
 
-test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, and cannot break out of its fence', (t) => {
+test('arbiter needed on a dispute round whose recorded toHead this clone lacks: an error, no input written (never "the file does not exist at the reviewed head")', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
+  const st = w.state();
+  st.rounds[0].toHead = 'f'.repeat(40);
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(st));
+  const before = w.stateText();
+  const r = w.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(r, 2, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'head-unavailable');
+  assert.ok(!existsSync(w.roundFile(1, 'arbiter-input.md')), 'no input without evidence');
+  assert.equal(w.stateText(), before);
+});
+
+test('arbiter needed: the excerpt is +/-20 lines of the file at the reviewed head, numbered, and cannot break out of its fence', (t) => {
   const w = world(t);
   w.repo.write('src/f.js', Array.from({ length: 60 }, (_, i) => (i === 29 ? '// ``` closes a naive fence' : `const f${i + 1} = ${i + 1};`)).join('\n') + '\n');
   const head2 = w.repo.commit('add f');
@@ -1086,7 +1101,7 @@ test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, 
   assertExit(w.judge(1, { 'R1-B1': ['REJECT'] }), 0);
   const r = w.cli(['arbiter', 'needed', '--round', '1']);
   const text = readFileSync(r.json.inputPath, 'utf8');
-  assert.match(text, /Code at HEAD, src\/f\.js lines 10-50:/);
+  assert.match(text, /Code at the reviewed head [0-9a-f]{12}, src\/f\.js lines 10-50:/);
   assert.match(text, /^10 \| const f10 = 10;$/m);
   assert.match(text, /^50 \| const f50 = 50;$/m);
   assert.doesNotMatch(text, /const f9 = 9;/);
@@ -2384,7 +2399,7 @@ test('codex-review: a finding path that tries to leave the repository reads noth
   assertExit(needed, 0);
   const input = readFileSync(needed.json.inputPath, 'utf8');
   assert.ok(!input.includes('root:') && !input.includes('/bin/'), 'no file outside the repository is quoted');
-  assert.equal((input.match(/does not exist at HEAD/g) ?? []).length >= 2, true);
+  assert.equal((input.match(/does not exist at the reviewed head/g) ?? []).length >= 2, true);
 });
 
 // -- the ruled cache
@@ -2965,6 +2980,44 @@ test('triage settle: the CLI runs the test; the command, file, exit code and hea
   assert.equal(rec.head, w.repo.git(['rev-parse', 'HEAD']).trim());
   assert.match(rec.evidence, /compute\(undefined\) is 0/);
   assert.equal(w.item('R1-B1').final.needsHuman, false, 'a non-security dismissal by test is final');
+});
+
+test('triage settle: production code changed after the round\'s reviewed head refuses before the test runs (settle-head-moved), nothing recorded', (t) => {
+  const w = disputedWorld(t);
+  w.repo.write('src/b.js', `${bFile}export const later = 1;\n`); // a later fix: it could make the settle test pass and give round 1's finding a REJECT
+  w.repo.commit('fix after the reviewed head');
+  const snapshot = w.stateText();
+  const r = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.match(r.json.next, /^arbiter needed --pr 7 --round 1/);
+  assert.equal(w.stateText(), snapshot, 'nothing recorded, nothing run');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
+test('triage settle: a HEAD that is not a descendant of the reviewed head and lacks its production change refuses (settle-head-moved), though only a test differs from the merge base', (t) => {
+  const w = disputedWorld(t);
+  w.repo.git(['reset', '-q', '--hard', w.base]); // HEAD forks from round 1's reviewed head: the reviewed fix (src/a.js, src/big.js) is not in it
+  const args = settleArgs(w, 'R1-B1', 'bug-disproved'); // the only change from the merge base is the proving test
+  const snapshot = w.stateText();
+  const r = w.cli(args);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.equal(w.stateText(), snapshot, 'nothing recorded');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
+test('triage settle: an uncommitted change to a tracked production file refuses (settle-head-moved): the run would read code the reviewed head does not have', (t) => {
+  const w = disputedWorld(t);
+  const args = settleArgs(w, 'R1-B1', 'bug-disproved'); // the proving test is committed
+  w.repo.write('src/b.js', `${bFile}export const wip = 1;\n`); // a fix in the file the test imports, not committed
+  const snapshot = w.stateText();
+  const r = w.cli(args);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.match(r.json.reason, /src\/b\.js/);
+  assert.equal(w.stateText(), snapshot, 'nothing recorded');
+  assert.equal(w.item('R1-B1').test, undefined);
 });
 
 test('triage settle: a passing test cannot confirm a bug, a failing test cannot disprove one (state untouched)', (t) => {
