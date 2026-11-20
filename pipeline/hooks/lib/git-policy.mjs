@@ -3271,6 +3271,9 @@ function evalString(str, startDir, ctx, level, child = false) {
   // For command c: the operator before the item of a tracker's list that holds it (c itself, or the group / text / subshell that holds c): && keeps the change certain, ; and everything else ends a conditional one,
   // || any (`cd d || exit 1`: nothing after it runs when the change failed).
   const settle = (c, i) => {
+    // (#530 / #545: after a plain `|| exit` a redirected move (x.redir) is proven to have happened: it goes on as a certain one. The tracker is replaced by a copy, never changed in place: snap() and the loop frames share them)
+    const proven = new Map();
+    const exits = (x) => { if (x.redir) proven.set(x, { ...x, cond: x.and, redir: false }); return true; };
     trackers = trackers.filter((x) => {
       if (!x.up.every((e, k) => c.up[k] === e)) return false; // (its level has ended: the rule of that level took over)
       const deeper = c.up.length > x.up.length;
@@ -3280,7 +3283,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
       if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
-        if (!deeper) return true;
+        if (!deeper) return exits(x);
         // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
         // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
         // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above))
@@ -3288,11 +3291,12 @@ function evalString(str, startDir, ctx, level, child = false) {
         let k = i + 1;
         while (cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].up?.length ?? 0) > x.up.length) { if ((cmds[k].redirects ?? []).length > 0) break; k++; }
         const closerRedir = cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].redirects ?? []).length > 0;
-        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return true;
+        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
       if (op === '||' || x.cond) forget(x);
       return false;
     });
+    if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
   };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
@@ -3575,10 +3579,12 @@ function evalString(str, startDir, ctx, level, child = false) {
     const changedState = argv.length > 0 && stateChanged(ctx, before);
     if (argv.length > 0 && (changesStateWords || changedState)) {
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir', redir: how === 'redir', and: c.sep === '&&', scoped: how === 'chain', lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
-      if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond, from: i, byDir: DIR_CHANGERS.includes(name) };
+      // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
+      const redirOnly = how === 'redir' && c.sep !== '&&';
+      if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly), from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);
         const top = levels?.[levels.length - 1];
@@ -3613,7 +3619,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   // decides what the last `git -C /abs switch b` left))
   if (levels) closeLevels(0);
   if (hazard) forgetState(false);
-  for (const x of trackers) if (x.and || x.scoped) forget(x);
+  for (const x of trackers) if (x.and || x.scoped || x.redir) forget(x); // (#545: a redirected move nothing proved at the end of the text may not have happened)
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it
@@ -3632,8 +3638,11 @@ function evalString(str, startDir, ctx, level, child = false) {
 // && (R36 kept it as 'chain' for the command chained to it, but nothing settled it when the text ended, so a script ending in `git switch b > /missing/f` handed b to its caller, which pushed the branch the failed switch left))
 function certainChange(cmds, c, trusted, moves = true) {
   if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
-  if (moves && !redirectsFirm(c.redirects)) return null;
-  return Object.values(c.ctl).some(Boolean) ? 'chain' : 'certain';
+  const inBody = Object.values(c.ctl).some(Boolean);
+  // (#530 / #545: a failed redirection stops the command and gives status 1, so what follows it with && (or after `|| exit`, a plain exit) runs only when the move happened: 'redir', a tracker that is conditional
+  // and is not settled by a `;`. Redirected in a body keeps today's reading: unknown at once)
+  if (moves && !redirectsFirm(c.redirects)) return inBody ? null : 'redir';
+  return inBody ? 'chain' : 'certain';
 }
 
 // Why (#84): text too long to parse inside the time budget is refused whatever it says. Judging it by the guarded words it

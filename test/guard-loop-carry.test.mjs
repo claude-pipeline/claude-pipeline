@@ -270,24 +270,56 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['straight line: switch with 2>/dev/null (R35 allow flipped)', `cd /work/other; git switch agent/x 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with >&2 (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
-    // (|| exit: sound to allow, since a failed redirection makes the cd fail and the exit runs, but the narrowing only knows a command with no redirection: refused, no new machinery)
-    ['straight line: cd back with 2>/dev/null || exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null, then another command, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && true; ${PB} origin HEAD`],
   ]) {
     denies(what, line, {}, DIRS);
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
   }
-  // (#352 R37-F1: no exception for &&: a redirected change is unknown at once, so a script ending in a redirected switch cannot hand it to its caller. R36 allowed these rows through a 'chain' tracker nothing settled at the end of a text)
+  // (#530 / #545, was refused by R37-F1 (a script ending in a redirected switch must not hand it to its caller, still held: the end of the text forgets it, see the eval pair below): a failed redirection stops
+  // the command and gives status 1, so a command chained with && runs only when the move happened, and one after `|| exit` (a plain exit) the same. The R36 / R37 rows with && and with || exit flip to allow)
   for (const [what, line] of [
-    ['cd back with 2>/dev/null && push (R36 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
-    ['cd back with >&2 && push (R36 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
-    ['cd back with &>/dev/null && push (R36 allow flipped)', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null && push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
+    ['cd back with >&2 && push', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
+    ['cd back with &>/dev/null && push', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
     ['failing redirection on the cd back, then && push', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
     ['failing redirection on the checkout, then && push', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { exit 1; }; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { echo; exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; exit 1; }; ${PB} origin HEAD`],
+    ['quiet pushd && push', `pushd ${GIT_ROOT} >/dev/null && ${PB} origin HEAD`],
+    ['quiet pushd || exit 1, then ;', `pushd ${GIT_ROOT} >/dev/null || exit 1; ${PB} origin HEAD`],
+    ['quiet pushd && push && popd', `pushd ${GIT_ROOT} >/dev/null && ${PB} origin HEAD && popd >/dev/null`],
+    ['a redirected { } group && push', `{ cd ${GIT_ROOT} >/dev/null 2>&1; } && ${PB} origin HEAD`],
+    ['a redirected switch && push', `git switch agent/x 2>/dev/null && ${PB} origin HEAD`],
+  ]) {
+    const startOther = what.startsWith('cd back') ? line : `cd /work/other; ${line}`; // (the cd-back rows start in /work/other themselves)
+    allows(what, startOther);
+    allows(`${what}, in a script`, RUN_SH, script('echo', startOther));
+  }
+  // (still refused: a redirected move nothing proves ran: joined by ;, behind || that does not leave, or settled by another command first)
+  for (const [what, line] of [
+    ['cd back with 2>/dev/null, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || echo, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || echo bad; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || true, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || true; ${PB} origin HEAD`],
+    ['quiet pushd, then ;', `cd /work/other; pushd ${GIT_ROOT} >/dev/null; ${PB} origin HEAD; popd >/dev/null`],
   ]) {
     denies(what, line, {}, DIRS);
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
   }
+});
+// (#545: the end of a text settles a redirected move nothing proved: an eval'd file (inline, so no child-process rule) ending in `git switch agent/x 2>/dev/null && true` hands nothing on, and a push after it from main is refused.
+// A child script of the same text is refused anyway, so it is no evidence; the file-fed eval is. #530 / F1: the same file with an `|| exit 1` before the `&& true` is proven by the exit and handed on.)
+test('#545: an eval\'d file ending in a redirected switch that nothing proved hands no branch on; one proven by || exit does', () => {
+  const at = (cmd, files) => evaluateGitCommand(cmd, {
+    cwd: '/work/other', home: '/home/u', currentBranch: () => MAIN, pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', { '/work/other/p.sh': `${PB} origin HEAD\n`, ...files }),
+  });
+  const line = 'eval "$(cat ./s.sh)"; bash ./p.sh';
+  const ends = at(line, { '/work/other/s.sh': 'git switch agent/x 2>/dev/null && true\n' });
+  assert.equal(ends.decision, 'deny', 'redirected switch ending the text: allowed');
+  assert.match(ends.reason, BRANCH, ends.reason);
+  assert.equal(at(line, { '/work/other/s.sh': 'git switch agent/x\n' }).decision, 'allow', 'twin: a plain switch');
+  assert.equal(at(line, { '/work/other/s.sh': 'git switch agent/x 2>/dev/null || exit 1 && true\n' }).decision, 'allow', 'F1: proven by || exit 1');
+  assert.equal(at(line, { '/work/other/s.sh': 'git switch agent/x || exit 1 && true\n' }).decision, 'allow', 'F1 twin: no redirection');
 });
 // (#352 R37-F1: the caller trusts the branch a definite script ends on, so a script whose LAST command is a switch that may not have run (a redirection that can fail, a && after a failing command) must not hand it over:
 // cwd a repository on main, reset.sh = `git switch agent/x > /missing/f`, the line `bash ./reset.sh; <push>` sends main when the redirection fails)
