@@ -55,6 +55,7 @@ test('publish: order and success shape: one comment (with the issue link), one i
   assert.deepEqual(r.json.held, []);
   assert.ok(Array.isArray(r.json.warnings));
   assert.deepEqual(r.json.outcome, w.cli(['state', 'outcome']).json, 'state outcome JSON verbatim');
+  assert.deepEqual(r.json.capDeferral, { applied: false, ids: [], refusals: ['round 1 is not the last allowed counted round (1 of 3)'], rounds: [] }, 'round 1 of 3: cap-defer refuses at once, before any git or GitHub read');
   assert.equal(w.fake.comments().length, 1, 'comment upserts: one triage comment');
   assert.equal(w.item('R1-S2').followupIssue, w.issueUrl(31), 'the issue link is in the state the second comment pass publishes');
   assert.equal(issuePosts(w), 1);
@@ -62,6 +63,7 @@ test('publish: order and success shape: one comment (with the issue link), one i
 
 test('publish: the exact child flags; state show carries no --pr; publish first, outcome last', () => {
   assert.deepEqual(publishSteps(7, 2).map(([id, args]) => [id, args.join(' ')]), [
+    ['cap-defer', 'triage cap-defer --pr 7 --round 2'],
     ['comment', 'comment --pr 7 --kind triage'],
     ['followups', 'followups create --round 2'],
     ['comment-links', 'comment --pr 7 --kind triage'],
@@ -76,20 +78,20 @@ test('publish: a failing step stops the bundle with that step\'s full JSON, its 
   w.fake.setFail({ write: true });
   const one = pub(w);
   assert.notEqual(one.code, 0);
-  assert.deepEqual([one.json.ok, one.json.step, one.json.ran], [false, 'comment', []]);
+  assert.deepEqual([one.json.ok, one.json.step, one.json.ran], [false, 'comment', ['cap-defer']]);
   assert.equal(typeof one.json.result, 'object');
   assert.equal(issuePosts(w), 0, 'followups did not run');
   w.fake.setFail({});
   postFollowupsFail(w);
   const two = pub(w);
   assert.notEqual(two.code, 0);
-  assert.deepEqual([two.json.step, two.json.ran], ['followups', ['comment']]);
+  assert.deepEqual([two.json.step, two.json.ran], ['followups', ['cap-defer', 'comment']]);
   assert.equal(typeof two.json.result, 'object');
   w.prHead(w.head);
   w.fake.setFail({ writeAfter: 1 });
   const three = pub(w);
   assert.notEqual(three.code, 0);
-  assert.deepEqual([three.json.step, three.json.ran], ['comment-links', ['comment', 'followups']]);
+  assert.deepEqual([three.json.step, three.json.ran], ['comment-links', ['cap-defer', 'comment', 'followups']]);
 });
 
 for (const [name, setup, newIssues] of [

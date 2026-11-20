@@ -99,6 +99,19 @@ test('F4 applyRulings: an added file, a rename (into or inside the matched paths
   }
 });
 
+// #631. Failure caught: a file-level (line 0) BLOCKING security finding never equals a line the PR adds, so it was waived with no mechanical check, even when the weakness sits in lines an earlier round added.
+test('#631 applyRulings / fableFindingItems: a same-on-base finding with no line (0) is never waived; the same finding on a real unchanged line still is', () => {
+  const files = [entry('pipeline/hooks/a.mjs', { added: [{ line: 9, text: 'x' }] })];
+  const it = item({ line: 0 });
+  const [out] = apply([it], [rule(it)], { regression: { globs: GLOBS, files } });
+  assert.deepEqual(parked(out), HUMAN, 'line 0: a human still decides');
+  const [f0] = findingItems([finding({ line: 0 })], { regression: { globs: GLOBS, files } });
+  assert.deepEqual(parked(f0), HUMAN, 'a Fable finding at line 0');
+  const real = item({ line: 4 });
+  const [ok] = apply([real], [rule(real)], { regression: { globs: GLOBS, files } });
+  assert.deepEqual([ok.final.needsHuman, ok.final.sameOnBase], [false, 'pipeline/hooks/**'], 'a real unchanged line is waived');
+});
+
 // R6-F1. Failure caught: a SUGGESTION (or a non-security BLOCKING) Codex item ruled FOLLOW-UP "same on base" on a file the PR adds, stored as same-on-base with no human.
 test('R6-F1 applyRulings: a SUGGESTION or non-security BLOCKING FOLLOW-UP with the scope on an added file or a PR-added line parks for a human with no scope; a plain modification is unchanged', () => {
   const added = { globs: GLOBS, files: [entry('pipeline/hooks/new.mjs', { oldPath: null, status: 'A' }), entry('pipeline/hooks/a.mjs', { added: [{ line: 4, text: 'x' }] })] };

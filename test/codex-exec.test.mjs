@@ -228,7 +228,8 @@ test("execCodex: capacity twice keeps today's outcome (error), with retried capa
 test('execCodex: only one retry in total: a timeout then capacity, or capacity then a timeout, is not retried again', async (t) => {
   const dir = scratch(t);
   const capture = join(dir, 'capture.jsonl');
-  const a = await run(dir, { PIPELINE_CODEX_TIMEOUT_MS: '700', PIPELINE_CODEX_CAPACITY_RETRY_MS: '0', FAKE_CODEX_HANG_ONCE: join(dir, 'hung.flag'), FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: CAPACITY, FAKE_CODEX_CAPTURE: capture });
+  // The first run hangs once and is killed by the timeout; the timeout is far above process start (as in case b) so a slow start (Windows) cannot kill it BEFORE it writes the hang flag, which would make the second run hang too (two timeouts: 'unavailable', not 'error').
+  const a = await run(dir, { PIPELINE_CODEX_TIMEOUT_MS: '5000', PIPELINE_CODEX_CAPACITY_RETRY_MS: '0', FAKE_CODEX_HANG_ONCE: join(dir, 'hung.flag'), FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: CAPACITY, FAKE_CODEX_CAPTURE: capture });
   assert.equal(a.ok, false);
   assert.equal(a.reason, 'error');
   assert.deepEqual(a.retried, { reason: 'timeout' });

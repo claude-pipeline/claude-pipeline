@@ -9,6 +9,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
 import { git as gitRun } from '../pipeline/lib/git.mjs';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
 import {
@@ -300,4 +301,30 @@ test('every remote-touching git call (ls-remote, fetch, push) carries a timeout;
   const network = seen.filter((c) => ['ls-remote', 'fetch', 'push'].includes(c.args[0]));
   assert.ok(network.some((c) => c.args[0] === 'push') && network.some((c) => c.args[0] === 'ls-remote'));
   for (const c of network) assert.ok(c.timeoutMs > 0, `${c.args[0]} needs a timeout`);
+});
+
+// Outbound text guard: a scanner reads text, not pixels, so a listed repository is never sent screenshots from here.
+test('artifacts push is refused for a repository listed in the outbound scan config: nothing is pushed, whatever the scanner would say', () => {
+  const w = world();
+  const scanner = makeScanner(tmp('cp-art-scanner-'), 'clean');
+  writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: scanner.command } });
+  w.put('a.png');
+  const r = w.cli(['push', '--pr', '7', '--dir', w.images]);
+  assert.equal(r.code, 1, r.stderr);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.match(r.json.message, /images are not text/);
+  assert.equal(w.onOrigin('branch', '--list', ARTIFACTS_BRANCH).trim(), '', 'no artifacts branch on origin');
+  assert.equal(scanner.runs().length, 0);
+});
+
+test('artifacts push checks where git push origin really goes: gh resolving an unlisted repo (GH_REPO) does not let screenshots reach a listed origin', () => {
+  const w = world();
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'git@github.com:Listed/Repo.git']); // push URL names the listed repo; gh (the fake) says acme/widgets
+  const scanner = makeScanner(tmp('cp-art-scanner-'), 'clean');
+  writeScanConfig(w.fake.scanHome, { 'listed/repo': { command: scanner.command } });
+  w.put('a.png');
+  const r = w.cli(['push', '--pr', '7', '--dir', w.images]);
+  assert.equal(r.code, 1, r.stderr);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(w.onOrigin('branch', '--list', ARTIFACTS_BRANCH).trim(), '', 'nothing was pushed');
 });

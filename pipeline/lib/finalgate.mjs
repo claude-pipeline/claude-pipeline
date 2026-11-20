@@ -24,7 +24,7 @@ import { toPosix } from './paths.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
-import { claudeRulingRows, sameOnBaseRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
+import { capLowItems, claudeRulingRows, sameOnBaseRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
 import { newerFormatText, readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
@@ -988,6 +988,8 @@ export const areasOf = (lines) => [...new Set(lines.map((l) => String(l).split('
 //   * owner_approval: label  -> `P merge` refuses on EVERY route (substitute-label-mode): no label or flag clears it, the owner merges by hand;
 //   * the gated route and the queue sweep's gated recheck refuse (substitute-owner-go-only): they bind the items digest only, and the Areas line (which carries `substitute`)
 //     is what the owner is shown; only `--owner-go` binds it. That also keeps the PR out of any low-risk auto-merge (the gated route is the only one).
+// A cap-low deferral (triage.mjs#capLowItems: review.cap_low_accepts) is the same: the gated route and the queue sweep's gated recheck refuse (cap-low-owner-go-only), because only `--owner-go` binds the Rulings
+// block that lists the deferred rows and needs the owner's word for them; a PR holding one is never an unattended merge. (No label-mode refusal: the deferral exists only with owner_approval: chat.)
 // -> { error, reason } or null. `route`: 'gated' | 'owner-go'. An unreadable or absent state is no inventory here (the review checks fail it on their own).
 export function substituteRouteProblem({ root, config, pr, route }) {
   let state = null;
@@ -996,7 +998,13 @@ export function substituteRouteProblem({ root, config, pr, route }) {
   } catch {
     return null;
   }
-  if (!state || state.pr !== pr || substituteInventory(state).length === 0) return null;
+  if (!state || state.pr !== pr) return null;
+  if (substituteInventory(state).length === 0) {
+    if (route === 'gated' && capLowItems(state).length > 0) {
+      return { error: 'cap-low-owner-go-only', reason: `#${pr} holds an accepted fix that was deferred unapplied at the round limit (review.cap_low_accepts): it merges only on the owner's word for its Rulings block, so ask with \`pipeline merge --pr ${pr} --dry-run --owner-go\`, show the request it prints (Rulings block included), and merge with \`pipeline merge --pr ${pr} --owner-go\`` };
+    }
+    return null;
+  }
   if (config?.owner_approval === 'label') {
     return { error: 'substitute-label-mode', reason: `#${pr} was reviewed by a Claude stand-in while Codex was out of quota, and owner_approval is label: the owner merges this PR by hand (no approval flag or label clears it)` };
   }
@@ -1283,14 +1291,18 @@ export function waitBlockers(gh, { base = null, exemptHold = false } = {}) {
 // Polls until the PR is MERGED, CLOSED, or the deadline passes. Transient gh errors are tolerated (a flaky call must
 // not lose a 15-minute wait) but three in a row surface as 'error'. With `blockers`, every poll of a still-OPEN PR asks
 // it for problems and a non-empty answer ends the wait as 'blocked' (the caller disables auto-merge).
+// A 'timeout' also says whether the LAST read of the PR worked (`readOk`): a zero wait that fails once is a timeout, not an 'error', so only this field
+// tells a caller whether the PR was ever seen (and its blockers checked).
 export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sleep = defaultSleep, blockers = null }) {
   const deadline = now() + waitMs;
   const fields = ['state', 'mergeCommit', ...(blockers ? ['labels', ...(blockers.fields ?? [])] : [])];
   let errors = 0;
+  let readOk = false;
   for (;;) {
     try {
       const view = gh.prView(pr, fields);
       errors = 0;
+      readOk = true;
       if (view.state === 'MERGED') return { state: 'merged', mergeSha: await readMergeSha({ gh, pr, first: view.mergeCommit?.oid, sleep, pollMs }) };
       if (view.state === 'CLOSED') return { state: 'closed' };
       if (blockers) {
@@ -1304,10 +1316,11 @@ export async function waitForMerge({ gh, pr, waitMs, pollMs, now = Date.now, sle
       }
     } catch (err) {
       errors += 1;
+      readOk = false;
       if (errors >= MAX_CONSECUTIVE_ERRORS) return { state: 'error', error: String(err?.message ?? err) };
     }
     const left = deadline - now();
-    if (left <= 0) return { state: 'timeout' };
+    if (left <= 0) return { state: 'timeout', readOk };
     await sleep(Math.min(pollMs, left));
   }
 }
