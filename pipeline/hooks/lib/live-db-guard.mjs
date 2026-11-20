@@ -210,7 +210,7 @@ export function localDbUrl(v) {
 }
 
 // commands that only read or print their arguments: a Management API hostname mentioned on a line made of these alone (a search, an echo) makes no request
-const NO_REQUEST = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls', 'cd', 'pwd', 'cut', 'tr', 'sort']);
+const NO_REQUEST = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls', 'cd', 'pwd', 'cut', 'tr', 'sort', 'true', 'false', ':', 'test', '[']);
 const NO_REQUEST_GIT = new Set(['grep', 'log', 'diff', 'show', 'blame', 'status', 'ls-files', 'shortlog', 'rev-list', 'describe']);
 // (a bare command word only: `/tmp/x/rg` and `./rg` are scripts that may be named anything; and a line that writes a file, `echo '…' > run.sh`, is not a mention that goes nowhere)
 const WRITE_OPS = new Set(['>', '>>', '>|', '>&', '&>', '&>>', '<>']);
@@ -229,10 +229,16 @@ const runsProgram = (c) => {
   if (n === 'git') return args.some((a) => (a.startsWith('--') ? a.length > 3 && PROGRAM_OPTION_GIT.some((o) => o.startsWith(a.slice(2).split('=')[0])) : /^-[A-Za-z0-9]*[oO]/.test(a)));
   return false;
 };
+// the git subcommand after the global options that only move or quiet it (`-C dir`, `--no-pager`); `-c`, `--exec-path`, `--config-env` and any other option stay unread (null: not a read)
+const gitReadSub = (argv) => {
+  let i = 1;
+  while (argv[i] === '--no-pager' || argv[i] === '-C') i += argv[i] === '-C' ? 2 : 1;
+  return argv[i];
+};
 const makesNoRequest = (c) => {
   if (c.argv[0].includes('/') || writesFile(c) || stdinFed(c) || Object.keys(c.env ?? {}).length || runsProgram(c)) return false;
   const n = commandName(c.argv[0]);
-  return NO_REQUEST.has(n) || (n === 'git' && NO_REQUEST_GIT.has(c.argv[1]));
+  return NO_REQUEST.has(n) || (n === 'git' && NO_REQUEST_GIT.has(gitReadSub(c.argv)));
 };
 
 // the first words of every supabase subcommand and alias (`supabase --help` of CLI 2.122; re-check on a CLI update), plus those the tables below do not carry
@@ -242,8 +248,10 @@ const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
 // (`supabase/migrations/x.sql`, `SUPABASE_URL`, `supabase.from(`, `supabase.com`, `@supabase/supabase-js` are not tokens; `supabase`, `./node_modules/.bin/supabase`, `'supabase db push'` are)
 const SB_TOKEN_SRC = String.raw`(?<![\w.@-])(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\\s'"]*)?(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`;
 const SB_TOKEN = new RegExp(SB_TOKEN_SRC, 'i');
+// (the CLI's global flags may sit between the token and the head, a value in its two-word or `=` form, quoted or not: `supabase --workdir /app db push`; the sets are the ones skipGlobals reads)
+const GLOBAL_FLAG_SRC = `(?:--(?:debug|experimental|yes|wizard)|(?:--(?:workdir|profile|network-id|dns-resolver|output|output-format|log-level|agent|completions)|-o)(?:=|\\s+)(?:"[^"]*"|'[^']*'|\\S+))`;
 // ... followed, after whitespace, by a subcommand head: the shape of a command line that runs the binary
-const SB_TOKEN_HEAD = new RegExp(`${SB_TOKEN_SRC}\\s+(?:${[...SUB_HEADS].join('|')}|network-[a-z-]+)(?![\\w-])`, 'i');
+const SB_TOKEN_HEAD = new RegExp(`${SB_TOKEN_SRC}\\s+(?:${GLOBAL_FLAG_SRC}\\s+)*(?:${[...SUB_HEADS].join('|')}|network-[a-z-]+)(?![\\w-])`, 'i');
 // B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
 function globMatchesHead(w) {
   if (!/[*?[]/.test(w)) return false;
@@ -475,7 +483,13 @@ function cleanApiPath(after) {
 const commandText = (w) => (w.startsWith('--') && w.includes('=') ? w.slice(w.indexOf('=') + 1) : w);
 // the pipeline's own CLI takes prose in --built / --summary / --reason / --owner-quote / --line / --body (copied verbatim, F4); sed's script text is a residual (F7)
 const PIPELINE_BINS = new Set(['pipeline.mjs', 'pipeline']);
-const isPipelineBin = (argv) => argv.slice(0, 8).some((a) => PIPELINE_BINS.has(commandName(a)));
+// (only when the pipeline CLI is the program that runs: word 0 is the bin, or node's first non-option word is the script; a container, session or project NAMED pipeline is not)
+const isPipelineBin = (argv) => {
+  const n = commandName(argv[0]);
+  if (PIPELINE_BINS.has(n)) return true;
+  const script = argv.slice(1).find((a) => !a.startsWith('-'));
+  return n === 'node' && script !== undefined && PIPELINE_BINS.has(commandName(script));
+};
 // the word that IS the program of an inline interpreter (`node -e|--eval|-p|--print CODE`, `--eval=CODE`, `python|python3|pythonX.Y -c CODE`): JavaScript / Python source, not a shell line, so it is not reparsed (owner 2026-11-20; a shell's `-c` stays read). Its residual is in docs/cli.md
 const isInlineProgram = (words, i) => {
   const n = commandName(words[0]);

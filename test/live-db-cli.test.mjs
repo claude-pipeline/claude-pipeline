@@ -210,6 +210,17 @@ const ALLOWED = [
   // B3: git is data only for a known subcommand
   'git status supabase db',
   'git -C supabase log --oneline',
+  // R1-B2: a repository search with git's -C / --no-pager before the subcommand makes no request (same as `cd /repo && git grep …`)
+  'git -C /repo grep -n api.supabase.com -- .',
+  'git --no-pager log -S api.supabase.com --oneline',
+  'git --no-pager log api.supabase.com',
+  // R1-F2: the builtins that run nothing keep a search on the no-request list (`|| true` after a grep is the common idiom)
+  'rg -n api.supabase.com pipeline || true',
+  'grep -c api.supabase.com f || :',
+  '[ -f x ] && grep -q api.supabase.com x',
+  'test -f x && rg -n api.supabase.com x',
+  // R1-F1: the pipeline CLI as the program that runs takes prose (bare bin, or node and its script)
+  'pipeline summary --pr 1 --built "Owner runs supabase db push after merge"',
 ];
 
 const DENIED = [
@@ -386,7 +397,10 @@ const DENIED = [
   'echo x | parallel git grep api.supabase.com',
   // git global options and ack / ag option spellings that run a program
   `git -c core.pager='curl https://api.supabase.com/v1/projects/${LIVE}' grep -O x`,
-  'git --no-pager log api.supabase.com',
+  // R1-B2: -c, --exec-path and --config-env run programs or move the config, so they stay refused (only -C and --no-pager are skipped)
+  `git -C /repo -c core.pager='curl https://api.supabase.com/v1/projects/${LIVE}' grep -O x`,
+  'git --exec-path=/tmp/x log api.supabase.com',
+  'git --config-env=core.pager=X log api.supabase.com',
   `ack +pager='curl https://api.supabase.com/v1/projects/${LIVE}' x`,
   `ack -pager='curl https://api.supabase.com/v1/projects/${LIVE}' x`,
   `ag +pa 'curl https://api.supabase.com/v1/projects/${LIVE}' x`,
@@ -422,6 +436,21 @@ const DENIED = [
   'doppler run --command "pnpm supabase db push"',
   "ssh ci 'cd app && yarn supabase db push'",
   `doppler run --command "${'true; '.repeat(501)}supabase db push"`,
+  // R1-B1: a global flag between the token and the head of a quoted command string (both reparse sites: the outer word and a nested one)
+  'doppler run --command "supabase --workdir /app db push"',
+  'doppler run --command "supabase --debug db push"',
+  'doppler run --command="supabase --workdir=/app db push"',
+  'git rebase -x "supabase --debug db push" main',
+  'git rebase -x "supabase --workdir . db push" main',
+  'doppler run --command "supabase -o json --debug db push"',
+  "nix-shell --run 'supabase --workdir \"/my app\" db push'",
+  "sh -c 'doppler run --command \"supabase --workdir /app db push\"'",
+  // R1-F1: a container, namespace, session or project NAMED pipeline is not the pipeline CLI
+  'docker exec pipeline sh -c "supabase db push"',
+  'kubectl exec deploy/pipeline -- sh -c "supabase db push"',
+  "tmux send-keys -t pipeline 'supabase db push' Enter",
+  'doppler run --project pipeline --command "supabase db push"',
+  'node ./pipeline/run.mjs --built "x" && sh -c "supabase db push"',
   // E7 (accepted false refusals): prose with a separator or a substitution followed by a supabase command
   'claude -p "Check migrations; supabase db push is forbidden"',
   "claude -p 'Owner step: run `supabase db push --linked` after merge'",
