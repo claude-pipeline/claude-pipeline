@@ -5,7 +5,7 @@
 import { gunzipSync, gzipSync } from 'node:zlib';
 import { MARKERS, clip, line } from './render.mjs';
 import { MAX_PROOFS, MAX_PROOF_STEP } from './config.mjs';
-import { addCostEntry, addRetries, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
+import { addCostEntry, deductBookedTranscript, addRetries, addSessions, costLines, costShapeProblem, setGuardBlocks } from './run-cost.mjs';
 
 export const RECORD_VERSION = 1;
 
@@ -292,7 +292,11 @@ export function applyCheckpoint(record, patch, { host, now }) {
   if (patch.cost != null) {
     if (!isPlainObject(patch.cost)) throw new Error('cost must be an object');
     let cost = next.cost;
-    if (patch.cost.entry !== undefined) cost = addCostEntry(cost, patch.cost.entry);
+    if (patch.cost.entry !== undefined) {
+      let entry = patch.cost.entry;
+      if (patch.cost.transcript !== undefined) ({ cost, entry } = deductBookedTranscript(cost, entry, patch.cost.transcript));
+      cost = addCostEntry(cost, entry);
+    }
     if (patch.cost.retries !== undefined) cost = addRetries(cost, patch.cost.retries);
     if (patch.cost.sessions !== undefined) cost = addSessions(cost, patch.cost.sessions);
     if (patch.cost.guardBlocks !== undefined) cost = setGuardBlocks(cost, patch.cost.guardBlocks, patch.cost.guardBySession);

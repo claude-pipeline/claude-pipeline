@@ -191,6 +191,15 @@ test('apply refusals: every way the transcript can differ from the prepared run 
   }
 });
 
+// A builder that pasted promptHeader and the Read line with a blank line between them ran the right review; apply refused it as "text was added" and the round
+// had to be prepared and run again (EW #2307). Blank lines there are whitespace, not text: accepted, while any word added anywhere still refuses (the table above).
+test('apply accepts a blank line between promptHeader and the Read line (the prompt is otherwise exactly the prepared one)', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const r = w.apply(install(w, prep, { prompt: `${prep.promptHeader}\n\n\nRead ${prep.inputPath} and review the pull request.\n` }));
+  assertExit(r, 0, r.stdout);
+});
+
 test('edited input or exported file since prepare, and an input that changed (PR edited), are proof failures', (t) => {
   const w = world(t);
   const prep = w.ready();

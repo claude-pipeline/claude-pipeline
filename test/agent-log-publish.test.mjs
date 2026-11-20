@@ -205,6 +205,29 @@ test('a race lost three times in a row is an error (the caller keeps its lines)'
   assert.equal(pushes, 3);
 });
 
+// `agent-log publish` exited 3 (`publish-failed`) on a one-off network blip during the push and left the run line queued for the summary step to chase.
+test('a network blip on the push is retried with a backoff and the line lands; a blip that never clears still exits with the lines queued', () => {
+  const w = world();
+  let failures = 1;
+  const sleeps = [];
+  const blip = (args, o) => {
+    if (args[0] === 'push' && failures-- > 0) throw new GitError({ args, code: 128, stderr: "fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com" });
+    return gitRun(args, o);
+  };
+  const r = publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L1], defaultBranch: 'main', gitFn: blip, sleepFn: (ms) => sleeps.push(ms) });
+  assert.equal(r.pushed, true);
+  assert.deepEqual(sleeps, [1000]);
+  assert.ok(w.logOnBranch().split('\n').includes(L1));
+
+  let pushes = 0;
+  const down = (args, o) => {
+    if (args[0] === 'push') { pushes += 1; throw new GitError({ args, code: 128, stderr: 'fatal: unable to access x: Connection timed out' }); }
+    return gitRun(args, o);
+  };
+  assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn: down, sleepFn: () => {} }), GitError);
+  assert.equal(pushes, 3, 'one try and two retries, then the failure stands');
+});
+
 test('the log branch deleted on the remote: a stale cached copy does not make publish drop a line; the branch is recreated with it', () => {
   const w = world();
   assertExit(w.run(['publish', '--line', L1]), 0);

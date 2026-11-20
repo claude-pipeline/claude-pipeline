@@ -127,6 +127,19 @@ export function readsCoverFile(calls, file, lines, fileText) {
   return next > lines;
 }
 
+// The expected prompt is `<promptHeader>\nRead <path> and review ...`: the actual one is the same, or has only blank (whitespace-only) lines between the header and the Read line.
+export function samePromptModuloBlankBeforeRead(actual, expected) {
+  const a = String(actual).trimEnd();
+  const e = String(expected).trimEnd();
+  if (a === e) return true;
+  const at = e.lastIndexOf('\nRead ');
+  if (at < 0) return false;
+  const head = e.slice(0, at);
+  const tail = e.slice(at + 1);
+  if (a.length < head.length + tail.length + 2 || !a.startsWith(head) || !a.endsWith(tail)) return false;
+  return /^\n(?:[ \t]*\r?\n)+$/.test(a.slice(head.length, a.length - tail.length));
+}
+
 // -> null when no transcript carries the tag (one that does is judged whatever its age: the window applies only when none does); else { found, proof, claudeCodeVersions, jsonlText }. Every problem is pushed to `errors` (the caller's list).
 //   agent: the agent type the attempt was prepared for; expectedPrompt: the exact first prompt; requiredReads: absolute paths that must each show a successful Read.
 //   projectsDir / maxAgeMs: test mode only (refuseTestOnlyFlags); without projectsDir the search is under the account's projects folder and a found transcript must really be inside it.
@@ -149,7 +162,8 @@ export function proveSubstituteRun({ tag, projectsDir, maxAgeMs, agent, expected
   const proof = proveModel({ jsonlText, metaText, expectModelPrefix: MODEL_PREFIX[agent] ?? '', expectEffort: PROOF_EFFORT, expectMetaModel: null, expectAgentType: agent });
   errors.push(...proof.errors);
   // Trailing whitespace is not text; everything else must be equal, so nothing can be added in front of or after the fixed prompt.
-  if (proof.firstUserText.trimEnd() !== expectedPrompt.trimEnd()) errors.push('the agent\'s first prompt is not exactly the prepared one (promptHeader + the fixed Read line): text was added or changed');
+  // The one blank-line run a builder may add (between promptHeader and the Read line) is whitespace too: accepted, so a pasted blank line does not cost a second review run.
+  if (!samePromptModuloBlankBeforeRead(proof.firstUserText, expectedPrompt)) errors.push('the agent\'s first prompt is not exactly the prepared one (promptHeader + the fixed Read line): text was added or changed');
 
   // Only Read / Grep / Glob were used, and every file of the packet was really read.
   const calls = toolCallsOf(jsonlText);

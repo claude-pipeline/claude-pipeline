@@ -127,8 +127,11 @@ function identitiesOf(sources) {
   return [...seen.values()];
 }
 
+// The `status` an `others` entry carries while its check is not finished (a check run's status, or a commit status's pending).
+const RUNNING_OTHER = new Set(['queued', 'in_progress', 'pending', 'waiting', 'requested']);
+
 export async function waitForCi({ readers, options, clock, onProgress = () => {} }) {
-  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, configChecks = [], mergeChecks = [], e2eLabel = null } = options;
+  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, waitOthers = false, configChecks = [], mergeChecks = [], e2eLabel = null } = options;
   const start = clock.now();
   const elapsed = () => clock.now() - start;
 
@@ -616,6 +619,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (unverified) return unverifiedResult();
     const others = await otherChecks(obs, identities);
     const owedNote = notOwed.length > 0 ? { notOwed } : {};
+    // --wait-others: the required checks are green but a non-required check of the run-e2e suite is still running: keep waiting for it (a red or finished one ends the wait as `passed` with `others`, as before).
+    if (waitOthers && others !== null && others.some((o) => RUNNING_OTHER.has(o.status)) && elapsed() < timeoutMs) return null;
     if (others !== null && others.length > 0) {
       return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
     }

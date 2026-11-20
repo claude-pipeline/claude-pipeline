@@ -171,6 +171,13 @@ export function logRelPath(root, agentLog) {
 }
 
 const isRaceFailure = (err) => err instanceof GitError && /rejected|non-fast-forward|fetch first|stale info|failed to push some refs/i.test(err.stderr ?? '');
+// A network blip (DNS, a dropped or timed-out connection, a 5xx from the host) is not a lost race and not a refusal: the same publish is worth one or two more tries a moment later
+// (`agent-log publish` exit 3 on a one-second blip left the run's line queued and the summary step stalled). A remote that is not a repository, a rejected push or a hook refusal are not blips.
+const NET_RETRIES = 2;
+const NET_BACKOFF_MS = [1000, 3000];
+const isNetworkBlip = (err) => err instanceof GitError && !/does not appear to be a git repository|permission denied|authentication failed|rejected|non-fast-forward/i.test(err.stderr ?? '')
+  && /could not resolve host|temporary failure in name resolution|network is unreachable|connection (?:timed out|reset|refused|closed)|operation timed out|timed out|early eof|remote end hung up|rpc failed|unable to access|ssl|tls|returned error: 5\d\d/i.test(err.stderr ?? '');
+const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait available: the retry still happens */ } };
 const REMOTE_LOG_REF = `refs/remotes/${REMOTE}/${AGENT_LOG_BRANCH}`;
 // The remote's default branch as git must READ it: fully qualified, because an abbreviated `origin/<b>` resolves through refs/tags and refs/heads first (#454).
 const remoteDefaultRef = (defaultBranch) => `refs/remotes/${REMOTE}/${defaultBranch}`;
@@ -265,10 +272,11 @@ function gitIn(g, cwd, args, { env, input } = {}) {
  * never touches the caller's HEAD / index / branches / working tree. `gitFn` is injectable for tests.
  * -> { commit, pushed, lines } (`lines`: the ones actually appended). Throws on a git failure; the caller keeps its lines queued.
  */
-export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, anonymous = false }) {
+export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, sleepFn = sleepSync, anonymous = false }) {
   const g = (args, cwd = root, timeoutMs, extra = {}) => gitFn(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}), ...extra });
   const clean = lines.map(assertSingleLine);
   let lastErr;
+  let blips = 0;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
     try {
       const { tip } = fetchLogBranch(root, g);
@@ -290,6 +298,7 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, 
       return { commit, pushed: true, lines: fresh };
     } catch (err) {
       lastErr = err;
+      if (isNetworkBlip(err) && blips < NET_RETRIES) { sleepFn(NET_BACKOFF_MS[blips]); blips += 1; attempt -= 1; continue; } // a blip does not use up a race attempt
       if (!isRaceFailure(err) || attempt === ATTEMPTS) throw err;
     }
   }

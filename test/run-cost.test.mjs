@@ -9,7 +9,7 @@ import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  PHASES, PRICE_TABLE_DATE, ROLES, addCostEntry, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
+  PHASES, PRICE_TABLE_DATE, ROLES, addCostEntry, deductBookedTranscript, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
@@ -236,6 +236,63 @@ test('P cost --from-transcript: the transcript usage is booked, explicit amounts
   assertExit(r, 0);
   assert.deepEqual([r.json.cost.total.input, r.json.cost.total.output, r.json.cost.total.cacheRead, r.json.cost.total.cacheWrite], [10, 25, 30, 40]);
   assertExit(costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/missing.jsonl']), 2);
+});
+
+// A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
+test('P cost --from-transcript: booking a continued agent\'s transcript again books only the new usage (total = the whole transcript once)', () => {
+  const s = scenario();
+  const msg = (id, n) => `${JSON.stringify({ message: { id, model: 'claude-sonnet-4-5', usage: { input_tokens: n, output_tokens: 2 * n, cache_read_input_tokens: 3 * n, cache_creation_input_tokens: 4 * n } } })}\n`;
+  s.repo.write('.review/agent-a1.jsonl', msg('m1', 10));
+  const first = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
+  assertExit(first, 0);
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5));
+  const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl', '--output', '1']);
+  assertExit(second, 0);
+  const t = second.json.cost.total;
+  assert.deepEqual([t.input, t.output, t.cacheRead, t.cacheWrite, t.calls], [15, 31, 45, 60, 2], 'the whole transcript once, plus the hand output');
+  assert.equal(t.usd, (() => { const sc = scenario(); sc.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5)); return costCli(sc, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']).json.cost.total.usd; })(), 'USD too');
+  // a third booking with nothing new adds no tokens
+  withComment(s, existing(written(s)));
+  const third = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
+  assert.deepEqual([third.json.cost.total.input, third.json.cost.total.output], [15, 31]);
+});
+
+// R4-B1: two overlapping bookings of one growing transcript: the one that read the smaller snapshot finished last and lowered the ledger, so the next booking of the larger transcript re-booked the difference.
+test('deductBookedTranscript: a stale smaller snapshot does not lower the ledger, so the larger one booked again adds nothing', () => {
+  const snap = (n) => ({ input: n, output: 2 * n, cacheRead: 3 * n, cacheWrite: 4 * n, usd: n / 100, byPrice: { p1: { input: n, output: 2 * n, cacheRead: 3 * n, cacheWrite5m: 4 * n, cacheWrite1h: 0, messages: n } } });
+  const book = (cost, n) => deductBookedTranscript(cost, { ...snap(n) }, { key: 'agent-a1.jsonl', usage: snap(n) });
+  const big = book(emptyCost(), 200);
+  const stale = book(big.cost, 100);
+  assert.deepEqual([stale.entry.input, stale.entry.usd], [0, 0], 'the stale snapshot adds nothing');
+  const again = book(stale.cost, 200);
+  assert.deepEqual([again.entry.input, again.entry.output, again.entry.cacheRead, again.entry.cacheWrite, again.entry.usd], [0, 0, 0, 0, 0], 'the larger snapshot again adds nothing');
+  assert.equal(again.entry.byPrice.p1, undefined, 'price buckets add nothing either');
+});
+
+// R1-B1 / R1-F2: the ledger key was the bare file name, so two different transcripts both called transcript.jsonl shared one entry (the second under-booked), and a name with a space or bracket made the booking fail.
+test('P cost --from-transcript: same-named transcripts from different folders both book; an odd file name still books', () => {
+  const s = scenario();
+  const one = (n) => `${JSON.stringify({ message: { id: `m${n}`, model: 'claude-sonnet-4-5', usage: { input_tokens: n, output_tokens: 1 } } })}\n`;
+  s.repo.write('.review/a/transcript.jsonl', one(100));
+  s.repo.write('.review/b/transcript.jsonl', one(50));
+  const first = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/a/transcript.jsonl']);
+  assertExit(first, 0);
+  withComment(s, existing(written(s)));
+  const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/b/transcript.jsonl']);
+  assertExit(second, 0);
+  assert.equal(second.json.cost.total.input, 150, 'both transcripts booked in full');
+  withComment(s, existing(written(s)));
+  const again = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/b/transcript.jsonl']);
+  assert.equal(again.json.cost.total.input, 150, 'the same file again books nothing new');
+  assert.doesNotMatch(JSON.stringify(written(s).cost.transcripts), /\.review|\/Users|\/tmp/, 'no folder path in the ledger');
+  const odd = scenario();
+  odd.repo.write('.review/agent copy (1) \u00e9.jsonl', one(7));
+  const r = costCli(odd, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent copy (1) \u00e9.jsonl']);
+  assertExit(r, 0);
+  assert.equal(r.json.cost.total.input, 7);
+  odd.repo.write(`.review/${'x'.repeat(200)}.jsonl`, one(3));
+  assertExit(costCli(odd, ['--phase', 'build', '--role', 'implementer', '--from-transcript', `.review/${'x'.repeat(200)}.jsonl`]), 0);
 });
 
 test('P cost: USD from list prices (--model, transcript models); --usd wins; tokens with no price warn', () => {
