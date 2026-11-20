@@ -539,6 +539,17 @@ test('#571: the expansion of a gh alias definition is judged, but what it would 
   allows('F7: a definition in an if that does not run', `${SET_STATUS}; if false; then gh alias set y '!${SHIP}'; fi; git ship`);
 });
 
+// #572 / #573 (the branch-log half of stateChanged, shipped in #362; R40-B1 pins the alias half): a branch switched away and back by an eval'd text in a subshell (an exit between) is unknown after the subshell. Caught:
+// the subshell's end state equals the one before it, so without the branch-log clause the line believes agent/x and pushes main.
+test('#572 / #573: a branch switched and put back by an eval\'d text in a subshell (an exit between) is unknown after it', () => {
+  const line = (script) => `git switch agent/x; ( eval "$(cat ./f.sh)" ); bash ./${script}`;
+  const p = { 'p.sh': `${PB} origin HEAD\n`, 'pn.sh': `${PB} origin agent/x\n` };
+  const away = `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`;
+  denies('file-fed eval in a subshell switches main and back', line('p.sh'), { ...p, 'f.sh': away }, BRANCH);
+  allows('the same, the push names the branch', line('pn.sh'), { ...p, 'f.sh': away });
+  allows('a file-fed eval that switches nothing', line('p.sh'), { ...p, 'f.sh': 'echo hi\nexit 0\n' });
+});
+
 // R39-F3 / F4 (the arbiter's reading: a memo hit replays an end state without the writes of the first judgement): the same text run a second time in the same state is still unknown afterwards
 test('#362 R39-F3 / F4: a startup file or a line-written script judged once in a state is still unknown to its caller the second time', () => {
   const rc = { rc: `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`, 'noop.sh': 'echo hi\n' };
