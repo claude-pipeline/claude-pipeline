@@ -14,10 +14,14 @@ export function createFakeGh(entries) {
   const dir = mkdtempSync(join(tmpdir(), 'cp-fakegh-'));
   const script = join(dir, 'script.json');
   const log = join(dir, 'log.jsonl');
+  // The outbound scan config is read from this home (an empty one unless a test writes the file): the machine-local scan
+  // config of whoever runs the suite must never change what a test sees.
+  const scanHome = join(dir, 'scan-home');
   writeFileSync(script, JSON.stringify(entries));
   return {
     dir,
-    env: { PIPELINE_GH: `node "${fakeGhPath}"`, PIPELINE_FAKE_GH_SCRIPT: script, PIPELINE_FAKE_GH_LOG: log },
+    scanHome,
+    env: { PIPELINE_GH: `node "${fakeGhPath}"`, PIPELINE_FAKE_GH_SCRIPT: script, PIPELINE_FAKE_GH_LOG: log, PIPELINE_OUTBOUND_SCAN_HOME: scanHome },
     // Every gh call made so far, oldest first: { argv, cwd, stdin }.
     calls() {
       if (!existsSync(log)) return [];

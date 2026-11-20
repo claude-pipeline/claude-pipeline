@@ -23,6 +23,8 @@ export const SEAM_VARS = [
   'PIPELINE_DOCKER', 'PIPELINE_PS', 'PIPELINE_LSOF', 'PIPELINE_SUPABASE', 'PIPELINE_STACKS_DEADLINE_MS',
   // install.mjs: extra skill names to retire; read only together with PIPELINE_TEST_MODE=1.
   'PIPELINE_INSTALL_RETIRED_SKILLS',
+  // github.mjs (outbound text guard): the home whose .claude/pipeline-local/outbound-scan.json lists the repositories whose outbound text is scanned (default: the account home).
+  'PIPELINE_OUTBOUND_SCAN_HOME',
 ];
 export const isInstalledCopy = (dir = pipelineRoot()) => existsSync(path.join(dir, 'INSTALLED.json'));
 

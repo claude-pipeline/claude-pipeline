@@ -424,3 +424,12 @@ test('repo config: the commands audit lists the decision-making commands (merge-
     assert.ok(list.includes(`pipeline/commands/${c}.mjs`), `pipeline/commands/${c}.mjs decides a hold, a guard, a protection, a record or an owner-only check: it must stay listed`);
   }
 });
+
+// #559 A3. Failure caught: the guard threat model and the regression-only bar drift apart, so a guard file gets the threat model's text but the ordinary bar (or the reverse), and nothing says so.
+test('repo config: review.regression_only_paths is exactly the guards threat model paths (all covered by high_risk_paths)', () => {
+  const guards = raw.review.threat_models.find((m) => m.name === 'guards');
+  assert.ok(guards, 'the guards threat model');
+  assert.deepEqual(raw.review.regression_only_paths, guards.paths);
+  assert.equal(raw.review.regression_only_paths.length, 17);
+  for (const p of raw.review.regression_only_paths) assert.ok(matchAny(p, raw.risk.high_risk_paths, { nocase: true }), `${p} is not covered by risk.high_risk_paths`);
+});

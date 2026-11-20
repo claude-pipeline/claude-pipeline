@@ -124,14 +124,15 @@ const regressionAmong = (globs, paths) => regressionOnlyFor(paths.map((p) => ({ 
 // modification (status M: not an added file, a rename or a copy, so the path exists at the merge base and the arbiter could compare it; not a binary file by git's own numstat verdict (`gitBinary`: --text hides it
 // in `binary`), a symlink or a submodule, which have no text to compare; and the cited line is not one the PR itself ADDS in that whole-PR diff: a weakness it added in an earlier round is no
 // pre-existing one), old and new path are the one clean repo path, and it
-// matches a glob. Anything else: no waiver, today's rule.
+// matches a glob; and the item cites a real line (an integer > 0: a file-level finding with no line cannot be checked against the PR's added lines, so it is never waived, #631).
+// Anything else: no waiver, today's rule.
 function sameOnBaseOf(item, { globs, files } = {}) {
   if (!Array.isArray(globs) || globs.length === 0 || typeof item.file !== 'string' || item.file === '') return null;
   const hit = regressionAmong(globs, [item.file])[0];
   if (hit === undefined) return null;
   const entries = Array.isArray(files) && locationProblem(item.file) === null ? files.filter((f) => entryPaths(f).includes(item.file)) : [];
   const only = entries.length === 1 ? entries[0] : null;
-  const waive = only !== null && only.status === 'M' && only.binary !== true && only.gitBinary !== true && only.symlink !== true && only.gitlink !== true && !(Array.isArray(only.added) && only.added.some((a) => a.line === item.line)) && only.oldPath === item.file && only.newPath === item.file && regressionAmong(globs, entryPaths(only)).length > 0;
+  const waive = Number.isInteger(item.line) && item.line > 0 && only !== null && only.status === 'M' && only.binary !== true && only.gitBinary !== true && only.symlink !== true && only.gitlink !== true && !(Array.isArray(only.added) && only.added.some((a) => a.line === item.line)) && only.oldPath === item.file && only.newPath === item.file && regressionAmong(globs, entryPaths(only)).length > 0;
   return { name: hit, waive };
 }
 
@@ -189,7 +190,7 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
       const waived = oom?.waive === true || (sob?.waive === true && f.scope === SAME_ON_BASE);
       // a same-on-base claim the whole-PR diff disproves (sob.waive false) waits for a human whatever the bucket or category (the arbiter files its own findings as SUGGESTION), and never stores the scope
       const contradicted = f.scope === SAME_ON_BASE && sob !== null && sob.waive !== true;
-      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, or a line the PR adds)', cause: 'security-dismissal' };
+      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)', cause: 'security-dismissal' };
       else final = { ...final, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(f.scope === SAME_ON_BASE ? { scope: SAME_ON_BASE } : {}) }) };
     }
     const item = {
@@ -430,7 +431,7 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
       // see fableFindingItems: a same-on-base claim the diff disproves parks for a human whatever the bucket or category
       const contradicted = r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' && sob !== null && sob.waive !== true;
       if ((dismissesBlockingSecurity && !waived) || contradicted) {
-        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, or a line the PR adds)', cause: 'security-dismissal' };
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)', cause: 'security-dismissal' };
       } else {
         next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' ? { scope: SAME_ON_BASE } : {}) }) };
       }

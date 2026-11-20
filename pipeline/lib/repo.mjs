@@ -1,7 +1,7 @@
 // Where am I? One place that answers "which repo, which root, which GitHub slug" so every
 // command resolves them the same way (worktrees included) and tests can inject answers.
 import { join, resolve } from 'node:path';
-import { git } from './git.mjs';
+import { git, GitError } from './git.mjs';
 import { ghJson } from './proc.mjs';
 
 // resolve(): git prints C:/forward/slashes on Windows; callers join() and compare native paths.
@@ -33,4 +33,24 @@ export function repoSlug(cwd = process.cwd(), { ghJsonFn = ghJson } = {}) {
   if (!owner || !name) throw new Error(`could not resolve GitHub repo for ${cwd}`);
   const host = /^https?:\/\/([^/]+)\//i.exec(String(r.url ?? ''))?.[1]?.toLowerCase() ?? null;
   return { owner, name, slug: `${owner}/${name}`, host, defaultBranch: r.defaultBranchRef?.name || 'main' };
+}
+
+// owner/name of every place `git push origin` really goes (each push URL, with url.<base>.pushInsteadOf rewrites applied: git pushes to all of
+// them), which gh need not agree with (GH_REPO, `gh repo set-default`, another remote). The last two path segments, so an ssh host alias still
+// yields a name. [] only when git cleanly says there is no such remote (exit 2: the push would fail too); a git that was killed, timed out or did
+// not run throws, so the destination check never fails open.
+export function pushRemoteSlugs(cwd = process.cwd(), remote = 'origin') {
+  let out;
+  try {
+    out = git(['remote', 'get-url', '--push', '--all', remote], { cwd, timeoutMs: GIT_TIMEOUT_MS });
+  } catch (err) {
+    if (err instanceof GitError && !err.abnormal && err.code === 2) return [];
+    throw err;
+  }
+  const slugs = [];
+  for (const url of out.split('\n').map((l) => l.trim()).filter(Boolean)) {
+    const parts = url.replace(/\/+$/, '').replace(/\.git$/, '').split(/[/:]/).filter(Boolean);
+    if (parts.length >= 2) slugs.push(`${parts.at(-2)}/${parts.at(-1)}`);
+  }
+  return slugs;
 }

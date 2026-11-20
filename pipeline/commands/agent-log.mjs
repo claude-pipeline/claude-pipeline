@@ -6,7 +6,9 @@
 import { readFileSync } from 'node:fs';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo } from '../lib/cmd-common.mjs';
-import { createGitHub, guardGh } from '../lib/github.mjs';
+import { OutboundScanBlocked, createGitHub, guardGh, guardOutbound } from '../lib/github.mjs';
+import { GhError } from '../lib/proc.mjs';
+import { pushRemoteSlugs } from '../lib/repo.mjs';
 import { GitError } from '../lib/git.mjs';
 import { loadState } from '../lib/state.mjs';
 import { LockTimeoutError } from '../lib/locks.mjs';
@@ -153,9 +155,20 @@ async function publish(rest, ctx, { deprecated = false } = {}) {
       const base = { ok: true, branch: AGENT_LOG_BRANCH, ...(deprecated ? { deprecated: true, committed: null } : {}), file: config.agent_log, dropped, ...(held > 0 ? { held } : {}) };
       if (entries.length === 0) return { exitCode: EXIT.OK, output: { ...base, commit: null, pushed: false, lines: [], remaining: readQueue(root).length } };
       // 2. Publish the rest. Only after the push succeeded do those entries leave the queue.
+      // 1c. Outbound text guard: for a repository listed in the machine-local scan config the new lines are scanned BEFORE anything is pushed.
+      //     A block (or a repository that cannot be looked up) leaves every line queued.
+      // Listed: the commit is also made under the fixed noreply identity, so the configured git name and email never reach a public repository.
+      let listed = false;
+      try {
+        listed = guardOutbound({ slug: () => [gh.repo().slug, ...pushRemoteSlugs(root)], fields: () => entries.map((e) => ({ kind: 'agent-log line', text: e.line })), env: { ...process.env, ...ctx.env } });
+      } catch (err) {
+        if (err instanceof OutboundScanBlocked) throw new Fail(EXIT.FAILED, { ...err.extra, ok: false, error: 'outbound-scan-blocked', message: `${err.message}; the lines stay queued. ${err.extra?.reason === 'blocked' && err.extra.exited !== undefined ? `To drop a flagged line, delete it from ${queuePath(root)} (one JSON line per entry)` : 'No line was flagged: fix the scanner or its config, and do not delete queued lines'}`, remaining: entries.length });
+        if (err instanceof GhError || err instanceof GitError) throw new Fail(EXIT.UNAVAILABLE, { ok: false, error: 'publish-failed', message: `could not look up the repository to check the outbound scan config (${err.message.slice(0, 300)}); the lines stay queued for the next run`, remaining: entries.length });
+        throw err;
+      }
       let result;
       try {
-        result = publishLines({ root, logRel, lines: entries.map((e) => e.line), defaultBranch: config.default_branch });
+        result = publishLines({ root, logRel, lines: entries.map((e) => e.line), defaultBranch: config.default_branch, anonymous: listed });
       } catch (err) {
         if (err instanceof LogTooLargeError) throw new Fail(EXIT.FAILED, { ok: false, error: 'log-too-large', message: `${err.message}; the lines stay queued`, remaining: entries.length });
         if (!(err instanceof GitError)) throw err;

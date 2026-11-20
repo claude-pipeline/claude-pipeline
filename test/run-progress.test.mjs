@@ -65,9 +65,25 @@ test('baseRecordFor: an absent or legacy comment and a record of another PR stay
   assert.equal(baseRecordFor(other, ID).record.resumed, undefined);
 });
 
-// R9-F1: a record bound to another repo / branch is replaced, but the mark the merge gate reads is not dropped with it.
-test('baseRecordFor: a resumed record bound to another repo or branch (rename / transfer) is replaced by a fresh one that is still resumed', () => {
-  for (const moved of [{ repo: 'acme/old-name' }, { branch: 'feat/old-branch' }, { pr: 99 }]) {
+// #641: a repo rename / transfer is the ONLY mismatch -> the record (booked cost included) is kept, bound to the live slug.
+test('baseRecordFor: a repo rename / transfer keeps the whole record (cost, step, resumed) and says so', () => {
+  const entry = { phase: 'build', role: 'implementer', input: 10, output: 5, cacheRead: 0, cacheWrite: 0, usd: 1.25 };
+  const old = applyCheckpoint({ ...resumedRecord(), repo: 'old/x' }, { cost: { entry }, round: 2 }, { host: 'pc-1', now: NOW });
+  const { record, warnings } = baseRecordFor({ status: 'ok', record: old }, { ...ID, repo: 'new/x', step: 'build' });
+  assert.deepEqual(record, { ...old, repo: 'new/x' });
+  assert.ok(JSON.stringify(record.cost).includes('1.25'));
+  assert.deepEqual(warnings, ['the repo moved (the run record said "old/x", the PR is in "new/x"): carried the run record over']);
+  // the repo and the pr (or branch) both differ: another PR's record, replaced as before (cost dropped)
+  for (const also of [{ pr: 99 }, { branch: 'feat/old-branch' }]) {
+    const r = baseRecordFor({ status: 'ok', record: { ...old, ...also } }, { ...ID, repo: 'new/x' });
+    assert.equal(r.record.cost, undefined, JSON.stringify(also));
+    assert.match(r.warnings[0], /does not belong to this PR/);
+  }
+});
+
+// R9-F1: a record bound to another branch / PR is replaced, but the mark the merge gate reads is not dropped with it.
+test('baseRecordFor: a resumed record bound to another branch or PR is replaced by a fresh one that is still resumed', () => {
+  for (const moved of [{ branch: 'feat/old-branch' }, { pr: 99 }]) {
     const { record, warnings } = baseRecordFor({ status: 'ok', record: { ...resumedRecord(), ...moved } }, ID);
     assert.deepEqual(record.resumed, RESUMED, JSON.stringify(moved));
     assert.deepEqual([record.repo, record.branch, record.pr], [ID.repo, ID.branch, PR], 'bound to this PR again');
@@ -75,10 +91,11 @@ test('baseRecordFor: a resumed record bound to another repo or branch (rename / 
   }
 });
 
-test('recorder: after a repo rename the next record write keeps the merge gate reading the run as resumed', () => {
+test('recorder: after a repo rename the next record write keeps the merge gate reading the run as resumed (and the record)', () => {
   const gh = memoryGh();
-  seed(gh, { ...resumedRecord(), repo: 'acme/old-name' });
-  assert.deepEqual(recorderFor(gh).update({ step: 'merge' }).resumed, RESUMED);
+  seed(gh, { ...resumedRecord(), repo: 'acme/old-name', round: 4 });
+  const rec = recorderFor(gh).update({ step: 'merge' });
+  assert.deepEqual([rec.resumed, rec.round], [RESUMED, 4]);
   const after = readSummaryComment(gh, PR);
   assert.deepEqual([after.status, after.record.repo, after.record.resumed], ['ok', ID.repo, RESUMED]);
 });
