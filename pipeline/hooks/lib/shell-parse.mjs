@@ -2202,7 +2202,7 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';', afterClose 
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   // pipeLead (#352 R11-F2): of a later stage of a pipeline, the operator before the pipeline's FIRST stage (a later stage may come out before the first: a heredoc waiting, an empty group). Not enumerable.
-  // (Not `lead`: that is #373's keyword the segment starts with (shapeSeg, files-policy cdTarget); one name for both made `x | { …; }` and `x | if …` throw, and the line was given up on)
+  // (Not `kwLead`: that is #373's keyword the segment starts with (shapeSeg, files-policy cdTarget); one name for both made `x | { …; }` and `x | if …` throw, and the line was given up on)
   if (ctx.lead) Object.defineProperty(cmd, 'pipeLead', { value: ctx.lead, enumerable: false });
   // afterClose (#352 R7-F2): its `&&` follows the closer of a construct whose body may not have run (`fi &&`, `done &&`, `esac &&`, a group that may skip): it is chained to the construct, not to the body's last command. Not enumerable
   Object.defineProperty(cmd, 'afterClose', { value: afterClose, enumerable: false });
@@ -3319,8 +3319,8 @@ class Parser {
     if (!plain) { ctx.notWide = true; return; }
     if (kw) {
       this.shapeEvent(kw, seg.sep, n0);
-      // (the keyword is no part of the command: its raw text starts with it, see `lead`)
-      for (let k = outFrom; k < ctx.out.length; k++) if (ctx.out[k].depth === 0) Object.defineProperty(ctx.out[k], 'lead', { value: kw, enumerable: false });
+      // (the keyword is no part of the command: its raw text starts with it, see `kwLead`)
+      for (let k = outFrom; k < ctx.out.length; k++) if (ctx.out[k].depth === 0) Object.defineProperty(ctx.out[k], 'kwLead', { value: kw, enumerable: false });
     }
   }
 
@@ -4060,7 +4060,7 @@ export function simpleCommands(str, opts) {
   // shape: null unless the text is a WIDER whitelist than plainSeq: simple commands joined by && ; a newline || | |& or &, and at the top level only (not inside one another) a subshell `( … )`, a brace group
   // `{ …; }` or `if CMD; then … [else …] fi`, each holding such a sequence; nothing else (no `!`, coproc, always, function, loop, case, `elif`, `[[`, `time`, command-less segment, cut-short parse, heredoc the parser and
   // the shell may read differently). Then an array of the constructs' events, see shapeEvent. The cd narrowing of the files policy reads it: from the commands in order, each one's own join (`sep`) and these events it
-  // works out what a command surely ran after. A command that opens a segment with `if` / `then` / `else` / `{` has `lead` = that word (its `raw` starts with it). plainSeq is the narrower, older flag.
+  // works out what a command surely ran after. A command that opens a segment with `if` / `then` / `else` / `{` has `kwLead` = that word (its `raw` starts with it). plainSeq is the narrower, older flag.
   Object.defineProperty(ctx.out, 'shape', { value: !ctx.notWide && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign && ctx.shapeStack.length === 0 ? ctx.shapeEvents : null, enumerable: false });
   // heredocSpans: [start, end, quoted] of every heredoc body in the text (quoted: its delimiter was quoted, so nothing in it expands), or null when one cannot be located (read out of other text, no terminator, a parse that gave up)
   Object.defineProperty(ctx.out, 'heredocSpans', { value: ctx.hdForeign || ctx.truncated ? null : ctx.hdSpans, enumerable: false });

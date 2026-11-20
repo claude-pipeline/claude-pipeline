@@ -359,7 +359,7 @@ describe('#352: a pipeline stage that is a { } group or an if is parsed, not giv
   test('the stage keeps both marks: the keyword it starts with and the operator before the pipeline', () => {
     const cmds = simpleCommands('true && echo a | { cat; }');
     const cat = cmds.find((c) => c.argv[0] === 'cat');
-    assert.equal(cat.lead, '{');
+    assert.equal(cat.kwLead, '{');
     assert.equal(cat.pipeLead, '&&');
   });
 });
