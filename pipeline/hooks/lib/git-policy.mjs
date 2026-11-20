@@ -1331,7 +1331,16 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
       const shell = expansion.startsWith('!') || flags.some((f) => f.name === 's' || f.name === 'shell');
       ctx.ghAliases[name.toLowerCase()] = { expansion, shell };
       logAlias(ctx, `gh:${name.toLowerCase()}`);
-      const v = shell ? evalString(expansion.replace(/^!/, ''), dir, ctx, level + 1) : checkGh(['gh', ...splitArgs(expansion)], env, dir, ctx, raw, level + 1);
+      // (#571: a definition never runs the alias, so its expansion is judged on a copy of the state and every change it makes is put back, the alias just set kept; the logs are cut back too, so a later
+      // level close does not call an alias unsure for a write that never happened)
+      const [aliasLen, branchLen] = [aliasLogLen(ctx), (ctx.budget.branchLog ??= []).length];
+      let v;
+      try {
+        v = isolatedState(ctx, () => (shell ? evalString(expansion.replace(/^!/, ''), dir, ctx, level + 1) : checkGh(['gh', ...splitArgs(expansion)], env, dir, ctx, raw, level + 1)));
+      } finally {
+        ctx.budget.aliasLog.length = aliasLen;
+        ctx.budget.branchLog.length = branchLen;
+      }
       if (v && v.decision === 'deny') return deny(`gh alias "${name}" would expand to a blocked command: ${v.reason}`);
     }
     return null;

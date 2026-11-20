@@ -522,6 +522,23 @@ test('#570: a `!` git alias / gh shell alias that switches or rewrites an alias 
   allows('a gh shell alias that changes nothing', `${SET_STATUS}; gh alias set x '!echo hi'; gh x; git ship`);
 });
 
+// #571: `gh alias set NAME '!text'` only DEFINES the alias, the text does not run. It was judged on the live state, so its switch / alias writes became the line's own: `git config alias.ship 'push origin main'; gh alias set x
+// '!git config alias.ship status'; git ship` believed ship was status and sent main. The expansion is still judged (a blocked command in it is refused) but every change it makes is put back.
+test('#571: the expansion of a gh alias definition is judged, but what it would change is not the state the line goes on in', () => {
+  const SET_STATUS = 'git config alias.ship status';
+  const p = { 'p.sh': `${PB} origin HEAD\n` };
+  const MAINPUSH = /pushing to main/;
+  denies('a definition would rewrite an alias: not believed', `git config alias.ship '${PUSH} origin ${MAIN}'; gh alias set x '!git config alias.ship status'; git ship`, {}, MAINPUSH);
+  denies('a definition would switch branch: not believed', `git switch ${MAIN}; gh alias set x '!git switch agent/x'; bash ./p.sh`, p, MAINPUSH);
+  denies('the same alias run: the use site is a child text, the branch is unknown', `git switch agent/x; gh alias set x '!git switch ${MAIN}'; gh x; ${PB} origin HEAD`, {}, BRANCH);
+  allows('a definition only (nothing ran): the push is on agent/x', `git switch agent/x; gh alias set x '!git switch ${MAIN}'; ${PB} origin HEAD`);
+  allows('a definition with a plain expansion', `${SET_STATUS}; gh alias set x 'pr view'; git ship`);
+  allows('a definition with a harmless shell expansion', `${SET_STATUS}; gh alias set x '!echo hi'; git ship`);
+  // (the logs of the simulated writes are cut back: a definition in a subshell / a branch that never runs does not leave `ship` unsure)
+  allows('F7: a definition in a subshell', `${SET_STATUS}; ( gh alias set ship2 '!${SHIP}' ); git ship`);
+  allows('F7: a definition in an if that does not run', `${SET_STATUS}; if false; then gh alias set y '!${SHIP}'; fi; git ship`);
+});
+
 // R39-F3 / F4 (the arbiter's reading: a memo hit replays an end state without the writes of the first judgement): the same text run a second time in the same state is still unknown afterwards
 test('#362 R39-F3 / F4: a startup file or a line-written script judged once in a state is still unknown to its caller the second time', () => {
   const rc = { rc: `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`, 'noop.sh': 'echo hi\n' };
