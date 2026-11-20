@@ -288,23 +288,29 @@ function nextDir(dir, name, argv, ctx, cdpath = false, env = {}) {
   // R30-F3: options, and the `--` that ends them, count only BEFORE the first operand (both shells stop reading options there): `cd DIR -P` is zsh's two-word `cd OLD NEW` / bash's "too many
   // arguments" and fails, `cd DIR --` the same: a dash word after the first operand is an operand, so these have two operands and leave the directory unknown)
   let first = 0;
+  let physical = false; // (#494: `cd -P` goes to the real directory, a `..` after it to the real parent; the last of -L / -P wins, per letter: `-LP` is -P)
   for (; first < args.length; first++) {
     const a = args[first];
     if (a === '--') { first++; break; }
     if (!(a.length > 1 && a[0] === '-')) break;
     if (!(name === 'cd' && /^-[LP]+$/.test(a))) return null;
+    for (const ch of a.slice(1)) physical = ch === 'P';
   }
+  // (#494: the walk's directories are lexical. A physical cd is followed only when the lexical and the real place are one: the directory it starts from (not for an absolute target, which does not depend on it)
+  // and the target hold no symlink; otherwise unknown. `cd link && cd -P ..`, `cd -P link && cd ..` and a bare `cd -P` to a HOME that is a link go to a parent the walk would not name.)
+  const linkFree = (p) => { const r = realLocation(ctx.realpath, p); return r !== null && path.resolve(r) === path.resolve(p); };
+  const phys = (j, absolute) => (!physical || j === null || ((absolute || dir === null || linkFree(dir)) && linkFree(j)) ? j : null);
   const operands = args.slice(first);
   if (operands.length > 1) return null;
   // Why: a bare cd goes to the HOME the cd builtin sees: its own prefix (`HOME=d cd`), else the line's (Codex review 3 of #50)
   if (operands.length === 0) {
     if (name !== 'cd') return null;
-    if (!Object.hasOwn(env, 'HOME')) return lineHome(ctx);
+    if (!Object.hasOwn(env, 'HOME')) return phys(lineHome(ctx), true);
     const h = expandVars(env.HOME, ctx);
-    return path.isAbsolute(h) && !DYNAMIC.test(h) ? path.resolve(h) : null;
+    return path.isAbsolute(h) && !DYNAMIC.test(h) ? phys(path.resolve(h), true) : null;
   }
   if (cdpath && !path.isAbsolute(operands[0]) && !/^(?:\.\.?(?:\/|$)|~)/.test(operands[0])) return null;
-  return joinDir(dir, operands[0], ctx);
+  return phys(joinDir(dir, operands[0], ctx), path.isAbsolute(operands[0]) || operands[0].startsWith('~'));
 }
 
 // The repository does not change while a line is judged, so each lookup is made once per evaluation (a push judged in many mixes, a

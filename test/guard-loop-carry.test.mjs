@@ -194,6 +194,36 @@ test('#352 R30-F3: a -P / -- after the cd operand makes the cd fail (two operand
   allows('cd -- operand', `cd /work/other && cd -- ${GIT_ROOT} && ${PB} origin HEAD`);
   allows('cd -P sub && cd .. in a loop', `for i in 1 2; do ${PB} origin HEAD; cd -P sub && cd ..; done`);
 });
+// (#494: `cd -P` goes to the real directory and a `..` after it to the real parent, while the walk's directories are lexical: `cd -P link && cd .. && push` was judged in /work/repo and ran in /work/other (main). A physical cd is
+// followed only when the directory it starts from and its target hold no symlink; the last of -L / -P wins, per letter (`-LP` is -P). Link table: /work/repo/link -> /work/other/sub, a repository on main.)
+test('#494: a physical cd (-P) through a symlink leaves the directory unknown; through real directories, or a logical cd, it is followed', () => {
+  const links = { [`${GIT_ROOT}/link`]: '/work/other/sub' };
+  const at = (cmd) => evaluateGitCommand(cmd, {
+    cwd: GIT_ROOT, home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [],
+    realpath: (p) => { const q = resolve(p); for (const [l, t] of Object.entries(links)) if (q === resolve(l) || q.startsWith(resolve(l) + '/')) return resolve(t) + q.slice(resolve(l).length); return q; }, ...fakeFs(GIT_ROOT, {}),
+  });
+  const H = `${PB} origin HEAD`;
+  for (const [what, line] of [
+    ['cd link, then cd -P ..', `cd link && cd -P .. && ${H}`],
+    ['cd -P link, then cd -P ..', `cd -P link && cd -P .. && ${H}`],
+    ['cd -P link, then cd ..', `cd -P link && cd .. && ${H}`],
+    ['cd -P link, push there', `cd -P link && ${H}`],
+    ['bare cd -P with HOME a link, then cd ..', `export HOME=${GIT_ROOT}/link; cd -P && cd .. && ${H}`],
+    ['-LP: the last letter wins (physical)', `cd -LP link && cd .. && ${H}`],
+  ]) {
+    const r = at(line);
+    assert.equal(r.decision, 'deny', `${what}: allowed`);
+    assert.match(r.reason, BRANCH, `${what}: ${r.reason}`);
+  }
+  for (const [what, line] of [
+    ['cd -P into a real directory, then cd -P ..', `cd sub && cd -P .. && ${H}`],
+    ['cd -P into a real directory, then cd ..', `cd -P sub && cd .. && ${H}`],
+    ['bare cd -P with HOME a real directory', `export HOME=${GIT_ROOT}/sub; cd -P && cd .. && ${H}`],
+    ['a logical cd through the link, then cd ..', `cd link && cd .. && ${H}`],
+    ['an absolute -P target does not depend on the directory it starts from', `cd link && cd -P ${GIT_ROOT} && ${H}`],
+    ['-PL: the last letter wins (logical)', `cd -PL link && cd .. && ${H}`],
+  ]) assert.equal(at(line).decision, 'allow', what);
+});
 // (#352 R35-B1, R35-B2, R35-F1, R35-F2: ONE rule. A cd / state change is trusted to have run only when it surely did: in a loop's replay a cd REPLACES the places the body may end in only when it is
 // certain there (after ;, not in a branch, an inner loop, the background or a pipeline stage, not negated, every level between the loop and it entered by ;, no redirection that can fail on it, on the
 // closer of its { } group or on the eval that holds it); any other ADDS its target. A `continue` that reaches the loop ends an iteration where it stands. On the straight line, a change with a
