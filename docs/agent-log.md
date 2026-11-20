@@ -301,3 +301,4 @@ full record.
 - 2026-11-20 · #705 · Guard: refuse switching off git hooks on push; protect the outbound-scan config folder (#661, #648) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 655 runs (177 high)
 - 2026-11-20 · #688 · Live-database guard, part 2: supabase CLI / Management API rule (#262) · risk high · rounds 7 · arbiter 7 (fix-verify 4) · blocked · Codex 7d: 664 runs (183 high)
 - 2026-11-20 · #737 · Guard: stop 4 files-guard false refusals (node -e reads, JS brackets, out= substitution, 200 KB cap #691) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 691 runs (190 high)
+- 2026-11-20 · #749 · Guard: fewer false refusals of quoted text, xargs-in-quotes gap closed, registry writer protected (#683 #610 #624 #617 #618 #620 #609 #605 #600) · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 693 runs (190 high)
