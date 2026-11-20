@@ -1069,7 +1069,7 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
     '## R1-S1', '## R1-S2', 'SUGGESTION', 'maintainability', 'Rename helper', 'src/b.js:3',
     'Codex detail:', 'x is dereferenced before it is checked', 'Codex reasoning:', 'compute(x.y) throws',
     'REJECT (confidence high) - judge: REJECT R1-S1', 'REJECT (confidence low)', 'Test result: none',
-    'Code at HEAD, src/b.js lines 1-8:', 'export const w3 = 3;',
+    `Code at the reviewed head ${w.head.slice(0, 12)}, src/b.js lines 1-8:`, 'export const w3 = 3;',
   ]) assert.ok(text.includes(needle), `missing ${needle}`);
   assert.ok(!text.includes('## R1-B1') && !text.includes('## R1-W1'), 'only items that need the arbiter are in the input');
 
@@ -1078,7 +1078,7 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.digest, r.json.digest, 'deterministic for unchanged state');
 });
 
-test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, and cannot break out of its fence', (t) => {
+test('arbiter needed: the excerpt is +/-20 lines of the file at the reviewed head, numbered, and cannot break out of its fence', (t) => {
   const w = world(t);
   w.repo.write('src/f.js', Array.from({ length: 60 }, (_, i) => (i === 29 ? '// ``` closes a naive fence' : `const f${i + 1} = ${i + 1};`)).join('\n') + '\n');
   const head2 = w.repo.commit('add f');
@@ -1086,7 +1086,7 @@ test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, 
   assertExit(w.judge(1, { 'R1-B1': ['REJECT'] }), 0);
   const r = w.cli(['arbiter', 'needed', '--round', '1']);
   const text = readFileSync(r.json.inputPath, 'utf8');
-  assert.match(text, /Code at HEAD, src\/f\.js lines 10-50:/);
+  assert.match(text, /Code at the reviewed head [0-9a-f]{12}, src\/f\.js lines 10-50:/);
   assert.match(text, /^10 \| const f10 = 10;$/m);
   assert.match(text, /^50 \| const f50 = 50;$/m);
   assert.doesNotMatch(text, /const f9 = 9;/);
@@ -2384,7 +2384,7 @@ test('codex-review: a finding path that tries to leave the repository reads noth
   assertExit(needed, 0);
   const input = readFileSync(needed.json.inputPath, 'utf8');
   assert.ok(!input.includes('root:') && !input.includes('/bin/'), 'no file outside the repository is quoted');
-  assert.equal((input.match(/does not exist at HEAD/g) ?? []).length >= 2, true);
+  assert.equal((input.match(/does not exist at the reviewed head/g) ?? []).length >= 2, true);
 });
 
 // -- the ruled cache

@@ -110,24 +110,26 @@ function fence(text) {
   return '`'.repeat(Math.max(3, longest + 1));
 }
 
-function excerptBlock(item, root) {
+// The excerpt is read at the commit the round reviewed (round.toHead), so a HEAD that moved on after the round was recorded cannot show Fable code Codex never saw.
+function excerptBlock(item, root, rev = 'HEAD') {
   if (!item.file) return '_No file given._';
+  const at = rev === 'HEAD' ? 'HEAD' : `the reviewed head ${rev.slice(0, 12)}`;
   let content = null;
   try {
-    content = showFile('HEAD', item.file, { cwd: root });
+    content = showFile(rev, item.file, { cwd: root });
   } catch (err) {
     if (!(err instanceof GitError)) throw err;
   }
-  if (content === null) return `_${oneLine(item.file)} does not exist at HEAD._`;
+  if (content === null) return `_${oneLine(item.file)} does not exist at ${at}._`;
   const w = excerptWindow(content, item.line, { maxLines: 2 * 20 + 1 });
   if (!w) return `_No code at line ${item.line} of ${oneLine(item.file)}._`;
   const width = String(w.end).length;
   const body = w.lines.map((text, i) => `${String(w.start + i).padStart(width)} | ${text}`).join('\n');
   const f = fence(body);
-  return [`Code at HEAD, ${oneLine(item.file)} lines ${w.start}-${w.end}:`, '', `${f}`, body, f].join('\n');
+  return [`Code at ${at}, ${oneLine(item.file)} lines ${w.start}-${w.end}:`, '', `${f}`, body, f].join('\n');
 }
 
-function itemSection(item, root) {
+function itemSection(item, root, rev) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : '(no file)';
   const j = item.judge;
   const t = item.test ?? { status: 'none', evidence: '' };
@@ -152,7 +154,7 @@ function itemSection(item, root) {
     '',
     String(item.codexReasoning ?? '').trim(),
     '',
-    excerptBlock(item, root),
+    excerptBlock(item, root, rev),
     '',
   ].join('\n');
 }
@@ -509,7 +511,7 @@ async function neededLocked(values, n, root, ctx) {
   const tm = review ? await threatModelContext(round, diffFileList, items, root, forkPoint) : null;
   const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: forcedFull, trusted: tm.config, ...(diffFileList === null ? {} : { files: diffFileList }) }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
   const itemsPart = items.length > 0
-    ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root))]
+    ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root, typeof round.toHead === 'string' ? round.toHead : 'HEAD'))]
     : ['# Items to rule on (0)', '', '_Codex raised nothing left to rule on in this round: your own review is the whole job._', ''];
   // The bar needs the merge-base view for the agent: without it (git cannot list the range) no bar is stated, and `apply` waives nothing.
   let regression = review ? tm.regression : null;
