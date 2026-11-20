@@ -2584,15 +2584,16 @@ const readElsewhere = (cmds, k, own) => cmds.some((d) => [...d.argv, ...Object.e
 const DATA_READERS = new Set(['ps', 'kill', 'pgrep', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'ls', 'head', 'tail', 'wc', 'cut', 'tr', 'basename', 'dirname', 'realpath', 'readlink', 'stat', 'file', 'du', 'lsof', 'cmp', 'shasum', 'sha256sum', 'md5', 'date']);
 // R1: a plain loop `read NAME` gives NAME one value only known at run time, judged where it lands (see collectAssignments): it qualifies only when every word of the line that reads it is a plain
 // argument (not the command word, not an env value: `g=$f` copies it, `X=$f cmd` hands it to cmd) of a DATA_READERS command. Any other reader, a redirect target, or a name the shell, git or gh read for themselves stays unknown (unsure).
+// R2: and only when nothing ELSE on the line could run what a reader prints: every command of the line is a bare-named (no `/`) DATA_READERS command or a `read`, and no redirect is a process substitution
+// (`echo "$c" | sh`, `cat "$f" | xargs rm`, `echo "$c" > >(sh)`, `./ps -p $f`). The keywords (while / do / done) are no commands of the list; a loop's own redirect (`done < list`) is a command without words.
 function readLandsAsData(cmds, k) {
   if (SPECIAL_NAMES.test(k)) return false;
   for (const c of cmds) {
-    if (Object.values(c.env ?? {}).some((w) => wordReads(w, k)) || (c.redirects ?? []).some((r) => wordReads(r.target ?? '', k))) return false;
+    if (Object.values(c.env ?? {}).some((w) => wordReads(w, k)) || (c.redirects ?? []).some((r) => wordReads(r.target ?? '', k) || /^[<>]\(/.test(r.target ?? ''))) return false;
     if (!c.argv.length) continue;
-    if (wordReads(c.argv[0], k)) return false;
-    if (!c.argv.slice(1).some((w) => wordReads(w, k))) continue;
-    const nm = baseName(c.argv[0]);
-    if (!DATA_READERS.has(nm) || (nm === 'printf' && c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) return false;
+    const head = c.argv[0];
+    if (head === 'read') { if (c.argv.slice(1).some((w) => wordReads(w, k))) return false; continue; }
+    if (head.includes('/') || !DATA_READERS.has(head) || (head === 'printf' && c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) return false;
   }
   return true;
 }

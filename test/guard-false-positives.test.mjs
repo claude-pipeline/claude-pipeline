@@ -490,6 +490,11 @@ test('11: `while read p` in a pipe stage binds p once, like `while read pid a b`
     const cmd = `while read f; do ${body}; done < list`;
     assert.equal(gitOf(cmd).decision, 'deny', cmd);
   }
+  // R2: a data command prints the value and a later stage, a process substitution or a program by path can run it: any other command on the line keeps the count at two
+  for (const body of ['echo "$f" | sh', "printf '%s\\n' \"$f\" | bash", 'cat "$f" | bash', 'echo "$f" | xargs rm -rf', './ps -p $f', '/tmp/echo "$f"']) {
+    const cmd = `while read f; do ${body}; done < list`;
+    assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  }
   // (outside a loop, a name assigned elsewhere, or a read with options stays unknown)
   for (const cmd of ['read f; echo hi | sh -c $f', 'f=a; ls | while read f; do ps -p $f; done; bash $f', 'ls | while read -p x f; do ps -p $f; done']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
 });
