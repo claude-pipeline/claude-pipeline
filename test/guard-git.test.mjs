@@ -210,6 +210,32 @@ const DENY = [
   ['git -c push.default=${V:-up}stream push'],
   ['git config $K v; git push'],
   ['git config ${K:-remote.origin.push} v; git push'],
+  // cp #661: switching off the repository's git hooks (the pre-push hook is a safety gate): core.hooksPath in any form, --no-verify, a config write of the key
+  ['git -c core.hooksPath=/dev/null push origin agent/x'],
+  ['git -c core.HooksPath=/dev/null push origin agent/x'], // any key casing
+  ['git -c CORE.HOOKSPATH=/dev/null push -u origin agent/x'],
+  ['git --config-env=core.hooksPath=HP push origin agent/x'],
+  ['git --config-env core.hooksPath=HP push origin agent/x'],
+  ['GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git push origin agent/x'],
+  ['export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null; git push origin agent/x'],
+  ['K=core.hooksPath; git -c $K=/dev/null push origin agent/x'],
+  ['git push --no-verify origin agent/x'],
+  ['git push origin agent/x --no-verify'],
+  ['git push --no-verify -u origin agent/x'], // (moved from the allow list: cp #661)
+  ['git push --no-v origin agent/x'], // git takes any unambiguous prefix
+  ['git push --no-ver origin agent/x'],
+  ['git config core.hooksPath /dev/null'],
+  ['git config core.hooksPath /dev/null && git push origin agent/x'],
+  ['git config --global core.HOOKSPATH /dev/null'],
+  ['git config --unset core.hooksPath'],
+  ['git config --global --unset-all core.hooksPath'],
+  ['git config --add core.hooksPath /dev/null'],
+  ['git config --replace-all core.hooksPath /dev/null'],
+  ['git config --local core.hooksPath ""'],
+  ['git config set core.hooksPath /dev/null'],
+  ['git config unset core.hooksPath'],
+  ['git config --remove-section core'],
+  ['K=core.hooksPath; git config $K /dev/null'],
 ];
 
 const ALLOW = [
@@ -506,7 +532,6 @@ const MORE_ALLOW = [
   ['git push', { pushDest: new Error('boom'), branch: 'agent/x' }],
   ['git push origin agent/x', { pushDest: 'origin/main' }], // explicit refspec: @{push} is irrelevant
   ['git push origin HEAD:agent/x', { pushDest: 'origin/main' }],
-  ['git push --no-verify -u origin agent/x'],
   ['git push --no-force-with-lease origin agent/x'],
   ['git push --follow-tags --atomic origin agent/x'],
   ['git push --dry-run origin agent/x'],
@@ -849,6 +874,22 @@ const BYPASS_ALLOW = [
   ['git -c user.name=x push'],
   ['git -c push.default=simple push'],
   ['git -c push.followTags=true push'],
+  // cp #661: other keys, reads and ordinary pushes stay open
+  ['git push -u origin agent/x'],
+  ['git -c user.name=x push -u origin agent/x'],
+  ['git -c core.pager=cat push origin agent/x'],
+  ['git --config-env=user.name=NAME push origin agent/x'],
+  ['GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x git push origin agent/x'],
+  ['git push --no-thin origin agent/x'],
+  ['git push --verify origin agent/x'],
+  ['git config --get core.hooksPath'],
+  ['git config core.hooksPath'],
+  ['git config --global --get core.hooksPath'],
+  ['git config get core.hooksPath'],
+  ['git config --list --show-origin'],
+  ['git config user.name x'],
+  ['git config --unset user.name'],
+  ['git commit -m "do not use core.hooksPath or --no-verify" && git push origin agent/x'],
   ['git config alias.st status && git st'],
   ['gh alias set pv "pr view" && gh pv 5'],
   ['LABEL=bug; gh pr edit 3 --add-label $LABEL'],

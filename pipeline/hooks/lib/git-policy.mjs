@@ -65,6 +65,12 @@ const GIT_ENV_CONFIG = /^GIT_CONFIG_(?:COUNT|KEY_\d+|VALUE_\d+|PARAMETERS|GLOBAL
 const RISKY_CONFIG = (key, value) => DYNAMIC.test(key) || /^remote\..*\.push$/.test(key) || /^branch\./.test(key)
   || (key === 'push.default' && (DYNAMIC.test(value) || /^(upstream|tracking|matching)$/i.test(value)));
 
+// cp #661: core.hooksPath points git away from the repository's own hooks (.githooks/pre-push is a safety gate), and --no-verify skips them, so neither may be set on a push or written by `git config`.
+const HOOKS_KEY = (key) => String(key).toLowerCase() === 'core.hookspath';
+const hooksPushReason = (via) => `this push switches off the repository's git hooks (core.hooksPath set by ${via}); the repo's own pre-push hook is a safety gate. Push without the override: git push -u origin agent/<slug>.`;
+const NO_VERIFY_REASON = '`git push --no-verify` skips the repository\'s pre-push hook, which is a safety gate. Push without it: git push -u origin agent/<slug>.';
+const HOOKS_CONFIG_REASON = '`git config` may not set or unset core.hooksPath: it points git away from the repository\'s own hooks, and the pre-push hook is a safety gate. The owner changes it from a terminal.';
+
 // Index of the first `sep` that is NOT inside a `${…}`, `$(…)`, `$((…))` or backtick expansion; -1 when there is none or the
 // word cannot be split reliably (an unbalanced expansion, or a quote / backslash inside one, which can hide a bracket or the
 // separator). -1 makes the caller treat the whole word as ONE run-time value, which is then denied: `${B:-x}` is a single
@@ -540,6 +546,7 @@ function pushReading(args, dir, gitDir, ctx, configs) {
     if (isPrefixOf(n, 'force-with-lease') || isPrefixOf(n, 'force-if-includes')) return deny(FORCE_REASON);
     if (isPrefixOf(n, 'mirror')) return deny('`git push --mirror` overwrites every remote ref, including main. It is blocked.');
     if (isPrefixOf(n, 'all') || isPrefixOf(n, 'branches')) return deny('`git push --all` pushes every branch, including main. Push your agent branch by name.');
+    if (isPrefixOf(n, 'no-verify', 4)) return deny(NO_VERIFY_REASON); // cp #661: git takes any unambiguous prefix (--no-v)
     if (n === 'repo' || isPrefixOf(n, 'repo', 3)) repoGiven = true;
   }
   if (positionals.some((p) => p.startsWith('+'))) return deny(FORCE_REASON);
@@ -577,9 +584,16 @@ function parseGitGlobal(argv, dir, env, ctx) {
   let gitDirUnknown = !envGitDir.known; // exported twice: which repository the command acts on cannot be told
   let gitDir = typeof envGitDir.value === 'string' && envGitDir.value ? joinDir(d, envGitDir.value, ctx) : null;
   const configs = [];
+  const configEnvKeys = []; // cp #661: --config-env=<key>=<ENVVAR> (the value is an environment variable's NAME, so it is no `configs` entry)
   let i = 1;
   for (; i < argv.length; i++) {
     const t = argv[i];
+    if (t === '--config-env' || t.startsWith('--config-env=')) {
+      const kv = t === '--config-env' ? (argv[++i] ?? '') : t.slice('--config-env='.length);
+      const eq = splitIndex(kv, '=');
+      configEnvKeys.push(expandVars(eq < 0 ? kv : kv.slice(0, eq), ctx).toLowerCase());
+      continue;
+    }
     if (t === '-C') { d = joinDir(d, argv[++i], ctx); continue; }
     if (t === '-c') {
       // Only the KEY is expanded (`-c $K=v`). The value stays as written: an alias body (`alias.p='!V=…; git push origin $V'`)
@@ -595,7 +609,7 @@ function parseGitGlobal(argv, dir, env, ctx) {
     if (t.startsWith('-')) continue; // boolean global option, or --opt=value
     break;
   }
-  return { d, gitDir, gitDirUnknown, configs, sub: argv[i], args: argv.slice(i + 1) };
+  return { d, gitDir, gitDirUnknown, configs, configEnvKeys, sub: argv[i], args: argv.slice(i + 1) };
 }
 
 // checkout / switch: which branch is the directory on afterwards?
@@ -636,22 +650,39 @@ function trackBranch(args, d, gitDir, ctx) {
   }
 }
 
+// cp #661: the environment's GIT_CONFIG_KEY_n / GIT_CONFIG_PARAMETERS, set by this command's prefix or earlier on the line, naming core.hooksPath -> a reason, else null.
+function envHooksPathReason(env, ctx) {
+  for (const n of new Set([...Object.keys(env), ...assignedNames(ctx)])) {
+    const isKey = /^GIT_CONFIG_KEY_\d+$/i.test(n);
+    if (!isKey && !/^GIT_CONFIG_PARAMETERS$/i.test(n)) continue;
+    if (!Object.hasOwn(env, n) && unsureVar(ctx, n)) return `${n} was assigned more than once on this line, so whether it sets core.hooksPath cannot be verified. Assign it once.`;
+    const v = expandVars(Object.hasOwn(env, n) ? env[n] : ctx.vars[n] ?? '', ctx);
+    if (DYNAMIC.test(v)) return `${n} is built at run time, so whether it sets core.hooksPath cannot be verified. Write it out or drop it.`;
+    if (isKey ? HOOKS_KEY(v.trim()) : /core\.hookspath/i.test(v)) return hooksPushReason(n);
+  }
+  return null;
+}
+
 function trackConfig(args, ctx) {
   let { flags, positionals } = parseOpts(args, { longValue: ['file', 'blob', 'type', 'default', 'comment'], shortValue: 'f' });
   let writes = positionals.length >= 2 || flags.some((f) => ['unset', 'unset-all', 'add', 'replace-all', 'remove-section', 'rename-section'].includes(f.name));
   if (['set', 'unset'].includes(positionals[0])) { writes = true; positionals = positionals.slice(1); }
   const key = String(positionals[0] ?? '').toLowerCase();
+  // cp #661 (a section removed or renamed away takes its keys with it: `--remove-section core`)
+  const spelled = expandVars(String(positionals[0] ?? ''), ctx).toLowerCase();
+  if (writes && (HOOKS_KEY(spelled) || (spelled === 'core' && flags.some((f) => ['remove-section', 'rename-section'].includes(f.name))))) return deny(HOOKS_CONFIG_REASON);
   if (key.startsWith('alias.') && positionals.length >= 2) { ctx.gitAliases[key.slice('alias.'.length)] = positionals[1]; logAlias(ctx, `git:${key.slice('alias.'.length)}`); }
   if (writes && RISKY_CONFIG(key, String(positionals[1] ?? ''))) ctx.cfgDirty = true;
   // (see directMergeVerdict; security review of de62b36: url.<base>.insteadOf rewrites a remote's URL, include / includeIf pull in other config)
   if (writes && (DYNAMIC.test(key) || key === '' || /^(?:remote|url|include|includeif|core)\./.test(key))) ctx.ghRepoDirty = true;
+  return null;
 }
 
 function trackGit(sub, args, g, ctx) {
   const { d } = g;
   if (sub === 'checkout' || sub === 'switch') trackSwitch(sub, args, d, ctx);
   else if (sub === 'branch') trackBranch(args, d, g.gitDir, ctx);
-  else if (sub === 'config') trackConfig(args, ctx);
+  else if (sub === 'config') return trackConfig(args, ctx);
   else if (sub === 'remote' && args.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true; // (aliases expanded: see directMergeVerdict)
   else if (sub === 'rebase') {
     // `git rebase <upstream> <branch>` checks <branch> out first
@@ -705,10 +736,15 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
       if (why) return deny(why);
     }
     ctx.envCfgDirty = [...Object.keys(env), ...assignedNames(ctx)].some((k) => GIT_ENV_CONFIG.test(k));
+    // cp #661: no override of core.hooksPath (-c in any key casing, --config-env, GIT_CONFIG_* env); --no-verify is refused in pushReading
+    const hooksKey = g.configs.find((c) => HOOKS_KEY(c.key));
+    if (hooksKey || g.configEnvKeys.some(HOOKS_KEY)) return deny(hooksPushReason(hooksKey ? '-c' : '--config-env'));
+    if (g.configs.some((c) => DYNAMIC.test(c.key))) return deny('a -c key on this push is built at run time, so whether it sets core.hooksPath (the repository\'s git hooks) cannot be verified. Write the key out.');
+    const envWhy = envHooksPathReason(env, ctx);
+    if (envWhy) return deny(envWhy);
     return checkPush(args, g.d, g.gitDir, ctx, g.configs);
   }
-  trackGit(sub, args, g, ctx);
-  return null;
+  return trackGit(sub, args, g, ctx) ?? null;
 }
 
 // ---- gh -------------------------------------------------------------------------------------------------
