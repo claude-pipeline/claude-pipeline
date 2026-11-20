@@ -2876,6 +2876,8 @@ class Parser {
         this.ctlOpen(kind, kind !== 'fn' && segNeg(seg), seg);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
+        // (`coproc { exit 1; }`: the group runs in a background subshell, so an exit in it leaves no shell: its level carries `co` for git-policy's settle, as the `coproc exit 1` word group does with `wrapped`)
+        if (kind !== 'fn' && seg.words.some((w) => w.text === 'coproc' && w.qa < 0)) this.ctx.up[this.ctx.up.length - 1].co = true;
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)

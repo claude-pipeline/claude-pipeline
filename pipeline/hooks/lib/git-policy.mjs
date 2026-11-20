@@ -3298,12 +3298,12 @@ function evalString(str, startDir, ctx, level, child = false) {
         if (!deeper) return exits(x);
         // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
         // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
-        // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above))
+        // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above). A redirected / loop-body move is not proven by an exit in a `coproc { }` level: it runs in a background subshell (`co`))
         const between = c.up.slice(x.up.length);
         let k = i + 1;
         while (cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].up?.length ?? 0) > x.up.length) { if ((cmds[k].redirects ?? []).length > 0) break; k++; }
         const closerRedir = cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].redirects ?? []).length > 0;
-        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
+        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.sep === '||' && !((x.redir || x.loopOnly) && e.co === true)) && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
       if (op === '||' || x.cond) forget(x);
       return false;
