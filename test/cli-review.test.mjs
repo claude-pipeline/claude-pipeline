@@ -257,7 +257,7 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   assert.deepEqual([state.pr, state.repo, state.branch, state.risk, state.lightLane, state.maxRounds], [7, 'acme/widgets', 'feat/x', 'low', false, 2]);
   assert.equal(r.json.reviewer, 'judge', 'a low-risk PR with no sensitive path is triaged by the judge');
   assert.equal(state.reviewer, 'judge');
-  assert.deepEqual([state.rounds[0].fableRequired, state.rounds[0].codexModel, state.rounds[0].forkPoint], [undefined, 'gpt-6-astra', w.base]);
+  assert.deepEqual([state.rounds[0].fableRequired, state.rounds[0].codexModel, state.rounds[0].forkPoint], [undefined, 'gpt-6.2-astra', w.base]);
   const round = state.rounds[0];
   assert.deepEqual([round.n, round.fromHead, round.toHead], [1, w.base, w.head]);
   assert.equal(round.contentHashAtToHead, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
@@ -281,7 +281,7 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   assert.match(at('-o'), /[\\/]round-1[\\/]attempt-[0-9a-f]{16}[\\/]codex-raw\.json$/, 'Codex writes into the attempt\'s own folder; the winner\'s copy is round-1/codex-raw.json');
   assert.equal(at('-C'), w.repo.dir);
   assert.match(at('--output-schema'), /codex-findings\.schema\.json$/);
-  assert.ok(call.argv.includes('model="gpt-6-astra"') && call.argv.includes('model_reasoning_effort="high"'));
+  assert.ok(call.argv.includes('model="gpt-6.2-astra"') && call.argv.includes('model_reasoning_effort="high"'));
   assert.equal(call.argv.at(-1), '-');
   assert.match(call.stdin, /PR: #7/);
   assert.match(call.stdin, /Title: Add compute/);
@@ -407,7 +407,7 @@ test('codex-review: each real Codex run, answered or failed, is logged in the us
   assert.equal(lines.length, 2);
   assert.deepEqual(lines.map((l) => l.ok), [false, true]);
   for (const l of lines) {
-    assert.deepEqual([l.v, l.kind, l.repo, l.pr, l.round, l.effort, l.model], [1, 'review', 'acme/widgets', 7, 1, 'high', 'gpt-6-astra']);
+    assert.deepEqual([l.v, l.kind, l.repo, l.pr, l.round, l.effort, l.model], [1, 'review', 'acme/widgets', 7, 1, 'high', 'gpt-6.2-astra']);
     assert.ok(Math.abs(Date.parse(l.ts) - Date.now()) < 60_000, 'ts is the run time');
     assert.equal('resolutionOnly' in l, false);
   }
@@ -1915,7 +1915,7 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
   const record = reviewJson(body);
   assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest', 'stateHash']);
   assert.deepEqual(record, {
-    contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6-astra', modelProofDigest: null,
+    contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6.2-astra', modelProofDigest: null,
     stateHash: reviewContentHash(w.state()), // the state review-complete published: the owner-go check binds the marker to it
   });
   assert.deepEqual(r.json.review, record);

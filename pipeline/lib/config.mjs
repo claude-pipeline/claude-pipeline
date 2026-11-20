@@ -95,7 +95,7 @@ export const DEFAULTS = deepFreeze({
     ],
   },
   review: {
-    codex_model: 'gpt-6-astra',
+    codex_model: 'gpt-6.2-astra',
     // low|medium|high: round 1 by the PR's risk; followup: every later round. small_fix: the effort of a fix-check round whose reviewed range is at most
     // small_fix_lines changed lines, adds no new file and touches no sensitive path (also used for every non-protected round when the weekly Codex governor is soft).
     // The review command refuses an --effort that is not the configured one for the round.

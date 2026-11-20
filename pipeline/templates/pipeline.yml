@@ -141,7 +141,7 @@ hard_stops:                    # project extras on top of the universal list
 review:
   # Reviews use codex_model and effort as committed on the default branch: a higher effort in your working copy applies at once; a lower effort or another codex_model
   # applies once it is on the default branch and this branch includes it. codex_model is a model id (letters, digits, . _ -).
-  codex_model: gpt-6-astra
+  codex_model: gpt-6.2-astra
   effort: {low: medium, medium: medium, high: high, followup: medium, small_fix: low, small_fix_lines: 40}
                                 # low/medium/high: round 1 by the PR's risk; followup: later rounds. small_fix: the effort of a fix-check round whose reviewed
                                 # range is at most small_fix_lines changed lines, adds no new file and touches no sensitive path (also every non-protected round
