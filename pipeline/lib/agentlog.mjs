@@ -233,7 +233,7 @@ function readRegularFile(run, ref, rel, { strictRef = false } = {}) {
 // A commit on top of `parent` (or a root commit) whose tree contains ONLY `rel`, built fresh from `text`: nothing is carried over
 // from the parent's tree (a file someone planted on the branch, say a workflow, never rides into our commit). Built with plumbing in a
 // private temp index: the caller's index, HEAD, branches and working tree are never read or written.
-function commitFile({ root, g, rel, text, parent, message }) {
+function commitFile({ root, g, rel, text, parent, message, anonymous = false }) {
   const dir = mkdtempSync(join(tmpdir(), 'cp-agent-log-'));
   try {
     const env = { GIT_INDEX_FILE: join(dir, 'index') };
@@ -243,9 +243,10 @@ function commitFile({ root, g, rel, text, parent, message }) {
     const tree = run(['write-tree']).trim();
     let ident = {};
     try {
+      if (anonymous) throw new Error('fixed identity'); // a public (scan-listed) repository never gets the configured name and email
       g(['var', 'GIT_AUTHOR_IDENT'], root);
       g(['var', 'GIT_COMMITTER_IDENT'], root);
-    } catch { ident = FALLBACK_IDENT; } // no user.name / user.email configured (a CI box)
+    } catch { ident = FALLBACK_IDENT; } // no user.name / user.email configured (a CI box), or `anonymous`
     return gitIn(g, root, ['-c', 'commit.gpgsign=false', 'commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', message], { env: ident }).trim();
   } finally {
     rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
@@ -264,7 +265,7 @@ function gitIn(g, cwd, args, { env, input } = {}) {
  * never touches the caller's HEAD / index / branches / working tree. `gitFn` is injectable for tests.
  * -> { commit, pushed, lines } (`lines`: the ones actually appended). Throws on a git failure; the caller keeps its lines queued.
  */
-export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }) {
+export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, anonymous = false }) {
   const g = (args, cwd = root, timeoutMs, extra = {}) => gitFn(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}), ...extra });
   const clean = lines.map(assertSingleLine);
   let lastErr;
@@ -283,7 +284,7 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }
       }
       const { text, fresh } = appendLines(existing, clean);
       if (fresh.length === 0) return { commit: tip, pushed: false, lines: [] }; // all already in the log: nothing to push
-      const commit = commitFile({ root, g, rel: logRel, text, parent: tip, message: `docs: agent log (${fresh.length} line${fresh.length === 1 ? '' : 's'})` });
+      const commit = commitFile({ root, g, rel: logRel, text, parent: tip, anonymous, message: `docs: agent log (${fresh.length} line${fresh.length === 1 ? '' : 's'})` });
       const dest = assertSafeLogTarget(`refs/heads/${AGENT_LOG_BRANCH}`);
       g(['push', '--no-verify', REMOTE, `${commit}:${dest}`], root, NETWORK_TIMEOUT_MS);
       return { commit, pushed: true, lines: fresh };
