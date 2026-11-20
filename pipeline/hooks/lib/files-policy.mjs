@@ -2521,7 +2521,76 @@ const LAST_WORD_RE = /\$(?:_|\{_)(?![A-Za-z0-9_])/; // `$_` / `${_}`: the last w
 const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s;&|(){`])(?:typeset|declare|local)\s+-[A-Za-z]*i|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?<![$\p{L}\p{N}_]|\$\{)_(?![\p{L}\p{N}_])/u;
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
-const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
+// (#618: a quote opens a word too: `env -S 'xargs rm'`, `rg --pre 'xargs rm'`, `git -c core.pager='xargs rm'` hand the quoted text to a shell)
+const FAN_OUT_RE = /(?:^|[\s;&|(`'"])(?:xargs|parallel)(?=\s|$)/;
+
+// #610 #617 #624: the ONLY quoted operands removed from a command's text before FAN_OUT_RE looks at it: values of options that are data, named exactly (a closed list), never a general "data head".
+// A value is removed only when it has no `$`, backtick, backslash or quote character, its quoted needle (`-e 'v'`, `--grep="v"` ...) occurs EXACTLY ONCE in the command text and stands between blanks;
+// anything else removes nothing and the text is scanned whole. The prefix before an rg / grep / git head must be empty, assignments or `env` + assignments (any other wrapper may hand the rest of the line to a shell).
+const ASSIGN_SRC = String.raw`[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|[^\s'"]*)`;
+const DATA_PREFIX = new RegExp(String.raw`^\s*(?:${ASSIGN_SRC}\s+)*(?:env\s+(?:${ASSIGN_SRC}\s+)*)?`);
+const RG_BOOL_SHORT = /^-[inFwvlLcrRHhsqEPSUIaoxzu]+$/;
+const RG_BOOL_LONG = new Set(['--ignore-case', '--line-number', '--fixed-strings', '--word-regexp', '--invert-match', '--files-with-matches', '--count', '--recursive', '--no-messages', '--quiet', '--hidden', '--no-ignore', '--smart-case', '--no-heading', '--with-filename', '--no-filename', '--only-matching']);
+const plainValue = (v) => typeof v === 'string' && v.length > 0 && !/[$`\\'"]/.test(v);
+function removeNeedles(text, needles) {
+  let out = text;
+  for (const n of needles) {
+    const at = out.indexOf(n);
+    if (at < 0 || out.indexOf(n, at + 1) >= 0) continue;
+    const before = out[at - 1];
+    const after = out[at + n.length];
+    if ((at > 0 && !/\s/.test(before)) || (after !== undefined && !/\s/.test(after))) continue;
+    out = `${out.slice(0, at)} ${out.slice(at + n.length)}`;
+  }
+  return out;
+}
+const quoted = (flag, v, seps) => seps.flatMap((sep) => [`${flag}${sep}'${v}'`, `${flag}${sep}"${v}"`]);
+// the values of `flags` among argv (spaced or `=` form)
+function flagValues(argv, flags) {
+  const out = [];
+  argv.forEach((w, i) => {
+    for (const f of flags) {
+      if (w === f && argv[i + 1] !== undefined) out.push([f, argv[i + 1]]);
+      else if (f.startsWith('--') && w.startsWith(`${f}=`)) out.push([f, w.slice(f.length + 1)]);
+    }
+  });
+  return out;
+}
+// -> the command's raw text without its named data operands (see above); `trusted`: the installed pipeline command (its --built / --line prose)
+export function withoutDataOperands(c, trusted) {
+  const raw = c.raw ?? '';
+  const argv = c.argv ?? [];
+  const needles = [];
+  if (trusted) {
+    const tool = raw.indexOf('pipeline.mjs');
+    if (tool < 0) return raw;
+    for (const [f, v] of flagValues(argv, ['--built', '--line'])) if (plainValue(v)) needles.push(...quoted(f, v, [' ', '=']));
+    return `${raw.slice(0, tool)}${removeNeedles(raw.slice(tool), needles)}`;
+  }
+  const m = DATA_PREFIX.exec(raw);
+  const afterPrefix = raw.slice(m[0].length);
+  const headWord = /^(rg|grep|egrep|fgrep|git)(?=\s|$)/.exec(afterPrefix)?.[1];
+  if (!headWord || baseOf(argv[0] ?? '') !== headWord) return raw;
+  const args = argv.slice(1);
+  const body = afterPrefix.slice(headWord.length);
+  if (headWord === 'git') {
+    let i = 0;
+    while (args[i] === '-C' && args[i + 1] !== undefined) i += 2;
+    if (args[i] !== 'log') return raw;
+    for (const [f, v] of flagValues(args.slice(i + 1), ['--grep', '--author', '--committer'])) if (plainValue(v)) needles.push(...quoted(f, v, [' ', '=']));
+  } else {
+    for (const [f, v] of flagValues(args, ['-e', '--regexp'])) if (plainValue(v)) needles.push(...quoted(f, v, f === '-e' ? [' '] : [' ', '=']));
+    const hasPatternSource = args.some((w) => w === '-e' || w === '--regexp' || w === '-f' || w === '--file' || w.startsWith('--regexp=') || w.startsWith('--file='));
+    if (!hasPatternSource) {
+      for (const w of args) {
+        if (RG_BOOL_SHORT.test(w) || RG_BOOL_LONG.has(w)) continue;
+        if (!w.startsWith('-') && plainValue(w)) needles.push(`'${w}'`, `"${w}"`);
+        break;
+      }
+    }
+  }
+  return `${raw.slice(0, m[0].length)}${headWord}${removeNeedles(body, needles)}`;
+}
 
 const shellQuote = (w) => (/^[\w@%+=:,./~-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`);
 
@@ -6052,9 +6121,21 @@ function evaluateBashForFilesFrame(command, opts) {
   // (R4-F1: allow-list: quoted text is blanked ONLY for a command known to run none of its arguments: a readable, unwrapped head in NON_RUNNERS, or an INLINE_RUNNERS name on a file program; every other command keeps c.raw, as origin/main does)
   // (R1-B2 / R2-F1: only a plain data command is blanked; quoted text stays when it may run: inline code, a wrapper (WRAPPER_CMDS), find -exec, a shell or another interpreter (INTERPRETERS) named in argv, or a written first word that is not argv[0] (the parser unwrapped it or it cannot be read))
   const rawHead = (c) => baseOf((c.raw ?? '').trim().split(/\s+/).find((w) => !/^[A-Za-z_]\w*=/.test(w)) ?? ''); // (the parser unwraps `env -S 'nice xargs rm'` to argv [rm]: the written first word is the wrapper)
-  const knownNonRunner = (c) => c.argv.length > 0 && rawHead(c) === baseOf(c.argv[0]) && (NON_RUNNERS.has(rawHead(c)) || INLINE_RUNNERS.test(rawHead(c)));
-  const runsText = (c) => !knownNonRunner(c) || runsInlineCode(c, ctx) || WRAPPER_CMDS.has(rawHead(c)) || c.argv.some((w) => WRAPPER_CMDS.has(baseOf(w))) || rawHead(c) !== baseOf(c.argv[0] ?? '') || c.argv.some((w) => SHELL_NAMES.has(baseOf(w))) || c.argv.some((w) => INTERPRETERS.test(baseOf(w)) && !INLINE_RUNNERS.test(baseOf(w))) || (baseOf(c.argv[0] ?? '') === 'find' && c.argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
-  const fansOut = (c) => FAN_OUT_RE.test(runsText(c) ? c.raw : (withoutLiteralText(c.raw, { dqData: true }) ?? c.raw));
+  // (#610 #617 #620 #624) The INLINE_RUNNERS door stays open ONLY for the installed pipeline command (its prose flags are data; `triage settle --test-cmd` is run by a shell, so it keeps its text); any other file program keeps its quoted text.
+  // A pager or preprocessor option is command-valued (`rg --pre 'xargs rm'`, `bat --pager ...`), so such a command is no known non-runner.
+  const trustedCall = (c) => c.argv.length > 0 && (isPipelineTool(c.argv[0], ctx) || (baseOf(c.argv[0]) === 'node' && isPipelineTool(c.argv[1], ctx)));
+  const settlesWithTestCmd = (c) => c.argv.includes('settle') && c.argv.some((w) => w === '--test-cmd' || w.startsWith('--test-cmd='));
+  const pagerish = (c) => ['less', 'more', 'bat', 'man'].includes(rawHead(c)) || c.argv.some((w) => /^--(?:pre|pre-glob|pager|preprocessor)(?:=|$)/.test(w));
+  const knownNonRunner = (c) => c.argv.length > 0 && rawHead(c) === baseOf(c.argv[0]) && !pagerish(c) && (NON_RUNNERS.has(rawHead(c)) || (INLINE_RUNNERS.test(rawHead(c)) && trustedCall(c) && !settlesWithTestCmd(c)));
+  // (#620: for the trusted command a prose value of --built / --line is no command NAME: `fixes R1/R2` ends in an interpreter-looking word)
+  const runWords = (c) => {
+    if (!trustedCall(c)) return c.argv;
+    const skip = new Set();
+    c.argv.forEach((w, i) => { if (w === '--built' || w === '--line') skip.add(i + 1); else if (w.startsWith('--built=') || w.startsWith('--line=')) skip.add(i); });
+    return c.argv.filter((_, i) => !skip.has(i));
+  };
+  const runsText = (c) => !knownNonRunner(c) || runsInlineCode(c, ctx) || WRAPPER_CMDS.has(rawHead(c)) || runWords(c).some((w) => WRAPPER_CMDS.has(baseOf(w))) || rawHead(c) !== baseOf(c.argv[0] ?? '') || runWords(c).some((w) => SHELL_NAMES.has(baseOf(w))) || runWords(c).some((w) => INTERPRETERS.test(baseOf(w)) && !INLINE_RUNNERS.test(baseOf(w))) || (baseOf(c.argv[0] ?? '') === 'find' && c.argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
+  const fansOut = (c) => FAN_OUT_RE.test(runsText(c) ? withoutDataOperands(c, trustedCall(c)) : (withoutLiteralText(c.raw, { dqData: true }) ?? c.raw));
   if (cmds.some((c) => fansOut(c) || (SHELL_NAMES.has(baseOf(c.argv[0] ?? '')) && !isReadOnly(c, ctx)))) return deny('the command refers to a protected pipeline file and hands work to xargs or a shell, which could modify it');
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
