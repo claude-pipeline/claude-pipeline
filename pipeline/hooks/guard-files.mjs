@@ -60,8 +60,9 @@ async function main() {
   if (!isShell && !FILE_TOOLS.has(tool) && !isMcp) return; // not ours (MCP write tools are judged by evaluateFileTool)
   try {
     const { evaluateFileTool, evaluateBashForFiles } = await import('./lib/files-policy.mjs');
+    const { HOOK_CLOCK } = await import('./lib/script-candidates.mjs');
     const cwd = typeof input.cwd === 'string' && input.cwd ? input.cwd : process.cwd();
-    const opts = { home: os.homedir(), env: process.env, platform: process.platform };
+    const opts = { home: os.homedir(), env: process.env, platform: process.platform, ...HOOK_CLOCK }; // one wall cap for the whole process, counted from its start (an MCP call judges one evaluation per command field)
     const verdict = isShell
       ? evaluateBashForFiles(input.tool_input?.command, { ...opts, cwd, shell: tool === 'PowerShell' ? 'powershell' : 'bash' })
       : evaluateFileTool({ ...input, cwd }, opts);

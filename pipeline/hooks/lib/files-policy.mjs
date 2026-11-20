@@ -436,7 +436,7 @@ function makeCtx(opts) {
     readHead: opts.readHead ?? defaultReadHead, // the first bytes of a file readText refused (over the cap)
     ignoreUnmodelled: opts._ignoreUnmodelled === true, // inside a real-home startup file's judgment: see judgeStartupFile
     frames: opts._frames ?? [], // the files each command list being evaluated writes (see line-writes.mjs), outermost first
-    budget: opts._budget ?? newEvalBudget(opts.now, opts.cpu), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
+    budget: opts._budget ?? newEvalBudget(opts.now, opts.cpu, opts.wall0), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
     nodePrefix: opts.nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration; undefined: from process.execPath, null: none (tests)
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
@@ -4914,7 +4914,7 @@ function evaluateSameText(command, opts) {
 function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._bashState) {
     const state = { bound: false, rewrote: false };
-    const budget = opts._budget ?? newEvalBudget(opts.now, opts.cpu);
+    const budget = opts._budget ?? newEvalBudget(opts.now, opts.cpu, opts.wall0);
     const first = evaluateBashForFilesUnchecked(command, { ...opts, _budget: budget, _bashState: state });
     if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
     // (the second pass spends what the first left, so every cap still ends in a denial; only the startup-file memo starts empty)
@@ -4990,7 +4990,7 @@ function loopReadings(command, opts) {
   return out;
 }
 function evaluateBashForFilesFrame(command, opts) {
-  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now, opts.cpu) }; // one budget for this evaluation and every script it reads
+  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now, opts.cpu, opts.wall0) }; // one budget for this evaluation and every script it reads
   const opts0 = opts; // (R16: the frame as it was called, for the pass that judges it again with a late switch seeded)
   const assumedCwd = opts._assumedCwd === true; // (a rerun of the line with the cwd assumed to be a protected directory; what it runs is judged normally)
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };

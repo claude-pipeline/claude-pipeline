@@ -21,8 +21,10 @@ export const MAX_SCRIPT_JUDGMENTS = 128;
 // The CPU used is capped at the wall time elapsed (CPU cannot exceed wall), so a clock that over-reports never refuses early.
 export const EVAL_DEADLINE_MS = 5000;
 // Hard wall-clock cap, the fail-closed bound: Claude Code ALLOWS a hook that runs past its timeout (HOOK_TIMEOUT_S, 15 s, in lib/installer.mjs),
-// so however little CPU the check used, it is refused once this much wall time has passed since the top-level call. It leaves the rest of the
-// hook timeout for node startup, module load (both before the evaluation starts) and writing the answer.
+// so however little CPU the check used, it is refused once this much wall time has passed. For the two hooks (HOOK_CLOCK) it counts from the START OF THE
+// HOOK PROCESS and is shared by every evaluation in it (an MCP call with several command fields is one evaluation each; node startup and module load count too),
+// because the host timeout covers the whole process. It leaves the rest of the timeout for writing the answer. A long-lived CLI process (command-guard,
+// preflight) has no host timeout to outrun, so there it counts from the top-level call of each evaluation.
 export const EVAL_WALL_CAP_MS = 10_000;
 // Variable expansion: one call may add at most one command line of text (the same 200,000 as MAX_LINE_CHARS), and the text
 // ADDED by expansion across one evaluation is bounded too (`A=<60k chars> ...` used by thousands of words).
@@ -490,11 +492,15 @@ export class GuardLimit extends Error {}
 // evaluation, nested scripts included, share this allowance; past it the check is refused (GuardLimit), as for too many script files.
 export const MAX_TOTAL_READINGS = 1024;
 const processCpuMs = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
+// What the two hook entry points pass (spread into the evaluator options): the wall clock is ms since process start (performance.now(), origin 0), so the
+// hard wall cap counts startup and is shared by every evaluation of the hook process. CPU is still read from the process, per evaluation.
+export const HOOK_CLOCK = Object.freeze({ now: () => performance.now(), cpu: processCpuMs, wall0: 0 });
 // `now` (wall, ms) and `cpu` (CPU, ms) are injectable so tests do not depend on timing. A test that injects only `now` gets one clock for both
 // (the old single-clock behaviour); the real default reads the process's CPU time.
-export function newEvalBudget(now = Date.now, cpu = now === Date.now ? processCpuMs : now) {
+// `wall0` is the `now` time the wall cap counts from: the evaluation start by default, 0 (process start) for a hook (HOOK_CLOCK). A budget copied for a second pass keeps it.
+export function newEvalBudget(now = Date.now, cpu = now === Date.now ? processCpuMs : now, wall0 = now()) {
   // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
-  return { now, cpu, wall0: now(), cpu0: cpu(), scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
+  return { now, cpu, wall0, cpu0: cpu(), scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
 }
 
 // Why the evaluation must stop, or null: past the hard wall cap (fail-closed against the host timeout), or past the CPU limit.

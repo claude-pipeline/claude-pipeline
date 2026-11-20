@@ -11,8 +11,9 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
-import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, newEvalBudget, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
 import { HOOK_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
+import { readFileSync } from 'node:fs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -168,6 +169,55 @@ for (const [name] of both) {
     const r = slowBy(4000, 10);
     assert.equal(r.decision, 'deny');
     assert.match(r.reason, /too busy/);
+  });
+}
+
+// ---- one wall cap per hook process (#627 review) ----------------------------------------------------------------------
+// Why: the host timeout (HOOK_TIMEOUT_S) covers the whole hook PROCESS, and Claude Code ALLOWS a hook that runs past it. A per-evaluation wall cap let an MCP
+// call with several command fields (guard-git runs one evaluation per field) take 2 x 10 s, and node startup was not counted at all. The hooks therefore pass
+// HOOK_CLOCK: the wall cap counts from process start (origin 0) and is shared by every evaluation of the process. Long-lived CLI callers (command-guard,
+// preflight) do not, and keep the cap per evaluation.
+for (const [name] of both) {
+  const evaluate = name === 'guard-git' ? git : files;
+  // each script read advances the fake clock by 1 s (the first evaluation reads a.sh once)
+  const ticking = (clock) => { const fs = (name === 'guard-git' ? gitFs : filesFs)({ 'a.sh': 'echo hi' }); return { ...fs, readText: (p) => { clock.t += 1000; return fs.readText(p); } }; };
+  const one = (clock) => evaluate('bash a.sh', ticking(clock), { now: () => clock.t, cpu: () => 0, wall0: 0 });
+  test(`${name}: two evaluations in one hook process share one wall cap (a hook past HOOK_TIMEOUT_S is allowed by Claude Code)`, () => {
+    const clock = { t: 5000 };
+    // the first evaluation ends at about 6 s: under the cap on its own
+    assert.equal(one(clock).decision, 'allow');
+    assert.ok(clock.t >= 6000 && clock.t < EVAL_WALL_CAP_MS, `first ends at ${clock.t}`);
+    // the second starts there and runs to about 10.5 s: under the cap on its own, over it counted from process start
+    clock.t = 9500;
+    const r = one(clock);
+    assert.equal(r.decision, 'deny', `${r.decision}: ${r.reason}`);
+    assert.match(r.reason, /too busy/);
+  });
+  test(`${name}: startup counts (an evaluation starting 9.5 s after process start that runs 1 s is denied)`, () => {
+    const r = one({ t: 9500 });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /too busy/);
+  });
+  test(`${name}: without the hook origin an evaluation counts from its own start (a long-lived CLI process is not refused)`, () => {
+    const clock = { t: 60_000 };
+    const r = evaluate('bash a.sh', ticking(clock), { now: () => clock.t, cpu: () => 0 });
+    assert.equal(r.decision, 'allow', `${r.decision}: ${r.reason}`);
+  });
+}
+
+test('budget: HOOK_CLOCK counts the wall cap from process start; the default counts from the evaluation start', () => {
+  const c = { t: 60_000 };
+  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0)), false, 'default budget created at 60 s');
+  c.t += 1000;
+  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0)), false);
+  assert.equal(HOOK_CLOCK.wall0, 0);
+  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0, HOOK_CLOCK.wall0)), true, 'a hook budget created at 61 s after process start');
+});
+
+for (const hook of ['guard-git.mjs', 'guard-files.mjs']) {
+  test(`${hook} passes HOOK_CLOCK to the evaluators (the shared wall cap is opt-in by the hook entry points)`, () => {
+    const src = readFileSync(new URL(`../pipeline/hooks/${hook}`, import.meta.url), 'utf8');
+    assert.ok(src.includes('...HOOK_CLOCK'), `${hook} does not spread HOOK_CLOCK`);
   });
 }
 

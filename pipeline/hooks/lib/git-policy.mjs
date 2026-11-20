@@ -3768,6 +3768,7 @@ function evaluateGitOnce(command, {
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable wall clock (tests)
   cpu, // injectable CPU clock (tests); with only `now` injected it is the same clock
+  wall0, // the `now` time the hard wall cap counts from (the hooks pass HOOK_CLOCK: process start); undefined: the start of this evaluation
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
   nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration (<nodePrefix>/etc/npmrc); undefined: from process.execPath, null: none (tests)
   ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), repoOf(dir), approvedHead(pr, head, repo) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
@@ -3776,7 +3777,7 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), branchesUnknown: false, cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
