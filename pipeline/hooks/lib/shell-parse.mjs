@@ -4006,7 +4006,7 @@ export const UNDECIDABLE_HEREDOC = 'the line has a heredoc whose end the shells 
 
 export function simpleCommands(str, opts) {
   const requested = Number.isFinite(opts?.maxDepth) ? Math.trunc(opts.maxDepth) : 5;
-  // opts.expired: () => true once the evaluation's wall-clock deadline has passed; scans that can run long poll it and give up (truncated)
+  // opts.expired: () => true once the evaluation's deadline (CPU limit or hard wall cap, see budgetExpired) has passed; scans that can run long poll it and give up (truncated)
   const expired = typeof opts?.expired === 'function' ? opts.expired : null;
   const bashState = opts?.bashState; // the evaluation's shared record of the BASH rewrite (see below)
   const ctx = newCtx(Math.min(Math.max(requested, 0), HARD_MAX_DEPTH), expired, bashState);

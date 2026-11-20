@@ -14,6 +14,7 @@ import { buildBlock, liveDbGoOutcome, sha256Of } from '../pipeline/hooks/lib/liv
 import { LIVE_DB_CONSUMED_REL, claimLiveDbGo, evaluateSupabaseMcp, isSupabaseTool } from '../pipeline/hooks/lib/live-db-guard.mjs';
 import { buildCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
 import { evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
+import { HOOK_CLOCK } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 const REF = 'abcdefghij0123456789';
 const DEV = 'zyxwvutsrq9876543210';
@@ -250,6 +251,15 @@ test('through the real guard entry: a call another rule denies leaves the go unc
   assert.equal(file(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: SQL }), 'allow');
   assert.equal(file(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: SQL }), 'deny');
   assert.equal(file(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: 'drop table t' }, { [['PIPELINE', 'ADMIN'].join('_')]: '1' }), 'allow');
+});
+
+test('with the hook\'s real options (HOOK_CLOCK): a recorded go allows the apply once, no go denies (the go is judged by the epoch clock, not the process clock)', async (t) => {
+  // Failure caught: the hooks passed a process-start clock as `now`, so every owner go looked years old and was refused (and pending clicks were settled as refused).
+  const s = await scene(t, { typedAt: Date.now() - 60_000 });
+  const file = (query) => evaluateFileTool({ tool_name: `${TOOL}apply_migration`, tool_input: { project_id: REF, name: NAME, query }, cwd: s.repo.dir, session_id: s.session, transcript_path: s.transcript }, { home: s.home, env: {}, platform: process.platform, ...HOOK_CLOCK }).decision;
+  assert.equal(file('drop table t'), 'deny', 'a call the go does not name is refused');
+  assert.equal(file(SQL), 'allow', 'the go the owner typed allows the exact call');
+  assert.equal(file(SQL), 'deny', 'and is spent');
 });
 
 test('two processes claiming the same go on one home: exactly one claims, the other sees it spent', async (t) => {

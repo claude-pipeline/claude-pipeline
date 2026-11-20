@@ -11,29 +11,38 @@ import { approvedPr } from './owner-go.mjs';
 const LOOKUP_TIMEOUT_MS = 5000;
 const PUSH_LOOKUP_TIMEOUT_MS = 3000;
 
+// The timeout of one lookup process: its own, or what is left of the evaluation's wall cap when that is less (`leftMs`, from the policy; absent for a caller with no cap). Nothing left:
+// the lookup does not start and throws, which every caller below turns into "unknown" (a denial), so a slow lookup can never carry a hook past its host timeout (which Claude Code allows).
+const boundedTimeout = (own, leftMs) => {
+  if (!leftMs) return own;
+  const left = leftMs();
+  if (!(left > 0)) throw new Error('no time is left to look this up');
+  return Math.min(own, left);
+};
+
 export function realGitWiring() {
   // null (unknown) when HEAD is detached, the directory is not a repository, or git is unavailable
-  const currentBranch = (dir, { gitDir } = {}) => {
+  const currentBranch = (dir, { gitDir, leftMs } = {}) => {
     const args = ['-C', dir, ...(gitDir ? ['--git-dir', gitDir] : []), 'symbolic-ref', '--short', '-q', 'HEAD'];
-    const r = run('git', args, { timeoutMs: LOOKUP_TIMEOUT_MS });
+    const r = run('git', args, { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
     const branch = r.stdout.trim();
     return r.code === 0 && branch ? branch : null;
   };
 
   // Where git would send a bare `git push` (e.g. "origin/main"); null when it cannot say (no upstream, detached, error).
   // With `branch` it answers for that branch instead of HEAD (a branch the command line switches to first).
-  const pushDestination = (dir, { gitDir, branch } = {}) => {
+  const pushDestination = (dir, { gitDir, branch, leftMs } = {}) => {
     if (branch !== undefined && !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(branch)) return null; // never feed odd text to rev-parse
     const rev = branch === undefined ? '@{push}' : `${branch}@{push}`;
     const args = ['-C', dir, ...(gitDir ? ['--git-dir', gitDir] : []), 'rev-parse', '--abbrev-ref', '--symbolic-full-name', rev];
-    const r = run('git', args, { timeoutMs: PUSH_LOOKUP_TIMEOUT_MS });
+    const r = run('git', args, { timeoutMs: boundedTimeout(PUSH_LOOKUP_TIMEOUT_MS, leftMs) });
     const dest = r.stdout.trim();
     return r.code === 0 && dest ? dest : null;
   };
 
   // throws when the lookup fails, so the policy denies instead of guessing
-  const issueLabels = (n, repoArgs = [], cwd) => {
-    const r = gh(['issue', 'view', String(n), ...repoArgs, '--json', 'labels', '-q', '.labels[].name'], { cwd, timeoutMs: LOOKUP_TIMEOUT_MS });
+  const issueLabels = (n, repoArgs = [], cwd, { leftMs } = {}) => {
+    const r = gh(['issue', 'view', String(n), ...repoArgs, '--json', 'labels', '-q', '.labels[].name'], { cwd, timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
     if (r.timedOut) throw new Error(`gh issue view ${n} timed out`);
     if (r.code !== 0) throw new Error(`gh issue view ${n} failed (exit ${r.code})${r.stderr ? `: ${r.stderr.trim().slice(0, 200)}` : ''}`);
     return r.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
@@ -54,20 +63,20 @@ export function realGitWiring() {
 // (the remote's refs FULLY QUALIFIED: git resolves an abbreviated `origin/main` through refs/tags and refs/heads before refs/remotes, so a local branch or tag of that name would
 // otherwise stand in for the remote's copy and hide a chat config, #454)
 const COMMITTED_REFS = ['HEAD', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'];
-const defaultGitShow = (root, ref) => {
+const defaultGitShow = (root, ref, leftMs) => {
   // a missing remote-tracking ref must read as missing: `git show` would fall through to a branch or tag literally named `refs/remotes/origin/<b>` (#455)
-  if (ref.startsWith('refs/') && run('git', ['-C', root, 'show-ref', '--verify', '--quiet', ref], { timeoutMs: LOOKUP_TIMEOUT_MS }).code !== 0) return null;
-  const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: LOOKUP_TIMEOUT_MS });
+  if (ref.startsWith('refs/') && run('git', ['-C', root, 'show-ref', '--verify', '--quiet', ref], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) }).code !== 0) return null;
+  const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
   return r.code === 0 ? r.stdout : null;
 };
-const defaultRemotes = (dir) => {
-  const r = run('git', ['-C', dir, 'remote', '-v'], { timeoutMs: LOOKUP_TIMEOUT_MS });
+const defaultRemotes = (dir, leftMs) => {
+  const r = run('git', ['-C', dir, 'remote', '-v'], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
   return r.code === 0 ? r.stdout : null;
 };
 // (Fable attacker pass) gh's own choice of repository among the remotes: `gh repo set-default` writes remote.<name>.gh-resolved, which
 // is `base` or an owner/name gh then uses instead. '' when none is set (git config exits 1), null when it cannot be read.
-export const defaultResolved = (dir, runFn = run) => { // runFn: a test seam
-  const r = runFn('git', ['-C', dir, 'config', '--get-regexp', '^remote\\..*\\.gh-resolved$'], { timeoutMs: LOOKUP_TIMEOUT_MS });
+export const defaultResolved = (dir, runFn = run, leftMs) => { // runFn: a test seam
+  const r = runFn('git', ['-C', dir, 'config', '--get-regexp', '^remote\\..*\\.gh-resolved$'], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
   // exit 1 is git's "nothing set"; a killed (signal) or cut-off (overBuffer) git also reports 1 but said nothing: unknown, not "no override"
   if (r.signal || r.timedOut || r.overBuffer) return null;
   return r.code === 0 ? r.stdout : r.code === 1 ? '' : null;
@@ -105,32 +114,32 @@ export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8
   // (one hook run judges before anything runs, so a repository's files cannot change mid-check: read them once per root, not once per
   // simple command, or a long script spends its deadline on git spawns. A read that throws is not remembered: the next question fails closed again)
   const configsByRoot = new Map();
-  const configsOf = (dir) => {
+  const configsOf = (dir, leftMs) => {
     const root = rootOf(dir);
     if (root === null) return [];
-    if (!configsByRoot.has(root)) configsByRoot.set(root, readConfigs(root));
+    if (!configsByRoot.has(root)) configsByRoot.set(root, readConfigs(root, leftMs));
     return configsByRoot.get(root);
   };
-  const readConfigs = (root) => {
+  const readConfigs = (root, leftMs) => {
     const texts = [];
     const yml = path.join(root, '.claude', 'pipeline.yml');
     if (exists(yml)) texts.push(readText(yml));
     for (const ref of COMMITTED_REFS) {
-      const t = gitShow(root, ref);
+      const t = gitShow(root, ref, leftMs);
       if (typeof t === 'string') texts.push(t);
     }
     return texts.map((t) => parseYaml(t) ?? {});
   };
   return {
-    mode: (dir) => {
-      const all = configsOf(dir);
+    mode: (dir, { leftMs } = {}) => {
+      const all = configsOf(dir, leftMs);
       if (all.length === 0) return 'none';
       return all.some((c) => c.owner_approval === 'chat') ? 'chat' : 'label';
     },
     // each distinct merge command as { prefix: the literal words before {pr}, shaFlag: the word before {sha} (null when it pins no head) }
-    mergeTemplates: (dir) => {
+    mergeTemplates: (dir, { leftMs } = {}) => {
       const out = [];
-      for (const cmd of new Set(configsOf(dir).map((c) => c?.merge?.command).filter((c) => typeof c === 'string'))) {
+      for (const cmd of new Set(configsOf(dir, leftMs).map((c) => c?.merge?.command).filter((c) => typeof c === 'string'))) {
         const words = cmd.trim().split(/\s+/);
         const at = words.indexOf('{pr}');
         const prefix = at > 0 ? words.slice(0, at) : [];
@@ -140,7 +149,7 @@ export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8
       }
       return out;
     },
-    repoOf: (dir) => repoOfRemotes(remotes(dir), resolved(dir)),
+    repoOf: (dir, { leftMs } = {}) => repoOfRemotes(remotes(dir, leftMs), resolved(dir, undefined, leftMs)),
     approvedHead: (pr, head, repo) => approvedPr({ repo, pr, head, session }),
   };
 }
