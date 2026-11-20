@@ -2110,7 +2110,7 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
     const orExits = next?.sep === '||' && plainExit(next) && cmds[j + 2]?.sep !== '|' && cmds[j + 2]?.sep !== '&'
       && !(cmds[j + 2] !== undefined && cmds[j + 2].argv.length === 0 && (cmds[j + 2].redirects ?? []).length > 0);
     const sure = surelyHere(c, j) && !(next?.sep === '||' && !orExits);
-    let moved = dirs.map((d) => (nm === 'chdir' ? null : nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}))); // (#425 R1-F2: chdir leaves the directory unknown)
+    let moved = dirs.map((d) => (nm === 'chdir' || c.extCd === true ? null : nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}))); // (#425 R1-F2: chdir leaves the directory unknown; T2: so does a cd behind `time` / `command`)
     // (`cd a && cd b`: the second runs only when the first did, so the pair either moves twice or not at all. #352 R28-F1: only when the second moves this shell as surely as the first:
     // not started by a wrapper or in a process of its own, not chdir (no builtin in bash), no redirection that may fail it, not a pipeline stage or in the background, in the first's own level; and neither is
     // negated (`! cd a && cd b`: b runs only when a failed). Else the general rule keeps a as a place the body may end in.)
@@ -2118,7 +2118,7 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
       && x.negated !== true && x.bg !== true && x.pipe !== true && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&'
       && (x.loops?.length ?? 0) === (c.loops?.length ?? 0) && (x.up?.length ?? 0) === (c.up?.length ?? 0) && (x.up ?? []).every((u, m) => c.up[m] === u);
     if (sure && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && surely(next, j + 1)) {
-      const after = moved.map((d) => nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {}));
+      const after = moved.map((d) => (next.extCd === true ? null : nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {})));
       moved = [...dirs, ...after];
       j++;
     }
@@ -3689,6 +3689,7 @@ function evalString(str, startDir, ctx, level, child = false) {
 // (#352 R35-F2, R36, R37-F1: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it (none is firm, redirectsFirm) means it may not have run at all: its change is unknown at once, NO exception for
 // && (R36 kept it as 'chain' for the command chained to it, but nothing settled it when the text ended, so a script ending in `git switch b > /missing/f` handed b to its caller, which pushed the branch the failed switch left))
 function certainChange(cmds, c, trusted, moves = true) {
+  if (c.extCd === true && DIR_CHANGERS.includes(baseName(c.argv[0]))) return null; // (T2: a cd behind `time` / `command` may have run as an external program in this shell's name: the directory is unknown, whatever follows)
   if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
   const inBody = Object.values(c.ctl).some(Boolean);
   // (#530 / #545: a failed redirection stops the command and gives status 1, so what follows it with && (or after `|| exit`, a plain exit) runs only when the move happened: 'redir', a tracker that is conditional
