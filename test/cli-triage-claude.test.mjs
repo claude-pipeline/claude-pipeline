@@ -834,6 +834,7 @@ test('claude-ruling: a triage comment from a newer pipeline is reported as publi
   assert.equal(r.json.published, false);
   assert.equal(r.json.publishError, 'newer-format');
   assert.match(r.json.next, /pipeline update/);
+  assert.match(r.json.next, /pipeline comment --pr \d+ --kind triage/);
   assert.equal(w.item('R1-S1').final.by, 'claude', 'saved locally');
 });
 

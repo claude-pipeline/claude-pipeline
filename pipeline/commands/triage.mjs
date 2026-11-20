@@ -428,7 +428,8 @@ function publishRuling({ ctx, root, pr, state }) {
     return { published: true };
   } catch (err) {
     if (err instanceof Fail && (err.output?.error === 'stale-publication' || err.output?.error === 'newer-format')) {
-      return { published: false, publishError: err.output.error, next: `NOT published: ${err.output.reason}. The decision is saved here only` };
+      const retry = err.output.error === 'newer-format' ? `; after \`pipeline update\`, run \`pipeline comment --pr ${pr} --kind triage\` to publish it (repeating this command is refused: the decision is already recorded)` : '';
+      return { published: false, publishError: err.output.error, next: `NOT published: ${err.output.reason}. The decision is saved here only${retry}` };
     }
     if (err instanceof GhError || err instanceof UnavailableError) {
       return { published: false, next: `GitHub could not be reached, so the result is only local: run \`pipeline comment --pr ${pr} --kind triage\` when it is back (until then \`pipeline state show\` keeps a ruling that continues the published state, with a warning, and replaces one the PR has moved on from)` };
