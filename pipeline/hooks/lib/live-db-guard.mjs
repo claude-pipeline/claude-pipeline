@@ -244,9 +244,8 @@ const makesNoRequest = (c) => {
 // the first words of every supabase subcommand and alias (`supabase --help` of CLI 2.122; re-check on a CLI update), plus those the tables below do not carry
 const SUB_HEADS = new Set([...[...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]), 'migrations', 'experimental', 'issue', 'feedback']);
 const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
-// what a glob word is matched against (`network-x` stands for the `network-*` family), and the longest of them: a pattern that must consume more characters than that matches none
-const GLOB_HEADS = [...SUB_HEADS, 'network-x'];
-const GLOB_HEAD_MAX = Math.max(...GLOB_HEADS.map((h) => h.length));
+// the longest head a glob word could stand for (`network-x` stands for the `network-*` family): a pattern that must consume more characters than that is no head
+const GLOB_HEAD_MAX = Math.max(...[...SUB_HEADS, 'network-x'].map((h) => h.length));
 // B7: a supabase TOKEN in a line's text = `supabase` (optionally `npm:` / `nixpkgs#` before, `-cli` / `@version` / .exe .cmd .bat after) as the LAST path component of a word: not followed by `/ . _ -` or a word character
 // (`supabase/migrations/x.sql`, `SUPABASE_URL`, `supabase.from(`, `supabase.com`, `@supabase/supabase-js` are not tokens; `supabase`, `./node_modules/.bin/supabase`, `'supabase db push'` are)
 const SB_TOKEN_SRC = String.raw`(?<![\w.@-])(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\\s'"]*)?(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`;
@@ -281,36 +280,20 @@ function sbTokenHead(text) {
   const first = words.findIndex((w) => SB_TOKEN.test(w));
   return first >= 0 && words.slice(first + 1).some(possibleHead);
 }
-// B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
-// (R6-F1: a pattern that must consume more characters than the longest head, a long path, URL or SQL operand, can match none; whitespace is not a reason to skip it: `[' 'd]b` is one glob word that can name a file `db`)
-// (R6-F2: the cost of a line is its word count times a per-word cost the 8-metacharacter cap bounds; a 190 kB line of the worst shapes measured 0.8 to 0.9 s, and findLiveDbCli is given no deadline to poll)
+// B8: a word with glob characters (`d?`, `*`, `[d]b`) may become a subcommand head, a simple fail-closed rule (owner 2026-11-20: rounds 5 to 7 each found a hole in a glob-to-regex translator, so no pattern is matched at all).
+// A glob word is a possible head unless it must consume more characters than the longest head, so every short glob is refused (`'src/**/*.ts'`, `httpx[http2]` too: a false refusal costs "the owner runs it") and a long path, URL or SQL operand stays allowed (R6-F1).
+// Whitespace is not a reason to skip a word: `[' 'd]b` is one glob word that can name a file `db`.
+// Linear in the word, no backtracking (R5-F1, R6-F2); supabaseCalls and findLiveDbCli judge each word and the line once (R7-F1).
 function globMatchesHead(w) {
   if (!/[*?[]/.test(w)) return false;
-  // R5-F1: runs of `*` are one star, and a pattern with many metacharacters is not matched at all (each `*` becomes `.*`, which backtracks past the hook timeout on a literal no head contains): fail closed
-  w = w.replace(/\*+/g, '*');
-  if ((w.match(/[*?[]/g) ?? []).length > 8) return true;
-  let re = '';
-  let need = 0; // the characters the pattern must consume: literals, `?` and each bracket class
-  for (let i = 0; i < w.length; i += 1) {
-    const ch = w[i];
-    if (ch === '*') { re += '.*'; continue; }
-    need += 1;
-    if (ch === '?') re += '.';
-    else if (ch === '[') {
-      const j = w.indexOf(']', i + 2);
-      if (j < 0) { re += '\\['; continue; }
-      let body = w.slice(i + 1, j);
-      const neg = body[0] === '!' || body[0] === '^';
-      if (neg) body = body.slice(1);
-      re += `[${neg ? '^' : ''}${body.replace(/[\\\]^[]/g, '\\$&')}]`;
-      i = j;
-    } else re += ch.replace(/[.+^${}()|\\\]]/g, '\\$&');
-  }
-  if (need > GLOB_HEAD_MAX) return false;
-  try {
-    const rx = new RegExp(`^${re}$`);
-    return GLOB_HEADS.some((h) => rx.test(h));
-  } catch { return true; }
+  // `need` is a STRICT LOWER BOUND on the characters the pattern consumes, so it never overestimates and no head can hide behind it:
+  // a backslash is dropped (an escaped character counts once at most), a `*` counts 0 (it may match nothing), everything between the first `[` and the last `]` counts 1
+  // (that region is at least one bracket class; POSIX classes, a leading `]` and nested brackets are never parsed), and every other character, `?` included, counts 1.
+  w = w.replace(/\\/g, '');
+  const open = w.indexOf('[');
+  const close = w.lastIndexOf(']');
+  if (open >= 0 && close > open) w = `${w.slice(0, open)}x${w.slice(close + 1)}`;
+  return w.replace(/\*/g, '').length <= GLOB_HEAD_MAX;
 }
 // an expansion after the supabase word (`supabase $SUB`, `supabase "$@"`) can become a subcommand; a glob (`'src/**/*.ts'`, `'httpx[http2]'`) is a file or package pattern
 const NON_LITERAL_WORD = /[$`]/;
@@ -378,12 +361,24 @@ function isSelector(words, i) {
 // every supabase call among the words -> [{ rest }] (the words after the supabase word, for supabaseRefusal). `data`: the command that runs is a data command, so a later supabase word is an operand
 function supabaseCalls(words, data) {
   const calls = [];
+  // R7-F1: each word is judged for "could be a head" once, then a suffix-any answers every supabase word (one scan per command, not one per supabase word)
+  let headFrom = null; // headFrom[i]: some word at index >= i could be a subcommand head
+  const anyHeadAfter = (i) => {
+    if (!headFrom) {
+      headFrom = new Array(words.length + 1).fill(false);
+      for (let k = words.length - 1; k >= 0; k -= 1) {
+        const x = words[k];
+        headFrom[k] = headFrom[k + 1] || (!x.startsWith('-') && (isSubcommandHead(x) || NON_LITERAL_WORD.test(x) || globMatchesHead(x)));
+      }
+    }
+    return headFrom[i + 1];
+  };
   words.forEach((w, i) => {
     if (!isSbWord(w)) return;
     const rest = words.slice(i + 1);
     if (i === 0) { calls.push({ rest }); return; }
     if (data || isSelector(words, i) || pmNonRun(words, i)) return;
-    if (rest.some((x) => !x.startsWith('-') && (isSubcommandHead(x) || NON_LITERAL_WORD.test(x) || globMatchesHead(x)))) calls.push({ rest });
+    if (anyHeadAfter(i)) calls.push({ rest });
   });
   return calls;
 }
@@ -392,9 +387,10 @@ function supabaseCalls(words, data) {
 const stdinFed = (c) => c.fan === true;
 // ... and what it builds can be the binary or a launcher of it unless the command it names is plain data (`xargs wc -l`; none named, or a search that can run a program from its options, is not)
 // (B2: `sed` runs programs with its `e` command, so it is plain data here only while the line shows no supabase token followed by a subcommand head)
-const buildsProgram = (c, text) => {
+// (`lineHead` is a function that reads the line once: it is asked per command, and a line of hundreds of `xargs sed` commands must not scan its text each time, R7-F1)
+const buildsProgram = (c, lineHead) => {
   const n = commandName(c.argv[0]);
-  return n === 'sed' ? sbTokenHead(text) : !STDIN_DATA.includes(n);
+  return n === 'sed' ? lineHead() : !STDIN_DATA.includes(n);
 };
 
 // the global flags (every subcommand accepts them, CLI 3.1 `GLOBAL FLAGS`; 2.x has the same set minus the 3.x-only ones, which 2.x rejects itself): one that takes a value (two-word or `=` form) and the booleans
@@ -588,7 +584,9 @@ export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv, rep
   const reading = cmds.filter((c) => c.argv?.length);
   const lineText = [scanRaw, ...cmds.map((c) => c.raw)].join('\n');
   // R10-F1: xargs / parallel append words from stdin that no reading shows; with a supabase token on the line the call cannot be judged
-  if (reading.some((c) => stdinFed(c) && buildsProgram(c, lineText)) && SB_TOKEN.test(lineText)) return refuse('`xargs` / `parallel` builds a command from stdin and the line names supabase');
+  let lineHead; // sbTokenHead(lineText), computed at most once
+  const lineHeadOnce = () => (lineHead ??= sbTokenHead(lineText));
+  if (reading.some((c) => stdinFed(c) && buildsProgram(c, lineHeadOnce)) && SB_TOKEN.test(lineText)) return refuse('`xargs` / `parallel` builds a command from stdin and the line names supabase');
   for (const c of reading) {
     const typed = typedWords(c);
     // B1: each reading carries its own data flag. The argv (the parser unwrapped npx / timeout / env …) is judged by its own word 0. The words as typed: when they end with the argv, only the stripped PREFIX is judged here (`env`, `timeout 30`, by its own word 0, F2); when the parser rewrote words, the whole typed reading is, by its word 0

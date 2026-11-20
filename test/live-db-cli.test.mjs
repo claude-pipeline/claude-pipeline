@@ -136,7 +136,6 @@ const ALLOWED = [
   'git diff main -- supabase test',
   "git log -p -- supabase ':(exclude)*.snap'",
   'cp -r supabase backups',
-  "npx prettier --check supabase 'src/**/*.ts'",
   "pip install supabase 'httpx[http2]'",
   'npm --prefix supabase test',
   'pnpm -C supabase test',
@@ -184,10 +183,8 @@ const ALLOWED = [
   '$GIT status',
   '"$HOME/.cargo/bin/cargo" test',
   '$HOME/.bun/bin/bun test',
-  // B8 (F5): a glob that names no head
+  // B8 (F5): a glob BEFORE the supabase word is no operand of it (a glob after it that is short is refused, see the DENIED B8 block)
   "npx eslint 'src/**/*.ts' supabase",
-  "npx eslint supabase 'src/**/*.ts'",
-  "uv pip install supabase 'httpx[http2]'",
   // B10 (F1/F4): a quoted argument with parentheses, commas or prose is not a command
   'node -e "console.log(foo(a, b))"',
   'python3 -c "print(max(1, 2))"',
@@ -484,6 +481,10 @@ const DENIED = [
   '$SB db push',
   '"$(command -v supabase)" db push',
   '$SB --workdir /x db push',
+  // B8, owner 2026-11-20: simple fail-closed glob rule: a short glob after a bare supabase word may become a head (these three were allowed under the old glob translator)
+  "npx prettier --check supabase 'src/**/*.ts'",
+  "npx eslint supabase 'src/**/*.ts'",
+  "uv pip install supabase 'httpx[http2]'",
   // B4: a global flag does not make the line safe
   'supabase --workdir /x db push',
   'supabase --debug db push',
@@ -569,7 +570,7 @@ test('a long flag run in a quoted command string is decided fast, not by the dea
   assert.ok(ms < 2000, `took ${ms} ms`);
 });
 
-// R5-F1: a word of many stars (each became \`.*\`) backtracked past the 15 s hook limit on a literal no head contains, and a hook past the limit is ALLOWED, so the db push after it ran
+// R5-F1: a word of many stars once backtracked past the 15 s hook limit (a regex per star), and a hook past the limit is ALLOWED, so the db push after it ran; stars now count 0 in the glob rule and nothing is matched
 test('a word of many stars after a supabase token is refused fast, not by the hook deadline', () => {
   for (const line of [
     `doppler run --command 'supabase ${'*'.repeat(60)}z; supabase db push'`,
@@ -600,7 +601,7 @@ test('a 190 kB word of repeated supabase@ tokens is decided fast, not by the hoo
   }
 });
 
-// R6-F2: four stars and four \`?\` in a word still backtrack per head; the same words by the thousand in one quoted string (and at the top level, behind the word cap) must be decided far from the hook limit
+// R6-F2: star-and-question-mark words by the thousand in one quoted string (and at the top level, behind the word cap) must be decided far from the hook limit; the glob rule is a length count, linear in the line
 test('a 190 kB line of star-and-question-mark words is denied fast, not by the hook deadline', () => {
   const words = '*?*?*?*?z '.repeat(19000);
   for (const line of [
@@ -618,7 +619,7 @@ test('a 190 kB line of star-and-question-mark words is denied fast, not by the h
   }
 });
 
-// R6-F1: a long word with a \`*\` or \`?\` (a query, a URL) after a bare \`supabase\` name is an operand, not a subcommand head: such lines were allowed before the length cap of R5 refused them
+// R6-F1: a long word with a \`*\` or \`?\` (a query, a URL) after a bare \`supabase\` name is an operand, not a subcommand head: a pattern that needs more characters than the longest subcommand head cannot be one
 test('a long glob-bearing operand after a supabase name is not read as a subcommand head', () => {
   for (const line of [
     `docker compose exec supabase psql -c "select * from public.some_long_table_name where created_at > now() - interval '1 day'"`,
@@ -629,11 +630,39 @@ test('a long glob-bearing operand after a supabase name is not read as a subcomm
     assert.doesNotMatch(v.reason ?? '', /not a subcommand the guard knows/, line);
     assert.equal(v.decision, 'allow', `${line}: ${v.reason}`);
   }
-  // (a short glob that can be a head stays refused)
+  // (a short glob stays refused, whatever it holds: owner 2026-11-20: simple fail-closed glob rule)
   assert.match(verdict("ssh supabase 'd?'").reason ?? '', /not a subcommand the guard knows/);
   // (a quoted space inside a bracket class is still one glob word the shell expands: `[' 'd]b` can name a file `db`)
   assert.equal(verdict("x supabase d? push").decision, 'deny');
   assert.equal(verdict("x supabase [' 'd]b push").decision, 'deny');
+});
+
+// R7-B1: a POSIX class inside a bracket (`[[:alpha:]]`) or a negated class that starts with `]` (`[!]x]b`) can name a file `db`; the old translator closed the bracket at the first `]` and allowed the push
+test('a short glob with a POSIX bracket class or a leading ] after a supabase token is refused', () => {
+  for (const line of [
+    "doppler run --command 'supabase d[[:alpha:]] push --linked'",
+    `doppler run --command 'supabase d[${'b'.repeat(70)}[:alpha:]] push --linked'`,
+    'x supabase [!]x]b push',
+  ]) assert.equal(verdict(line).decision, 'deny', line);
+});
+
+// R7-F1: the glob check ran once per supabase word, and findLiveDbCli re-read the whole line once per `xargs sed` command: both were quadratic and a hook past its 15 s limit is ALLOWED, so the later command ran
+test('glob words after many supabase words, or after many xargs sed commands, are denied fast', () => {
+  const protect = ['pipeline', 'protect', '--apply'].join(' '); // built here: the guard scans the source text of a script for a guarded command
+  for (const line of [
+    'x ' + 'supabase '.repeat(2000) + '*?*?*?*?z '.repeat(1990) + '; supabase db push',
+    `${protect}; ` + 'a|xargs sed p; '.repeat(499) + 'x supabase ' + '*?*?*?*?z '.repeat(3400),
+    // (the 499-command line above is refused by the word cap before any glob work; 100 commands pass the cap and took 47 s on the quadratic code)
+    `${protect}; ` + 'a|xargs sed p; '.repeat(100) + 'x supabase ' + '*?*?*?*?z '.repeat(3400),
+  ]) {
+    const t0 = Date.now();
+    const v = verdict(line);
+    const ms = Date.now() - t0;
+    assert.equal(v.decision, 'deny');
+    assert.doesNotMatch(v.reason ?? '', /took too long/);
+    // same bound as R6-F2 above: a third of the 15 s hook limit, far above the linear cost and far below the quadratic one
+    assert.ok(ms < 5000, `took ${ms} ms`);
+  }
 });
 
 test('an unknown subcommand names itself', () => {
