@@ -445,6 +445,15 @@ const DENIED = [
   'doppler run --command "supabase -o json --debug db push"',
   "nix-shell --run 'supabase --workdir \"/my app\" db push'",
   "sh -c 'doppler run --command \"supabase --workdir /app db push\"'",
+  // R2-B1 / R2-F1: the gate reads any run of words between the token and the head (flag spellings, an escaped space, a quoted head), the reparse judges
+  'doppler run --command "supabase --yes=true db push --linked"',
+  'doppler run --command "supabase --linked=true db push"',
+  'doppler run --command "supabase --db-url=postgres://u@db.x.supabase.co/postgres db push"',
+  'doppler run --command "supabase -ojson db push"',
+  "doppler run --command 'supabase --workdir /my\\ app db push'",
+  'ssh ci "supabase \'db\' push"',
+  "doppler run --command 'supabase \"db\" push'",
+  'doppler run --command "supabase --create-ticket db push"',
   // R1-F1: a container, namespace, session or project NAMED pipeline is not the pipeline CLI
   'docker exec pipeline sh -c "supabase db push"',
   'kubectl exec deploy/pipeline -- sh -c "supabase db push"',
@@ -505,6 +514,17 @@ for (const line of DENIED) test(`denied: ${line}`, () => {
   assert.equal(v.decision, 'deny', `${line} was allowed`);
   assert.match(v.reason, /live database/);
   assert.match(v.reason, /owner runs this/);
+});
+
+// R2 backtracking: a long run of flags between the token and its words must not hang the guard past the hook timeout (the old flag regex took 8 s at 28 pairs and hit the deadline)
+test('a long flag run in a quoted command string is decided fast, not by the deadline', () => {
+  const line = `doppler run --command "supabase ${"-o 'a' ".repeat(40)}zzz"`;
+  const t0 = Date.now();
+  const v = verdict(line);
+  const ms = Date.now() - t0;
+  assert.equal(v.decision, 'allow', v.reason);
+  assert.doesNotMatch(v.reason ?? '', /took too long/);
+  assert.ok(ms < 2000, `took ${ms} ms`);
 });
 
 test('an unknown subcommand names itself', () => {

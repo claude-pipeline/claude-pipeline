@@ -248,10 +248,32 @@ const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
 // (`supabase/migrations/x.sql`, `SUPABASE_URL`, `supabase.from(`, `supabase.com`, `@supabase/supabase-js` are not tokens; `supabase`, `./node_modules/.bin/supabase`, `'supabase db push'` are)
 const SB_TOKEN_SRC = String.raw`(?<![\w.@-])(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\\s'"]*)?(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`;
 const SB_TOKEN = new RegExp(SB_TOKEN_SRC, 'i');
-// (the CLI's global flags may sit between the token and the head, a value in its two-word or `=` form, quoted or not: `supabase --workdir /app db push`; the sets are the ones skipGlobals reads)
-const GLOBAL_FLAG_SRC = `(?:--(?:debug|experimental|yes|wizard)|(?:--(?:workdir|profile|network-id|dns-resolver|output|output-format|log-level|agent|completions)|-o)(?:=|\\s+)(?:"[^"]*"|'[^']*'|\\S+))`;
-// ... followed, after whitespace, by a subcommand head: the shape of a command line that runs the binary
-const SB_TOKEN_HEAD = new RegExp(`${SB_TOKEN_SRC}\\s+(?:${GLOBAL_FLAG_SRC}\\s+)*(?:${[...SUB_HEADS].join('|')}|network-[a-z-]+)(?![\\w-])`, 'i');
+// The gate that decides whether a quoted command string is read again as a command line: a supabase token followed, in the same simple command, by ANY run of words and then a subcommand head.
+// It is liberal on purpose (R2-F1: any flag spelling -- `--yes=true`, `-ojson`, `--linked=true`, an escaped space in a value, a quoted head -- sits in that run) and the reparse judges: reparsedRefusal only refuses when a parsed command really starts with the binary.
+// It is a linear scan (one pass for the text, one split per simple command), never a regex over flag shapes: those backtracked (#688, a run of `-o 'a'` pairs took seconds).
+function sbTokenHead(text) {
+  if (!SB_TOKEN.test(text)) return false; // (the common case, a word or line with no supabase token at all: one regex pass, no scan)
+  // quote and backslash characters dropped; a `;` `&` `|` or newline outside quotes ends the simple command (marked \0)
+  let clean = '';
+  let quote = null;
+  for (let i = 0; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === '\\') { if (quote !== "'" && i + 1 < text.length) { i += 1; clean += text[i] === '\n' ? ' ' : text[i]; } continue; }
+    if (quote) { if (ch === quote) quote = null; else clean += ch; continue; }
+    if (ch === '"' || ch === "'") quote = ch;
+    else if (ch === ';' || ch === '&' || ch === '|' || ch === '\n') clean += '\0';
+    else clean += ch;
+  }
+  for (const part of clean.split('\0')) {
+    const at = SB_TOKEN.exec(part); // (the first token of a command is enough: a head after a later token is also after the first)
+    if (!at) continue;
+    for (const w of part.slice(at.index + at[0].length).split(/\s+/)) {
+      const head = /^[a-z][a-z0-9-]*(?![\w-])/i.exec(w)?.[0].toLowerCase();
+      if (head && isSubcommandHead(head)) return true;
+    }
+  }
+  return false;
+}
 // B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
 function globMatchesHead(w) {
   if (!/[*?[]/.test(w)) return false;
@@ -357,7 +379,7 @@ const stdinFed = (c) => c.fan === true;
 // (B2: `sed` runs programs with its `e` command, so it is plain data here only while the line shows no supabase token followed by a subcommand head)
 const buildsProgram = (c, text) => {
   const n = commandName(c.argv[0]);
-  return n === 'sed' ? SB_TOKEN_HEAD.test(text) : !STDIN_DATA.includes(n);
+  return n === 'sed' ? sbTokenHead(text) : !STDIN_DATA.includes(n);
 };
 
 // the global flags (every subcommand accepts them, CLI 3.1 `GLOBAL FLAGS`; 2.x has the same set minus the 3.x-only ones, which 2.x rejects itself): one that takes a value (two-word or `=` form) and the booleans
@@ -516,7 +538,7 @@ function reparsedRefusal(text, state, reparse, depth) {
     for (const [i, w] of words.entries()) {
       if (isInlineProgram(words, i)) continue;
       // (a word that is the whole text just read -- the parser lists a `$(…)` word as its own command -- reads the same again: its commands are already judged)
-      if (!SB_TOKEN_HEAD.test(w) || commandText(w) === text) continue;
+      if (!sbTokenHead(w) || commandText(w) === text) continue;
       if (depth >= MAX_REPARSE_DEPTH) return NESTED_UNREAD;
       why = reparsedRefusal(commandText(w), state, reparse, depth + 1);
       if (why) return why;
@@ -567,7 +589,7 @@ export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv, rep
     if (data || commandName(c.argv[0]) === 'sed' || isPipelineBin(c.argv)) continue;
     const own = wordsOf(c);
     for (const [i, w] of own.entries()) {
-      if (!SB_TOKEN_HEAD.test(w) || isInlineProgram(own, i)) continue;
+      if (!sbTokenHead(w) || isInlineProgram(own, i)) continue;
       const why = reparse ? reparsedRefusal(commandText(w), state, reparse, 1) : NESTED_UNREAD;
       if (why) return refuse(why);
     }
