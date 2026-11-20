@@ -2275,3 +2275,33 @@ test('item 5: inline node -e / -p that only reads a review file is allowed; a wr
     `node -e "eval(process.argv[1]);require('./.review/state.json')" 'x'`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
+
+// Items 5b/10 (refused: `node -e 'const r=require("./.review/risk.json");console.log((r.items||[]).length)'` and the double-quoted twin on .review/round-18/codex.json): the arithmetic gate (#266 R7-F3) must not read
+// the parentheses or a `let` of a JavaScript program that is the whole single- or double-quoted word after node -e / -p. Everything else keeps the gate: `$((`, `$[`, a lone `_` (zsh reads it as the last word of the
+// previous command), `((` / let in shell code, a program word with an unquoted part, a `$` or backtick inside a double-quoted program, and a `node -e` that is only text inside another quoted string.
+test('items 5b/10: a ((, a let or a (x||[]) inside a quoted node -e program is no arithmetic; the zsh _ attack and every other arithmetic shape on a line naming a review file stays refused', () => {
+  for (const cmd of [
+    `node -e 'const r=require("./.review/state.json");console.log((r.items||[]).length)'`,
+    `node -e "const t=require('fs').readFileSync('.review/round-18/codex.json','utf8');console.log((t.match(/x/g)||[]).join())"`,
+    `node -e 'let n=0;const r=require("./.review/state.json");for(let i=0;i<3;i++){n+=((r.a||0)+1)};console.log(n)'`,
+    `node -p '(require("./.review/state.json").items||[]).length' && cat .review/state.json`,
+    `cd /repo && node -e "console.log(((require('./.review/state.json').x)||1))"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    `echo 'path[$(cmd)]'; node -e "console.log($((_)))" .review/state.json`,
+    `echo 'path[$(cmd)]'; echo $((_)); cat .review/state.json`,
+    `node -e "console.log($((1+1)))" .review/state.json`,
+    `node -e "console.log($[1+1])" .review/state.json`,
+    `node -e 'console.log(_.keys(require("./.review/state.json")))'`,
+    `node -e "((_))" .review/state.json`,
+    `node -e "console.log(\`$(echo ((_)))\`)" .review/state.json`,
+    `node -e "x $( ((_)) ) y" .review/state.json`,
+    `((x=1)); cat .review/state.json`,
+    `let x=1; cat .review/state.json`,
+    `echo node -e '((x))'; cat .review/state.json`,
+    `eval "echo; node -e '$((_))' .review/state.json"`,
+    `node -e '((x))'"$X" .review/state.json`,
+    `node -e 'console.log(require("./.review/state.json"))' $((_))`,
+    `node -e '((x))' > .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
