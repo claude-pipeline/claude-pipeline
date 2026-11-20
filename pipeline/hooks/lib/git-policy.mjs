@@ -1580,7 +1580,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   if (!sf.sourced && path.isAbsolute(abs)) ctx.selfScript = abs;
   let v;
   try {
-    v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced);
+    v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced && !sf.inline); // (#609 R1: an eval-fed text runs in the caller's shell, not a child's)
   } finally {
     ctx.selfScript = outerSelf;
   }
@@ -3323,6 +3323,8 @@ function evalString(str, startDir, ctx, level, child = false) {
   };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
+  // (#609 R1: one mark for the whole evaluation: a walked text defines / aliases / disables `exit` or exports a function (a child shell inherits it), so a written `exit` may not end the shell and no forget is deferred)
+  if (hazard || cmds.some((c) => c.argv.length > 1 && baseName(c.argv[0]) === 'export' && c.argv.slice(1).some((a) => /^-[a-zA-Z]*f/.test(a)))) ctx.exitMayBeRedefined = true;
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
   const dirAt = new Map();
   const cdDirs = cdTargets(cmds, startDir, ctx);
@@ -3458,7 +3460,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       restoreAfterGroup();
       // (#609: deferred only for a bare, unwrapped `exit` (plainExit, no child-launch flag, and the WRITTEN first word is `exit`: wrapper classification uses the basename, so an external `/usr/bin/time exit 1` reads as the shell's own `time` and cannot end the shell); everything else forgets at once, as before)
       if (!inert) {
-        if (level > 0 && child === true && groupExit && plainExit(groupExit) && groupExit.spawn !== true && /^\s*exit(?:[\s;}]|$)/.test(groupExit.raw ?? '')) pendingForget = true;
+        if (level > 0 && child === true && !ctx.exitMayBeRedefined && groupExit && plainExit(groupExit) && groupExit.spawn !== true && /^\s*exit(?:[\s;}]|$)/.test(groupExit.raw ?? '')) pendingForget = true;
         else forgetBranches(ctx);
       }
     }

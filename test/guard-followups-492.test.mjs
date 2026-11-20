@@ -152,6 +152,20 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
   test('a function named exit defined by the caller: sourcing the script is denied (the written exit may not leave the shell; the reason a sourced text does not defer)', () => {
     expect('deny', 'exit() { :; }; source /work/repo/s.sh', { '/work/repo/s.sh': V1 });
   });
+  // R1-B1 / R1-F1: the written exit may not be the shell's real exit: the caller's function, an exported one, an eval (this shell), a startup file, or a sourced helper redefines it; the cd failing then switches to main and the push runs there
+  const S = V2;
+  const REDEF = { '/work/repo/s.sh': S, ...FIX };
+  for (const [why, line, files] of [
+    ['eval-fed text with a caller function exit', 'exit() { :; }; eval "$(cat /work/repo/s.sh)"', REDEF],
+    ['an exported function exit into the child shell', 'exit() { :; }; export -f exit; bash /work/repo/s.sh', REDEF],
+    ['BASH_ENV startup file that defines exit', 'BASH_ENV=/work/repo/rc.sh bash /work/repo/s.sh', { ...REDEF, '/work/repo/rc.sh': 'exit() { :; }\n' }],
+    ['a sourced helper inside the group that defines exit', 'bash /work/repo/s.sh', { '/work/repo/s.sh': 'cd /work/repo/sub || { source /work/repo/h.sh; exit 1; }\ngit push\n', '/work/repo/h.sh': 'exit() { :; }\ngit checkout main\n' }],
+    ['a plain eval of the script (this shell, so a function of the caller may stand for exit)', 'eval "$(cat /work/repo/s.sh)"', REDEF],
+  ]) {
+    test(`${why}: denied`, () => {
+      expect('deny', line, files);
+    });
+  }
   test('intended tightening: a git switch after the group no longer re-establishes a known branch for the caller', () => {
     const v = verdict('bash s.sh; git -C /work/repo push', { '/work/repo/s.sh': `${GROUP('exit 1')}git switch agent/x\n` });
     assert.equal(v.decision, 'deny', v.reason);
