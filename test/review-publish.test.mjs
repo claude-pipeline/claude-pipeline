@@ -13,10 +13,10 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createCommentsGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
+import { SUPPORTED_STATE_VERSION, addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../pipeline/lib/review-marker.mjs';
-import { assertPublishedHistory, establishBaseline, readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
+import { assertPublishedHistory, establishBaseline, pastRoundHistoryProblem, readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
 import { adoptPublishedGrants, compareHistory, historyPreserved, reviewLockName } from '../pipeline/lib/review-context.mjs';
 import { reviewEligibilityProblems, rulingContentDigest, rulingsBlock, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
 import { buildReviewPrompt } from '../pipeline/lib/codex.mjs';
@@ -117,6 +117,32 @@ test('publishTriage: the first publication creates the comment and records the b
   assert.equal(readBaseline(root, 7), reviewContentHash(s));
   assert.equal(readBaseline(root, 8), null, 'a baseline is for one PR');
   assert.equal(published(gh.comments[0].body).rounds.length, 1);
+});
+
+// A triage comment a NEWER pipeline wrote (state version above what this install reads) must never be overwritten: a decode failure there is not damage.
+const newerFormatComment = (state, id = 1) => mine({ ...state, version: SUPPORTED_STATE_VERSION + 1 }, id);
+
+test('publishTriage: refuses newer-format when the PR\'s triage comment is from a newer pipeline, and never upserts; a damaged comment is still overwritten', (t) => {
+  const s = mk([it('R1-B1')]);
+  const gh = memGh([newerFormatComment(s)]);
+  const root = tmpRoot(t);
+  assert.throws(() => publishTriage({ gh, root, pr: 7, state: s }), (e) => {
+    assert.equal(e.exitCode, 1);
+    assert.equal(e.output.error, 'newer-format');
+    assert.match(e.output.reason, new RegExp(`version ${SUPPORTED_STATE_VERSION + 1}.*up to ${SUPPORTED_STATE_VERSION}.*pipeline update`));
+    return true;
+  });
+  assert.equal(gh.upserts, 0, 'the newer pipeline\'s comment is untouched');
+  assert.equal(readBaseline(root, 7), null);
+  const p = readPublished(gh, 7);
+  assert.deepEqual([p.undecodable, p.newerFormat], [true, { version: SUPPORTED_STATE_VERSION + 1 }]);
+  // a newer-format comment for ANOTHER PR is not this PR's history: plain undecodable
+  assert.equal(readPublished(gh, 8).newerFormat, null);
+  // genuinely damaged: unchanged behaviour, it is replaced
+  const damaged = memGh([{ ...mine(s, 1), body: `${MARKERS.triage}\nclaude-pipeline:state:garbage` }]);
+  assert.equal(readPublished(damaged, 7).newerFormat, null);
+  assert.equal(publishTriage({ gh: damaged, root: tmpRoot(t), pr: 7, state: s }).action, 'updated');
+  assert.equal(damaged.upserts, 1);
 });
 
 test('publishTriage: allowed when the PR holds what this copy last published; refused when it holds something else', (t) => {
@@ -306,6 +332,20 @@ test('assertPublishedHistory: no comment passes; unreadable, behind, diverged an
   fails(check([mine(pub)], history(2)), 'stale-history', /owner grant on round 2/);
   fails(check([mine(pub)], history(3, { grants: { 2: { ...GRANT, k: 2 } } })), 'unpublished-history', /comment --pr 7 --kind triage/);
   fails(check([mine(pub)], withRound(pub, 1, { toHead: 'e'.repeat(40) })), 'stale-history', /pipeline state show --pr 7/);
+});
+
+test('assertPublishedHistory / pastRoundHistoryProblem: a newer-format comment says update the pipeline, never publish or restore', () => {
+  const s = mk([it('R1-B1')]);
+  const gh = memGh([newerFormatComment(s)]);
+  assert.throws(() => assertPublishedHistory({ gh, pr: 7, state: s }), (e) => {
+    assert.equal(e.output.error, 'history-unreadable');
+    assert.match(e.output.message, /pipeline update/);
+    assert.doesNotMatch(e.output.message, /--kind triage/);
+    return true;
+  });
+  const { problem } = pastRoundHistoryProblem({ local: s, published: readPublished(gh, 7), pr: 7 });
+  assert.equal(problem.error, 'history-unreadable');
+  assert.match(problem.message, /pipeline update/);
 });
 
 test('establishBaseline (R6-F1): with a baseline already present it makes no GitHub read; without one it reads once and writes it when the states are equal', (t) => {

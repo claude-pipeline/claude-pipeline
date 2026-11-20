@@ -25,7 +25,7 @@ import { isDocPath } from './doc-paths.mjs';
 import { loadState } from './state.mjs';
 import { parseYaml } from './yaml.mjs';
 import { capLowItems, claudeRulingRows, sameOnBaseRows, substituteDigest, substituteInventory, substituteRefusal, substituteItemLine, isOwnerDeferral, ownerRuledItems, reviewEligibilityProblems, reviewValidFor, rulingsBlock, rulingsDigest, rulingsInventory, fableBypassNote, fableBypassRounds, staleFableReason, staleFableRounds } from './triage.mjs';
-import { readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
+import { newerFormatText, readPublished, reviewContentHash as stateContentHash } from './review-publish.mjs';
 import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
 import { readReviewGate } from './model-floor.mjs';
@@ -1074,6 +1074,7 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
   const mine = stateContentHash(local);
   // Everything that depends on what GitHub lists; judged again once after a pause (a comment just posted may not be listed yet).
   const problemWith = (p) => {
+    if (p.newerFormat) return newerFormatText(p.newerFormat);
     if (p.undecodable) return `the PR's newest triage comment holds no readable review state: restore it with \`pipeline state show --pr ${pr}\``;
     const m = p.marker;
     if (!m.found) return `the review has not been completed on this PR (no review-complete comment): ${RUN}`;

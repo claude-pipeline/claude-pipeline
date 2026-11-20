@@ -20,7 +20,7 @@ import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch, trustedDefaultBranch } from '../lib/risk.mjs';
 import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
 import { DEFERRABLE_ACCEPT_BY, arbiterFailures, capLowItems, countsTowardCap, finalIsReopenable, isDeferrableAccept, isOwnerDeferral, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
-import { pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
+import { newerFormatText, pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
   allItems, canonicalJson, currentContentHash, decidedItemsKey, findItem, findRound, followupsPending, newStaleDir, quarantineReviewDir, refreshBaseRef, requireState, reviewBaseRef,
   adoptPublishedGrants, roundDir, stateExtends, withStateLock,
@@ -39,9 +39,10 @@ export const meta = {
     '  (.review/published-baseline.json), which is what the next publication is checked against (lib/review-publish.mjs)',
     '  owner grants the PR holds on rounds this copy has (and it lacks or holds differently) are copied onto them, nothing is quarantined and local rounds / decisions are kept: grantsRestored:[round numbers]. This also holds when the PR moved off this copy\'s baseline by such a grant alone (another checkout published it) while this copy has unpublished decisions or a trailing round. A local-only owner grant (the PR\'s round has none) that does not verify on this machine is dropped, with the admission it set: grantsDropped:[round numbers] (the refusal `unverified-grant` of `state past-round-grant` names this remedy); it is checked against the gh repository, like `past-round-grant` does, and a check that failed with an error (not a "no") keeps the grant with a warning. After adopting grants the baseline follows the PR only when this copy equals the PR apart from grants and trailing local rounds (a copy that lacks a published decision or round-level proof keeps its baseline, so it cannot publish over it)',
     '  (GitHub unreachable but a local state exists: served as is with a `warnings` entry, exit 0; with no local state exit 3)',
+    '  (the PR\'s triage comment was written by a newer pipeline: with no local state exit 2 {error:no-state, newerFormat:true}; with one it is served as source local-unverified with a `warnings` entry; run `pipeline update`)',
     'pipeline state discard-round --round R [--pr N] [--repo DIR]',
     '  -> drop an unpublished, trailing round R from the local state and move .review/round-R/ into .review/stale-<UTC time>/;',
-    '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict',
+    '     refused (exit 2) when the PR triage comment already holds round R, or (error round-has-verdict) when the round holds a second-review verdict, or (error history-unreadable, newerFormat:true) when the PR triage comment was written by a newer pipeline (run `pipeline update`)',
     'pipeline state outcome [--repo DIR]   -> roundOutcome + {clean, arbiterFailures, followupsPending, capDeferred, rounds, reviewedRounds, maxRounds, roundStats: {rounds: [{n, items, byBucket}], reRaised, ruledReRaised}, wholePrOwed, nextRound:{round, base, wholePrOwed}[, base][, warnings]}; exit 0 whether or not clean',
     '  capDeferred: [ids] = the accepts `triage cap-defer` turned into follow-ups unapplied at the last allowed round (review.cap_low_accepts; final.postMax.rule cap-low), read from the state, so it also answers after a retry: name those issues in the hand-off, they are NOT in the PR',
     '  warnings: [the untrusted-anchor sentence] when the default branch could not be anchored on the remote (the hashes are then measured from the PR-editable default_branch; fix: `git remote set-head origin -a`)',
@@ -88,7 +89,7 @@ export const meta = {
     '     with no owner grant or one whose record is gone), already-approved (the PR already holds a verified grant on it); no-grant (no past-round record for this repository, PR, counted round and head, younger than 24 h, typed by the owner)',
     '  -> every matching unspent record is claimed together (one machine-global marker each, like codex-review), the newest is recorded. An interrupted run is resumed by running the command again: a record whose marker is already spent and verifies is',
     '     used without a new claim (at any age), leftovers are claimed. claim-failed | save-failed (exit 1) keep the markers; a failed publication keeps the saved state: exit 3 {unavailable:true, saved:true, published:false, next} for GitHub, exit 1',
-    '     {error: stale-publication | history-loss, saved:true, published:false} when the PR moved; run the command again to retry. Re-approving a round whose published grant no longer verifies replaces that grant. remaining: [{n, k}] the other rounds still to approve',
+    '     {error: stale-publication | history-loss | newer-format, saved:true, published:false} when the PR moved; run the command again to retry. Re-approving a round whose published grant no longer verifies replaces that grant. remaining: [{n, k}] the other rounds still to approve',
   ].join('\n'),
 };
 
@@ -300,6 +301,9 @@ async function showLocked(values, n, pr, root, ctx) {
     }
     const found = await recoverState(root, pr, ctx, gh);
     state = found.state;
+    if (!state && found.newerFormat) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', newerFormat: true, message: `cannot rebuild the review state from PR #${pr}: ${newerFormatText(found.newerFormat)}` });
+    }
     if (!state) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'no-state', message: `no local review state and no triage comment with state on PR #${pr}` });
     }
@@ -320,6 +324,10 @@ async function showLocked(values, n, pr, root, ctx) {
     } catch (err) {
       if (!(err instanceof UnavailableError)) throw err;
       warnings.push(`GitHub unavailable: the local review state was not compared with the published triage comment (${String(err.message).split('\n')[0].slice(0, 200)})`);
+      source = 'local-unverified';
+    }
+    if (found?.newerFormat) {
+      warnings.push(`the local review state was not compared with the published triage comment: ${newerFormatText(found.newerFormat)}`);
       source = 'local-unverified';
     }
     // The PR moving off this copy's baseline by owner grants alone (another checkout published one) is not a change of decisions: the grants are adopted below,
@@ -414,7 +422,11 @@ async function discardRound(rest, ctx) {
     if (withVerdict.length > 0) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'round-has-verdict', message: `round ${n} holds a second-review verdict (${withVerdict.join(', ')}), so it cannot be discarded: a second review runs once per item` });
     }
-    const published = (await recoverState(root, pr, ctx)).state;
+    const found = await recoverState(root, pr, ctx);
+    if (found.newerFormat) {
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'history-unreadable', newerFormat: true, message: `cannot tell whether round ${n} is published: ${newerFormatText(found.newerFormat)}` });
+    }
+    const published = found.state;
     if ((published?.rounds ?? []).some((r) => r.n === n)) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'round-published', message: `round ${n} is in the PR triage comment: it is history, not an interrupted round` });
     }
@@ -907,6 +919,9 @@ async function pastRoundGrant(rest, ctx) {
     } catch (err) {
       if (err instanceof GhError || err instanceof UnavailableError) {
         return { exitCode: EXIT.UNAVAILABLE, output: { ok: false, unavailable: true, reason: 'github', ...out, published: false, remaining, next: `GitHub could not be reached, so the approval is saved here only: ${retry}` } };
+      }
+      if (err instanceof Fail && err.output?.error === 'newer-format') {
+        return { exitCode: EXIT.FAILED, output: { ok: false, error: 'newer-format', ...out, published: false, remaining, reason: err.output.reason, next: 'NOT published: the approval is saved here only. Run `pipeline update`, then ' + retry } };
       }
       if (err instanceof Fail && (err.output?.error === 'stale-publication' || err.output?.error === 'history-loss')) {
         return { exitCode: EXIT.FAILED, output: { ok: false, error: err.output.error, ...out, published: false, remaining, reason: err.output.reason, next: `NOT published: the approval is saved here only. Run \`pipeline state show --pr ${pr}\`, then ${retry}` } };

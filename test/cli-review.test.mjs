@@ -3198,6 +3198,23 @@ test('state discard-round: refuses a round the PR comment holds, a round that is
   assert.match(w.cli(['state', 'bogus']).stdout + w.cli(['state', 'bogus']).stderr, /discard-round/);
 });
 
+// A newer pipeline's triage comment decodes to no state here; that must not read as "round not published" (the round would be discarded from the local copy).
+test('state discard-round / state show: a newer-format triage comment refuses the discard and serves the local state as local-unverified', (t) => {
+  const { w, published } = publishedWorld(t);
+  const script = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8'));
+  w.fake.setScript([...COMMENTS(mine({ ...published, version: 99 })), ...script]);
+  const d = w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']);
+  assertExit(d, 2);
+  assert.equal(d.json.error, 'history-unreadable');
+  assert.match(d.json.message, /pipeline update/);
+  assert.equal(w.state().rounds.length, 1);
+  assert.deepEqual(staleDirs(w), []);
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.equal(show.json.source, 'local-unverified');
+  assert.match(show.json.warnings.join(' '), /pipeline update/);
+});
+
 test('state discard-round: a gh outage is exit 3 and nothing is moved', (t) => {
   const { w } = publishedWorld(t);
   editState(w, (s) => {

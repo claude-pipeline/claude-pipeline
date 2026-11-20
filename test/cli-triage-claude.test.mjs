@@ -822,6 +822,22 @@ test('claude-ruling: a state published by someone else is reported as published:
   assert.equal(publishedState(w).rounds[0].items[1].final.reason, 'theirs', 'the PR was not touched');
 });
 
+test('claude-ruling: a triage comment from a newer pipeline is reported as published:false, publishError newer-format; the local save stands', (t) => {
+  const w = world(t, { comments: true });
+  assertExit(w.codex(1, findingsOf([finding()], [sugg()])), 0);
+  w.wait('R1-B1');
+  w.wait('R1-S1');
+  assertExit(w.cli(ruling('R1-B1', 'ACCEPT')), 0);
+  w.fake.addComment({ body: triageComment({ ...w.state(), version: SUPPORTED_STATE_VERSION + 1 }) });
+  const r = w.cli(ruling('R1-S1', 'FOLLOW-UP', { reason: 'mine' }));
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.equal(r.json.published, false);
+  assert.equal(r.json.publishError, 'newer-format');
+  assert.match(r.json.next, /pipeline update/);
+  assert.match(r.json.next, /pipeline comment --pr \d+ --kind triage/);
+  assert.equal(w.item('R1-S1').final.by, 'claude', 'saved locally');
+});
+
 // R5-B2: a checkout from before the baseline existed (no .review/published-baseline.json) whose state equals the published one: the first decision on a
 // published item must publish (it used to be refused as stale-publication, because the decided item no longer "extends" the published one).
 const baselineFile = (w) => join(w.repo.dir, '.review', 'published-baseline.json');
