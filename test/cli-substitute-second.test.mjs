@@ -639,7 +639,7 @@ test('model stop: exit 3 reason model with the substitute packet; route-2nd hold
   const only = solo.apply(s.json.substitute.tag, install(solo, s.json.substitute, ['R1-B1'], { answer: answerOf(['R1-B1', 'REJECT', 'high']) }));
   assertExit(only, 0, only.stdout + only.stderr);
   assert.equal(solo.item('R1-B1').final.by, 'arbiter');
-  assert.match(triageComment(solo.state()), /Codex refused the configured model gpt-6-astra/);
+  assert.match(triageComment(solo.state()), /Codex refused the configured model gpt-6\.2-astra/);
 });
 
 test('R2-F1: a second-review re-run after a proven model stop hands the open attempt back (reused true): the message says --apply FIRST and names the call protocol', (t) => {
@@ -686,6 +686,6 @@ test('apply refuses a refused-model record whose trusted model has changed since
   const applied = w.apply(sub.tag, install(w, sub, ['R1-B1']));
   assertExit(applied, 1, applied.stdout);
   assert.equal(applied.json.error, 'route-mismatch');
-  assert.match(applied.json.message, /the trusted Codex model is now gpt-6-astra, not the refused gpt-older-1/);
+  assert.match(applied.json.message, /the trusted Codex model is now gpt-6\.2-astra, not the refused gpt-older-1/);
   assert.equal(w.item('R1-B1').secondReview, undefined, 'nothing recorded');
 });
