@@ -492,24 +492,31 @@ export class GuardLimit extends Error {}
 // evaluation, nested scripts included, share this allowance; past it the check is refused (GuardLimit), as for too many script files.
 export const MAX_TOTAL_READINGS = 1024;
 const processCpuMs = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
-// What the two hook entry points pass (spread into the evaluator options): the wall clock is ms since process start (performance.now(), origin 0), so the
-// hard wall cap counts startup and is shared by every evaluation of the hook process. CPU is still read from the process, per evaluation.
-export const HOOK_CLOCK = Object.freeze({ now: () => performance.now(), cpu: processCpuMs, wall0: 0 });
+// What the two hook entry points pass (spread into the evaluator options): only the ORIGIN of the hard wall cap, the epoch time (ms) the process started at, so the
+// cap counts startup and is shared by every evaluation of the hook process. `now` stays the real epoch clock (the owner-go records are judged by it), CPU is still per evaluation.
+export const HOOK_CLOCK = Object.freeze({ wall0: performance.timeOrigin });
 // `now` (wall, ms) and `cpu` (CPU, ms) are injectable so tests do not depend on timing. A test that injects only `now` gets one clock for both
 // (the old single-clock behaviour); the real default reads the process's CPU time.
-// `wall0` is the `now` time the wall cap counts from: the evaluation start by default, 0 (process start) for a hook (HOOK_CLOCK). A budget copied for a second pass keeps it.
-export function newEvalBudget(now = Date.now, cpu = now === Date.now ? processCpuMs : now, wall0 = now()) {
+// `wall0` is the `now` time the wall cap counts from: the evaluation start by default, the process start for a hook (HOOK_CLOCK). `evalStart` is where this evaluation began, which bounds its CPU
+// reading (CPU cannot exceed the wall time of the evaluation itself). A budget copied for a second pass keeps both. One clock read serves every origin when `cpu` is `now` itself.
+export function newEvalBudget(now = Date.now, cpu = now === Date.now ? processCpuMs : now, wall0) {
+  const t0 = now();
+  const c0 = cpu === now ? t0 : cpu();
   // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
-  return { now, cpu, wall0, cpu0: cpu(), scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
+  return { now, cpu, evalStart: t0, wall0: wall0 ?? t0, cpu0: c0, scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
 }
 
 // Why the evaluation must stop, or null: past the hard wall cap (fail-closed against the host timeout), or past the CPU limit.
 export function budgetExpiry(budget) {
-  const wall = budget.now() - budget.wall0;
-  if (wall > EVAL_WALL_CAP_MS) return 'wall';
-  if (Math.min(budget.cpu() - budget.cpu0, wall) > EVAL_DEADLINE_MS) return 'cpu';
+  const t = budget.now();
+  if (t - budget.wall0 > EVAL_WALL_CAP_MS) return 'wall';
+  const c = budget.cpu === budget.now ? t : budget.cpu();
+  if (Math.min(c - budget.cpu0, t - budget.evalStart) > EVAL_DEADLINE_MS) return 'cpu';
   return null;
 }
+
+// Wall time left under the hard cap (ms, never negative): the bound of a blocking lookup (a git or gh child process), which the deadline checks cannot interrupt.
+export const wallLeftMs = (budget) => Math.max(0, EVAL_WALL_CAP_MS - (budget.now() - budget.wall0));
 
 // The one predicate every deadline reader uses (checkDeadline, and the scanners' `expired` callbacks).
 export const budgetExpired = (budget) => budgetExpiry(budget) !== null;

@@ -23,12 +23,12 @@ function evaluate(command, o = {}) {
   const verdict = evaluateGitCommand(command, {
     cwd: o.cwd ?? '/work/repo',
     home: '/home/u',
-    currentBranch: (dir, extra) => {
+    currentBranch: (dir, { leftMs, ...extra } = {}) => { // (leftMs, the wall-cap bound every lookup is given, is checked in guard-budget.test.mjs)
       calls.branchDirs.push({ dir, ...extra });
       if (byDir) return byDir[dir] ?? null;
       return o.branch === undefined ? 'agent/x' : o.branch;
     },
-    pushDestination: (dir, extra) => {
+    pushDestination: (dir, { leftMs, ...extra } = {}) => {
       calls.pushDirs.push({ dir, ...extra });
       if (o.pushDest instanceof Error) throw o.pushDest;
       if (typeof o.pushDest === 'function') return o.pushDest(dir, extra);

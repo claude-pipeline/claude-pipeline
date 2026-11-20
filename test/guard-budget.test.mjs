@@ -11,7 +11,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
-import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, wallLeftMs, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
 import { HOOK_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
 import { readFileSync } from 'node:fs';
 
@@ -205,13 +205,48 @@ for (const [name] of both) {
   });
 }
 
-test('budget: HOOK_CLOCK counts the wall cap from process start; the default counts from the evaluation start', () => {
+test('budget: HOOK_CLOCK is only the epoch origin of the wall cap (process start); the default counts from the evaluation start', () => {
+  assert.deepEqual(Object.keys(HOOK_CLOCK), ['wall0'], 'no `now` or `cpu` override: the owner-go records are judged by the real epoch clock');
+  assert.equal(HOOK_CLOCK.wall0, performance.timeOrigin);
   const c = { t: 60_000 };
   assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0)), false, 'default budget created at 60 s');
   c.t += 1000;
   assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0)), false);
-  assert.equal(HOOK_CLOCK.wall0, 0);
-  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0, HOOK_CLOCK.wall0)), true, 'a hook budget created at 61 s after process start');
+  c.t = HOOK_CLOCK.wall0 + 11_000;
+  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0, HOOK_CLOCK.wall0)), true, 'a hook budget created 11 s after process start');
+});
+
+test('budget (hook origin): the CPU limit counts from the evaluation start, not from process start (a later command field is not refused for the time before it)', () => {
+  // Failure caught: the CPU clamp used the wall since process start, so an evaluation that began 2 s in was refused after 5 s of CPU although only 4 s of its own wall had passed.
+  const c = { wall: 2000, cpu: 0 };
+  const budget = newEvalBudget(() => c.wall, () => c.cpu, 0);
+  Object.assign(c, { wall: 6000, cpu: 5200 });
+  assert.equal(budgetExpired(budget), false, '4 s of own wall bounds the 5.2 s of CPU');
+  Object.assign(c, { wall: 8000, cpu: 5200 });
+  assert.equal(budgetExpired(budget), true, '6 s of own wall and 5.2 s of CPU is past the CPU limit');
+  assert.equal(wallLeftMs(budget), 2000, 'the wall cap is 10 s from process start');
+});
+
+test('guard-git: a bare push does not start its second lookup once the wall cap is gone, and the first one is bounded by what is left (a hook past HOOK_TIMEOUT_S is allowed)', () => {
+  // Failure caught: the branch (5 s) and push-destination (3 s) lookups ran back to back after the last deadline check; at 9 s that could end past the host timeout.
+  const clock = { t: 9000 };
+  const seen = { branchLeft: null, destStarted: false };
+  const r = git('git push', gitFs({}), {
+    now: () => clock.t, cpu: () => 0, wall0: 0,
+    currentBranch: (dir, o) => { seen.branchLeft = o?.leftMs?.(); clock.t = 10_500; return 'agent/x'; },
+    pushDestination: () => { seen.destStarted = true; return 'origin/agent/x'; },
+  });
+  assert.ok(seen.branchLeft <= 1000, `the branch lookup was told ${seen.branchLeft} ms are left`);
+  assert.equal(r.decision, 'deny');
+  assert.equal(seen.destStarted, false);
+});
+
+test('the wiring lookups start nothing when no wall time is left (a throw: unknown, which the policy denies)', async () => {
+  const { realGitWiring } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const w = realGitWiring();
+  assert.throws(() => w.currentBranch(process.cwd(), { leftMs: () => 0 }));
+  assert.throws(() => w.pushDestination(process.cwd(), { leftMs: () => 0 }));
+  assert.throws(() => w.issueLabels(1, [], process.cwd(), { leftMs: () => 0 }));
 });
 
 for (const hook of ['guard-git.mjs', 'guard-files.mjs']) {
