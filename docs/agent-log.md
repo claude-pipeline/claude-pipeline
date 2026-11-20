@@ -282,3 +282,4 @@ full record.
 - 2026-11-19 · #670 · Two load-flaky tests tolerate a busy machine (#589, guard CPU budget) · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge · Codex 7d: 566 runs (150 high)
 - 2026-11-20 · #668 · Refuse to publish over a newer-format triage comment (#612) · risk high · rounds 1 · arbiter 1 · awaiting-review · Codex 7d: 570 runs (153 high)
 - 2026-11-20 · #646 · Outbound text scan for listed repositories (machine-local scanner, fail closed) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 593 runs (159 high)
+- 2026-11-20 · #664 · A repo rename or transfer keeps each PR's run record and booked cost (#641) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 593 runs (159 high)
