@@ -20,7 +20,7 @@ export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
-import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
+import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -2461,7 +2461,7 @@ function checkCandidateScripts(sf, dir, ctx, level) {
 
 // A command followed by | or & ran in a subshell (a pipeline stage / background job): what it assigned or changed is lost.
 // #493: the next command is read from the text's own level for a command of it (the parser lists a `$( )`'s inner commands before the command that holds them, so cmds[i + 1] can be an inner command:
-// `cd /other | tee "$(date)"; git push`); a command inside a substitution keeps the flat reading (as nextAt in evalString).
+// `cd /other | tee "$(date)"; git push`); a command inside a substitution keeps the flat reading.
 const nextSep = (cmds, i) => {
   if (cmds[i]?.depth > 0) return cmds[i + 1]?.sep;
   for (let j = i + 1; j < cmds.length; j++) if (!(cmds[j].depth > 0)) return cmds[j].sep;
@@ -3206,15 +3206,6 @@ function evalString(str, startDir, ctx, level, child = false) {
     return after >= 1 ? cmds.indexOf(shapeTop.top[after - 1]) : -1; // (the exit is the construct's last command; a substitution of the command after it is listed after the exit)
   };
   const exitsAsGroup = (i) => exitOfGroup(i) >= 0;
-  // #481: the command `n` places after cmds[i] at the text's own level. The parser lists the commands of a `$( )` before the command that holds them, so cmds[i + 1] can be a substitution's
-  // inner command (`cd d || echo "$(pwd)"; git push`): the next command is read from the top-level list. (A command inside a substitution itself keeps the flat reading.)
-  let topIdx; // (command -> its index in the text's own level, built when first asked)
-  const nextAt = (i, n) => {
-    if (cmds[i].depth > 0) return cmds[i + n];
-    if (!topIdx) { topIdx = new Map(); for (const c of cmds) if (!(c.depth > 0)) topIdx.set(c, topIdx.size); }
-    shapeTop ??= { top: cmds.filter((c) => !(c.depth > 0)), evAt: cmds.shape ? shapeAt(cmds.shape) : null };
-    return shapeTop.top[topIdx.get(cmds[i]) + n];
-  };
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
