@@ -1317,3 +1317,35 @@ test('R24-F3: the sticky refusal (an earlier line holds a `name[` the guard cann
   const same = simpleCommands("cat <<'E' >/dev/null; a[0\n+1]=1\nE\ntrue\n");
   assert.match(same.refused, /while a here-document is pending on the line/);
 });
+
+// Shell-parser follow-ups C1, T2: the parser marks a command that a `time` / `command` wrapper stood in front of (`extCd`, not enumerable), whatever the spelling, and never gives the line up for it
+// (a trailing / leading redirect or an assignment before `time` is no reason to refuse `\time make`).
+test('T2: every spelling of time / command in front of a command sets extCd and leaves the line trusted', () => {
+  for (const line of ['>/dev/null time cd /x', 'X=1 time cd /x', 'command time cd /x', '\\time cd /x', "'time' cd /x", '"time" cd /x', 'noglob time cd /x', 'time command cd /x', 'time time cd /x', 'command cd /x', 'time cd /x', 'time -p cd /x', 'time cd /x >/dev/null', 'builtin cd /x']) {
+    const cmds = simpleCommands(line);
+    assert.ok(!cmds.truncated, `${line}: truncated`);
+    assert.ok(!cmds.ctlBroken, `${line}: ctlBroken`);
+    const cd = cmds.find((c) => c.argv[0] === 'cd');
+    assert.ok(cd, `${line}: no cd command`);
+    assert.equal(cd.extCd, true, `${line}: extCd`);
+  }
+  // (no mark where nothing stood in front, `command -v` only looks a name up, and a wrapper that is no time / command is not one)
+  for (const line of ['cd /x', 'cd /x >/dev/null', 'command -v cd', 'nohup cd /x']) {
+    const cd = simpleCommands(line).find((c) => c.argv.includes('cd'));
+    assert.notEqual(cd?.extCd, true, `${line}: extCd`);
+  }
+  assert.equal(Object.keys(simpleCommands('time cd /x')[0]).includes('extCd'), false, 'extCd is not enumerable');
+});
+
+// Shell-parser follow-ups C1, T4 (#704): a `{` that opens the body of a for / select / repeat / foreach after a `;` or a newline (no `do`) puts the marks in doubt, as the `{` in the head's own segment already did (R16).
+// Why: `for x in; { cd R; } && P` runs the brace as a plain group in bash (after a loop of no iterations) and as the zsh short body, while the loop level never closes in the parser: the cd was believed (allowed on main, the push ran in main).
+test('T4: a brace body after for / select / repeat / foreach (no do) is not trusted; while / until / if keep their brace conditions', () => {
+  for (const line of ['for x in; { cd /r; } && P', 'for x in a; { break; cd /r; } && P', 'repeat 0; { cd /r; } && P', 'select x in a; { cd /r; } && P', 'foreach x (a); { cd /r; } && P',
+    'for ((i=0;i<0;i++)); { cd /r; } && P', 'for ((i=0;i<0;i++))\n{ cd /r; } && P', 'for x; { cd /r; } && P', 'for x in\n{ cd /r; } && P', 'repeat 0\n{ cd /r; } && P']) {
+    assert.equal(simpleCommands(line).ctlBroken, true, `${JSON.stringify(line)}: marks trusted`);
+  }
+  for (const line of ['for x in a; do cd /r && P; done', '{ cd /r; P; }', 'if { cd /r; }; then P; fi', 'while { read x; }; do :; done', 'until { a; }; do b; done', 'if a; { b; }; then c; fi',
+    'for x in a; do :; done; while { true; }; do break; done; cd /r && P']) { // (the last: a closed loop leaves no stale head marker)
+    assert.ok(!simpleCommands(line).ctlBroken, `${JSON.stringify(line)}: marks refused`);
+  }
+});

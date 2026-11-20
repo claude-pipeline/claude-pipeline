@@ -750,3 +750,125 @@ test('#615: a loop over literal words that exits early before its cd / switch do
   assert.equal(at(`for d in a; do cd ${GIT_ROOT} && ${push}; done`).decision, 'allow', 'cd && push inside the body');
   assert.equal(at(`cd ${GIT_ROOT} && ${push}`).decision, 'allow', 'cd && push, no loop');
 });
+
+// ---- shell-parser follow-ups C1, T1 (#447, #485, #704): ONE current-shell exit rule, and `coproc` is a background child ----
+// From /work/main (a repository on main) with /work/repo on agent/x: a push that the guard places in /work/main is "pushing to main is blocked", one it cannot place is "cannot determine the current branch".
+// Why: a wrapped exit (`coproc exit 1`, `nohup exit 1`, zsh's `command exit 1`) or a huge number (bash 5.3: `exit 99999999999999999999` is an error and the shell goes on) leaves no shell, so the cd that FAILED (the
+// push stays in /work/main) was taken as proven; and `coproc cd X` / `coproc { cd X; }` run in a background child, so the parent never moved.
+const fromMain = (cmd, cwd = '/work/main') => evaluateGitCommand(cmd, {
+  cwd, home: '/home/u', currentBranch: (d) => ({ '/work/main': MAIN, '/work/repo': 'agent/x' })[unwin(d)] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false,
+});
+const IN_MAIN = /pushing to main is blocked/;
+const refused = (what, cmd, reason, cwd) => {
+  const r = fromMain(cmd, cwd);
+  assert.equal(r.decision, 'deny', `${what}: allowed (${cmd})`);
+  assert.match(r.reason, reason, `${what}: ${r.reason}`);
+};
+const accepted = (what, cmd, cwd) => {
+  const r = fromMain(cmd, cwd);
+  assert.equal(r.decision, 'allow', `${what}: ${r.reason} (${cmd})`);
+};
+const PH = `${PB} origin HEAD`;
+
+test('T1: an exit that may leave no shell (coproc / nohup / command, wrapped or in a child) is no proof that the cd worked, on every exit path', () => {
+  // (a direct `cd X || W exit 1; P`, a failure group `cd X || { echo no; W exit 1; }; P`, and a loop body with the push INSIDE it. On main: `coproc` direct, `nohup` / `command` direct + group were ALLOWED; `command` is zsh: "not found", it goes on)
+  for (const w of ['coproc', 'nohup', 'command']) {
+    refused(`${w}, direct`, `cd /work/repo || ${w} exit 1; ${PH}`, BRANCH);
+    refused(`${w}, failure group`, `cd /work/repo || { echo no; ${w} exit 1; }; ${PH}`, BRANCH);
+    refused(`${w}, loop body (regression row: denied on main already)`, `for d in a; do cd /work/repo || ${w} exit 1; ${PH}; done`, BRANCH);
+  }
+  refused('coproc { exit 1; }, direct', `cd /work/repo || coproc { exit 1; }; ${PH}`, BRANCH);
+  refused('coproc { exit 1; } inside a failure group', `cd /work/repo || { echo no; coproc { exit 1; }; }; ${PH}`, BRANCH);
+  // (the same forms with a plain exit stay proven: the rule is narrower, not off)
+  accepted('exit 1', `cd /work/repo || exit 1; ${PH}`);
+  accepted('exit', `cd /work/repo || exit; ${PH}`);
+  accepted('failure group', `cd /work/repo || { echo no >&2; exit 1; }; ${PH}`);
+  accepted('loop body', `for d in a; do cd /work/repo || exit 1; ${PH}; done`);
+  accepted('exit 255', `cd /work/repo || exit 255; ${PH}`);
+  // (regression row, no teeth: the loop contract forgets the proof at the body's end, so a push AFTER the loop stays refused)
+  refused('push after the loop', `for d in a; do cd /work/repo || exit 1; done; ${PH}`, BRANCH);
+});
+
+test('T1 F2: an exit number longer than 3 digits is no exit (bash 5.3 "numeric argument required": the shell goes on)', () => {
+  for (const n of ['99999999999999999999', '9223372036854775808']) {
+    refused(`exit ${n}, direct`, `cd /work/repo || exit ${n}; ${PH}`, BRANCH);
+    refused(`exit ${n}, failure group`, `cd /work/repo || { echo no; exit ${n}; }; ${PH}`, BRANCH);
+    refused(`exit ${n}, loop body`, `for d in a; do cd /work/repo || exit ${n}; ${PH}; done`, BRANCH);
+  }
+});
+
+test('T1: `coproc cd` and `coproc { cd; }` run in a background child: the parent stays where it was', () => {
+  // (all four were ALLOWED on main: the push ran in /work/main)
+  refused('coproc cd; P', `coproc cd /work/repo; ${PH}`, IN_MAIN);
+  refused('coproc { cd; }; P', `coproc { cd /work/repo; }; ${PH}`, IN_MAIN);
+  refused('coproc cd && P', `coproc cd /work/repo && ${PH}`, IN_MAIN);
+  refused('coproc { cd; } && P', `coproc { cd /work/repo; } && ${PH}`, IN_MAIN);
+  refused('cd /work/repo || coproc exit 1 (the exit is the child\'s)', `cd /work/repo || coproc exit 1; ${PH}`, BRANCH);
+  refused('cd /work/repo || nohup exit 1', `cd /work/repo || nohup exit 1; ${PH}`, BRANCH);
+  // (the child's OWN commands are judged where the child is: the push inside the group runs in /work/repo, and a cd to main inside it is the push's place)
+  accepted('from main: push inside coproc { cd repo; P; }', `coproc { cd /work/repo; ${PH}; }`);
+  refused('from repo: push inside coproc { cd main; P; }', `coproc { cd /work/main; ${PH}; }`, IN_MAIN, '/work/repo');
+  accepted('from repo: coproc { cd main; }; P (the parent stays on repo)', `coproc { cd /work/main; }; ${PH}`, '/work/repo');
+  accepted('coproc { cd repo || exit 1; P; } (an exit inside the child proves the child\'s cd)', `coproc { cd /work/repo || exit 1; ${PH}; }`);
+  accepted('cd repo; coproc P', `cd /work/repo; coproc ${PH}`);
+  accepted('cd repo && P', `cd /work/repo && ${PH}`);
+  // (an exit inside a coproc group proves nothing for the commands after the group)
+  refused('cd X || coproc { exit 1; }; P', `cd /work/repo || coproc { exit 1; }; ${PH}`, BRANCH);
+  // (a cd in a coproc group inside a loop body is the child's: the next iteration starts where the parent was, in /work/main)
+  refused('loop: cd main; coproc { cd repo; }', `for d in a b; do ${PH}; cd /work/main; coproc { cd /work/repo; }; done`, IN_MAIN, '/work/repo');
+});
+
+test('T1 F8: a branch switched by a `coproc` child may not have happened when the next command runs', () => {
+  // (allowed on main: the switch was believed, the push judged on agent/y)
+  refused('coproc git checkout; P', `coproc git checkout agent/y; ${PH}`, BRANCH);
+  refused('coproc { git checkout; }; P', `coproc { git checkout agent/y; }; ${PH}`, BRANCH);
+  refused('coproc { git checkout; } && P', `coproc { git checkout agent/y; } && ${PH}`, BRANCH);
+});
+
+// ---- review round 1 (#761): R1-B1, a cd behind `builtin` / `command` / `time` leaves the directory unknown, and the package scripts / runner bins the line then runs must not be skipped ----
+// Why: on the merge base `builtin cd packages/app && npm test` read packages/app/package.json and judged its `pretest`; with the directory unknown (T2) neither that script nor `npx tool`'s bin was looked up, so a
+// blocked operation in them ran unseen. The line is refused when the directory is unknown and it runs a package script or a runner bin; the same lines with no cd behind a wrapper stay allowed.
+test('R1-B1: a package script or a runner bin run after a cd behind builtin / command / time is judged or refused, not skipped', () => {
+  const lifecycle = { 'packages/app/package.json': JSON.stringify({ name: 'app', scripts: { pretest: `${PB} origin ${MAIN}`, test: 'echo ok' } }) };
+  const bin = { 'packages/app/package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo ok' } }), 'packages/app/node_modules/.bin/tool': `#!/bin/sh\n${PB} origin ${MAIN}\n` };
+  for (const w of ['builtin', 'command', 'time', '\\time']) {
+    for (const j of [' && ', '; ']) {
+      denies(`${w} cd; npm test (pretest pushes main)`, `${w} cd packages/app${j}npm test`, lifecycle, /./);
+      denies(`${w} cd; npx tool (the bin pushes main)`, `${w} cd packages/app${j}npx tool`, bin, /./);
+    }
+  }
+  // (the unknown directory reaches a text the line starts too)
+  denies('builtin cd; bash -c "npm test"', `builtin cd packages/app && bash -c 'npm test'`, lifecycle, /./);
+  // (everyday: no cd behind a wrapper, so the directory is known; a cd with no wrapper reads the manifest as before)
+  const quiet = { 'package.json': JSON.stringify({ name: 'x', scripts: { test: 'echo ok' } }), 'packages/app/package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo ok' } }) };
+  allows('\\time make', '\\time make', quiet);
+  allows('FOO=1 time npm test', 'FOO=1 time npm test', quiet);
+  allows('time npm test', 'time npm test', quiet);
+  allows('cd packages/app && npm test (plain cd, harmless manifest)', 'cd packages/app && npm test', quiet);
+  denies('cd packages/app && npm test (plain cd, pretest pushes main)', 'cd packages/app && npm test', lifecycle, /./);
+});
+
+// ---- review round 1 (#761): R1-B2 / R1-B3, the child a `coproc` starts is the one construct that follows it, whole ----
+// From /work/repo (on agent/x). Why: only the `{` right after `coproc` is the child's boundary, so a nested `{ cd main; }` inside it is a plain group and the child goes on in main (the merge base refused the
+// push there; the nested group's closer put the parent's directory back and the push was judged on agent/x). And `coproc if cd main && P; then :; fi` runs the whole `if` in the child: its cd moves the child for the
+// push chained to it (the merge base refused that too; marking the first command as spawned made the cd be ignored).
+test('R1-B2: a brace group nested in `coproc { }` is a plain group, the child stays where its cd put it', () => {
+  refused('coproc { { cd main; }; P; }', `coproc { { cd /work/main; }; ${PH}; }`, IN_MAIN, '/work/repo');
+  refused('coproc NAME { { cd main; }; P; }', `coproc NAME { { cd /work/main; }; ${PH}; }`, DIRS, '/work/repo');
+  refused('coproc { { { cd main; }; }; P; }', `coproc { { { cd /work/main; }; }; ${PH}; }`, IN_MAIN, '/work/repo');
+  // (still the child's: its own cd never reaches the parent, nested or not)
+  accepted('coproc { { cd main; }; }; P (the parent stays on repo)', `coproc { { cd /work/main; }; }; ${PH}`, '/work/repo');
+  accepted('coproc { { cd repo; }; P; } from main', `coproc { { cd /work/repo; }; ${PH}; }`);
+});
+
+test('R1-B3: a compound after `coproc` is the child whole: a cd in it moves the commands chained inside it, never the parent', () => {
+  refused('coproc if cd main && P; then :; fi', `coproc if cd /work/main && ${PH}; then :; fi`, IN_MAIN, '/work/repo');
+  refused('coproc if cd main; then P; fi', `coproc if cd /work/main; then ${PH}; fi`, DIRS, '/work/repo');
+  refused('coproc while cd main && P; do break; done', `coproc while cd /work/main && ${PH}; do break; done`, IN_MAIN, '/work/repo');
+  accepted('coproc if cd main; then :; fi; P (the parent stays on repo)', `coproc if cd /work/main; then :; fi; ${PH}`, '/work/repo');
+  accepted('coproc if cd repo && P; then :; fi from main', `coproc if cd /work/repo && ${PH}; then :; fi`);
+  refused('coproc if cd repo; then :; fi; P from main (the parent stays in main)', `coproc if cd /work/repo; then :; fi; ${PH}`, IN_MAIN);
+  // (R2-S1: after `coproc` an `if` / `while` is the construct, never a name: the group in its condition is a plain group, so the cd in it stays for the push in the child)
+  refused('coproc if { cd main; }; then P; fi', `coproc if { cd /work/main; }; then ${PH}; fi`, DIRS, '/work/repo');
+  refused('coproc while { cd main; }; do P; break; done', `coproc while { cd /work/main; }; do ${PH}; break; done`, DIRS, '/work/repo');
+});

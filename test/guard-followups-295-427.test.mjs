@@ -359,7 +359,95 @@ describe('#352: a pipeline stage that is a { } group or an if is parsed, not giv
   test('the stage keeps both marks: the keyword it starts with and the operator before the pipeline', () => {
     const cmds = simpleCommands('true && echo a | { cat; }');
     const cat = cmds.find((c) => c.argv[0] === 'cat');
-    assert.equal(cat.lead, '{');
+    assert.equal(cat.kwLead, '{');
     assert.equal(cat.pipeLead, '&&');
+  });
+});
+
+// ---- shell-parser follow-ups C1, T2 (#449): a cd behind `time` / `command` may not be this shell's own ----
+// From /work/main (a repository on main; /work/repo is on agent/x). Why: `X=1 time cd D` (bash, dash: an external program), `command time cd D`, `\time` / `'time'` / `"time"`, zsh's `noglob time cd D`, `time command cd D`, `command cd D`
+// (zsh runs the external cd), and dash's plain `time cd D` (no `time` keyword) leave the shell in /work/main in at least one real shell, while the guard moved to /work/repo and judged the push there: it ran in main (allowed on main for all
+// of them; `>/dev/null time cd D && P` is the same line with a redirect first). The change is UNKNOWN, not "child's" (bash really moves) and not "refused" (`\time make` is everyday).
+const gitMain = (command, cwd = '/work/main') => evaluateGitCommand(command, {
+  cwd, home: HOME, currentBranch: (d) => ({ [resolve('/work/main')]: 'main', [resolve('/work/repo')]: 'agent/x' })[d] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false,
+});
+describe('T2: a cd behind time / command leaves the directory unknown', () => {
+  const PUSH_CMD = 'git push origin HEAD';
+  const WRAPS = ['>/dev/null time ', 'X=1 time ', 'command time ', '\\time ', "'time' ", '"time" ', 'noglob time ', 'time command ', 'time time ', 'command ', 'time ', 'time -p '];
+  for (const w of WRAPS) {
+    for (const j of [' && ', '; ']) {
+      test(`deny: ${w}cd /work/repo${j}push (from main)`, () => {
+        const v = gitMain(`${w}cd /work/repo${j}${PUSH_CMD}`);
+        assert.equal(v.decision, 'deny');
+        assert.match(v.reason, /cannot determine the current branch/);
+      });
+    }
+  }
+  // (`builtin`: dash has none ("builtin: not found"), so the cd never runs and the push runs in /work/main; allowed on main. The `&&` form stops in dash, but bash / zsh move: refused as unknown, an accepted over-refusal)
+  for (const j of ['; ', ' && ']) {
+    test(`deny: builtin cd /work/repo${j}push (from main)`, () => {
+      const v = gitMain(`builtin cd /work/repo${j}${PUSH_CMD}`);
+      assert.equal(v.decision, 'deny');
+      assert.match(v.reason, /cannot determine the current branch/);
+    });
+  }
+  test('deny: time cd /work/repo || exit 1; push (the exit proves nothing about a cd that may not be this shell\'s)', () => {
+    assert.equal(gitMain(`time cd /work/repo || exit 1; ${PUSH_CMD}`).decision, 'deny');
+  });
+  test('refused: from /work/repo, command cd /work/main && push is never allowed (unknown or main)', () => {
+    const v = gitMain(`command cd /work/main && ${PUSH_CMD}`, '/work/repo');
+    assert.equal(v.decision, 'deny');
+    assert.match(v.reason, /cannot determine the current branch|pushing to main is blocked/);
+  });
+  test('deny: a loop body whose cd runs behind time leaves the next iteration\'s directory unknown', () => {
+    assert.equal(gitMain(`for d in a b; do ${PUSH_CMD}; time cd /work/main; done`, '/work/repo').decision, 'deny');
+  });
+  for (const [name, line] of [
+    ['a plain cd', `cd /work/repo && ${PUSH_CMD}`],
+    ['a cd with a redirect', `cd /work/repo >/dev/null && ${PUSH_CMD}`],
+    ['a timed command that is no cd, then a push in the repository', `time make && ${PUSH_CMD}`],
+    ['a time-wrapped switch (the switch is on disk whichever process runs it)', `time git checkout agent/y && ${PUSH_CMD}`],
+  ]) {
+    test(`allow: ${name}`, () => {
+      const v = gitMain(line, name.startsWith('a timed') ? '/work/repo' : '/work/main');
+      assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+    });
+  }
+  test('allow: everyday timed commands stay allowed in both guards', () => {
+    for (const line of ['\\time make && echo ok', 'FOO=1 time npm test', 'time -p make; echo ok']) {
+      assert.equal(gitMain(line).decision, 'allow', line);
+      assert.equal(run(line).decision, 'allow', line);
+    }
+  });
+  test('allow: the push in /work/repo with a redirect', () => {
+    assert.equal(gitMain(`${PUSH_CMD} >/dev/null`, '/work/repo').decision, 'allow');
+  });
+});
+
+// ---- shell-parser follow-ups C1, T4 (#704): `for …; { cd R; } && P` ----
+// From /work/main: bash and zsh both run these lines with the push in /work/main when the loop ran nothing (`for x in;`, `break`, `repeat 0`, `for ((;0;))`); allowed on main.
+describe('T4: a short brace body after for / select / repeat / foreach is a cd the guard does not believe', () => {
+  const PUSH_CMD = 'git push origin HEAD';
+  for (const head of ['for x in;', 'for x in a; { break; cd /work/nowhere; }; for x in;', 'repeat 0;', 'select x in a;', 'for ((i=0;i<0;i++));', 'for x;', 'for x in\n', 'repeat 0\n', 'for ((i=0;i<0;i++))\n']) {
+    test(`deny: ${JSON.stringify(head)} { cd /work/repo; } && push`, () => {
+      const v = gitMain(`${head} { cd /work/repo; } && ${PUSH_CMD}`);
+      assert.equal(v.decision, 'deny');
+      assert.match(v.reason, /cannot determine the current branch/);
+    });
+  }
+  for (const [name, line] of [
+    ['a loop with its do', `for x in a; do cd /work/repo && ${PUSH_CMD}; done`],
+    ['a plain brace group', `{ cd /work/repo; ${PUSH_CMD}; }`],
+    ['a closed loop, a while with a brace condition, then a cd and push', `for x in a; do :; done; while { true; }; do break; done; cd /work/repo && ${PUSH_CMD}`],
+    ['a while with a brace condition', 'while { read x; }; do :; done'],
+  ]) {
+    test(`allow: ${name}`, () => {
+      const v = gitMain(line);
+      assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+    });
+  }
+  test('a short body that runs nothing guarded (`for x in a b; { echo $x; }`) is refused by neither guard', () => {
+    assert.equal(gitMain('for x in a b; { echo $x; }').decision, 'allow');
+    assert.equal(run('for x in a b; { echo $x; }').decision, 'allow');
   });
 });

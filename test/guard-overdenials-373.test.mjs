@@ -199,7 +199,7 @@ describe('#373: the parser reports the shapes (cmds.shape)', () => {
   });
   test('#373 shape: a command that opens with if / then / else / { carries that word (lead)', () => {
     const cmds = simpleCommands('if cd a; then b; else c; fi\n{ d; }');
-    assert.deepEqual(cmds.map((c) => c.lead), ['if', 'then', 'else', '{']);
+    assert.deepEqual(cmds.map((c) => c.kwLead), ['if', 'then', 'else', '{']);
   });
   test('#373 shape: plainSeq keeps its strict meaning', () => {
     for (const line of ['a || b', 'a | b', 'a &', '(a)', '{ a; }', 'if a; then b; fi']) assert.equal(simpleCommands(line).plainSeq, false, line);
