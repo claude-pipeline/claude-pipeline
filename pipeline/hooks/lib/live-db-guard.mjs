@@ -183,8 +183,8 @@ const OWNER_RUNS = 'the owner runs this; hand them the exact line';
 const SB_WORD = /^(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\]*)?$/;
 const isSbWord = (w) => typeof w === 'string' && SB_WORD.test(commandName(w));
 // subcommand prefixes (the words before the first flag): LOCAL_ONLY lines pass with no target flag or with `--local`; REMOTE_CAPABLE ones only with a local or `dev` target proof
-const LOCAL_ONLY = [['start'], ['stop'], ['status'], ['init'], ['link'], ['unlink'], ['login'], ['logout'], ['db', 'reset'], ['db', 'diff'], ['db', 'lint'], ['migration', 'new'], ['migration', 'list'], ['migration', 'up'], ['test', 'db'], ['functions', 'serve'], ['functions', 'new'], ['projects', 'list'], ['orgs', 'list'], ['help']];
-const REMOTE_CAPABLE = [['db', 'push'], ['db', 'pull'], ['db', 'dump'], ['migration', 'repair'], ['migration', 'squash'], ['migration', 'fetch'], ['functions', 'deploy'], ['functions', 'delete'], ['functions', 'download'], ['secrets'], ['storage'], ['branches'], ['config', 'push'], ['postgres-config'], ['sso'], ['domains'], ['vanity-subdomains'], ['ssl-enforcement'], ['inspect', 'db'], ['gen', 'types'], ['seed', 'buckets'], ['backups'], ['encryption'], ['snippets']];
+const LOCAL_ONLY = [['start'], ['stop'], ['status'], ['init'], ['link'], ['unlink'], ['login'], ['logout'], ['db', 'reset'], ['db', 'diff'], ['db', 'lint'], ['migration', 'new'], ['migration', 'list'], ['migration', 'up'], ['test', 'db'], ['functions', 'serve'], ['functions', 'new'], ['projects', 'list'], ['orgs', 'list'], ['help'], ['db', 'start'], ['test', 'new'], ['gen', 'signing-key'], ['gen', 'bearer-jwt'], ['services'], ['completion']];
+const REMOTE_CAPABLE = [['db', 'push'], ['db', 'pull'], ['db', 'dump'], ['migration', 'repair'], ['migration', 'squash'], ['migration', 'fetch'], ['functions', 'deploy'], ['functions', 'delete'], ['functions', 'download'], ['secrets'], ['storage'], ['branches'], ['config', 'push'], ['postgres-config'], ['sso'], ['domains'], ['vanity-subdomains'], ['ssl-enforcement'], ['inspect', 'db'], ['gen', 'types'], ['seed', 'buckets'], ['backups'], ['encryption'], ['snippets'], ['db', 'query'], ['db', 'advisors'], ['db', 'schema'], ['migration', 'down'], ['inspect', 'report'], ['functions', 'list'], ['logs'], ['pull'], ['notebooks'], ['projects'], ['orgs'], ['bootstrap'], ['telemetry'], ['whoami']];
 // package managers: their non-run verbs only name the package (`npm install supabase`); `command -v` needs no entry (nothing follows the word)
 const PM_HEADS = new Set(['pnpm', 'yarn', 'npm', 'bun', 'corepack']);
 const NON_RUN_VERBS = new Set(['install', 'i', 'add', 'remove', 'rm', 'uninstall', 'update', 'upgrade', 'ls', 'list', 'why', 'view', 'info', 'outdated']);
@@ -195,15 +195,17 @@ const PM_SKIP = {
   yarn: { bool: [], val: ['--cwd'], workspace: true },
 };
 const startsWith = (tokens, prefix) => prefix.every((w, i) => tokens[i] === w);
-const BOOL_FLAGS = new Set(['yes', 'debug', 'help', 'experimental', 'include-all', 'include-roles', 'include-seed', 'data-only', 'role-only', 'use-copy', 'keep-comments', 'no-verify-jwt', 'use-api', 'use-docker', 'legacy-bundle', 'prune', 'no-seed', 'use-migra', 'use-pgadmin', 'use-pg-schema', 'no-backup']);
+const BOOL_FLAGS = new Set(['yes', 'debug', 'help', 'experimental', 'include-all', 'include-roles', 'include-seed', 'data-only', 'role-only', 'use-copy', 'keep-comments', 'no-verify-jwt', 'use-api', 'use-docker', 'legacy-bundle', 'prune', 'no-seed', 'use-migra', 'use-pgadmin', 'use-pg-schema', 'no-backup', 'read-only', 'skip-vault', 'with-migration-history', 'force', 'wizard', 'skip-pooler']);
 const NON_LITERAL = /[\s$`*?[\]{}()~\\<>|;&'"!#]/;
 const LOCAL_HOSTS = new Set(['localhost', '127.0.0.1', '[::1]']);
 
-// a literal postgres URI whose host (after WHATWG parsing) is exactly localhost / 127.0.0.1 / ::1, with no query string
+// a literal postgres URI whose host (after WHATWG parsing) is exactly localhost / 127.0.0.1 / ::1, with no query string but one `sslmode=<letters/->` (any other parameter, libpq's host= / hostaddr= / service= / options=, can move the host)
+const SSLMODE_ONLY = /\?sslmode=[a-z-]+$/;
 export function localDbUrl(v) {
-  if (v.includes('?') || (v.match(/@/g) ?? []).length > 1) return false;
+  const bare = v.replace(SSLMODE_ONLY, '');
+  if (bare.includes('?') || (bare.match(/@/g) ?? []).length > 1) return false;
   let u;
-  try { u = new URL(v); } catch { return false; }
+  try { u = new URL(bare); } catch { return false; }
   return (u.protocol === 'postgresql:' || u.protocol === 'postgres:') && LOCAL_HOSTS.has(u.hostname) && u.search === '' && u.hash === '';
 }
 
@@ -234,13 +236,62 @@ const makesNoRequest = (c) => {
 };
 
 // the first words of every supabase subcommand and alias (`supabase --help` of CLI 2.122; re-check on a CLI update), plus those the tables below do not carry
-const SUB_HEADS = new Set([...[...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]), 'bootstrap', 'completion', 'services', 'migrations', 'pull', 'notebooks', 'logs', 'experimental', 'issue', 'feedback', 'telemetry', 'whoami']);
+const SUB_HEADS = new Set([...[...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]), 'migrations', 'experimental', 'issue', 'feedback']);
 const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
+// B7: a supabase TOKEN in a line's text = `supabase` (optionally `npm:` / `nixpkgs#` before, `-cli` / `@version` / .exe .cmd .bat after) as the LAST path component of a word: not followed by `/ . _ -` or a word character
+// (`supabase/migrations/x.sql`, `SUPABASE_URL`, `supabase.from(`, `supabase.com`, `@supabase/supabase-js` are not tokens; `supabase`, `./node_modules/.bin/supabase`, `'supabase db push'` are)
+const SB_TOKEN_SRC = String.raw`(?<![\w.@-])(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\\s'"]*)?(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`;
+const SB_TOKEN = new RegExp(SB_TOKEN_SRC, 'i');
+// ... followed, after whitespace, by a subcommand head: the shape of a command line that runs the binary
+const SB_TOKEN_HEAD = new RegExp(`${SB_TOKEN_SRC}\\s+(?:${[...SUB_HEADS].join('|')}|network-[a-z-]+)(?![\\w-])`, 'i');
+// B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
+function globMatchesHead(w) {
+  if (!/[*?[]/.test(w)) return false;
+  let re = '';
+  for (let i = 0; i < w.length; i += 1) {
+    const ch = w[i];
+    if (ch === '*') re += '.*';
+    else if (ch === '?') re += '.';
+    else if (ch === '[') {
+      const j = w.indexOf(']', i + 2);
+      if (j < 0) { re += '\\['; continue; }
+      let body = w.slice(i + 1, j);
+      const neg = body[0] === '!' || body[0] === '^';
+      if (neg) body = body.slice(1);
+      re += `[${neg ? '^' : ''}${body.replace(/[\\\]^[]/g, '\\$&')}]`;
+      i = j;
+    } else re += ch.replace(/[.+^${}()|\\\]]/g, '\\$&');
+  }
+  try {
+    const rx = new RegExp(`^${re}$`);
+    return [...SUB_HEADS, 'network-x'].some((h) => rx.test(h));
+  } catch { return true; }
+}
 // an expansion after the supabase word (`supabase $SUB`, `supabase "$@"`) can become a subcommand; a glob (`'src/**/*.ts'`, `'httpx[http2]'`) is a file or package pattern
 const NON_LITERAL_WORD = /[$`]/;
+const nonLiteralHead = (words) => words.length > 0 && NON_LITERAL_WORD.test(commandName(words[0]));
 // commands whose operands are data (a pattern, a path, a package, a message), not a program: a supabase word after one is a name, never the binary (git / make / gh can start a program only through an option or a word the line quotes, which stays one word)
-const STDIN_DATA = ['grep', 'egrep', 'fgrep', 'cat', 'head', 'tail', 'wc', 'ls', 'cut', 'tr', 'uniq', 'sed', 'cp', 'mv', 'rm', 'mkdir', 'touch', 'diff', 'echo', 'printf', 'which', 'pip', 'pip3'];
-const DATA_COMMANDS = new Set([...STDIN_DATA, 'rg', 'ag', 'ack', 'git', 'gh', 'find', 'make', 'sort', 'cd', 'pwd']);
+// (`sed` stays here as a plain-data program behind xargs, but is NOT a data command as an operand head: its `e` command / `s///e` flag run programs, see buildsProgram)
+const STDIN_DATA = ['grep', 'egrep', 'fgrep', 'cat', 'head', 'tail', 'wc', 'ls', 'cut', 'tr', 'uniq', 'sed', 'cp', 'mv', 'rm', 'mkdir', 'touch', 'diff', 'echo', 'printf', 'which', 'pip', 'pip3', 'basename', 'dirname', 'realpath', 'stat', 'file', 'du'];
+const DATA_COMMANDS = new Set([...STDIN_DATA.filter((n) => n !== 'sed'), 'rg', 'ag', 'ack', 'gh', 'find', 'make', 'sort', 'cd', 'pwd']);
+// git is data only for a subcommand that cannot run a command word (bisect run, rebase -x, submodule foreach, an alias or an unknown one can)
+const GIT_DATA_SUBS = new Set(['add', 'apply', 'blame', 'branch', 'checkout', 'cherry-pick', 'clone', 'commit', 'config', 'describe', 'diff', 'fetch', 'grep', 'init', 'log', 'ls-files', 'ls-remote', 'ls-tree', 'merge', 'merge-base', 'mv', 'notes', 'pull', 'push', 'remote', 'reset', 'restore', 'rev-list', 'rev-parse', 'revert', 'rm', 'shortlog', 'show', 'show-ref', 'stash', 'status', 'switch', 'tag', 'worktree']);
+const GIT_BOOL_GLOBALS = new Set(['--no-pager', '-P', '--bare', '--no-optional-locks', '--literal-pathspecs']);
+function gitSub(words) {
+  for (let i = 1; i < words.length; i += 1) {
+    const w = words[i];
+    if (GIT_BOOL_GLOBALS.has(w)) continue;
+    if (w === '-C' || w === '-c' || w === '--git-dir' || w === '--work-tree') { i += 1; continue; }
+    if (/^--(?:git-dir|work-tree)=/.test(w)) continue;
+    return w.startsWith('-') ? null : w;
+  }
+  return null;
+}
+// the command that RUNS (word 0 of one reading) is a data command: its supabase words are operands
+const isDataWords = (words) => {
+  const n = commandName(words[0]);
+  return n === 'git' ? GIT_DATA_SUBS.has(gitSub(words)) : DATA_COMMANDS.has(n);
+};
 const typedWords = (c) => (Array.isArray(c.typed) ? c.typed : c.argv);
 const nearestHead = (words, i, heads) => { let j = i - 1; while (j >= 0 && !heads.has(commandName(words[j]))) j -= 1; return j; };
 
@@ -287,7 +338,7 @@ function supabaseCalls(words, data) {
     const rest = words.slice(i + 1);
     if (i === 0) { calls.push({ rest }); return; }
     if (data || isSelector(words, i) || pmNonRun(words, i)) return;
-    if (rest.some((x) => !x.startsWith('-') && (isSubcommandHead(x) || NON_LITERAL_WORD.test(x)))) calls.push({ rest });
+    if (rest.some((x) => !x.startsWith('-') && (isSubcommandHead(x) || NON_LITERAL_WORD.test(x) || globMatchesHead(x)))) calls.push({ rest });
   });
   return calls;
 }
@@ -295,11 +346,38 @@ function supabaseCalls(words, data) {
 // xargs / parallel is the command that runs (the parser's `fan`): it builds the command from stdin text the line does not show. As an operand (`rg -n parallel supabase`) it is just a word
 const stdinFed = (c) => c.fan === true;
 // ... and what it builds can be the binary or a launcher of it unless the command it names is plain data (`xargs wc -l`; none named, or a search that can run a program from its options, is not)
-const buildsProgram = (c) => !(STDIN_DATA.includes(commandName(c.argv[0])));
+// (B2: `sed` runs programs with its `e` command, so it is plain data here only while the line shows no supabase token followed by a subcommand head)
+const buildsProgram = (c, text) => {
+  const n = commandName(c.argv[0]);
+  return n === 'sed' ? SB_TOKEN_HEAD.test(text) : !STDIN_DATA.includes(n);
+};
 
-function supabaseRefusal(rest, state) {
+// the global flags (every subcommand accepts them, CLI 3.1 `GLOBAL FLAGS`; 2.x has the same set minus the 3.x-only ones, which 2.x rejects itself): one that takes a value (two-word or `=` form) and the booleans
+const GLOBAL_VALUE = new Set(['--workdir', '--profile', '--network-id', '--dns-resolver', '--output', '-o', '--output-format', '--log-level', '--agent', '--completions']);
+const GLOBAL_BOOL = new Set(['--debug', '--experimental', '--yes', '--wizard']);
+// words after the supabase word -> { rest: the words after the leading global flags, error }
+function skipGlobals(words) {
+  let i = 0;
+  while (i < words.length) {
+    const w = words[i];
+    if (GLOBAL_BOOL.has(w)) { i += 1; continue; }
+    if (GLOBAL_VALUE.has(w)) {
+      if (words[i + 1] === undefined) return { rest: words, error: `\`${w}\` has no value` };
+      i += 2;
+      continue;
+    }
+    if (/^--[a-z-]+=/.test(w) && GLOBAL_VALUE.has(w.slice(0, w.indexOf('=')))) { i += 1; continue; }
+    break;
+  }
+  return { rest: words.slice(i), error: null };
+}
+
+function supabaseRefusal(words, state) {
+  const skipped = skipGlobals(words);
+  if (skipped.error) return skipped.error;
+  const rest = skipped.rest;
   const first = rest[0];
-  if (first === undefined) return null; // bare `supabase` prints help
+  if (first === undefined) return null; // bare `supabase` (or only global flags) prints help
   const sub = [];
   for (const w of rest) { if (w.startsWith('-')) break; sub.push(w); }
   // a real `--help` / `-h` (before a `--`, not the value of an option that may take the next word) only prints help
@@ -311,16 +389,17 @@ function supabaseRefusal(rest, state) {
     takesNext = false;
     if (!ended && !isValue && (w === '--help' || w === '-h')) return null;
     const m = /^--([a-z-]+)(=.*)?$/s.exec(w);
-    if (w.startsWith('-') && !w.includes('=') && !(m && (BOOL_FLAGS.has(m[1]) || ['local', 'linked', 'dry-run'].includes(m[1])))) takesNext = true;
+    if (w.startsWith('-') && !w.includes('=') && !(m && (BOOL_FLAGS.has(m[1]) || ['local', 'linked', 'dry-run', 'remote'].includes(m[1])))) takesNext = true;
   }
   if (!sub.length) return ['--version', '--help', '-h', '-v'].includes(first) ? null : `\`supabase ${first}\` leads with a flag, which is not a shape the guard knows`;
   const local = LOCAL_ONLY.some((p) => startsWith(sub, p));
   const remote = REMOTE_CAPABLE.some((p) => startsWith(sub, p)) || /^network-/.test(sub[0]);
   if (!local && !remote) return `\`supabase ${sub.join(' ')}\` is not a subcommand the guard knows`;
   // flag hygiene: each target flag once, in one form, with a literal value
-  // `--local` / `--dry-run` / `--db-url` / `--project-ref` prove a safe target only when they are real flags: before a `--`, and not the value of another option (an option the guard does not know may take the next word as its value)
-  const seen = { 'db-url': [], 'project-ref': [], linked: [], local: [], 'dry-run': [] };
-  const real = { local: 0, 'dry-run': 0, 'db-url': 0, 'project-ref': 0 };
+  // `--local` / `--dry-run` / `--db-url` / `--project-ref` / `--read-only` prove what they say only when they are real flags: before a `--`, and not the value of another option (an option the guard does not know may take the next word as its value)
+  // `--remote` takes an OPTIONAL value (3.1): `--remote=<ref|branch|url>` is a target like `--db-url`; a bare `--remote` is the linked project (`--remote X` leaves X a positional)
+  const seen = { 'db-url': [], 'project-ref': [], linked: [], local: [], 'dry-run': [], remote: [], 'read-only': [] };
+  const real = { local: 0, 'dry-run': 0, 'db-url': 0, 'project-ref': 0, remote: 0, 'read-only': 0 };
   let terminated = false;
   let swallowed = false;
   for (let i = sub.length; i < rest.length; i += 1) {
@@ -329,15 +408,20 @@ function supabaseRefusal(rest, state) {
     const isValue = swallowed;
     swallowed = false;
     const m = /^--([a-z-]+)(=(.*))?$/s.exec(w);
-    if (m?.[1] === 'remote') return '`--remote` selects a remote database';
     if (!m || !(m[1] in seen)) {
       if (w.startsWith('-') && !w.includes('=') && !(m && BOOL_FLAGS.has(m[1]))) swallowed = true;
       continue;
     }
-    if (m[1] === 'linked' || m[1] === 'local' || m[1] === 'dry-run') {
-      if (m[2] !== undefined) return `\`${w}\` is not the bare \`--${m[1]}\` flag`;
-      seen[m[1]].push(true);
-      if (m[1] !== 'linked' && !terminated && !isValue) real[m[1]] += 1;
+    if (m[1] === 'remote') {
+      seen.remote.push(m[2] === undefined ? true : m[3]);
+      if (!terminated && !isValue) real.remote += 1;
+      continue;
+    }
+    if (m[1] === 'linked' || m[1] === 'local' || m[1] === 'dry-run' || m[1] === 'read-only') {
+      // (a valued `--read-only=x` is counted, so a second `--read-only` is "given more than once", but it is never the bare flag)
+      if (m[2] !== undefined && m[1] !== 'read-only') return `\`${w}\` is not the bare \`--${m[1]}\` flag`;
+      seen[m[1]].push(m[2] === undefined ? true : w);
+      if (m[2] === undefined && m[1] !== 'linked' && !terminated && !isValue) real[m[1]] += 1;
       continue;
     }
     let value = m[3];
@@ -349,22 +433,32 @@ function supabaseRefusal(rest, state) {
   for (const [name, list] of Object.entries(seen)) if (list.length > 1) return `\`--${name}\` is given more than once`;
   const [dbUrl] = seen['db-url'];
   const [projectRef] = seen['project-ref'];
+  const [remoteFlag] = seen.remote;
+  const remoteValue = typeof remoteFlag === 'string' ? remoteFlag : undefined;
   const isLocal = seen.local.length === 1 && real.local === 1;
   const linked = seen.linked.length === 1;
-  if (isLocal && (linked || dbUrl !== undefined || projectRef !== undefined)) return '`--local` is combined with a remote target flag';
+  const hasRemote = remoteFlag !== undefined;
+  // a real bare `--read-only` on `db query` runs the statement in a read-only transaction (owner 2026-11-20: it passes for any target; the other subcommands ignore the flag)
+  const readOnly = sub[0] === 'db' && sub[1] === 'query' && seen['read-only'].length === 1 && seen['read-only'][0] === true && real['read-only'] === 1;
+  if (isLocal && (linked || dbUrl !== undefined || projectRef !== undefined || hasRemote)) return '`--local` is combined with a remote target flag';
+  if (hasRemote && (linked || dbUrl !== undefined || projectRef !== undefined)) return '`--remote` is combined with another target flag';
   if (linked && (dbUrl !== undefined || projectRef !== undefined)) return '`--linked` is combined with another target flag';
   if (dbUrl !== undefined && projectRef !== undefined) return '`--db-url` is combined with `--project-ref`';
-  for (const v of [dbUrl, projectRef]) if (v !== undefined && NON_LITERAL.test(v.replace('@[::1]:', '@:'))) return `the target value \`${v}\` is not a literal`;
-  const hasTarget = linked || dbUrl !== undefined || projectRef !== undefined;
+  // (a read-only `db query` lets a non-literal target value through too; a repeated or conflicting target flag, above, is refused with it)
+  for (const v of [dbUrl, projectRef, remoteValue]) if (v !== undefined && !readOnly && NON_LITERAL.test(v.replace(SSLMODE_ONLY, '').replace('@[::1]:', '@:'))) return `the target value \`${v}\` is not a literal`;
+  const hasTarget = linked || dbUrl !== undefined || projectRef !== undefined || hasRemote;
   if (local && !hasTarget) return null;
   if (isLocal) return null;
   if (dbUrl !== undefined && real['db-url'] === 1 && localDbUrl(dbUrl)) return null;
+  if (remoteValue !== undefined && real.remote === 1 && (localDbUrl(remoteValue) || isDevRef(remoteValue, state))) return null;
   if (projectRef !== undefined && real['project-ref'] === 1 && isDevRef(projectRef, state)) return null;
-  if (sub[0] === 'db' && sub[1] === 'push' && seen['dry-run'].length === 1 && real['dry-run'] === 1) return null;
+  if (readOnly) return null;
+  if (sub[0] === 'db' && sub[1] === 'push' && seen['dry-run'].length === 1 && real['dry-run'] === 1 && !hasRemote) return null;
   for (const name of ['db-url', 'project-ref']) if (seen[name].length === 1 && real[name] === 0) return `the \`--${name}\` follows \`--\` or an option that may take it as its value; put the target flag first`;
   const what = dbUrl !== undefined ? 'a `--db-url` that is not a plain localhost URI'
     : projectRef !== undefined ? `\`--project-ref ${projectRef}\`, which the owner has not declared dev`
-      : linked ? '`--linked`' : 'no `--local` or other target flag (it defaults to the linked project)';
+      : hasRemote ? (remoteValue !== undefined ? `\`--remote=${remoteValue}\`, which is neither a plain localhost URI nor a dev project` : '`--remote`, the linked project')
+        : linked ? '`--linked`' : 'no `--local` or other target flag (it defaults to the linked project)';
   return `\`supabase ${sub.join(' ')}\` can reach a non-local database: ${what}`;
 }
 
@@ -377,15 +471,84 @@ function cleanApiPath(after) {
   return !segs.slice(3).some((g) => /^[a-z0-9]{20}$/i.test(g));
 }
 
+// B10: a word that holds a whole command line (a quoted string given to doppler / nix-shell / ssh / docker exec / git rebase -x): the text of the word, or of the value of `--opt=value`
+const commandText = (w) => (w.startsWith('--') && w.includes('=') ? w.slice(w.indexOf('=') + 1) : w);
+// the pipeline's own CLI takes prose in --built / --summary / --reason / --owner-quote / --line / --body (copied verbatim, F4); sed's script text is a residual (F7)
+const PIPELINE_BINS = new Set(['pipeline.mjs', 'pipeline']);
+const isPipelineBin = (argv) => argv.slice(0, 8).some((a) => PIPELINE_BINS.has(commandName(a)));
+const NESTED_UNREAD = 'a quoted command string the guard could not read whole';
+const MAX_REPARSE_DEPTH = 2;
+
+// the supabase calls of one command read from a quoted string: word 0 (after the parser's own unwrapping of npx / timeout / env …) is the binary; a package manager head keeps the later-word rule (F8); a variable head is B9
+function reparsedRefusal(text, state, reparse, depth) {
+  const inner = reparse(text);
+  if (!inner || inner.truncated || inner.undecidable) return NESTED_UNREAD;
+  for (const c of inner) {
+    const words = c.argv ?? [];
+    if (!words.length) continue;
+    let why = null;
+    if (isSbWord(words[0])) why = supabaseRefusal(words.slice(1), state);
+    else if (PM_HEADS.has(commandName(words[0]))) {
+      for (const call of supabaseCalls(words, false)) why ??= supabaseRefusal(call.rest, state);
+    } else why = variableHeadRefusal(words, state);
+    if (why) return why;
+    if (isDataWords(words) || commandName(words[0]) === 'sed') continue;
+    for (const w of words) {
+      // (a word that is the whole text just read -- the parser lists a `$(…)` word as its own command -- reads the same again: its commands are already judged)
+      if (!SB_TOKEN_HEAD.test(w) || commandText(w) === text) continue;
+      if (depth >= MAX_REPARSE_DEPTH) return NESTED_UNREAD;
+      why = reparsedRefusal(commandText(w), state, reparse, depth + 1);
+      if (why) return why;
+    }
+  }
+  return null;
+}
+
+// B9: the command is run through a variable (`$SB db push`, `"$(command -v supabase)" db push`): when word 0 itself is non-literal (a literal last component, `"$HOME/.cargo/bin/cargo"`, is a program) and the first later non-flag word is a subcommand head, the words after word 0 are judged
+function variableHeadRefusal(words, state) {
+  if (!nonLiteralHead(words)) return null;
+  const { rest } = skipGlobals(words.slice(1));
+  const at = rest.findIndex((w) => !w.startsWith('-'));
+  if (at < 0 || !isSubcommandHead(rest[at])) return null;
+  const why = supabaseRefusal(words.slice(1), state);
+  // (the group name alone prints help, and a word after the head that no subcommand is named like -- a quoted `'.shell echo hi'`, a path -- makes the line a sqlite / psql file argument, not a supabase subcommand: `Q=sqlite3; $Q db '.shell x'`, `$Q db < q.sql`)
+  const next = rest[at + 1];
+  if (why && /is not a subcommand the guard knows/.test(why) && (next === undefined || (!next.startsWith('-') && !/^[a-z][a-z0-9-]*$/.test(next) && !NON_LITERAL_WORD.test(next)))) return null;
+  return why;
+}
+
 // `scanRaw` is the line with the prose flags (commit message, PR body) masked; `wordsOf(cmd)` the words of one command without those prose values (a command inside `$(…)` or backticks in a prose value is its own command, so its words are still read)
-export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv) {
+// `reparse(text)` parses a quoted command string with the guard's own parser (same env and deadline as the outer parse, its own `bashState`); null = none given
+export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv, reparse = null) {
   const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
   const reading = cmds.filter((c) => c.argv?.length);
-  // R10-F1: xargs / parallel append words from stdin that no reading shows; with supabase named anywhere on the line the call cannot be judged
-  if (reading.some((c) => stdinFed(c) && buildsProgram(c)) && /supabase/i.test([scanRaw, ...cmds.map((c) => c.raw)].join('\n'))) return refuse('`xargs` / `parallel` builds a command from stdin and the line names supabase');
-  for (const c of reading) for (const words of [c.argv, typedWords(c)]) for (const call of supabaseCalls(words, DATA_COMMANDS.has(commandName(c.argv[0])))) {
-    const why = supabaseRefusal(call.rest, state);
-    if (why) return refuse(why);
+  const lineText = [scanRaw, ...cmds.map((c) => c.raw)].join('\n');
+  // R10-F1: xargs / parallel append words from stdin that no reading shows; with a supabase token on the line the call cannot be judged
+  if (reading.some((c) => stdinFed(c) && buildsProgram(c, lineText)) && SB_TOKEN.test(lineText)) return refuse('`xargs` / `parallel` builds a command from stdin and the line names supabase');
+  for (const c of reading) {
+    const typed = typedWords(c);
+    // B1: each reading carries its own data flag. The argv (the parser unwrapped npx / timeout / env …) is judged by its own word 0. The words as typed: when they end with the argv, only the stripped PREFIX is judged here (`env`, `timeout 30`, by its own word 0, F2); when the parser rewrote words, the whole typed reading is, by its word 0
+    const data = isDataWords(c.argv);
+    const readings = [[c.argv, data]];
+    const cut = typed.length - c.argv.length;
+    if (cut >= 0 && c.argv.every((w, i) => typed[cut + i] === w)) { if (cut > 0) readings.push([typed.slice(0, cut), isDataWords(typed)]); } else readings.push([typed, isDataWords(typed)]);
+    for (const [words, isData] of readings) {
+      for (const call of supabaseCalls(words, isData)) {
+        const why = supabaseRefusal(call.rest, state);
+        if (why) return refuse(why);
+      }
+    }
+    for (const words of [c.argv, typed]) {
+      const why = variableHeadRefusal(words, state);
+      if (why) return refuse(why);
+    }
+    // B10: a quoted word that holds a command line is read again (a data command, sed and the pipeline's own CLI take prose)
+    if (data || commandName(c.argv[0]) === 'sed' || isPipelineBin(c.argv)) continue;
+    for (const w of wordsOf(c)) {
+      if (!SB_TOKEN_HEAD.test(w)) continue;
+      const why = reparse ? reparsedRefusal(commandText(w), state, reparse, 1) : NESTED_UNREAD;
+      if (why) return refuse(why);
+    }
   }
   // the Management API: every mention on the line (prose flags of a commit or PR already masked; a variable holding the URL is still caught) must name a dev project's own routes, by a clean path
   const texts = [String(scanRaw ?? ''), ...cmds.map((c) => [...wordsOf(c), ...Object.values(c.env ?? {})].join(' '))];

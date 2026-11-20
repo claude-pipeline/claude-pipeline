@@ -5126,7 +5126,9 @@ function evaluateBashForFilesFrame(command, opts) {
   if (installer) return deny(installer);
   if (findDbRefsWrite(cmds, raw)) return deny('pipeline db-refs changes which databases count as live; only the owner may run it, from their own terminal (`pipeline db-refs show` is allowed)');
   {
-    const dbCli = findLiveDbCli(cmds, scanRaw, readDbRefs(opts.home || os.homedir()), wordsOf); // #262: an agent-run supabase CLI line or Management API call that can reach a non-local database
+    // (B10: a quoted command string is parsed again with the same env and deadline; its own bashState, `{ bound: true }`: a prose word that binds BASH must not force the whole-evaluation rerun above)
+    const reparse = (text) => simpleCommands(text, { env: opts.env ?? process.env, bashState: { bound: true }, expired: () => opts._budget.now() > opts._budget.deadline });
+    const dbCli = findLiveDbCli(cmds, scanRaw, readDbRefs(opts.home || os.homedir()), wordsOf, reparse); // #262: an agent-run supabase CLI line or Management API call that can reach a non-local database
     if (dbCli) return deny(dbCli);
   }
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');

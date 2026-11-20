@@ -198,6 +198,10 @@ const ALLOWED = [
   // B1 (F2): find's own prefix is data
   'find supabase -type d -name functions -exec ls {} \\;',
   "find supabase -name '*.sql' -exec grep -l storage {} +",
+  // B9/B10: a substitution word is its own command (judged once), a variable head with no subcommand or a non-subcommand word after `db` is no supabase call
+  "eval \"$(supabase status -o env | grep -E '^(API_URL|SERVICE_ROLE_KEY)=')\"",
+  '$NPM test',
+  "Q=sqlite3; $Q db '.shell x'",
   // B3: git is data only for a known subcommand
   'git status supabase db',
   'git -C supabase log --oneline',
