@@ -219,6 +219,9 @@ test('waitForMerge: zero wait looks exactly once; transient errors are tolerated
   const once = fakeGh([{ state: 'OPEN' }]);
   assert.equal((await waitForMerge({ gh: once, pr: 12, waitMs: 0, pollMs: 10, ...clock() })).state, 'timeout');
   assert.equal(once.calls.length, 1);
+  assert.equal((await waitForMerge({ gh: fakeGh([{ state: 'OPEN' }]), pr: 12, waitMs: 0, pollMs: 10, ...clock() })).readOk, true, 'a timeout says the PR was read');
+  const failed = await waitForMerge({ gh: fakeGh([new Error('502')]), pr: 12, waitMs: 0, pollMs: 10, ...clock() });
+  assert.deepEqual(failed, { state: 'timeout', readOk: false }, 'a zero wait whose one read failed is a timeout that never saw the PR');
   const flaky = fakeGh([new Error('boom'), new Error('boom'), { state: 'MERGED', mergeCommit: null }]);
   assert.deepEqual(await waitForMerge({ gh: flaky, pr: 12, waitMs: 60_000, pollMs: 1, ...clock() }), { state: 'merged', mergeSha: null });
   const dead = fakeGh([new Error('a'), new Error('b'), new Error('c'), { state: 'MERGED' }]);

@@ -1,7 +1,7 @@
 // `pipeline stats rounds`: what the review rounds past the limit (review.max_rounds) found and cost, read from the merged PRs' own comments (the triage state and the
 // run record). Pure: the command fetches and decodes, this module only counts. Display only: nothing here decides anything. The audit scripts of 2026-11-11 were the
 // first version of this (their SEC regex is the fallback security heuristic below).
-import { ROUND_CAP_CAUSE, SECURITY_CATEGORIES, asciiLine, countsTowardCap, isRoundCapDeferral } from './triage.mjs';
+import { CAP_LOW_RULE, ROUND_CAP_CAUSE, SECURITY_CATEGORIES, asciiLine, countsTowardCap, isRoundCapDeferral } from './triage.mjs';
 
 // itemSeverity needs the reviewed diff, which a PR comment does not carry, so the audit's rule judges an item: BLOCKING or security is not low.
 const SEC = /secur|auth|permission|rls|grant|policy|privilege|role|token|secret|injection|xss|csrf|leak|pii|tenant|access|escalat|sanitiz|credential|session|data loss|corrupt|migration|idempot|race|integrity/i;
@@ -15,6 +15,19 @@ const isNewAccept = (item) => decisionOf(item) === 'ACCEPT' && item.final.by !==
 const isDeferredAccept = (item) => isRoundCapDeferral(item) || (item?.final?.claude?.cause === ROUND_CAP_CAUSE && item.final.claude.overruled?.decision === 'ACCEPT');
 // what a round newly accepted (the fixes the round after it had to re-check): the same isNewAccept rule `found` uses, so a cached accept carried as implemented is no fix.
 const newAccepts = (round) => (round?.items ?? []).filter(isNewAccept);
+// The accepts `triage cap-defer` turned into follow-ups unapplied at the last allowed round (final.postMax.rule cap-low), over EVERY round of the state: an uncounted (resolution-only) round recorded after the cap round
+// can hold them, and analysePr skips those rounds before building rows. One per id; a cached copy (by 'cache', its own id, final spread from the original) is the same finding carried, not a second deferral.
+const capLowOf = (state) => {
+  const byId = new Map();
+  for (const r of state.rounds) for (const i of r?.items ?? []) if (decisionOf(i) === 'FOLLOW-UP' && i.final.by !== 'cache' && i.final.postMax?.rule === CAP_LOW_RULE) byId.set(i.id, i);
+  return [...byId.values()];
+};
+// Cap-low deferrals Claude tightened back to ACCEPT (final.claude.overruled keeps the deferral): the signal that the floor was wrong for that item.
+const capLowReopenedOf = (state) => {
+  const ids = new Set();
+  for (const r of state.rounds) for (const i of r?.items ?? []) if (i?.final?.by === 'claude' && i.final.claude?.overruled?.postMax?.rule === CAP_LOW_RULE) ids.add(i.id);
+  return ids.size;
+};
 const money = (v) => (Number.isFinite(v) ? Math.round(v * 100) / 100 : null);
 const share = (n, d) => (d > 0 ? Math.round((n / d) * 1000) / 1000 : null);
 
@@ -40,6 +53,7 @@ export function analysePr({ repo, pr, state, record }) {
   if (!state || !Array.isArray(state.rounds)) return null;
   const max = Number.isFinite(state.maxRounds) ? state.maxRounds : null;
   const byRound = record?.cost?.byRound && typeof record.cost.byRound === 'object' ? record.cost.byRound : {};
+  const capDeferred = capLowOf(state).length;
   const rows = [];
   let k = 0;
   let prev = null;
@@ -58,12 +72,15 @@ export function analysePr({ repo, pr, state, record }) {
       row.previous = prevAccepts.length === 0 ? 'no-accepts' : prevAccepts.every((i) => i.bucket !== 'BLOCKING' && !isSecurityItem(i)) ? 'only-low-fixes' : 'blocking-or-security';
       row.found = row.acceptedBlocking ? 'new-blocking' : items.some(isNewAccept) ? 'accepts' : items.some(isDeferredAccept) ? 'deferred' : 'nothing-accepted';
     }
+    if (max !== null && k === max) row.capDeferred = capDeferred;
     rows.push(row);
     prev = r;
   }
   const blockingLoop = rows.some((row, i) => i > 0 && row.acceptedBlocking && rows[i - 1].acceptedBlocking);
   const usd = Number.isFinite(record?.cost?.total?.usd) ? money(record.cost.total.usd) : null;
-  return { repo, pr, id: `${String(repo).split('/').pop()}#${pr}`, maxRounds: max, countedRounds: rows.length, pastCapRounds: rows.filter((r) => r.pastCap).length, usd, blockingLoop, rounds: rows };
+  // The cap round's new accepts were all low (the stats' own rule: no BLOCKING, no security item), nothing was deferred, and an automatic extra round followed: what `review.cap_low_accepts` would have saved.
+  const capLowNotDeferred = capDeferred === 0 && rows.some((r) => r.pastCap && r.k === max + 1 && r.admission === 'auto-extra' && r.previous === 'only-low-fixes');
+  return { repo, pr, id: `${String(repo).split('/').pop()}#${pr}`, maxRounds: max, countedRounds: rows.length, pastCapRounds: rows.filter((r) => r.pastCap).length, usd, blockingLoop, capDeferredItems: capDeferred, capDeferReopened: capLowReopenedOf(state), capLowNotDeferred, rounds: rows };
 }
 
 const bump = (o, key) => { o[key] = (o[key] ?? 0) + 1; };
@@ -71,7 +88,7 @@ const bump = (o, key) => { o[key] = (o[key] ?? 0) + 1; };
 // { prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission, previous, found, blockingLoopPrs, usd, pastCapUsd } over analysed PRs (nulls dropped).
 export function aggregate(analysed) {
   const prs = analysed.filter(Boolean);
-  const t = { prs: prs.length, prsPastCap: 0, countedRounds: 0, pastCapRounds: 0, pastCapShare: null, admission: {}, previous: {}, found: {}, kind: {}, ineligible: {}, blockingLoopPrs: 0, usd: 0, pastCapUsd: null };
+  const t = { prs: prs.length, prsPastCap: 0, countedRounds: 0, pastCapRounds: 0, pastCapShare: null, admission: {}, previous: {}, found: {}, kind: {}, ineligible: {}, blockingLoopPrs: 0, capDeferredPrs: 0, capDeferredItems: 0, capDeferReopened: 0, capLowNotDeferred: 0, usd: 0, pastCapUsd: null };
   let pastUsd = 0;
   let pastKnown = 0;
   for (const p of prs) {
@@ -79,6 +96,10 @@ export function aggregate(analysed) {
     t.pastCapRounds += p.pastCapRounds;
     if (p.pastCapRounds > 0) t.prsPastCap += 1;
     if (p.blockingLoop) t.blockingLoopPrs += 1;
+    if (p.capDeferredItems > 0) t.capDeferredPrs += 1;
+    t.capDeferredItems += p.capDeferredItems ?? 0;
+    t.capDeferReopened += p.capDeferReopened ?? 0;
+    if (p.capLowNotDeferred) t.capLowNotDeferred += 1;
     t.usd += p.usd ?? 0;
     for (const r of p.rounds) {
       bump(t.kind, r.reviewKind);
@@ -114,6 +135,7 @@ export function renderTable({ since, repos, totals, prs, withoutState }) {
   out.push('', `PRs ${totals.prs} (${totals.prsPastCap} went past the limit) · counted rounds ${totals.countedRounds} · past the limit ${totals.pastCapRounds}${totals.pastCapShare === null ? '' : ` (${(totals.pastCapShare * 100).toFixed(1)}%)`} · booked ${usdText(totals.usd)}`);
   out.push(`Past-limit admission: ${list(totals.admission)}`, `Round before them: ${list(totals.previous)}`, `What they found: ${list(totals.found)}`);
   out.push(`Round kinds (counted rounds): ${list(totals.kind)}`, `Why a conflict resolution was not reviewed alone: ${list(totals.ineligible)}`);
+  out.push(`Cap-low deferral (review.cap_low_accepts): PRs ${totals.capDeferredPrs} · items ${totals.capDeferredItems} · tightened back to ACCEPT ${totals.capDeferReopened} · PRs whose last-round accepts were all low but ran an extra round ${totals.capLowNotDeferred}`);
   out.push(`PRs without a review state: ${Number.isFinite(withoutState) ? withoutState : 0}`);
   out.push(`PRs with a BLOCKING loop (BLOCKING accepted in 2+ consecutive rounds): ${totals.blockingLoopPrs}${totals.pastCapUsd ? ` · past-limit rounds with a booking: ${totals.pastCapUsd.rounds}, ${usdText(totals.pastCapUsd.usd)}` : ''}`);
   return out.join('\n');

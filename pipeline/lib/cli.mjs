@@ -13,6 +13,16 @@ export class UnavailableError extends Error {
   }
 }
 
+// An outbound text guard (lib/github.mjs) stopped a write: the scanner flagged the text, crashed, or is missing, the config is
+// unreadable, or the write cannot be scanned at all (images). Never carries the scanned text. `extra`: machine-readable fields for the output.
+export class OutboundScanBlocked extends Error {
+  constructor(message, extra = {}) {
+    super(message);
+    this.name = 'OutboundScanBlocked';
+    this.extra = extra;
+  }
+}
+
 // Parse argv for one command. `options` uses node:util parseArgs syntax; unknown flags are
 // usage errors rather than silently ignored, because a typo'd safety flag must not pass.
 export function parseCommandArgs(argv, options = {}, { allowPositionals = true } = {}) {
@@ -52,5 +62,6 @@ export function emit({ exitCode = EXIT.OK, output = {}, compact = false, silent 
 export function errorResult(err) {
   if (err instanceof UsageError) return { exitCode: EXIT.USAGE, output: { ok: false, error: 'usage', message: err.message } };
   if (err instanceof UnavailableError) return { exitCode: EXIT.UNAVAILABLE, output: { ...err.extra, ok: false, error: 'unavailable', message: err.message } };
+  if (err instanceof OutboundScanBlocked) return { exitCode: EXIT.FAILED, output: { ...err.extra, ok: false, error: 'outbound-scan-blocked', message: err.message } };
   return { exitCode: EXIT.USAGE, output: { ok: false, error: 'internal', message: String(err?.stack || err) } };
 }

@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { GhError } from '../pipeline/lib/proc.mjs';
-import { createGitHub, parseConcatenatedJson, classifyApiError } from '../pipeline/lib/github.mjs';
+import { createGitHub, parseConcatenatedJson, classifyApiError, OutboundScanBlocked, runScanner } from '../pipeline/lib/github.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PLANTED, makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
 
 const cwd = process.cwd();
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -360,4 +364,133 @@ test('writeSummaryComment PATCHes the id it read: no second listing of the comme
   const b = mk([REPO, ME, comments(), { match: '^api -X POST repos/acme/widgets/issues/4/comments ', stdoutJson: { id: 99, html_url: 'https://x/99' } }]);
   const created = writeSummaryComment(b.gh, 4, { sections: 'first' });
   assert.equal(created.action, 'created');
+});
+
+// ---- outbound text guard (lib/github.mjs): a listed repository's text goes through a machine-local scanner first ----
+
+const scanKit = (t, mode = 'scan', { listed = 'acme/widgets' } = {}) => {
+  const { fake, gh } = mk([REPO, { match: '^api -X', stdoutJson: { id: 5, number: 5, html_url: 'https://x/5' } }, { match: '^(label|pr edit)', stdout: '' }, { match: '^api graphql', stdoutJson: { data: { ok: true } } }]);
+  const dir = mkdtempSync(join(tmpdir(), 'cp-outscan-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const scanner = makeScanner(dir, mode);
+  if (listed !== null) writeScanConfig(fake.scanHome, { [listed]: { command: scanner.command } });
+  const writes = () => fake.lines().filter((l) => !l.startsWith('repo view'));
+  return { fake, gh, scanner, dir, writes };
+};
+const caught = (fn) => {
+  try {
+    fn();
+  } catch (e) {
+    return e;
+  }
+  return null;
+};
+
+test('blocks a comment when the scanner exits 1', (t) => {
+  const { gh, scanner, writes } = scanKit(t);
+  const err = caught(() => gh.createComment(7, `hello ${PLANTED}`));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.deepEqual(writes(), [], 'nothing reached GitHub');
+  assert.match(err.message, /scanned: body/);
+  assert.match(err.message, /exited 1/);
+  // the hit: neither the scanner's stdout nor the scanned text, and the masked stderr line hides the word it found
+  assert.doesNotMatch(err.message, new RegExp(PLANTED));
+  assert.doesNotMatch(err.message, /HIT/);
+  // text travelled on stdin, never argv
+  const [run] = scanner.runs();
+  assert.match(run.stdin, new RegExp(`hello ${PLANTED}`));
+  assert.deepEqual(run.argv, ['--flag']);
+});
+
+test('blocks a PR title-only hit', (t) => {
+  const { gh, writes } = scanKit(t);
+  const err = caught(() => gh.issueCreate({ title: `Re: ${PLANTED}`, body: 'all clean here', labels: ['agent-suggestion'] }));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.match(err.message, /title/);
+  assert.ok(!err.message.includes(PLANTED));
+  assert.deepEqual(writes(), []);
+});
+
+test('fails closed when the scanner crashes (a signal, or a spawn error)', (t) => {
+  const { gh, writes } = scanKit(t, 'crash');
+  assert.ok(caught(() => gh.createComment(7, 'a clean comment')) instanceof OutboundScanBlocked);
+  assert.deepEqual(writes(), [], 'a crashed scanner is not a pass');
+  const failing = (code) => () => runScanner({ command: ['/x'], fields: [{ kind: 'body', text: 'x' }], spawnFn: () => ({ error: Object.assign(new Error('spawn'), { code }), status: null }) });
+  assert.match(caught(failing('ENOENT')).message, /could not run \(ENOENT\)/);
+  assert.match(caught(failing('ETIMEDOUT')).message, /timed out/);
+});
+
+test('fails closed when the slug is listed but the scanner path is missing', (t) => {
+  const { gh, fake, writes } = scanKit(t, 'scan', { listed: null });
+  writeScanConfig(fake.scanHome, { 'ACME/Widgets': { command: ['/no/such/scanner'] } }); // the slug match is case-insensitive
+  const err = caught(() => gh.createComment(7, 'a clean comment'));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.match(err.message, /scanner is missing or not executable/);
+  assert.deepEqual(writes(), []);
+});
+
+test('unlisted slug posts unchanged: no scanner is spawned, and gh gets exactly the arguments and stdin it always did', (t) => {
+  const { gh, scanner, writes, fake } = scanKit(t, 'scan', { listed: 'other/repo' });
+  const body = `a body with ${PLANTED} that only a listed repository would refuse`;
+  gh.createComment(7, body);
+  assert.deepEqual(writes(), ['api -X POST repos/acme/widgets/issues/7/comments --input -']);
+  assert.deepEqual(JSON.parse(fake.calls().at(-1).stdin), { body });
+  assert.deepEqual(scanner.runs(), []);
+});
+
+test('an invalid scan config blocks every write, listed or not', (t) => {
+  const { gh, fake, writes } = scanKit(t, 'scan', { listed: null });
+  // a key that can never match a `gh repo view` name would leave a repository looking listed while nothing is scanned
+  const keyed = (key) => JSON.stringify({ [key]: { command: ['/x'] } });
+  for (const bad of ['{ not json', '[]', '"x"', keyed('https://github.com/acme/widgets'), keyed('acme/widgets.git'), keyed('acme/widgets '), keyed('widgets')]) {
+    writeScanConfig(fake.scanHome, bad);
+    const err = caught(() => gh.createComment(7, 'a clean comment'));
+    assert.ok(err instanceof OutboundScanBlocked, bad);
+    assert.match(err.message, /every write is blocked/);
+  }
+  assert.deepEqual(writes(), [], 'nothing reached GitHub');
+});
+
+test('every free-text write of a listed repository is scanned (label create, a GraphQL mutation variable); a query and the id-only stop controls are not', (t) => {
+  const { gh, scanner, writes } = scanKit(t);
+  assert.match(caught(() => gh.createLabel({ name: 'ok', color: 'ffffff', description: `d ${PLANTED}` })).message, /label description/);
+  assert.match(caught(() => gh.graphql('mutation M($b:String!){m(input:{b:$b}){id}}', { b: PLANTED })).message, /graphql variable b/);
+  assert.deepEqual(writes(), []);
+  assert.equal(scanner.runs().length, 2);
+  gh.graphql('query Q($o:String!){x(o:$o){id}}', { o: PLANTED }); // a read: nothing to scan
+  gh.addLabels(7, ['needs-human']); // an existing label's name: not free text
+  gh.updateBranch(7, 'a'.repeat(40));
+  assert.equal(scanner.runs().length, 2, 'none of those reached the scanner');
+  assert.equal(writes().length, 3);
+});
+
+test('dequeue, enqueue and convert-to-draft still reach gh when the scan config is invalid (a stop control never depends on the scanner)', (t) => {
+  const { fake, gh, writes } = scanKit(t, 'scan', { listed: null });
+  writeScanConfig(fake.scanHome, '{ not json');
+  fake.setScript([REPO, { match: '^api graphql', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_x' } }, dequeuePullRequest: { mergeQueueEntry: { id: 'Q' } }, enqueuePullRequest: { mergeQueueEntry: { id: 'Q', state: 'QUEUED', position: 1 } }, convertPullRequestToDraft: { pullRequest: { isDraft: true, autoMergeRequest: null } } } } }]);
+  gh.dequeue(7);
+  gh.enqueue(7, 'a'.repeat(40));
+  assert.equal(gh.convertToDraft(7).isDraft, true);
+  assert.equal(writes().filter((l) => l.startsWith('api graphql')).length, 6, 'three node-id lookups and three mutations');
+  assert.ok(caught(() => gh.createComment(7, 'text')) instanceof OutboundScanBlocked, 'free text is still blocked by the invalid config');
+});
+
+test('a blocked write never echoes the scanner output, whatever punctuation wraps the hit', () => {
+  const secret = 'alice@example.test';
+  for (const stderr of [`found "${secret}"`, `${secret}.`, `email=${secret}`]) {
+    const err = caught(() => runScanner({ command: ['/x'], fields: [{ kind: 'body', text: `mail ${secret}` }], spawnFn: () => ({ status: 1, stdout: secret, stderr }) }));
+    assert.ok(err instanceof OutboundScanBlocked);
+    assert.ok(!err.message.includes('alice'), err.message);
+    assert.match(err.message, /exited 1/);
+  }
+});
+
+test('a scanner that ignores SIGTERM is killed at the timeout and the write is blocked', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-outscan-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const stubborn = join(dir, 'stubborn.mjs');
+  writeFileSync(stubborn, "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);\n");
+  const err = caught(() => runScanner({ command: [process.execPath, stubborn], fields: [{ kind: 'body', text: 'x' }], timeoutMs: 1500 }));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.match(err.message, /timed out/);
 });

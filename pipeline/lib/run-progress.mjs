@@ -7,7 +7,7 @@
 // read-then-write here is NOT atomic: re-reading right before the write (writeRunRecord) only narrows the window in which a concurrent writer's
 // mark could be overwritten, and the merge gate reads the events too (resumedRunState). A record from a newer CLI that the re-read sees is refused, not overwritten.
 import { hostname } from 'node:os';
-import { applyCheckpoint, bindRecord, emptyRecord } from './run-record.mjs';
+import { adoptRecord, applyCheckpoint, emptyRecord } from './run-record.mjs';
 import { postEvent, readResumedEvidence } from './run-events.mjs';
 import { readSummaryComment, writeSummaryComment } from './summary-comment.mjs';
 
@@ -15,7 +15,8 @@ export const VIEW_FIELDS = Object.freeze(['headRefOid', 'headRefName', 'baseRefN
 
 // The record to build on: the one in the summary comment when it is readable and belongs to this PR, else a fresh one
 // (with a warning when a record existed but was not usable). `existing` is a readSummaryComment result.
-// A record bound to another repo / branch (a rename) is replaced too, but keeps its `resumed` mark.
+// A record whose ONLY mismatch is the repo (a rename / transfer) is kept whole, bound to the live slug, with a warning (adoptRecord, #641).
+// A record bound to another branch / PR is replaced, but keeps its `resumed` mark.
 // An INVALID record may have been a resumed one, so its replacement is stamped `resumed` {at, host, head} (head: the PR head the caller
 // knows, else ''): `P merge` keeps asking for the owner's word. An UNSUPPORTED record (a newer CLI wrote it) is not replaced: this throws.
 export function baseRecordFor(existing, { repo, pr, branch, baseRef, step = 'build', host = hostname(), now = Date.now(), head = '' }) {
@@ -23,10 +24,10 @@ export function baseRecordFor(existing, { repo, pr, branch, baseRef, step = 'bui
   let resumed;
   if (existing.status === 'unsupported') throw new Error(UNSUPPORTED);
   if (existing.status === 'ok') {
-    const mismatch = bindRecord(existing.record, { repo, pr, branch });
-    if (mismatch.length === 0) return { record: existing.record, warnings };
-    warnings.push(`the existing run record does not belong to this PR (${mismatch.join('; ')}); started a new one`);
-    // (it is still THIS PR's summary comment, the one the merge gate reads: a repo or branch rename must not clear a resumed mark)
+    const adopted = adoptRecord(existing.record, { repo, pr, branch });
+    if (adopted.record) return adopted;
+    warnings.push(...adopted.warnings);
+    // (it is still THIS PR's summary comment, the one the merge gate reads: a branch rename must not clear a resumed mark)
     if (existing.record.resumed) resumed = existing.record.resumed;
   } else if (existing.status === 'invalid') {
     resumed = stampResumed({ host, now, head });

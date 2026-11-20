@@ -170,9 +170,9 @@ review:
   #                              # never the PR's own): a security finding outside it is ruled FOLLOW-UP (an issue is filed), not merge-blocking. Bugs and broken behaviour are unaffected.
   #                              # A judge or light round never sees the model, so a modelled path should also be listed in risk.high_risk_paths or review.arbiter_always_paths if the model
   #                              # is meant to apply to every PR touching it. name /^[a-z0-9-]{1,40}$/, text <= 4000 chars.
-  # regression_only_paths: []  # up to 20 globs, each also listed in risk.high_risk_paths or review.arbiter_always_paths (else a config error). For a PR touching one, the Fable arbiter judges a
+  # regression_only_paths: []  # up to 20 globs, each also listed in risk.high_risk_paths or review.arbiter_always_paths (else a config error; so is an entry a later `!` exclusion there fully cancels). For a PR touching one, the Fable arbiter judges a
   #                              # finding on it by "is it worse than the merge base?": the same weakness already there is FOLLOW-UP (scope same-on-base, an issue is filed, the owner's merge is bound to
-  #                              # it), a regression stays merge-blocking. Codex and the substitute keep their buckets. Read from the default branch's config, never the PR's own: set it only after
+  #                              # it; a finding with no line is never waived), a regression stays merge-blocking. Codex and the substitute keep their buckets. Read from the default branch's config, never the PR's own: set it only after
   #                              # `pipeline vendor --check` shows the runner knows the key.
   #                              # Like every new key, set it only after the installed pipeline and the vendored CI runner know it (`pipeline vendor --check`). Empty = off.
   # fix_verify_after_round: null  # null (off) | 1..10: counted review rounds past this one may use the narrow fix-verify brief even on sensitive / high-risk paths (never on a hard-stop hit
@@ -182,6 +182,8 @@ review:
   # post_max_suggestions: review # review (off) | follow-up: past review.max_rounds (counted round > max + 1: the first round past the limit, the automatic extra round or the owner's first grant when there was none, is exempt; later owner-granted rounds are affected) a low-severity SUGGESTION / WORTH CONSIDERING
   #                              # (performance, maintainability, testing, design, docs, other) the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP: an issue is filed, the merge digest lists it, and Claude may
   #                              # tighten it back to ACCEPT. Never a BLOCKING or security / bug item, never the owner's or Claude's own ruling. `review` in any of the working-tree, fork-point or trusted default-branch config (or an unreadable one) keeps it off.
+  # cap_low_accepts: defer     # defer (default) | extra-round: at the last allowed round (review.max_rounds), when every fix the round accepted is low severity (same test as `triage defer-fixes`) and none is built, the accepts
+  #                              # become follow-up issues unapplied instead of being built and re-reviewed in an extra round; the owner still says "merge" and sees them in the Rulings block. `extra-round` in the working-tree or trusted config keeps it off.
   # trip_wire_extra_rounds: 3    # 1..10: counted rounds past review.max_rounds after which `triage round-request` asks for a PROCESS REVIEW (a prompt, not a gate) before another round line
   # trip_wire_not_falling: 2     # 1..5: past-limit rounds whose new-ACCEPT count did not fall (and was above zero) that trip the same prompt. The smaller value of the two configs applies.
                                 # The trip-wire is ON by default in chat mode (review round-request); set trip_wire_extra_rounds: 10 and trip_wire_not_falling: 5 for the laxest setting.

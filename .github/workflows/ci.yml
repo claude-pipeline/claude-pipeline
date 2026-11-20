@@ -25,13 +25,18 @@
 # installer runs into a throwaway Claude home whose path contains a space, then --check must
 # report no drift, a second install must be a no-op, and --uninstall must leave no pipeline files.
 #
-# Push to main skips a job's steps when that exact tree already passed the SAME job on the merged PR
-# (.github/scripts/tested-tree.mjs): identical tree (git tree sha of the pushed commit == tree of the PR head), the PR
-# head contains the previous main (so the PR run's merge checkout was that same tree), and a completed pull_request run
-# of this workflow on that head has this job green. That makes the main run redundant, so a squash merge of an
-# up-to-date PR costs no second long run. If the PR branch was NOT up to date at merge, the trees differ and the job
-# runs: that is the intended fail-open. Any API or git error also means run. The job itself still starts and reports
-# success (skipped steps), so the required check names are unchanged. pull_request runs never skip.
+# Push to main skips a job's steps when that code already passed the SAME job (.github/scripts/tested-tree.mjs), on either of
+# two pieces of evidence, the first tried before the second:
+#   1. merge queue: a successful merge_group run of this workflow (from this repo) on the very commit that was pushed has this
+#      job green. The queue fast-forwards main to the exact commit its merge_group run tested (for a batch, the top queue
+#      commit, whose run tested everything below it), so the same sha means the same tree.
+#   2. merged PR: identical tree (git tree sha of the pushed commit == tree of the PR head), the PR head contains the previous
+#      main (so the PR run's merge checkout was that same tree), and a completed pull_request run of this workflow on that head
+#      has this job green.
+# Either makes the main run redundant, so a merge costs no second long run. If neither proves it (for instance the PR branch
+# was NOT up to date at a direct merge, so the trees differ), the job runs: that is the intended fail-open. Any API or git
+# error also means run. The job itself still starts and reports success (skipped steps), so the required check names are
+# unchanged. pull_request and merge_group runs never skip.
 name: CI
 
 on:
@@ -78,7 +83,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Push to main only: skip this job when the exact tree already passed this same job on the merged PR.
+      # Push to main only: skip this job when this exact commit passed it in the merge queue, or the exact tree passed it on the merged PR.
       - name: Already tested on the PR?
         id: tested
         if: github.event_name == 'push'
@@ -152,7 +157,7 @@ jobs:
         with:
           persist-credentials: false
 
-      # Push to main only: skip this job when the exact tree already passed this same job on the merged PR.
+      # Push to main only: skip this job when this exact commit passed it in the merge queue, or the exact tree passed it on the merged PR.
       - name: Already tested on the PR?
         id: tested
         if: github.event_name == 'push'

@@ -3367,17 +3367,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     failGroup = null;
   };
   const loopsAt = loopRangesOf(cmds);
-  // (#352 R37-F1: the command is in loop bodies only (no branch, function or trap), every loop a `for` over literal words, at least one: the body surely ran)
-  const literalFor = (id) => {
-    for (const rs of loopsAt.values()) {
-      const r = rs.find((x) => x.id === id);
-      if (r) { const h = cmds[r.start]; return h.argv[0] === 'for' && h.argv[2] === 'in' && h.argv.length > 3 && h.argv.slice(3).every((w) => !/[$`*?[{~\\'"()]/.test(w)); }
-    }
-    return false;
-  };
-  const surelyRan = (c) => c.ctl?.loop === true && !c.ctl.cond && !c.ctl.fn && !c.ctl.trap && (c.loops?.length ?? 0) > 0 && c.loops.every(literalFor);
   // (the levels above depth k are given back, innermost first, as the command that ends them (or the end of the text, #352 R38) finds them)
-  const closeLevels = (k, atEnd = false) => {
+  const closeLevels = (k) => {
     while (levels.length > k) {
       const l = levels.pop();
       const outer = levels[levels.length - 1];
@@ -3386,7 +3377,7 @@ function evalString(str, startDir, ctx, level, child = false) {
         if (l.e.kind === 'sub' || (dir !== null && !hazard)) dir = l.dir;
         if (l.state) { forgetNames(l.mover); aliasesUnsure(l.al); } // (#352 R11-B1: an alias it (re)defined is unsure too: the level may not have run, as for a change that is not certain)
       }
-      else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e) && !(atEnd && x.ran && x.up.length === 1)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
+      else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
       else if (l.e.kind === 'brace' && (l.e.sep === ';' || l.e.sep === '&') && !l.doubt) {
         // (#352 R10: a { } group the line surely enters (first, or after ; or &: one after && or || is a `blk`) is this shell going on. A change certain at its top stays certain after the closer, settled by
         // the operator that follows it (`{ git switch x; } && push`; `{ [ -f x ] && git switch x; } && push`: the group's status is its last list's, so push runs only when the switch did). One in a negated,
@@ -3611,7 +3602,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const changedState = argv.length > 0 && stateChanged(ctx, before);
     if (argv.length > 0 && (changesStateWords || changedState)) {
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', ran: how === 'chain' && surelyRan(c), lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain', and: c.sep === '&&', scoped: how === 'chain', lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || x.cond, from: i, byDir: DIR_CHANGERS.includes(name) };
@@ -3640,16 +3631,16 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();
     else forgetBranches(ctx);
   }
-  // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop whose words are not literal made may not either; when the text ends nothing
+  // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop (#615: a body can leave early: break / continue / return / exit) made may not either; when the text ends nothing
   // after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text ends in: as if a command after `;` followed, it is forgotten
-  // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). The one kept: a body of loops over literal non-empty word lists only (`ran`), which surely ran)
+  // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). (#615: none is kept)
   // (#352 R38: nor does a level still open at the end hand its changes on: nothing after it gives it back (a closer with no redirection emits no command; `{ git switch b; } < /missing` as the last command), so the
-  // levels are closed here as the next command would, and only a change at the text's own top level, or directly in the body of one literal loop (`ran`, one level), is kept)
+  // levels are closed here as the next command would, and only a change at the text's own top level is kept)
   // (#352 R38-F1: a text with a function / trap / state hazard forgets the state before each command (above), so after its last one too: it hands nothing on (an EXIT trap or a function named git
   // decides what the last `git -C /abs switch b` left))
-  if (levels) closeLevels(0, true);
+  if (levels) closeLevels(0);
   if (hazard) forgetState(false);
-  for (const x of trackers) if (x.and || (x.scoped && !x.ran)) forget(x);
+  for (const x of trackers) if (x.and || x.scoped) forget(x);
   return allowed();
   } finally {
     // what the list wrote is still true for the commands after the one that ran it
