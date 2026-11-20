@@ -236,6 +236,17 @@ const DENY = [
   ['git config unset core.hooksPath'],
   ['git config --remove-section core'],
   ['K=core.hooksPath; git config $K /dev/null'],
+  // only a literal repo-relative value, local scope, is let through (R1-F1)
+  ['git config core.hooksPath ../x'],
+  ['git config core.hooksPath ~/hooks'],
+  ['git config core.hooksPath $H'],
+  ['git config core.hooksPath .'],
+  ['git config --global core.hooksPath .githooks'],
+  ['git config --system core.hooksPath .githooks'],
+  ['git config --worktree core.hooksPath .githooks'],
+  ['git config --file x.cfg core.hooksPath .githooks'],
+  ['git config --add core.hooksPath .githooks'],
+  ['git config --unset core.hooksPath .githooks'],
 ];
 
 const ALLOW = [
@@ -280,6 +291,18 @@ const ALLOW = [
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);
+
+// R1-F1: the usual `prepare` script that installs a repo's own hooks dir must not make every install refuse
+const prepareOf = (prepare) => ({ pathExists: (p) => p === resolve('/work/repo/package.json'), readText: (p) => (p === resolve('/work/repo/package.json') ? JSON.stringify({ name: 'x', scripts: { prepare } }) : null) });
+for (const cmd of ['npm ci', 'npm install', 'npm run prepare']) {
+  test(`ALLOW ${cmd} when prepare sets core.hooksPath to .githooks`, () => {
+    const v = evaluate(cmd, prepareOf('git config core.hooksPath .githooks || true'));
+    assert.equal(v.decision, 'allow', v.reason);
+  });
+  test(`DENY ${cmd} when prepare points core.hooksPath elsewhere`, () => {
+    assert.equal(evaluate(cmd, prepareOf('git config core.hooksPath /dev/null || true')).decision, 'deny');
+  });
+}
 
 for (const [command, o] of DENY) {
   test(`DENY ${label(command, o)}`, () => {
@@ -886,7 +909,16 @@ const BYPASS_ALLOW = [
   ['git config core.hooksPath'],
   ['git config --global --get core.hooksPath'],
   ['git config get core.hooksPath'],
+  // read actions with a value filter are not writes (R1-B1); a repo installing its own hooks dir is not refused (R1-F1)
+  ['git config --get core.hooksPath .githooks'],
+  ['git config --get-all core.hooksPath .githooks'],
+  ['git config --get-regexp core.hooksPath .githooks'],
+  ['git config get core.hooksPath .githooks'],
+  ['git config core.hooksPath .githooks'],
+  ['git config --local core.hooksPath .githooks'],
+  ['git config core.hooksPath tools/git-hooks'],
   ['git config --list --show-origin'],
+  ['git config -l'],
   ['git config user.name x'],
   ['git config --unset user.name'],
   ['git commit -m "do not use core.hooksPath or --no-verify" && git push origin agent/x'],

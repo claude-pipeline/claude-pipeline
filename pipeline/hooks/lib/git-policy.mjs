@@ -665,12 +665,19 @@ function envHooksPathReason(env, ctx) {
 
 function trackConfig(args, ctx) {
   let { flags, positionals } = parseOpts(args, { longValue: ['file', 'blob', 'type', 'default', 'comment'], shortValue: 'f' });
-  let writes = positionals.length >= 2 || flags.some((f) => ['unset', 'unset-all', 'add', 'replace-all', 'remove-section', 'rename-section'].includes(f.name));
-  if (['set', 'unset'].includes(positionals[0])) { writes = true; positionals = positionals.slice(1); }
+  const writeFlag = flags.some((f) => ['unset', 'unset-all', 'add', 'replace-all', 'remove-section', 'rename-section'].includes(f.name));
+  // cp #661: a read (--get / --get-all / --get-regexp / --get-urlmatch / --list / -l, or the `get` / `list` subcommand) takes a value filter as its second word; it writes nothing
+  const reads = !writeFlag && (flags.some((f) => (f.short ? f.name === 'l' : ['get', 'get-all', 'get-regexp', 'get-urlmatch', 'list'].includes(f.name))) || ['get', 'list'].includes(positionals[0]));
+  if (reads && ['get', 'list'].includes(positionals[0])) positionals = positionals.slice(1);
+  let writes = !reads && (positionals.length >= 2 || writeFlag);
+  if (!reads && ['set', 'unset'].includes(positionals[0])) { writes = true; positionals = positionals.slice(1); }
   const key = String(positionals[0] ?? '').toLowerCase();
   // cp #661 (a section removed or renamed away takes its keys with it: `--remove-section core`)
   const spelled = expandVars(String(positionals[0] ?? ''), ctx).toLowerCase();
-  if (writes && (HOOKS_KEY(spelled) || (spelled === 'core' && flags.some((f) => ['remove-section', 'rename-section'].includes(f.name))))) return deny(HOOKS_CONFIG_REASON);
+  // the one write let through: a repository installing its own hooks dir (a `prepare` script of `git config core.hooksPath .githooks`): plain set, local scope, a literal repo-relative path (no `/` start, `.` / `..` segment, `$`, `~`)
+  const ownHooksDir = !writeFlag && positionals.length === 2 && !flags.some((f) => (f.short ? f.name === 'f' : ['global', 'system', 'worktree', 'file', 'blob'].includes(f.name)))
+    && /^[\w.][\w.-]*(?:\/[\w.][\w.-]*)*$/.test(positionals[1]) && !positionals[1].split('/').some((seg) => /^\.+$/.test(seg));
+  if (writes && !(HOOKS_KEY(spelled) && ownHooksDir) && (HOOKS_KEY(spelled) || (spelled === 'core' && flags.some((f) => ['remove-section', 'rename-section'].includes(f.name))))) return deny(HOOKS_CONFIG_REASON);
   if (key.startsWith('alias.') && positionals.length >= 2) { ctx.gitAliases[key.slice('alias.'.length)] = positionals[1]; logAlias(ctx, `git:${key.slice('alias.'.length)}`); }
   if (writes && RISKY_CONFIG(key, String(positionals[1] ?? ''))) ctx.cfgDirty = true;
   // (see directMergeVerdict; security review of de62b36: url.<base>.insteadOf rewrites a remote's URL, include / includeIf pull in other config)
