@@ -2664,12 +2664,17 @@ test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warnin
   const w = readyForArbiter(t);
   w.cli(['arbiter', 'needed', '--round', '1']);
   const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
-  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
+  const run = () => arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
+  // #589: the installed copy takes REAL admission in the account's folder (no seam points it elsewhere, by design) and waits up to 20 s for it. Under load, or while a real
+  // `pipeline update` or another suite's installed-copy child holds it, that wait can run out: the CLI then refuses BEFORE it reads anything (error update-in-progress, state
+  // untouched), so the same call can safely be made once more. Only that one refusal is retried; any other result, or a second refusal, is asserted below as before.
+  let r = run();
+  if (r.json?.error === 'update-in-progress') r = run();
   assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
   assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
   // R4-6: an installed copy ignores PIPELINE_REVIEW_LEASE_DIR, so this child (a plain process: noClaudeSession) took a REAL, momentary process lease and real admission in the
   // account's folder - no opt-out is wanted here, it is the path the owner's terminal takes. It must have closed it: no proc-* file of that child's pid is left. (If a real
-  // update holds admission while this runs, the child waits up to 20 s and then refuses with update-in-progress; the assertions above would fail loudly rather than hang.)
+  // update holds admission while this runs, the child waits up to 20 s and then refuses with update-in-progress; the call is made once more, and a second refusal fails the assertions above loudly rather than hanging.)
   const leaseFolder = leasesDir();
   const left = existsSync(leaseFolder) ? readdirSync(leaseFolder).filter((n) => n.startsWith(`proc-${r.pid}-`)) : [];
   assert.deepEqual(left, [], `the child's process lease was closed (${leaseFolder})`);
