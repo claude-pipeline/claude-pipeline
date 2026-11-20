@@ -2287,8 +2287,14 @@ test('R1-B2: an uncalled fs function (callback, alias, destructuring, object mem
     `node -e "['.review/state.json'].map(this['f'+'s'].openSync)"`,
     `node -e "['.review/state.json'].map(global['f'+'s'].openSync)"`,
     `node -e "console.log(require('./.review/state.json'));['x'].map(vm.runInThisContext)"`,
+    // R2-F1: a JavaScript identifier escape (\uXXXX, \u{X}) hides fs / a write name from every word scan, so a program holding one is no read-only program
+    `node -e "['w'].reduce(f\\u0073.openSync,'.review/state.json')"`,
+    `node -e "['.review/state.json'].forEach(f\\u0073.unlinkSync)"`,
+    `node -e "['w'].reduce(f\\u{73}.openSync,'.review/state.json')"`,
+    `node -e "['.review/state.json'].forEach(f\\u{73}.unl\\u0069nkSync)"`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
+    `node -e "console.log(require('fs').readFileSync('.review/state.json','utf8').split('\\n').length)"`,
     `node -e "console.log(require('./.review/state.json'))"`,
     `node -e "console.log(require('fs').readFileSync('.review/round-3/accepted.json','utf8'))"`,
     `node -e "const fs=require('fs');console.log(JSON.parse(fs.readFileSync('/abs/.review/hardstops.json','utf8')))"`,

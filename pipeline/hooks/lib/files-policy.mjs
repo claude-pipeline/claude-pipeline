@@ -4041,6 +4041,7 @@ function readFileSyncArgsPlain(args) {
   return false;
 }
 function inlineNodeReadOnly(prog) {
+  if (/\\u/.test(prog)) return false; // (R2-F1: an identifier escape, `fs` for `fs`, hides a name from every word scan below; `'\n'` and other escapes stay allowed)
   if (INLINE_NODE_WORDS.test(prog) || WRITE_HINT.test(prog.replace(/[<>=]/g, ' '))) return false; // (a write name is refused even as a callback: .map(fs.unlinkSync))
   if (/\brequire\b(?!\s*\(\s*(?:'[^'\\]*'|"[^"\\]*")\s*\))/.test(prog)) return false; // (every `require` is a call with one plain string)
   for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'([^'\\]*)'|"([^"\\]*)")\s*\)/g)) {
