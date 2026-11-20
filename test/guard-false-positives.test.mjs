@@ -484,6 +484,12 @@ test('11: `while read p` in a pipe stage binds p once, like `while read pid a b`
   assert.equal(gitOf('git branch -r | while read b; do git push origin $b; done').decision, 'deny');
   // a value read at run time that reaches eval or a shell's script stays unknown
   for (const cmd of ['cat commands.txt | while read cmd; do eval "$cmd"; done', 'while read f; do bash "$f"; done < list']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  // R1 follow-up: the value counts once only where every reader is a known data command. A copy into another name, a prefix env value (GIT_DIR=$f), an alias for git, and code-taking commands
+  // the guard does not list all still reach code at run time (the denylist allowed them; main denied)
+  for (const body of ['g=$f; bash "$g"', 'GIT_DIR=$f git status', 'git -c "alias.x=!$f" x', 'osascript -e "$f"', 'parallel ::: "$f"', 'make -f "$f"', 'go run "$f"', 'expect -c "$f"', 'tclsh "$f"', 'Rscript -e "$f"', 'swift "$f"', 'ps -p $f > $f']) {
+    const cmd = `while read f; do ${body}; done < list`;
+    assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  }
   // (outside a loop, a name assigned elsewhere, or a read with options stays unknown)
   for (const cmd of ['read f; echo hi | sh -c $f', 'f=a; ls | while read f; do ps -p $f; done; bash $f', 'ls | while read -p x f; do ps -p $f; done']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
 });

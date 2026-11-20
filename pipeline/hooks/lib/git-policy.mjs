@@ -2577,20 +2577,22 @@ function bindsRunTimeName(c) {
 // R1: builtins whose prefix assignment outlives the command (bash: `B=main export B` leaves B set; POSIX mode: all the special builtins).
 const PREFIX_PERSISTS = new Set(['export', ':', 'set', 'unset', 'shift', 'return', 'exit', 'break', 'continue', 'times']);
 const wordReads = (w, k) => { for (const m of String(w).matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)) if (m[1] === k) return true; return false; };
-const wordsOf = (c) => [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')];
 // Is $k read by a word of the line other than the value of the prefix `k=` of `own` itself?
 const readElsewhere = (cmds, k, own) => cmds.some((d) => [...d.argv, ...Object.entries(d.env ?? {}).filter(([ek]) => !(d === own && ek === k)).map(([, ev]) => ev), ...(d.redirects ?? []).map((r) => r.target ?? '')].some((w) => wordReads(w, k)));
-// Commands that run one of their words as code or a script (or hand it on to a command): the shells and eval / source (EVALUATES_HERE), the interpreters, awk / sed programs, wrappers.
-const CODE_TAKERS = new Set(['node', 'nodejs', 'python', 'python3', 'deno', 'bun', 'ruby', 'perl', 'php', 'lua', 'tsx', 'ts-node', 'bunx', 'pnpx', 'npx', 'awk', 'gawk', 'mawk', 'nawk', 'sed', 'env', 'xargs', 'nohup', 'time', 'timeout', 'nice', 'sudo', 'find', 'watch']);
-// R1: a plain loop `read NAME` gives NAME one value only known at run time, judged where it lands (see collectAssignments): only a data argument qualifies. A value that is a command word, reaches
-// eval / source or a shell's or interpreter's script / code position, or a name the shell, git or gh read for themselves stays unknown (unsure).
+// Commands that never run a word as code, never hand a word on to another program and have no option that runs a program: the only readers of a loop `read` value that leave it as data.
+// (R1 follow-up: an allowlist. The denylist it replaces missed any code-taking command it did not name, and a copy of the value into another variable.)
+const DATA_READERS = new Set(['ps', 'kill', 'pgrep', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'ls', 'head', 'tail', 'wc', 'cut', 'tr', 'basename', 'dirname', 'realpath', 'readlink', 'stat', 'file', 'du', 'lsof', 'cmp', 'shasum', 'sha256sum', 'md5', 'date']);
+// R1: a plain loop `read NAME` gives NAME one value only known at run time, judged where it lands (see collectAssignments): it qualifies only when every word of the line that reads it is a plain
+// argument (not the command word, not an env value: `g=$f` copies it, `X=$f cmd` hands it to cmd) of a DATA_READERS command. Any other reader, a redirect target, or a name the shell, git or gh read for themselves stays unknown (unsure).
 function readLandsAsData(cmds, k) {
   if (SPECIAL_NAMES.test(k)) return false;
   for (const c of cmds) {
+    if (Object.values(c.env ?? {}).some((w) => wordReads(w, k)) || (c.redirects ?? []).some((r) => wordReads(r.target ?? '', k))) return false;
     if (!c.argv.length) continue;
     if (wordReads(c.argv[0], k)) return false;
+    if (!c.argv.slice(1).some((w) => wordReads(w, k))) continue;
     const nm = baseName(c.argv[0]);
-    if ((EVALUATES_HERE.has(nm) || CODE_TAKERS.has(nm)) && wordsOf(c).some((w) => wordReads(w, k))) return false;
+    if (!DATA_READERS.has(nm) || (nm === 'printf' && c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) return false;
   }
   return true;
 }
