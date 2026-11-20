@@ -1223,7 +1223,15 @@ function reviewMarkerVerdict(group, verb, rest, dir, ctx) {
       break;
     }
   }
-  if (texts.some((t) => DYNAMIC.test(t))) {
+  // (replay 11-19: `--title "cost +\$0.29"` / `--body "saw \`sh x.sh\` refused"` hold `$` / a backtick as escaped text: the shell parser's own fact, litWords, as for the GraphQL query below. The text must be exactly one
+  // word of this command's own, literal, and no word may have been changed by a variable the line set: a second word with the same text could be the expanded one)
+  const literalText = (t) => {
+    const w = ctx.ghWords;
+    if (!w || w.argv.some((x) => expandVars(x, ctx) !== x)) return false;
+    const holders = w.argv.filter((x) => x.endsWith(t));
+    return holders.length === 1 && w.lit?.has(holders[0]) === true;
+  };
+  if (texts.some((t) => DYNAMIC.test(t) && !literalText(t))) {
     return deny('the comment text (or its file name) is built at run time ($VAR / $(...) / backticks), so it cannot be checked for the pipeline markers (review-complete, triage). Write the body to a file and pass --body-file with a literal name.');
   }
   for (const file of files) {
@@ -2502,14 +2510,21 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
     // Once even where the loop may not run (an empty list, `false && for …`): an unknown value already stands for any value, the one held before included.
     if (c.argv[0] === 'for' && /^[A-Za-z_][A-Za-z0-9_]*$/.test(c.argv[1] ?? '')) bump(c.argv[1], computedLoopWord(c) === null ? 2 : 1);
     // builtins that bind a variable without a NAME=value word: its value is whatever was read / parsed at run time
+    // (`while read p; do ps -p $p; done`, replay 11-19: a plain `read NAME…` in a loop gives each name ONE value, only known at run time, like `P=$(cmd)`: counted once, so the value is judged where it lands
+    // (a command word, a script, a ref), as for the loop variable of `for p in $(cmd)` above. Any other form (`-a`, `-p`, `NAME?prompt`, `NAME[i]`) and the other binders stay unsure)
     if (c.argv.length && VALUE_BINDERS.has(baseName(c.argv[0]))) {
+      const plainRead = baseName(c.argv[0]) === 'read' && (c.loops?.length ?? 0) > 0 && c.argv.slice(1).every((a) => /^(?:-r|[A-Za-z_][A-Za-z0-9_]*)$/.test(a));
       for (const a of c.argv.slice(1)) {
         const m = /^([A-Za-z_][A-Za-z0-9_]*)/.exec(a);
-        if (m) bump(m[1], 2);
+        if (m) bump(m[1], plainRead && readLandsAsData(cmds, m[1]) ? 1 : 2);
       }
     }
     for (const k of implicitBindsOf(c)) implicit.add(k); // (`read` sets REPLY, `getopts` OPTARG, `[[ =~ ]]` MATCH, `k[0]=`, `$_` …: see implicitBindsOf)
-    for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k])) bump(k, n);
+    // (a prefix assignment, `PATH=x gh pr view 1`, sets the name in that command's own environment only (withPrefixEnv judges the command with it): it is no assignment of this shell,
+    // unless the command evaluates words in this shell or the line defines a function, which sees it, as before. Replay 11-19: `cd d && PATH=/opt/homebrew/bin:$PATH gh pr view 1` was refused)
+    // (R1: only when the name is read by no other word of the line (`B=main export B` leaves B set here, and `F=b.mjs node $F` expands the $F of the line, not the prefix's), and not on a builtin whose prefix persists)
+    const prefixLocal = c.argv.length > 0 && topLevelLocal && readsOnlyData(c) && !PREFIX_PERSISTS.has(baseName(c.argv[0]));
+    for (const k of Object.keys(c.env)) if (!sameValue(ctx, k, c.env[k]) && (!prefixLocal || readElsewhere(cmds, k, c))) bump(k, n);
     if (c.argv.length && VAR_BUILTINS.includes(baseName(c.argv[0]))) {
       // `declare -n X=F` makes X a NAMEREF: $X reads $F at run time, while the text says "F". Unknown, like a binder.
       // Why: -L / -R / -Z / -i change the value the text gives (width cut, arithmetic): unknown too. -l / -u are applied where the value is recorded; declared
@@ -2558,6 +2573,29 @@ function bindsRunTimeName(c) {
   if (!VALUE_BINDERS.has(nm)) return false;
   if (nm === 'printf' && !words.some((w) => /^-[A-Za-z]*v/.test(w))) return false;
   return words.some((w) => DYNAMIC.test(w));
+}
+// R1: builtins whose prefix assignment outlives the command (bash: `B=main export B` leaves B set; POSIX mode: all the special builtins).
+const PREFIX_PERSISTS = new Set(['export', ':', 'set', 'unset', 'shift', 'return', 'exit', 'break', 'continue', 'times']);
+const wordReads = (w, k) => { for (const m of String(w).matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)) if (m[1] === k) return true; return false; };
+// Is $k read by a word of the line other than the value of the prefix `k=` of `own` itself?
+const readElsewhere = (cmds, k, own) => cmds.some((d) => [...d.argv, ...Object.entries(d.env ?? {}).filter(([ek]) => !(d === own && ek === k)).map(([, ev]) => ev), ...(d.redirects ?? []).map((r) => r.target ?? '')].some((w) => wordReads(w, k)));
+// Commands that never run a word as code, never hand a word on to another program and have no option that runs a program: the only readers of a loop `read` value that leave it as data.
+// (R1 follow-up: an allowlist. The denylist it replaces missed any code-taking command it did not name, and a copy of the value into another variable.)
+const DATA_READERS = new Set(['ps', 'kill', 'pgrep', 'cat', 'echo', 'printf', 'grep', 'egrep', 'fgrep', 'ls', 'head', 'tail', 'wc', 'cut', 'tr', 'basename', 'dirname', 'realpath', 'readlink', 'stat', 'file', 'du', 'lsof', 'cmp', 'shasum', 'sha256sum', 'md5', 'date']);
+// R1: a plain loop `read NAME` gives NAME one value only known at run time, judged where it lands (see collectAssignments): it qualifies only when every word of the line that reads it is a plain
+// argument (not the command word, not an env value: `g=$f` copies it, `X=$f cmd` hands it to cmd) of a DATA_READERS command. Any other reader, a redirect target, or a name the shell, git or gh read for themselves stays unknown (unsure).
+// R2: and only when nothing ELSE on the line could run what a reader prints: every command of the line is a bare-named (no `/`) DATA_READERS command or a `read`, and no redirect is a process substitution
+// (`echo "$c" | sh`, `cat "$f" | xargs rm`, `echo "$c" > >(sh)`, `./ps -p $f`). The keywords (while / do / done) are no commands of the list; a loop's own redirect (`done < list`) is a command without words.
+function readLandsAsData(cmds, k) {
+  if (SPECIAL_NAMES.test(k)) return false;
+  for (const c of cmds) {
+    if (Object.values(c.env ?? {}).some((w) => wordReads(w, k)) || (c.redirects ?? []).some((r) => wordReads(r.target ?? '', k) || /^[<>]\(/.test(r.target ?? ''))) return false;
+    if (!c.argv.length) continue;
+    const head = c.argv[0];
+    if (head === 'read') { if (c.argv.slice(1).some((w) => wordReads(w, k))) return false; continue; }
+    if (head.includes('/') || !DATA_READERS.has(head) || (head === 'printf' && c.argv.some((w) => /^-[A-Za-z]*v/.test(w)))) return false;
+  }
+  return true;
 }
 // Every `$NAME` / `${NAME…}` the line's words, prefixes and redirections read.
 function namesReadOn(cmds) {

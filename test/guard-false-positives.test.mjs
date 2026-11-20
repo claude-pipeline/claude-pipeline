@@ -454,3 +454,60 @@ test('M: the pipeline CLI run after a command whose writes are unknown is not re
   const other = files('eval "$X"; bash PIPELINE_ADMIN.sh', fakeFs(PROJ, { 'PIPELINE_ADMIN.sh': 'echo hi\n' }, DIRS));
   assert.equal(other.decision, 'deny');
 });
+
+// Guard false-alarm batch (replay 11-19), PR A. Each allowed line is one refused command of the live log; its deny controls stay refused.
+const gitOf = (command, fsOpts = fakeFs(GIT_ROOT, {}, DIRS)) => git(command, fsOpts);
+test('7a: a per-command `PATH=x cmd` prefix is not a second assignment of $PATH on the line', () => {
+  // refused as "$PATH is assigned more than once" because the prefix counted next to the inherited PATH
+  for (const cmd of ['cd /work/repo && PATH=/opt/homebrew/bin:$PATH gh pr view 1', 'PATH="$HOME/.local/bin:$PATH" gh pr view 1',
+    'cd /work/repo && mkdir -p .codex && printf x | PATH="$HOME/.local/bin:$PATH" codex exec hi']) {
+    assert.equal(gitOf(cmd).decision, 'allow', `${cmd}: ${gitOf(cmd).reason}`);
+  }
+  // deny controls: two real assignments still make it unknown where it is read, a prefix on a command that evaluates words here (or on a line that
+  // defines a function) still counts, and a prefix PATH does not hide a push
+  for (const cmd of ['PATH=/x; PATH=/y; echo $PATH | sh', 'F=a; F=b; bash $F', 'cd /work/repo && F=run.sh eval "bash $F"', 'f() { echo; }; cd /work/repo && PATH=/x:$PATH gh pr view 1']) {
+    assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  }
+  // (a prefix on `export` persists: B is main afterwards; the command's own words read the F of the line, not the prefix's: node runs a.mjs)
+  for (const cmd of ['B=agent/x; B=main export B; git push origin "$B"', 'F=a.mjs; F=b.mjs node $F', 'F=a.sh; F=b.sh node $F']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  assert.equal(gitOf('PATH=/evil:$PATH git push origin main').decision, 'deny');
+  assert.equal(gitOf('cd /work/repo && PATH=/evil:$PATH git push origin main').decision, 'deny');
+});
+
+test('11: `while read p` in a pipe stage binds p once, like `while read pid a b`', () => {
+  // refused as "$p is assigned more than once" ("read" in a pipe stage counted twice)
+  for (const cmd of ['pgrep -P 1 | while read p; do ps -o pid,command -p $p | tail -1; done', 'pgrep -P 1 | while read pid a b; do ps -p $pid; done']) {
+    assert.equal(gitOf(cmd).decision, 'allow', `${cmd}: ${gitOf(cmd).reason}`);
+  }
+  // deny controls: a value read at run time still cannot be a command word, nor a pushed ref
+  assert.equal(gitOf('echo push | while read G; do $G push origin main; done').decision, 'deny');
+  assert.equal(gitOf('git branch -r | while read b; do git push origin $b; done').decision, 'deny');
+  // a value read at run time that reaches eval or a shell's script stays unknown
+  for (const cmd of ['cat commands.txt | while read cmd; do eval "$cmd"; done', 'while read f; do bash "$f"; done < list']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  // R1 follow-up: the value counts once only where every reader is a known data command. A copy into another name, a prefix env value (GIT_DIR=$f), an alias for git, and code-taking commands
+  // the guard does not list all still reach code at run time (the denylist allowed them; main denied)
+  for (const body of ['g=$f; bash "$g"', 'GIT_DIR=$f git status', 'git -c "alias.x=!$f" x', 'osascript -e "$f"', 'parallel ::: "$f"', 'make -f "$f"', 'go run "$f"', 'expect -c "$f"', 'tclsh "$f"', 'Rscript -e "$f"', 'swift "$f"', 'ps -p $f > $f']) {
+    const cmd = `while read f; do ${body}; done < list`;
+    assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  }
+  // R2: a data command prints the value and a later stage, a process substitution or a program by path can run it: any other command on the line keeps the count at two
+  for (const body of ['echo "$f" | sh', "printf '%s\\n' \"$f\" | bash", 'cat "$f" | bash', 'echo "$f" | xargs rm -rf', './ps -p $f', '/tmp/echo "$f"']) {
+    const cmd = `while read f; do ${body}; done < list`;
+    assert.equal(gitOf(cmd).decision, 'deny', cmd);
+  }
+  // (outside a loop, a name assigned elsewhere, or a read with options stays unknown)
+  for (const cmd of ['read f; echo hi | sh -c $f', 'f=a; ls | while read f; do ps -p $f; done; bash $f', 'ls | while read -p x f; do ps -p $f; done']) assert.equal(gitOf(cmd).decision, 'deny', cmd);
+});
+
+test('9a/9b: a backslash-escaped $ or backtick inside double quotes is literal text in a gh comment', () => {
+  const opts = fakeFs(GIT_ROOT, { '/lit/x.md': 'plain\n' }, DIRS);
+  for (const cmd of ['gh issue create -R o/r --title "cost +\\$0.29" --body-file /lit/x.md', 'gh issue comment 1 -R o/r --body "saw \\`sh x.sh\\` refused"']) {
+    assert.equal(gitOf(cmd, opts).decision, 'allow', `${cmd}: ${gitOf(cmd, opts).reason}`);
+  }
+  // deny controls: a real expansion, also after an escaped backslash
+  for (const cmd of ['gh issue comment 1 -R o/r --body "$(cat f)"', 'gh issue comment 1 -R o/r --body "$X"', 'gh issue comment 1 -R o/r --body "\\\\$X"',
+    'gh issue comment 1 -R o/r --body "\\\\`cat f`"', 'gh issue comment 1 -R o/r --body "saw \\`claude-pipeline:summary\\` here"',
+    "gh issue comment 1 -R o/r --body '$X' --title \"$X\"", 'gh issue create -R o/r --title "t" --body-file "/lit/$X.md"']) {
+    assert.equal(gitOf(cmd, opts).decision, 'deny', cmd);
+  }
+});

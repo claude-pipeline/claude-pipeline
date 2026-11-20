@@ -102,9 +102,16 @@ export function ownerGoWiring(session, { readText = (p) => readFileSync(p, 'utf8
       d = up;
     }
   };
+  // (one hook run judges before anything runs, so a repository's files cannot change mid-check: read them once per root, not once per
+  // simple command, or a long script spends its deadline on git spawns. A read that throws is not remembered: the next question fails closed again)
+  const configsByRoot = new Map();
   const configsOf = (dir) => {
     const root = rootOf(dir);
     if (root === null) return [];
+    if (!configsByRoot.has(root)) configsByRoot.set(root, readConfigs(root));
+    return configsByRoot.get(root);
+  };
+  const readConfigs = (root) => {
     const texts = [];
     const yml = path.join(root, '.claude', 'pipeline.yml');
     if (exists(yml)) texts.push(readText(yml));
