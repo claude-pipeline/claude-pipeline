@@ -1078,6 +1078,21 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.digest, r.json.digest, 'deterministic for unchanged state');
 });
 
+test('arbiter needed on a dispute round whose recorded toHead this clone lacks: an error, no input written (never "the file does not exist at the reviewed head")', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
+  const st = w.state();
+  st.rounds[0].toHead = 'f'.repeat(40);
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(st));
+  const before = w.stateText();
+  const r = w.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(r, 2, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'head-unavailable');
+  assert.ok(!existsSync(w.roundFile(1, 'arbiter-input.md')), 'no input without evidence');
+  assert.equal(w.stateText(), before);
+});
+
 test('arbiter needed: the excerpt is +/-20 lines of the file at the reviewed head, numbered, and cannot break out of its fence', (t) => {
   const w = world(t);
   w.repo.write('src/f.js', Array.from({ length: 60 }, (_, i) => (i === 29 ? '// ``` closes a naive fence' : `const f${i + 1} = ${i + 1};`)).join('\n') + '\n');

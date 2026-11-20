@@ -13,7 +13,7 @@ import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { CATEGORIES, categoryNotes, fingerprint, largeBinaryNote, normalizeFindingCategories, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
-import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
+import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, revParse, showFile } from '../lib/git.mjs';
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, countedOrdinal, expectationOf, fixRoundCandidate, fixRoundScope, postMaxSettings } from '../lib/fix-verify.mjs';
@@ -501,6 +501,15 @@ async function neededLocked(values, n, root, ctx) {
   const items = round.items.filter((item) => arbiterNeeded(item, { lightLane: state.lightLane, force }));
   if (!review && items.length === 0) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
 
+  // The excerpts are read at the recorded toHead: a clone that lacks it must fail here, not tell the arbiter that a cited file does not exist (writeFableDiff fails loudly for a review round).
+  if (!review && typeof round.toHead === 'string') {
+    try {
+      revParse(`${round.toHead}^{commit}`, { cwd: root });
+    } catch (err) {
+      if (!(err instanceof GitError)) throw err;
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'head-unavailable', message: `round ${round.n} was reviewed at ${round.toHead.slice(0, 12)}, which this clone does not have: fetch it (or run codex-review for the round again)` });
+    }
+  }
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
   // The files the Fable diff covers (shared by the threat-model lookup and chooseBrief); null when git cannot list them (no model is shown then, chooseBrief says why).
   let diffFileList = null;
