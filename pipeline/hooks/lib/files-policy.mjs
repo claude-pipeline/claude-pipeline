@@ -4041,7 +4041,7 @@ function readFileSyncArgsPlain(args) {
   return false;
 }
 function inlineNodeReadOnly(prog) {
-  if (/\\u/.test(prog)) return false; // (R2-F1: an identifier escape, `fs` for `fs`, hides a name from every word scan below; `'\n'` and other escapes stay allowed)
+  if (/\\u/i.test(prog)) return false; // (R2-F1: an identifier escape, `fs` for `fs`, hides a name from every word scan below; `'\n'` and other escapes stay allowed)
   if (INLINE_NODE_WORDS.test(prog) || WRITE_HINT.test(prog.replace(/[<>=]/g, ' '))) return false; // (a write name is refused even as a callback: .map(fs.unlinkSync))
   if (/\brequire\b(?!\s*\(\s*(?:'[^'\\]*'|"[^"\\]*")\s*\))/.test(prog)) return false; // (every `require` is a call with one plain string)
   for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'([^'\\]*)'|"([^"\\]*)")\s*\)/g)) {
@@ -6152,6 +6152,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // assignment, wrapper (env, command, npx ...: the raw text starts with node) or write redirect, no NODE_OPTIONS anywhere on the line. Anything else is judged as before.
   const readsInlineNode = (c) => /^node$/.test(c.argv[0] ?? '') && /^(?:-e|-p)$/.test(c.argv[1] ?? '') && c.argv.length === 3 && /^node\s/.test(c.raw.trimStart())
     && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && Object.keys(c.env ?? {}).length === 0 && !/NODE_OPTIONS/.test(raw)
+    && !/\$['"]/.test(c.raw) // (an ANSI-C or locale word is decoded by the shell into text the raw word does not show)
     && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
     && inlineNodeReadOnly(c.argv[2]);
   // Item 7b (guard false refusals): `out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait …)`: an assignment that gives plain lower-case names (no shell variable the shell reads: PATH, IFS, the zsh `path` family ...) nothing but ONE whole

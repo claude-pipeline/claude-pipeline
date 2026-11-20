@@ -93,6 +93,9 @@ function readAnsiC(s, i) {
       let m = /^x([0-9a-fA-F]{1,2})/.exec(s.slice(j + 1, j + 4));
       if (!m) m = /^u([0-9a-fA-F]{1,4})/.exec(s.slice(j + 1, j + 6));
       if (m) { out += String.fromCharCode(parseInt(m[1], 16)); j += 1 + m[0].length; continue; }
+      // \UHHHHHHHH (1 to 8 hex digits) is a code point; past U+10FFFF it stays literal text (fromCodePoint would throw)
+      m = /^U([0-9a-fA-F]{1,8})/.exec(s.slice(j + 1, j + 10));
+      if (m && parseInt(m[1], 16) <= 0x10FFFF) { out += String.fromCodePoint(parseInt(m[1], 16)); j += 1 + m[0].length; continue; }
       m = /^([0-7]{1,3})/.exec(s.slice(j + 1, j + 4));
       if (m) { out += String.fromCharCode(parseInt(m[1], 8)); j += 1 + m[0].length; continue; }
       out += '\\' + nx;
