@@ -298,3 +298,4 @@ full record.
 - 2026-11-20 · #700 · Git guard walk follow-ups: aliases as child text, quiet redirects, cd -P, unknown-dir switch, loop exit · risk high · rounds 5 · arbiter 5 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 639 runs (171 high)
 - 2026-11-20 · #676 · Pipeline fixes: synthetic-grant image note, low-confidence confirm, cost double-count, ci-wait --wait-others, publish retry · risk high · rounds 5 · arbiter 5 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 643 runs (171 high)
 - 2026-11-20 · #688 · Live-database guard, part 2: supabase CLI / Management API rule (#262) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · blocked · Codex 7d: 651 runs (175 high)
+- 2026-11-20 · #705 · Guard: refuse switching off git hooks on push; protect the outbound-scan config folder (#661, #648) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 655 runs (177 high)
