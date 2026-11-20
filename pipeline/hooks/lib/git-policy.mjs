@@ -690,8 +690,14 @@ function checkGit(argv, env, dir, ctx, raw, level = 0) {
   const alias = aliasConfig ? aliasConfig.value : ctx.gitAliases[sub.toLowerCase()];
   if (alias !== undefined && level < MAX_NESTING) {
     if (alias.startsWith('!')) {
-      const v = evalString(`${alias.slice(1)} ${args.map(shellQuote).join(' ')}`, g.d, ctx, level + 1);
-      return v.decision === 'deny' ? v : null;
+      // (#570: a `!` alias runs in a child shell: what its text changed, or may have changed, is unknown afterwards, as for any child text, see forgetChildChanges)
+      const spec = markChildState(ctx);
+      try {
+        const v = evalString(`${alias.slice(1)} ${args.map(shellQuote).join(' ')}`, g.d, ctx, level + 1);
+        return v.decision === 'deny' ? v : null;
+      } finally {
+        forgetChildChanges(ctx, spec);
+      }
     }
     return checkGit(['git', ...splitArgs(alias), ...args], env, g.d, ctx, raw, level + 1);
   }
@@ -1334,8 +1340,13 @@ function checkGh(argv, env, dir, ctx, raw, level = 0) {
   const alias = ctx.ghAliases[group];
   if (alias !== undefined && level < MAX_NESTING) {
     if (alias.shell) {
-      const v = evalString(`${alias.expansion.replace(/^!/, '')} ${[verb, ...rest].filter((x) => x !== undefined).map(shellQuote).join(' ')}`, dir, ctx, level + 1);
-      return v.decision === 'deny' ? v : null;
+      const spec = markChildState(ctx); // (#570: a shell alias runs in a child shell, like a `!` git alias)
+      try {
+        const v = evalString(`${alias.expansion.replace(/^!/, '')} ${[verb, ...rest].filter((x) => x !== undefined).map(shellQuote).join(' ')}`, dir, ctx, level + 1);
+        return v.decision === 'deny' ? v : null;
+      } finally {
+        forgetChildChanges(ctx, spec);
+      }
     }
     return checkGh(['gh', ...splitArgs(alias.expansion), ...args.slice(1)], env, dir, ctx, raw, level + 1);
   }

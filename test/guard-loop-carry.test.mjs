@@ -509,6 +509,19 @@ test('#362 R39-B1 / F1 / F2: an alias written and put back by a text that may en
   allows('a subshell that writes no alias', `${SET_STATUS}; ( echo hi; exit 0 ); git ship`);
 });
 
+// #570: a `!` git alias and a gh shell alias run in a child shell, so what their text changed (it may have exited before the put-back) is unknown to the line afterwards, like any child text.
+// Caught: `git x` that switches to main, exits, and has the switch back after it: the line believed it was back on agent/x and pushed main.
+test('#570: a `!` git alias / gh shell alias that switches or rewrites an alias and puts it back (an exit between) leaves that unknown for the line', () => {
+  const SET_STATUS = 'git config alias.ship status';
+  const p = { 'p.sh': `${PB} origin HEAD\n` };
+  denies('alias written and put back by a ! git alias', `${SET_STATUS}; git config alias.x '!${SHIP}; exit 0; ${SET_STATUS}'; git x; git ship`, {}, ALIAS);
+  denies('branch switched and put back by a ! git alias', `git switch agent/x; git config alias.x '!git switch ${MAIN}; exit 0; git switch agent/x'; git x; bash ./p.sh`, p, BRANCH);
+  denies('alias written and put back by a gh shell alias', `${SET_STATUS}; gh alias set x '!${SHIP}; exit 0; ${SET_STATUS}'; gh x; git ship`, {}, ALIAS);
+  denies('R38-F2: the same text given as -c alias.x=', `git -c alias.x='!git switch ${MAIN}; exit 0; git switch agent/x' x; ${PB} origin HEAD`, {}, BRANCH);
+  allows('a ! git alias that changes nothing', `${SET_STATUS}; git config alias.x '!echo hi'; git x; git ship`);
+  allows('a gh shell alias that changes nothing', `${SET_STATUS}; gh alias set x '!echo hi'; gh x; git ship`);
+});
+
 // R39-F3 / F4 (the arbiter's reading: a memo hit replays an end state without the writes of the first judgement): the same text run a second time in the same state is still unknown afterwards
 test('#362 R39-F3 / F4: a startup file or a line-written script judged once in a state is still unknown to its caller the second time', () => {
   const rc = { rc: `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`, 'noop.sh': 'echo hi\n' };
