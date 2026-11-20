@@ -285,3 +285,4 @@ full record.
 - 2026-11-20 · #664 · A repo rename or transfer keeps each PR's run record and booked cost (#641) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 593 runs (159 high)
 - 2026-11-20 · #656 · fix: follow-ups batch — #576, #577 and DRMed intake items · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 593 runs (159 high)
 - 2026-11-20 · #665 · Regression-only bar for the guard files (#559 A3); refuse a cancelled entry (#640); no waiver without a line (#631) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 595 runs (161 high)
+- 2026-11-20 · #653 · Main skips re-testing a commit the merge queue already passed (tested-tree accepts merge_group runs) · risk high · rounds 2 · arbiter 1 · awaiting-owner-merge · Codex 7d: 597 runs (161 high)
