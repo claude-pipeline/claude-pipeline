@@ -23,6 +23,7 @@ import {
   STATE_VERSION_OWNER_DEFERRAL,
   STATE_VERSION_SAME_ON_BASE,
   stateNeedsSameOnBaseVersion,
+  stateNeedsCapLowVersion,
   stateNeedsOwnerDeferralVersion,
   stateNeedsPostMaxVersion,
   maxRiskOf,
@@ -522,7 +523,7 @@ test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForCom
     assert.equal(loadState(dir).version, 4);
     assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
     saveState(dir, { ...s, version: SUPPORTED_STATE_VERSION + 1 });
-    assert.throws(() => loadState(dir), /version 10.*supports.*9/);
+    assert.throws(() => loadState(dir), /version 11.*supports.*10/);
     assert.equal(decodeFromComment(encodeForComment({ ...s, version: SUPPORTED_STATE_VERSION + 1 })), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -697,6 +698,22 @@ test('F11 (owner deferral): version 7 ONLY when a final carries ownerDeferral (a
 
 // Failure caught: a pipeline of version 7 reads a state holding a same-on-base final, counts its unfiled FOLLOW-UP as done and leaves it out of the owner's bound items; or the new
 // version is written for an ordinary state (an old CLI could no longer read it), or loses to 7 when both marks are in one state.
+test('cap-low deferral: version 10 ONLY when a final carries postMax.rule cap-low (a plain post-max stays 6); 10 wins over 9; a CLI supporting 9 refuses it', () => {
+  const plain = sampleState();
+  const final = (postMax) => ({ decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'r', postMax: { from: 'ACCEPT', by: 'judge', ordinal: 1, max: 1, ...postMax } });
+  const capLow = updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: final({ rule: 'cap-low' }) })]);
+  assert.equal(stateNeedsCapLowVersion(capLow), true);
+  assert.equal(capLow.version, STATE_VERSION_CAP_LOW);
+  assert.equal(updateItems(plain, 1, [it('R1-S1', { bucket: 'SUGGESTION', final: final({}) })]).version, STATE_VERSION_POST_MAX, 'an ordinary post-max follow-up stays at 6');
+  const both = updateItems(capLow, 1, [capLow.rounds[0].items[0], it('R1-S2', { bucket: 'SUGGESTION', final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: false, reason: 'r', sameOnBase: 'src/**' } })]);
+  assert.equal(both.version, STATE_VERSION_CAP_LOW, 'version 10 wins over 9');
+  assert.ok(STATE_VERSION_CAP_LOW > STATE_VERSION_SAME_ON_BASE);
+  const refusesAt9 = (state) => Number.isFinite(state.version) && state.version > 9;
+  assert.equal(refusesAt9(capLow), true);
+  assert.equal(refusesAt9(plain), false);
+  assert.equal(stateNeedsCapLowVersion(null), false);
+});
+
 test('A2 (regression-only): version 9 ONLY when a final carries sameOnBase (also on a cached copy); version 9 wins over 7; a plain or owner-deferral-only state keeps its version; a CLI supporting 8 refuses 9', () => {
   const plain = sampleState();
   assert.equal(stateNeedsSameOnBaseVersion(plain), false);
