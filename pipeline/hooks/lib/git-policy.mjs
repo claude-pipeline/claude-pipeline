@@ -343,7 +343,7 @@ function forgetBranches(ctx) {
   for (const e of ctx.branches.values()) e.name = null;
 }
 function setBranch(ctx, dir, name, trackMain = false) {
-  if (dir === null) { ctx.branchesUnknown = true; return; }
+  if (dir === null) { forgetBranches(ctx); return; } // (a switch in a directory the walk cannot name may be the repository a tracked name belongs to: those names are forgotten too)
   if (name !== null && DYNAMIC.test(name)) name = null; // still holds `$B` / `$(…)` after expansion: unknown, not a name
   ctx.branches.set(dir, { name: name === null ? null : stripHeads(name), trackMain });
   (ctx.budget.branchLog ??= []).push(dir); // (every write, for judgeScopedIn: a text that switched and switched back has still changed the branch)

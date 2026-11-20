@@ -612,6 +612,19 @@ test('#572 / #573: a branch switched and put back by an eval\'d text in a subshe
   allows('a file-fed eval that switches nothing', line('p.sh'), { ...p, 'f.sh': 'echo hi\nexit 0\n' });
 });
 
+// C: a switch in a directory the walk cannot name (`git -C "$(git rev-parse --show-toplevel)" switch main`, a cd to `$(mktemp -d)`) may hit the repository the walk tracks as agent/x. Caught: the tracked name
+// stood, so the HEAD push after it was judged on agent/x and sent main.
+test('C: a branch switch in a directory the walk cannot name makes the tracked branch unknown', () => {
+  const TOP = '"$(git rev-parse --show-toplevel)"';
+  const H = `${PB} origin HEAD`;
+  denies('-C with a toplevel substitution, push on the line', `git switch agent/x; git -C ${TOP} switch ${MAIN}; ${H}`, {}, BRANCH);
+  denies('the same, the push in a script', `git switch agent/x; git -C ${TOP} switch ${MAIN}; bash ./p.sh`, { 'p.sh': `${H}\n` }, BRANCH);
+  denies('a switch after a cd to a directory not named', `git switch agent/x; cd "$(mktemp -d)"; git switch ${MAIN}; cd ${GIT_ROOT}; ${H}`, {}, BRANCH);
+  denies('F8: a child script switches in a directory it cannot name', `git switch agent/x; bash ./s.sh; ${H}`, { 's.sh': `git -C ${TOP} switch ${MAIN}\n` }, BRANCH);
+  allows('a literal other repository', `git switch agent/x; git -C /work/other switch ${MAIN}; ${H}`);
+  allows('an unnamed directory, no branch move', `git switch agent/x; git -C ${TOP} status; ${H}`);
+});
+
 // #569 pin (passes on main by design: the loop rule and #647 already hold it): an eval'd file that itself evals a file inside a literal loop does not hand its switch to the caller (the loop may have broken out first);
 // the same two files with no loop do (the switch is believed). Guards the loop-carry rule against a later refactor.
 test('#569: a switch made by a file eval\'d inside a literal loop in an eval\'d file is not handed to the caller', () => {
