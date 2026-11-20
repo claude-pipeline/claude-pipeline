@@ -569,6 +569,37 @@ test('a long flag run in a quoted command string is decided fast, not by the dea
   assert.ok(ms < 2000, `took ${ms} ms`);
 });
 
+// R5-F1: a word of many stars (each became \`.*\`) backtracked past the 15 s hook limit on a literal no head contains, and a hook past the limit is ALLOWED, so the db push after it ran
+test('a word of many stars after a supabase token is refused fast, not by the hook deadline', () => {
+  for (const line of [
+    `doppler run --command 'supabase ${'*'.repeat(60)}z; supabase db push'`,
+    `x supabase '${'*'.repeat(60)}z'; supabase db push`,
+  ]) {
+    const t0 = Date.now();
+    const v = verdict(line);
+    const ms = Date.now() - t0;
+    assert.equal(v.decision, 'deny', line.slice(0, 60));
+    assert.doesNotMatch(v.reason ?? '', /took too long/);
+    assert.ok(ms < 2000, `took ${ms} ms`);
+  }
+});
+
+// R5-F2: the prose rule's lookahead made the greedy @-tail of the token backtrack at every start of \`;supabase@;supabase@...\` (about 7 s at 190 kB, 19 s with the call inside the same quoted string)
+test('a 190 kB word of repeated supabase@ tokens is decided fast, not by the hook deadline', () => {
+  const word = ';supabase@'.repeat(19000);
+  for (const line of [
+    `doppler run --command '${word}' 'supabase db push'`,
+    `doppler run --command 'supabase db push ${word}'`,
+  ]) {
+    const t0 = Date.now();
+    const v = verdict(line);
+    const ms = Date.now() - t0;
+    assert.equal(v.decision, 'deny');
+    assert.doesNotMatch(v.reason ?? '', /took too long/);
+    assert.ok(ms < 2000, `took ${ms} ms`);
+  }
+});
+
 test('an unknown subcommand names itself', () => {
   assert.match(verdict('supabase frobnicate').reason, /not a subcommand the guard knows/);
 });

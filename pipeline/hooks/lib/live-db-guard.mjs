@@ -260,10 +260,16 @@ const possibleHead = (w) => {
   const head = /^[a-z][a-z0-9-]*(?![\w-])/i.exec(w)?.[0].toLowerCase();
   return Boolean(head && isSubcommandHead(head)) || w.includes(MARK) || globMatchesHead(w);
 };
-const PROSE_TOKEN = new RegExp(`${SB_TOKEN_SRC}(?=[ \\t]+([A-Za-z]+)(?!\\S))`, 'gi');
+// the prose rule's tail is tested apart from the token (R5-F2): a lookahead appended to SB_TOKEN made its greedy `@...` tail backtrack through the whole word at every token start, quadratic on `;supabase@;supabase@...`
+const SB_TOKEN_ALL = new RegExp(SB_TOKEN_SRC, 'gi');
+const PROSE_TAIL = /[ \t]+([A-Za-z]+)(?!\S)/y;
 function sbTokenHead(text) {
   const words = text
-    .replace(PROSE_TOKEN, (token, word) => (possibleHead(word) ? token : '\x03'))
+    .replace(SB_TOKEN_ALL, (token, offset) => {
+      PROSE_TAIL.lastIndex = offset + token.length;
+      const word = PROSE_TAIL.exec(text)?.[1];
+      return word !== undefined && !possibleHead(word) ? '\x03' : token;
+    })
     .replace(/\\\n/g, '')
     .replace(/['"\\]/g, '')
     .replace(/[$`{]/g, ' ' + MARK)
@@ -275,6 +281,9 @@ function sbTokenHead(text) {
 // B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
 function globMatchesHead(w) {
   if (!/[*?[]/.test(w)) return false;
+  // R5-F1: runs of `*` are one star, and a pattern that is long or has many metacharacters is not matched at all (each `*` becomes `.*`, which backtracks past the hook timeout on a literal no head contains): fail closed
+  w = w.replace(/\*+/g, '*');
+  if (w.length > 64 || (w.match(/[*?[]/g) ?? []).length > 8) return true;
   let re = '';
   for (let i = 0; i < w.length; i += 1) {
     const ch = w[i];
