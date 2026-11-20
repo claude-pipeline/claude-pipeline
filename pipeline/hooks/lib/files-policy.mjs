@@ -2520,26 +2520,15 @@ const LAST_WORD_RE = /\$(?:_|\{_)(?![A-Za-z0-9_])/; // `$_` / `${_}`: the last w
 // R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...), an integer declaration (`typeset -i`, `declare -i`, `local -i`, `integer`) and a lone `_` in ANY spelling (bare, quoted, escaped or assigned:
 // `${x:_}`, `$a[_]`, `printf %d "_"`, `n=_`, `[ "_" -gt 0 ]` read it as arithmetic; any `_` not touching a letter, digit or `_` fails closed; `$_` and `${_}` are expansions of the last word, not a name, and are judged by LAST_WORD_RE). Each alternative is a literal, a lookaround or a one-class run, so the scan is linear.
 const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s;&|(){`])(?:typeset|declare|local)\s+-[A-Za-z]*i|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?<![$\p{L}\p{N}_]|\$\{)_(?![\p{L}\p{N}_])/u;
-// Items 5b/10 (guard false refusals): the line as the arithmetic gate reads it. The JavaScript of `node -e` / `-p` PROGRAM, when PROGRAM is the whole of one word, written at command position outside any quote (a
-// quote scan of what precedes it; a line with `$(`, a backtick or a heredoc before it is not read this way), is not shell code: in a SINGLE-quoted program `((` and a `let` word are no arithmetic, in a DOUBLE-quoted
+// Items 5b/10 (guard false refusals): the line as the arithmetic gate reads it. The JavaScript of `node -e` / `-p` PROGRAM, when PROGRAM is the whole of one word, written at command position with nothing before it
+// that can open a quote, a comment, an expansion or a heredoc (no quote, `#`, `$`, backslash, backtick or `<<`: `node -e …` first on the line, or after `cd /repo && `), is not shell code: in a SINGLE-quoted program `((` and a `let` word are no arithmetic, in a DOUBLE-quoted
 // program with no `$` and no backtick in it (so no expansion can run) a `((` is none. Only those two spellings are rewritten: `$((`, `$[`, a lone `_`, `((` / let in shell code, a program word with an
 // unquoted part and every other match of ARITH_CONTEXT are read as written.
 const INLINE_NODE_WORD = /(?<=^|[;&|(\n]\s*)node(?:js)?\s+(?:-e|-p|--eval|--print)\s+(?:'([^']*)'|"((?:[^"\\$`]|\\[^$`])*)")(?=\s|$|[;&|)])/g;
-function unquotedAt(text, end) {
-  let q = '';
-  for (let i = 0; i < end; i++) {
-    const ch = text[i];
-    if (q === "'") { if (ch === "'") q = ''; continue; }
-    if (ch === '\\') { i++; continue; }
-    if (q === '"') { if (ch === '"') q = ''; continue; }
-    if (ch === "'" || ch === '"') q = ch;
-  }
-  return q === '';
-}
 function arithView(raw) {
   return raw.replace(INLINE_NODE_WORD, (all, single, double, at) => {
     const before = raw.slice(0, at);
-    if (/\$\(|`|<<|\\|\$['"]/.test(before) || !unquotedAt(raw, at)) return all; // (a backslash, `$'` or `$"` before it: the quote scan does not know ANSI-C quoting or escapes, so the line is read as written)
+    if (/['"#$\\`]|<</.test(before)) return all; // (R1-B3 / R1-F1: a quote, a comment, an expansion, an escape or a heredoc anywhere before the word: a quote scan cannot tell where the shell is quoted once a comment, an ANSI-C quote, a nested "${…}" or an escape is in play, so the line is read as written)
     const head = all.slice(0, all.search(/['"]/));
     if (single !== undefined) return `${head}'${single.replace(/\((?=\()/g, '( ').replace(/(?<!\w)let(?=\s)/g, 'lXt')}'`;
     if (double.includes('\\')) return all;

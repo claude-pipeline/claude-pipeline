@@ -2349,6 +2349,24 @@ test('items 5b/10: an ANSI-C quote, a backslash or $" before a node -e word, and
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
+// R1-B3 + R1-F1 (#737): the same desync with two other triggers: a quote inside a shell comment (`# a'`), and a quote inside a double-quoted `${…}` (`"${x:-" ' "}"`, a nested double quote: the shell is unquoted after it, a scan
+// that ends the quote at the first `"` is not). Failure caught: the line is allowed, and the shell runs the planted `x` subscript as arithmetic. The gate rewrites a `((` only when nothing before the node word holds a quote, `#`, `$`,
+// a backslash, a backtick or a heredoc (a node -e first on the line, or after `cd /repo && `, still passes).
+test('R1-B3 / R1-F1: a quote in a comment or in a nested "${…}" before a node -e word leaves the arithmetic gate reading the line as written', () => {
+  for (const cmd of [
+    `# '\n: '; node -e '; x="path[\\$(rm .review/sta\\te.json)]"; ((x)); : '\n'\ncat .review/state.json`,
+    `: # a'\nx';node -e '((x))';'; cat .review/state.json`,
+    `x=path; : # a'\nx';node -e '((x))';'; cat .review/state.json`,
+    `: "\${x:-" ' "}" '; node -e '; x="a[\\$(touch SENT)]"; ((x)); : ' '; cat .review/state.json`,
+    `: "\${x:-" ' "}" '; node -e '; ((x)); : ' '; cat .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e 'console.log((require("./.review/state.json").x||[]).length)'`,
+    `cd /repo && node -e 'console.log(((require("./.review/state.json").x)||1))'`,
+    `echo ok; node -e 'console.log(((require("./.review/state.json").x)||1))'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
 // Item 7b (refused: `for i in 1 2 3 4; do out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540); echo "$out"; done`): an assignment whose whole value is one command substitution is judged as the
 // command inside it (the bare pipeline CLI call is allowed on its own); that command is still judged, and any other text beside it, a redirect or a variable the shell reads keep the refusal.
 test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a write inside the substitution, extra text, a redirect and PATH= stay refused', () => {
