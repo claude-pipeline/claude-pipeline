@@ -3584,7 +3584,10 @@ class Parser {
         argv.push(w.text);
       }
     }
-    return this.process(argv, env, seg, false);
+    const cmd = this.process(argv, env, seg, false);
+    // (a leading `coproc` was stripped above: its command runs in a background subshell, so it is wrapped for git-policy's bareExit just as `command` / `noglob` are)
+    if (cmd && words.slice(0, i).some((w) => w.text === 'coproc' && w.qa < 0)) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
+    return cmd;
   }
 
   // Replaces argv[0] by its backslash-preserving spelling when the word was a Windows path (C:\Git\git.exe).

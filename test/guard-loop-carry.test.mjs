@@ -342,6 +342,9 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
       [`cd back with 2>/dev/null || ${w} exit 1, then ;`, `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || ${w} exit 1; ${PB} origin HEAD`],
       [`cd back with 2>/dev/null || { echo; ${w} exit 1; }, then ;`, `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; ${w} exit 1; }; ${PB} origin HEAD`],
     ]),
+    // (R3-F1: `coproc exit 1` runs the exit in a background subshell (bash 3.2: not found): the keyword is stripped by the parser, so the wrapper mark has to be set there)
+    ['cd back with 2>/dev/null || coproc exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || coproc exit 1; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { echo; coproc exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; coproc exit 1; }; ${PB} origin HEAD`],
     // (R2-F2: a text with a loop reads no failure group, so only the settle step decides here)
     ['cd back with 2>/dev/null || env exit 1, then ; and a loop', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || env exit 1; ${PB} origin HEAD; for i in 1 2; do :; done`],
     ['cd back with 2>/dev/null || command exit 1, then ; and a loop', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || command exit 1; ${PB} origin HEAD; for i in 1 2; do :; done`],
@@ -670,6 +673,9 @@ test('D: a plain `|| exit` after a cd / switch in a loop body keeps it known for
     denies(`cd sub1 || ${w} exit 1; push; cd ..`, `for d in sub1 sub2; do cd sub1 || ${w} exit 1; ${H}; cd ..; done`, sub, DIRS);
     denies(`cd sub1 || ${w} exit 1; push; cd .., in a script`, RUN_SH, script('echo', `for d in sub1 sub2; do cd sub1 || ${w} exit 1; ${H}; cd ..; done`), DIRS);
   }
+  // (R3-F1: nor does `|| coproc exit 1`: the exit runs in a background subshell)
+  denies('cd sub1 || coproc exit 1; push; cd ..', `for d in sub1 sub2; do cd sub1 || coproc exit 1; ${H}; cd ..; done`, sub, DIRS);
+  denies('cd sub1 || coproc exit 1; push; cd .., in a script', RUN_SH, script('echo', `for d in sub1 sub2; do cd sub1 || coproc exit 1; ${H}; cd ..; done`), DIRS);
   // (the next iteration starts where the body ended)
   denies('next iteration starts in another repository', `for d in a b; do ${H}; cd /work/other || exit 1; done`, {}, DIRS);
   denies('next iteration starts on main', `for d in a b; do ${H}; git switch ${MAIN} || exit 1; done`, {}, DIRS);
