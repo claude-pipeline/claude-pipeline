@@ -332,6 +332,11 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['cd back with 2>/dev/null || echo, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || echo bad; ${PB} origin HEAD`],
     ['cd back with 2>/dev/null || true, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || true; ${PB} origin HEAD`],
     ['quiet pushd, then ;', `cd /work/other; pushd ${GIT_ROOT} >/dev/null; ${PB} origin HEAD; popd >/dev/null`],
+    // (R1-B1 / R1-F1: `env exit 1` runs in a child and leaves no shell, so it proves nothing about the failed redirection: the push runs from the old directory)
+    ['cd back with < /missing/input || env exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} < /missing/input || env exit 1; ${PB} origin HEAD`],
+    ['cd back with < /missing/input || { echo; env exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} < /missing/input || { echo no >&2; env exit 1; }; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || env exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || env exit 1; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { echo; env exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; env exit 1; }; ${PB} origin HEAD`],
   ]) {
     denies(what, line, {}, DIRS);
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);

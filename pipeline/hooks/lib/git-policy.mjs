@@ -3291,7 +3291,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       const op = own.sep === '|' ? ((deeper ? own.lead : own.pipeLead) ?? ';') : own.sep; // (a level's entry holds it as `lead`, a command as `pipeLead`: see emit)
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
-      if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
+      if (op === '||' && plainExit(c) && !(x.redir && c.spawn) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
         if (!deeper) return exits(x);
         // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
         // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
@@ -3592,7 +3592,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
-      const redirOnly = how === 'redir' && c.sep !== '&&';
+      // (a spawn-wrapped exit (`env exit 1`) leaves no shell: it proves nothing about the redirected move)
+      const redirOnly = how === 'redir' && c.sep !== '&&' && !cmds[exitOfGroup(i)]?.spawn;
       if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly), from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);
