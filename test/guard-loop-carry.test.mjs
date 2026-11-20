@@ -625,6 +625,38 @@ test('C: a branch switch in a directory the walk cannot name makes the tracked b
   allows('an unnamed directory, no branch move', `git switch agent/x; git -C ${TOP} status; ${H}`);
 });
 
+// D: in a loop body a cd / switch followed by a plain `|| exit 1` is proven (the exit leaves when the move failed), so the commands after it in the SAME body run where the cd went: `for d in …; do cd d || exit 1; git push origin HEAD;
+// cd ..; done` was refused (the next `;` forgot the move). The move is still unknown once the body is left (a break / continue before the cd skips it, a loop over no words), and the next iteration still starts where the body ended.
+// (The `|| { …; exit 1; }` group form is not read in a text with a loop: no shape events there; it stays refused, the deny rows below pin that it does not become an allow by accident.)
+test('D: a plain `|| exit` after a cd / switch in a loop body keeps it known for the rest of that body only', () => {
+  const sub = { 'sub1/x': '', 'sub2/x': '' };
+  const H = `${PB} origin HEAD`;
+  for (const [what, line] of [
+    ['cd sub1 || exit 1; push; cd ..', `for d in sub1 sub2; do cd sub1 || exit 1; ${H}; cd ..; done`],
+    ['switch agent/x || exit 1; push', `for b in a b; do git switch agent/x || exit 1; ${H}; done`],
+  ]) {
+    allows(what, line, sub);
+    allows(`${what}, in a script`, RUN_SH, script('echo', line));
+  }
+  // (start /work/other, a repository on main: a push judged where the body surely cd'd is /work/repo's (agent/x); one judged in the start directory is refused)
+  const at = (cmd) => evaluateGitCommand(cmd, {
+    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', { [`${GIT_ROOT}/.keep`]: '' }),
+  });
+  for (const [what, line] of [
+    ['break before the cd', `for d in a; do break; cd ${GIT_ROOT} || exit 1; echo hi; done; ${H}`],
+    ['continue before the cd, the group form', `for d in a; do [ -d x ] || continue; cd ${GIT_ROOT} || { echo no >&2; exit 1; }; done; ${H}`],
+    ['break before the cd, the group form', `for d in a; do break; cd ${GIT_ROOT} || { echo no >&2; exit 1; }; done; ${H}`],
+    ['a loop that may run zero times', `for d in $(ls); do cd ${GIT_ROOT} || exit 1; echo hi; done; ${H}`],
+  ]) {
+    const r = at(line);
+    assert.equal(r.decision, 'deny', `${what}: allowed`);
+    assert.match(r.reason, BRANCH, `${what}: ${r.reason}`);
+  }
+  // (the next iteration starts where the body ended)
+  denies('next iteration starts in another repository', `for d in a b; do ${H}; cd /work/other || exit 1; done`, {}, DIRS);
+  denies('next iteration starts on main', `for d in a b; do ${H}; git switch ${MAIN} || exit 1; done`, {}, DIRS);
+});
+
 // #569 pin (passes on main by design: the loop rule and #647 already hold it): an eval'd file that itself evals a file inside a literal loop does not hand its switch to the caller (the loop may have broken out first);
 // the same two files with no loop do (the switch is believed). Guards the loop-carry rule against a later refactor.
 test('#569: a switch made by a file eval\'d inside a literal loop in an eval\'d file is not handed to the caller', () => {
