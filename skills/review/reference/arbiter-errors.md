@@ -8,6 +8,7 @@ Old 2.4.
    exit 1 with `restartRequired` (through `P round codex` it is at `result.restartRequired` of its `step: "arbiter-needed"` JSON; the round is recorded, never discard or rerun it) (`stale-terminal` from `needed`, `stale-model` from `apply`; Fable round) ⇒ do NOT retry here and do NOT park: outcome `blocked`, with no `pipeline-blocked`
    label and no `needs-human`. Post the CLI's `advice` text (`P comment --pr N --kind blocked --reason "<advice>"`), with `merge.hold_command` in `P config` `P merge-hold --pr N --release --reason restart`,
    run the stop ritual, and tell the owner to restart the terminal (or update Claude Code / `pipeline model-floor reset`, as the advice says). After the restart: `P arbiter needed --round R` and the arbiter again.
+   Exit 2 `error: head-unavailable` (a judge round; this clone lacks the round's recorded `toHead`) ⇒ fetch that commit, then run `P arbiter needed --round R` again (nothing was written; never rerun `round codex` for a recorded round).
    Exit 1 `error: model-floor-busy` ⇒ run `P arbiter apply` once more after a minute (no new arbiter call). Exit 1 `unrecognised-fable`, `model-floor-unreadable` or
    `model-floor-unwritable` ⇒ no new Fable pass can fix it: do NOT re-run the arbiter; stop `blocked` exactly like the `restartRequired` stop, posting the CLI's `advice`.
    Any other exit 1 ⇒ the items are `needsHuman` (Fable round: run `needed` and the arbiter once more; failing twice ⇒ park, cause `arbiter:model-proof`).

@@ -61,6 +61,7 @@ export const meta = {
     '    the stop is saved as round.arbiter.failure {cause, advice, at}',
     '  a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner\'s and Claude\'s rulings are kept; an item the arbiter no longer needs is settled by the judge again',
     '  mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none',
+    '  mode dispute, a round whose recorded toHead this clone does not have: exit 2 {ok:false, error: head-unavailable} before anything is written (the excerpts are read at that commit); fetch the commit, then run needed again',
     '  start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman',
     'pipeline arbiter apply --round R [--pr N] [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  the proof is pinned to claude-fable- and to the round\'s STORED brief: agent `arbiter` at effort high (full; a round stored without a brief is full), agent `arbiter-fix` at effort medium or higher (fix-verify);',
@@ -507,7 +508,7 @@ async function neededLocked(values, n, root, ctx) {
       revParse(`${round.toHead}^{commit}`, { cwd: root });
     } catch (err) {
       if (!(err instanceof GitError)) throw err;
-      throw new Fail(EXIT.USAGE, { ok: false, error: 'head-unavailable', message: `round ${round.n} was reviewed at ${round.toHead.slice(0, 12)}, which this clone does not have: fetch it (or run codex-review for the round again)` });
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'head-unavailable', message: `round ${round.n} was reviewed at ${round.toHead.slice(0, 12)}, which this clone does not have: fetch that commit, then run \`arbiter needed\` again` });
     }
   }
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
