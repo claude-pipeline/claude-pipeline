@@ -1628,28 +1628,10 @@ function makeMatchers(ctx) {
   const HOME_LOOKUP = /\bHOME\b|\bUSERPROFILE\b|expanduser|homedir|Path\.home|Dir\.home|(?<![\w.\-])~(?=[/'"`\s)\]])/; // (case-sensitive: HOME is the variable, home is a path word)
   // (a quoted piece with an optional path tail, or the same glued by refVariants to a call/slash with no quote: Path.home()/.claude/projects/-repo)
   const HOME_CLAUDE_PIECE = /['"`]\/?\.claude[\w\-]*(?:\/|['"`])|(?<=[)\]\s])\/\.claude[\w\-]*\//i;
-  // Items 3/4 (guard false refusals): a config root named in program text is no reference when what follows is a literal path to a file in scripts/ or in a project folder of projects/ (<root>/scripts/usage.mjs,
-  // <root>/projects/-repo/report.md): neither is a protected entry nor holds one. Whole names only (no trailing slash: the rest may be built by `+`), no run-time part ($ * ? [ { backslash), no `..` piece
-  // anywhere in the text (it could climb back into pipeline/), a last name that is no .jsonl (a transcript; refVariants also reads `'a', 'b'` as a/b), projects/ only with a project folder and a name in it, and
-  // never through a memory folder (a program text that names one stays refused, #128). Any other name below the root (CLAUDE.md, docs, a protected entry), the bare root and the bare folders stay a reference, as on main.
-  const DOTDOT_PIECE = /(?:^|[/'"`\s,(+[])\.\.(?=$|[/'"`\s,)+\]])/;
-  const belowRootFree = (v, end) => {
-    const mm = /^\/([^\s'"`;|&<>()$*?[\]{}\\]*)([^]?)/.exec(v.slice(end, end + 4096));
-    if (!mm || /[$*?[{\\]/.test(mm[2]) || DOTDOT_PIECE.test(v)) return false;
-    const segs = mm[1].split('/');
-    const last = segs[segs.length - 1];
-    if (segs.some((x) => x === '' || x === '.' || x.toLowerCase() === 'memory') || /\.jsonl$/i.test(last)) return false;
-    const top = segs[0].toLowerCase();
-    return (top === 'scripts' && segs.length >= 2) || (top === 'projects' && segs.length >= 3);
-  };
-  const rootNamed = (res, v) => res.some((re) => {
-    for (const mm of v.matchAll(new RegExp(re.source, re.flags.includes('g') ? re.flags : `${re.flags}g`))) if (!belowRootFree(v, mm.index + mm[0].length)) return true;
-    return false;
-  });
-  const homeClaudeText = (v) => rootNamed(homeClaudeRes, v) || (HOME_CLAUDE_PIECE.test(v) && HOME_LOOKUP.test(v));
+  const homeClaudeText = (v) => homeClaudeRes.some((re) => re.test(v)) || (HOME_CLAUDE_PIECE.test(v) && HOME_LOOKUP.test(v));
   const envTranscriptText = (v) => {
     const call = /[()[\]]/.test(v);
-    if (call && (v.includes('CLAUDE_CONFIG_DIR') || rootNamed(rootWordText, v) || homeClaudeText(v))) return true;
+    if (call && (v.includes('CLAUDE_CONFIG_DIR') || rootWordText.some((re) => re.test(v)) || homeClaudeText(v))) return true;
     if (!/(?<![\w])projects(?![\w])/i.test(v) || !/\.jsonl(?![\w])/i.test(v)) return false;
     return v.includes('CLAUDE_CONFIG_DIR') || /(?<![\w.\-])\.claude/i.test(v) || rootWordText.some((re) => re.test(v));
   };

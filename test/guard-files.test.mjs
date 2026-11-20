@@ -2193,63 +2193,6 @@ test('#472 click state: asks/*.pending, asks/*.settled, consumed/*.json and roun
   assert.equal(file('Write', { file_path: '~/.claude/pipeline-state/owner-go/round-claims/0123456789abcdef.2.json', content: '{}' }), 'deny');
 });
 
-// ---- guard false-refusal batch, PR B (files guard) --------------------------------------------------------------------------------------------------------
-// A program file run by `node p.mjs` whose text is `text` (the file system is faked: only /repo/p.mjs exists).
-const progOpts = (text, extra = {}) => ({ existsSync: (p) => p === '/repo/p.mjs', readText: (p) => (p === '/repo/p.mjs' ? text : null), ...extra });
-const runProg = (text, extra) => bash('node p.mjs', progOpts(text, extra));
-
-// Items 3/4 (refused: `node ~/.claude/scripts/memory-health.mjs --quiet`, whose text names its own report under ~/.claude/projects): program text that names a file BELOW ~/.claude which is neither a protected entry nor a
-// directory that holds one (scripts/, a report in projects/<project>/) is no reference to a protected file, writes included.
-test('items 3/4: program text writing a file under ~/.claude/scripts or ~/.claude/projects/<project>/ is allowed; the protected names stay refused', () => {
-  for (const text of [
-    "const R = `${HOME}/.claude/projects/-Users-u/memory-health.md`; fs.writeFileSync(R, 'x')",
-    "fs.writeFileSync('/home/u/.claude/projects/x/report.md', 'x')",
-    "fs.writeFileSync('/home/u/.claude/scripts/usage.json', JSON.stringify(o))",
-    "fs.writeFileSync(process.env.HOME + '/.claude/scripts/usage.json', 'x')",
-    "const f = '~/.claude/scripts/a.mjs'; fs.appendFileSync(f, 'x')",
-  ]) assert.equal(runProg(text), 'allow', text);
-  // deny controls: the same shapes naming what main protects, a dot-dot back into it, a name only known at run time, a transcript, the bare directory
-  for (const text of [
-    "fs.writeFileSync('/home/u/.claude/pipeline/hooks/guard-git.mjs', 'x')",
-    "fs.writeFileSync('/home/u/.claude/skills/review/SKILL.md', 'x')",
-    "fs.writeFileSync('/home/u/.claude/agents/judge.md', 'x')",
-    "fs.writeFileSync('/home/u/.claude/settings.json', '{}')",
-    "fs.writeFileSync('/home/u/.claude/hooks/x.mjs', 'x')",
-    "fs.writeFileSync('/home/u/.claude/pipeline-state/owner-go/x.json', 'x')",
-    "fs.writeFileSync('/home/u/.claude/projects/../pipeline/x.mjs', 'x')",
-    "fs.writeFileSync(path.join('/home/u/.claude/scripts/a.md', '../../pipeline/x.mjs'), 'x')",
-    "fs.writeFileSync('/home/u/.claude/scripts/' + name, 'x')",
-    "fs.writeFileSync(`/home/u/.claude/scripts/${name}`, 'x')",
-    "fs.writeFileSync('/home/u/.claude/projects/x/a.jsonl', 'x')",
-    "fs.writeFileSync('/home/u/.claude/projects/x/' + id + '.jsonl', 'x')",
-    "fs.writeFileSync('/home/u/.claude/projects', 'x')",
-    "fs.writeFileSync('/home/u/.claude', 'x')",
-    "fs.writeFileSync('~/.claude/skills', 'x')",
-  ]) assert.equal(runProg(text), 'deny', text);
-});
-
-// Items 3/4, command words: `cp ~/.claude/scripts/a.mjs /tmp/b.mjs` and `sed -i '' … ~/.claude/scripts/a.mjs` are not writes to a protected file; the protected entries and the bare directory still are.
-test('items 3/4: cp / sed -i / mv of a ~/.claude/scripts file are allowed; the same on ~/.claude/pipeline, skills, agents, settings.json, the bare ~/.claude are refused', () => {
-  for (const cmd of [
-    'cp ~/.claude/scripts/a.mjs /tmp/b.mjs',
-    "sed -i '' 's/a/b/' ~/.claude/scripts/a.mjs",
-    "sed -i '' 's#~/.claude/scripts/a#b#' /home/u/notes/note.md",
-    'cp /tmp/a.mjs ~/.claude/scripts/b.mjs',
-    'cp /tmp/a.md ~/.claude/projects/-Users-u/memory/x.md',
-  ]) assert.equal(bash(cmd), 'allow', cmd);
-  for (const cmd of [
-    'cp /tmp/a.mjs ~/.claude/pipeline/x.mjs',
-    "sed -i '' 's/a/b/' ~/.claude/pipeline/hooks/guard-git.mjs",
-    'cp /tmp/a.md ~/.claude/skills/review/SKILL.md',
-    'cp /tmp/a.md ~/.claude/agents/judge.md',
-    'cp /tmp/a.json ~/.claude/settings.json',
-    'cp /tmp/a ~/.claude',
-    'rm -r ~/.claude',
-    'mv /tmp/a ~/.claude',
-    'cp /tmp/a ~/.claude/projects/../pipeline/x',
-  ]) assert.equal(bash(cmd), 'deny', cmd);
-});
-
 // Item 5 (refused: `node -e "const s=require('./.review/state.json');console.log(Object.keys(s))"`, 141 times in a month): an inline node program is judged like a program file:
 // naming a protected path is a refusal only next to a write (or child_process); reading and printing it is not a write.
 test('item 5: inline node -e / -p that only reads a review file is allowed; a write, a child process or a redirect on the same names stays refused', () => {
