@@ -178,6 +178,20 @@ test('R2-F2 review.threat_models: the template and the config defaults say the C
   assert.match(cfg, /Codex prompt[^\n]*\n?[^\n]*on a Fable-lane round only/);
 });
 
+// Failure caught: the arbiter agent files never learn the same-on-base scope (the model never emits it, so the bar is dead text), or the skill / template / README forget the key and an owner cannot find it.
+test('A2 review.regression_only_paths: both arbiter agents, the skill, its arbiter reference, the README and the template name the bar and its scope; SKILL.md still fits', () => {
+  for (const doc of ['agents/arbiter.md', 'agents/arbiter-fix.md']) {
+    const text = read(doc);
+    assert.match(text, /A "Regression-only bar" section works the same way for the files it\s+lists: a finding the same on the merge base is FOLLOW-UP with `scope`/, doc);
+    assert.match(text, /"same-on-base"/, doc);
+  }
+  assert.match(skillMd(), /the input carries `review\.threat_models` and `regression_only_paths` from the trusted/);
+  assert.match(read('skills/review/reference/arbiter-errors.md'), /`regression_only_paths`/);
+  assert.match(read('README.md'), /\| `review\.regression_only_paths` \| `\[\]` \|/);
+  assert.match(read('pipeline/templates/pipeline.yml'), /# regression_only_paths: \[\]/);
+  assert.ok(Buffer.byteLength(skillMd()) <= 12 * 1024, 'SKILL.md stays within 12 KB');
+});
+
 test('the review skill says one closing keyword per issue (GitHub links only the first number of `Closes #1, #2`)', () => {
   assert.match(skillMd(), /one keyword per issue, `Closes #1\. Closes #2\.`/);
   const skill = ref('build');

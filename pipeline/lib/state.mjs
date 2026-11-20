@@ -32,14 +32,19 @@ const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 // and would quarantine the owner's step on `state show`.
 // Version 8 (round discipline 2, PR B): a round's `ownerGrant` carries `askVariant` (the owner's grant came from a click on a new-variant round dialog): an older pipeline cannot re-verify such a grant (it does
 // not know the variant), so it must refuse the state loudly instead of misreading it.
+// Version 9: a final carries `sameOnBase` (an arbiter dismissal on a review.regression_only_paths file, #559 A2): a pipeline of version 8 would not hold the review back until its FOLLOW-UP is filed,
+// and would leave it out of the owner's bound items.
 // A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
-export const SUPPORTED_STATE_VERSION = 8;
+export const SUPPORTED_STATE_VERSION = 9;
 export const STATE_VERSION_CLAUDE = 2;
 export const STATE_VERSION_DEFERRAL = 3;
 export const STATE_VERSION_SUBSTITUTE = 4;
 export const STATE_VERSION_OUT_OF_MODEL = 5;
 export const STATE_VERSION_POST_MAX = 6;
 export const STATE_VERSION_OWNER_DEFERRAL = 7;
+export const STATE_VERSION_SAME_ON_BASE = 9;
+// Does any final of the state carry the same-on-base mark (a cached copy too)? Then the writer lifts the state to STATE_VERSION_SAME_ON_BASE (and only then).
+export const stateNeedsSameOnBaseVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => typeof i?.final?.sameOnBase === 'string' && i.final.sameOnBase !== ''));
 // Does any final of the state carry the owner-deferral mark (the original and a cached copy alike)? Then the writer lifts the state to STATE_VERSION_OWNER_DEFERRAL (and only then).
 export const stateNeedsOwnerDeferralVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => isPlainObject(i?.final?.ownerDeferral)));
 export const STATE_VERSION_CLICK_DIALOG = 8;
@@ -61,9 +66,10 @@ export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute
 // Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
 export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
 const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
-// The lowest version that may hold this state, the HIGHEST any feature in it needs: 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
+// The lowest version that may hold this state, the HIGHEST any feature in it needs: 9 when a final carries the same-on-base mark, 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
 // 4 when it holds a substitute round / second review or a governor / budget decision, else 1.
 export function requiredStateVersion(state) {
+  if (stateNeedsSameOnBaseVersion(state)) return STATE_VERSION_SAME_ON_BASE;
   if (stateNeedsClickDialogVersion(state)) return STATE_VERSION_CLICK_DIALOG;
   if (stateNeedsOwnerDeferralVersion(state)) return STATE_VERSION_OWNER_DEFERRAL;
   if (stateNeedsPostMaxVersion(state)) return STATE_VERSION_POST_MAX;

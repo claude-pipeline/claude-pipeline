@@ -420,7 +420,7 @@ test('repo config: every file in pipeline/commands/ is matched by risk.high_risk
 
 test('repo config: the commands audit lists the decision-making commands (merge-hold, job, update-branch, redraft, protect, summary, queue-sweep)', () => {
   const list = raw.risk.high_risk_paths;
-  for (const c of ['merge-hold', 'job', 'update-branch', 'redraft', 'protect', 'summary', 'queue-sweep', 'repo-move', 'followups']) {
+  for (const c of ['merge-hold', 'job', 'update-branch', 'redraft', 'protect', 'summary', 'queue-sweep', 'repo-move', 'followups', 'db-refs', 'live-db']) {
     assert.ok(list.includes(`pipeline/commands/${c}.mjs`), `pipeline/commands/${c}.mjs decides a hold, a guard, a protection, a record or an owner-only check: it must stay listed`);
   }
 });
