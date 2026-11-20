@@ -868,4 +868,7 @@ test('R1-B3: a compound after `coproc` is the child whole: a cd in it moves the 
   accepted('coproc if cd main; then :; fi; P (the parent stays on repo)', `coproc if cd /work/main; then :; fi; ${PH}`, '/work/repo');
   accepted('coproc if cd repo && P; then :; fi from main', `coproc if cd /work/repo && ${PH}; then :; fi`);
   refused('coproc if cd repo; then :; fi; P from main (the parent stays in main)', `coproc if cd /work/repo; then :; fi; ${PH}`, IN_MAIN);
+  // (R2-S1: after `coproc` an `if` / `while` is the construct, never a name: the group in its condition is a plain group, so the cd in it stays for the push in the child)
+  refused('coproc if { cd main; }; then P; fi', `coproc if { cd /work/main; }; then ${PH}; fi`, DIRS, '/work/repo');
+  refused('coproc while { cd main; }; do P; break; done', `coproc while { cd /work/main; }; do ${PH}; break; done`, DIRS, '/work/repo');
 });

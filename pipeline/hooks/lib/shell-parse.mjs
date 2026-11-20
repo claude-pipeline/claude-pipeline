@@ -3364,12 +3364,12 @@ class Parser {
     } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; this.ctx.loops = loops; this.ctx.up = up; this.ctx.upHold = upHold; this.ctx.lead = lead; }
   }
 
-  // R1-B2 / R1-B3: the construct just opened (a `{` group, an if, a loop) is the child a `coproc` right before it starts (`coproc [NAME] CONSTRUCT`): its level carries `co`, so what it does is judged inside it and the parent goes on
+  // R1-B2 / R1-B3: the construct just opened (a `{` group, an if, a loop) is the child a `coproc` right before it starts (`coproc CONSTRUCT`; a `coproc NAME {` never opens a group here, and a word after `coproc` that opens a construct is that construct, never a name): its level carries `co`, so what it does is judged inside it and the parent goes on
   // where it was, as after a subshell. Not one the words before it only contain (`coproc { { cd d; }; }`: the inner group).
   coChild(seg) {
     const w = seg.words;
     const co = (x) => x?.text === 'coproc' && x.qa < 0;
-    if (co(w[w.length - 1]) || (co(w[w.length - 2]) && /^[A-Za-z_]\w*$/.test(w[w.length - 1].text))) this.ctx.up[this.ctx.up.length - 1].co = true;
+    if (co(w[w.length - 1])) this.ctx.up[this.ctx.up.length - 1].co = true;
   }
 
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
