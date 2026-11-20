@@ -289,3 +289,4 @@ full record.
 - 2026-11-20 · #667 · Guard: read the repo's pipeline config once per check (fixes 'took too long'); 3 more false refusals · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 597 runs (161 high)
 - 2026-11-20 · #638 · Floor A: low-only fixes accepted at the round limit go to follow-up issues unapplied (cap-low deferral) · risk high · rounds 5 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 601 runs (161 high)
 - 2026-11-20 · #668 · Refuse to publish over a newer-format triage comment (#612) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 603 runs (162 high)
+- 2026-11-20 · #676 · Pipeline fixes: synthetic-grant image note, low-confidence confirm, cost double-count, ci-wait --wait-others, publish retry · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 607 runs (163 high)
