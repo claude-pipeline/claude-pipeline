@@ -282,11 +282,10 @@ function sbTokenHead(text) {
   return first >= 0 && words.slice(first + 1).some(possibleHead);
 }
 // B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
-// (R6-F1: a word with whitespace is never a glob -- quoted words are not globbed -- and one that must consume more characters than the longest head, a long path or URL operand, can match none)
+// (R6-F1: a pattern that must consume more characters than the longest head, a long path, URL or SQL operand, can match none; whitespace is not a reason to skip it: `[' 'd]b` is one glob word that can name a file `db`)
 // (R6-F2: the cost of a line is its word count times a per-word cost the 8-metacharacter cap bounds; a 190 kB line of the worst shapes measured 0.8 to 0.9 s, and findLiveDbCli is given no deadline to poll)
 function globMatchesHead(w) {
   if (!/[*?[]/.test(w)) return false;
-  if (/\s/.test(w)) return false;
   // R5-F1: runs of `*` are one star, and a pattern with many metacharacters is not matched at all (each `*` becomes `.*`, which backtracks past the hook timeout on a literal no head contains): fail closed
   w = w.replace(/\*+/g, '*');
   if ((w.match(/[*?[]/g) ?? []).length > 8) return true;

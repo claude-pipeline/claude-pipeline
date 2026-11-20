@@ -613,7 +613,8 @@ test('a 190 kB line of star-and-question-mark words is denied fast, not by the h
     const ms = Date.now() - t0;
     assert.equal(v.decision, 'deny');
     assert.doesNotMatch(v.reason ?? '', /took too long/);
-    assert.ok(ms < 2000, `took ${ms} ms`);
+    // ~0.8 s idle, up to 3.4 s at load 34: the bound is a third of the 15 s hook limit; the backtracking this guards against took 6 s to never
+    assert.ok(ms < 5000, `took ${ms} ms`);
   }
 });
 
@@ -630,6 +631,9 @@ test('a long glob-bearing operand after a supabase name is not read as a subcomm
   }
   // (a short glob that can be a head stays refused)
   assert.match(verdict("ssh supabase 'd?'").reason ?? '', /not a subcommand the guard knows/);
+  // (a quoted space inside a bracket class is still one glob word the shell expands: `[' 'd]b` can name a file `db`)
+  assert.equal(verdict("x supabase d? push").decision, 'deny');
+  assert.equal(verdict("x supabase [' 'd]b push").decision, 'deny');
 });
 
 test('an unknown subcommand names itself', () => {
