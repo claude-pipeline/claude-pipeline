@@ -78,6 +78,13 @@ test('the changing subcommands refuse inside Claude Code (CLAUDECODE=1 and a Cla
   assert.equal(runOwnerCli(home, args, { CLAUDECODE: '1' }).exitCode, 0);
 });
 
+// R1-B2: the owner helper holds the admin switch, so a home that only LOOKS like it is under the temp folder (a `..` behind a missing folder) must be refused, not written to
+test('owner helper: a home that escapes the temp folder through a missing folder is refused, and nothing is written there', () => {
+  const escape = `${realpathSync(tmpdir())}/db-refs-missing-${process.pid}/../../db-refs-escape-${process.pid}`;
+  assert.throws(() => runOwnerCli(escape, ['server', 'add', 'x']), /exited 3.*refusing a home outside/s);
+  assert.equal(existsSync(dbRefsFile(escape)), false);
+});
+
 test('usage errors: a bad ref, name or repo, an option on the wrong subcommand, an unknown subcommand', async (t) => {
   const home = scratchHome(t);
   for (const a of [

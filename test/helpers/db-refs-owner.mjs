@@ -21,8 +21,9 @@ export function seedRegistry(home, { refs = [], servers = [] } = {}) {
 
 // `pipeline db-refs <args>` as the owner, in a child process; -> { exitCode, output }.
 export function runOwnerCli(home, args, env = {}) {
-  const childEnv = { ...process.env, ...env, [SWITCH]: '1' };
-  delete childEnv[SESSION];
+  const childEnv = { ...process.env };
+  delete childEnv[SESSION]; // (the inherited marker goes; one the caller passes on purpose stays: a test of the admin switch inside a session)
+  Object.assign(childEnv, env, { [SWITCH]: '1' });
   const r = spawnSync(process.execPath, [CHILD, JSON.stringify({ home, args })], { env: childEnv, encoding: 'utf8' });
   if (r.status !== 0) throw new Error(`db-refs owner child exited ${r.status}: ${r.stderr}`);
   return JSON.parse(r.stdout);
