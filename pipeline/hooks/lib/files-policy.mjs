@@ -4020,8 +4020,30 @@ const INTERP_PROGRAM = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|p
 // Program text that names a protected path next to something that writes, moves or deletes.
 const WRITE_WORDS = String.raw`write|append|unlink|\brm\b|rmSync|rmtree|rmdir|rename|copy|\bcp(?:Sync)?\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|extractall|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install`;
 const WRITE_HINT = new RegExp(`${WRITE_WORDS}|open\\s*\\(`, 'i');
-// Item 5: what WRITE_HINT cannot see in an inline node program (it is no file the guard can read twice): a child process, openSync(…), code or a name built at run time (eval, Function, a computed call, string pieces joined by +)
-const INLINE_NODE_RISK = /child_process|open\w*\s*\(|\beval\b|\bFunction\b|\]\s*\(|['"`]\s*\+|\+\s*['"`]/;
+// Item 5: an inline node -e / -p program that can only READ is described by an ALLOWLIST (no write-hint blocklist can name everything node can do): no run-time part, no word that reaches the process or loads code, every call on a short read-only list,
+// `require(` with one literal module. A program that is anything else keeps the rule for any text that names a protected file.
+const INLINE_NODE_WORDS = /[`$]|[)\]]\s*\(|\?\.\s*\(|\b(?:new|import|process|Reflect|globalThis|binding|eval|Function|child_process)\b/;
+const INLINE_NODE_BARE = new Set(['require', 'readFileSync', 'existsSync', 'readdirSync', 'String', 'Number', 'Boolean', 'if', 'for', 'while', 'switch', 'catch']);
+const INLINE_NODE_QUALIFIED = new Set(['JSON.parse', 'JSON.stringify', 'console.log', 'console.error', 'Object.keys', 'Object.values', 'Object.entries', 'Array.isArray']);
+const INLINE_NODE_METHODS = new Set(['readFileSync', 'existsSync', 'readdirSync', 'map', 'filter', 'find', 'some', 'every', 'forEach', 'reduce', 'sort', 'flat', 'join', 'split', 'slice', 'includes', 'startsWith', 'endsWith', 'trim', 'match', 'test', 'toFixed', 'padStart', 'padEnd']);
+function inlineNodeReadOnly(prog) {
+  if (INLINE_NODE_WORDS.test(prog) || WRITE_HINT.test(prog.replace(/[<>=]/g, ' '))) return false; // (a write name is refused even as a callback: .map(fs.unlinkSync))
+  if (/\brequire\b(?!\s*\(\s*(?:'[^'\\]*'|"[^"\\]*")\s*\))/.test(prog)) return false; // (every `require` is a call with one plain string)
+  for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'([^'\\]*)'|"([^"\\]*)")\s*\)/g)) {
+    const mod = r[1] ?? r[2];
+    if (!(['fs', 'node:fs', 'path', 'node:path'].includes(mod) || mod.endsWith('.json'))) return false;
+  }
+  for (const r of prog.matchAll(/([\p{L}_][\p{L}\p{N}_]*(?:\s*\.\s*[\p{L}_][\p{L}\p{N}_]*)*)\s*\(/gu)) {
+    const before = prog.slice(0, r.index).trimEnd();
+    if (before.endsWith('.')) { // (a method after something: `).readFileSync(`, `/x/.test(`, `?.(` is no allowed shape)
+      if (before.endsWith('?.') || !INLINE_NODE_METHODS.has(r[1].split(/\s*\.\s*/).at(-1))) return false;
+      continue;
+    }
+    const name = r[1].replace(/\s+/g, '');
+    if (name.includes('.') ? !(INLINE_NODE_QUALIFIED.has(name) || /^Math\.[A-Za-z]+$/.test(name) || INLINE_NODE_METHODS.has(name.split('.').at(-1))) : !INLINE_NODE_BARE.has(name)) return false;
+  }
+  return true;
+}
 
 // `bash f.sh`, `source f`, `./f`, `node f.mjs`, `python f.py`: the file is read (up to 1 MB) and judged like the same text
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
@@ -6090,12 +6112,12 @@ function evaluateBashForFilesFrame(command, opts) {
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
   const harmless = assignmentOnlyHarmless(cmds, ctx, ctx.frames.indexOf(frame) === 0);
-  // Item 5 (guard false refusals): `node -e / -p PROGRAM` is judged like a program file (judgeFoundScript): the protected name is a refusal only next to a write word (WRITE_HINT) or child_process.
-  // Not this route (judged as before): another option, a redirect, an assignment value that names a protected path, a run-time part ($ or a backtick) in the words, or an argument word that names one.
-  const readsInlineNode = (c) => /^node(?:js)?$/.test(baseOf(c.argv[0] ?? '')) && /^(?:-e|-p|--eval|--print)$/.test(c.argv[1] ?? '') && c.argv.length >= 3
-    && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && !Object.values(c.env ?? {}).some((v) => m.rawHit(v, dirs))
-    && !c.argv.slice(1).some((w) => /[$`]/.test(w)) && !c.argv.slice(3).some((w) => tokenHit(w)) && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
-    && !((m.rawHit(c.argv[2], dirs, true) || m.pathHit(c.argv[2], dirs, true)) && (WRITE_HINT.test(c.argv[2]) || INLINE_NODE_RISK.test(c.argv[2])));
+  // Item 5 (guard false refusals): `node -e / -p PROGRAM` that can only read is not judged as a command that may write (an ALLOWLIST, inlineNodeReadOnly). The command is exactly `node -e|-p PROGRAM`: no other option, argument, `--`, env-prefix
+  // assignment, wrapper (env, command, npx ...: the raw text starts with node) or write redirect, no NODE_OPTIONS anywhere on the line. Anything else is judged as before.
+  const readsInlineNode = (c) => /^node$/.test(c.argv[0] ?? '') && /^(?:-e|-p)$/.test(c.argv[1] ?? '') && c.argv.length === 3 && /^node\s/.test(c.raw.trimStart())
+    && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && Object.keys(c.env ?? {}).length === 0 && !/NODE_OPTIONS/.test(raw)
+    && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
+    && inlineNodeReadOnly(c.argv[2]);
   // Item 7b (guard false refusals): `out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait …)`: an assignment that gives plain lower-case names (no shell variable the shell reads: PATH, IFS, the zsh `path` family ...) nothing but ONE whole
   // command substitution is judged as the command inside it, which is a command of the line like any other (judged above and below: `out=$(rm …)` is still refused as rm). A value with any other text, a redirect, and every other name keep the rule above.
   const TIED_NAMES = /^(?:path|cdpath|fpath|manpath|mailpath|module_path|watch|fignore|histchars|psvar|argv|status|pipestatus|prompt|signals|options|commands|aliases|functions|parameters|keymaps|widgets)$/;

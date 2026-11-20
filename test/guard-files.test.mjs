@@ -2217,6 +2217,37 @@ test('item 5: inline node -e / -p that only reads a review file is allowed; a wr
     `node -e "require('fs')['wri'+'teFileSync']('.review/state.json','{}')"`,
     `node -e "eval(process.argv[1]);require('./.review/state.json')" 'x'`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
+  // The exemption is an allowlist: a hard link (then a write through the other name), utimes / chown / mkdtemp, a worker, a watcher, a destructured or Reflect call, process internals, a preload option, NODE_OPTIONS, a trailing argument, another launcher word
+  // and a wrapper keep main's rule. Failure caught: `node -e "require('fs').linkSync('.review/state.json','/tmp/l')"` allowed, then `echo x > /tmp/l` rewrites the protected file.
+  for (const cmd of [
+    `node -e "require('fs').linkSync('.review/state.json','/tmp/l')"`,
+    `node -e "require('fs').link('.review/state.json','/tmp/l',()=>{})"`,
+    `node -e "require('fs').promises.link('.review/state.json','/tmp/l')"`,
+    `node -e "require('fs').utimesSync('.review/state.json',1,1)"`,
+    `node -e "require('fs').chownSync('.review/state.json',1,1)"`,
+    `node -e "require('fs').mkdtempSync('.review/state.json')"`,
+    `node -e "process.execve('/bin/sh',['sh','-c','x'],{});require('./.review/state.json')"`,
+    `node -e "new Worker('x',{eval:true});require('./.review/state.json')"`,
+    `node -e "require('fs').watch('.review/state.json',()=>{})"`,
+    `node -e "const {linkSync}=require('fs');linkSync('.review/state.json','/tmp/l')"`,
+    `node -e "Reflect.apply(require('fs').linkSync,0,['.review/state.json','/tmp/l'])"`,
+    `node -e "process.binding('fs');require('./.review/state.json')"`,
+    `node -r ./evil.js -e "console.log(require('./.review/state.json'))"`,
+    `node --require=./evil.js -e "console.log(require('./.review/state.json'))"`,
+    `node --import ./evil.mjs -e "console.log(require('./.review/state.json'))"`,
+    `NODE_OPTIONS='--require /repo/evil.js' node -e "console.log(require('./.review/state.json'))"`,
+    `export NODE_OPTIONS='--require /repo/evil.js'; node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('./.review/state.json'))" -- x`,
+    `node -e "console.log(require('./.review/state.json'))" evil.js`,
+    `nodejs -e "console.log(require('./.review/state.json'))"`,
+    `env node -e "console.log(require('./.review/state.json'))"`,
+    `command node -e "console.log(require('./.review/state.json'))"`,
+    `npx node -e "console.log(require('./.review/state.json'))"`,
+    `A=1 node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('child_process').spawnSync('id'), require('./.review/state.json'))"`,
+    `node -e "console.log(require('./evil.js'), require('./.review/state.json'))"`,
+    `node -e "[1].map(require('fs').unlinkSync);require('./.review/state.json')"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
 // Items 5b/10 (refused: `node -e 'const r=require("./.review/risk.json");console.log((r.items||[]).length)'` and the double-quoted twin on .review/round-18/codex.json): the arithmetic gate (#266 R7-F3) must not read
