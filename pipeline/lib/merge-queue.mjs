@@ -472,6 +472,8 @@ export function reconcileNow({ gh, root, pr, head, log = () => {} }) {
 
 // ---- watchQueue --------------------------------------------------------------------------------------------------------------------
 
+export const HEARTBEAT_MS = 240_000; // one progress line this often while queued (the polls stay pollMs apart; the checks are read once per beat)
+export const STALL_MS = 30 * 60_000; // one warning per this long while nothing about the entry changes
 const CONFIRM_TRIES = 6; // after a dequeue: look this many times (pollMs apart, at most 5 s) for the entry to be gone
 
 // Watches one queued entry until it ends or `budgetMs` runs out. Each poll = reconcile + `blockers(view)`; the default blockers is
@@ -484,25 +486,75 @@ const CONFIRM_TRIES = 6; // after a dequeue: look this many times (pollMs apart,
 // The head compared with GitHub's is the LIVE record's head when there is one, else `head` (#230): a watch resumed from a worktree at another commit
 // than the one queued still sees the entry's removal or its confirmed dequeue and notes it on the record, instead of ending as `head-moved`. Nothing
 // is ever re-queued from the other head: mayRequeue compares the record's head with the caller's.
-export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000, blockers = null, now = Date.now, sleep = defaultSleep, log = () => {} }) {
+export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000, heartbeatMs = HEARTBEAT_MS, stallMs = STALL_MS, blockers = null, now = Date.now, sleep = defaultSleep, log = () => {} }) {
   const check = blockers ?? waitBlockers(gh, { base: null });
-  const deadline = now() + budgetMs;
+  const startedAt = now();
+  const deadline = startedAt + budgetMs;
+  let entry = null;
+  let lastBeat = startedAt;
+  let signature = null; // what the last beat saw; the stall clock runs while it stays the same
+  let stallFrom = startedAt;
   const watched = () => {
     const rec = root === undefined ? null : readQueueRecord(root, pr);
     return rec !== null && rec.terminal === null ? rec.head : head;
   };
   let position = null;
+  let seen = false; // an entry was seen at least once
+  let pollFailed = false; // the latest poll threw, so `entry` is the last known state
   for (;;) {
     let outcome = null;
+    pollFailed = false;
     try {
       outcome = await pollOnce();
     } catch (err) {
+      pollFailed = true;
       log(`PR #${pr}: queue poll failed, retrying (${String(err?.message ?? err).split('\n')[0]})`);
     }
     if (outcome) return finish(outcome);
+    heartbeat();
     const left = deadline - now();
-    if (left <= 0) return { state: 'still-queued', position };
+    if (left <= 0) return finish({ state: 'still-queued', position });
     await sleep(Math.min(pollMs, left));
+  }
+
+  function minutesSince(t) {
+    return Math.max(0, Math.floor((now() - t) / 60_000));
+  }
+
+  // Every heartbeatMs of elapsed time: one line saying where the entry is and what its merge-group commit's checks say (read here and only here: once per
+  // beat, never per poll). While the same picture holds for stallMs, one extra warning per window. A failed read says so and the wait goes on.
+  function heartbeat() {
+    if (!seen || now() - lastBeat < heartbeatMs) return;
+    lastBeat = now();
+    if (entry === null) { // it was queued once, but GitHub no longer shows an entry: say so rather than repeat the old position
+      log(`PR #${pr} not visible in the merge queue${pollFailed ? ' (the latest poll failed)' : ''}`);
+      return;
+    }
+    try {
+      const since = Date.parse(entry.enqueuedAt);
+      const mins = minutesSince(Number.isNaN(since) ? startedAt : since);
+      let summary = { text: 'group not built yet', signature: '' };
+      if (entry.headCommit) {
+        let read;
+        try {
+          read = checkSummary(gh, entry.headCommit);
+        } catch {
+          read = { text: 'checks unreadable', signature: 'unreadable' };
+        }
+        summary = { text: `group commit ${entry.headCommit.slice(0, 12)}: ${read.text}`, signature: read.signature };
+      }
+      log(`PR #${pr} queued ${mins} min: ${entry.state}, position ${entry.position}, ${summary.text}${pollFailed ? ' (last known state: the latest poll failed)' : ''}`);
+      const sig = [entry.state, entry.position, entry.headCommit ?? '', summary.signature].join('|');
+      if (sig !== signature) {
+        signature = sig;
+        stallFrom = now();
+      } else if (now() - stallFrom >= stallMs) {
+        stallFrom = now();
+        log(`PR #${pr}: the queue has not moved in ${Math.round(stallMs / 60_000)} min — ${summary.text}`);
+      }
+    } catch (err) {
+      log(`PR #${pr}: queue progress could not be summarised (${String(err?.message ?? err).split('\n')[0]})`);
+    }
   }
 
   // -> null (keep watching) or a result for finish()
@@ -512,8 +564,14 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     if (r.kind === 'closed') return { state: 'closed' };
     if (r.kind === 'head-moved') return { state: 'head-moved' };
     if (r.kind === 'removed') return { state: 'removed', removal: r.removal };
-    if (r.kind === 'not-queued') return null; // not visible (yet): keep looking until the budget ends
+    if (r.kind === 'not-queued') { // not visible (yet): keep looking until the budget ends
+      entry = null;
+      position = null;
+      return null;
+    }
     position = r.entry.position;
+    entry = r.entry;
+    seen = true;
     const view = gh.prView(pr, ['state', 'labels', ...(check.fields ?? [])]);
     const problems = await check(view);
     if (problems.length === 0) return null;
@@ -546,13 +604,19 @@ export async function watchQueue({ gh, root, pr, head, budgetMs, pollMs = 90_000
     const rec = root === undefined ? null : readQueueRecord(root, pr);
     if (out.state === 'merged') {
       if (rec) endRecord(root, pr, 'merged');
+      log(`PR #${pr} merged as ${String(out.mergeSha ?? 'an unreported commit').slice(0, 12)}`);
       return out;
     }
     if (out.state === 'removed') {
       if (rec) noteRemoval(root, pr, out.removal);
+      log(`PR #${pr} was removed from the merge queue (reason ${out.removal?.reason ?? 'unknown'})`);
       return out;
     }
+    if (out.state === 'closed') log(`PR #${pr} was closed`);
+    if (out.state === 'head-moved') log(`PR #${pr}: the head moved, so the queued commit is no longer the PR's`);
+    if (out.state === 'still-queued') log(`PR #${pr} still queued after ${minutesSince(startedAt)} min — re-run P merge to keep watching`);
     if (out.state === 'blocked') {
+      log(`PR #${pr} blocked (${(out.problems ?? []).join('; ')})${out.dequeued === true ? ', dequeued' : ', still queued: the dequeue is not confirmed'}`);
       const { view, ...result } = out;
       // The record ends here only when the dequeue is CONFIRMED (else the entry may be live and the sweep must find the record again) and no lifted
       // needs-human label is owed back: none was lifted, or it is on the PR again (a new hold).
@@ -590,6 +654,39 @@ export function failingChecksOn(gh, sha) {
     out.push(`could not read the checks of ${sha.slice(0, 12)} (${msgOf(err)})`);
   }
   return [...new Set(out)];
+}
+
+// Where the checks of a queue (merge-group) commit stand, for the progress lines: check runs and commit statuses (the queue posts Test integrity /
+// Hard-stop scan / Cross-model review as statuses), the latest of each name. -> { text, signature }; throws when the checks cannot be read (the caller says so).
+export function checkSummary(gh, sha) {
+  const latest = new Map(); // name -> 'passed' | 'pending' | 'failed'
+  const runs = new Map();
+  for (const c of gh.checkRunsOf(sha)) {
+    const prev = runs.get(c?.name);
+    if (prev === undefined || Number(c?.id) > Number(prev.id)) runs.set(c?.name, c);
+  }
+  for (const [name, c] of runs) {
+    if (c.conclusion === null || c.conclusion === undefined) latest.set(name, 'pending'); // (no conclusion yet: queued or running)
+    else if (FAILING_CONCLUSIONS.includes(c.conclusion)) latest.set(name, 'failed');
+    else latest.set(name, 'passed');
+  }
+  const seen = new Set();
+  for (const s of gh.statusesOf(sha)) { // newest first
+    if (seen.has(s?.context)) continue;
+    seen.add(s?.context);
+    const state = ['failure', 'error'].includes(s.state) ? 'failed' : s.state === 'success' ? 'passed' : 'pending';
+    // a check run and a status of one name are separate results (failingChecksOn reports both): on a collision the worse one stands
+    const worse = (a, b) => ['failed', 'pending', 'passed'].find((v) => v === a || v === b);
+    latest.set(s.context, latest.has(s.context) ? worse(latest.get(s.context), state) : state);
+  }
+  const names = (want) => [...latest].filter(([, v]) => v === want).map(([k]) => k).sort();
+  const [passed, pending, failed] = [names('passed'), names('pending'), names('failed')];
+  const list = (a) => (a.length > 8 ? `${a.slice(0, 8).join(', ')} +${a.length - 8} more` : a.join(', '));
+  const detail = [pending.length > 0 ? `pending: ${list(pending)}` : null, failed.length > 0 ? `failed: ${list(failed)}` : null].filter(Boolean).join('; ');
+  return {
+    text: `checks ${passed.length} passed / ${pending.length} pending / ${failed.length} failed${detail ? ` (${detail})` : ''}`,
+    signature: [...latest].map(([k, v]) => `${k}=${v}`).sort().join(','),
+  };
 }
 
 // The hold as a later re-queue must present it to the owner-go approval check ({ id, login, at }); null when the record owns none.

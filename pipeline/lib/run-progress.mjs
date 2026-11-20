@@ -55,8 +55,9 @@ const stampResumed = ({ host, now, head }) => ({ at: new Date(now).toISOString()
 //  - `firstRead`: the caller's OWN earlier read of the comment, for a caller that builds its record without baseRecordFor (`P summary`, `P comment --kind summary`):
 //    when it was invalid the record is stamped here exactly as baseRecordFor would have, so a stale writer that PATCHed an ordinary record in between does not
 //    leave the run unmarked and without an event.
-// The fresh read also supplies the kept sections.
-export function writeRunRecord(gh, pr, { record, sections, host = hostname(), now = Date.now(), skipResumedEvent = false, firstRead = null }) {
+// The fresh read also supplies the kept sections. `retry`: the summary write waits out a rate limit (the comment, summary and checkpoint commands opt in;
+// the run recorder never does, so merge, update-branch and cost never sleep).
+export function writeRunRecord(gh, pr, { record, sections, host = hostname(), now = Date.now(), skipResumedEvent = false, firstRead = null, retry = false }) {
   const fresh = readSummaryComment(gh, pr);
   if (fresh.status === 'unsupported') throw new Error(UNSUPPORTED);
   let out = record;
@@ -69,7 +70,7 @@ export function writeRunRecord(gh, pr, { record, sections, host = hostname(), no
     }
   }
   if (out.resumed && !skipResumedEvent && !(fresh.status === 'ok' && fresh.record.resumed)) postResumedEvent(gh, pr, out.resumed);
-  return { ...writeSummaryComment(gh, pr, { record: out, sections, existing: fresh }), warnings };
+  return { ...writeSummaryComment(gh, pr, { record: out, sections, existing: fresh, retry }), warnings };
 }
 
 // The append-only evidence that this run was resumed: one new comment, never edited. Throws when it cannot be posted. The event id is built from

@@ -10,7 +10,7 @@ import { EXIT } from './cli.mjs';
 import { DEFAULTS, fill } from './config.mjs';
 import { GATE_FILE, GATE_MAX_AGE_MS, PR_FIELDS, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, preMergeProblems, readReviewJson, substituteRouteProblem, waitBlockers } from './finalgate.mjs';
 import { classifyMergeCommand, commandTail } from './merge-cleanup.mjs';
-import { QueueRecordUnreadable, adoptHeadMoved, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, predatesQueueMessage, queueCatchUpState, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
+import { HEARTBEAT_MS, STALL_MS, QueueRecordUnreadable, adoptHeadMoved, beginAttempt, confirmAttempt, endRecord, failingChecksOn, mayRequeue, noteRemoval, openRecord, predatesQueueMessage, queueCatchUpState, queueRulesOf, queueWaitMs, readQueueRecord, reconcile, restoreHoldLabel, watchQueue } from './merge-queue.mjs';
 import { RESTORE_NOTE } from './hold.mjs';
 import { headSha } from './git.mjs';
 import { hashBranch } from './risk.mjs';
@@ -23,7 +23,8 @@ const CONFIRM_MS = 60_000; // GitHub shows the entry within this long of an acce
 const OUTPUT_LINES = 20;
 
 // Test switches (they can only shorten a wait, like PIPELINE_MERGE_WAIT_MS): PIPELINE_QUEUE_POLL_MS (watch poll; production 90 s, the shared
-// GitHub API budget), PIPELINE_QUEUE_CONFIRM_MS / PIPELINE_QUEUE_CONFIRM_POLL_MS, PIPELINE_QUEUE_WAIT_MS (the watch budget).
+// GitHub API budget), PIPELINE_QUEUE_CONFIRM_MS / PIPELINE_QUEUE_CONFIRM_POLL_MS, PIPELINE_QUEUE_WAIT_MS (the watch budget),
+// PIPELINE_QUEUE_HEARTBEAT_MS / PIPELINE_QUEUE_STALL_MS (the progress line and the "not moved" warning; production 4 min / 30 min, shortened only).
 export function queueTiming(env = {}) {
   const num = (key, min) => {
     const n = Number(env[key]);
@@ -34,6 +35,8 @@ export function queueTiming(env = {}) {
     confirmMs: Math.min(num('PIPELINE_QUEUE_CONFIRM_MS', 0) ?? CONFIRM_MS, CONFIRM_MS),
     confirmPollMs: num('PIPELINE_QUEUE_CONFIRM_POLL_MS', 1) ?? 5000,
     waitCapMs: num('PIPELINE_QUEUE_WAIT_MS', 0),
+    heartbeatMs: Math.min(num('PIPELINE_QUEUE_HEARTBEAT_MS', 1) ?? HEARTBEAT_MS, HEARTBEAT_MS),
+    stallMs: Math.min(num('PIPELINE_QUEUE_STALL_MS', 1) ?? STALL_MS, STALL_MS),
   };
 }
 
@@ -216,6 +219,7 @@ export function createQueueRoute({
 
   const removedRefusal = async (removal, why) => {
     const failing = failingChecksOn(gh, removal?.beforeCommit);
+    log(`PR #${pr}: not re-queued${why ? ` (${why.replace(/^not re-queued: /, '')})` : requeued > 0 ? ' (the one automatic re-queue was already used)' : ''}`);
     const holdFields = await terminal('removed');
     const reason = removal?.reason ?? 'unknown';
     return refusal('queue-removed', [`PR #${pr} was removed from the merge queue (reason ${reason})${requeued > 0 ? ' after one automatic re-queue' : ''}${failing.length > 0 ? `; failing: ${failing.join(', ')}` : ''}${why ? `; ${why}` : ''}`], {
@@ -462,7 +466,7 @@ export function createQueueRoute({
           if (confirmed.done) return confirmed.done;
         }
         enqueueNow = true;
-        const w = await watchQueue({ gh, root, pr, head, budgetMs, pollMs: timing.pollMs, blockers: waitBlockers(gh, { base: null }), now, sleep, log });
+        const w = await watchQueue({ gh, root, pr, head, budgetMs, pollMs: timing.pollMs, heartbeatMs: timing.heartbeatMs, stallMs: timing.stallMs, blockers: waitBlockers(gh, { base: null }), now, sleep, log });
         switch (w.state) {
           case 'merged': return mergedOut(w.mergeSha, w.warning ? { warning: w.warning } : {});
           case 'still-queued':
@@ -482,6 +486,7 @@ export function createQueueRoute({
                 return again.error === 'blocked' ? refuse('blocked', again.reasons, fields({ queued: false, removal: removed.output.removal })) : removed;
               }
               requeued = 1;
+              log(`PR #${pr}: re-queuing it once (the group's checks removed it)`);
               continue;
             }
             // (a watch resumed from a worktree at another head than the queued one follows the record's head and is never re-queued from here: #230. A removal that

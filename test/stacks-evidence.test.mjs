@@ -12,7 +12,7 @@ import path from 'node:path';
 import { createGitHub } from '../pipeline/lib/github.mjs';
 import { BRANCH_PRS_QUERY } from '../pipeline/lib/worktree-prune/prs.mjs';
 import {
-  resolveProbeBins, connections, processRefs, cwdInside, consumerWorktrees, prStates, transcriptRefs, memoryRefs, expandTranscriptDirs, ownerQuiet,
+  resolveProbeBins, connections, processRefs, cwdInside, consumerWorktrees, prStates, transcriptRefs, memoryRefs, expandTranscriptDirs, ownerQuiet, transcriptCountWhy,
 } from '../pipeline/lib/stacks/evidence.mjs';
 
 const posixOnly = { skip: process.platform === 'win32' && 'POSIX only' };
@@ -839,6 +839,21 @@ test('ownerQuiet: no transcript, two transcripts of the id, a bad session id, an
   mkdirSync(other);
   writeFileSync(path.join(other, `${SID}.jsonl`), `${startup}\n`);
   assert.match(verdictOf(none.run()), /^unknown: .*more than one/);
+});
+
+test('ownerQuiet: the unknown reason says plainly NONE found, or MORE THAN ONE and how many', () => {
+  const none = oqWorld([startup]);
+  const missing = '11111111-2222-4333-8444-555555555555';
+  assert.equal(verdictOf(none.run({ sessionId: missing })), `unknown: no transcript for session ${missing}: none found (0 files) under the transcript folders`);
+  for (const name of ['proj2', 'proj3']) {
+    mkdirSync(path.join(none.dirs, name));
+    writeFileSync(path.join(none.dirs, name, `${SID}.jsonl`), `${startup}\n`);
+  }
+  const why = verdictOf(none.run());
+  assert.match(why, /^unknown: more than one transcript for session .*: 3 different files found/);
+  assert.doesNotMatch(why, /no transcript|none found/);
+  assert.equal(transcriptCountWhy(SID, 1), null);
+  assert.match(transcriptCountWhy(SID, 2), /2 different files found/);
 });
 
 test('ownerQuiet: an unreadable subagents directory is unknown; a missing one is fine', () => {

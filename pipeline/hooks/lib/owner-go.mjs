@@ -55,6 +55,16 @@ export { accountHome };
 
 export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
 
+// #190.3b: the owner copies an answer out of a terminal and the prompt glyph comes with it ("❯ R4-B1: reject", "> merge"). answerBody is the words every answer parser reads: the prompt
+// trimmed, with at most ONE leading glyph from ❯ › > $ removed when at least one space follows it, and only on a single-line prompt. `>merge` and `$5 …` keep their first character, two glyphs
+// leave one (so the parser refuses it), a glyph mid-line is never touched, and the words after the glyph must still be the whole answer. promptProvenance still proves the owner typed the
+// entry, and the glyph adds no word, so it grants no authority the bare words did not have. Callers: parseApproval, parseRoundGrant, rulingsIn and the PAIRS_ONLY nudge sites. The stored
+// prompt and the --owner-quote comparison stay verbatim (the record is the audit trail); a length cap applies to the body, after the strip.
+export const answerBody = (s) => {
+  const t = String(s ?? '').trim();
+  return /[\r\n]/.test(t) ? t : t.replace(/^[❯›>$][ \t ]+/, '').trim();
+};
+
 // Why (#472): readRecords settles pending clicks (owner-go-click.mjs settlePendingClicks) unless the caller says `settle: false` (the read-only paths: the merge dry run's gate, click replay).
 // `settle: true` forces it. Otherwise the environment switch PIPELINE_CLICK_SETTLE=off, which the test runner and the test helpers set, turns it off, so a test can never settle the owner's real
 // pending clicks. Already recorded clicks still count: the switch only stops pending clicks from becoming records through the readers. Strict lookups still see unresolved round clicks, so
@@ -68,7 +78,7 @@ const FILLER = /^(?:and|it|both|all|them|these|those|please|pls|now|go|ok|okay|t
 // A prompt that approves: "merge", "merge #58", "merge 1318 1319", "Merge it.", "merge a1b2c3d4e5f6". Anything else is not an
 // approval: "do not merge", "merge?", "merge later", "merge after CI", "why merge". Returns null or { prs, shas }.
 export function parseApproval(prompt) {
-  const t = String(prompt ?? '').trim();
+  const t = answerBody(prompt);
   const m = /^merge(?![A-Za-z0-9_-])([\s\S]*)$/i.exec(t);
   if (!m) return null;
   const rest = m[1];
@@ -305,6 +315,11 @@ const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource
 // set (a value this list does not know stays invisible, fail closed) or an entrypoint other than "cli" (a headless sdk-cli is synthetic already, so that is an unknown future one).
 const isSet = (v) => v !== undefined && v !== null;
 const unplacedProvenance = (e) => isSet(e.promptSource) || isSet(e.origin) || isSet(e.turnOrigin) || (isSet(e.entrypoint) && e.entrypoint !== 'cli');
+// #253, NOT SUPPORTED: a pre-provenance transcript (Claude Code older than 2.1.258: no prompt carries promptSource, origin, entrypoint or turnOrigin) has nothing to say who wrote a prompt, so
+// every one of its prompts is an unplaced note below, and the chain walk of invisibleNote ends at the first prompt, whose parentUuid (the SessionStart attachment, or an entry older than the tail
+// window) resolves to no prompt: all of them are hidden and no merge, extra-round or ruling request binds. That is deliberate and fails closed: "no provenance field" must never become authority
+// (a hidden headless run is the case it would let through), and no machine here runs such a client. The readers do not exempt such a file; the owner is asked again after upgrading
+// (promptProvenance's legacy branch for a stored record predates this and is unchanged). Pinned by test/owner-go-visible-turns.test.mjs (#253).
 const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
@@ -319,17 +334,30 @@ const invisibleTurn = (e) => {
 // (invisible), and so does a chain that ends at a non-prompt root (e.g. the SessionStart attachment above the /clear caveat and command notes: they sit before the first owner prompt and carry no
 // assistant text, so what they mute is never an ask; pinned by R6-F1); only an entry with no parentUuid at all (a legacy transcript) leaves its own fields to decide (visible); a chain of notes
 // resolves transitively, a cycle fails closed.
-function invisibleNote(entries, parent, first) {
+// #246: a visibleSynthetic turn (a task notice, a peer or plugin message: system + cli) is no exception. Its own fields say the interactive UI renders it, but a headless process that was
+// started under an invisible turn (an sdk prompt) can write one under ITS prompt, and nothing of that is on the owner's screen. So it follows parent[] like an unplaced note: to a typed owner
+// prompt (or any other visible boundary): visible; to an invisible turn: invisible; and ancestry that does not resolve (a parent outside the window, a duplicate uuid, a cycle, a chain that ends
+// at a non-prompt root such as a SessionStart attachment with no typed prompt behind it) fails closed. Compaction and `--resume` need nothing here: resolve() in originsOf already steps over
+// a compact_boundary / hidden summary by logicalParentUuid, and a resumed session continues the SAME chain through its SessionStart attachments (probed on 2.1.3xx transcripts), so both reach
+// the typed prompt behind them. An entry with no parentUuid at all (not even null) leaves its own fields to decide, as an unplaced note does. The walk keeps a visited set and `memo` (index ->
+// verdict, shared across the calls of one lastReply), so n chained notes cost O(n), not O(n^2).
+function invisibleNote(entries, parent, first, memo = new Map()) {
+  const path = [];
   const seen = new Set();
-  for (let i = first; ; ) {
+  let verdict;
+  for (let i = first; verdict === undefined; ) {
+    if (memo.has(i)) { verdict = memo.get(i); break; }
     const e = entries[i];
-    if (invisibleTurn(e)) return true;
-    if (!unplacedNote(e)) return false; // the owner's prompt, a visibleSynthetic turn or a plain boundary of its own: its own fields said so
-    if (typeof e.parentUuid !== 'string') return false;
-    if (seen.has(i) || parent[i] < 0) return true; // a cycle, or a parent outside the window
+    path.push(i);
     seen.add(i);
-    i = parent[i];
+    if (invisibleTurn(e)) verdict = true;
+    else if (!unplacedNote(e) && !visibleSynthetic(e)) verdict = false; // the owner's prompt, or a plain boundary of its own: its own fields said so
+    else if (typeof e.parentUuid !== 'string') verdict = false;
+    else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
+    else i = parent[i];
   }
+  for (const i of path) memo.set(i, verdict);
+  return verdict;
 }
 
 // The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
@@ -518,7 +546,8 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
 }
 function replyOf(entries, { prompt, skipSynthetic = false } = {}) {
   const { origin, parent } = originsOf(entries);
-  const hidden = (i) => invisibleNote(entries, parent, i);
+  const verdicts = new Map(); // memoised hidden(i), shared by every chain walk (#246)
+  const hidden = (i) => invisibleNote(entries, parent, i, verdicts);
   // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
   const turns = [];
   const turnAt = new Map(); // prompt entry index -> turn
@@ -569,13 +598,14 @@ function replyOf(entries, { prompt, skipSynthetic = false } = {}) {
         else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
       }
     }
-    if (visibleSynthetic(t.e) && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
+    const visible = visibleSynthetic(t.e) && !hidden(t.pos); // (#246: a system turn written under an invisible one is on nobody's screen)
+    if (visible && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
     else if (anything) {
       const before = slots[slots.length - 1];
       if (before && before.lastPos < t.pos) before.voided = true; // (a slot still being written when this turn opened was not replaced by it: interleaved, not later)
       // R3-F1: ... but a VISIBLE synthetic turn's text or surfaced ask is on the owner's screen wherever its prompt opened: when it lands after the selected slot's last shown entry (checked below),
       // that request is stale. An invisible turn (sdk, non-human origin, unknown source) is never shown, so the interleaved exemption above stays for it.
-      if (visibleSynthetic(t.e)) shownSkips.push(t.shownPos);
+      if (visible) shownSkips.push(t.shownPos);
     }
   }
   // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
@@ -763,7 +793,7 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
 const promptRefs = (input) => ({
   prompt_id: typeof input?.prompt_id === 'string' && input.prompt_id !== '' ? input.prompt_id : null,
   transcript_path: typeof input?.transcript_path === 'string' && input.transcript_path !== '' ? input.transcript_path : null,
-  prompt: typeof input?.prompt === 'string' && input.prompt.length <= RULING_PROMPT_MAX ? input.prompt : null,
+  prompt: typeof input?.prompt === 'string' && answerBody(input.prompt).length <= RULING_PROMPT_MAX ? input.prompt : null, // (the cap is on the words after a pasted glyph, #190.3b)
 });
 
 // Appends one record to <home>/.claude/pipeline-state/owner-go/<session>.jsonl; the record, or null when it cannot be written safely.
@@ -790,7 +820,7 @@ export const RULING_PROMPT_MAX = 1000; // a ruling answer is only decisions (rul
 // The binding a ruling answer makes: the ruling line the text ENDS with (presentedRuling) when the answer is a plausible one (non-empty, at most RULING_PROMPT_MAX; what it decides per item is
 // rulingsIn's job at use time). Pure, shared with the click recorder (#261). Returns { repo, pr, ids, content } or null.
 export function rulingBinding(answer, shownText) {
-  if (typeof answer !== 'string' || answer.trim() === '' || answer.length > RULING_PROMPT_MAX) return null;
+  if (typeof answer !== 'string' || answer.trim() === '' || answerBody(answer).length > RULING_PROMPT_MAX) return null;
   return presentedRuling(shownText);
 }
 
@@ -800,7 +830,7 @@ export function recordRuling(input, { home = accountHome(), now = Date.now } = {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
-    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || answerBody(input.prompt).length > RULING_PROMPT_MAX) return null; // (#190.3b: the cap applies after the glyph strip, as the nudges' does)
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's words)
     if (queuedAnswer(input)) return null; // (#191 B1)
     const reply = lastReply(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true });
@@ -827,7 +857,7 @@ export function rulingNudge(input) {
   try {
     if (notOwnerPrompt(input) || !SESSION_RE.test(String(input?.session_id ?? ''))) return null;
     const answer = input?.prompt;
-    if (typeof answer !== 'string' || answer.length > RULING_PROMPT_MAX || !PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim())) return null;
+    if (typeof answer !== 'string' || answerBody(answer).length > RULING_PROMPT_MAX || !PAIRS_ONLY.test(answerBody(answer).replace(/\s+/g, ' ').trim())) return null;
     return notOwnerWords(input, String(input?.transcript_path ?? '')) ? null : RULING_NUDGE;
   } catch {
     return null;
@@ -850,10 +880,11 @@ export function queuedNudge(input) {
     if (notOwnerPrompt(input)) return null;
     const answer = input?.prompt;
     if (typeof answer !== 'string') return null;
+    const body = answerBody(answer); // (#190.3b: the caps apply to the words after a pasted glyph)
     const readsAsAnswer = parseApproval(answer) !== null
       || parseGo(answer) !== null
-      || (answer.length <= ROUND_GRANT_PROMPT_MAX && (parseRoundGrant(answer) !== null || parsePastRoundGrant(answer) !== null))
-      || (answer.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim()));
+      || (body.length <= ROUND_GRANT_PROMPT_MAX && (parseRoundGrant(answer) !== null || parsePastRoundGrant(answer) !== null))
+      || (body.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(body.replace(/\s+/g, ' ').trim()));
     if (!readsAsAnswer || notOwnerWords(input, String(input?.transcript_path ?? ''))) return null;
     return queuedAnswer(input) ? QUEUED_NUDGE : null;
   } catch {
@@ -1167,7 +1198,7 @@ const SEP = '(?:\\s*[,;.]\\s*|\\s+and\\s+|\\s+)';
 const PAIR = `${ITEM}\\s*[:=–—-]?\\s*${DECISION}`;
 const PAIRS_ONLY = new RegExp(`^${PAIR}(?:${SEP}${PAIR})*[.!]?$`, 'i');
 export function rulingsIn(answer, askedIds) {
-  const a = String(answer ?? '').replace(/\s+/g, ' ').trim();
+  const a = answerBody(answer).replace(/\s+/g, ' ').trim();
   const asked = (askedIds ?? []).map((x) => String(x).toUpperCase());
   const out = new Map();
   if (!PAIRS_ONLY.test(a)) return out;
@@ -1271,7 +1302,7 @@ export function parsePastRoundGrant(prompt) {
 }
 
 function parseRoundWords(prompt, opener) {
-  const t = String(prompt ?? '').trim();
+  const t = answerBody(prompt); // (#190.3b: a pasted prompt glyph is stripped)
   const m = opener.exec(t);
   if (!m) return null;
   const rest = m[1];
@@ -1290,7 +1321,7 @@ function parseRoundWords(prompt, opener) {
 // The binding an "extra round" answer makes (pure, shared with the click recorder, #261): the request line the text ENDS with, when the answer is a grant (parseRoundGrant, at most
 // ROUND_GRANT_PROMPT_MAX) and every PR or round it names is the line's. Returns { pr, k, head, repo } or null.
 export function roundBinding(answer, shownText, { parse = parseRoundGrant, present = presentedRoundRequest } = {}) {
-  if (typeof answer !== 'string' || answer.trim() === '' || answer.length > ROUND_GRANT_PROMPT_MAX) return null;
+  if (typeof answer !== 'string' || answer.trim() === '' || answerBody(answer).length > ROUND_GRANT_PROMPT_MAX) return null;
   const g = parse(answer);
   if (!g) return null;
   const asked = present(shownText);
@@ -1315,7 +1346,7 @@ function recordRoundKind(input, { home = accountHome(), now = Date.now } = {}, {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
-    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > ROUND_GRANT_PROMPT_MAX) return null;
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || answerBody(input.prompt).length > ROUND_GRANT_PROMPT_MAX) return null; // (#190.3b: after the glyph strip)
     if (!parse(input.prompt)) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
     if (queuedAnswer(input)) return null; // (#191 B1)
@@ -1339,7 +1370,7 @@ const isPastRoundRecord = (r) => isGrantRecord(r, 'past-round');
 function isGrantRecord(r, kind) {
   return r?.kind === kind && typeof r.session === 'string' && typeof r.ts === 'string' && typeof r.prompt_sha256 === 'string'
     && repoKey(r.repo) === r.repo && Number.isInteger(r.pr) && Number.isInteger(r.k) && /^[0-9a-f]{12,40}$/.test(String(r.head))
-    && typeof r.prompt === 'string' && r.prompt.trim() !== '' && r.prompt.length <= ROUND_GRANT_PROMPT_MAX
+    && typeof r.prompt === 'string' && r.prompt.trim() !== '' && answerBody(r.prompt).length <= ROUND_GRANT_PROMPT_MAX
     && createHash('sha256').update(r.prompt).digest('hex') === r.prompt_sha256;
 }
 

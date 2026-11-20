@@ -623,3 +623,126 @@ test('R2-F4: openRecord upgrades a live record\'s approval.ownerRequired to true
   }
   assert.equal(beginAttempt(root, 7, HEAD, { ...APPROVAL, ownerRequired: false }, IDENT).approval.ownerRequired, true, 'nor by beginAttempt');
 });
+
+// ---- watchQueue progress lines (#244) -------------------------------------------------------------------------------------------------
+// `P merge` used to print nothing for the whole wait (a 100-minute queue ran silently). The watch now speaks every heartbeatMs, warns once per stall window and says
+// how it ended. The clock starts at 09:00:00Z, so an entry enqueued at 09:00:00Z has been queued as long as the watch has run.
+
+const T0 = '2026-11-09T09:00:00Z';
+const GROUP = 'f'.repeat(40);
+const queuedAt = (over = {}) => (position = 2) => st({ inQueue: true, entry: { id: 'MQE_1', state: 'AWAITING_CHECKS', position, enqueuedAt: T0, headCommit: GROUP, ...over } });
+// A gh whose group commit has checks to read; `reads` counts every check read (runs + statuses).
+const withChecks = (base, { runs = [], statuses = [], fail = false } = {}) => {
+  const reads = { runs: 0, statuses: 0 };
+  return Object.assign(base, {
+    reads,
+    checkRunsOf: () => { reads.runs += 1; if (fail) throw new Error('rate limited'); return runs; },
+    statusesOf: () => { reads.statuses += 1; return statuses; },
+  });
+};
+const logger = (c) => {
+  const lines = [];
+  return { lines, log: (l) => lines.push({ at: c.t - Date.parse(T0), l }) };
+};
+const MIN = 60_000;
+
+test('watchQueue progress: a 100-minute wait prints a heartbeat every ~4 min (not silence), reads the checks once per beat, and nothing between beats', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(2)] }), { runs: [{ id: 1, name: 'ci', status: 'in_progress', conclusion: null }] });
+  const r = await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 100 * MIN, pollMs: 90_000, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.equal(r.state, 'still-queued');
+  const beats = lines.filter((x) => /^PR #7 queued \d+ min:/.test(x.l));
+  assert.ok(beats.length >= 20 && beats.length <= 25, `about 25 beats over 100 min, got ${beats.length}`);
+  for (let i = 1; i < beats.length; i += 1) assert.ok(beats[i].at - beats[i - 1].at >= 240_000, 'no beat sooner than heartbeatMs after the last');
+  assert.equal(gh.reads.runs, beats.length, 'the checks are read once per beat, never per poll (polls: ~67)');
+  assert.match(beats[0].l, /^PR #7 queued 4 min: AWAITING_CHECKS, position 2, group commit f{12}: checks 0 passed \/ 1 pending \/ 0 failed \(pending: ci\)$/);
+  assert.equal(lines.length, beats.length + lines.filter((x) => /not moved/.test(x.l)).length + 1, 'only beats, stall warnings and the one exit line');
+});
+
+test('watchQueue progress: before GitHub builds the group commit the line says "group not built yet" and reads no checks', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt({ headCommit: null, state: 'QUEUED' })(3)] }));
+  await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 10 * MIN, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.match(lines[0].l, /^PR #7 queued 4 min: QUEUED, position 3, group not built yet$/);
+  assert.equal(gh.reads.runs + gh.reads.statuses, 0);
+});
+
+test('watchQueue progress: the check summary uses the latest run per name and the newest status per context, and names what is pending / failed', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(1)] }), {
+    runs: [
+      { id: 1, name: 'ci', status: 'completed', conclusion: 'failure' }, // rerun below passed: the latest counts
+      { id: 2, name: 'ci', status: 'completed', conclusion: 'success' },
+      { id: 3, name: 'e2e', status: 'queued', conclusion: null },
+      { id: 4, name: 'lint', status: 'completed', conclusion: 'timed_out' },
+    ],
+    statuses: [{ context: 'Test integrity', state: 'success' }, { context: 'Hard-stop scan', state: 'pending' }, { context: 'Test integrity', state: 'failure' }],
+  });
+  await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 5 * MIN, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.match(lines[0].l, /checks 2 passed \/ 2 pending \/ 1 failed \(pending: Hard-stop scan, e2e; failed: lint\)$/);
+});
+
+test('watchQueue progress: a failed check run is not hidden by a passing status of the same name', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(1)] }), {
+    runs: [{ id: 1, name: 'ci', status: 'completed', conclusion: 'failure' }],
+    statuses: [{ context: 'ci', state: 'success' }],
+  });
+  await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 5 * MIN, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.match(lines[0].l, /checks 0 passed \/ 0 pending \/ 1 failed \(failed: ci\)$/);
+});
+
+test('watchQueue progress: once GitHub stops showing the entry the beat says so, not the old position', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(2), () => st()] }), { runs: [{ id: 1, name: 'ci', status: 'in_progress', conclusion: null }] });
+  const r = await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 20 * MIN, pollMs: 90_000, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.equal(r.position, null, 'the result does not carry the last position GitHub showed');
+  const beats = lines.map((x) => x.l).filter((l) => /^PR #7 (queued|not visible)/.test(l));
+  assert.ok(beats.length >= 2, beats.join('\n'));
+  assert.ok(beats.every((l) => l === 'PR #7 not visible in the merge queue'), beats.join('\n'));
+});
+
+test('watchQueue progress: one stall warning per window while nothing moves, and a move resets the clock', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  // position 2 for the first 45 min, then 1: without the reset the warnings would land at ~36, ~67 and ~99 min
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(c.t - Date.parse(T0) < 45 * MIN ? 2 : 1)] }), { runs: [{ id: 1, name: 'ci', status: 'in_progress' }] });
+  await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 100 * MIN, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  const stalls = lines.filter((x) => /the queue has not moved in 30 min — group commit f{12}: checks 0 passed \/ 1 pending \/ 0 failed \(pending: ci\)$/.test(x.l));
+  assert.equal(lines.filter((x) => /not moved/.test(x.l)).length, 2, 'every stall line has the 30-min text and the check summary');
+  assert.equal(stalls.length, 2);
+  assert.ok(stalls[0].at < 45 * MIN, 'the first warning comes before the position moved');
+  assert.ok(stalls[1].at >= 45 * MIN + 30 * MIN, 'the second needs a whole new window after the move');
+});
+
+test('watchQueue progress: a check read that fails says "checks unreadable", keeps the signature stable and the wait goes on to the merge', async () => {
+  const c = clock();
+  const { lines, log } = logger(c);
+  const gh = withChecks(stubGh({ states: [() => queuedAt()(1), () => queuedAt()(1), () => queuedAt()(1), () => queuedAt()(1), merged] }), { fail: true });
+  const r = await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: 60 * MIN, pollMs: 90_000, blockers: noBlockers, now: c.now, sleep: c.sleep, log });
+  assert.equal(r.state, 'merged', 'an unreadable summary never ends or throws out of the wait');
+  assert.ok(lines.some((x) => /group commit f{12}: checks unreadable$/.test(x.l)), lines.map((x) => x.l).join('\n'));
+});
+
+test('watchQueue progress: each way the watch ends says so once', async () => {
+  const run = async (states, opts = {}) => {
+    const c = clock();
+    const { lines, log } = logger(c);
+    const events = opts.events ?? [[]];
+    const gh = stubGh({ states, events, views: opts.views, dequeueThrows: false });
+    const r = await watchQueue({ gh, root: repoDir(), pr: 7, head: HEAD, budgetMs: opts.budgetMs ?? 60 * MIN, blockers: opts.blockers ?? noBlockers, now: c.now, sleep: c.sleep, log });
+    return { r, out: lines.map((x) => x.l) };
+  };
+  assert.deepEqual((await run([queuedAt()(1), merged])).out, [`PR #7 merged as ${MERGE_SHA.slice(0, 12)}`]);
+  assert.deepEqual((await run([st()], { events: [[added(), removed(REASON_GROUP_CHECKS)]] })).out, ['PR #7 was removed from the merge queue (reason failed_checks)']);
+  assert.deepEqual((await run([st({ state: 'CLOSED' })])).out, ['PR #7 was closed']);
+  assert.deepEqual((await run([st({ head: 'd'.repeat(40) })])).out, ["PR #7: the head moved, so the queued commit is no longer the PR's"]);
+  assert.deepEqual((await run([queuedAt()(2)], { budgetMs: 3 * MIN })).out, ['PR #7 still queued after 3 min — re-run P merge to keep watching']);
+  const blocked = await run([queuedAt()(2), queuedAt()(2), st()], { blockers: async () => ['blocking label(s): needs-human'] });
+  assert.deepEqual(blocked.out, ['PR #7 blocked (blocking label(s): needs-human), dequeued']);
+});
