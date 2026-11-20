@@ -23,6 +23,9 @@ import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
+// (an exit written bare: no wrapper in front of it (shell-parse's `wrapped`; `spawn` for a find -exec / launcher). Only that one is proof the shell left: `command exit 1` (zsh), `noglob exit 1` (bash) and `/usr/bin/time exit 1` are
+// not found or run a child, and the line goes on. Used where a `|| exit` is trusted to prove a redirected or loop-body move happened)
+const bareExit = (c) => c?.wrapped !== true && c?.spawn !== true;
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
 const GUARD_LABELS = ['needs-human', 'pipeline-blocked', 'awaiting-review', 'pipeline-pause', 'pipeline-rollback'];
@@ -3291,7 +3294,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       const op = own.sep === '|' ? ((deeper ? own.lead : own.pipeLead) ?? ';') : own.sep; // (a level's entry holds it as `lead`, a command as `pipeLead`: see emit)
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
-      if (op === '||' && plainExit(c) && !(x.redir && c.spawn) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
+      if (op === '||' && plainExit(c) && !((x.redir || x.loopOnly) && !bareExit(c)) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
         if (!deeper) return exits(x);
         // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
         // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
@@ -3592,8 +3595,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
-      // (a spawn-wrapped exit (`env exit 1`) leaves no shell: it proves nothing about the redirected move)
-      const redirOnly = how === 'redir' && c.sep !== '&&' && !cmds[exitOfGroup(i)]?.spawn;
+      // (an exit behind a wrapper (`env exit 1`, `command exit 1`, `/usr/bin/time exit 1`) may leave no shell: it proves nothing about the redirected move)
+      const redirOnly = how === 'redir' && c.sep !== '&&' && bareExit(cmds[exitOfGroup(i)]);
       if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly), from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);

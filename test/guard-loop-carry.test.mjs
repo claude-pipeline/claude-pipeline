@@ -337,6 +337,14 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['cd back with < /missing/input || { echo; env exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} < /missing/input || { echo no >&2; env exit 1; }; ${PB} origin HEAD`],
     ['cd back with 2>/dev/null || env exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || env exit 1; ${PB} origin HEAD`],
     ['cd back with 2>/dev/null || { echo; env exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; env exit 1; }; ${PB} origin HEAD`],
+    // (R2-F1: the wrappers this shell runs itself are no proof either: `command exit 1` (zsh: not found), `noglob exit 1` (bash: unknown), `/usr/bin/time exit 1` (a child) leave nothing, and the line goes on)
+    ...['command', 'noglob', '/usr/bin/time'].flatMap((w) => [
+      [`cd back with 2>/dev/null || ${w} exit 1, then ;`, `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || ${w} exit 1; ${PB} origin HEAD`],
+      [`cd back with 2>/dev/null || { echo; ${w} exit 1; }, then ;`, `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; ${w} exit 1; }; ${PB} origin HEAD`],
+    ]),
+    // (R2-F2: a text with a loop reads no failure group, so only the settle step decides here)
+    ['cd back with 2>/dev/null || env exit 1, then ; and a loop', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || env exit 1; ${PB} origin HEAD; for i in 1 2; do :; done`],
+    ['cd back with 2>/dev/null || command exit 1, then ; and a loop', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || command exit 1; ${PB} origin HEAD; for i in 1 2; do :; done`],
   ]) {
     denies(what, line, {}, DIRS);
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
@@ -656,6 +664,11 @@ test('D: a plain `|| exit` after a cd / switch in a loop body keeps it known for
     const r = at(line);
     assert.equal(r.decision, 'deny', `${what}: allowed`);
     assert.match(r.reason, BRANCH, `${what}: ${r.reason}`);
+  }
+  // (R2-F1: `|| command exit 1` / `|| noglob exit 1` may leave nothing behind: the cd is not proven)
+  for (const w of ['command', 'noglob']) {
+    denies(`cd sub1 || ${w} exit 1; push; cd ..`, `for d in sub1 sub2; do cd sub1 || ${w} exit 1; ${H}; cd ..; done`, sub, DIRS);
+    denies(`cd sub1 || ${w} exit 1; push; cd .., in a script`, RUN_SH, script('echo', `for d in sub1 sub2; do cd sub1 || ${w} exit 1; ${H}; cd ..; done`), DIRS);
   }
   // (the next iteration starts where the body ended)
   denies('next iteration starts in another repository', `for d in a b; do ${H}; cd /work/other || exit 1; done`, {}, DIRS);
