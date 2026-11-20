@@ -9,7 +9,7 @@ import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  PHASES, PRICE_TABLE_DATE, ROLES, addCostEntry, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
+  PHASES, PRICE_TABLE_DATE, ROLES, addCostEntry, deductBookedTranscript, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
@@ -256,6 +256,18 @@ test('P cost --from-transcript: booking a continued agent\'s transcript again bo
   withComment(s, existing(written(s)));
   const third = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
   assert.deepEqual([third.json.cost.total.input, third.json.cost.total.output], [15, 31]);
+});
+
+// R4-B1: two overlapping bookings of one growing transcript: the one that read the smaller snapshot finished last and lowered the ledger, so the next booking of the larger transcript re-booked the difference.
+test('deductBookedTranscript: a stale smaller snapshot does not lower the ledger, so the larger one booked again adds nothing', () => {
+  const snap = (n) => ({ input: n, output: 2 * n, cacheRead: 3 * n, cacheWrite: 4 * n, usd: n / 100, byPrice: { p1: { input: n, output: 2 * n, cacheRead: 3 * n, cacheWrite5m: 4 * n, cacheWrite1h: 0, messages: n } } });
+  const book = (cost, n) => deductBookedTranscript(cost, { ...snap(n) }, { key: 'agent-a1.jsonl', usage: snap(n) });
+  const big = book(emptyCost(), 200);
+  const stale = book(big.cost, 100);
+  assert.deepEqual([stale.entry.input, stale.entry.usd], [0, 0], 'the stale snapshot adds nothing');
+  const again = book(stale.cost, 200);
+  assert.deepEqual([again.entry.input, again.entry.output, again.entry.cacheRead, again.entry.cacheWrite, again.entry.usd], [0, 0, 0, 0, 0], 'the larger snapshot again adds nothing');
+  assert.equal(again.entry.byPrice.p1, undefined, 'price buckets add nothing either');
 });
 
 // R1-B1 / R1-F2: the ledger key was the bare file name, so two different transcripts both called transcript.jsonl shared one entry (the second under-booked), and a name with a space or bracket made the booking fail.

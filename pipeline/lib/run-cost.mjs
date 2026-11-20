@@ -117,7 +117,20 @@ export function deductBookedTranscript(cost, entry, booking) {
     }
   }
   delete ledger[key];
-  ledger[key] = { input: usage.input, output: usage.output, cacheRead: usage.cacheRead, cacheWrite: usage.cacheWrite, usd: usage.usd, byPrice: structuredClone(usage.byPrice ?? {}) };
+  // The ledger is a high-water mark: a stale, smaller snapshot (a booking that read the transcript before another one grew it) must not lower it, or the next booking re-adds the difference.
+  const hi = (a, b) => Math.max(Number(a) || 0, Number(b) || 0);
+  const priceBefore = isPlainObject(before?.byPrice) ? before.byPrice : {};
+  const priceNow = isPlainObject(usage.byPrice) ? usage.byPrice : {};
+  const byPrice = {};
+  for (const price of new Set([...Object.keys(priceBefore), ...Object.keys(priceNow)])) {
+    const a = isPlainObject(priceBefore[price]) ? priceBefore[price] : {};
+    const b = isPlainObject(priceNow[price]) ? priceNow[price] : {};
+    byPrice[price] = Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'messages'].map((k) => [k, hi(a[k], b[k])]));
+  }
+  ledger[key] = {
+    input: hi(before?.input, usage.input), output: hi(before?.output, usage.output), cacheRead: hi(before?.cacheRead, usage.cacheRead), cacheWrite: hi(before?.cacheWrite, usage.cacheWrite),
+    usd: hi(before?.usd, usage.usd), byPrice,
+  };
   for (const old of Object.keys(ledger).slice(0, Math.max(0, Object.keys(ledger).length - MAX_TRANSCRIPTS))) delete ledger[old];
   next.transcripts = ledger;
   return { cost: next, entry: out };
