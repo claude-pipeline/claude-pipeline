@@ -190,7 +190,7 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
       const waived = oom?.waive === true || (sob?.waive === true && f.scope === SAME_ON_BASE);
       // a same-on-base claim the whole-PR diff disproves (sob.waive false) waits for a human whatever the bucket or category (the arbiter files its own findings as SUGGESTION), and never stores the scope
       const contradicted = f.scope === SAME_ON_BASE && sob !== null && sob.waive !== true;
-      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, or a line the PR adds)', cause: 'security-dismissal' };
+      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)', cause: 'security-dismissal' };
       else final = { ...final, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(f.scope === SAME_ON_BASE ? { scope: SAME_ON_BASE } : {}) }) };
     }
     const item = {
@@ -431,7 +431,7 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
       // see fableFindingItems: a same-on-base claim the diff disproves parks for a human whatever the bucket or category
       const contradicted = r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' && sob !== null && sob.waive !== true;
       if ((dismissesBlockingSecurity && !waived) || contradicted) {
-        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, or a line the PR adds)', cause: 'security-dismissal' };
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)', cause: 'security-dismissal' };
       } else {
         next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' ? { scope: SAME_ON_BASE } : {}) }) };
       }

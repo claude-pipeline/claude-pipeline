@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
-import { globToRegExp, matchAny, normalizeGlob } from './glob.mjs';
+import { globToRegExp, matchAny, matchGlob, normalizeGlob } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { isUniversalHardStopPath } from './hardstops.mjs';
 import { showFile } from './git.mjs';
@@ -669,7 +669,7 @@ function checkThreatModels(models, errors) {
 // review.regression_only_paths: at most MAX_REGRESSION_ONLY_PATHS usable globs. `risk` = the risk section: the waiver only reaches a file the Fable lane reviews, so each glob must be
 // covered by risk.high_risk_paths or review.arbiter_always_paths of the same config (the glob listed there verbatim, or, for an entry with no wildcard or brace, a literal path one of them matches; both sides are read as glob.mjs reads a glob: `dir/` is `dir/**`, a leading `/` or `./` is dropped).
 // The two lists are judged SEPARATELY (glob.mjs reads one list last-match-wins, so a `!` in one never touches the other). A verbatim entry that a LATER `!` exclusion in its list fully cancels
-// (the same glob, `**`, or `P/**` with a wildcard-free P above it) covers no file and is refused (#640); a partial exclusion (`src/**` with `!src/auth/**`) is accepted.
+// (the same glob, `**`, or `P/**` with a wildcard-free P above it) covers no file and is refused (#640) unless a later positive entry can put part of it back; a literal entry is judged by matchAny on the list; a partial exclusion (`src/**` with `!src/auth/**`) is accepted.
 // A `!` exclusion entry in this list is refused: each entry is matched on its own, so it could never cancel another one.
 export const MAX_REGRESSION_ONLY_PATHS = 20;
 const cancelsEntry = (exclusion, norm) => {
@@ -678,16 +678,41 @@ const cancelsEntry = (exclusion, norm) => {
   if (e === n || e === '**') return true;
   return e.endsWith('/**') && !/[*?{[]/.test(e.slice(0, -3)) && n.startsWith(e.slice(0, -2));
 };
-// -> 'covered' | { cancelledBy } | null: how list `list` covers the entry `norm`.
+// The wildcard-free leading directories of a normalised glob (`x/hooks/**` -> `x/hooks`, `*.js` -> ``), lower-cased.
+const globPrefix = (g) => {
+  const segs = [];
+  for (const seg of g.toLowerCase().split('/')) {
+    if (/[*?{[]/.test(seg)) break;
+    segs.push(seg);
+  }
+  return segs.join('/');
+};
+// A positive entry can put back part of `norm`: `**`, or one whose wildcard-free prefix lies under or above the entry's own.
+const overlaps = (positive, norm) => {
+  const p = normalizeGlob(positive);
+  if (p === '**') return true;
+  const a = globPrefix(p);
+  const e = globPrefix(norm);
+  return a === e || a === '' || e === '' || a.startsWith(`${e}/`) || e.startsWith(`${a}/`);
+};
+// -> 'covered' | { cancelledBy } | null: how list `list` covers the entry `norm`. A literal entry (no wildcard or brace) is decided by matchAny on the list alone; a verbatim wildcard entry is
+// cancelled only by a later exclusion that covers it whole AND with no positive entry after that exclusion able to put part of it back.
 function coverIn(list, norm) {
+  const verbatim = (x) => !x.startsWith('!') && normalizeGlob(x) === norm;
+  if (!/[*?{]/.test(norm)) {
+    if (matchAny(norm, list, { nocase: true })) return 'covered';
+    if (!list.some(verbatim)) return null;
+    const last = list.filter((x) => x.startsWith('!') && matchGlob(norm, x.slice(1), { nocase: true })).pop();
+    return last === undefined ? null : { cancelledBy: last };
+  }
   let cancelledBy = null;
   for (let i = 0; i < list.length; i++) {
-    if (list[i].startsWith('!') || normalizeGlob(list[i]) !== norm) continue;
-    const later = list.slice(i + 1).find((x) => x.startsWith('!') && cancelsEntry(x, norm));
-    if (later === undefined) return 'covered';
-    cancelledBy ??= later;
+    if (!verbatim(list[i])) continue;
+    let lastCancel = -1;
+    for (let j = i + 1; j < list.length; j++) if (list[j].startsWith('!') && cancelsEntry(list[j], norm)) lastCancel = j;
+    if (lastCancel === -1 || list.slice(lastCancel + 1).some((x) => !x.startsWith('!') && overlaps(x, norm))) return 'covered';
+    cancelledBy ??= list[lastCancel];
   }
-  if (cancelledBy === null && !/[*?{]/.test(norm) && matchAny(norm, list, { nocase: true })) return 'covered';
   return cancelledBy === null ? null : { cancelledBy };
 }
 function checkRegressionOnly(globs, review, risk, errors) {

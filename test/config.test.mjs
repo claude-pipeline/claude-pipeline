@@ -296,6 +296,11 @@ test('#640 review.regression_only_paths: an entry a later `!` exclusion fully ca
   assert.ok(has(set(['X/a/**'], high(['X/a/**', '!x/**'])), cancelled), 'compared case-insensitively');
   assert.ok(has(set(['x/a/**'], { review: { arbiter_always_paths: ['x/a/**', '!x/a/**'] } }), 'is listed in review.arbiter_always_paths but a later'), 'names the list');
   assert.ok(has(set(['x'], high(['x', '!x'])), 'covers no file: remove the exclusion or the entry'));
+  assert.equal(set(['src/a.js'], high(['src/a.js', '!src/**', 'src/*.js'])).ok, true, 'R1-B1: a literal entry a later positive glob puts back is covered (matchAny last-match-wins)');
+  assert.ok(has(set(['x.js'], high(['x.js', '!*.js'])), cancelled), 'R1-F2: a wildcard exclusion cancels a literal entry');
+  assert.ok(has(set(['src/a.js'], high(['src/a.js', '!src/*.js'])), cancelled), 'R1-F2: and a directory-level one');
+  assert.equal(set(['x/**'], high(['x/**', '!x/**', 'x/hooks/**'])).ok, true, 'R1-F1: a later positive entry that overlaps puts part of it back');
+  assert.ok(has(set(['x/**'], high(['x/**', '!x/**', 'y/**'])), cancelled), 'R1-F1: an unrelated later positive entry does not');
   assert.equal(set(['src/**'], high(['src/**', '!src/auth/**'])).ok, true, 'a partial exclusion stays accepted');
   assert.equal(set(['src/**'], high(['src/**', '!src/*.md'])).ok, true, 'a wildcard exclusion below the entry is partial');
   assert.equal(set(['x/**'], high(['!x/**', 'x/**'])).ok, true, 'an exclusion BEFORE the entry does not cancel it');
