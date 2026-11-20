@@ -221,12 +221,15 @@ const ALLOWED = [
   'test -f x && rg -n api.supabase.com x',
   // R1-F1: the pipeline CLI as the program that runs takes prose (bare bin, or node and its script)
   'pipeline summary --pr 1 --built "Owner runs supabase db push after merge"',
-  // R3-F3: prose that starts with the word Supabase and has a subcommand name (test, status, logs, start) later is not a call: the gate walks the words after the token and a plain word ends the walk
+  // R3-F3: prose that starts with the word Supabase and has a subcommand name (test, status, logs, start) later is not a call: a token followed only by blanks and a plain word is prose (the gate reads the raw text)
   'claude -p "Supabase must be running before the test"',
   'cnotify "supabase stack failed to start"',
   "osascript -e 'display notification \"Supabase is ready for the test\"'",
   "sh -c 'claude -p \"Supabase must be running before the test\"'",
   'claude -p "Notes for the owner\nSupabase output is noisy in the logs"',
+  // R4-F3: a wrapped search inside a quoted command string is a search (the typed reading judges word 0 only; the data-command test stays on the parsed words)
+  "sh -c 'sudo rg -n \"supabase db push\" docs'",
+  "bash -c 'timeout 10 grep -rn \"supabase db push\" docs'",
 ];
 
 const DENIED = [
@@ -526,6 +529,21 @@ const DENIED = [
   "doppler run --command 'supa\\base db push'",
   'sh -c "su\'\'pabase db push"',
   'doppler run --command "su\'\'pabase db push"',
+  // R4-B1 / R4-F2: a backslash-newline is deleted by the shell, inside a word, inside double quotes, and inside the token itself
+  "doppler run --command 'supabase --workdir /t\\\nmp db push'",
+  "doppler run --command 'supabase \"d\\\nb\" push'",
+  "doppler run --command 'supa\\\nbase db push'",
+  // R4-F1: a here-string or a `<<-` heredoc between the token and the head
+  "doppler run --command 'supabase <<< y db push'",
+  'supabase <<- EOF db push\nEOF',
+  // security scan: the other redirect and process-substitution shapes
+  "doppler run --command 'supabase <>f db push'",
+  "doppler run --command 'supabase 2>>&1 db push'",
+  "doppler run --command 'supabase <(true) db push'",
+  "doppler run --command 'supabase >(cat) db push'",
+  // the prose rule cannot hide a call: a tab then a flag is no prose word, and a second token is judged on its own
+  "doppler run --command 'supabase\t--workdir x db push'",
+  'doppler run --command "Supabase is ready; supabase db push"',
 ];
 
 for (const line of ALLOWED) test(`allowed: ${line}`, () => {

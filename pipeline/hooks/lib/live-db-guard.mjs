@@ -248,78 +248,29 @@ const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
 // (`supabase/migrations/x.sql`, `SUPABASE_URL`, `supabase.from(`, `supabase.com`, `@supabase/supabase-js` are not tokens; `supabase`, `./node_modules/.bin/supabase`, `'supabase db push'` are)
 const SB_TOKEN_SRC = String.raw`(?<![\w.@-])(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\\s'"]*)?(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`;
 const SB_TOKEN = new RegExp(SB_TOKEN_SRC, 'i');
-// The gate that decides whether a quoted command string is read again as a command line: a supabase token, then the words of its simple command up to a subcommand head (or a word that could become one).
-// The walk after the token: a flag word continues; a non-flag word that is a head (or an expansion / glob / brace group, R3-F1) says yes; a non-flag word right after a flag without `=` is that flag's value and continues
-// (`--workdir "/my app"`, `-ojson`, `--create-ticket`); a redirect (`2>&1`, `> f`) is skipped; any other plain word ends the walk (R3-F3: `Supabase must be running before the test` is prose, not a call).
-// It is liberal on purpose (R2-F1: any flag spelling sits before the head) and the reparse judges: reparsedRefusal only refuses when a parsed command really starts with the binary.
-// It is linear (R2): one pass over the text, one backward pass over the words (the walk's state is one bit, so it is solved once per word, never per token), never a regex over flag shapes: those backtracked (#688, a run of `-o 'a'` pairs took seconds).
-const REDIRECT = /^(?:\d*|&)[<>][>&|<]?/;
+// The gate that decides whether a quoted command string is read again as a command line, a simple fail-closed rule (owner 2026-11-20; rounds 3 and 4 tried a word walk to spare prose and each found new holes):
+// normalise the text in one pass, then say yes when ANY word after the first supabase token is a subcommand head or could become one (an expansion, a backtick, a brace, a glob).
+// Normalising: every backslash-newline pair is deleted (the shell joins the lines), then every quote and backslash character; ( ) < > & | ; } become spaces, and a $ ` { becomes a space that also marks the word after it as a possible head.
+// So no redirect, substitution, separator or quote shape can hide the head from the gate.
+// One narrow prose rule (R3-F3, owner 2026-11-20), read on the RAW text before normalising: a token followed only by spaces or tabs and then a word of letters that is no head (`Supabase must be running`, `supabase stack failed to start`) is prose, not a call.
+// A special character between the token and the word (`<<< y`, `"db"`, a backslash-newline, `2>&1`) or a later token makes it a call again; `supabase y db push` is harmless prose-shaped input (the CLI rejects the unknown command `y`).
+// The reparse still judges: reparsedRefusal only refuses when a parsed command really starts with the binary. Linear: one regex pass, one split, one scan; never a regex over flag shapes (those backtracked, #688).
+const MARK = '\x02';
 const possibleHead = (w) => {
   const head = /^[a-z][a-z0-9-]*(?![\w-])/i.exec(w)?.[0].toLowerCase();
-  return Boolean(head && isSubcommandHead(head)) || /[$`{]/.test(w) || globMatchesHead(w);
+  return Boolean(head && isSubcommandHead(head)) || w.includes(MARK) || globMatchesHead(w);
 };
+const PROSE_TOKEN = new RegExp(`${SB_TOKEN_SRC}(?=[ \\t]+([A-Za-z]+)(?!\\S))`, 'gi');
 function sbTokenHead(text) {
-  // (the common case, a line with no supabase token: one regex pass, no scan; quote and backslash characters dropped first, so `su''pabase` and `supa\base`, which the inner shell reads as supabase, are tokens too)
-  if (!SB_TOKEN.test(text.replace(/['"\\]/g, ''))) return false;
-  // split into simple commands of words. m = the word as scanned (quote and backslash characters dropped, quoted or escaped whitespace masked \x01 so it stays inside the word), v = the word as the inner shell receives it.
-  // A `;` `&` `|` or newline outside quotes ends the simple command, except the & or | of a redirect (`2>&1`, `>&2`, `&>`, `>|`) and any inside an unquoted $( ) or backtick substitution (R3-F2)
-  const parts = [[]];
-  let m = '';
-  let v = '';
-  let open = false;
-  let quote = null;
-  let depth = 0;
-  let tick = false;
-  const put = (cm, cv = cm) => { m += cm; v += cv; open = true; };
-  const mask = (ch) => (/\s/.test(ch) ? '\x01' : ch);
-  const end = () => { if (open) parts[parts.length - 1].push({ m, v }); m = ''; v = ''; open = false; };
-  for (let i = 0; i < text.length; i += 1) {
-    const ch = text[i];
-    if (ch === '\\') {
-      if (i + 1 >= text.length) continue;
-      if (quote === "'") { put('', ch); continue; }
-      i += 1;
-      const nx = text[i];
-      if (nx === '\n') { if (quote) put('\x01', ' '); else end(); continue; }
-      put(mask(nx), quote === '"' && !'$`"\\'.includes(nx) ? ch + nx : nx);
-      continue;
-    }
-    if (quote) { if (ch === quote) quote = null; else put(mask(ch), ch); continue; }
-    const nested = depth > 0 || tick;
-    if (ch === '"' || ch === "'") { quote = ch; open = true; }
-    else if (ch === '`') { tick = !tick; put(ch); }
-    else if (ch === '$' && text[i + 1] === '(') { depth += 1; i += 1; put('$('); }
-    else if (depth > 0 && ch === '(') { depth += 1; put(ch); }
-    else if (depth > 0 && ch === ')') { depth -= 1; put(ch); }
-    else if (ch === '\n') { end(); if (!nested) parts.push([]); }
-    else if (/\s/.test(ch)) end();
-    else if (!nested && (ch === ';' || (ch === '&' && !'<>'.includes(text[i - 1] ?? '') && text[i + 1] !== '>') || (ch === '|' && text[i - 1] !== '>'))) { end(); parts.push([]); }
-    else put(ch);
-  }
-  end();
-  for (const words of parts) {
-    const first = words.findIndex((w) => SB_TOKEN.test(w.m));
-    if (first < 0) continue;
-    const n = words.length;
-    // r0[i] / r1[i]: the walk from word i says yes, when the word before it is not / is a flag still waiting for its value
-    const r0 = new Array(n + 3).fill(false);
-    const r1 = new Array(n + 3).fill(false);
-    for (let i = n - 1; i > first; i -= 1) {
-      const w = words[i].m;
-      const red = w.startsWith('-') ? null : REDIRECT.exec(w);
-      if (w.startsWith('-')) { r0[i] = w.includes('=') ? r0[i + 1] : r1[i + 1]; r1[i] = r0[i]; }
-      else if (red) { const j = i + (red[0].length === w.length ? 2 : 1); r0[i] = r0[j]; r1[i] = r1[j]; }
-      else if (possibleHead(w)) { r0[i] = true; r1[i] = true; }
-      else { r0[i] = false; r1[i] = r0[i + 1]; }
-    }
-    for (let t = first; t < n; t += 1) {
-      if (!SB_TOKEN.test(words[t].m)) continue;
-      if (r0[t + 1]) return true;
-      // (a token inside a quoted word: that string is a command line of its own, judged the same way)
-      if (words[t].m.includes('\x01') && words[t].v.length < text.length && sbTokenHead(words[t].v)) return true;
-    }
-  }
-  return false;
+  const words = text
+    .replace(PROSE_TOKEN, (token, word) => (possibleHead(word) ? token : '\x03'))
+    .replace(/\\\n/g, '')
+    .replace(/['"\\]/g, '')
+    .replace(/[$`{]/g, ' ' + MARK)
+    .replace(/[}()<>&|;]/g, ' ')
+    .split(/\s+/);
+  const first = words.findIndex((w) => SB_TOKEN.test(w));
+  return first >= 0 && words.slice(first + 1).some(possibleHead);
 }
 // B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
 function globMatchesHead(w) {
@@ -570,12 +521,13 @@ const MAX_REPARSE_DEPTH = 2;
 
 // the supabase calls of one command read from a quoted string: word 0 (after the parser's own unwrapping of npx / timeout / env …) is the binary; a package manager head keeps the later-word rule (F8); a variable head is B9
 function reparsedRefusal(text, state, reparse, depth) {
-  const inner = reparse(text);
+  // (zsh's `>>&` appends both streams to the next word; the parser reads it as `>>` then a `&` separator and would split the command, so it is read as the plain `>>` here)
+  const inner = reparse(text.replace(/>>&/g, '>>'));
   if (!inner || inner.truncated || inner.undecidable) return NESTED_UNREAD;
   for (const c of inner) {
-    // (the words as typed too: the parser keeps the backslash of `supa\base` in argv, the typed words read it as the shell does)
     const argv = c.argv ?? [];
     const typed = typedWords(c);
+    // (the words as typed too, for the word-0 judgement only: the parser keeps the backslash of `supa\base` in argv, the typed words read it as the shell does)
     for (const words of typed !== argv && typed.join('\0') !== argv.join('\0') ? [argv, typed] : [argv]) {
       if (!words.length) continue;
       let why = null;
@@ -584,15 +536,16 @@ function reparsedRefusal(text, state, reparse, depth) {
         for (const call of supabaseCalls(words, false)) why ??= supabaseRefusal(call.rest, state);
       } else why = variableHeadRefusal(words, state);
       if (why) return why;
-      if (isDataWords(words) || commandName(words[0]) === 'sed') continue;
-      for (const [i, w] of words.entries()) {
-        if (isInlineProgram(words, i)) continue;
-        // (a word that is the whole text just read -- the parser lists a `$(…)` word as its own command -- reads the same again: its commands are already judged)
-        if (!sbTokenHead(w) || commandText(w) === text) continue;
-        if (depth >= MAX_REPARSE_DEPTH) return NESTED_UNREAD;
-        why = reparsedRefusal(commandText(w), state, reparse, depth + 1);
-        if (why) return why;
-      }
+    }
+    // (R4-F3: the data-command test and the inner words stay on argv, so `sudo rg -n "supabase db push" docs` is a search, as at the top level)
+    if (!argv.length || isDataWords(argv) || commandName(argv[0]) === 'sed') continue;
+    for (const [i, w] of argv.entries()) {
+      if (isInlineProgram(argv, i)) continue;
+      // (a word that is the whole text just read -- the parser lists a `$(…)` word as its own command -- reads the same again: its commands are already judged)
+      if (!sbTokenHead(w) || commandText(w) === text) continue;
+      if (depth >= MAX_REPARSE_DEPTH) return NESTED_UNREAD;
+      const why = reparsedRefusal(commandText(w), state, reparse, depth + 1);
+      if (why) return why;
     }
   }
   return null;
