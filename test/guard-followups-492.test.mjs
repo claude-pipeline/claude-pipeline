@@ -125,12 +125,15 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
   const V1 = `${GROUP('exit 1')}git push\n`;
   const V2 = `cd /work/repo || { bash /work/repo/fix.sh; exit 1; }\ngit push\n`;
   const FIX = { '/work/repo/fix.sh': 'git checkout main\n' };
-  const verdict = (command, files) => gitRun(command, files);
+  // gitRun looks a fake file up by resolve(path), which on Windows is D:\work\repo\s.sh: key the fixtures the same way
+  const at = (files = {}) => Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
+  const verdict = (command, files) => gitRun(command, at(files));
+  const expectAt = (decision, command, files) => expect(decision, command, at(files));
   for (const [vname, script, extra] of [['V1 (echo in the group)', V1, {}], ['V2 (the group runs a helper that switches branch)', V2, FIX]]) {
     for (const run of ['bash s.sh', 'source s.sh']) {
       // (a SOURCED text runs in the caller's shell: a function named exit defined by the caller would make the written exit not leave it, which the walk cannot see, so only a child-run text defers)
       test(`${vname}: \`${run}\` with the push INSIDE the script after a literal exit is ${run === 'bash s.sh' ? 'allowed' : 'still denied (sourced)'}`, () => {
-        expect(run === 'bash s.sh' ? 'allow' : 'deny', run, { ...extra, '/work/repo/s.sh': script });
+        expectAt(run === 'bash s.sh' ? 'allow' : 'deny', run, { ...extra, '/work/repo/s.sh': script });
       });
       test(`${vname}: \`${run}; git -C /work/repo push\` stays denied, on the CALLER's push`, () => {
         const v = verdict(`${run}; git -C /work/repo push`, { ...extra, '/work/repo/s.sh': script });
@@ -150,7 +153,7 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
     });
   }
   test('a function named exit defined by the caller: sourcing the script is denied (the written exit may not leave the shell; the reason a sourced text does not defer)', () => {
-    expect('deny', 'exit() { :; }; source /work/repo/s.sh', { '/work/repo/s.sh': V1 });
+    expectAt('deny', 'exit() { :; }; source /work/repo/s.sh', { '/work/repo/s.sh': V1 });
   });
   // R1-B1 / R1-F1: the written exit may not be the shell's real exit: the caller's function, an exported one, an eval (this shell), a startup file, or a sourced helper redefines it; the cd failing then switches to main and the push runs there
   const S = V2;
@@ -168,7 +171,7 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
     ['a plain eval of the script (this shell, so a function of the caller may stand for exit)', 'eval "$(cat /work/repo/s.sh)"', REDEF],
   ]) {
     test(`${why}: denied`, () => {
-      expect('deny', line, files);
+      expectAt('deny', line, files);
     });
   }
   test('intended tightening: a git switch after the group no longer re-establishes a known branch for the caller', () => {
@@ -184,16 +187,16 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
   });
   // #608 does not need a source change (the candidate walk already covers a literal PATH prefix); the three rows fail if PATH-setting lines are excluded or `sourceGone` hides the walked case
   test('#608 pin: a dynamic PATH prefix on source keeps the push denied', () => {
-    expect('deny', 'PATH="$(tooldir):$PATH" source env.sh; git -C /work/repo push', {});
+    expectAt('deny', 'PATH="$(tooldir):$PATH" source env.sh; git -C /work/repo push', {});
   });
   test('#608 pin: a literal PATH prefix whose env.sh switches branch is walked and denied; a harmless one is allowed', () => {
     const v = verdict('PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'git checkout main\n' });
     assert.equal(v.decision, 'deny', v.reason);
     assert.match(v.reason, /cannot determine the current branch/);
-    expect('allow', 'PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'echo hi\n' });
+    expectAt('allow', 'PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'echo hi\n' });
   });
   test('#608 pin: the everyday `export PATH=...; [ -f .env.local ] && source .env.local; git push` stays allowed', () => {
-    expect('allow', 'export PATH="$HOME/bin:$PATH"; [ -f .env.local ] && source .env.local; git -C /work/repo push', {});
+    expectAt('allow', 'export PATH="$HOME/bin:$PATH"; [ -f .env.local ] && source .env.local; git -C /work/repo push', {});
   });
 });
 
