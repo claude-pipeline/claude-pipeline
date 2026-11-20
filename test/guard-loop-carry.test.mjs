@@ -824,3 +824,26 @@ test('T1 F8: a branch switched by a `coproc` child may not have happened when th
   refused('coproc { git checkout; }; P', `coproc { git checkout agent/y; }; ${PH}`, BRANCH);
   refused('coproc { git checkout; } && P', `coproc { git checkout agent/y; } && ${PH}`, BRANCH);
 });
+
+// ---- review round 1 (#761): R1-B1, a cd behind `builtin` / `command` / `time` leaves the directory unknown, and the package scripts / runner bins the line then runs must not be skipped ----
+// Why: on the merge base `builtin cd packages/app && npm test` read packages/app/package.json and judged its `pretest`; with the directory unknown (T2) neither that script nor `npx tool`'s bin was looked up, so a
+// blocked operation in them ran unseen. The line is refused when the directory is unknown and it runs a package script or a runner bin; the same lines with no cd behind a wrapper stay allowed.
+test('R1-B1: a package script or a runner bin run after a cd behind builtin / command / time is judged or refused, not skipped', () => {
+  const lifecycle = { 'packages/app/package.json': JSON.stringify({ name: 'app', scripts: { pretest: `${PB} origin ${MAIN}`, test: 'echo ok' } }) };
+  const bin = { 'packages/app/package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo ok' } }), 'packages/app/node_modules/.bin/tool': `#!/bin/sh\n${PB} origin ${MAIN}\n` };
+  for (const w of ['builtin', 'command', 'time', '\\time']) {
+    for (const j of [' && ', '; ']) {
+      denies(`${w} cd; npm test (pretest pushes main)`, `${w} cd packages/app${j}npm test`, lifecycle, /./);
+      denies(`${w} cd; npx tool (the bin pushes main)`, `${w} cd packages/app${j}npx tool`, bin, /./);
+    }
+  }
+  // (the unknown directory reaches a text the line starts too)
+  denies('builtin cd; bash -c "npm test"', `builtin cd packages/app && bash -c 'npm test'`, lifecycle, /./);
+  // (everyday: no cd behind a wrapper, so the directory is known; a cd with no wrapper reads the manifest as before)
+  const quiet = { 'package.json': JSON.stringify({ name: 'x', scripts: { test: 'echo ok' } }), 'packages/app/package.json': JSON.stringify({ name: 'app', scripts: { test: 'echo ok' } }) };
+  allows('\\time make', '\\time make', quiet);
+  allows('FOO=1 time npm test', 'FOO=1 time npm test', quiet);
+  allows('time npm test', 'time npm test', quiet);
+  allows('cd packages/app && npm test (plain cd, harmless manifest)', 'cd packages/app && npm test', quiet);
+  denies('cd packages/app && npm test (plain cd, pretest pushes main)', 'cd packages/app && npm test', lifecycle, /./);
+});

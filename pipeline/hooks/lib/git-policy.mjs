@@ -1693,6 +1693,8 @@ function judgeAlternatives(ctx, items, judge) {
   return v;
 }
 
+// (R1-B1: a cd behind `time` / `command` / `builtin` may or may not have moved this shell, so which package.json or node_modules/.bin a package script or a runner reads is one of two places: refused, as for a cd the guard cannot follow)
+const EXT_CD_MSG = (said) => `package script: an earlier cd behind time / command / builtin may or may not have moved this shell, so which package.json or node_modules/.bin \`${said}\` reads cannot be verified. Run the cd without the wrapper, or use an absolute --prefix.`;
 const MARKERS_MSG =(said, kind) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${kind === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
 function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
@@ -1716,6 +1718,7 @@ function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
     const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => packageScriptVerdict(argv, d, ctx, level, judged));
     if (v) return v;
     // a directory the guard lost track of (after a sourced file or a cd it cannot follow): judged like a script named at run time (`bash $F`) -- refused when the line mentions a guarded operation (t11)
+    if (ctx.extCdUnknown === true) return deny(EXT_CD_MSG(said));
     return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json `' + said + '` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
   }
   const plan = packageScripts(call, pkgEnv(ctx, dir));
@@ -1804,6 +1807,7 @@ function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
 function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
   const name = expandVars(argv[0], ctx);
   if (name.includes('/')) return null;
+  if (dir === null && !quiet && ctx.extCdUnknown === true) return deny(EXT_CD_MSG(argv.slice(0, 4).join(' ')));
   // (#352) a runner (npx, npm exec, pnpm dlx / exec, yarn exec, bunx) run after a cd the guard cannot follow, in a script file: its bin is looked up from the script's own directory and each one above it
   if (dir === null && lookup === null) {
     const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => binVerdict(name, d, ctx, level, quiet, d));
@@ -3530,7 +3534,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (childCd) { /* the child's own directory */ }
-    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
