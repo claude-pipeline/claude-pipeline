@@ -550,6 +550,19 @@ test('#572 / #573: a branch switched and put back by an eval\'d text in a subshe
   allows('a file-fed eval that switches nothing', line('p.sh'), { ...p, 'f.sh': 'echo hi\nexit 0\n' });
 });
 
+// #569 pin (passes on main by design: the loop rule and #647 already hold it): an eval'd file that itself evals a file inside a literal loop does not hand its switch to the caller (the loop may have broken out first);
+// the same two files with no loop do (the switch is believed). Guards the loop-carry rule against a later refactor.
+test('#569: a switch made by a file eval\'d inside a literal loop in an eval\'d file is not handed to the caller', () => {
+  const onMain = (cmd, files) => evaluateGitCommand(cmd, { cwd: GIT_ROOT, home: '/home/u', currentBranch: () => MAIN, pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files) });
+  const p = { 'p.sh': `${PB} origin HEAD\n`, 'b.sh': 'git switch agent/x\n' };
+  const line = 'eval "$(cat ./a.sh)"; bash ./p.sh';
+  const looped = onMain(line, { ...p, 'a.sh': 'for i in 1; do eval "$(cat ./b.sh)"; done\n' });
+  assert.equal(looped.decision, 'deny', 'loop: allowed');
+  assert.match(looped.reason, BRANCH);
+  const plain = onMain(line, { ...p, 'a.sh': 'eval "$(cat ./b.sh)"\n' });
+  assert.equal(plain.decision, 'allow', `no loop: ${plain.reason}`);
+});
+
 // R39-F3 / F4 (the arbiter's reading: a memo hit replays an end state without the writes of the first judgement): the same text run a second time in the same state is still unknown afterwards
 test('#362 R39-F3 / F4: a startup file or a line-written script judged once in a state is still unknown to its caller the second time', () => {
   const rc = { rc: `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`, 'noop.sh': 'echo hi\n' };
