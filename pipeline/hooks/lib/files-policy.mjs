@@ -34,7 +34,7 @@ const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
 const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known; past it collection STOPS silently, so a hard link to a file beyond the cap is not seen: a documented residual, not a fail-closed. Which files fall past it depends on listing order. Depth: the protected names directly in .review, and a round folder's entries two levels down)
-const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
+const MAX_ALIAS_TEXT = MAX_SCRIPT_BYTES; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused; cp #691: no shorter than the largest program the guard reads, it was 200,000)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
 const SENSITIVE_WORDS = /\.claude|\.codex(?:\/*(?![\w.\-\/])|\W+sessions)|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|published-baseline|[\w.-]*smoke)/i;
@@ -1687,11 +1687,13 @@ function makeMatchers(ctx) {
   const ALIAS_WORD_WIDE = /[^\s'"`;|&<>(){}[\]*?$]+/g;
   const aliasInText = (v, dirs) => {
     if (!ctx.hasReviewDir()) return false; // (no review folder: nothing below can match, see hitReviewInode)
-    if (v.length > MAX_ALIAS_TEXT) return true;
+    if (v.length > MAX_ALIAS_TEXT) { ctx.aliasLimit = true; return true; } // (a refusal from a cap says so: ctx.aliasLimit, read by judgeFoundScript)
     const where = dirs?.length ? dirs : [ctx.cwd];
     const words = new Set([...(v.match(ALIAS_WORD) ?? []), ...(v.match(ALIAS_WORD_WIDE) ?? [])]);
-    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return true;
+    if (words.size * where.length > MAX_ALIAS_LOOKUPS) { ctx.aliasLimit = true; return true; }
+    let seen = 0;
     for (const word of words) {
+      if ((++seen & 511) === 0 && ctx.budget) checkDeadline(ctx.budget); // (a long text is scanned up to the evaluation's deadline, then the check fails closed)
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
       for (const d of isAbs(e) ? [''] : where) {
@@ -4354,8 +4356,10 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   const dynamicBefore = ctx.dynamic;
   ctx.braceChunks = true; // (#265 g: the text is brace-expanded in pieces, so a brace-split protected path in a long program is seen)
   let hitsProtected;
+  ctx.aliasLimit = false;
   try { hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true); } finally { ctx.braceChunks = false; }
   ctx.dynamic = dynamicBefore;
+  if (hitsProtected && ctx.aliasLimit === true && WRITE_HINT.test(text)) return deny(`the program ${sf.file} is refused for its size / scan limit: it is too long, or holds too many distinct words, to be checked word by word for a link to a repo's review folder (${PROTECTED_MSG}); split it up or keep what writes in a smaller file`);
   if (hitsProtected && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
   return null;
 }

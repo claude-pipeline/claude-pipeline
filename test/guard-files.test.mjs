@@ -2330,3 +2330,24 @@ test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a wri
     `OUT=$(${P})`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
+
+// cp #691 (refused: a 250 KB DRMed proof script run from a checkout that has a .review folder, "where it is could not be worked out in the time allowed"): the alias scan read a program only up to 200 KB and refused the
+// rest unread. It now reads up to MAX_SCRIPT_BYTES; a program over the word / lookup cap is still refused (fail closed), and the refusal says it is the size / scan limit, not a protected file.
+test('#691: a program over 200 KB that holds no link to the review folder is allowed from a checkout with .review; a link in it, or too many distinct words, is refused with the scan-limit wording', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const run = (text) => {
+    fs.writeFileSync(path.join(w.cwd, 'prog.mjs'), text);
+    return evaluateBashForFiles('node prog.mjs', { home: path.join(w.tmp, 'home'), env: {}, cwd: w.cwd, platform: process.platform });
+  };
+  const filler = 'const filler_a = "xxxxxxxxxxxxxxxxxxxx";\n'.repeat(8000); // (about 330 KB, a handful of distinct words)
+  const tail = "import fs from 'node:fs'; fs.writeFileSync('/tmp/proof-out.txt', 'ok');\n";
+  assert.ok(filler.length > 200_000);
+  assert.equal(run(filler + tail).decision, 'allow', 'allowed: clean program over 200 KB');
+  assert.equal(run(`${filler}${tail}fs.writeFileSync('${w.alias}/state.json', 'x');\n`).decision, 'deny', 'denied: the same text writing through a link to the review folder');
+  const many = Array.from({ length: 21_000 }, (_, i) => `const w${i} = ${i};`).join('\n');
+  const r = run(`${many}\n${tail}`);
+  assert.equal(r.decision, 'deny', 'denied: too many distinct words to scan');
+  assert.match(r.reason, /scan limit/);
+  assert.doesNotMatch(r.reason, /refers to a protected pipeline file/);
+});
