@@ -3618,14 +3618,14 @@ class Parser {
     let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
     let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see plainExit. A leading `coproc` is also `spawn`, below)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
-    // extCd (T2): a `time` or `command` stood in front. Whether it ran the command as the shell's own builtin or as an external program differs by shell and spelling (dash has no `time` keyword, zsh's `command cd` runs /usr/bin/cd,
+    // extCd (T2): a `time`, `command` or `builtin` stood in front. Whether it ran the command as the shell's own builtin or as an external program differs by shell and spelling (dash has no `time` keyword, zsh's `command cd` runs /usr/bin/cd,
     // bash's `time` after an assignment is a program), so a `cd` behind it may or may not have moved THIS shell: git-policy leaves the directory unknown. Not `spawn` (bash really moves), not truncated (`\time make` is everyday).
     let extCd = false;
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
       if (!un) break;
       wrapped = true;
-      if (base(a[0]) === 'time' || base(a[0]) === 'command') extCd = true;
+      if (base(a[0]) === 'time' || base(a[0]) === 'command' || base(a[0]) === 'builtin') extCd = true; // (`builtin`: dash has none, "not found": the cd never runs and the line goes on in the old directory)
       if (PACKAGE_RUNNERS.has(base(a[0]))) {
         viaRunner = true;
         // (R1-B6: `npx --prefix sub tool`, `npm exec --prefix sub tool`: the bin is looked up from that directory too; every directory option among the words counts, a tool's own --prefix included: more places, never fewer)

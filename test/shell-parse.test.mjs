@@ -1321,7 +1321,7 @@ test('R24-F3: the sticky refusal (an earlier line holds a `name[` the guard cann
 // Shell-parser follow-ups C1, T2: the parser marks a command that a `time` / `command` wrapper stood in front of (`extCd`, not enumerable), whatever the spelling, and never gives the line up for it
 // (a trailing / leading redirect or an assignment before `time` is no reason to refuse `\time make`).
 test('T2: every spelling of time / command in front of a command sets extCd and leaves the line trusted', () => {
-  for (const line of ['>/dev/null time cd /x', 'X=1 time cd /x', 'command time cd /x', '\\time cd /x', "'time' cd /x", '"time" cd /x', 'noglob time cd /x', 'time command cd /x', 'time time cd /x', 'command cd /x', 'time cd /x', 'time -p cd /x', 'time cd /x >/dev/null']) {
+  for (const line of ['>/dev/null time cd /x', 'X=1 time cd /x', 'command time cd /x', '\\time cd /x', "'time' cd /x", '"time" cd /x', 'noglob time cd /x', 'time command cd /x', 'time time cd /x', 'command cd /x', 'time cd /x', 'time -p cd /x', 'time cd /x >/dev/null', 'builtin cd /x']) {
     const cmds = simpleCommands(line);
     assert.ok(!cmds.truncated, `${line}: truncated`);
     assert.ok(!cmds.ctlBroken, `${line}: ctlBroken`);
@@ -1330,7 +1330,7 @@ test('T2: every spelling of time / command in front of a command sets extCd and 
     assert.equal(cd.extCd, true, `${line}: extCd`);
   }
   // (no mark where nothing stood in front, `command -v` only looks a name up, and a wrapper that is no time / command is not one)
-  for (const line of ['cd /x', 'cd /x >/dev/null', 'command -v cd', 'nohup cd /x', 'builtin cd /x']) {
+  for (const line of ['cd /x', 'cd /x >/dev/null', 'command -v cd', 'nohup cd /x']) {
     const cd = simpleCommands(line).find((c) => c.argv.includes('cd'));
     assert.notEqual(cd?.extCd, true, `${line}: extCd`);
   }

@@ -383,6 +383,14 @@ describe('T2: a cd behind time / command leaves the directory unknown', () => {
       });
     }
   }
+  // (`builtin`: dash has none ("builtin: not found"), so the cd never runs and the push runs in /work/main; allowed on main. The `&&` form stops in dash, but bash / zsh move: refused as unknown, an accepted over-refusal)
+  for (const j of ['; ', ' && ']) {
+    test(`deny: builtin cd /work/repo${j}push (from main)`, () => {
+      const v = gitMain(`builtin cd /work/repo${j}${PUSH_CMD}`);
+      assert.equal(v.decision, 'deny');
+      assert.match(v.reason, /cannot determine the current branch/);
+    });
+  }
   test('deny: time cd /work/repo || exit 1; push (the exit proves nothing about a cd that may not be this shell\'s)', () => {
     assert.equal(gitMain(`time cd /work/repo || exit 1; ${PUSH_CMD}`).decision, 'deny');
   });
