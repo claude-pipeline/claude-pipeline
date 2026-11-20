@@ -155,11 +155,16 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
   // R1-B1 / R1-F1: the written exit may not be the shell's real exit: the caller's function, an exported one, an eval (this shell), a startup file, or a sourced helper redefines it; the cd failing then switches to main and the push runs there
   const S = V2;
   const REDEF = { '/work/repo/s.sh': S, ...FIX };
+  const SUB = { '/work/repo/s.sh': 'cd /work/repo/sub || { bash /work/repo/fix.sh; exit 1; }\ngit push\n', ...FIX };
   for (const [why, line, files] of [
     ['eval-fed text with a caller function exit', 'exit() { :; }; eval "$(cat /work/repo/s.sh)"', REDEF],
     ['an exported function exit into the child shell', 'exit() { :; }; export -f exit; bash /work/repo/s.sh', REDEF],
     ['BASH_ENV startup file that defines exit', 'BASH_ENV=/work/repo/rc.sh bash /work/repo/s.sh', { ...REDEF, '/work/repo/rc.sh': 'exit() { :; }\n' }],
     ['a sourced helper inside the group that defines exit', 'bash /work/repo/s.sh', { '/work/repo/s.sh': 'cd /work/repo/sub || { source /work/repo/h.sh; exit 1; }\ngit push\n', '/work/repo/h.sh': 'exit() { :; }\ngit checkout main\n' }],
+    // R2-F1: an implicit home startup file (zsh reads ~/.zshenv, bash -l ~/.bash_profile) is judged on a copy of the state; the mark that exit may be redefined must still reach the script
+    ['a home .zshenv that defines exit (zsh reads it implicitly)', 'zsh /work/repo/s.sh', { ...SUB, [HOME + '/.zshenv']: 'exit() { :; }\n' }],
+    ['a home .zshenv that aliases exit', 'zsh /work/repo/s.sh', { ...SUB, [HOME + '/.zshenv']: 'alias exit=true\n' }],
+    ['a home .bash_profile that defines exit (bash -l reads it implicitly)', 'bash -l /work/repo/s.sh', { ...SUB, [HOME + '/.bash_profile']: 'exit() { :; }\n' }],
     ['a plain eval of the script (this shell, so a function of the caller may stand for exit)', 'eval "$(cat /work/repo/s.sh)"', REDEF],
   ]) {
     test(`${why}: denied`, () => {
