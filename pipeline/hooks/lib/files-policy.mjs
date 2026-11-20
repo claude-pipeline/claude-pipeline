@@ -27,7 +27,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
 
 const posix = path.posix;
@@ -436,7 +436,7 @@ function makeCtx(opts) {
     readHead: opts.readHead ?? defaultReadHead, // the first bytes of a file readText refused (over the cap)
     ignoreUnmodelled: opts._ignoreUnmodelled === true, // inside a real-home startup file's judgment: see judgeStartupFile
     frames: opts._frames ?? [], // the files each command list being evaluated writes (see line-writes.mjs), outermost first
-    budget: opts._budget ?? newEvalBudget(opts.now), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
+    budget: opts._budget ?? newEvalBudget(opts.now, opts.cpu), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
     nodePrefix: opts.nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration; undefined: from process.execPath, null: none (tests)
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
@@ -4330,14 +4330,14 @@ function programHitWhere(text, m, dir, ctx, file) {
   const b = ctx.budget;
   const saved = { grown: b.grown, braceOver: ctx.braceOver, dynamic: ctx.dynamic };
   try {
-    const stopAt = Math.min(b.deadline, b.now() + LOCATE_MS);
+    const stopAt = b.now() + LOCATE_MS;
     // (rawHit reads a home config folder in program text as a hit when the text holds a call anywhere: `(` `)` `[` `]`; a line is judged as the text would be, with that call added)
     const hasCall = /[()[\]]/.test(text);
     const hits = [];
     let cut = false;
     let from = 0;
     for (let n = 1; from <= text.length; n++) {
-      if (n > LOCATE_MAX_LINES || ((n & 63) === 0 && b.now() > stopAt)) { cut = true; break; }
+      if (n > LOCATE_MAX_LINES || ((n & 63) === 0 && (b.now() > stopAt || budgetExpired(b)))) { cut = true; break; }
       let to = text.indexOf('\n', from);
       if (to < 0) to = text.length;
       const line = text.slice(from, text[to - 1] === '\r' ? to - 1 : to);
@@ -4704,7 +4704,7 @@ function setPositionals(argv) {
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false) { // (rep: the file is sourced from a frame that can run it again, R18)
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
-  const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
+  const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => budgetExpired(ctx.budget) });
   // (#352 R23-F2: a script line whose shape the parser cannot follow (ctlBroken: a bare { or } argument that splits the word groups, `echo { F=x }`, a zsh condition-then-body form, a {fd} word) may or may
   // not run the commands read from it: what it binds, and the directory it ends in, are unknown)
   if (cmds.truncated || cmds.dynamic || cmds.ctlBroken) out.all = true;
@@ -4914,7 +4914,7 @@ function evaluateSameText(command, opts) {
 function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._bashState) {
     const state = { bound: false, rewrote: false };
-    const budget = opts._budget ?? newEvalBudget(opts.now);
+    const budget = opts._budget ?? newEvalBudget(opts.now, opts.cpu);
     const first = evaluateBashForFilesUnchecked(command, { ...opts, _budget: budget, _bashState: state });
     if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
     // (the second pass spends what the first left, so every cap still ends in a denial; only the startup-file memo starts empty)
@@ -4990,7 +4990,7 @@ function loopReadings(command, opts) {
   return out;
 }
 function evaluateBashForFilesFrame(command, opts) {
-  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
+  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now, opts.cpu) }; // one budget for this evaluation and every script it reads
   const opts0 = opts; // (R16: the frame as it was called, for the pass that judges it again with a late switch seeded)
   const assumedCwd = opts._assumedCwd === true; // (a rerun of the line with the cwd assumed to be a protected directory; what it runs is judged normally)
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
@@ -5026,7 +5026,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (variantsOf(raw).some((t) => setsAdmin(t, ctx.platform) || setsAdmin(t.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''), ctx.platform))) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code (naming it, e.g. in grep or prose, is fine)');
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
-  const cmds = simpleCommands(raw, { env: opts.env ?? process.env, bashState: opts._bashState, expired: () => opts._budget.now() > opts._budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  const cmds = simpleCommands(raw, { env: opts.env ?? process.env, bashState: opts._bashState, expired: () => budgetExpired(opts._budget) }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
@@ -5044,7 +5044,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const rawOfCmd = (c) => maskProse(c.raw, prose.get(c).values);
   const wordsOf = (c) => { const d = prose.get(c).drop; return d.size ? c.argv.filter((_, i) => !d.has(i)) : c.argv; };
   for (const c of cmds) {
-    checkDeadline(ctx.budget); // (the one wall-clock deadline of the evaluation, checked at every command: a hook past its timeout is ALLOWED)
+    checkDeadline(ctx.budget); // (the one deadline of the evaluation (CPU limit and hard wall cap), checked at every command: a hook past its timeout is ALLOWED)
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');

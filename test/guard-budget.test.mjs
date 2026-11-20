@@ -11,7 +11,8 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
-import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, newEvalBudget, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { HOOK_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -103,6 +104,70 @@ for (const [name, run] of both) {
     // the same chain on a clock that stands still is fine
     const fast = name === 'guard-git' ? git('bash a.sh', inner, { now: () => 5 }) : files('bash a.sh', inner, { now: () => 5 });
     assert.equal(fast.decision, 'allow');
+  });
+}
+
+// ---- CPU limit + hard wall cap (#627) -------------------------------------------------------------------------------
+// Why: the limit counts the hook's CPU time, so a loaded machine (wall runs ahead of the work) no longer refuses ordinary commands; a hook that
+// runs past the host timeout (HOOK_TIMEOUT_S) is ALLOWED by Claude Code, so a hard wall cap below it still refuses whatever the CPU says.
+
+test('the hard wall cap leaves margin under the host hook timeout (a hook past its timeout is allowed)', () => {
+  assert.ok(EVAL_WALL_CAP_MS > EVAL_DEADLINE_MS, 'the wall cap is above the CPU limit');
+  assert.ok(EVAL_WALL_CAP_MS <= HOOK_TIMEOUT_S * 1000 - 3000, `wall cap ${EVAL_WALL_CAP_MS} ms must leave >= 3 s of the ${HOOK_TIMEOUT_S} s hook timeout for startup and output`);
+});
+
+// wall and cpu are two fake clocks that start at 0 (ms)
+const clocks = (wall = 0, cpu = 0) => { const c = { wall, cpu }; return { c, budget: newEvalBudget(() => c.wall, () => c.cpu) }; };
+
+test('budget: wall 6 s but CPU 1 s is not expired; CPU past the limit and wall past the cap each are, and the scanners agree with checkDeadline', () => {
+  const cases = [
+    ['busy machine: wall 6 s, cpu 1 s', 6000, 1000, 'ok'],
+    ['at the CPU limit exactly', 5000, 5000, 'ok'],
+    ['real blow-up: cpu past 5 s', 5600, 5600, 'cpu'],
+    ['cpu cannot exceed wall: a clock that over-reports cpu never refuses early', 3000, 9000, 'ok'],
+    ['little cpu but wall past the hard cap', EVAL_WALL_CAP_MS + 1, 100, 'wall'],
+    ['wall at the cap exactly, little cpu', EVAL_WALL_CAP_MS, 100, 'ok'],
+  ];
+  for (const [label, wall, cpu, want] of cases) {
+    const { c, budget } = clocks();
+    Object.assign(c, { wall, cpu });
+    assert.equal(budgetExpired(budget), want !== 'ok', label);
+    if (want === 'ok') assert.doesNotThrow(() => checkDeadline(budget), label);
+    else assert.throws(() => checkDeadline(budget), (e) => e instanceof GuardLimit && (want === 'wall' ? /too busy/ : /script chain or a command line too large/).test(e.message), label);
+  }
+});
+
+test('budget: the limit counts from the start of the evaluation, not from the process start', () => {
+  const { c, budget } = clocks(1_000_000, 900_000);
+  Object.assign(c, { wall: 1_004_000, cpu: 903_000 });
+  assert.equal(budgetExpired(budget), false);
+  Object.assign(c, { wall: 1_007_000, cpu: 906_000 });
+  assert.equal(budgetExpired(budget), true);
+});
+
+// the same through both policies: script reads advance the fake clocks (a chain of four scripts, so several checkpoints see them)
+const CHAIN4 = { 'a.sh': 'bash b.sh', 'b.sh': 'bash c.sh', 'c.sh': 'bash d.sh', 'd.sh': 'echo hi' };
+for (const [name] of both) {
+  const slowBy = (dWall, dCpu) => {
+    const c = { wall: 0, cpu: 0 };
+    const inner = name === 'guard-git' ? gitFs(CHAIN4) : filesFs(CHAIN4);
+    const fs = { ...inner, readText: (p) => { c.wall += dWall; c.cpu += dCpu; return inner.readText(p); } };
+    const o = { now: () => c.wall, cpu: () => c.cpu };
+    return name === 'guard-git' ? git('bash a.sh', fs, o) : files('bash a.sh', fs, o);
+  };
+  test(`${name}: a busy machine (wall 8 s, CPU 1 s over the evaluation) still allows an ordinary chain`, () => {
+    const r = slowBy(2000, 250);
+    assert.equal(r.decision, 'allow', `${r.decision}: ${r.reason}`);
+  });
+  test(`${name}: CPU past the limit is still denied with the "took too long" reason`, () => {
+    const r = slowBy(2000, 2000);
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /took too long \(a script chain/);
+  });
+  test(`${name}: little CPU but wall past the hard cap is denied (a hook past the host timeout is allowed)`, () => {
+    const r = slowBy(4000, 10);
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /too busy/);
   });
 }
 

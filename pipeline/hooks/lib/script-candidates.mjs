@@ -16,8 +16,14 @@ export const MAX_CANDIDATES = 32; // more words than this are refused, not judge
 // 128: a real chain (verify -> lint, tests, build ...) reads a few dozen scripts at most, and 128 reads of the largest
 // judged file (200,000 characters) still finish in a fraction of the deadline below.
 export const MAX_SCRIPT_JUDGMENTS = 128;
-// Wall-clock limit for one evaluation, measured from the top-level call (nested calls share it): a third of the hook timeout.
+// CPU-time limit for one evaluation, measured from the top-level call (nested calls share it): a third of the hook timeout.
+// CPU time, not wall time (#627): on a loaded machine wall time runs far ahead of the work done, and ordinary short commands were refused.
+// The CPU used is capped at the wall time elapsed (CPU cannot exceed wall), so a clock that over-reports never refuses early.
 export const EVAL_DEADLINE_MS = 5000;
+// Hard wall-clock cap, the fail-closed bound: Claude Code ALLOWS a hook that runs past its timeout (HOOK_TIMEOUT_S, 15 s, in lib/installer.mjs),
+// so however little CPU the check used, it is refused once this much wall time has passed since the top-level call. It leaves the rest of the
+// hook timeout for node startup, module load (both before the evaluation starts) and writing the answer.
+export const EVAL_WALL_CAP_MS = 10_000;
 // Variable expansion: one call may add at most one command line of text (the same 200,000 as MAX_LINE_CHARS), and the text
 // ADDED by expansion across one evaluation is bounded too (`A=<60k chars> ...` used by thousands of words).
 export const MAX_EXPANDED_CHARS = 200_000;
@@ -483,13 +489,29 @@ export class GuardLimit extends Error {}
 // that each assign four names twice and loop over eight words were 1024 readings each, 1024^3 in all, and the check ended at the 5 s deadline instead of at once. The readings of a whole
 // evaluation, nested scripts included, share this allowance; past it the check is refused (GuardLimit), as for too many script files.
 export const MAX_TOTAL_READINGS = 1024;
-export function newEvalBudget(now = Date.now) {
+const processCpuMs = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
+// `now` (wall, ms) and `cpu` (CPU, ms) are injectable so tests do not depend on timing. A test that injects only `now` gets one clock for both
+// (the old single-clock behaviour); the real default reads the process's CPU time.
+export function newEvalBudget(now = Date.now, cpu = now === Date.now ? processCpuMs : now) {
   // startupOk: startup files already judged in a given state (see the policies), so a line with many shells reads ~/.zshenv once, not once each
-  return { now, deadline: now() + EVAL_DEADLINE_MS, scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
+  return { now, cpu, wall0: now(), cpu0: cpu(), scripts: MAX_SCRIPT_JUDGMENTS, readings: MAX_TOTAL_READINGS, grown: 0, startupOk: new Set() };
 }
 
+// Why the evaluation must stop, or null: past the hard wall cap (fail-closed against the host timeout), or past the CPU limit.
+export function budgetExpiry(budget) {
+  const wall = budget.now() - budget.wall0;
+  if (wall > EVAL_WALL_CAP_MS) return 'wall';
+  if (Math.min(budget.cpu() - budget.cpu0, wall) > EVAL_DEADLINE_MS) return 'cpu';
+  return null;
+}
+
+// The one predicate every deadline reader uses (checkDeadline, and the scanners' `expired` callbacks).
+export const budgetExpired = (budget) => budgetExpiry(budget) !== null;
+
 export function checkDeadline(budget) {
-  if (budget.now() > budget.deadline) throw new GuardLimit('the check took too long (a script chain or a command line too large to verify in time), so it cannot be verified. Split it into simpler commands or name the script file.');
+  const why = budgetExpiry(budget);
+  if (why === 'wall') throw new GuardLimit('the check took too long (the machine was too busy to finish it in time), so it cannot be verified. Try the command again, or split it into simpler commands.');
+  if (why === 'cpu') throw new GuardLimit('the check took too long (a script chain or a command line too large to verify in time), so it cannot be verified. Split it into simpler commands or name the script file.');
 }
 
 // A reading of a text is about to be judged: one unit of the shared allowance of readings.
