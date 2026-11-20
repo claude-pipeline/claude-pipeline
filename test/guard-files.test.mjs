@@ -44,6 +44,7 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/pipeline-state/db-refs.json', // (#262)
     '/home/u/.claude/pipeline-state/codex',
     '/home/u/.codex/sessions',
+    '/home/u/.claude/pipeline-local', // (#648)
   ]);
   assert.equal(protectedRoots('C:\\Users\\u\\')[0], 'C:/Users/u/.claude/skills/ship');
 });
@@ -2148,6 +2149,25 @@ test('#256 the machine-wide Codex record and Codex\'s session logs are protected
     "echo '{}' > ~/.claude/pipeline-state/codex/status.json",
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [`cat ${R}/status.json`, `ls ${S}`, `grep token_count ${S}/2026/11/11/rollout-a.jsonl`, 'ls ~/.codex', 'cat ~/.codex/config.toml']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// cp #648: failure caught = an agent that keeps hitting outbound-scan-blocked deletes or repoints the scan config, and every later write goes out unscanned.
+test('#648 the outbound-scan config folder (~/.claude/pipeline-local) is protected from every write, move and delete, in every account config dir; reading it stays open', () => {
+  const F = '/home/u/.claude/pipeline-local/outbound-scan.json';
+  for (const p of [F, '~/.claude/pipeline-local/outbound-scan.json']) {
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
+  }
+  for (const cmd of [
+    `echo '{"command":"/usr/bin/true"}' > ${F}`, `cp /tmp/forged.json ${F}`, `rm ${F}`, `rm -rf ~/.claude/pipeline-local`, `mv ${F} /tmp/x.json`,
+    'mv ~/.claude/pipeline-local /tmp/x && mkdir ~/.claude/pipeline-local', 'cp -R /tmp/forged/. ~/.claude/pipeline-local',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`cat ${F}`, 'ls ~/.claude/pipeline-local', `grep command ${F}`, 'echo x > ~/.claude/pipeline-locale/x']) assert.equal(bash(cmd), 'allow', cmd);
+  assert.equal(file('Write', { file_path: '/home/u/.claude/pipeline-local-notes/a.md', content: 'x' }), 'allow', 'a prefix lookalike');
+  // another account's config dir (~/.claude-eaglewatch) holds the same folder
+  const acct = { readDir: (d) => (d === '/home/u' ? ['.claude-eaglewatch', '.claude'] : null) };
+  assert.equal(file('Write', { file_path: '/home/u/.claude-eaglewatch/pipeline-local/outbound-scan.json', content: '{}' }, acct), 'deny');
+  assert.equal(file('Write', { file_path: '/home/u/.claude-eaglewatch/notes.md', content: 'x' }, acct), 'allow');
 });
 
 test('#256 R5-B1 the ~/.codex folder itself is a protected reference: a recursive copy, move, remove or cd+relative write into it is denied, plain reads stay open', () => {

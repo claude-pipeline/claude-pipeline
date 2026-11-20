@@ -67,6 +67,8 @@ const PROTECTED_REL = [
   // logs (the weekly-usage figure is read from them, so an agent may not write them)
   '.claude/pipeline-state/codex',
   '.codex/sessions',
+  // cp #648: the machine-local folder (outbound-scan.json: the outbound text scanner's list and command, pipeline/lib/github.mjs). Removing or repointing it lets every later write go out unscanned, so only the owner edits it, from a terminal
+  '.claude/pipeline-local',
 ];
 
 // The directories that hold them. Writing INTO them is fine (history, projects, CLAUDE.md, other skills), but
@@ -744,7 +746,7 @@ function accountConfigDirs({ base, cfgDir, readDir, home }) {
   return [...dirs];
 }
 function configRoots(o) {
-  return accountConfigDirs(o).flatMap((d) => ['hooks', 'settings.json', 'settings.local.json'].map((r) => `${d}/${r}`));
+  return accountConfigDirs(o).flatMap((d) => ['hooks', 'settings.json', 'settings.local.json', 'pipeline-local'].map((r) => `${d}/${r}`));
 }
 // The scripts of the dialog-hook list the owner approved (<home>/.claude/pipeline-state/owner-go/dialog-hooks.json, written by `P owner-go approve-dialog-hooks`): each one is a hook on
 // AskUserQuestion, so an edit to it changes what runs on the owner's dialogs. Read fail-safe: a missing or unreadable list adds nothing (the folder that holds it is protected already).
