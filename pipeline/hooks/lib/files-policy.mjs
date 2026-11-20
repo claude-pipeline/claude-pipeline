@@ -2539,9 +2539,10 @@ function unquotedAt(text, end) {
 function arithView(raw) {
   return raw.replace(INLINE_NODE_WORD, (all, single, double, at) => {
     const before = raw.slice(0, at);
-    if (/\$\(|`|<</.test(before) || !unquotedAt(raw, at)) return all;
+    if (/\$\(|`|<<|\\|\$['"]/.test(before) || !unquotedAt(raw, at)) return all; // (a backslash, `$'` or `$"` before it: the quote scan does not know ANSI-C quoting or escapes, so the line is read as written)
     const head = all.slice(0, all.search(/['"]/));
     if (single !== undefined) return `${head}'${single.replace(/\((?=\()/g, '( ').replace(/(?<!\w)let(?=\s)/g, 'lXt')}'`;
+    if (double.includes('\\')) return all;
     return `${head}"${double.replace(/\((?=\()/g, '( ')}"`;
   });
 }

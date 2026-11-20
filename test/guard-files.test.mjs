@@ -2249,6 +2249,28 @@ test('items 5b/10: a ((, a let or a (x||[]) inside a quoted node -e program is n
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
+// Items 5b/10, quote desync (a live zsh exploit found by a probe): the gate's quote scan does not know ANSI-C `$'..\'..'` quoting, a backslash escape or `$"`, so a `$'\''` before a node -e word makes it read a `((x))` that
+// zsh really runs (with a planted `x`) as the inside of a quoted program, and rewrites it away. Failure caught: the line below is allowed and the planted `$(touch SENT)` runs.
+test('items 5b/10: an ANSI-C quote, a backslash or $" before a node -e word, and a backslash inside a double-quoted program, leave the arithmetic gate reading the line as written', () => {
+  const plants = [
+    `x=$'path[\\x24(touch SENT)]'`,
+    `x=path\\[\\$\\(touch\\ SENT\\)\\]`,
+    `printf -v x 'path[\\044(touch SENT)]'`,
+  ];
+  const shapes = [
+    (pl) => `${pl}; : $'\\'' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    (pl) => `${pl}; echo $'\\'' ' ; node -e '$((x))' ; true ; echo ' ; cat .review/state.json`,
+    (pl) => `${pl}; : $'a\\'b' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+  ];
+  for (const pl of plants) for (const sh of shapes) assert.equal(bash(sh(pl)), 'deny', sh(pl));
+  for (const cmd of [
+    `: $'a\\'b' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `: \\' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `: $"a" '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `node -e "console.log(\\"a\\", ((1)))" .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
 // Item 7b (refused: `for i in 1 2 3 4; do out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540); echo "$out"; done`): an assignment whose whole value is one command substitution is judged as the
 // command inside it (the bare pipeline CLI call is allowed on its own); that command is still judged, and any other text beside it, a redirect or a variable the shell reads keep the refusal.
 test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a write inside the substitution, extra text, a redirect and PATH= stay refused', () => {
