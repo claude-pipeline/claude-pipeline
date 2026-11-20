@@ -244,6 +244,9 @@ const makesNoRequest = (c) => {
 // the first words of every supabase subcommand and alias (`supabase --help` of CLI 2.122; re-check on a CLI update), plus those the tables below do not carry
 const SUB_HEADS = new Set([...[...LOCAL_ONLY, ...REMOTE_CAPABLE].map((p) => p[0]), 'migrations', 'experimental', 'issue', 'feedback']);
 const isSubcommandHead = (w) => SUB_HEADS.has(w) || /^network-/.test(w);
+// what a glob word is matched against (`network-x` stands for the `network-*` family), and the longest of them: a pattern that must consume more characters than that matches none
+const GLOB_HEADS = [...SUB_HEADS, 'network-x'];
+const GLOB_HEAD_MAX = Math.max(...GLOB_HEADS.map((h) => h.length));
 // B7: a supabase TOKEN in a line's text = `supabase` (optionally `npm:` / `nixpkgs#` before, `-cli` / `@version` / .exe .cmd .bat after) as the LAST path component of a word: not followed by `/ . _ -` or a word character
 // (`supabase/migrations/x.sql`, `SUPABASE_URL`, `supabase.from(`, `supabase.com`, `@supabase/supabase-js` are not tokens; `supabase`, `./node_modules/.bin/supabase`, `'supabase db push'` are)
 const SB_TOKEN_SRC = String.raw`(?<![\w.@-])(?:npm:|nixpkgs#)?supabase(?:-cli)?(?:@[^/\\\s'"]*)?(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`;
@@ -279,16 +282,21 @@ function sbTokenHead(text) {
   return first >= 0 && words.slice(first + 1).some(possibleHead);
 }
 // B8: a word with glob characters (`d?`, `*`, `[d]b`) counts as a subcommand head when the shell pattern matches one; `'src/**/*.ts'` and `httpx[http2]` match none. A pattern the guard cannot read counts as a match
+// (R6-F1: a word with whitespace is never a glob -- quoted words are not globbed -- and one that must consume more characters than the longest head, a long path or URL operand, can match none)
+// (R6-F2: the cost of a line is its word count times a per-word cost the 8-metacharacter cap bounds; a 190 kB line of the worst shapes measured 0.8 to 0.9 s, and findLiveDbCli is given no deadline to poll)
 function globMatchesHead(w) {
   if (!/[*?[]/.test(w)) return false;
-  // R5-F1: runs of `*` are one star, and a pattern that is long or has many metacharacters is not matched at all (each `*` becomes `.*`, which backtracks past the hook timeout on a literal no head contains): fail closed
+  if (/\s/.test(w)) return false;
+  // R5-F1: runs of `*` are one star, and a pattern with many metacharacters is not matched at all (each `*` becomes `.*`, which backtracks past the hook timeout on a literal no head contains): fail closed
   w = w.replace(/\*+/g, '*');
-  if (w.length > 64 || (w.match(/[*?[]/g) ?? []).length > 8) return true;
+  if ((w.match(/[*?[]/g) ?? []).length > 8) return true;
   let re = '';
+  let need = 0; // the characters the pattern must consume: literals, `?` and each bracket class
   for (let i = 0; i < w.length; i += 1) {
     const ch = w[i];
-    if (ch === '*') re += '.*';
-    else if (ch === '?') re += '.';
+    if (ch === '*') { re += '.*'; continue; }
+    need += 1;
+    if (ch === '?') re += '.';
     else if (ch === '[') {
       const j = w.indexOf(']', i + 2);
       if (j < 0) { re += '\\['; continue; }
@@ -299,9 +307,10 @@ function globMatchesHead(w) {
       i = j;
     } else re += ch.replace(/[.+^${}()|\\\]]/g, '\\$&');
   }
+  if (need > GLOB_HEAD_MAX) return false;
   try {
     const rx = new RegExp(`^${re}$`);
-    return [...SUB_HEADS, 'network-x'].some((h) => rx.test(h));
+    return GLOB_HEADS.some((h) => rx.test(h));
   } catch { return true; }
 }
 // an expansion after the supabase word (`supabase $SUB`, `supabase "$@"`) can become a subcommand; a glob (`'src/**/*.ts'`, `'httpx[http2]'`) is a file or package pattern

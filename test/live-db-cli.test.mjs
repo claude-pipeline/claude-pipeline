@@ -600,6 +600,38 @@ test('a 190 kB word of repeated supabase@ tokens is decided fast, not by the hoo
   }
 });
 
+// R6-F2: four stars and four \`?\` in a word still backtrack per head; the same words by the thousand in one quoted string (and at the top level, behind the word cap) must be decided far from the hook limit
+test('a 190 kB line of star-and-question-mark words is denied fast, not by the hook deadline', () => {
+  const words = '*?*?*?*?z '.repeat(19000);
+  for (const line of [
+    `doppler run --command 'supabase ${words}; supabase db push'`,
+    `x supabase ${words}; supabase db push`,
+    `x supabase ${'*?*?*?*?z '.repeat(3900)}; supabase db push`,
+  ]) {
+    const t0 = Date.now();
+    const v = verdict(line);
+    const ms = Date.now() - t0;
+    assert.equal(v.decision, 'deny');
+    assert.doesNotMatch(v.reason ?? '', /took too long/);
+    assert.ok(ms < 2000, `took ${ms} ms`);
+  }
+});
+
+// R6-F1: a long word with a \`*\` or \`?\` (a query, a URL) after a bare \`supabase\` name is an operand, not a subcommand head: such lines were allowed before the length cap of R5 refused them
+test('a long glob-bearing operand after a supabase name is not read as a subcommand head', () => {
+  for (const line of [
+    `docker compose exec supabase psql -c "select * from public.some_long_table_name where created_at > now() - interval '1 day'"`,
+    `ssh supabase 'curl "https://example.com/a/very/long/path/that/goes/on/and/on?x=1&y=2"'`,
+    `ssh supabase 'https://example.com/a/very/long/path/that/goes/on/and/on?x=1&y=2'`,
+  ]) {
+    const v = verdict(line);
+    assert.doesNotMatch(v.reason ?? '', /not a subcommand the guard knows/, line);
+    assert.equal(v.decision, 'allow', `${line}: ${v.reason}`);
+  }
+  // (a short glob that can be a head stays refused)
+  assert.match(verdict("ssh supabase 'd?'").reason ?? '', /not a subcommand the guard knows/);
+});
+
 test('an unknown subcommand names itself', () => {
   assert.match(verdict('supabase frobnicate').reason, /not a subcommand the guard knows/);
 });
