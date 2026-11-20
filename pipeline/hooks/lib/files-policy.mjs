@@ -6109,7 +6109,22 @@ function evaluateBashForFilesFrame(command, opts) {
     && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && !Object.values(c.env ?? {}).some((v) => m.rawHit(v, dirs))
     && !c.argv.slice(1).some((w) => /[$`]/.test(w)) && !c.argv.slice(3).some((w) => tokenHit(w)) && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
     && !((m.rawHit(c.argv[2], dirs, true) || m.pathHit(c.argv[2], dirs, true)) && (WRITE_HINT.test(c.argv[2]) || INLINE_NODE_RISK.test(c.argv[2])));
-  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c) && !readsInlineNode(c));
+  // Item 7b (guard false refusals): `out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait …)`: an assignment that gives plain lower-case names (no shell variable the shell reads: PATH, IFS, the zsh `path` family ...) nothing but ONE whole
+  // command substitution is judged as the command inside it, which is a command of the line like any other (judged above and below: `out=$(rm …)` is still refused as rm). A value with any other text, a redirect, and every other name keep the rule above.
+  const TIED_NAMES = /^(?:path|cdpath|fpath|manpath|mailpath|module_path|watch|fignore|histchars|psvar|argv|status|pipestatus|prompt|signals|options|commands|aliases|functions|parameters|keymaps|widgets)$/;
+  const wholeSubstitution = (v) => {
+    const s = String(v).replace(/^"([^"]*)"$/, '$1');
+    if (!s.startsWith('$(') || s.startsWith('$((') || !s.endsWith(')') || /`/.test(s)) return false;
+    let depth = 0;
+    for (let i = 1; i < s.length; i++) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')' && --depth === 0 && i !== s.length - 1) return false;
+    }
+    return depth === 0;
+  };
+  const assignsSubstitution = (c) => c.argv.length === 0 && !(c.redirects ?? []).length && Object.keys(c.env ?? {}).length > 0
+    && Object.entries(c.env).every(([k, v]) => /^[a-z][a-z0-9_]*$/.test(k) && !TIED_NAMES.test(k) && wholeSubstitution(v));
+  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c) && !readsInlineNode(c) && !assignsSubstitution(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
     // #295: a command that is read-only in itself, refused only because the line's heredoc text holds an expansion that can evaluate (ctx.heredocPlants, R5-F3): say so, not "is not a read-only command"

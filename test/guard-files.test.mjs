@@ -2305,3 +2305,28 @@ test('items 5b/10: a ((, a let or a (x||[]) inside a quoted node -e program is n
     `node -e '((x))' > .review/state.json`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
+
+// Item 7b (refused: `for i in 1 2 3 4; do out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540); echo "$out"; done`): an assignment whose whole value is one command substitution is judged as the
+// command inside it (the bare pipeline CLI call is allowed on its own); that command is still judged, and any other text beside it, a redirect or a variable the shell reads keep the refusal.
+test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a write inside the substitution, extra text, a redirect and PATH= stay refused', () => {
+  const P = 'node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540';
+  for (const cmd of [
+    `out=$(${P}); echo "$out"`,
+    `for i in 1 2 3 4; do out=$(${P}); echo "$out"; done`,
+    `out="$(${P})"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    'out=$(rm ~/.claude/pipeline/x)',
+    'out=$(cp /tmp/a ~/.claude/pipeline/x)',
+    `out=$(${P}; rm ~/.claude/pipeline/y)`,
+    `out=$(${P} | tee ~/.claude/pipeline/y)`,
+    `out=$(${P}) > ~/.claude/pipeline/y`,
+    `out=x$(${P})`,
+    `out="$(${P}) ~/.claude/pipeline/y"`,
+    `out=$(${P})$(rm ~/.claude/pipeline/y)`,
+    `PATH=$(${P})`,
+    `PATH=/x$(${P})`,
+    `path=$(${P})`,
+    `OUT=$(${P})`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
