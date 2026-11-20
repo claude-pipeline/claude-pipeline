@@ -17,6 +17,7 @@ import {
   parseRoundGrant, presentedRoundRequest, recordRoundGrant, recordPastRoundGrant, ownerGrantedRounds, ownerGrantGap, ownerGrantLookups, ownerGrantConfigDirHint, grantIdOf, markerPath, claimGrantMarkers, readGrantMarker, verifyOwnerGrant,
   readRecords, ROUND_CLAIMS_REL, roundTicketKey, roundCoverage, roundCoverageSource, pastRoundGrantsFor, ownerPastRoundRecords,
 } from '../pipeline/hooks/lib/owner-go.mjs';
+import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { HOME_CONFIG_DIR_RE, TRANSCRIPT_PROJECT_RE, isTranscriptFile, toPosix, transcriptConfigDirs, transcriptRes } from '../pipeline/lib/paths.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { OWNER_ENTRY, linesOf, ownerGrants, pastRoundRequest, roundRequest, runHook } from './helpers/owner-go.mjs';
@@ -816,6 +817,24 @@ test('#128 Codex #145 P1: a transcript is evidence only under ~/<HOME_CONFIG_DIR
 });
 
 // Fix round item 4: the default home is the ACCOUNT's (os.userInfo), never $HOME, which the agent can point at a folder it writes.
+// #418: Claude Code writes a hidden note (isMeta, no provenance field) with the SAME promptId when Read opens an image in the granted turn.
+test('#418 promptProvenance: an isMeta image note sharing the owner prompt\'s promptId does not make the grant synthetic; a second real prompt entry still does', () => {
+  const root = tmp();
+  const at = (entries) => {
+    const f = join(root, '.claude/projects/-repo/s.jsonl');
+    mkdirSync(join(f, '..'), { recursive: true });
+    writeFileSync(f, entries.map((e) => `${JSON.stringify(e)}\n`).join(''));
+    return { transcript_path: f, prompt_id: 'pid-img' };
+  };
+  const owner = promptEntry('extra round', OWNER_META, 'pid-img');
+  // the real shape (Claude Code 2.1.258): entrypoint cli and userType external on every line, turnCompanion true, no promptSource / origin
+  const note = { type: 'user', isMeta: true, promptId: 'pid-img', entrypoint: 'cli', userType: 'external', turnCompanion: true, message: { content: [{ type: 'text', text: '[Image: original 1440x6616, displayed at 1440x1600]' }] } };
+  assert.equal(promptProvenance(at([owner, said('ok'), note]), { env: {}, home: root }), 'owner', 'a meta image note after the typed prompt');
+  assert.equal(promptProvenance(at([owner, note, { ...note, uuid: 'n2' }]), { env: {}, home: root }), 'owner', 'two image notes');
+  assert.equal(promptProvenance(at([owner, promptEntry('extra round', OWNER_META, 'pid-img')]), { env: {}, home: root }), 'synthetic', 'a forged second typed entry');
+  assert.equal(promptProvenance(at([owner, { ...note, promptSource: 'system' }]), { env: {}, home: root }), 'synthetic', 'a meta entry that carries provenance still counts');
+});
+
 test('#128 isTranscriptFile / promptProvenance / transcriptConfigDirs: the default home is the account home, not $HOME', () => {
   const savedHome = process.env.HOME;
   const savedProfile = process.env.USERPROFILE;
@@ -1724,6 +1743,32 @@ test('#128 legacy grant: no transcript, two different transcripts, a subagent\'s
   for (const f of [join(evil.home, '.claude', 'x.jsonl'), join(evil.home, '.claude', 'projects', 'x.jsonl'), join(evil.home, '.claude', 'projects', '-repo', 'x.jsonl')]) writeFileSync(f, lines(legacyEntries));
   for (const s of ['../x', '../../x', '-repo/../x', 'a/b', '', '.', null, undefined, 7]) assert.equal(legacyTranscriptOf(s, { home: evil.home, env: {} }), null, String(s));
   assert.equal(legacyTranscriptOf('x', { home: evil.home, env: {} }), join(evil.home, '.claude', 'projects', '-repo', 'x.jsonl'), 'a plain name is found');
+});
+
+// #190.2: the refusal names WHY the grant cannot be verified (it used to say only "cannot be verified on this machine")
+const reasonOf = (w, { claim = true } = {}) => {
+  const record = legacyRecord({ k: 1 });
+  if (claim) assert.equal(claimGrantMarkers([record], { repo: REPO, pr: 58, k: 1, head: GHEAD, checkout: '/work/app' }, { home: w.home }).ok, true);
+  const state = { maxRounds: 1, rounds: [{ n: 1, toHead: GHEAD, ownerGrant: { grantId: grantIdOf(record), k: 1, quote: 'extra round' } }] };
+  const r = verifyOwnerGrants(state, { repo: REPO, pr: 58, home: w.home, env: {} });
+  assert.equal(r.ok, false);
+  return r.problems.join('; ');
+};
+
+test('#190.2 a legacy grant whose transcript cannot be found says so, naming the transcript it needs', () => {
+  const w = legacyWorld({ entries: legacyEntries, places: [], record: legacyRecord({ k: 1 }) });
+  const msg = reasonOf(w);
+  assert.match(msg, /round 1: owner grant cannot be verified on this machine — run the gate on the machine that reviewed it \(the only recovery once the round is published\)/, 'the pinned prefix and recovery stay');
+  assert.match(msg, /not found as typed by the owner in this session's transcript on this machine/);
+  assert.match(msg, /exactly one .*projects.*<session>\.jsonl/);
+});
+
+test('#190.2 a grant that was never consumed on this machine says so (own wording)', () => {
+  const w = legacyWorld({ entries: legacyEntries, record: legacyRecord({ k: 1 }) });
+  const msg = reasonOf(w, { claim: false });
+  assert.match(msg, /owner grant cannot be verified on this machine/);
+  assert.match(msg, /this grant was never consumed on this machine/);
+  assert.doesNotMatch(msg, /transcript/);
 });
 
 test('#128 legacy grant: nothing else gets this: a pre-#128 "merge" with a findable transcript approves nothing', () => {

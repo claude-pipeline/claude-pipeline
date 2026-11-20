@@ -131,7 +131,7 @@ export const run = guarded(async (argv, ctx) => {
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
     });
     warnings.push(...guard.warnings);
-    const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing });
+    const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing, retry: true });
     for (const w of posted.warnings) if (!warnings.includes(w)) warnings.push(w);
     const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), codexUsage: usage, ...(testsAddedLine === undefined ? {} : { testsAdded: testsAddedLine }), warnings };
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.

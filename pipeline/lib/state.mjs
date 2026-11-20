@@ -34,8 +34,10 @@ const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 // not know the variant), so it must refuse the state loudly instead of misreading it.
 // Version 9: a final carries `sameOnBase` (an arbiter dismissal on a review.regression_only_paths file, #559 A2): a pipeline of version 8 would not hold the review back until its FOLLOW-UP is filed,
 // and would leave it out of the owner's bound items.
+// Version 10: a final carries `postMax.rule === 'cap-low'` (an unbuilt low-severity ACCEPT deferred at the round cap, the owner-approval route): a pipeline of version 9 reads it as an ordinary post-limit follow-up and would merge it
+// with no owner "merge" and no Rulings block shown.
 // A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
-export const SUPPORTED_STATE_VERSION = 9;
+export const SUPPORTED_STATE_VERSION = 10;
 export const STATE_VERSION_CLAUDE = 2;
 export const STATE_VERSION_DEFERRAL = 3;
 export const STATE_VERSION_SUBSTITUTE = 4;
@@ -43,6 +45,9 @@ export const STATE_VERSION_OUT_OF_MODEL = 5;
 export const STATE_VERSION_POST_MAX = 6;
 export const STATE_VERSION_OWNER_DEFERRAL = 7;
 export const STATE_VERSION_SAME_ON_BASE = 9;
+export const STATE_VERSION_CAP_LOW = 10;
+// Does any final of the state carry the cap-low rule on its post-max marker (a cached copy too)? Then the writer lifts the state to STATE_VERSION_CAP_LOW (and only then). The rule's name is triage.mjs CAP_LOW_RULE (not imported: that module imports this one).
+export const stateNeedsCapLowVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => i?.final?.postMax?.rule === 'cap-low'));
 // Does any final of the state carry the same-on-base mark (a cached copy too)? Then the writer lifts the state to STATE_VERSION_SAME_ON_BASE (and only then).
 export const stateNeedsSameOnBaseVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => typeof i?.final?.sameOnBase === 'string' && i.final.sameOnBase !== ''));
 // Does any final of the state carry the owner-deferral mark (the original and a cached copy alike)? Then the writer lifts the state to STATE_VERSION_OWNER_DEFERRAL (and only then).
@@ -66,9 +71,10 @@ export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute
 // Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
 export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
 const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
-// The lowest version that may hold this state, the HIGHEST any feature in it needs: 9 when a final carries the same-on-base mark, 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
+// The lowest version that may hold this state, the HIGHEST any feature in it needs: 10 when a final carries the cap-low rule (stateNeedsCapLowVersion), 9 when a final carries the same-on-base mark, 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
 // 4 when it holds a substitute round / second review or a governor / budget decision, else 1.
 export function requiredStateVersion(state) {
+  if (stateNeedsCapLowVersion(state)) return STATE_VERSION_CAP_LOW;
   if (stateNeedsSameOnBaseVersion(state)) return STATE_VERSION_SAME_ON_BASE;
   if (stateNeedsClickDialogVersion(state)) return STATE_VERSION_CLICK_DIALOG;
   if (stateNeedsOwnerDeferralVersion(state)) return STATE_VERSION_OWNER_DEFERRAL;
@@ -195,10 +201,10 @@ export function encodeForComment(state) {
   return `<!-- claude-pipeline:state:${gzipSync(Buffer.from(JSON.stringify(withRequiredVersion(state)))).toString('base64')} -->`;
 }
 
-// Bad data of any kind yields null, never an exception: resume must fall back to a fresh review,
-// not crash on someone's edited comment. The LAST marker wins so that quoted or forged markers
-// earlier in a body cannot override the real one the pipeline writes at the end.
-export function decodeFromComment(body) {
+// The state in the comment's LAST marker, or null for bad data of any kind (never an exception): resume must fall back to a fresh review,
+// not crash on someone's edited comment. The LAST marker wins so that quoted or forged markers earlier in a body cannot override the real one
+// the pipeline writes at the end. Its version is NOT judged here (decodeFromComment / newerFormatInComment do).
+function decodeLastMarker(body) {
   if (typeof body !== 'string') return null;
   const matches = [...body.matchAll(STATE_MARKER)];
   if (matches.length === 0) return null;
@@ -207,10 +213,23 @@ export function decodeFromComment(body) {
     const state = JSON.parse(raw.toString('utf8'));
     // Anything that is not recognisably a review state (an array of rounds, a real PR number) is
     // treated as garbage, so a hand-edited comment cannot feed resume a half-made state.
-    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 && !newerThanSupported(state) ? state : null;
+    return isPlainObject(state) && Array.isArray(state.rounds) && Number.isInteger(state.pr) && state.pr > 0 ? state : null;
   } catch {
     return null;
   }
+}
+
+// A state of a version this installation does not read is null here, like any other bad data (newerFormatInComment tells the two apart).
+export function decodeFromComment(body) {
+  const state = decodeLastMarker(body);
+  return state !== null && !newerThanSupported(state) ? state : null;
+}
+
+// The comment's last marker holds a real review state written by a NEWER pipeline: { version, pr }; null for anything else (damaged, readable, no marker).
+// Publishing over it would erase history this install cannot read, so callers refuse and say "update the pipeline", never "restore" or "publish".
+export function newerFormatInComment(body) {
+  const state = decodeLastMarker(body);
+  return state !== null && newerThanSupported(state) ? { version: state.version, pr: state.pr } : null;
 }
 
 // reviewBase / reviewBaseKind: what the round was actually diffed against (see git.mjs#effectiveReviewBase); baseOnly: the

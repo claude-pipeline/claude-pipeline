@@ -194,6 +194,36 @@ test('#352 R30-F3: a -P / -- after the cd operand makes the cd fail (two operand
   allows('cd -- operand', `cd /work/other && cd -- ${GIT_ROOT} && ${PB} origin HEAD`);
   allows('cd -P sub && cd .. in a loop', `for i in 1 2; do ${PB} origin HEAD; cd -P sub && cd ..; done`);
 });
+// (#494: `cd -P` goes to the real directory and a `..` after it to the real parent, while the walk's directories are lexical: `cd -P link && cd .. && push` was judged in /work/repo and ran in /work/other (main). A physical cd is
+// followed only when the directory it starts from and its target hold no symlink; the last of -L / -P wins, per letter (`-LP` is -P). Link table: /work/repo/link -> /work/other/sub, a repository on main.)
+test('#494: a physical cd (-P) through a symlink leaves the directory unknown; through real directories, or a logical cd, it is followed', () => {
+  const links = { [`${GIT_ROOT}/link`]: '/work/other/sub' };
+  const at = (cmd) => evaluateGitCommand(cmd, {
+    cwd: GIT_ROOT, home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [],
+    realpath: (p) => { const q = resolve(p); for (const [l, t] of Object.entries(links)) if (q === resolve(l) || q.startsWith(resolve(l) + '/')) return resolve(t) + q.slice(resolve(l).length); return q; }, ...fakeFs(GIT_ROOT, {}),
+  });
+  const H = `${PB} origin HEAD`;
+  for (const [what, line] of [
+    ['cd link, then cd -P ..', `cd link && cd -P .. && ${H}`],
+    ['cd -P link, then cd -P ..', `cd -P link && cd -P .. && ${H}`],
+    ['cd -P link, then cd ..', `cd -P link && cd .. && ${H}`],
+    ['cd -P link, push there', `cd -P link && ${H}`],
+    ['bare cd -P with HOME a link, then cd ..', `export HOME=${GIT_ROOT}/link; cd -P && cd .. && ${H}`],
+    ['-LP: the last letter wins (physical)', `cd -LP link && cd .. && ${H}`],
+  ]) {
+    const r = at(line);
+    assert.equal(r.decision, 'deny', `${what}: allowed`);
+    assert.match(r.reason, BRANCH, `${what}: ${r.reason}`);
+  }
+  for (const [what, line] of [
+    ['cd -P into a real directory, then cd -P ..', `cd sub && cd -P .. && ${H}`],
+    ['cd -P into a real directory, then cd ..', `cd -P sub && cd .. && ${H}`],
+    ['bare cd -P with HOME a real directory', `export HOME=${GIT_ROOT}/sub; cd -P && cd .. && ${H}`],
+    ['a logical cd through the link, then cd ..', `cd link && cd .. && ${H}`],
+    ['an absolute -P target does not depend on the directory it starts from', `cd link && cd -P ${GIT_ROOT} && ${H}`],
+    ['-PL: the last letter wins (logical)', `cd -PL link && cd .. && ${H}`],
+  ]) assert.equal(at(line).decision, 'allow', what);
+});
 // (#352 R35-B1, R35-B2, R35-F1, R35-F2: ONE rule. A cd / state change is trusted to have run only when it surely did: in a loop's replay a cd REPLACES the places the body may end in only when it is
 // certain there (after ;, not in a branch, an inner loop, the background or a pipeline stage, not negated, every level between the loop and it entered by ;, no redirection that can fail on it, on the
 // closer of its { } group or on the eval that holds it); any other ADDS its target. A `continue` that reaches the loop ends an iteration where it stands. On the straight line, a change with a
@@ -270,24 +300,76 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['straight line: switch with 2>/dev/null (R35 allow flipped)', `cd /work/other; git switch agent/x 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with >&2 (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
-    // (|| exit: sound to allow, since a failed redirection makes the cd fail and the exit runs, but the narrowing only knows a command with no redirection: refused, no new machinery)
-    ['straight line: cd back with 2>/dev/null || exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null, then another command, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && true; ${PB} origin HEAD`],
   ]) {
     denies(what, line, {}, DIRS);
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
   }
-  // (#352 R37-F1: no exception for &&: a redirected change is unknown at once, so a script ending in a redirected switch cannot hand it to its caller. R36 allowed these rows through a 'chain' tracker nothing settled at the end of a text)
+  // (#530 / #545, was refused by R37-F1 (a script ending in a redirected switch must not hand it to its caller, still held: the end of the text forgets it, see the eval pair below): a failed redirection stops
+  // the command and gives status 1, so a command chained with && runs only when the move happened, and one after `|| exit` (a plain exit) the same. The R36 / R37 rows with && and with || exit flip to allow)
   for (const [what, line] of [
-    ['cd back with 2>/dev/null && push (R36 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
-    ['cd back with >&2 && push (R36 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
-    ['cd back with &>/dev/null && push (R36 allow flipped)', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null && push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
+    ['cd back with >&2 && push', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
+    ['cd back with &>/dev/null && push', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
     ['failing redirection on the cd back, then && push', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
     ['failing redirection on the checkout, then && push', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { exit 1; }; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { echo; exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; exit 1; }; ${PB} origin HEAD`],
+    ['quiet pushd && push', `pushd ${GIT_ROOT} >/dev/null && ${PB} origin HEAD`],
+    ['quiet pushd || exit 1, then ;', `pushd ${GIT_ROOT} >/dev/null || exit 1; ${PB} origin HEAD`],
+    ['quiet pushd && push && popd', `pushd ${GIT_ROOT} >/dev/null && ${PB} origin HEAD && popd >/dev/null`],
+    ['a redirected { } group && push', `{ cd ${GIT_ROOT} >/dev/null 2>&1; } && ${PB} origin HEAD`],
+    ['a redirected switch && push', `git switch agent/x 2>/dev/null && ${PB} origin HEAD`],
+  ]) {
+    const startOther = what.startsWith('cd back') ? line : `cd /work/other; ${line}`; // (the cd-back rows start in /work/other themselves)
+    allows(what, startOther);
+    allows(`${what}, in a script`, RUN_SH, script('echo', startOther));
+  }
+  // (still refused: a redirected move nothing proves ran: joined by ;, behind || that does not leave, or settled by another command first)
+  for (const [what, line] of [
+    ['cd back with 2>/dev/null, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || echo, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || echo bad; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || true, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || true; ${PB} origin HEAD`],
+    ['quiet pushd, then ;', `cd /work/other; pushd ${GIT_ROOT} >/dev/null; ${PB} origin HEAD; popd >/dev/null`],
+    // (R1-B1 / R1-F1: `env exit 1` runs in a child and leaves no shell, so it proves nothing about the failed redirection: the push runs from the old directory)
+    ['cd back with < /missing/input || env exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} < /missing/input || env exit 1; ${PB} origin HEAD`],
+    ['cd back with < /missing/input || { echo; env exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} < /missing/input || { echo no >&2; env exit 1; }; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || env exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || env exit 1; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { echo; env exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; env exit 1; }; ${PB} origin HEAD`],
+    // (R2-F1: the wrappers this shell runs itself are no proof either: `command exit 1` (zsh: not found), `noglob exit 1` (bash: unknown), `/usr/bin/time exit 1` (a child) leave nothing, and the line goes on)
+    ...['command', 'noglob', '/usr/bin/time'].flatMap((w) => [
+      [`cd back with 2>/dev/null || ${w} exit 1, then ;`, `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || ${w} exit 1; ${PB} origin HEAD`],
+      [`cd back with 2>/dev/null || { echo; ${w} exit 1; }, then ;`, `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; ${w} exit 1; }; ${PB} origin HEAD`],
+    ]),
+    // (R3-F1: `coproc exit 1` runs the exit in a background subshell (bash 3.2: not found): the keyword is stripped by the parser, so the wrapper mark has to be set there)
+    ['cd back with 2>/dev/null || coproc exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || coproc exit 1; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { echo; coproc exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; coproc exit 1; }; ${PB} origin HEAD`],
+    // (R4-F1: the unnamed group form `coproc { exit 1; }`: the parser splits at the `{`, so the exit is a bare command of a level opened behind coproc; the group runs in a background subshell, nested or not)
+    ['cd back with 2>/dev/null || coproc { exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || coproc { exit 1; }; ${PB} origin HEAD`],
+    ['cd back with 2>/dev/null || { coproc { exit 1; }; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { coproc { exit 1; }; }; ${PB} origin HEAD`],
+    ['cd back with < /missing/input || coproc { exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} < /missing/input || coproc { exit 1; }; ${PB} origin HEAD`],
+    // (R2-F2: a text with a loop reads no failure group, so only the settle step decides here)
+    ['cd back with 2>/dev/null || env exit 1, then ; and a loop', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || env exit 1; ${PB} origin HEAD; for i in 1 2; do :; done`],
+    ['cd back with 2>/dev/null || command exit 1, then ; and a loop', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || command exit 1; ${PB} origin HEAD; for i in 1 2; do :; done`],
   ]) {
     denies(what, line, {}, DIRS);
     denies(`${what}, in a script`, RUN_SH, script('echo', line), DIRS);
   }
+});
+// (#545: the end of a text settles a redirected move nothing proved: an eval'd file (inline, so no child-process rule) ending in `git switch agent/x 2>/dev/null && true` hands nothing on, and a push after it from main is refused.
+// A child script of the same text is refused anyway, so it is no evidence; the file-fed eval is. #530 / F1: the same file with an `|| exit 1` before the `&& true` is proven by the exit and handed on.)
+test('#545: an eval\'d file ending in a redirected switch that nothing proved hands no branch on; one proven by || exit does', () => {
+  const at = (cmd, files) => evaluateGitCommand(cmd, {
+    cwd: '/work/other', home: '/home/u', currentBranch: () => MAIN, pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', { '/work/other/p.sh': `${PB} origin HEAD\n`, ...files }),
+  });
+  const line = 'eval "$(cat ./s.sh)"; bash ./p.sh';
+  const ends = at(line, { '/work/other/s.sh': 'git switch agent/x 2>/dev/null && true\n' });
+  assert.equal(ends.decision, 'deny', 'redirected switch ending the text: allowed');
+  assert.match(ends.reason, BRANCH, ends.reason);
+  assert.equal(at(line, { '/work/other/s.sh': 'git switch agent/x\n' }).decision, 'allow', 'twin: a plain switch');
+  assert.equal(at(line, { '/work/other/s.sh': 'git switch agent/x 2>/dev/null || exit 1 && true\n' }).decision, 'allow', 'F1: proven by || exit 1');
+  assert.equal(at(line, { '/work/other/s.sh': 'git switch agent/x || exit 1 && true\n' }).decision, 'allow', 'F1 twin: no redirection');
 });
 // (#352 R37-F1: the caller trusts the branch a definite script ends on, so a script whose LAST command is a switch that may not have run (a redirection that can fail, a && after a failing command) must not hand it over:
 // cwd a repository on main, reset.sh = `git switch agent/x > /missing/f`, the line `bash ./reset.sh; <push>` sends main when the redirection fails)
@@ -507,6 +589,116 @@ test('#362 R39-B1 / F1 / F2: an alias written and put back by a text that may en
   allows('a script that writes no alias', `${SET_STATUS}; bash ./noop.sh; git ship`, { 'noop.sh': '#!/bin/bash\necho hi\n' });
   allows('a sourced file that writes no alias', `${SET_STATUS}; . ./noop.sh; git ship`, { 'noop.sh': 'echo hi\n' });
   allows('a subshell that writes no alias', `${SET_STATUS}; ( echo hi; exit 0 ); git ship`);
+});
+
+// #570: a `!` git alias and a gh shell alias run in a child shell, so what their text changed (it may have exited before the put-back) is unknown to the line afterwards, like any child text.
+// Caught: `git x` that switches to main, exits, and has the switch back after it: the line believed it was back on agent/x and pushed main.
+test('#570: a `!` git alias / gh shell alias that switches or rewrites an alias and puts it back (an exit between) leaves that unknown for the line', () => {
+  const SET_STATUS = 'git config alias.ship status';
+  const p = { 'p.sh': `${PB} origin HEAD\n` };
+  denies('alias written and put back by a ! git alias', `${SET_STATUS}; git config alias.x '!${SHIP}; exit 0; ${SET_STATUS}'; git x; git ship`, {}, ALIAS);
+  denies('branch switched and put back by a ! git alias', `git switch agent/x; git config alias.x '!git switch ${MAIN}; exit 0; git switch agent/x'; git x; bash ./p.sh`, p, BRANCH);
+  denies('alias written and put back by a gh shell alias', `${SET_STATUS}; gh alias set x '!${SHIP}; exit 0; ${SET_STATUS}'; gh x; git ship`, {}, ALIAS);
+  denies('R38-F2: the same text given as -c alias.x=', `git -c alias.x='!git switch ${MAIN}; exit 0; git switch agent/x' x; ${PB} origin HEAD`, {}, BRANCH);
+  allows('a ! git alias that changes nothing', `${SET_STATUS}; git config alias.x '!echo hi'; git x; git ship`);
+  allows('a gh shell alias that changes nothing', `${SET_STATUS}; gh alias set x '!echo hi'; gh x; git ship`);
+});
+
+// #571: `gh alias set NAME '!text'` only DEFINES the alias, the text does not run. It was judged on the live state, so its switch / alias writes became the line's own: `git config alias.ship 'push origin main'; gh alias set x
+// '!git config alias.ship status'; git ship` believed ship was status and sent main. The expansion is still judged (a blocked command in it is refused) but every change it makes is put back.
+test('#571: the expansion of a gh alias definition is judged, but what it would change is not the state the line goes on in', () => {
+  const SET_STATUS = 'git config alias.ship status';
+  const p = { 'p.sh': `${PB} origin HEAD\n` };
+  const MAINPUSH = /pushing to main/;
+  denies('a definition would rewrite an alias: not believed', `git config alias.ship '${PUSH} origin ${MAIN}'; gh alias set x '!git config alias.ship status'; git ship`, {}, MAINPUSH);
+  denies('a definition would switch branch: not believed', `git switch ${MAIN}; gh alias set x '!git switch agent/x'; bash ./p.sh`, p, MAINPUSH);
+  denies('the same alias run: the use site is a child text, the branch is unknown', `git switch agent/x; gh alias set x '!git switch ${MAIN}'; gh x; ${PB} origin HEAD`, {}, BRANCH);
+  allows('a definition only (nothing ran): the push is on agent/x', `git switch agent/x; gh alias set x '!git switch ${MAIN}'; ${PB} origin HEAD`);
+  allows('a definition with a plain expansion', `${SET_STATUS}; gh alias set x 'pr view'; git ship`);
+  allows('a definition with a harmless shell expansion', `${SET_STATUS}; gh alias set x '!echo hi'; git ship`);
+  // (the logs of the simulated writes are cut back: a definition in a subshell / a branch that never runs does not leave `ship` unsure)
+  allows('F7: a definition in a subshell', `${SET_STATUS}; ( gh alias set ship2 '!${SHIP}' ); git ship`);
+  allows('F7: a definition in an if that does not run', `${SET_STATUS}; if false; then gh alias set y '!${SHIP}'; fi; git ship`);
+});
+
+// #572 / #573 (the branch-log half of stateChanged, shipped in #362; R40-B1 pins the alias half): a branch switched away and back by an eval'd text in a subshell (an exit between) is unknown after the subshell. Caught:
+// the subshell's end state equals the one before it, so without the branch-log clause the line believes agent/x and pushes main.
+test('#572 / #573: a branch switched and put back by an eval\'d text in a subshell (an exit between) is unknown after it', () => {
+  const line = (script) => `git switch agent/x; ( eval "$(cat ./f.sh)" ); bash ./${script}`;
+  const p = { 'p.sh': `${PB} origin HEAD\n`, 'pn.sh': `${PB} origin agent/x\n` };
+  const away = `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`;
+  denies('file-fed eval in a subshell switches main and back', line('p.sh'), { ...p, 'f.sh': away }, BRANCH);
+  allows('the same, the push names the branch', line('pn.sh'), { ...p, 'f.sh': away });
+  allows('a file-fed eval that switches nothing', line('p.sh'), { ...p, 'f.sh': 'echo hi\nexit 0\n' });
+});
+
+// C: a switch in a directory the walk cannot name (`git -C "$(git rev-parse --show-toplevel)" switch main`, a cd to `$(mktemp -d)`) may hit the repository the walk tracks as agent/x. Caught: the tracked name
+// stood, so the HEAD push after it was judged on agent/x and sent main.
+test('C: a branch switch in a directory the walk cannot name makes the tracked branch unknown', () => {
+  const TOP = '"$(git rev-parse --show-toplevel)"';
+  const H = `${PB} origin HEAD`;
+  denies('-C with a toplevel substitution, push on the line', `git switch agent/x; git -C ${TOP} switch ${MAIN}; ${H}`, {}, BRANCH);
+  denies('the same, the push in a script', `git switch agent/x; git -C ${TOP} switch ${MAIN}; bash ./p.sh`, { 'p.sh': `${H}\n` }, BRANCH);
+  denies('a switch after a cd to a directory not named', `git switch agent/x; cd "$(mktemp -d)"; git switch ${MAIN}; cd ${GIT_ROOT}; ${H}`, {}, BRANCH);
+  denies('F8: a child script switches in a directory it cannot name', `git switch agent/x; bash ./s.sh; ${H}`, { 's.sh': `git -C ${TOP} switch ${MAIN}\n` }, BRANCH);
+  allows('a literal other repository', `git switch agent/x; git -C /work/other switch ${MAIN}; ${H}`);
+  allows('an unnamed directory, no branch move', `git switch agent/x; git -C ${TOP} status; ${H}`);
+});
+
+// D: in a loop body a cd / switch followed by a plain `|| exit 1` is proven (the exit leaves when the move failed), so the commands after it in the SAME body run where the cd went: `for d in …; do cd d || exit 1; git push origin HEAD;
+// cd ..; done` was refused (the next `;` forgot the move). The move is still unknown once the body is left (a break / continue before the cd skips it, a loop over no words), and the next iteration still starts where the body ended.
+// (The `|| { …; exit 1; }` group form is not read in a text with a loop: no shape events there; it stays refused, the deny rows below pin that it does not become an allow by accident.)
+test('D: a plain `|| exit` after a cd / switch in a loop body keeps it known for the rest of that body only', () => {
+  const sub = { 'sub1/x': '', 'sub2/x': '' };
+  const H = `${PB} origin HEAD`;
+  for (const [what, line] of [
+    ['cd sub1 || exit 1; push; cd ..', `for d in sub1 sub2; do cd sub1 || exit 1; ${H}; cd ..; done`],
+    ['switch agent/x || exit 1; push', `for b in a b; do git switch agent/x || exit 1; ${H}; done`],
+  ]) {
+    allows(what, line, sub);
+    allows(`${what}, in a script`, RUN_SH, script('echo', line));
+  }
+  // (start /work/other, a repository on main: a push judged where the body surely cd'd is /work/repo's (agent/x); one judged in the start directory is refused)
+  const at = (cmd) => evaluateGitCommand(cmd, {
+    cwd: '/work/other', home: '/home/u', currentBranch: (d) => (unwin(d).startsWith(GIT_ROOT) ? 'agent/x' : MAIN), pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs('/work/other', { [`${GIT_ROOT}/.keep`]: '' }),
+  });
+  for (const [what, line] of [
+    ['break before the cd', `for d in a; do break; cd ${GIT_ROOT} || exit 1; echo hi; done; ${H}`],
+    ['continue before the cd, the group form', `for d in a; do [ -d x ] || continue; cd ${GIT_ROOT} || { echo no >&2; exit 1; }; done; ${H}`],
+    ['break before the cd, the group form', `for d in a; do break; cd ${GIT_ROOT} || { echo no >&2; exit 1; }; done; ${H}`],
+    ['a loop that may run zero times', `for d in $(ls); do cd ${GIT_ROOT} || exit 1; echo hi; done; ${H}`],
+  ]) {
+    const r = at(line);
+    assert.equal(r.decision, 'deny', `${what}: allowed`);
+    assert.match(r.reason, BRANCH, `${what}: ${r.reason}`);
+  }
+  // (R2-F1: `|| command exit 1` / `|| noglob exit 1` may leave nothing behind: the cd is not proven)
+  for (const w of ['command', 'noglob']) {
+    denies(`cd sub1 || ${w} exit 1; push; cd ..`, `for d in sub1 sub2; do cd sub1 || ${w} exit 1; ${H}; cd ..; done`, sub, DIRS);
+    denies(`cd sub1 || ${w} exit 1; push; cd .., in a script`, RUN_SH, script('echo', `for d in sub1 sub2; do cd sub1 || ${w} exit 1; ${H}; cd ..; done`), DIRS);
+  }
+  // (R3-F1: nor does `|| coproc exit 1`: the exit runs in a background subshell)
+  denies('cd sub1 || coproc exit 1; push; cd ..', `for d in sub1 sub2; do cd sub1 || coproc exit 1; ${H}; cd ..; done`, sub, DIRS);
+  denies('cd sub1 || coproc exit 1; push; cd .., in a script', RUN_SH, script('echo', `for d in sub1 sub2; do cd sub1 || coproc exit 1; ${H}; cd ..; done`), DIRS);
+  // (R4-F1: nor does the unnamed group form `|| coproc { exit 1; }`: the group runs in a background subshell)
+  denies('cd sub1 || coproc { exit 1; }; push; cd ..', `for d in sub1 sub2; do cd sub1 || coproc { exit 1; }; ${H}; cd ..; done`, sub, DIRS);
+  denies('cd sub1 || coproc { exit 1; }; push; cd .., in a script', RUN_SH, script('echo', `for d in sub1 sub2; do cd sub1 || coproc { exit 1; }; ${H}; cd ..; done`), DIRS);
+  // (the next iteration starts where the body ended)
+  denies('next iteration starts in another repository', `for d in a b; do ${H}; cd /work/other || exit 1; done`, {}, DIRS);
+  denies('next iteration starts on main', `for d in a b; do ${H}; git switch ${MAIN} || exit 1; done`, {}, DIRS);
+});
+
+// #569 pin (passes on main by design: the loop rule and #647 already hold it): an eval'd file that itself evals a file inside a literal loop does not hand its switch to the caller (the loop may have broken out first);
+// the same two files with no loop do (the switch is believed). Guards the loop-carry rule against a later refactor.
+test('#569: a switch made by a file eval\'d inside a literal loop in an eval\'d file is not handed to the caller', () => {
+  const onMain = (cmd, files) => evaluateGitCommand(cmd, { cwd: GIT_ROOT, home: '/home/u', currentBranch: () => MAIN, pushDestination: () => null, issueLabels: () => [], realpath: (p) => p, ...fakeFs(GIT_ROOT, files) });
+  const p = { 'p.sh': `${PB} origin HEAD\n`, 'b.sh': 'git switch agent/x\n' };
+  const line = 'eval "$(cat ./a.sh)"; bash ./p.sh';
+  const looped = onMain(line, { ...p, 'a.sh': 'for i in 1; do eval "$(cat ./b.sh)"; done\n' });
+  assert.equal(looped.decision, 'deny', 'loop: allowed');
+  assert.match(looped.reason, BRANCH);
+  const plain = onMain(line, { ...p, 'a.sh': 'eval "$(cat ./b.sh)"\n' });
+  assert.equal(plain.decision, 'allow', `no loop: ${plain.reason}`);
 });
 
 // R39-F3 / F4 (the arbiter's reading: a memo hit replays an end state without the writes of the first judgement): the same text run a second time in the same state is still unknown afterwards

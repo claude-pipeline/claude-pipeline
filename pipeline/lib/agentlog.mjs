@@ -171,6 +171,13 @@ export function logRelPath(root, agentLog) {
 }
 
 const isRaceFailure = (err) => err instanceof GitError && /rejected|non-fast-forward|fetch first|stale info|failed to push some refs/i.test(err.stderr ?? '');
+// A network blip (DNS, a dropped or timed-out connection, a 5xx from the host) is not a lost race and not a refusal: the same publish is worth one or two more tries a moment later
+// (`agent-log publish` exit 3 on a one-second blip left the run's line queued and the summary step stalled). A remote that is not a repository, a rejected push or a hook refusal are not blips.
+const NET_RETRIES = 2;
+const NET_BACKOFF_MS = [1000, 3000];
+const isNetworkBlip = (err) => err instanceof GitError && !/does not appear to be a git repository|permission denied|authentication failed|rejected|non-fast-forward/i.test(err.stderr ?? '')
+  && /could not resolve host|temporary failure in name resolution|network is unreachable|connection (?:timed out|reset|refused|closed)|operation timed out|timed out|early eof|remote end hung up|rpc failed|unable to access|ssl|tls|returned error: 5\d\d/i.test(err.stderr ?? '');
+const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait available: the retry still happens */ } };
 const REMOTE_LOG_REF = `refs/remotes/${REMOTE}/${AGENT_LOG_BRANCH}`;
 // The remote's default branch as git must READ it: fully qualified, because an abbreviated `origin/<b>` resolves through refs/tags and refs/heads first (#454).
 const remoteDefaultRef = (defaultBranch) => `refs/remotes/${REMOTE}/${defaultBranch}`;
@@ -233,7 +240,7 @@ function readRegularFile(run, ref, rel, { strictRef = false } = {}) {
 // A commit on top of `parent` (or a root commit) whose tree contains ONLY `rel`, built fresh from `text`: nothing is carried over
 // from the parent's tree (a file someone planted on the branch, say a workflow, never rides into our commit). Built with plumbing in a
 // private temp index: the caller's index, HEAD, branches and working tree are never read or written.
-function commitFile({ root, g, rel, text, parent, message }) {
+function commitFile({ root, g, rel, text, parent, message, anonymous = false }) {
   const dir = mkdtempSync(join(tmpdir(), 'cp-agent-log-'));
   try {
     const env = { GIT_INDEX_FILE: join(dir, 'index') };
@@ -243,9 +250,10 @@ function commitFile({ root, g, rel, text, parent, message }) {
     const tree = run(['write-tree']).trim();
     let ident = {};
     try {
+      if (anonymous) throw new Error('fixed identity'); // a public (scan-listed) repository never gets the configured name and email
       g(['var', 'GIT_AUTHOR_IDENT'], root);
       g(['var', 'GIT_COMMITTER_IDENT'], root);
-    } catch { ident = FALLBACK_IDENT; } // no user.name / user.email configured (a CI box)
+    } catch { ident = FALLBACK_IDENT; } // no user.name / user.email configured (a CI box), or `anonymous`
     return gitIn(g, root, ['-c', 'commit.gpgsign=false', 'commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', message], { env: ident }).trim();
   } finally {
     rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
@@ -264,10 +272,11 @@ function gitIn(g, cwd, args, { env, input } = {}) {
  * never touches the caller's HEAD / index / branches / working tree. `gitFn` is injectable for tests.
  * -> { commit, pushed, lines } (`lines`: the ones actually appended). Throws on a git failure; the caller keeps its lines queued.
  */
-export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }) {
+export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, sleepFn = sleepSync, anonymous = false }) {
   const g = (args, cwd = root, timeoutMs, extra = {}) => gitFn(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}), ...extra });
   const clean = lines.map(assertSingleLine);
   let lastErr;
+  let blips = 0;
   for (let attempt = 1; attempt <= ATTEMPTS; attempt += 1) {
     try {
       const { tip } = fetchLogBranch(root, g);
@@ -283,12 +292,13 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git }
       }
       const { text, fresh } = appendLines(existing, clean);
       if (fresh.length === 0) return { commit: tip, pushed: false, lines: [] }; // all already in the log: nothing to push
-      const commit = commitFile({ root, g, rel: logRel, text, parent: tip, message: `docs: agent log (${fresh.length} line${fresh.length === 1 ? '' : 's'})` });
+      const commit = commitFile({ root, g, rel: logRel, text, parent: tip, anonymous, message: `docs: agent log (${fresh.length} line${fresh.length === 1 ? '' : 's'})` });
       const dest = assertSafeLogTarget(`refs/heads/${AGENT_LOG_BRANCH}`);
       g(['push', '--no-verify', REMOTE, `${commit}:${dest}`], root, NETWORK_TIMEOUT_MS);
       return { commit, pushed: true, lines: fresh };
     } catch (err) {
       lastErr = err;
+      if (isNetworkBlip(err) && blips < NET_RETRIES) { sleepFn(NET_BACKOFF_MS[blips]); blips += 1; attempt -= 1; continue; } // a blip does not use up a race attempt
       if (!isRaceFailure(err) || attempt === ATTEMPTS) throw err;
     }
   }

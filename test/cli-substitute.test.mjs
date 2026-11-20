@@ -191,6 +191,15 @@ test('apply refusals: every way the transcript can differ from the prepared run 
   }
 });
 
+// A builder that pasted promptHeader and the Read line with a blank line between them ran the right review; apply refused it as "text was added" and the round
+// had to be prepared and run again (EW #2307). Blank lines there are whitespace, not text: accepted, while any word added anywhere still refuses (the table above).
+test('apply accepts a blank line between promptHeader and the Read line (the prompt is otherwise exactly the prepared one)', (t) => {
+  const w = world(t);
+  const prep = w.ready();
+  const r = w.apply(install(w, prep, { prompt: `${prep.promptHeader}\n\n\nRead ${prep.inputPath} and review the pull request.\n` }));
+  assertExit(r, 0, r.stdout);
+});
+
 test('edited input or exported file since prepare, and an input that changed (PR edited), are proof failures', (t) => {
   const w = world(t);
   const prep = w.ready();
@@ -1087,14 +1096,14 @@ test('model evidence is fresh for 2 hours (reset-passed after), needs the same p
   const keep = w.route();
   const refused = (error, code = 1) => { const r = w.prepare(); assertExit(r, code, r.stdout); assert.equal(r.json.error, error); return r.json; };
   writeFileSync(w.routeFile(), JSON.stringify({ ...keep, at: new Date(Date.now() - 3 * 60 * 60_000).toISOString() }));
-  assert.match(refused('reset-passed').message, /Codex's model refusal \(review\.codex_model gpt-6-astra\) is no longer evidence/);
+  assert.match(refused('reset-passed').message, /Codex's model refusal \(review\.codex_model gpt-6\.2-astra\) is no longer evidence/);
   writeFileSync(w.routeFile(), JSON.stringify({ ...keep, at: new Date(Date.now() - 60 * 60_000).toISOString() }));
   assertExit(w.prepare(), 0);
   writeFileSync(w.routeFile(), JSON.stringify({ ...keep, promptSha256: 'f'.repeat(64) }));
   refused('route-mismatch');
   // the default branch's fork point moved on and now names another model: the refusal says nothing about it (R3-2)
   writeFileSync(w.routeFile(), JSON.stringify({ ...keep, model: 'gpt-older-1' }));
-  assert.match(refused('route-mismatch').message, /the trusted Codex model is now gpt-6-astra, not the refused gpt-older-1/);
+  assert.match(refused('route-mismatch').message, /the trusted Codex model is now gpt-6\.2-astra, not the refused gpt-older-1/);
   const applied = w.apply(w.projects);
   assertExit(applied, 1, applied.stdout);
   assert.equal(applied.json.error, 'route-mismatch', 'apply judges it too');

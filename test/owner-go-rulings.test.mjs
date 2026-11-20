@@ -499,7 +499,7 @@ test('state version SUPPORTED + 1: loadState, the published reader, both history
   const past = pastRoundHistoryProblem({ local: w.st, published: p, pr: PR });
   assert.deepEqual([past.problem?.error, past.diff], ['history-unreadable', null]);
   // the final gate: a newer PUBLISHED state with a good local one, and a newer LOCAL state
-  refusal(await w.check(theirs), /no readable review state/);
+  refusal(await w.check(theirs), /newer pipeline[^]*pipeline update/);
   const dir = w.repo.dir;
   saveState(dir, bad);
   assert.throws(() => loadState(dir), new RegExp(`version ${SUPPORTED_STATE_VERSION + 1}.*supports.*${SUPPORTED_STATE_VERSION}`));

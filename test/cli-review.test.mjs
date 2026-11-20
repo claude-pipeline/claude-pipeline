@@ -13,7 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, fakeGhPath, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { contentHash } from '../pipeline/lib/git.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
@@ -62,6 +62,7 @@ const noIssues = (slug) => [
   { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=100 --paginate`, stdout: '[]' },
 ];
 const NO_ISSUES = noIssues('acme/widgets');
+const SEQ_GH = `node "${join(dirname(fakeGhPath), 'fake-gh-seq.mjs')}"`;
 
 // codex-review reads the PR's triage comment before it admits a counted round (published history): a world answers "no comment" unless a test
 // scripts the comments itself (these entries come LAST, so a test's own entries win).
@@ -257,7 +258,7 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   assert.deepEqual([state.pr, state.repo, state.branch, state.risk, state.lightLane, state.maxRounds], [7, 'acme/widgets', 'feat/x', 'low', false, 2]);
   assert.equal(r.json.reviewer, 'judge', 'a low-risk PR with no sensitive path is triaged by the judge');
   assert.equal(state.reviewer, 'judge');
-  assert.deepEqual([state.rounds[0].fableRequired, state.rounds[0].codexModel, state.rounds[0].forkPoint], [undefined, 'gpt-6-astra', w.base]);
+  assert.deepEqual([state.rounds[0].fableRequired, state.rounds[0].codexModel, state.rounds[0].forkPoint], [undefined, 'gpt-6.2-astra', w.base]);
   const round = state.rounds[0];
   assert.deepEqual([round.n, round.fromHead, round.toHead], [1, w.base, w.head]);
   assert.equal(round.contentHashAtToHead, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
@@ -281,7 +282,7 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   assert.match(at('-o'), /[\\/]round-1[\\/]attempt-[0-9a-f]{16}[\\/]codex-raw\.json$/, 'Codex writes into the attempt\'s own folder; the winner\'s copy is round-1/codex-raw.json');
   assert.equal(at('-C'), w.repo.dir);
   assert.match(at('--output-schema'), /codex-findings\.schema\.json$/);
-  assert.ok(call.argv.includes('model="gpt-6-astra"') && call.argv.includes('model_reasoning_effort="high"'));
+  assert.ok(call.argv.includes('model="gpt-6.2-astra"') && call.argv.includes('model_reasoning_effort="high"'));
   assert.equal(call.argv.at(-1), '-');
   assert.match(call.stdin, /PR: #7/);
   assert.match(call.stdin, /Title: Add compute/);
@@ -407,7 +408,7 @@ test('codex-review: each real Codex run, answered or failed, is logged in the us
   assert.equal(lines.length, 2);
   assert.deepEqual(lines.map((l) => l.ok), [false, true]);
   for (const l of lines) {
-    assert.deepEqual([l.v, l.kind, l.repo, l.pr, l.round, l.effort, l.model], [1, 'review', 'acme/widgets', 7, 1, 'high', 'gpt-6-astra']);
+    assert.deepEqual([l.v, l.kind, l.repo, l.pr, l.round, l.effort, l.model], [1, 'review', 'acme/widgets', 7, 1, 'high', 'gpt-6.2-astra']);
     assert.ok(Math.abs(Date.parse(l.ts) - Date.now()) < 60_000, 'ts is the run time');
     assert.equal('resolutionOnly' in l, false);
   }
@@ -1332,7 +1333,13 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
 
   w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   w.repo.commit('fix');
-  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1']);
+  // --pr N (like discard-round): a PR the state does not belong to is refused before anything is marked; the right one (or none) marks
+  const beforeMark = w.stateText();
+  const wrongPr = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1', '--pr', '8']);
+  assertExit(wrongPr, 2);
+  assert.equal(wrongPr.json.error, 'state-pr-mismatch');
+  assert.equal(w.stateText(), beforeMark, 'a mismatched --pr marks nothing');
+  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1', '--pr', '7']);
   assertExit(marked, 0);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items, []);
   assert.equal(w.item('R1-B1').implemented, true);
@@ -1909,7 +1916,7 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
   const record = reviewJson(body);
   assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest', 'stateHash']);
   assert.deepEqual(record, {
-    contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6-astra', modelProofDigest: null,
+    contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6.2-astra', modelProofDigest: null,
     stateHash: reviewContentHash(w.state()), // the state review-complete published: the owner-go check binds the marker to it
   });
   assert.deepEqual(r.json.review, record);
@@ -2215,6 +2222,32 @@ test('followups create: a gh failure is exit 3 and nothing is recorded as filed'
   const r = w.cli(['followups', 'create', '--round', '1']);
   assertExit(r, 3);
   assert.equal(w.item('R1-W1').followupIssue ?? null, null);
+});
+
+test('followups create: a rate limit on the issue POST that DID land is retried with a fresh lookup, so no duplicate issue is filed (#190)', (t) => {
+  const url = 'https://github.com/acme/widgets/issues/11';
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  const marker = `<!-- claude-pipeline:followup pr=7 fp=${w.item('R1-W1').fingerprint} -->`;
+  const limited = { code: 1, stderr: 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)' };
+  w.fake.setScript([
+    { match: '^repo view', stdoutJson: REPO_VIEW },
+    { match: '^api user', stdout: 'me\n' },
+    // the lookup: empty the first time; the second time the issue the limited POST had actually created is there
+    { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100 --paginate', sequence: [
+      { stdout: '[]' },
+      { stdoutJson: [{ number: 11, html_url: url, state: 'open', body: `${marker}\nbody`, user: { login: 'me' } }] },
+    ] },
+    { match: '^api -X POST repos/acme/widgets/issues ', sequence: [limited, { stdoutJson: { number: 12, html_url: 'https://github.com/acme/widgets/issues/12' } }] },
+  ]);
+  const r = w.cli(['followups', 'create', '--round', '1'], { PIPELINE_GH: SEQ_GH, PIPELINE_GH_RETRY_MS: '50' });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.created, []);
+  assert.deepEqual(r.json.reused.map((x) => x.number), [11]);
+  assert.equal(w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues ')).length, 1, 'one POST only');
+  assert.match(r.stderr, /secondary rate limit; retrying in/);
+  assert.equal(w.item('R1-W1').followupIssue, url);
 });
 
 // ---- a whole round, end to end ----------------------------------------------------------------
@@ -3163,6 +3196,23 @@ test('state discard-round: refuses a round the PR comment holds, a round that is
   assert.equal(w.cli(['state', 'discard-round', '--round', '2', '--pr', '8']).json.error, 'state-pr-mismatch');
   assertExit(w.cli(['state', 'discard-round']), 2);
   assert.match(w.cli(['state', 'bogus']).stdout + w.cli(['state', 'bogus']).stderr, /discard-round/);
+});
+
+// A newer pipeline's triage comment decodes to no state here; that must not read as "round not published" (the round would be discarded from the local copy).
+test('state discard-round / state show: a newer-format triage comment refuses the discard and serves the local state as local-unverified', (t) => {
+  const { w, published } = publishedWorld(t);
+  const script = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8'));
+  w.fake.setScript([...COMMENTS(mine({ ...published, version: 99 })), ...script]);
+  const d = w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']);
+  assertExit(d, 2);
+  assert.equal(d.json.error, 'history-unreadable');
+  assert.match(d.json.message, /pipeline update/);
+  assert.equal(w.state().rounds.length, 1);
+  assert.deepEqual(staleDirs(w), []);
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.equal(show.json.source, 'local-unverified');
+  assert.match(show.json.warnings.join(' '), /pipeline update/);
 });
 
 test('state discard-round: a gh outage is exit 3 and nothing is moved', (t) => {

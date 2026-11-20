@@ -12,6 +12,7 @@ import { cli, AGENT_LOG } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { git as gitRun, GitError } from '../pipeline/lib/git.mjs';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
+import { PLANTED, makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
 import { AGENT_LOG_BRANCH, AGENT_LOG_HEADER, assertSafeLogTarget, logRelPath, publishLines } from '../pipeline/lib/agentlog.mjs';
 
 const BRANCH = AGENT_LOG_BRANCH;
@@ -202,6 +203,29 @@ test('a race lost three times in a row is an error (the caller keeps its lines)'
   };
   assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn }), GitError);
   assert.equal(pushes, 3);
+});
+
+// `agent-log publish` exited 3 (`publish-failed`) on a one-off network blip during the push and left the run line queued for the summary step to chase.
+test('a network blip on the push is retried with a backoff and the line lands; a blip that never clears still exits with the lines queued', () => {
+  const w = world();
+  let failures = 1;
+  const sleeps = [];
+  const blip = (args, o) => {
+    if (args[0] === 'push' && failures-- > 0) throw new GitError({ args, code: 128, stderr: "fatal: unable to access 'https://github.com/x/y.git/': Could not resolve host: github.com" });
+    return gitRun(args, o);
+  };
+  const r = publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L1], defaultBranch: 'main', gitFn: blip, sleepFn: (ms) => sleeps.push(ms) });
+  assert.equal(r.pushed, true);
+  assert.deepEqual(sleeps, [1000]);
+  assert.ok(w.logOnBranch().split('\n').includes(L1));
+
+  let pushes = 0;
+  const down = (args, o) => {
+    if (args[0] === 'push') { pushes += 1; throw new GitError({ args, code: 128, stderr: 'fatal: unable to access x: Connection timed out' }); }
+    return gitRun(args, o);
+  };
+  assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn: down, sleepFn: () => {} }), GitError);
+  assert.equal(pushes, 3, 'one try and two retries, then the failure stands');
 });
 
 test('the log branch deleted on the remote: a stale cached copy does not make publish drop a line; the branch is recreated with it', () => {
@@ -564,4 +588,107 @@ test('an abnormal GitError (code 1) from the ref check is never "no file": the p
     return gitRun(args, o);
   };
   assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn }), (e) => e instanceof GitError && e.abnormal === true);
+});
+
+// Outbound text guard: a repository listed in the machine-local scan config gets its log lines scanned before they are pushed.
+test('publish: a blocked outbound scan keeps every line queued, pushes nothing and exits 1 with the reason (never the hit)', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+  const scanner = makeScanner(tmp('cp-log-scanner-'));
+  writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: scanner.command } });
+  w.run(['queue', '--line', L1]);
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(r.json.remaining, 2);
+  assert.match(r.json.message, /agent-log line/);
+  assert.ok(!r.stdout.includes(PLANTED), 'the output never echoes the scanned text');
+  assert.deepEqual(w.queued(), [L1, planted], 'both lines are still queued');
+  assert.equal(w.onOrigin('branch', '--list', BRANCH).trim(), '', 'nothing was pushed');
+  assert.equal(scanner.runs().length, 1);
+});
+
+test('publish: the scan follows the push destination, not only what gh resolves (origin listed, gh says an unlisted repo)', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]); // gh: acme/widgets, unlisted
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'https://example.test/Listed/Repo.git']);
+  const scanner = makeScanner(tmp('cp-log-scanner-'));
+  writeScanConfig(w.fake.scanHome, { 'listed/repo': { command: scanner.command } });
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(scanner.runs().length, 1, 'the listed push destination was scanned');
+});
+
+test('publish: for a listed repository the log commit carries the fixed noreply identity, not the configured git name and email; an unlisted one keeps it', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+  w.repo.git(['config', 'user.email', 'private-address@example.invalid']);
+  const scanner = makeScanner(tmp('cp-log-scanner-'), 'clean');
+  writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: scanner.command } });
+  assertExit(w.run(['publish', '--line', L1]), 0);
+  assert.equal(w.onOrigin('log', '-1', '--format=%ae|%ce', BRANCH).trim(), 'claude-pipeline@users.noreply.github.com|claude-pipeline@users.noreply.github.com');
+  writeScanConfig(w.fake.scanHome, { 'other/repo': { command: scanner.command } });
+  assertExit(w.run(['publish', '--line', L2]), 0);
+  assert.equal(w.onOrigin('log', '-1', '--format=%ae', BRANCH).trim(), 'private-address@example.invalid');
+});
+
+// Failure caught: only the first push URL was checked, so a listed second destination of `git push origin` got the log unscanned.
+test('publish: a listed repository as the SECOND push URL of origin is scanned too', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]); // gh: acme/widgets, unlisted
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'https://example.test/private/Repo.git']);
+  w.repo.git(['remote', 'set-url', '--add', '--push', 'origin', 'https://example.test/Listed/Mirror.git']);
+  const scanner = makeScanner(tmp('cp-log-scanner-'));
+  writeScanConfig(w.fake.scanHome, { 'listed/mirror': { command: scanner.command } });
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(scanner.runs().length, 1, 'the listed second push destination was scanned');
+});
+
+// Failure caught: scannerFor returned the first listed name (gh's), so when gh named listed repo A (lenient scanner) and the push went to listed repo B,
+// B's stricter scanner never ran and the line reached B.
+test('publish: when gh names one listed repository and the push goes to another, both scanners must pass', () => {
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]); // gh: acme/widgets
+  w.repo.git(['remote', 'set-url', '--push', 'origin', 'https://example.test/Listed/Repo.git']);
+  const dir = tmp('cp-log-scanner-');
+  const lenient = makeScanner(join(dir, 'a'), 'clean');
+  const strict = makeScanner(join(dir, 'b'), 'scan');
+  writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: lenient.command }, 'listed/repo': { command: strict.command } });
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const r = w.run(['publish', '--line', planted]);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'outbound-scan-blocked');
+  assert.equal(strict.runs().length, 1, "the push destination's own scanner ran");
+  assert.equal(w.onOrigin('branch', '--list', BRANCH).trim(), '', 'nothing was pushed');
+});
+
+// Failure caught: the "delete the flagged line from the queue" hint was printed for every block, so a crashed scanner or a broken config (nothing flagged) told
+// the owner to delete good run-record lines while the publish stayed blocked.
+test('publish: the delete-a-flagged-line hint appears only when the scanner flagged something, not for a crashed scanner or a broken config', () => {
+  const hint = /delete it from/;
+  const run = (setup) => {
+    const w = world();
+    w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+    setup(w);
+    const r = w.run(['publish', '--line', L1]);
+    assertExit(r, 1);
+    assert.equal(r.json.error, 'outbound-scan-blocked');
+    return r.json.message;
+  };
+  const withScanner = (mode) => (w) => writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: makeScanner(tmp('cp-log-scanner-'), mode).command } });
+  // No POSIX signals on Windows: a killed scanner exits 1 there, which reads as "flagged".
+  if (process.platform !== 'win32') assert.doesNotMatch(run(withScanner('crash')), hint, 'scanner killed by a signal');
+  assert.doesNotMatch(run((w) => writeScanConfig(w.fake.scanHome, '{ not json')), hint, 'config invalid');
+  assert.doesNotMatch(run((w) => writeScanConfig(w.fake.scanHome, { 'acme/widgets': { command: ['/no/such/scanner'] } })), hint, 'scanner missing');
+  const planted = `- 2026-10-03 · #12 · ${PLANTED} · risk low · rounds 1 · arbiter 0 · merged — prod smoke pending`;
+  const w = world();
+  w.fake.setScript([{ match: '^repo view', stdoutJson: REPO_VIEW }]);
+  withScanner('scan')(w);
+  assert.match(w.run(['publish', '--line', planted]).json.message, hint, 'a plain flagged exit keeps the hint');
 });

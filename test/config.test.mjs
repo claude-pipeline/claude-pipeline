@@ -284,6 +284,31 @@ test('review.regression_only_paths: a `!` entry is refused; a glob with a wildca
   assert.equal(set(['src/a.js'], { risk: { high_risk_paths: ['src/*'] } }).ok, true, 'a literal path is matched');
 });
 
+// #640. Failure caught: an entry the sensitive list names verbatim but a later `!` entry cancels was accepted, so the bar was dead text (no file ever matched) while the owner believed it applied.
+test('#640 review.regression_only_paths: an entry a later `!` exclusion fully cancels is refused; a partial exclusion, an exclusion in the other list or one before the entry is not', () => {
+  const set = (regression_only_paths, extra) => validateConfig({ ...minimal(), ...extra, review: { regression_only_paths, ...(extra.review ?? {}) } });
+  const high = (list) => ({ risk: { high_risk_paths: list } });
+  const cancelled = 'is listed in risk.high_risk_paths but a later `!` entry there';
+  for (const g of ['x/**', 'x/', '/x/**', 'x\\']) assert.ok(has(set([g], high(['x/**', '!x/**'])), cancelled), `${g} cancelled by !x/**`);
+  for (const g of ['x', '/x', './x']) assert.ok(has(set([g], high(['x', '!x'])), cancelled), `${g} cancelled by !x`);
+  assert.ok(has(set(['x/a/**'], high(['x/a/**', '!**'])), cancelled), '!** cancels everything');
+  assert.ok(has(set(['x/a/**'], high(['x/a/**', '!x/**'])), cancelled), '!x/** cancels the entry under x/');
+  assert.ok(has(set(['X/a/**'], high(['X/a/**', '!x/**'])), cancelled), 'compared case-insensitively');
+  assert.ok(has(set(['x/a/**'], { review: { arbiter_always_paths: ['x/a/**', '!x/a/**'] } }), 'is listed in review.arbiter_always_paths but a later'), 'names the list');
+  assert.ok(has(set(['x'], high(['x', '!x'])), 'covers no file: remove the exclusion or the entry'));
+  assert.equal(set(['src/a.js'], high(['src/a.js', '!src/**', 'src/*.js'])).ok, true, 'R1-B1: a literal entry a later positive glob puts back is covered (matchAny last-match-wins)');
+  assert.ok(has(set(['x.js'], high(['x.js', '!*.js'])), cancelled), 'R1-F2: a wildcard exclusion cancels a literal entry');
+  assert.ok(has(set(['src/a.js'], high(['src/a.js', '!src/*.js'])), cancelled), 'R1-F2: and a directory-level one');
+  assert.equal(set(['x/**'], high(['x/**', '!x/**', 'x/hooks/**'])).ok, true, 'R1-F1: a later positive entry that overlaps puts part of it back');
+  assert.ok(has(set(['x/**'], high(['x/**', '!x/**', 'y/**'])), cancelled), 'R1-F1: an unrelated later positive entry does not');
+  assert.equal(set(['src/**'], high(['src/**', '!src/auth/**'])).ok, true, 'a partial exclusion stays accepted');
+  assert.equal(set(['src/**'], high(['src/**', '!src/*.md'])).ok, true, 'a wildcard exclusion below the entry is partial');
+  assert.equal(set(['x/**'], high(['!x/**', 'x/**'])).ok, true, 'an exclusion BEFORE the entry does not cancel it');
+  assert.equal(set(['x'], high(['!x', 'x'])).ok, true, 'a literal entry re-listed after its exclusion');
+  assert.equal(set(['x/**'], { ...high(['x/**']), review: { arbiter_always_paths: ['!x/**'] } }).ok, true, 'an exclusion in arbiter_always_paths does not cancel a high_risk_paths cover');
+  assert.equal(set(['x/**'], { ...high(['!x/**']), review: { arbiter_always_paths: ['x/**'] } }).ok, true, 'and the other way round');
+});
+
 test('review.fix_verify_after_round: null or an integer 1..10; review.fix_round_max_lines: a positive integer', () => {
   const set = (k, v) => validateConfig({ ...minimal(), review: { [k]: v } });
   for (const v of [null, 1, 3, 10]) assert.equal(set('fix_verify_after_round', v).ok, true, String(v));
@@ -1227,4 +1252,12 @@ test('ci.merge_checks defaults to [] (frozen), must be an array of strings, and 
   assert.deepEqual(ok.config.ci.merge_checks, ['Replay from zero']);
   // ci-wait waits for them, but branch protection / `protect` / the final gate list must not start requiring them
   assert.deepEqual(requiredChecks({ required_checks: ['build'], guard_checks: false, merge_checks: ['Replay from zero'] }), ['build']);
+});
+
+test('review.cap_low_accepts: defaults to defer; defer|extra-round only (a typo must not silently turn the deferral on or off)', () => {
+  assert.equal(validateConfig(minimal()).config.review.cap_low_accepts, 'defer');
+  assert.equal(DEFAULTS.review.cap_low_accepts, 'defer');
+  const set = (v) => validateConfig({ ...minimal(), review: { cap_low_accepts: v } });
+  for (const v of ['defer', 'extra-round']) assert.equal(set(v).ok, true, v);
+  for (const v of ['off', 'follow-up', '', 1, null, true]) assert.ok(set(v).errors?.some((e) => e.includes('review.cap_low_accepts must be one of defer|extra-round')), String(v));
 });

@@ -536,6 +536,13 @@ function unexplained(obj, { strict, platform }) {
   return null;
 }
 
+// Says plainly whether NONE or MORE THAN ONE main transcript of a session was found, and how many; null when exactly one was.
+export function transcriptCountWhy(sessionId, count) {
+  if (count === 1) return null;
+  if (count === 0) return `no transcript for session ${sessionId}: none found (0 files) under the transcript folders`;
+  return `more than one transcript for session ${sessionId}: ${count} different files found, so which one is the owner's cannot be told`;
+}
+
 // Did the process that held a stack lease do anything but read-only inspection between its birth and the decision, according to its
 // own session transcript? -> ok({ verdict: 'quiet' | 'active', file, why }) | unknown. The transcript must show the process STARTED in
 // it (a SessionStart:startup / :resume hook line near the birth; after /clear or /compact an earlier transcript of the same process
@@ -562,8 +569,8 @@ export function ownerQuiet({ sessionId, birthMs, decidedMs, dirs, fsx = fs, plat
       if (!mains.has(real)) mains.set(real, { file, pdir });
     }
   }
-  if (mains.size === 0) return unknown(`no transcript for session ${sessionId}`);
-  if (mains.size > 1) return unknown(`more than one transcript for session ${sessionId}`);
+  const countWhy = transcriptCountWhy(sessionId, mains.size);
+  if (countWhy !== null) return unknown(countWhy);
   const { file, pdir } = [...mains.values()][0];
   const subs = subagentFiles(fsx, pdir, sessionId);
   if (subs.fail) return subs.fail;

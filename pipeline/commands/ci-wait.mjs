@@ -13,7 +13,7 @@ import { readClassicRequired } from '../lib/protection.mjs';
 
 export const meta = {
   summary: 'wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict',
-  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, on a PR with ci.e2e_label: [{name, status, url}] non-required checks still running or red), notOwed? (passed, or failed under --wait-all: ci.merge_checks names with no producer at all, not owed)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
+  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all] [--wait-others]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, on a PR with ci.e2e_label: [{name, status, url}] non-required checks still running or red), notOwed? (passed, or failed under --wait-all: ci.merge_checks names with no producer at all, not owed)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
 };
 
 export const DEFAULT_APPEAR_SECONDS = 300;
@@ -25,7 +25,7 @@ const realClock = () => ({ now: () => Date.now(), sleep: (ms) => new Promise((re
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
     pr: { type: 'string' }, repo: { type: 'string' }, 'appear-timeout': { type: 'string' }, timeout: { type: 'string' },
-    interval: { type: 'string' }, 'wait-all': { type: 'boolean' },
+    interval: { type: 'string' }, 'wait-all': { type: 'boolean' }, 'wait-others': { type: 'boolean' },
   }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const appear = intOption(values, 'appear-timeout', { min: 0, max: 86_400 }) ?? DEFAULT_APPEAR_SECONDS;
@@ -66,7 +66,7 @@ export const run = guarded(async (argv, ctx) => {
   };
   const result = await waitForCi({
     readers,
-    options: { appearTimeoutMs: appear * 1000, timeoutMs: timeout * 1000, intervalMs: interval * 1000, waitAll: values['wait-all'] === true, configChecks, mergeChecks, e2eLabel },
+    options: { appearTimeoutMs: appear * 1000, timeoutMs: timeout * 1000, intervalMs: interval * 1000, waitAll: values['wait-all'] === true, waitOthers: values['wait-others'] === true, configChecks, mergeChecks, e2eLabel },
     clock: seam.clock ?? realClock(),
     onProgress: seam.onProgress ?? ((line) => process.stderr.write(`ci-wait: ${line}\n`)),
   });

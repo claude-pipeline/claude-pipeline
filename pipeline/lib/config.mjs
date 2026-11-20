@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { parseYaml } from './yaml.mjs';
-import { globToRegExp, matchAny, normalizeGlob } from './glob.mjs';
+import { globToRegExp, matchAny, matchGlob, normalizeGlob } from './glob.mjs';
 import { isDocPath } from './doc-paths.mjs';
 import { isUniversalHardStopPath } from './hardstops.mjs';
 import { showFile } from './git.mjs';
@@ -95,7 +95,7 @@ export const DEFAULTS = deepFreeze({
     ],
   },
   review: {
-    codex_model: 'gpt-6-astra',
+    codex_model: 'gpt-6.2-astra',
     // low|medium|high: round 1 by the PR's risk; followup: every later round. small_fix: the effort of a fix-check round whose reviewed range is at most
     // small_fix_lines changed lines, adds no new file and touches no sensitive path (also used for every non-protected round when the weekly Codex governor is soft).
     // The review command refuses an --effort that is not the configured one for the round.
@@ -136,6 +136,9 @@ export const DEFAULTS = deepFreeze({
     // 'review' (off) | 'follow-up': past review.max_rounds (counted ordinal > max + 1: the first round past the limit (the automatic extra round, or the owner's first grant when there was none) is exempt, later owner-granted rounds are affected) a low-severity SUGGESTION / WORTH CONSIDERING
     // the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP (filed as an issue; Claude may tighten it back). 'review' in ANY config (working tree, fork point or the trusted default-branch one; an unreadable one counts) keeps it off.
     post_max_suggestions: 'review',
+    // 'defer' (default) | 'extra-round': at the LAST allowed counted round (review.max_rounds), when every fix the round accepted is low severity and none is built yet, `triage cap-defer` (run first by
+    // `round publish`) turns those ACCEPTs into follow-up issues unapplied instead of building them and paying the extra confirm round. 'extra-round' in ANY config (working tree or the trusted default-branch one; an unreadable one counts) keeps it off: a PR can switch it off, never on.
+    cap_low_accepts: 'defer',
     // The round trip-wire (chat mode, at `triage round-request`): once the PR has reviewed max_rounds + trip_wire_extra_rounds counted rounds, or trip_wire_not_falling rounds
     // past the limit accepted at least as many new items as the round before (and some), the ask becomes a process-review prompt first. The smaller value of the two configs applies.
     trip_wire_extra_rounds: 3,
@@ -221,7 +224,7 @@ const KEYS = {
   hard_stops: ['paths', 'patterns', 'auth_calls', 'disable_rules', 'report_only_rules', 'report_only_paths'],
   pattern: ['name', 'regex', 'paths'],
   integrity: ['test_globs'],
-  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'regression_only_paths', 'fix_verify_after_round', 'fix_round_max_lines', 'post_max_suggestions', 'trip_wire_extra_rounds', 'trip_wire_not_falling'],
+  review: ['codex_model', 'effort', 'max_rounds', 'light_lane_max_lines', 'size_only_medium_reviewer', 'arbiter_always_paths', 'docs_exempt_paths', 'substitute', 'codex_round_budget', 'codex_budget', 'threat_models', 'regression_only_paths', 'fix_verify_after_round', 'fix_round_max_lines', 'post_max_suggestions', 'cap_low_accepts', 'trip_wire_extra_rounds', 'trip_wire_not_falling'],
   review_codex_budget: ['soft', 'hard'],
   review_substitute: ['mode', 'min_wait_minutes', 'max_packet_mb'],
   threat_model: ['name', 'paths', 'text'],
@@ -551,6 +554,7 @@ function checkProduction(p, errors) {
 export const RISK_IGNORABLE_RULES = Object.freeze(['P-path', 'R4-config']);
 export const SIZE_ONLY_REVIEWERS = Object.freeze(['judge', 'fable']);
 export const POST_MAX_POLICIES = Object.freeze(['follow-up', 'review']);
+export const CAP_LOW_POLICIES = Object.freeze(['defer', 'extra-round']);
 
 function checkIgnoreRules(rules, errors) {
   if (!Array.isArray(rules)) return errors.push('risk.ignore_hard_stop_rules must be an array');
@@ -668,12 +672,57 @@ function checkThreatModels(models, errors) {
 
 // review.regression_only_paths: at most MAX_REGRESSION_ONLY_PATHS usable globs. `risk` = the risk section: the waiver only reaches a file the Fable lane reviews, so each glob must be
 // covered by risk.high_risk_paths or review.arbiter_always_paths of the same config (the glob listed there verbatim, or, for an entry with no wildcard or brace, a literal path one of them matches; both sides are read as glob.mjs reads a glob: `dir/` is `dir/**`, a leading `/` or `./` is dropped).
-// A `!` exclusion entry is refused: each entry is matched on its own, so it could never cancel another one.
+// The two lists are judged SEPARATELY (glob.mjs reads one list last-match-wins, so a `!` in one never touches the other). A verbatim entry that a LATER `!` exclusion in its list fully cancels
+// (the same glob, `**`, or `P/**` with a wildcard-free P above it) covers no file and is refused (#640) unless a later positive entry can put part of it back; a literal entry is judged by matchAny on the list; a partial exclusion (`src/**` with `!src/auth/**`) is accepted.
+// A `!` exclusion entry in this list is refused: each entry is matched on its own, so it could never cancel another one.
 export const MAX_REGRESSION_ONLY_PATHS = 20;
+const cancelsEntry = (exclusion, norm) => {
+  const e = normalizeGlob(exclusion.slice(1)).toLowerCase();
+  const n = norm.toLowerCase();
+  if (e === n || e === '**') return true;
+  return e.endsWith('/**') && !/[*?{[]/.test(e.slice(0, -3)) && n.startsWith(e.slice(0, -2));
+};
+// The wildcard-free leading directories of a normalised glob (`x/hooks/**` -> `x/hooks`, `*.js` -> ``), lower-cased.
+const globPrefix = (g) => {
+  const segs = [];
+  for (const seg of g.toLowerCase().split('/')) {
+    if (/[*?{[]/.test(seg)) break;
+    segs.push(seg);
+  }
+  return segs.join('/');
+};
+// A positive entry can put back part of `norm`: `**`, or one whose wildcard-free prefix lies under or above the entry's own.
+const overlaps = (positive, norm) => {
+  const p = normalizeGlob(positive);
+  if (p === '**') return true;
+  const a = globPrefix(p);
+  const e = globPrefix(norm);
+  return a === e || a === '' || e === '' || a.startsWith(`${e}/`) || e.startsWith(`${a}/`);
+};
+// -> 'covered' | { cancelledBy } | null: how list `list` covers the entry `norm`. A literal entry (no wildcard or brace) is decided by matchAny on the list alone; a verbatim wildcard entry is
+// cancelled only by a later exclusion that covers it whole AND with no positive entry after that exclusion able to put part of it back.
+function coverIn(list, norm) {
+  const verbatim = (x) => !x.startsWith('!') && normalizeGlob(x) === norm;
+  if (!/[*?{]/.test(norm)) {
+    if (matchAny(norm, list, { nocase: true })) return 'covered';
+    if (!list.some(verbatim)) return null;
+    const last = list.filter((x) => x.startsWith('!') && matchGlob(norm, x.slice(1), { nocase: true })).pop();
+    return last === undefined ? null : { cancelledBy: last };
+  }
+  let cancelledBy = null;
+  for (let i = 0; i < list.length; i++) {
+    if (!verbatim(list[i])) continue;
+    let lastCancel = -1;
+    for (let j = i + 1; j < list.length; j++) if (list[j].startsWith('!') && cancelsEntry(list[j], norm)) lastCancel = j;
+    if (lastCancel === -1 || list.slice(lastCancel + 1).some((x) => !x.startsWith('!') && overlaps(x, norm))) return 'covered';
+    cancelledBy ??= list[lastCancel];
+  }
+  return cancelledBy === null ? null : { cancelledBy };
+}
 function checkRegressionOnly(globs, review, risk, errors) {
   if (!isStrArray(globs)) return errors.push('review.regression_only_paths must be an array of strings');
   if (globs.length > MAX_REGRESSION_ONLY_PATHS) errors.push(`review.regression_only_paths has ${globs.length} entries; at most ${MAX_REGRESSION_ONLY_PATHS}`);
-  const sensitive = [...(isStrArray(risk?.high_risk_paths) ? risk.high_risk_paths : []), ...(isStrArray(review?.arbiter_always_paths) ? review.arbiter_always_paths : [])];
+  const lists = [['risk.high_risk_paths', isStrArray(risk?.high_risk_paths) ? risk.high_risk_paths : []], ['review.arbiter_always_paths', isStrArray(review?.arbiter_always_paths) ? review.arbiter_always_paths : []]];
   globs.forEach((g, i) => {
     const norm = normalizeGlob(g); // what the glob matcher runs with: every check below must judge this form, not the raw text (`/!x` is `!x` once normalised)
     if (norm.startsWith('!')) return errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is a \`!\` exclusion, which this list does not support: list only the paths the bar covers`);
@@ -682,11 +731,15 @@ function checkRegressionOnly(globs, review, risk, errors) {
     } catch (err) {
       return errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is not a usable glob (${err.message})`);
     }
-    let covered = false;
-    try {
-      covered = sensitive.some((s) => normalizeGlob(s) === norm) || (!/[*?{]/.test(norm) && matchAny(norm, sensitive, { nocase: true }));
-    } catch { /* an unusable sensitive glob is reported by its own list */ }
-    if (!covered) errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is not covered by risk.high_risk_paths or review.arbiter_always_paths: add it to one of them, or the bar never applies to it`);
+    const found = lists.map(([name, list]) => {
+      try {
+        return [name, coverIn(list, norm)];
+      } catch { return [name, null]; /* an unusable sensitive glob is reported by its own list */ }
+    });
+    if (found.some(([, c]) => c === 'covered')) return;
+    const cancelled = found.find(([, c]) => c !== null);
+    if (cancelled) errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is listed in ${cancelled[0]} but a later \`!\` entry there (${JSON.stringify(cancelled[1].cancelledBy)}) cancels it, so it covers no file: remove the exclusion or the entry`);
+    else errors.push(`review.regression_only_paths[${i}] (${JSON.stringify(g)}) is not covered by risk.high_risk_paths or review.arbiter_always_paths: add it to one of them, or the bar never applies to it`);
   });
 }
 
@@ -799,6 +852,7 @@ export function validateConfig(obj) {
     if (review.fix_verify_after_round !== null && !inRange(review.fix_verify_after_round, 1, 10)) errors.push('review.fix_verify_after_round must be null or an integer 1..10');
     checkPosInt(review.fix_round_max_lines, 'review.fix_round_max_lines', errors);
     if (!POST_MAX_POLICIES.includes(review.post_max_suggestions)) errors.push(`review.post_max_suggestions must be one of ${POST_MAX_POLICIES.join('|')}`);
+    if (!CAP_LOW_POLICIES.includes(review.cap_low_accepts)) errors.push(`review.cap_low_accepts must be one of ${CAP_LOW_POLICIES.join('|')}`);
     if (!inRange(review.trip_wire_extra_rounds, 1, 10)) errors.push('review.trip_wire_extra_rounds must be an integer 1..10');
     if (!inRange(review.trip_wire_not_falling, 1, 5)) errors.push('review.trip_wire_not_falling must be an integer 1..5');
     if (!SIZE_ONLY_REVIEWERS.includes(review.size_only_medium_reviewer)) errors.push(`review.size_only_medium_reviewer must be one of ${SIZE_ONLY_REVIEWERS.join('|')}`);

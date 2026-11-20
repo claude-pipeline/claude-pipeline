@@ -38,7 +38,7 @@ export const meta = {
     '  confirmed by a later round, and (exit 1 {error:closing-keywords}) a PR body that lists several issues after one closing keyword ("Closes #1, #2" closes only #1),',
     '  a substitute review (a Claude stand-in for Codex while its quota was spent) writes substitute {rounds, agents, models} and substituteDigest into the record, and codexModel none-substitute:<model> when no Codex round ran (the newest Codex model otherwise); it refuses (exit 1 {error}) substitute-escalation (a high-risk PR whose substitute rounds were Opus alone, with no later whole-PR Fable-substitute or Codex round) and substitute-unproven (a substitute round whose agent, models, effort or Fable floor proof does not hold)',
     '  then publishes the triage state when the PR holds a different one (exit 1 {error:stale-publication} when the PR holds a state this',
-    '  copy did not publish or restore: run `pipeline state show --pr N`), and only then posts the marker. The record carries rulingsDigest only when there are rulings',
+    '  copy did not publish or restore: run `pipeline state show --pr N`; {error:newer-format} when the PR\'s triage comment was written by a newer pipeline: `pipeline update`), and only then posts the marker. The record carries rulingsDigest only when there are rulings',
     '  the checked-out HEAD must be the head GitHub holds for the PR; the PR must have had every Fable pass its risk or paths need',
     `  the comment starts with the line ${'`<!-- claude-pipeline:review-complete v1 -->`'} and carries the JSON {contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash}`,
     '  (base = the merge base the content hash is measured from; modelProofDigest = sha256 of the Fable model proofs, null when no Fable pass ran; stateHash = the hash of the review state the marker',
@@ -328,7 +328,7 @@ export const run = guarded(async (argv, ctx) => {
         && String(latest.updated_at ?? '') === String(latest.created_at ?? '');
       const comment = reused ? { id: latest.id, url: latest.html_url ?? null } : gh.createComment(pr, body);
 
-      gh.removeLabels(pr, [AWAITING_REVIEW]);
+      gh.removeLabels(pr, [AWAITING_REVIEW], { retry: true });
       // gh exiting 0 is not the label being gone: read it back, and never report a removal that did not happen.
       if (gh.prLabels(pr).includes(AWAITING_REVIEW)) {
         return {
@@ -342,8 +342,8 @@ export const run = guarded(async (argv, ctx) => {
       let recheckError = null;
       if (recheck === 'triggered') {
         try {
-          gh.addLabels(pr, [RECHECK_LABEL]);
-          gh.removeLabels(pr, [RECHECK_LABEL]);
+          gh.addLabels(pr, [RECHECK_LABEL], { retry: true });
+          gh.removeLabels(pr, [RECHECK_LABEL], { retry: true });
         } catch (err) {
           recheck = 'failed';
           recheckError = `${String(err?.message ?? err).split('\n')[0].slice(0, 160)}; run \`P labels\` (creates ${RECHECK_LABEL}), then add and remove ${RECHECK_LABEL} by hand, so the guards post Cross-model review`;

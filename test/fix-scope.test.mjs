@@ -99,6 +99,13 @@ test('state fix-scope: a small edit of existing source is not flagged; the outpu
   assert.ok(r.json.fixScope.nonTestLines >= 5);
   assert.equal(w.stateText(), before, 'read-only');
   assert.equal(w.state().rounds[0].fixScope, undefined, 'fixScope is never persisted on the round');
+  // --pr N (like discard-round): the state's own PR is accepted (same answer), another PR is refused
+  const own = scopeOf(w, '--pr', String(w.state().pr));
+  assertExit(own, 0, own.stderr + own.stdout);
+  assert.deepEqual(own.json.fixScope, r.json.fixScope);
+  const other = scopeOf(w, '--pr', String(w.state().pr + 1));
+  assertExit(other, 2);
+  assert.equal(other.json.error, 'state-pr-mismatch');
 });
 
 test('state fix-scope: lines over the limit flag; the stricter of the working-tree and fork-point limits wins', (t) => {

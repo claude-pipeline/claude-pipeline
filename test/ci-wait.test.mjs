@@ -1304,6 +1304,57 @@ test('R1-F1: the run is read once per poll (memoised), not once per status evalu
   assert.equal(s.reads.runs.length, 8, String(s.reads.runs.length));
 });
 
+// ---- a required check pending only as a commit status holds the wait (#214 residual, #190) ---------------------------------------
+
+test('a required check pending as a commit status (no run) holds an absent check past the appear window: timeout with heldBy.kind status, not missing', async () => {
+  const s = sim({
+    classic: present('check A', 'check B'), timeline: readyTimeline,
+    statuses: [st('check A', 'pending', 'github-actions[bot]', { id: 7, created_at: '2026-01-01T12:00:10Z', target_url: 'https://ci.example/a' })],
+  }, { timeoutMs: 900_000 });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'timeout', JSON.stringify(r.output));
+  assert.equal(s.elapsed(), 900_000, 'held to --timeout, not given up at the 300s appear deadline');
+  assert.equal(r.output.heldBy.kind, 'status');
+  assert.equal(r.output.heldBy.name, 'check A');
+  assert.equal(r.output.heldBy.status, 'pending');
+  assert.ok(s.progress.some((l) => /still running/.test(l) && /check A/.test(l)), s.progress.join(' | '));
+});
+
+test('the pending status turns success and the absent check appears: passed', async () => {
+  const s = sim({
+    classic: present('check A', 'check B'), timeline: readyTimeline,
+    statuses: (t) => [st('check A', t < 400 ? 'pending' : 'success', 'github-actions[bot]', { id: t < 400 ? 7 : 8, created_at: '2026-01-01T12:00:10Z' })],
+    checkRuns: (t) => (t >= 400 ? [cr('check B', 'success')] : []),
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(r.output.heldBy.kind, 'status');
+});
+
+test('control: nothing pending and nothing running still ends `missing` at the appear deadline', async () => {
+  const s = sim({
+    classic: present('check A', 'check B'), timeline: readyTimeline,
+    statuses: [st('check A', 'success', 'github-actions[bot]', { created_at: '2026-01-01T12:00:10Z' })],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'missing');
+  assert.equal(s.elapsed(), 300_000);
+  assert.equal(r.output.heldBy, undefined);
+});
+
+test('#214 shape: queued shards plus a missing `test (windows)` aggregate are held by the check run, never `missing`', async () => {
+  const shards = [1, 2, 3].map((n) => cr(`test (windows ${n}/3)`, null, { status: 'queued', check_suite: { id: 9 } }));
+  const s = sim({
+    classic: present('test (ubuntu)', 'test (windows)'), timeline: readyTimeline,
+    checkRuns: [cr('test (ubuntu)', 'success'), ...shards],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T12:00:05Z' }],
+  }, { timeoutMs: 900_000 });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'timeout', JSON.stringify(r.output));
+  assert.equal(r.output.heldBy.kind, 'check-run');
+  assert.match(r.output.heldBy.name, /^test \(windows \d\/3\)$/);
+});
+
 // ---- a conflicting PR runs no pull_request workflow: say so instead of `missing` (#471) ----------------------------------------
 
 const MERGEABLE = (name) => fx(`pr-mergeable-${name}.json`); // gh pr view --json mergeable,mergeStateStatus, captured shapes
@@ -1536,6 +1587,30 @@ test('e2e label (R1-F1): a newer skipped no-op run of the suite does not hide th
   }
   const onlySkipped = await sim({ classic: present('A'), labels: ['run-e2e'], checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', 'skipped', { id: 2 })] }, E2E).run();
   assert.deepEqual(onlySkipped.output.others, []);
+});
+
+// A run-e2e PR whose required checks are green returned `passed` with the Playwright suite still running; the hand-off then needed the same ci-wait job re-run by hand every few minutes.
+// --wait-others keeps polling until no `others` entry is running; without it the verdict is unchanged.
+test('e2e label + waitOthers: a still-running non-required check is waited for; a red one ends the wait as passed with others; without the option the first read answers', async () => {
+  const world = (suite) => ({ classic: present('A'), labels: ['run-e2e'], checkRuns: (t) => [cr('A', 'success', { id: 1 }), suite(t)] });
+  const running = (t) => (t < 100 ? cr('Playwright suite', null, { id: 2 }) : cr('Playwright suite', 'success', { id: 2 }));
+  const waited = sim(world(running), { ...E2E, waitOthers: true });
+  const w = await waited.run();
+  assert.equal(w.output.verdict, 'passed');
+  assert.deepEqual(w.output.others, []);
+  assert.ok(waited.elapsed() >= 100_000, 'it polled until the suite finished');
+  const plain = sim(world(running), E2E);
+  const p = await plain.run();
+  assert.equal(p.output.others.length, 1);
+  assert.equal(plain.elapsed(), 0);
+  const red = sim(world(() => cr('Playwright suite', 'failure', { id: 2 })), { ...E2E, waitOthers: true });
+  const r = await red.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.equal(r.output.others[0].status, 'failure');
+  assert.equal(red.elapsed(), 0);
+  const stuck = sim(world(() => cr('Playwright suite', null, { id: 2 })), { ...E2E, waitOthers: true, timeoutMs: 60_000 });
+  const s = await stuck.run();
+  assert.equal(s.output.others[0].status, 'in_progress', 'at the limit the running entry is still reported, never hidden');
 });
 
 test('e2e label: no label on the PR, or no ci.e2e_label configured, leaves the output unchanged (no `others`, no label read without the option)', async () => {

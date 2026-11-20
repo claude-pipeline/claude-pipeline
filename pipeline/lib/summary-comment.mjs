@@ -37,7 +37,8 @@ export function readSummaryComment(gh, pr) {
 // `record` / `sections` left undefined are kept from the existing comment; pass `existing` (a readSummaryComment result)
 // to avoid reading it twice. An existing record this CLI cannot read (`unsupported`, newer version) is never dropped
 // silently: omit `record` and the write is refused.
-export function writeSummaryComment(gh, pr, { record, sections, existing } = {}) {
+// `retry`: wait out a rate limit (the run recorder leaves it off; the comment, summary and checkpoint commands opt in).
+export function writeSummaryComment(gh, pr, { record, sections, existing, retry = false } = {}) {
   const current = existing ?? readSummaryComment(gh, pr);
   if (record === undefined && current.status === 'unsupported') {
     throw new Error('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI before rewriting it');
@@ -50,8 +51,10 @@ export function writeSummaryComment(gh, pr, { record, sections, existing } = {})
   if (useRecord) parts.push(encodeRecord(useRecord));
   const body = parts.join('\n').trimEnd();
   // `current` is a fresh read of the newest own marker comment: edit that id instead of listing every comment again (#396); no comment yet (or a gh without updateComment): the upsert creates it.
+  // `retry` reaches the write only (both are safe to re-run: the PATCH is idempotent, the upsert re-lists before it writes).
+  const opts = retry ? [{ retry: true }] : [];
   const posted = current.id != null && typeof gh.updateComment === 'function'
-    ? gh.updateComment(current.id, MARKERS.summary, body)
-    : gh.upsertComment(pr, MARKERS.summary, body);
+    ? gh.updateComment(current.id, MARKERS.summary, body, ...opts)
+    : gh.upsertComment(pr, MARKERS.summary, body, ...opts);
   return { ...posted, record: useRecord };
 }
