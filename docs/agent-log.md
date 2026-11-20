@@ -294,3 +294,4 @@ full record.
 - 2026-11-20 · #667 · Guard: read the repo's pipeline config once per check (fixes 'took too long'); 3 more false refusals · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 624 runs (165 high)
 - 2026-11-20 · #697 · Codex review model default: gpt-6.2-astra · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 627 runs (167 high)
 - 2026-11-20 · #668 · Refuse to publish over a newer-format triage comment (#612) · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 627 runs (167 high)
+- 2026-11-20 · #266 · Owner-answer glyph and visibility, gh rate-limit retry, ci-wait status holder, worktree self-session (#190 non-guard items, #245, #214, #246, #253, #243; #244 pending) · risk high · rounds 16 · arbiter 14 (fix-verify 1) · merged · Codex 7d: 637 runs (170 high)
