@@ -24,6 +24,7 @@ export async function pushedWhileReadyOf({ root, gh, pr }) {
     const pull = gh.api('GET', `repos/${slug}/pulls/${pr}`);
     const timeline = pages(gh, `repos/${slug}/issues/${pr}/timeline`, undefined, cut('timeline events'));
     const commits = pages(gh, `repos/${slug}/pulls/${pr}/commits`, undefined, cut('commits'));
+    if (Number.isInteger(pull?.commits) && pull.commits > commits.length) warnings.push(`pushed-while-ready check: GitHub lists ${pull.commits} commits for this PR but returned ${commits.length} (it caps the commits of a PR at 250): the count may be short`);
     const branch = pull?.head?.ref;
     if (typeof branch !== 'string' || branch === '' || typeof pull?.created_at !== 'string') throw new Error('the PR has no branch or creation time');
     const created = Date.parse(pull.created_at);

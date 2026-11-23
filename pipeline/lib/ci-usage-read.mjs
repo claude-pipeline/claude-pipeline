@@ -59,11 +59,10 @@ const prNumberOf = (run, byBranch) => {
   if (Number.isInteger(n)) return n;
   const key = branchKey(run.head_repository?.full_name, run.head_branch);
   const created = Date.parse(run.created_at);
-  // the newest PR of that repository and branch created before the run; if an older one was still open then (or two were created at the same instant) the run cannot be told apart: unattributed.
-  // An older one already closed (a reused branch name) is no ambiguity.
-  const list = (key === null ? [] : byBranch?.get(key) ?? []).filter((p) => Date.parse(p.created_at) <= created).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
-  if (list.length > 1 && (list[0].created_at === list[1].created_at || list.slice(1).some((p) => !(Date.parse(p.closed_at) <= created)))) return null;
-  return list[0]?.number ?? null;
+  // the PRs of that repository and branch that were open when the run was created (created before it, not closed before it); the run is theirs only when exactly one was: two open at once
+  // (different bases, or created at the same instant) cannot be told apart, so it stays unattributed. A closed one (a reused branch name) is no ambiguity.
+  const open = (key === null ? [] : byBranch?.get(key) ?? []).filter((p) => Date.parse(p.created_at) <= created && !(Date.parse(p.closed_at) <= created));
+  return open.length === 1 ? open[0].number ?? null : null;
 };
 
 // ci.draft_while_iterating of the repository's own .claude/pipeline.yml on its default branch: true | false | 'unknown'. A config without the setting is false (its default).
@@ -151,6 +150,8 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
       const pr = gh.api('GET', `repos/${slug}/pulls/${n}`);
       const timeline = pages(gh, `repos/${slug}/issues/${n}/timeline`, undefined, cut('timeline events', n), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
       const commits = pages(gh, `repos/${slug}/pulls/${n}/commits`, undefined, cut('commits', n), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
+      // GitHub returns at most 250 commits of a PR whatever the pages: a PR with more is short here, with no cut page to show it
+      if (Number.isInteger(pr?.commits) && pr.commits > commits.length) { truncated = true; warn(`#${n}: GitHub lists ${pr.commits} commits for this PR but returned ${commits.length} (it caps the commits of a PR at 250): the classification of this PR may be short`); }
       readPr.set(n, { pr: { createdAt: pr?.created_at, draft: pr?.draft === true, baseRef: pr?.base?.ref }, timeline, commits, comments: null });
     } catch (err) {
       if (err instanceof budget.stop) { skipped.prs += 1; continue; }

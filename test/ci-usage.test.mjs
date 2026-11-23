@@ -253,6 +253,26 @@ test('R2-B1: two PRs open at once from the same head branch (different bases): a
   assert.equal(r.json.warnings.length, 0, r.json.warnings.join('\n'));
 });
 
+test('R3-B1: a newer PR from the same branch already closed when the run was created does not hide the one PR that was open: the run goes to it', () => {
+  const unlinked = RUNS.map((x) => ({ ...x, pull_requests: [] }));
+  const pulls = [{ match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [
+    { number: 9, created_at: T('09:10'), updated_at: T('13:00'), closed_at: T('09:20'), head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+    { number: 7, created_at: T('09:00'), updated_at: T('13:00'), closed_at: null, head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+  ] }];
+  const r = usage(world({ runs: unlinked, extra: pulls }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.repos[0].prs.map((p) => p.pr), [7]);
+  assert.equal(r.json.repos[0].totals.pushesWhileReady, 1);
+});
+
+test('R3-B4: a PR with more commits than GitHub returned (it caps them at 250, with no cut page) makes the report partial and warns', () => {
+  const capped = [{ match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { ...PR7, commits: 251 } }];
+  const r = usage(world({ extra: capped }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.repos[0].partial, true);
+  assert.match(r.json.warnings.join('\n'), /acme\/widgets: #7: GitHub lists 251 commits for this PR but returned 2 /);
+});
+
 test('R1-B13: the optional PR-list lookup failing leaves the runs it was for unclassified and the report partial; it is not an exit 3', () => {
   const half = RUNS.map((x) => (x.id === 1003 ? { ...x, pull_requests: [] } : x));
   const down = [{ match: '^api repos/acme/widgets/pulls\\?state=all', code: 1, stderr: 'gh: HTTP 502' }];
