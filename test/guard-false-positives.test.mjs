@@ -17,6 +17,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands, startupFilesOf } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { sqlShellEscapes } from '../pipeline/hooks/lib/sql-clients.mjs';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -378,17 +379,10 @@ test('J: an unknown psql line is refused only with protected text around, also w
   const env = { env: { HOME: '/home/u', ZDOTDIR: '/home/u' } };
   const spec = { '/home/u/.zshenv': 'source "$(echo x)"\n' }; // (a sourced file that cannot be followed: every name is unknown)
   const run = (cmd) => files(cmd, fakeFs(PROJ, spec, DIRS), env);
-  for (const sql of ["select ':x'", 'select \'{"a":null}\'::jsonb', "insert into t values ('{\"k\":\"v\"}')"]) {
-    assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}"`).decision, 'allow', sql);
-    assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}; select '/home/u/.claude/settings.json'"`).decision, 'deny', `${sql} + protected`);
-  }
-  // (R5 regression: the protected set grew by pipeline-state/codex, .codex/sessions and .codex, and the reruns per assumed directory went past the allowance, refusing the harmless line;
-  // text naming the Codex session logs is still refused, for that text and not for the allowance)
-  const harmless = run('psql -c "select \':x\'"');
-  assert.equal(harmless.decision, 'allow', harmless.reason);
-  const codexLog = run('psql -c "select \':x\'; select \'/home/u/.codex/sessions/x.jsonl\'"');
-  assert.equal(codexLog.decision, 'deny');
-  assert.doesNotMatch(codexLog.reason, /too many commands run/);
+  // (#262 B1b: the psql line itself is refused by the live-database guard now, so the unknown line is read from a sqlite3 meta-command; the psql scanner's unknown line is asserted at the scanner entry point)
+  assert.match(sqlShellEscapes("select ':x'", { family: 'psql' }).join('\n'), /SQL_UNKNOWN_SHELL_LINE/);
+  assert.match(run(`psql -c "select ':x'"`).reason ?? '', /live database:/);
+  // (the end-to-end half of this test, the unknown line refused only with protected text around, needed a psql line: a psql line is now refused by the live-database guard whatever it holds, #262)
 });
 
 // Why (commit review of I and J): the value a word has when the shell runs is the one assigned before it, once; and the SQL placeholder must not be a name a command can set.

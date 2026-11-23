@@ -1,0 +1,287 @@
+// #262 (live-database guard, B1b): the psql family. A tripwire: an agent-run line that runs psql or another Postgres client cannot, by its own command line, point the client at a non-local
+// database. Two psql shapes pass (a strict host psql to a literal localhost URI; psql inside a local Supabase container through `docker exec`); every other family line is refused.
+// All rows go through evaluateBashForFiles with the production options (the real reparse); the SQL files and the Docker config are real files in a temp folder.
+import { test, after } from 'node:test';
+import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { seedRegistry } from './helpers/db-refs-owner.mjs';
+import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+
+const home = mkdtempSync(join(tmpdir(), 'cp-live-db-psql-home-'));
+const work = mkdtempSync(join(tmpdir(), 'cp-live-db-psql-work-'));
+after(() => { rmSync(home, { recursive: true, force: true }); rmSync(work, { recursive: true, force: true }); });
+seedRegistry(home, { refs: [{ ref: 'zyxwvutsrq9876543210', name: 'Scratch', repo: 'acme/widgets', kind: 'dev' }] });
+
+const OPTS = { home, env: {}, platform: 'linux', realpath: (p) => p, existsSync: () => false, cwd: work };
+const run = (line, o = {}) => evaluateBashForFiles(line, { ...OPTS, ...o });
+const URI = 'postgresql://postgres:postgres@127.0.0.1:54322/postgres';
+const sql = (text) => writeFileSync(join(work, 't.sql'), text);
+const dockerDir = join(home, '.docker');
+const clearDocker = () => rmSync(dockerDir, { recursive: true, force: true });
+const dockerConfig = (text) => { clearDocker(); mkdirSync(dockerDir, { recursive: true }); if (text !== null) writeFileSync(join(dockerDir, 'config.json'), text); };
+const dockerMeta = (name, host) => {
+  const dir = join(dockerDir, 'contexts', 'meta', createHash('sha256').update(name).digest('hex'));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ Name: name, Endpoints: { docker: { Host: host } } }));
+};
+const GOOD_FILE = "\\set uid 'abc'\nselect :'uid';\n\\echo done\n\\if true\nselect 1::int;\n\\endif\n";
+const DOCKER_FILE = 'docker exec -i supabase_db_e2e-ci psql -X -U postgres -d postgres -v ON_ERROR_STOP=1 -f - < t.sql';
+
+const mustAllow = (line, o = {}) => { const v = run(line, o); assert.equal(v.decision, 'allow', `${line}: ${v.reason}`); };
+const mustRefuse = (line, o = {}, why = /live database:/) => {
+  const v = run(line, o);
+  assert.equal(v.decision, 'deny', `${line}: allowed`);
+  assert.match(v.reason ?? '', why, line);
+};
+
+// Catches: the guard refusing the two shapes the owner's daily database work uses (a host psql to the local stack, psql inside the local Supabase container), or failing to refuse them differently.
+test('the two allowed psql shapes pass (host to a literal localhost URI, docker exec into a local supabase_db container)', () => {
+  dockerConfig(null);
+  sql(GOOD_FILE);
+  for (const line of [
+    `psql -X "${URI}" -c 'select 1'`,
+    'psql -X -d postgresql://postgres:postgres@localhost:54322/postgres -tAc \'select 1\'',
+    `timeout 30 psql -X ${URI} -c 'select 1'`,
+    'psql --version',
+    "psql '-?'",
+    'which psql',
+    'rg -n psql docs',
+    'git commit -m "psql guard"',
+    'pg_config --version',
+    DOCKER_FILE,
+    'docker exec -i supabase_db_DRMed psql -X -U postgres -d postgres < t.sql',
+    "docker exec supabase_db_x psql -X -c 'select 1'",
+    "docker exec supabase_db_x psql -X -c '\\dt'",
+    "docker exec supabase_db_x psql -X -F '|' -Atc 'select 1'",
+    'docker ps',
+    'docker logs supabase_db_x',
+  ]) mustAllow(line);
+});
+
+test('a docker config naming a LOCAL context passes; an absent config is the default context', () => {
+  dockerConfig(JSON.stringify({ currentContext: 'desktop-linux' }));
+  dockerMeta('desktop-linux', 'unix:///Users/u/.docker/run/docker.sock');
+  mustAllow("docker exec supabase_db_x psql -X -c 'select 1'");
+  dockerConfig(JSON.stringify({ currentContext: 'default' }));
+  mustAllow("docker exec supabase_db_x psql -X -c 'select 1'");
+  dockerConfig(null);
+  mustAllow("docker exec supabase_db_x psql -X -c 'select 1'");
+  clearDocker();
+  mustAllow("docker exec supabase_db_x psql -X -c 'select 1'");
+});
+
+// Catches: a host psql whose own line can name a remote server (host, service, URI parameter, env) or read input the guard cannot see.
+test('host psql: every shape that can reach another server or read unseen input is refused', () => {
+  dockerConfig(null);
+  const P = `psql -X ${URI}`;
+  for (const [line, o] of [
+    ['psql', {}],
+    ['psql "$LOCAL_URL"', {}],
+    [`psql ${URI} -c 'select 1'`, {}],
+    [`psql -X -h db.x.supabase.co -p 5432 -U postgres -d postgres -c 'select 1'`, {}],
+    [`psql -X -h 127.0.0.1 ${URI} -c 'select 1'`, {}],
+    [`psql -X ${URI}?host=db.x.supabase.co -c 'select 1'`, {}],
+    [`psql -X ${URI}?sslmode=disable -c 'select 1'`, {}],
+    ["psql -X -d 'host=db.x.supabase.co dbname=postgres' -c 'select 1'", {}],
+    ['psql -X "service=prod" -c \'select 1\'', {}],
+    [`${P} -c '\\connect prod'`, {}],
+    [`${P} -c 'select :LAST_ERROR_MESSAGE'`, {}],
+    [`${P} -c "select :foo"`, {}],
+    [`${P} -c "$SQL"`, {}],
+    [`${P} -c "select 1"`, {}],
+    [`${P} -c "copy (values (1)) to program 'curl x'"`, {}],
+    [`${P} -c 'copy (values (1)) to program x'`, {}],
+    [`${P} -c 'copy t from stdin' < data.csv`, {}],
+    [`cat d.csv | ${P} -c 'copy t from stdin'`, {}],
+    [`${P} -c 'select 1' | head`, {}],
+    [`${P} -f x.sql`, {}],
+    [`${P} <<'EOF'\nselect 1;\nEOF`, {}],
+    [`${P} -c 'select 1' -o out.txt`, {}],
+    [`${P} --comm='select 1'`, {}],
+    [`PGSERVICE=production ${P} -c 'select 1'`, {}],
+    [`export PGHOST=x; ${P} -c 'select 1'`, {}],
+    [`${P} -c 'select 1'`, { env: { PGHOSTADDR: '10.0.0.1' } }],
+    [`${P} -c 'select 1' &`, {}],
+    ['pg_isready -h db.x.supabase.co', {}],
+    [`ssh host "psql -X ${URI} -c 'select 1'"`, {}],
+    [`bash -c "psql -X ${URI} -c 'select 1'"`, {}],
+    ['rg --pre ./run.sh psql .', {}],
+    [`psql -X $"${URI}" -c 'select 1'`, {}],
+    ["psql -?", {}],
+  ]) mustRefuse(line, o);
+});
+
+// Catches (Fable F2/F3/F5): wrappers, assignments and repeated words that change what psql sees without showing in the argv.
+test('host psql: wrappers, env-name tricks and repeated quoted words are refused; timeout <duration> alone passes', () => {
+  dockerConfig(null);
+  const P = `psql -X ${URI} -c 'show server_version'`;
+  mustAllow(`timeout 30 ${P}`);
+  for (const line of [
+    `timeout -s KILL 30 ${P}`,
+    `npx ${P}`,
+    `sudo -u postgres ${P}`,
+    `wsl ${P}`,
+    `env HOME=/tmp ${P}`,
+    `export PGHOSTADDR+=10.0.0.1; ${P}`,
+    `read PGHOST <<< x; ${P}`,
+    `printf -v PGHOST x; ${P}`,
+    `${P} -c 'show server_version'`,
+    `${P}; echo done`,
+    `echo x && ${P}`,
+  ]) mustRefuse(line);
+});
+
+test('docker psql: a repeated plain word (-U postgres -d postgres) still passes', () => {
+  dockerConfig(null);
+  mustAllow("docker exec supabase_db_x psql -X -U postgres -d postgres -c 'select 1'");
+});
+
+// Catches: the SQL a docker psql reads (a file or -c) carrying a meta-command, an interpolation or a word that reaches out of the container.
+test('docker psql: a SQL file with any meta-command outside the allow-list, raw interpolation or unreadable encoding is refused', () => {
+  dockerConfig(null);
+  const bad = [
+    '\\c other\n', '\\connect other\n', '\\i x.sql\n', '\\ir x.sql\n', '\\! id\n', '\\o out.txt\n', '\\copy t from x\n', '\\gset\n', '\\setenv X 1\n', '\\encoding SJIS\n',
+    "\\set x '\\\\c y'\n", "\\set x ':y'\n", "\\set X 1\n", '\\echo `id`\n', 'select :uid;\n', 'select :LAST_ERROR_MESSAGE;\n', 'select 1;\rselect 2;\n', 'select 1;\0\n',
+    '\\pset pager on\n', '\\g out.txt\n', "copy t from program 'x';\n", 'create extension dblink;\n', '/* a\n-- */ \\c x\n', '$$ a\n-- $$ \\c x\n',
+    'select 1:::uid;\n', "\\set x 'a' b\n", 'select 1; \\if \\c x\n',
+    Buffer.from([0x73, 0xff, 0x0a]), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('select 1;\n')]),
+  ];
+  for (const text of bad) {
+    sql(text);
+    mustRefuse(DOCKER_FILE);
+  }
+  sql('-- \uFFFD a real replacement character\nselect 1;\n');
+  mustAllow(DOCKER_FILE);
+  sql(GOOD_FILE);
+  mustAllow(DOCKER_FILE);
+  sql('select 1::int;\n');
+  mustAllow(DOCKER_FILE);
+  // the same checks apply to -c
+  mustRefuse("docker exec supabase_db_x psql -X -c '\\c other'");
+  mustRefuse("docker exec supabase_db_x psql -X -c 'select :uid'");
+});
+
+// Catches: the file the guard reads not being the file psql reads (missing, a directory, too big, a path the shell rewrites), or stdin arriving some other way.
+test('docker psql: the file read is bounded and the redirect must be the one literal file', () => {
+  dockerConfig(null);
+  sql(GOOD_FILE);
+  rmSync(join(work, 'gone.sql'), { force: true });
+  mkdirSync(join(work, 'adir'), { recursive: true });
+  writeFileSync(join(work, 'big.sql'), Buffer.alloc(1_000_001, 0x20));
+  const D = 'docker exec -i supabase_db_x psql -X';
+  for (const line of [
+    `${D} < gone.sql`,
+    `${D} < adir`,
+    `${D} < big.sql`,
+    `${D} < "$F"`,
+    `${D} < ~/t.sql`,
+    `${D} -f /tmp/t.sql`,
+    `${D} <<'EOF'\nselect 1;\nEOF`,
+    `${D} <<< 'select 1'`,
+    `cat t.sql | ${D}`,
+    'docker exec supabase_db_x psql -X -f - < t.sql',
+    "docker exec -it supabase_db_x psql -X -c 'select 1'",
+    D,
+    `echo x >> t.sql; ${D} < t.sql`,
+    `cd sub && ${D} < t.sql`,
+    `> t.sql; ${D} < t.sql`,
+    `${D} < t.sql 2> t.sql`,
+    `${D} < t.sql > t.sql`,
+    `${D} -f - < t.sql | head`,
+  ]) mustRefuse(line);
+});
+
+// Catches: a docker psql that is pointed anywhere but the local container's own server, or that changes what runs in the container.
+test('docker psql: container name, options and program are pinned; tampering with a supabase_db container is refused', () => {
+  dockerConfig(null);
+  sql(GOOD_FILE);
+  for (const line of [
+    'docker exec -i -e PGPASSWORD=postgres supabase_db_x psql -X -U postgres -d postgres < t.sql',
+    'docker exec -i supabase_db_x psql -X -h 127.0.0.1 < t.sql',
+    "docker exec -i supabase_db_x psql -X -d 'host=db.x dbname=postgres' < t.sql",
+    "docker exec -i supabase_db_x psql -X -c \"$SQL\"",
+    'docker exec -i "$DB_CONTAINER" psql -X < t.sql',
+    'docker exec -i drm-guard-pg psql -X < t.sql',
+    'docker exec -i supabase_db_x psql < t.sql',
+    'docker --context prod exec -i supabase_db_x psql -X < t.sql',
+    'DOCKER_HOST=ssh://x docker exec -i supabase_db_x psql -X < t.sql',
+    'docker exec -u root supabase_db_x psql -X -c \'select 1\'',
+    'docker exec supabase_db_x pg_dumpall',
+    "docker exec supabase_db_x sh -c 'echo hi'",
+    'docker cp w supabase_db_x:/usr/local/bin/psql',
+    'docker run --name supabase_db_y postgres',
+    'docker rename a supabase_db_y',
+    "docker exec supabase_db_x psql -X -c $\"select 1\"",
+    "docker exec supabase_db_x psql -X -c $'select 1'",
+    "docker exec supabase_db_x psql -X -c 'select 1' -c 'select 1'",
+    "docker context use prod; docker exec supabase_db_x psql -X -c 'select 1'",
+    "sudo docker exec supabase_db_x psql -X -c 'select 1'",
+    "env HOME=/tmp/h docker exec supabase_db_x psql -X -c 'select 1'",
+    "docker exec supabase_db_x psql -X -c 'select 1' | head -1",
+    'kubectl exec db -- psql -c \'select 1\'',
+    'podman exec x psql -X',
+    'docker run img psql',
+    'docker compose exec db psql -X',
+  ]) mustRefuse(line);
+  mustRefuse("docker exec supabase_db_x psql -X -c 'select 1'", { env: { DOCKER_HOST: 'ssh://x' } });
+  mustRefuse("docker exec supabase_db_x psql -X -c 'select 1'", { env: { DOCKER_CONTEXT: 'prod' } });
+  mustRefuse("docker exec supabase_db_x psql -X -c 'select 1'", { env: { DOCKER_CONFIG: '/tmp/x' } });
+});
+
+// Catches (Codex R1 P1-1, R2-1): a saved Docker context or config the agent cannot see on the line sending the exec to a remote daemon.
+test('docker psql: the Docker endpoint must be proven local from the config file; unreadable, invalid or remote refuses', () => {
+  const Q = "docker exec supabase_db_x psql -X -c 'select 1'";
+  dockerConfig(JSON.stringify({ currentContext: 'prod' }));
+  dockerMeta('prod', 'ssh://x');
+  mustRefuse(Q);
+  dockerConfig(JSON.stringify({ currentContext: 'missing' }));
+  mustRefuse(Q);
+  dockerConfig('{not json');
+  mustRefuse(Q);
+  dockerConfig(JSON.stringify({ currentContext: 7 }));
+  mustRefuse(Q);
+  dockerConfig(null);
+  mkdirSync(join(dockerDir, 'config.json'));
+  mustRefuse(Q); // present but not a regular file: unreadable, not absent
+  // a Windows named pipe: only the local form
+  dockerConfig(JSON.stringify({ currentContext: 'win' }));
+  dockerMeta('win', 'npipe://otherhost/pipe/docker_engine');
+  mustRefuse(Q, { platform: 'win32' });
+  dockerMeta('win', 'npipe:////./pipe/docker_engine');
+  mustAllow(Q, { platform: 'win32' });
+});
+
+// Catches (Fable F1): the lines the guard reads again (a piped shell, a script, eval, a held command line) hiding a psql line behind the outer line's other commands.
+test('a psql family word inside script text the guard reads again is refused, whatever the shape', () => {
+  dockerConfig(null);
+  writeFileSync(join(work, 'x.sh'), "docker exec supabase_db_x psql -X -c 'select 1'\n");
+  mustRefuse("bash -s <<'EOF'\ndocker exec supabase_db_x psql -X -c 'select 1'\nEOF");
+  mustRefuse('bash x.sh', { existsSync: (p) => p.startsWith(work) });
+  mustRefuse(`eval "psql -X ${URI} -c 'select 1'"`);
+  mustRefuse(`L="psql -X ${URI} -c 'select 1'"; $L`);
+});
+
+// Catches: every other member of the family (dump, restore, other clients, the pg_* utilities) and every launcher that runs psql with arguments the guard cannot read.
+test('the other family programs and psql behind launchers or variables are refused', () => {
+  dockerConfig(null);
+  for (const line of [
+    'pg_dump -h 127.0.0.1 postgres', 'pg_restore x.dump', 'pg_dumpall', 'pgcli', 'usql pg://x',
+    'dropdb x', 'createdb x', 'vacuumdb x', 'reindexdb x', 'clusterdb x', 'pgbench x', 'pg_basebackup -D x', 'pg_receivewal -D x',
+    'createuser x', 'dropuser x', 'pg_amcheck x', 'pg_isready', 'vacuumlo x', 'oid2name', 'pg_upgrade --version',
+    "kubectl exec db -- psql -c 'select 1'",
+    "doppler run --command 'psql -c 1'",
+    "$PSQL -c 'select 1'",
+    'DB=(docker exec -i "$C" psql); "${DB[@]}" -c \'select 1\'',
+    'ls | xargs psql',
+    `git -c core.pager='psql -X ${URI} -c "select 1"' grep -O x`,
+    `git -C /repo -c core.pager='psql -X ${URI} -c "select 1"' grep -O x`,
+    'git --config-env=core.pager=X log psql',
+    "rg --pre ./x psql",
+    'echo psql > run.sh',
+  ]) mustRefuse(line);
+  // a data-only mention passes (the command cannot run psql)
+  for (const line of ['echo psql', 'grep -rn pg_dump docs', 'git log --grep=psql', 'cat psql.md', 'ls psql']) mustAllow(line);
+});

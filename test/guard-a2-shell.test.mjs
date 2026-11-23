@@ -12,6 +12,11 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { simpleCommands, commandName, scriptFileOf, shebangShell } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { sqlShellEscapes, sqlClientPlan } from '../pipeline/hooks/lib/sql-clients.mjs';
+
+// #262 B1b: the shell lines the SQL scanner derives from a psql input (what the policies then judge like any shell line); the scanner is shared by git-policy and files-policy
+const psqlLines = (text) => sqlShellEscapes(text, { family: 'psql' }).join('\n');
+const psqlPlanLines = (...words) => sqlClientPlan('psql', words, {}).lines.join('\n');
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -60,6 +65,16 @@ const allowBoth = (command, spec, o) => {
   const r = both(command, spec, o);
   assert.equal(r.git.decision, 'allow', `git: ${command} -> ${r.git.reason}`);
   assert.equal(r.files.decision, 'allow', `files: ${command} -> ${r.files.reason}`);
+};
+
+// #262 B1b: the files guard refuses every psql-family line that is not one of its two allowed shapes (live-db-guard.mjs), whatever the line's files say; git-policy judges the same line by its own rules.
+// The shared git+files fixtures of psql lines keep the git verdict and expect the live-database refusal from files (the SQL scanner both policies use is covered by the git side and by the scanner-level asserts).
+const LIVE_DB = /live database:/;
+const gitOnly = (command, spec, want, o) => {
+  const r = both(command, spec, o);
+  assert.equal(r.git.decision, want, `git: ${command} -> ${r.git.reason}`);
+  assert.equal(r.files.decision, 'deny', `files: ${command}`);
+  assert.match(r.files.reason ?? '', LIVE_DB, `files: ${command}`);
 };
 
 const SPEC = { 'f.sh': 'bad', 'ok.sh': 'ok', 'x.sh': 'ok', 'bin/tool': 'bad', 'bin2/tool': 'ok' };
@@ -292,9 +307,10 @@ test('S2: several producers of one feed are judged joined when every one of them
 test('S2: the program text of an inline interpreter run is not a file name', () => {
   for (const c of [
     `eval "$(node -e 'console.log(a[0] === 2)')"`,
-    `bash -c "$(python3 -c 'print([1][0])')"`, `node -e 'console.log(a[0] === 2)' | $PSQL $DB`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `perl -e 'print $a[0]' | sh`,
+    `bash -c "$(python3 -c 'print([1][0])')"`, `node -e 'console.log(a[0] === 2)' | bash`, `python3 -c 'print(a[0])' | bash`, `perl -e 'print $a[0]' | sh`,
     `node --eval='console.log(a[0])' | bash`,
   ]) allowBoth(c, FEED);
+  gitOnly(`node -e 'console.log(a[0] === 2)' | $PSQL $DB`, FEED, 'allow'); // (psql: git still allows it; the files guard refuses the psql line, #262)
   // (a false refusal, not a bypass: main allowed these two, but #288's AUTO_CD rule read together with this branch's reading of the -c text takes a one-word `{}` / assignment-with-substitution text for a possible
   // directory name; guard-git still allows, guard-files refuses. Owner rule: false refusals over bypasses; tracked for #359)
   for (const c of ["xargs -I{} sh -c '{}' < x.sh", "bash -c \"$(node -e 'a=`x`')\""]) {
@@ -415,8 +431,9 @@ test('S3: variables an explicit startup file exports reach the script judged nex
 
 test('S3: a known data program fed a file is not a shell reading a script', () => {
   const sql = '-- push to main, then merge and git push origin main';
+  for (const c of ['Q=psql; $Q < q.sql', 'PSQL="psql -h localhost"; $PSQL $DB -q < q.sql', 'PSQL=/opt/homebrew/opt/libpq/bin/psql; $PSQL $DB -v ON_ERROR_STOP=1 -q < q.sql']) gitOnly(c, { 'q.sql': sql }, 'allow');
   for (const c of [
-    'Q=psql; $Q < q.sql', 'PSQL="psql -h localhost"; $PSQL $DB -q < q.sql', 'PSQL=/opt/homebrew/opt/libpq/bin/psql; $PSQL $DB -v ON_ERROR_STOP=1 -q < q.sql', 'Q=jq; cat q.sql | $Q .', 'Q=sqlite3; $Q db.sqlite < q.sql',
+    'Q=jq; cat q.sql | $Q .', 'Q=sqlite3; $Q db.sqlite < q.sql',
   ]) {
     assert.equal(git(c, fakeFs(GIT_ROOT, { 'q.sql': sql }, DIRS)).decision, 'allow', c);
     assert.equal(files(c, fakeFs(PROJ, { 'q.sql': '-- ' + BAD_FILES }, DIRS)).decision, 'allow', c);
@@ -465,6 +482,8 @@ const sqlBoth = (template, fileTemplates, expect) => {
   const one = (tag, run, bad, ok, root) => {
     const fsOf = (b, o) => fakeFs(root, Object.fromEntries(Object.entries(fileTemplates).map(([k, v]) => [k, fill(v, b, o)])), DIRS);
     const r = run(fill(template, bad, ok), fsOf(bad, ok));
+    // (#262 B1b: a psql line is refused by the files guard as a live-database line, whatever its text says; the git side and the scanner-level asserts below keep the SQL scanning proven)
+    if (tag === 'files' && /psql/.test(template)) { assert.equal(r.decision, 'deny', `${tag}: ${template}`); if (expect === 'allow') assert.match(r.reason ?? '', LIVE_DB, `${tag}: ${template}`); return; } // (a line whose text holds a guarded command is refused by that rule first)
     assert.equal(r.decision, expect, `${tag}: ${template} -> ${r.reason}`);
   };
   one('git', (c, f) => git(c, f), BAD_GIT, 'git status', GIT_ROOT);
@@ -650,7 +669,17 @@ test('S4c: a client writes files without any escape (files-policy)', () => {
   for (const [c, text] of [
     ['psql < w.sql', '\\o out.txt\nselect 1;'], ['psql < w.sql', "\\copy t to 'out.csv' csv"], ['psql < w.sql', "\\copy t to stdout"], ['sqlite3 db < w.sql', '.output out.txt'], ['sqlite3 db < w.sql', "select writefile('out.bin', 'x');"],
     ['psql -o out.txt < w.sql', 'select 1;'], ['mysql < w.sql', 'tee out.txt'], ['sqlite3 db.sqlite < w.sql', 'select 1;'], ['psql < w.sql', '\\o\nselect 1;'], ['psql < w.sql', '\\g\nselect 1;'], ['sqlite3 db < w.sql', '.output stdout'],
-  ]) assert.equal(w(c, 'w.sql', text), 'allow', `${c} / ${text}`);
+  ]) {
+    // (psql rows: the files guard refuses the line itself, #262; the scanner derives no write to a protected path)
+    if (/psql/.test(c)) {
+      assert.equal(w(c, 'w.sql', text), 'deny', `${c} / ${text}`);
+      assert.ok(!(psqlLines(text) + psqlPlanLines(...c.split(' ').slice(1, c.includes('-o ') ? 3 : 1).filter((x) => x !== '<'))).includes(P), `${c} / ${text}`);
+    } else assert.equal(w(c, 'w.sql', text), 'allow', `${c} / ${text}`);
+  }
+  // (the psql write shapes the scanner reads, at the scanner entry point: each yields the write line the policies judge)
+  for (const [text, want] of [[`\\o ${P}\nselect 1;`, `: > ${P}`], [`select 1 \\g ${P}`, `: > ${P}`], [`\\w ${P}`, `: > ${P}`], [`\\s ${P}`, `: > ${P}`], [`\\copy t to '${P}'`, `: > ${P}`], [`\\gx ${P}`, `: > ${P}`], [`\\lo_export 1 ${P}`, `: > ${P}`], [`\\out ${P}`, `: > ${P}`]]) assert.ok(psqlLines(text).split('\n').includes(want), text);
+  assert.match(psqlLines(`\\set f ${P}\n\\o :f`), /SQL_UNKNOWN_SHELL_LINE/);
+  for (const o of [['-o', P], ['-L', P], [`--output=${P}`], ['--log-file', P]]) assert.ok(psqlPlanLines(...o).split('\n').includes(`: > ${P}`), o.join(' '));
 });
 
 test('S4c: the client\'s own writes are judged in every directory the command may run in (files-policy)', () => {
@@ -658,7 +687,9 @@ test('S4c: the client\'s own writes are judged in every directory the command ma
   for (const cd of ['[ -n "$X" ] && cd /home/u/.claude', 'if [ -n "$X" ]; then cd /home/u/.claude; fi', 'cd /home/u/.claude', 'cd /tmp; cd /home/u/.claude', 'cd /tmp || cd /home/u/.claude', 'cd /home/u/.claude || cd /tmp', 'if [ -n "$X" ]; then cd /tmp; else cd /home/u/.claude; fi']) {
     for (const c of ["psql -o settings.json -c 'select 1'", "sqlite3 db '.output settings.json'", 'Q=psql; $Q -o settings.json -c "select 1"']) assert.equal(files(`${cd}; ${c}`, fs).decision, 'deny', `${cd}; ${c}`);
   }
-  assert.equal(files("cd ./sub; psql -o settings.json -c 'select 1'", fs).decision, 'allow');
+  assert.equal(files("cd ./sub; sqlite3 db '.output settings.json'", fs).decision, 'allow');
+  assert.equal(files("cd ./sub; psql -o settings.json -c 'select 1'", fs).decision, 'deny'); // (#262: the psql line itself)
+  assert.equal(psqlPlanLines('-o', 'settings.json', '-c', 'select 1'), ': > settings.json');
 });
 
 test('S4c: \\g (options) is skipped before the target; sqlite SQL functions are read per statement, across lines', () => {
@@ -669,8 +700,9 @@ test('S4c: \\g (options) is skipped before the target; sqlite SQL functions are 
   const P = '/home/u/.claude/settings.json';
   const w = (text) => files('psql < w.sql', fakeFs(PROJ, { 'w.sql': text }, DIRS)).decision;
   assert.equal(w(`select 1 \\g (format=csv) ${P}`), 'deny');
-  assert.equal(w('select 1 \\g (format=csv) out.csv'), 'allow');
-  assert.equal(w('select 1 \\g (format=csv)'), 'allow');
+  assert.equal(psqlLines('select 1 \\g (format=csv) out.csv'), ': > out.csv');
+  assert.equal(psqlLines('select 1 \\g (format=csv)'), '');
+  assert.equal(psqlLines(`select 1 \\g (format=csv) ${P}`), `: > ${P}`);
   const s = (text) => files('sqlite3 db < w.sql', fakeFs(PROJ, { 'w.sql': text }, DIRS)).decision;
   assert.equal(s(`select writefile(\n'${P}',\n 'x');`), 'deny');
   assert.equal(s(`select writefile( -- c\n'${P}'\n, 'x');`), 'deny');
@@ -718,7 +750,8 @@ test('S4d: the rest of a line after an unknown cd is judged as if the cwd were e
   assert.equal(files('cd $UNSET && cat ../x', fs).decision, 'allow');
   // (S5a: script text fed in and a script named relative to the unknown directory are judged where they may be - the directories the line knows and the protected ones - not refused outright)
   const rel = fakeFs(PROJ, { 'x.sh': 'echo hi', 'q.sql': 'select 1;' }, DIRS);
-  for (const w of ['bash < x.sh', 'cat x.sh | bash', 'bash -s < x.sh', 'psql -f q.sql', 'mysql < q.sql', 'cat a.sh b.sh | bash', 'cat q.sql | psql', 'node scripts/x.mjs', 'bash x.sh', 'source x.sh', './x.sh', 'python3 build/x.py']) assert.equal(files(`cd $UNSET && ${w}`, rel).decision, 'allow', w);
+  for (const w of ['bash < x.sh', 'cat x.sh | bash', 'bash -s < x.sh', 'mysql < q.sql', 'cat a.sh b.sh | bash', 'node scripts/x.mjs', 'bash x.sh', 'source x.sh', './x.sh', 'python3 build/x.py']) assert.equal(files(`cd $UNSET && ${w}`, rel).decision, 'allow', w);
+  for (const w of ['psql -f q.sql', 'cat q.sql | psql']) assert.match(files(`cd $UNSET && ${w}`, rel).reason ?? '', LIVE_DB, w); // (#262: a psql line is refused as such)
   const relBad = fakeFs(PROJ, { 'x.sh': 'echo x > ~/.claude/settings.json', 'q.sql': '\\! echo x > ~/.claude/settings.json' }, DIRS);
   for (const w of ['bash < x.sh', 'cat x.sh | bash', 'bash -s < x.sh', 'psql -f q.sql', 'bash x.sh', 'source x.sh', './x.sh']) assert.equal(files(`cd $UNSET && ${w}`, relBad).decision, 'deny', w);
   assert.equal(files('cd $UNSET && node /tmp/x.mjs', fs).decision, 'allow'); // (a missing file runs nothing)
@@ -816,9 +849,10 @@ test('S4d: a write / include target with spaces or quotes is judged by its real 
   const w = (text, cmd = 'psql < w.sql') => files(cmd, fakeFs(PROJ, { 'w.sql': text }, DIRS)).decision;
   assert.equal(w(`\\o '${P}'\nselect 1;`), 'deny');
   assert.equal(w("\\o '/home/u/.claude/pipeline/a b.txt'\nselect 1;"), 'deny');
-  assert.equal(w("\\o 'out dir/a b.txt'\nselect 1;"), 'allow');
+  assert.ok(!psqlLines("\\o 'out dir/a b.txt'\nselect 1;").includes('/home/u/.claude'));
+  assert.equal(w("\\o 'out dir/a b.txt'\nselect 1;"), 'deny'); // (#262: the psql line itself)
   assert.equal(w("\\i '/home/u/.claude/pipeline/a b.txt'"), 'deny'); // (the include is a read of a protected path by a client that is not read-only)
-  assert.equal(w("\\i 'inc dir/a b.sql'"), 'allow');
+  assert.ok(!psqlLines("\\i 'inc dir/a b.sql'").includes('/home/u/.claude'));
   const F = { 'e.sql': 'echo hi' };
   const s = (text, cmd = 'sqlite3 db < w.sql') => files(cmd, fakeFs(PROJ, { 'w.sql': text, ...F }, DIRS)).decision;
   for (const u of ['file:/home/u/.claude/settings.json', 'file:///home/u/.claude/settings.json', 'file://localhost/home/u/.claude/settings.json?mode=rwc', 'file:/home/u/.cl%61ude/settings.json?mode=rwc&cache=shared']) {

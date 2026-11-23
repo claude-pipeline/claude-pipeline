@@ -45,7 +45,8 @@ function both(command, spec = {}, o = {}) {
 const allowBoth = (command, spec, o) => {
   const r = both(command, spec, o);
   assert.equal(r.git.decision, 'allow', `git: ${command} -> ${r.git.reason}`);
-  assert.equal(r.files.decision, 'allow', `files: ${command} -> ${r.files.reason}`);
+  // (#262 B1b: the files guard refuses a psql line that is not an allowed shape; git keeps its verdict)
+  if (/psql/.test(command)) { assert.equal(r.files.decision, 'deny', `files: ${command}`); assert.match(r.files.reason ?? '', /live database:/, `files: ${command}`); } else assert.equal(r.files.decision, 'allow', `files: ${command} -> ${r.files.reason}`);
 };
 const denyBoth = (command, spec, o) => {
   const r = both(command, spec, o);
