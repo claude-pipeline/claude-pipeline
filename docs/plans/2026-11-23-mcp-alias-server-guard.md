@@ -90,6 +90,7 @@ next to the account file, makes that layer UNKNOWN (F-P3).
 
 **5c. Decide** (no precedence model: F-P2):
 - Any scanned entry for the name is SUPABASE ⇒ Supabase (also when a layer is UNKNOWN: a positive match wins).
+- Changed in review R1-B1: a configured vendor no longer skips the input check (launch-time bindings are invisible to the hook).
 - At least one entry found, every one of them OTHER, and no layer UNKNOWN ⇒ not Supabase; the generic decision stands (a configured vendor is never
   judged by shape: Codex P1-2). An agent-added vendor entry cannot hide a Supabase one: the Supabase entry still triggers the first bullet.
 - Otherwise (no entry: plugin servers `plugin_<p>_<s>`, claude.ai connectors `claude_ai_<x>`, `--mcp-config`; a layer UNKNOWN; an entry

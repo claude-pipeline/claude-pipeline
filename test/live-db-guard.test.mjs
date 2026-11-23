@@ -399,7 +399,8 @@ test('#687 collisions: another project\'s or account\'s same-named server is not
   // (a) an unrelated directory's Supabase `db` does not turn the session's vendor `db` into Supabase
   const a = mcpScene(t);
   a.put(join(a.home, ACCOUNT_FILE), { mcpServers: { db: VENDOR }, projects: { [join(a.root, 'unrelated')]: { mcpServers: { db: SUPA_STDIO } } } });
-  assert.equal(a.run('mcp__db__delete_branch', { branch_id: 'b' }).decision, 'allow', 'vendor db, collision elsewhere');
+  assert.equal(a.run('mcp__db__delete_branch', { branch_id: 'b', strategy: 'x' }).decision, 'allow', 'vendor db, collision elsewhere: a foreign key is not Supabase-shaped');
+  denied(a.run('mcp__db__delete_branch', { branch_id: 'b' }), SHAPE_HINT, 'vendor db, collision elsewhere: the unrelated Supabase entry is not this session\'s, so shape decides');
   // (b) another account dir's Supabase `db`; the session has none: the shape fallback decides
   const b = mcpScene(t);
   b.put(join(b.acct, ACCOUNT_FILE), { mcpServers: { db: SUPA_HTTP } });
@@ -414,7 +415,7 @@ test('#687 collisions: another project\'s or account\'s same-named server is not
   const d = mcpScene(t);
   d.user({ db: VENDOR });
   denied(d.run('mcp__db__delete_branch', { branch_id: 'b' }, {}), SHAPE_HINT, 'project dir unset');
-  assert.equal(d.run('mcp__db__delete_branch', { branch_id: 'b' }).decision, 'allow', 'same config, project dir set: a configured vendor');
+  denied(d.run('mcp__db__delete_branch', { branch_id: 'b' }), SHAPE_HINT, 'same config, project dir set: a configured vendor still gets the shape check');
 });
 
 test('#687 identity: bridges, docker, a local build and the access-token env are Supabase; an incidental path and the owner\'s own function URL are not; an expanded URL or a legacy config file leaves the server unidentified', async (t) => {
@@ -443,7 +444,15 @@ test('#687 identity: bridges, docker, a local build and the access-token env are
     const s = mcpScene(t);
     s.user({ mine: entry });
     assert.equal(s.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }).decision, 'allow', label);
-    assert.equal(s.run('mcp__mine__merge_branch', { branch_id: 'b' }).decision, 'allow', `${label}: a configured vendor is not judged by shape`);
+    denied(s.run('mcp__mine__merge_branch', { branch_id: 'b' }), SHAPE_HINT, `${label}: a configured vendor does not vouch for the server (launch-time bindings are invisible): judged by shape`);
+  }
+  // a launch-time server (--mcp-config / managed file) can reuse a configured vendor's name: the config never switches the shape check off
+  const acme = mcpScene(t);
+  acme.user({ mine: { command: 'npx', args: ['-y', '@acme/mcp'] } });
+  denied(acme.run('mcp__mine__pause_project', { project_id: 'p' }), SHAPE_HINT, 'configured acme, pause_project');
+  denied(acme.run('mcp__mine__merge_branch', { branch_id: 'b' }), SHAPE_HINT, 'configured acme, merge_branch');
+  for (const [tool, input] of [['mcp__mine__create_branch', { owner: 'o', repo: 'r', branch: 'b' }], ['mcp__mine__create_branch', { project_id: '1', branch: 'b', ref: 'main' }], ['mcp__mine__delete_branch', { projectId: 'p', branchId: 'b' }]]) {
+    assert.equal(acme.run(tool, input).decision, 'allow', `configured acme: ${tool} ${JSON.stringify(input)}`);
   }
   const expanded = mcpScene(t);
   expanded.user({ mine: { type: 'http', url: '${MCP_URL}' } });

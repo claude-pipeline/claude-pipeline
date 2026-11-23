@@ -33,11 +33,11 @@ export const serverSegment = (tool) => parts(tool)[1] ?? '';
 //  4. an unreadable or invalid registry (`ok` false) hides that list, so every write name is judged on any server ('registry-broken': evaluateSupabaseMcp then denies with the registry error); a missing registry file is `ok` with an empty list;
 //  5. only for the other eleven write names (GENERIC_SIGNATURES: create_branch, run_notebook, create_project …), and only when the caller passes `ctx` (without it rules 1-4 alone answer): these are also other vendors' tool names, so they cannot be judged on any server (GitHub / GitLab / Neon / Sentry /
 //     Linear tools stay untouched). The real Supabase MCP server configured under another name is found from the ACTIVE session's MCP configuration first (mcp-servers.mjs: this session's account file, local and
-//     project layers; an entry that points at Supabase's endpoint or package) ('config'); a server the configuration lists only as some other vendor is never judged by shape. Only when the configuration cannot
-//     identify the server (a plugin or claude.ai connector, `--mcp-config`, an unreadable layer, an expanded launcher, an unset CLAUDE_PROJECT_DIR) is the call judged by its INPUT: it has only the fields Supabase's
+//     project layers; an entry that points at Supabase's endpoint or package) ('config'). The configuration only adds recognition, it never vouches a server as non-Supabase: the hook cannot see servers bound at launch (`--mcp-config`, managed files), so
+//     in every other case (an entry for another vendor, an unreadable layer, an expanded launcher, a plugin or claude.ai connector, an unset CLAUDE_PROJECT_DIR) the call is judged by its INPUT: it has only the fields Supabase's
 //     schema has for that tool, and all those a mode of it requires ('shape'). The guard's standing rule is that what it cannot identify is refused: a wrong allow can merge migrations into production or pause the live app.
 // Limits: a deliberately disguised server (a wrapper script with no Supabase marker, renamed parameters) is out of the threat model; the shape check is evidence, not proof (the schemas strip unknown keys); a vendor tool with a
-// Supabase-identical input on an unidentifiable server is over-denied (the hint says how the call was recognised); a registered alias with a broken registry and tools outside the write list is #584; a server from `--mcp-config` / `--strict-mcp-config` or a managed MCP file that reuses the name of a vendor entry in the session's own files is judged by that entry (its generic writes pass), and a same-named Supabase entry in any scanned layer makes a vendor server of that name be judged as Supabase (rename one entry).
+// Supabase-identical input on an unidentifiable server is over-denied (the hint says how the call was recognised); a registered alias with a broken registry and tools outside the write list is #584; a server from `--mcp-config` / `--strict-mcp-config` or a managed MCP file is judged by its input, whatever the session's own files say about a server of that name, and a same-named Supabase entry in any scanned layer makes a vendor server of that name be judged as Supabase (rename one entry).
 const SUPABASE_ONLY_NAMES = ['apply_migration', 'execute_sql', 'deploy_edge_function', 'create_edge_function_secret'];
 // Rule 5d: the input keys of each generic write tool. `keys` = every key the tool's schema has; `modes` = the required keys of the account-scoped call and of the project-scoped one (`--project-ref`: project_id removed;
 // null = the tool is not exposed project-scoped). Source: supabase-community/supabase-mcp (now supabase/mcp) main at 03afe8e7a021 (2026-11-23), npm @supabase/mcp-server-supabase 0.19.0, packages/mcp-server-supabase/src/
@@ -73,8 +73,6 @@ export function supabaseMatch(tool, state, ti, ctx) {
   if (!ctx || !Object.hasOwn(GENERIC_SIGNATURES, name)) return null;
   const found = activeBinding(seg, ctx).layers;
   if (found.some((l) => l.state === 'found' && identify(l.entry) === 'supabase')) return 'config';
-  const entries = found.filter((l) => l.state === 'found');
-  if (entries.length > 0 && entries.every((l) => identify(l.entry) === 'other') && !found.some((l) => l.state === 'unknown')) return null;
   return shapeMatches(name, ti) ? 'shape' : null;
 }
 export const isSupabaseTool = (tool, state, ti, ctx) => !!supabaseMatch(tool, state, ti, ctx);
