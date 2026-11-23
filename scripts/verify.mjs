@@ -93,13 +93,13 @@ export function testCounts(text) {
   const clean = String(text).replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
   const counts = { passed: 0, failed: 0, skipped: 0 };
   let found = false;
-  let block = null; // node:test counters held until duration_ms closes the block (only when it saw a pass and a fail line)
+  let block = null; // node:test counters held until duration_ms closes the block (only when it saw a pass and a fail line and they add up to its `tests` total)
   let afterFiles = false; // the previous non-blank line was vitest's `Test Files` row
   for (const line of clean.split('\n')) {
     const summary = /^\s*(?:#|ℹ)\s+(tests|suites|pass|fail|cancelled|skipped|skip|todo|duration_ms)\s+(\d+(?:\.\d+)?)\s*$/.exec(line);
-    if (summary?.[1] === 'tests') block = { passed: 0, failed: 0, skipped: 0, sawPass: false, sawFail: false };
+    if (summary?.[1] === 'tests') block = { passed: 0, failed: 0, skipped: 0, sawPass: false, sawFail: false, declared: Number(summary[2]) };
     else if (summary?.[1] === 'duration_ms') {
-      if (block?.sawPass && block.sawFail) {
+      if (block?.sawPass && block.sawFail && block.passed + block.failed + block.skipped === block.declared) {
         for (const k of Object.keys(counts)) counts[k] += block[k];
         found = true;
       }
