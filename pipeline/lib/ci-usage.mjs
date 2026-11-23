@@ -21,7 +21,7 @@ export const HEAVY_ELAPSED_MS = 60_000;
 export const OS_KEYS = Object.freeze(['linux', 'windows', 'macos', 'self-hosted']);
 // USD per minute of a GitHub-hosted runner (the standard rates; larger runners cost more, so they are underestimated). Overridable with `--rate os=usd`. Self-hosted runners cost nothing here.
 export const DEFAULT_RATES = Object.freeze({ linux: 0.008, windows: 0.016, macos: 0.08 });
-export const CLASSES = Object.freeze(['ready-for-review', 'push-while-ready', 'push-while-draft', 'converted-cancel', 'catch-up', 'rerun', 'other', 'unclassified']);
+export const CLASSES = Object.freeze(['ready-for-review', 'opening', 'push-while-ready', 'push-while-draft', 'converted-cancel', 'catch-up', 'rerun', 'other', 'unclassified']);
 
 const ms = (v) => {
   const t = typeof v === 'number' ? v : Date.parse(v);
@@ -133,7 +133,9 @@ export function elapsedMs(run) {
 //   unclassified      a pull_request run of a PR whose timeline could not be read
 //   converted-cancel  cancelled within 120 s after a converted_to_draft: the redraft stopped it
 //   rerun             run_attempt > 1 (the whole run, all its attempts, is charged to this class)
-//   ready-for-review  created within 120 s after a ready_for_review: the one suite the redraft flow plans for
+//   ready-for-review  created within 120 s after a ready_for_review, on the head of the earliest run of that window: the one suite the redraft flow plans for
+//                     (one ready event exempts ONE head; any other head first seen in the window is a push)
+//   opening           its head is the one the PR was opened with (headPushes kind 'opening'): the first suite of any PR, not a push
 //   catch-up          its head is an update-branch merge of the base
 //   push-while-ready  first seen on a head pushed while the PR was ready
 //   push-while-draft  the same while it was a draft
@@ -141,6 +143,8 @@ export function elapsedMs(run) {
 export function classifyRuns({ pr = null, timeline = null, commits = [], runs, jobsByRun = new Map(), rates = DEFAULT_RATES }) {
   const events = timeline ? toggles(timeline) : [];
   const catchups = catchUpShas(commits);
+  const readyBy = readyHeads(events, runs);
+  const openingHeads = pr && timeline ? new Set(headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind === 'opening').map((h) => h.sha)) : new Set();
   return (runs ?? []).map((run) => {
     const created = ms(run.created_at);
     const updated = ms(run.updated_at);
@@ -149,7 +153,8 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
     else if (!pr || !timeline) cls = 'unclassified';
     else if (run.conclusion === 'cancelled' && updated !== null && events.some((e) => e.to === 'draft' && updated - e.t >= 0 && updated - e.t <= WINDOW_MS)) cls = 'converted-cancel';
     else if (Number(run.run_attempt) > 1) cls = 'rerun';
-    else if (created !== null && events.some((e) => e.to === 'ready' && created - e.t >= 0 && created - e.t <= WINDOW_MS)) cls = 'ready-for-review';
+    else if (isReadyRun(events, readyBy, created, run.head_sha)) cls = 'ready-for-review';
+    else if (openingHeads.has(run.head_sha)) cls = 'opening';
     else if (catchups.has(run.head_sha)) cls = 'catch-up';
     else cls = prPhaseAt(timeline, pr, created) === 'ready' ? 'push-while-ready' : 'push-while-draft';
     const read = jobsByRun.has(run.id);
@@ -164,6 +169,25 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
     };
   });
 }
+
+// Per ready_for_review (by its time): the head of the earliest pull_request run created within 120 s after it, i.e. the head that event started. One ready event
+// exempts one head; a second head first seen in the same window is a push.
+function readyHeads(events, runs) {
+  const prRuns = (runs ?? []).filter((r) => r.event === 'pull_request' && r.head_sha && ms(r.created_at) !== null);
+  const heads = new Map();
+  for (const e of events) {
+    if (e.to !== 'ready') continue;
+    let best = null;
+    for (const r of prRuns) {
+      const t = ms(r.created_at);
+      if (t - e.t < 0 || t - e.t > WINDOW_MS) continue;
+      if (!best || t < best.t || (t === best.t && Number(r.id) < Number(best.run.id))) best = { t, run: r };
+    }
+    if (best) heads.set(e.t, best.run.head_sha);
+  }
+  return heads;
+}
+const isReadyRun = (events, readyBy, t, headSha) => t !== null && events.some((e) => e.to === 'ready' && t - e.t >= 0 && t - e.t <= WINDOW_MS && readyBy.get(e.t) === headSha);
 
 // ---- the pushes (heads) of one PR -----------------------------------------------------------------------------------
 
@@ -183,19 +207,20 @@ export function headPushes({ pr, timeline, commits = [], runs }) {
     const seen = first.get(run.head_sha);
     if (!seen || t < seen.t || (t === seen.t && Number(run.id) < Number(seen.run.id))) first.set(run.head_sha, { t, run });
   }
+  const readyBy = readyHeads(events, runs);
   const rows = [...first.entries()].sort((a, b) => a[1].t - b[1].t);
   const opened = ms(pr?.createdAt);
   return rows.map(([sha, { t }], i) => {
     let kind = 'push';
     if (i === 0 && opened !== null && Math.abs(t - opened) <= WINDOW_MS) kind = 'opening';
     else if (catchups.has(sha)) kind = 'catch-up';
-    else if (events.some((e) => e.to === 'ready' && t - e.t >= 0 && t - e.t <= WINDOW_MS)) kind = 'ready-run';
+    else if (isReadyRun(events, readyBy, t, sha)) kind = 'ready-run';
     return { sha, createdAt: new Date(t).toISOString(), t, phase: prPhaseAt(timeline, pr, t), kind };
   });
 }
 
 // Heads pushed while the PR was READY: the missed redrafts (when the repository iterates in draft). Excluded: the opening head, catch-ups, heads whose first run was the
-// ready one, and re-runs (see headPushes). NOT excludable: a push after Rule 8's proven `convert-failed` rejection (GitHub refused the redraft, so the review skill pushes
+// ready one (ONE head per ready event), and re-runs (see headPushes). NOT excludable: a push after Rule 8's proven `convert-failed` rejection (GitHub refused the redraft, so the review skill pushes
 // anyway) leaves no trace on GitHub; it counts here like any other push while ready.
 export const UNEXCLUDABLE = 'A push made after a proven convert-failed rejection of `pipeline redraft` (Rule 8: push anyway) leaves no trace on GitHub and counts as pushed while ready.';
 export function pushedWhileReady({ pr, timeline, commits = [], runs }) {
@@ -205,7 +230,8 @@ export function pushedWhileReady({ pr, timeline, commits = [], runs }) {
 
 // A converted_to_draft (by `viewer`, else anybody) followed by a ready_for_review with no new head in between: the redraft bought nothing. A new head is a head with a first
 // run, a force push, or a commit dated in between.
-export function wastedRedrafts({ pr, timeline, commits = [], runs, viewer = null }) {
+// `sinceMs`: only the cycles that ended (the ready_for_review) in the period count.
+export function wastedRedrafts({ pr, timeline, commits = [], runs, viewer = null, sinceMs = null }) {
   const events = toggles(timeline);
   const pushes = headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind !== 'opening').map((h) => h.t);
   for (const e of Array.isArray(timeline) ? timeline : []) {
@@ -219,7 +245,7 @@ export function wastedRedrafts({ pr, timeline, commits = [], runs, viewer = null
   events.forEach((e, i) => {
     if (e.to !== 'draft' || (viewer !== null && e.actor !== viewer)) return;
     const next = events[i + 1];
-    if (!next || next.to !== 'ready') return;
+    if (!next || next.to !== 'ready' || (sinceMs !== null && next.t < sinceMs)) return;
     if (!pushes.some((t) => t > e.t && t < next.t)) wasted += 1;
   });
   return wasted;
@@ -240,8 +266,12 @@ export function lastReviewMarkerAt(comments) {
 
 const addTo = (acc, minutes) => { for (const k of OS_KEYS) acc[k] += minutes[k] ?? 0; };
 
+const commitDate = (c) => ms(c?.commit?.committer?.date ?? c?.commit?.author?.date);
+
 // -> the PR's row and its classified runs. `comments` null = not read (needed only for finalCatchupReruns, which is then null).
-export function analysePrUsage({ number, pr, timeline, commits = [], comments = null, runs, jobsByRun = new Map(), rates = DEFAULT_RATES, viewer = null }) {
+// `sinceMs` (the report's period): the whole timeline and commit list still set the phase, but only the ready cycles, wasted redrafts and catch-ups dated in the period are counted.
+// `isPrivate`: a public repository is free, so its PR rows are 0 too.
+export function analysePrUsage({ number, pr, timeline, commits = [], comments = null, runs, jobsByRun = new Map(), rates = DEFAULT_RATES, viewer = null, sinceMs = null, isPrivate = true }) {
   const classified = classifyRuns({ pr, timeline, commits, runs, jobsByRun, rates });
   const pushes = headPushes({ pr, timeline, commits, runs });
   const pushedReady = pushes.filter((h) => h.kind === 'push' && h.phase === 'ready');
@@ -271,13 +301,13 @@ export function analysePrUsage({ number, pr, timeline, commits = [], comments = 
   const toggled = toggles(timeline);
   return {
     pr: number,
-    readyCycles: (initialPhase(timeline, pr?.draft) === 'ready' ? 1 : 0) + toggled.filter((e) => e.to === 'ready').length,
+    readyCycles: (initialPhase(timeline, pr?.draft) === 'ready' && (sinceMs === null || ms(pr?.createdAt) >= sinceMs) ? 1 : 0) + toggled.filter((e) => e.to === 'ready' && (sinceMs === null || e.t >= sinceMs)).length,
     pushesWhileReady: pushedReady.length,
     pushedHeads: pushedReady.map((h) => sha12(h.sha)),
     pushesWhileDraft: pushes.filter((h) => h.kind === 'push' && h.phase === 'draft').length,
-    wastedRedrafts: wastedRedrafts({ pr, timeline, commits, runs, viewer }),
-    catchups: [...catchUpShas(commits)].length,
-    heavyRuns, workflowElapsedMin: round(workflowElapsedMin), jobMinutes: roundMinutes(jobMinutes), estimatedUsd: round(usd, 4),
+    wastedRedrafts: wastedRedrafts({ pr, timeline, commits, runs, viewer, sinceMs }),
+    catchups: new Set((commits ?? []).filter((c) => isCatchUpCommit(c) && (sinceMs === null || (commitDate(c) ?? sinceMs) >= sinceMs)).map((c) => normalizeCommit(c).sha)).size,
+    heavyRuns, workflowElapsedMin: round(workflowElapsedMin), jobMinutes: roundMinutes(jobMinutes), estimatedUsd: isPrivate ? round(usd, 4) : 0,
     churnRuns, churnMinutes: round(churnMinutes), churnUnreadRuns,
     finalCatchupReruns: comments === null ? null : finalCatchupReruns,
     classified,

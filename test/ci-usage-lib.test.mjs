@@ -98,6 +98,36 @@ test('pushedWhileReady: three workflows on one pushed head count once; the openi
   assert.equal(pushedWhileReady({ pr: PR_DRAFT, timeline: TIMELINE, runs: [] }).count, 0);
 });
 
+test('R1-B4: one ready_for_review exempts ONE head: a second head pushed within 120 s of it is a push (and its run is not the ready-for-review suite)', () => {
+  const runs = [run(sha('1'), T('10:00', 30)), run(sha('1'), T('10:00', 31), { name: 'guards' }), run(sha('2'), T('10:01'))];
+  const r = pushedWhileReady({ pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs });
+  assert.deepEqual(r.heads.map((h) => h.sha), [sha('2')]);
+  assert.deepEqual(classifyRuns({ pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs }).map((x) => x.class), ['ready-for-review', 'ready-for-review', 'push-while-ready']);
+});
+
+test('R1-B6: the opening head of a PR opened ready is class "opening", not push-while-ready, and agrees with the PR row', () => {
+  const pr = { createdAt: T('09:00'), draft: false };
+  const runs = [longRun(sha('o'), T('09:00', 30), 5), longRun(sha('p'), T('09:30'), 5)];
+  const jobsByRun = new Map(runs.map((r) => [r.id, [job(r.run_started_at, 5)]]));
+  const p = analysePrUsage({ number: 4, pr, timeline: [], commits: [], runs, jobsByRun });
+  assert.deepEqual(p.classified.map((x) => x.class), ['opening', 'push-while-ready']);
+  assert.equal(p.pushesWhileReady, 1);
+  const agg = aggregateUsage({ classified: p.classified, prRows: [p], isPrivate: true });
+  assert.deepEqual([agg.totals.byClass.opening.heavyRuns, agg.totals.byClass['push-while-ready'].heavyRuns], [1, 1]);
+});
+
+test('R1-B12: with sinceMs only the redrafts, ready cycles and catch-ups of the period count; the older timeline still sets the phase', () => {
+  const caught = { ...commit('c'), parents: [{}, {}], committer: { login: 'web-flow' } };
+  const old = { ...caught, sha: sha('d'), commit: { message: 'm', committer: { date: T('08:00') } } };
+  const recent = { ...caught, commit: { message: 'm', committer: { date: T('13:30') } } };
+  const runs = [run(sha('2'), T('10:30'))];
+  const all = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [old, recent], runs, viewer: 'me' });
+  assert.deepEqual([all.readyCycles, all.wastedRedrafts, all.catchups], [2, 1, 2]);
+  const since = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [old, recent], runs, viewer: 'me', sinceMs: Date.parse(T('13:00')) });
+  assert.deepEqual([since.readyCycles, since.wastedRedrafts, since.catchups], [0, 0, 1]);
+  assert.equal(since.pushesWhileReady, 1, 'the phase at the run still comes from the whole timeline');
+});
+
 test('headPushes: a head whose first run is the ready_for_review one is not a push (workflows that skip drafts leave no earlier run)', () => {
   const rows = headPushes({ pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs: [run(sha('1'), T('10:00', 30))] });
   assert.deepEqual(rows.map((h) => [h.kind, h.phase]), [['ready-run', 'ready']]);
@@ -191,6 +221,9 @@ test('aggregateUsage: private estimate with coverage and assumptions; public is 
   assert.equal(aggregateUsage({ classified, prRows: [p], isPrivate: true, draftWhileIterating: 'unknown' }).totals.missedRedrafts, null);
   const pub = aggregateUsage({ classified, prRows: [p], isPrivate: false });
   assert.deepEqual([pub.billing, pub.totals.estimatedUsd], ['free-public', 0]);
+  // R1-B8: the PR row of a public repository is 0 too (a consumer summing the rows must get the total)
+  assert.ok(p.estimatedUsd > 0);
+  assert.equal(analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs: runs.slice(0, 2), jobsByRun, viewer: 'me', isPrivate: false }).estimatedUsd, 0);
   // self-hosted jobs cost nothing
   const sh = analysePrUsage({ number: 8, pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs: [runs[0]], jobsByRun: new Map([[runs[0].id, [job(runs[0].run_started_at, 9, ['self-hosted'])]]]) });
   assert.equal(aggregateUsage({ classified: sh.classified, prRows: [sh], isPrivate: true }).totals.estimatedUsd, 0);
