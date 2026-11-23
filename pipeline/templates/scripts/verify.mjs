@@ -89,6 +89,29 @@ export function excerpt(text, n = EXCERPT_LINES) {
   return clean.slice(-n).join('\n');
 }
 
+// Test counts from a step's own summary lines, or null when it printed none (counts are never invented). node:test: `# pass N` /
+// `ℹ pass N` (also fail, skipped / skip, todo); vitest: `Tests  N passed | M failed | K skipped`. todo counts as skipped; several
+// summaries in one step (a command that runs two suites) add up.
+export function testCounts(text) {
+  const clean = String(text).replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
+  const counts = { passed: 0, failed: 0, skipped: 0 };
+  let found = false;
+  for (const line of clean.split('\n')) {
+    const node = /^\s*(?:#|ℹ)\s+(pass|fail|skipped|skip|todo)\s+(\d+)\s*$/.exec(line);
+    if (node) {
+      counts[{ pass: 'passed', fail: 'failed' }[node[1]] ?? 'skipped'] += Number(node[2]);
+      found = true;
+      continue;
+    }
+    const vitest = /^\s*Tests\s+(\d+ (?:passed|failed|skipped|todo)(?: \| \d+ (?:passed|failed|skipped|todo))*)(?:\s+\(\d+\))?\s*$/.exec(line);
+    if (vitest) {
+      for (const m of vitest[1].matchAll(/(\d+) (passed|failed|skipped|todo)/g)) counts[m[2] === 'todo' ? 'skipped' : m[2]] += Number(m[1]);
+      found = true;
+    }
+  }
+  return found ? counts : null;
+}
+
 // libpq lets a connection string carry `host=` / `hostaddr=` (query parameters, or key=value pairs) that OVERRIDE the host
 // in the URL, and a comma-separated list of hosts; a value starting with "/" is a unix-socket directory (local).
 const splitHosts = (v) => String(v).split(',').map((h) => h.trim()).filter(Boolean).map((h) => (h.startsWith('/') ? 'localhost' : h.toLowerCase()));
@@ -380,6 +403,8 @@ export async function runVerify(opts = {}) {
       writeFileSync(join(logsDir, `${s.name}.log`), output);
       const passed = res.code === 0 && !res.timedOut;
       r.status = passed ? 'pass' : 'fail';
+      const counts = testCounts(output);
+      if (counts) r.counts = counts;
       if (!passed) {
         r.errorExcerpt = excerpt(`${res.timedOut ? `[timed out after ${human(s.timeoutMs ?? STEP_TIMEOUT_MS)}]\n` : ''}${output}`);
         say(`[FAIL] ${s.name} (exit ${res.code}${res.timedOut ? ', timed out' : ''}, ${(r.durationMs / 1000).toFixed(1)}s)`);

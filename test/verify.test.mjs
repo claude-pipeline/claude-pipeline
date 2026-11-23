@@ -739,3 +739,24 @@ test('local skips carry skipKind local; a run that is not skipped (or a skipIf r
   assert.equal(both.exitCode, 0);
   assert.deepEqual([reportOf(repo).steps[0].skipKind, reportOf(repo).steps[0].skipReason], ['ci', 'deferred to CI (.github/workflows/ci.yml#SQL arms)']);
 });
+
+// ---- test counts per step (#644) ------------------------------------------------------------------------------------
+
+// Catches: a "pass" that ran no tests being indistinguishable from a full run: report.json had only pass/fail per step.
+test('a step that prints a node:test or vitest summary gets counts in report.json; a step with no summary has none (never zeros)', async () => {
+  const repo = await setup();
+  // No backslashes in the snippet (see the ANSI test above): one console.log per line, strings in single quotes.
+  const say = (lines) => nodeCmd(lines.map((l) => `console.log('${l}')`).join(';'));
+  const steps = [
+    { name: 'node', cmd: say(['# tests 7', '# pass 4', '# fail 1', '# cancelled 0', '# skipped 1', '# todo 1']), quick: false },
+    { name: 'vitest', cmd: say([' Test Files  2 passed (2)', '      Tests  12 passed | 2 failed | 1 skipped (15)']), quick: false },
+    { name: 'empty', cmd: say(['# pass 0', '# fail 0']), quick: false },
+    pass('plain'),
+  ];
+  await verify(repo, [], steps);
+  const rep = reportOf(repo);
+  assert.deepEqual(rep.steps[0].counts, { passed: 4, failed: 1, skipped: 2 });
+  assert.deepEqual(rep.steps[1].counts, { passed: 12, failed: 2, skipped: 1 });
+  assert.deepEqual(rep.steps[2].counts, { passed: 0, failed: 0, skipped: 0 }, 'a pass that ran nothing is visible as counts.passed 0');
+  assert.equal('counts' in rep.steps[3], false);
+});
