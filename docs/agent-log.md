@@ -308,3 +308,4 @@ full record.
 - 2026-11-23 · #688 · Live-database guard, part 2: supabase CLI / Management API rule (#262) · risk high · rounds 10 · arbiter 10 (fix-verify 5) · substitute 1 · awaiting-owner-merge · Codex 7d: 595 runs (165 high)
 - 2026-11-23 · #763 · Guard: deadline counts CPU time, hard wall cap stays fail-closed (#627) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 598 runs (167 high)
 - 2026-11-23 · #748 · Finish an untriaged round before the next one after head-moved-since-round; show Fable the reviewed code (#551) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 606 runs (169 high)
+- 2026-11-23 · #781 · Live-DB approval block: "changes every row" warning, fail-closed (#655) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 630 runs (178 high)
