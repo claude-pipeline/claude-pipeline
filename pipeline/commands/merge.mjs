@@ -27,7 +27,7 @@ import {
   GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, ownerItemsMoved, substituteRouteProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
-import { classifyMergeCommand, cleanStatusRetry, commandTail } from '../lib/merge-cleanup.mjs';
+import { classifyMergeCommand, cleanStatusRetry, commandTail, waitFailureNote } from '../lib/merge-cleanup.mjs';
 import { hashBranch } from '../lib/risk.mjs';
 
 // The default branch the gate resolved for its run (finalgate.mjs#evaluateGate's trustedBranch), recorded in the gate file; absent (an older gate file) -> undefined, so the hash helper works it out.
@@ -398,7 +398,7 @@ export const run = guarded(async (argv, ctx) => {
       if (behindHold) return holdRefuse(queuedBehindRefusal(behindHold), failure);
       if (ran.code !== 0) {
         // #567: the exact clean-status refusal with a proven clean state says a fresh run is safe (informational on this route: the owner re-runs their own command)
-        return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure, ...cleanStatusRetry(ran, outcome, abandoned) } };
+        return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged${waitFailureNote(outcome) ? `; ${waitFailureNote(outcome)}` : ''}`, ...failure, ...cleanStatusRetry(ran, outcome, abandoned) } };
       }
       const base = {
         timeout: 'not merged in time',
@@ -584,7 +584,7 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
     if (behindHold) return holdRefuse(queuedBehindRefusal(behindHold), failure);
     // #567: set here, never after withHoldLifted (it spreads this output and adds the hold fields): a lifted or recovered hold means a fresh "merge" is needed, so no retryable.
     const retry = hold === null && recHold === null ? cleanStatusRetry(ran, outcome, abandoned) : {};
-    if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged`, ...failure, ...retry } };
+    if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged${waitFailureNote(outcome) ? `; ${waitFailureNote(outcome)}` : ''}`, ...failure, ...retry } };
     const base = {
       timeout: 'not merged in time', closed: 'the PR was closed without merging', error: `could not read the PR state while waiting (${outcome.error})`,
       blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
