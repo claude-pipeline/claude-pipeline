@@ -3425,7 +3425,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   };
   const openSpans = (c, i) => {
     if (c.maybeBgEnds === undefined) return;
-    for (const end of c.maybeBgEnds) if (end >= i && !spans.some((sp) => sp.end === end)) spans.push({ end, changed: false, every: false, names: new Set(), al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
+    for (const end of c.maybeBgEnds) if (end >= i && !spans.some((sp) => sp.end === end)) spans.push({ end, dir, changed: false, every: false, names: new Set(), al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
   };
   const noteSpans = (c, i, { changed, every = false, names = [] }) => {
     if (!changed && names.length === 0) return;
@@ -3437,6 +3437,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   if (hazard || cmds.some((c) => c.argv.length > 1 && baseName(c.argv[0]) === 'export' && c.argv.slice(1).some((a) => /^-[a-zA-Z]*f/.test(a)))) ctx.budget.exitMayBeRedefined = true; // (on the shared budget: a startup file is judged on a copy of ctx, and its mark must reach the script)
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
   const dirAt = new Map();
+  const altDirs = new Map(); // (#529: command index -> the directories its `&>` / `&>>` target and the redirects after it may ALSO be opened from: dash opens them in the directory before the span, see openSpans)
   const cdDirs = cdTargets(cmds, startDir, ctx);
   const frame = newWriteFrame(cmds, {
     text: str,
@@ -3450,12 +3451,13 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (path.isAbsolute(e)) return [path.resolve(e)];
       if (!dirAt.has(idx)) return [...cdDirs.map((d) => path.resolve(d, e)), e];
       const d = dirAt.get(idx);
-      return d ? [path.resolve(d, e)] : [e];
+      const alt = (altDirs.get(idx) ?? []).map((a) => (a ? path.resolve(a, e) : e));
+      return [...(d ? [path.resolve(d, e)] : [e]), ...alt];
     },
     isAbs: path.isAbsolute, p: path, ci: process.platform === 'win32' || process.platform === 'darwin',
     real: (q) => realLocation(ctx.realpath, q),
     readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
-    stamp: (idx) => (dirAt.has(idx) ? `S${dirAt.get(idx)}` : ''), // (locate() answers differently once the command's directory is known)
+    stamp: (idx) => (dirAt.has(idx) ? `S${dirAt.get(idx)}${(altDirs.get(idx) ?? []).map((a) => `|${a}`).join('')}` : ''), // (locate() answers differently once the command's directory is known)
     tick: () => checkDeadline(ctx.budget),
   });
   ctx.writeFrames.push(frame);
@@ -3613,6 +3615,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const varsBefore = c.maybeBg === true && argv.length > 0 ? { vars: { ...ctx.vars }, unsure: new Set(ctx.unsureVars) } : null;
     frame.i = i;
     dirAt.set(i, dir);
+    if (c.maybeBgEnds !== undefined && (c.redirects ?? []).some((r) => r.op === '&>' || r.op === '&>>')) { const alts = spans.filter((sp) => sp.end === i && sp.dir !== dir).map((sp) => sp.dir); if (alts.length) altDirs.set(i, alts); } // (#529: the span moved the directory: dash opens the target from where it was before)
     // (#352 R35-F2: the closer of a { } group is listed as a command of no words in it, after its last one: a redirection on it that can fail (`{ cd d; } < /missing`) fails the group before it runs, so what
     // the group changed is not handed on as certain when it ends (see the brace rule above))
     if (isCloser(c) && levels?.length && c.up.length && !redirectsFirm(c.redirects)) levels[levels.length - 1].doubt = true;
