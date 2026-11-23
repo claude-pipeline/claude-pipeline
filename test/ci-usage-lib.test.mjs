@@ -159,7 +159,7 @@ test('costOfJobs: three parallel shards plus one job are summed; an attempt-2 jo
   assert.equal(c.minutes['self-hosted'], 13);
   assert.equal(c.rerunMinutes, 2);
   // 3 x ceil(4.2)=5 + 1 + ceil(2)=2 on linux; 2 on windows; ceil(1.5)=2 on macos
-  assert.equal(Math.round(c.usd * 1e6) / 1e6, Math.round((18 * 0.008 + 2 * 0.016 + 2 * 0.08) * 1e6) / 1e6);
+  assert.equal(Math.round(c.usd * 1e6) / 1e6, Math.round((18 * 0.006 + 2 * 0.010 + 2 * 0.062) * 1e6) / 1e6);
   assert.deepEqual(['ubuntu-22.04', 'windows-2022', 'macos-latest', 'self-hosted', 'ubicloud-standard-4', 'custom-box'].map((l) => runnerOs([l])), ['linux', 'windows', 'macos', 'self-hosted', 'self-hosted', 'self-hosted']);
   assert.equal(runnerOs(['self-hosted', 'linux', 'x64']), 'self-hosted');
   assert.equal(costOfJobs(jobs, { ...DEFAULT_RATES, linux: 0.01 }).usd > c.usd, true, 'a rate override is used');

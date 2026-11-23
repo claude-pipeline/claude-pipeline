@@ -17,8 +17,8 @@ export const WINDOW_MS = 120_000;
 export const HEAVY_JOB_MINUTES = 1;
 export const HEAVY_ELAPSED_MS = 60_000;
 export const OS_KEYS = Object.freeze(['linux', 'windows', 'macos', 'self-hosted']);
-// USD per minute of a GitHub-hosted runner (the standard rates; larger runners cost more, so they are underestimated). Overridable with `--rate os=usd`. Self-hosted runners cost nothing here.
-export const DEFAULT_RATES = Object.freeze({ linux: 0.008, windows: 0.016, macos: 0.08 });
+// USD per minute of a GitHub-hosted runner (the standard rates of 2026-01-01; larger runners cost more, so they are underestimated). Overridable with `--rate os=usd`. Self-hosted runners cost nothing here.
+export const DEFAULT_RATES = Object.freeze({ linux: 0.006, windows: 0.010, macos: 0.062 });
 export const CLASSES = Object.freeze(['ready-for-review', 'opening', 'push-while-ready', 'push-while-draft', 'converted-cancel', 'catch-up', 'rerun', 'other', 'unclassified']);
 
 const ms = (v) => {
