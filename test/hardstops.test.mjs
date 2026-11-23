@@ -823,7 +823,8 @@ test('IO: deleting a shared-runner pgTAP file (assertions, test function, or inc
     includeLong: "\\include 0150_rls_cases.sql\n",
     includeRelative: "\\include_relative 0150_rls_cases.sql\n",
     setHas: "select set_has('select id from visible_rows', 'values (1)', 'expected row is visible');\n",
-    quotedCall: "select \"ok\"(false, 'x');\nselect \"set_has\"('select 1', 'values (1)');\n",
+    quotedOk: "select \"ok\"(false, 'x');\n",
+    quotedSetHas: "select \"set_has\"('select 1', 'values (1)');\n",
     isntEmpty: "select isnt_empty('select id from patients', 'rls leaves rows');\n",
   };
   for (const [label, body] of Object.entries(bodies)) {
