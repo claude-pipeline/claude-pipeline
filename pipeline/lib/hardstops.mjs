@@ -184,8 +184,20 @@ const isR4Pipeline = (p) => (inc(p, R4_PIPELINE_GLOBS.filter((g) => !GITHUB_DIR_
 const isR4Config = (p) => isAgentInstructionPath(p) || inc(p, R4_CONFIG_GLOBS) || (inc(p, GITHUB_DIR_GLOBS) && MARKDOWN_FILE.test(p));
 // pgTAP tests are the RLS safety net: deleting or moving one weakens it (editing one is left to the test-integrity check).
 const TEST_DIR_GLOBS = ['**/supabase/tests/**'];
-// A pgTAP test file declares its plan or runs its tests through one of these; a helper or fixture under the test dir has none.
-const PGTAP_MARKER = /\b(?:plan|no_plan|done_testing|finish|runtests)\s*\(/i;
+// A pgTAP test file shows one of these: a harness call (plan/finish/runtests), an assertion call, a test-function definition
+// (test_*, startup_*, setup_*, teardown_*, shutdown_*; a driver's runtests() runs them from another file) or a psql include
+// (\i / \ir pulls a suite in). A helper or fixture under the test dir has none. Over-matching is the safe side: it keeps R4.
+const PGTAP_MARKER = new RegExp(
+  [
+    '\\b(?:plan|no_plan|done_testing|finish|runtests)\\s*\\(',
+    '\\b(?:ok|is|isnt|like|unlike|matches|doesnt_match|imatches|doesnt_imatch|alike|unalike|ialike|unialike|cmp_ok|pass|fail|isa_ok|is_empty)\\s*\\(',
+    '\\b[a-z0-9_]+_(?:ok|eq|ne|are|is|isnt|like|unlike)\\s*\\(',
+    '\\b(?:has|hasnt|col|fk|can|cannot)_[a-z0-9_]+\\s*\\(',
+    '\\bcreate\\s+(?:or\\s+replace\\s+)?function\\s+(?:"?[a-z0-9_]+"?\\.)?"?(?:test|startup|setup|teardown|shutdown)[a-z0-9_]*"?\\s*\\(',
+    '^\\s*\\\\ir?\\s+\\S',
+  ].join('|'),
+  'im',
+);
 const WORKFLOW_GLOBS = ['**/.github/workflows/**'];
 
 // `\b` treats `_` as a word character, so `tin_number` would dodge `\btin\b`; use explicit [a-z0-9] boundaries.

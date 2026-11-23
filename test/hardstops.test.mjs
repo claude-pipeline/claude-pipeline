@@ -808,6 +808,23 @@ test('IO: a real pgTAP file renamed or deleted under supabase/tests still trips 
   assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
 });
 
+// Catches: a suite split over files (a driver runs runtests(), another file holds the assertions or test functions, a third only
+// \ir-includes them) losing R4 when the file without plan()/finish() is deleted.
+test('IO: deleting a shared-runner pgTAP file (assertions, test function, or include only) still trips R4', async () => {
+  const bodies = {
+    assertions: "select is(1, 1, 'one');\nselect throws_ok('select 1/0', '22012');\n",
+    testFunction: "create or replace function tests.test_rls() returns setof text as $$ begin return next ok(true); end $$ language plpgsql;\n",
+    include: "\\ir 0150_rls_cases.sql\n",
+  };
+  for (const [label, body] of Object.entries(bodies)) {
+    const hits = await moveCollect({ 'supabase/tests/0150_cases.sql': body }, (repo) => {
+      repo.rm('supabase/tests/0150_cases.sql');
+      repo.commit('delete shared file');
+    });
+    assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), `${label}: ${JSON.stringify(hits)}`);
+  }
+});
+
 // Catches: reading the blob from inside the PR, so commit 1 strips the markers and commit 2 moves the "helper" away.
 test('IO: markers stripped in one PR commit and the file moved in the next still trips R4 (base blob decides)', async () => {
   const hits = await moveCollect({ 'supabase/tests/rls.sql': PGTAP_BASE }, (repo) => {
