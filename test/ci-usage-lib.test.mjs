@@ -175,3 +175,11 @@ test('review round 1 B2: an unreadable timeline gives an unknown pushedWhileRead
   // a timeline read successfully and empty is still a known history
   assert.equal(pushedWhileReady({ pr, timeline: [], commits: [], runs }).count, 1);
 });
+
+test('review round 1 B3: a run created well after its head\'s first run (a reopen, a converted_to_draft run) is class "other", not another push', () => {
+  const pr = { createdAt: T('09:00'), draft: false };
+  const runs = [run(sha('o'), T('09:00', 30)), run(sha('p'), T('09:30')), run(sha('p'), T('09:30', 5), { name: 'guards' }), run(sha('p'), T('10:30'))];
+  // the three workflows of the push share a class; the run an hour later (reopened PR, same SHA) is not a push
+  assert.deepEqual(classifyRuns({ pr, timeline: [], commits: [], runs }).map((x) => x.class), ['opening', 'push-while-ready', 'push-while-ready', 'other']);
+  assert.equal(pushedWhileReady({ pr, timeline: [], commits: [], runs }).count, 1);
+});

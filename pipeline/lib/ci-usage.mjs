@@ -144,7 +144,7 @@ export function elapsedMs(run) {
 // ---- classification -------------------------------------------------------------------------------------------------
 
 // Every run gets ONE class, the first that fits:
-//   other             not a pull_request run (push to main, schedule, workflow_dispatch, a guards run on `labeled` ...): kept apart, by event
+//   other             not a pull_request run (push to main, schedule, workflow_dispatch, a guards run on `labeled` ...): kept apart, by event; or a pull_request run created more than 120 s after the first run of its head (a reopened PR, a converted_to_draft run on the old head), which is no push
 //   unclassified      a pull_request run of a PR whose timeline could not be read
 //   converted-cancel  cancelled within 120 s after a converted_to_draft: the redraft stopped it
 //   rerun             run_attempt > 1 (the whole run, all its attempts, is charged to this class)
@@ -152,7 +152,7 @@ export function elapsedMs(run) {
 //                     (one ready event exempts ONE head; any other head first seen in the window is a push)
 //   opening           its head is the one the PR was opened with (headPushes kind 'opening'): the first suite of any PR, not a push
 //   catch-up          its head is an update-branch merge of the base
-//   push-while-ready  first seen on a head pushed while the PR was ready
+//   push-while-ready  created within 120 s of the first run of a head pushed while the PR was ready
 //   push-while-draft  the same while it was a draft
 // `jobsByRun`: Map run id -> jobs for the runs whose jobs were read (a list the reader had to cut carries `cut: true`: priced as far as read, but not counted as fully read). -> one row per run, same order.
 export function classifyRuns({ pr = null, timeline = null, commits = [], runs, jobsByRun = new Map(), rates = DEFAULT_RATES }) {
@@ -160,6 +160,7 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
   const events = toggles(timeline);
   const catchups = catchUpShas(commits, pr?.baseRef, pr?.baseRepo);
   const readyBy = readyHeads(events, runs);
+  const firstOf = firstRuns(runs);
   const openingHeads = pr && readable ? new Set(headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind === 'opening').map((h) => h.sha)) : new Set();
   return (runs ?? []).map((run) => {
     const created = ms(run.created_at);
@@ -172,6 +173,8 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
     else if (isReadyRun(events, readyBy, created, run.head_sha)) cls = 'ready-for-review';
     else if (openingHeads.has(run.head_sha)) cls = 'opening';
     else if (catchups.has(run.head_sha)) cls = 'catch-up';
+    // a run created well after its head's first run is no push (a reopened PR, a converted_to_draft run on the old head)
+    else if (created !== null && created - (firstOf.get(run.head_sha)?.t ?? created) > WINDOW_MS) cls = 'other';
     else cls = prPhaseAt(timeline, pr, created) === 'ready' ? 'push-while-ready' : 'push-while-draft';
     const read = jobsByRun.has(run.id);
     const cost = read ? costOfJobs(jobsByRun.get(run.id), rates) : null;
@@ -208,14 +211,8 @@ const isReadyRun = (events, readyBy, t, headSha) => t !== null && events.some((e
 
 // ---- the pushes (heads) of one PR -----------------------------------------------------------------------------------
 
-// One row per head commit that pull_request runs were created for, oldest first (all workflows of one push share a head: one row):
-//   { sha, createdAt, phase, kind: 'opening' | 'catch-up' | 'ready-run' | 'push' }
-// opening = the head the PR was opened with (its first run within 120 s of the PR's creation); catch-up = an update-branch merge; ready-run = the head's first run
-// was the one `ready_for_review` started (nothing ran on it before: the workflow skips drafts); push = a push of the agent. `phase` is the PR's phase when the first run was
-// created ('unknown' when the timeline is not an array: it could not be read). A re-run keeps its original created_at, so a re-run never makes a push look newer; only the first run of a head counts.
-export function headPushes({ pr, timeline, commits = [], runs }) {
-  const events = toggles(timeline);
-  const catchups = catchUpShas(commits, pr?.baseRef, pr?.baseRepo);
+// head sha -> { t, run }: the earliest pull_request run created for each head (ties: the lower run id).
+function firstRuns(runs) {
   const first = new Map();
   for (const run of runs ?? []) {
     if (run.event !== 'pull_request' || !run.head_sha) continue;
@@ -224,6 +221,18 @@ export function headPushes({ pr, timeline, commits = [], runs }) {
     const seen = first.get(run.head_sha);
     if (!seen || t < seen.t || (t === seen.t && Number(run.id) < Number(seen.run.id))) first.set(run.head_sha, { t, run });
   }
+  return first;
+}
+
+// One row per head commit that pull_request runs were created for, oldest first (all workflows of one push share a head: one row):
+//   { sha, createdAt, phase, kind: 'opening' | 'catch-up' | 'ready-run' | 'push' }
+// opening = the head the PR was opened with (its first run within 120 s of the PR's creation); catch-up = an update-branch merge; ready-run = the head's first run
+// was the one `ready_for_review` started (nothing ran on it before: the workflow skips drafts); push = a push of the agent. `phase` is the PR's phase when the first run was
+// created ('unknown' when the timeline is not an array: it could not be read). A re-run keeps its original created_at, so a re-run never makes a push look newer; only the first run of a head counts.
+export function headPushes({ pr, timeline, commits = [], runs }) {
+  const events = toggles(timeline);
+  const catchups = catchUpShas(commits, pr?.baseRef, pr?.baseRepo);
+  const first = firstRuns(runs);
   const readyBy = readyHeads(events, runs);
   const rows = [...first.entries()].sort((a, b) => a[1].t - b[1].t);
   const opened = ms(pr?.createdAt);
