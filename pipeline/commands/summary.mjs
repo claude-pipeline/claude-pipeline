@@ -20,6 +20,7 @@ import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import { readModelProofs, reviewBaseRef } from '../lib/review-context.mjs';
 import { testsAdded } from '../lib/diff.mjs';
 import { diffFiles, refExists } from '../lib/git.mjs';
+import { pushedWhileReadyOf } from '../lib/ci-usage-pr.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
@@ -113,11 +114,12 @@ export const run = guarded(async (argv, ctx) => {
     } catch { return undefined; /* the line is left out */ }
   };
   const gh = createGitHub({ cwd: root, env: ctx.env });
+  const ciUsage = await pushedWhileReadyOf({ root, gh, pr }); // ci.draft_while_iterating only; report only, never throws
   return guardGh(async () => {
     const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
     const { title } = view;
     const testsAddedLine = await testsAddedFor(view.baseRefName);
-    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine });
+    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine, ciNote: ciUsage.note });
     // The weekly Codex spend rides at the end of the line (agent-log close's pending-line match tolerates it).
     const usage = codexUsage({ env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
     const usageText = codexUsageSuffix(usage);
@@ -130,10 +132,11 @@ export const run = guarded(async (argv, ctx) => {
       repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
     });
-    warnings.push(...guard.warnings);
+    warnings.push(...guard.warnings, ...ciUsage.warnings);
     const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing, retry: true });
     for (const w of posted.warnings) if (!warnings.includes(w)) warnings.push(w);
     const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), codexUsage: usage, ...(testsAddedLine === undefined ? {} : { testsAdded: testsAddedLine }), warnings };
+    if (ciUsage.field) output.pushedWhileReady = ciUsage.field;
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
     if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME }) + usageText;
     return { exitCode: EXIT.OK, output };
