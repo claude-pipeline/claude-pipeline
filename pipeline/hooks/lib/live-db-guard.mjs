@@ -891,8 +891,19 @@ function dockerPsqlRefusal(c, x, p) {
 // (read-only helpers: `cd docs && rg …`, `rg … | sort | uniq`; runsProgram, which pgDataOnly applies, already refuses `sort -o` and its program options; `uniq IN OUT` writes OUT, so it is checked here)
 const PG_DATA = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'which', 'type', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls', 'cd', 'pwd', 'cut', 'tr', 'sort', 'uniq']);
 const PG_DATA_GIT = new Set(['commit', 'grep', 'log', 'show', 'diff', 'status', 'blame', 'ls-files']);
-// uniq [INPUT [OUTPUT]]: a second operand is a file it writes (line-writes.mjs reads it the same way); -f / -s / -w take a value
-const uniqWrites = (args) => { let n = 0; for (let i = 0; i < args.length; i += 1) { const a = args[i]; if (a === '-f' || a === '-s' || a === '-w') i += 1; else if (a === '-' || !a.startsWith('-')) n += 1; } return n > 1; };
+// uniq [INPUT [OUTPUT]]: a second operand is a file it writes (line-writes.mjs reads it the same way); -f / -s / -w and their long spellings (a unique prefix too) take a value; after `--` every word is an operand
+const UNIQ_LONG_VAL = ['skip-fields', 'skip-chars', 'check-chars'];
+const uniqWrites = (args) => {
+  let n = 0;
+  let ended = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const a = args[i];
+    if (ended || a === '-' || !a.startsWith('-')) n += 1;
+    else if (a === '--') ended = true;
+    else if (a === '-f' || a === '-s' || a === '-w' || (a.startsWith('--') && !a.includes('=') && UNIQ_LONG_VAL.filter((o) => o.startsWith(a.slice(2))).length === 1)) i += 1;
+  }
+  return n > 1;
+};
 // a later word whose first token is a bare pg_* program name (`/usr/bin/pg_repack`, `pg_repack -h prod` inside `ssh host '…'`): never a name inside a word (`pg_class` in a SQL string) or a file with an extension
 const laterPgWord = (w) => { const t = String(w).trim().split(/\s+/)[0] ?? ''; return /^pg_[a-z0-9_]+$/i.test(commandName(t)) && pgWord(t); };
 // heads whose operands are data (git add / switch, mkdir, rm, gh …), but not find / make, which can run a word
@@ -912,7 +923,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
   const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n')])].join('\n');
   // the text test misses a family program the parser unwrapped (a `pg_*` name that is not in the list, `timeout 30 pg_prove`): the command names are judged too
   // (a later word of a command that is not data-only is judged too, by its first token as a bare program name: `kubectl exec db -- /usr/bin/pg_repack -h x`, `ssh host 'pg_repack -h x'`; a file with an extension, `supabase/migrations/pg_cron.sql`, is no program name; a command whose operands are data, `git switch pg_repack`, `mkdir pg_dumps`, is skipped)
-  const token = PG_TOKEN.test(seen) || reading.some((c) => pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '') || (!pgDataOnly(c, true) && !dataOperands(c.argv) && [...c.argv, ...typedWords(c)].some(laterPgWord)));
+  const token = PG_TOKEN.test(seen) || reading.some((c) => pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '') || (!pgDataOnly(c, true) && (runsProgram(c) || !dataOperands(c.argv)) && [...c.argv, ...typedWords(c)].some(laterPgWord)));
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
   const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
@@ -955,7 +966,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
     if (sdb && [...argv, ...typed].some((w) => commandName(w) === 'docker') && [...argv, ...typed].some((w) => F4_VERBS.has(w)) && [...argv, ...typed].some((w) => SDB_TEXT.test(w))) return `a docker line that runs, copies into or changes a \`supabase_db_*\` container (${DOCKER_HINT})`;
     if (!token || name === 'sed' || isPipelineBin(argv)) continue;
     const words = [...own, ...(aligned ? typed.slice(0, cut) : typed)];
-    const dataOps = dataOperands(argv);
+    const dataOps = !runsProgram(c) && dataOperands(argv);
     for (const [i, w] of words.entries()) {
       if (i < own.length && isInlineProgram(own, i)) continue;
       if (PG_TOKEN.test(w) || PG_SET.has(commandName(w)) || (!dataOps && (pgWord(w) || laterPgWord(w)))) return `\`${w.slice(0, 40)}\` is a psql family program the guard does not know how to read here (a launcher, a quoted command string, or a client other than the two allowed psql shapes)`;
