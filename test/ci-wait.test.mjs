@@ -1674,6 +1674,7 @@ test('a timeline read that fails once does not hide predatesReady: the flag is j
   });
   const r = await s.run();
   assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
-  // the flag and the printed readyAt agree: flagged when readyAt is printed, absent when it could not be read
-  assert.equal(r.output.checks[0].predatesReady, r.output.readyAt === null ? undefined : true, JSON.stringify(r.output));
+  // the one failed read is retried by the poll loop, so the pass still carries readyAt and the draft-era flag
+  assert.notEqual(r.output.readyAt, null, JSON.stringify(r.output));
+  assert.equal(r.output.checks[0].predatesReady, true, JSON.stringify(r.output));
 });
