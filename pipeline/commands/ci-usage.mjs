@@ -18,11 +18,11 @@ export const meta = {
     '     totals {prs, heavyRuns (jobs add up to >= 1 min; with the jobs unread, the run lasted >= 1 min), workflowElapsedMin (measured: run updated_at - run_started_at), jobMinutes {linux, windows, macos, self-hosted} (the sum of the job durations),',
     '     estimatedUsd (ESTIMATE: each job rounded up to a whole minute x the rate of its OS, self-hosted 0; a public repository is free-public and 0), coverage (% of the heavy runs whose jobs were read), byClass, byEvent, pushesWhileReady,',
     '     missedRedrafts (= pushesWhileReady when the repository\'s .claude/pipeline.yml has ci.draft_while_iterating: true, 0 when false, null when it could not be read), wastedRedrafts, catchupsPerPr, churnRuns, churnMinutes, finalCatchupReruns};',
-    '     class of a run: ready-for-review | push-while-ready | push-while-draft | converted-cancel | catch-up | rerun | other (not a pull_request run, by event in byEvent) | unclassified (its PR was not read);',
+    '     class of a run: ready-for-review | opening (the head the PR was opened with) | push-while-ready | push-while-draft | converted-cancel | catch-up | rerun | other (not a pull_request run, by event in byEvent) | unclassified (its PR was not read);',
     '     prs [{pr, readyCycles, pushesWhileReady, pushedHeads, pushesWhileDraft, wastedRedrafts, catchups, heavyRuns, workflowElapsedMin, jobMinutes, estimatedUsd, churnRuns, churnMinutes, finalCatchupReruns}];',
     '     unexcludable: what the numbers cannot tell apart. Rates (USD per minute, default linux 0.008, windows 0.016, macos 0.08) are overridden with --rate os=usd (os: linux | windows | macos).',
     '     Budget: --max-calls GitHub calls (one per page; the PRs\' reads stop at 60% of it so the biggest runs get their jobs read) and a stop when fewer than 1000 rate-limit calls are left (checked at the start and every 50 calls): `partial: true`',
-    '     with `skipped` counts and a warning; coverage then says how much of the cost is measured. Without --json the same numbers print as a plain-text table. Read-only; no billing endpoint, nothing is cached.',
+    '     with `skipped` counts and a warning (also `partial`: a list GitHub cut or capped, a failed PR-list lookup); coverage then says how much of the cost is measured. Without --json the same numbers print as a plain-text table. Read-only; no billing endpoint, nothing is cached.',
   ].join('\n'),
 };
 
