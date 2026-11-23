@@ -1662,3 +1662,18 @@ test('a passing check run that started before ready is flagged predatesReady on 
   assert.deepEqual(flag, { old: true, fresh: undefined, unknown: undefined, oldstatus: true, freshstatus: undefined });
   assert.equal(s.suiteCalls.length, 0, 'no extra workflow-run reads to date a pass');
 });
+
+// Catches: one failed timeline read turning a draft-era pass into an unflagged one while the report still prints the readyAt a later
+// read found (the skill reads a missing predatesReady as "not a draft-era pass").
+test('a timeline read that fails once does not hide predatesReady: the flag is judged against the readyAt the report prints', async () => {
+  let reads = 0;
+  const s = sim({
+    classic: present('old'),
+    timeline: () => { reads += 1; if (reads === 1) throw new Error('HTTP 502'); return readyTimeline; },
+    checkRuns: [cr('old', 'success', { started_at: '2026-01-01T11:00:00Z' })],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  // the flag and the printed readyAt agree: flagged when readyAt is printed, absent when it could not be read
+  assert.equal(r.output.checks[0].predatesReady, r.output.readyAt === null ? undefined : true, JSON.stringify(r.output));
+});

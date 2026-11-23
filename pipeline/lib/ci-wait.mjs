@@ -311,23 +311,16 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return era === 'stale' ? 'stale-fail' : era === 'superseded' ? 'superseded' : bad;
   };
 
-  // Report only (see RESIDUAL): did this PASSING check run start before the ready event? Dated by its own started_at (data the poll
-  // already holds: no extra read; a re-run is a new check run with its own start). Unreadable: false, never throws.
-  const passPredatesReady = async (run, pr) => {
-    try {
-      const at = Date.parse(run.started_at);
-      return Number.isFinite(at) && at < Date.parse(await getReadyAt(pr));
-    } catch {
-      return false;
-    }
-  };
-
+  // Report only (see RESIDUAL): did a PASSING check start before the ready event? Dated by its own started_at (a re-run is a new check
+  // run with its own start), noted here per check and judged in result() against the same readyAt the report prints, so one failed
+  // timeline read cannot leave a pass dated before readyAt unflagged.
+  const passStarts = new WeakMap(); // evaluate() result -> ms each passing producer started (NaN when unreadable)
   const statusBasis = new WeakMap(); // evaluate() result -> the commit status it rests on (for the status re-read and its evidence)
   const evaluate = async (identity, obs, pr) => {
     const producers = [];
     for (const run of latestRuns(obs.checkRuns, identity.name, identity.appId)) {
       const state = await runState(run, pr);
-      producers.push({ state, url: run.html_url ?? null, ...(state === 'pass' && (await passPredatesReady(run, pr)) ? { predates: true } : {}) });
+      producers.push({ state, url: run.html_url ?? null, ...(state === 'pass' ? { at: Date.parse(run.started_at) } : {}) });
     }
     const status = latestStatus(obs.statuses, identity.name);
     if (status) {
@@ -336,19 +329,14 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       if (counts) {
         let state = statusState(status);
         if (state === 'fail' && (await statusPredatesReady(status, pr))) state = 'stale-fail';
-        let predates = false;
-        if (state === 'pass') {
-          const at = Date.parse(status.created_at);
-          try { predates = Number.isFinite(at) && at < Date.parse(await getReadyAt(pr)); } catch { predates = false; }
-        }
-        producers.push({ state, url: status.target_url ?? null, status, ...(predates ? { predates: true } : {}) });
+        producers.push({ state, url: status.target_url ?? null, status, ...(state === 'pass' ? { at: Date.parse(status.created_at) } : {}) });
       }
     }
     if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null, ...(identity.source ? { source: identity.source } : {}) };
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
     const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url, ...(identity.source ? { source: identity.source } : {}) };
     if (worst.status) statusBasis.set(out, worst.status);
-    if (out.state === 'pass' && producers.some((p) => p.state === 'pass' && p.predates)) out.predatesReady = true;
+    if (out.state === 'pass') passStarts.set(out, producers.filter((p) => p.state === 'pass').map((p) => p.at));
     return out;
   };
 
@@ -449,6 +437,13 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (readyAt === null && last.pr) {
       try { readyAt = await getReadyAt(last.pr); } catch { readyAt = null; }
     }
+    const readyMs = readyAt === null ? NaN : Date.parse(readyAt);
+    const checks = last.states.map((s) => {
+      const starts = passStarts.get(s);
+      if (!starts) return s;
+      const { predatesReady: _drop, ...rest } = s;
+      return Number.isFinite(readyMs) && starts.some((at) => Number.isFinite(at) && at < readyMs) ? { ...rest, predatesReady: true } : rest;
+    });
     return {
       exitCode,
       output: {
@@ -457,7 +452,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         head,
         readyAt,
         requiredSource: { classic: sources.classic?.kind ?? null, rules: sources.rules?.kind ?? null },
-        checks: last.states,
+        checks,
         ...extra,
       },
     };
