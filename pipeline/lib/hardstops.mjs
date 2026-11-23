@@ -195,7 +195,7 @@ const PGTAP_MARKER = new RegExp(
     '\\b(?:is|isnt|set|bag|throws|performs|lives|has|hasnt|col|fk|results|function|enum|index|policy|policies|trigger|rule|language|domain|can|cannot)_[a-z0-9_]*"?\\s*\\(',
     '\\b[a-z0-9_]+_(?:ok|eq|ne|are|is|isnt|like|unlike|has|hasnt|empty|returns|within|ilike|matching|imatching)"?\\s*\\(',
     '\\bcreate\\s+(?:or\\s+replace\\s+)?function\\s+(?:"?[a-z0-9_]+"?\\.)?"?(?:test|startup|setup|teardown|shutdown)[a-z0-9_]*"?\\s*\\(',
-    '^[ \\t]*\\\\(?:i|ir|include|include_relative)[ \\t]+\\S',
+    '^\\uFEFF?[ \\t]*\\\\(?:i|ir|include|include_relative)[ \\t]+\\S',
     // An entry point that only delegates to a routine (`select * from [schema.]routine(`, `select schema.routine(`), whatever its file name.
     '\\bselect\\s+\\*\\s+from\\s+(?:"?[a-z0-9_]+"?\\.)?"?[a-z0-9_]+"?\\s*\\(',
     '\\bselect\\s+"?[a-z0-9_]+"?\\.\\s*"?[a-z0-9_]+"?\\s*\\(',
