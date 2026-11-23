@@ -315,7 +315,8 @@ test('docker psql: an input path with a `..` component is refused; a plain ./ pa
 test('any pg_* program (but pg_config) run as a command is refused, also spelled with empty quotes; catalog names in data pass', () => {
   dockerConfig(null);
   for (const line of ['pg_repack -h db.x.supabase.co -d postgres', 'pg_prove -h db.x.supabase.co -d postgres tests/a.sql', "pg''_repack -h db.x.supabase.co", 'timeout 30 pg_prove -d postgres t.sql']) mustRefuse(line);
-  for (const line of ['echo pg_class', 'grep -rn pg_repack docs', 'pg_config --version', 'psql_x --help']) mustAllow(line);
+  for (const line of ['echo pg_class', 'grep -rn pg_repack docs', 'pg_config --version', 'psql_x --help', "node scripts/q.mjs 'select * from pg_class'"]) mustAllow(line);
+  for (const line of ['kubectl exec db -- /usr/bin/pg_repack -h prod', "ssh db-host 'pg_repack -h prod -d postgres'", "doppler run --command 'pg_repack -h prod'", "kubectl exec db -- sh -c 'pg_repack -h prod'"]) mustRefuse(line);
 });
 
 // Catches (round 1, R1-B4): Docker's Go decoder reads `CurrentContext` / `host` as the same field as `currentContext` / `Host`; an exact-key lookup saw no context and approved the default (local) endpoint.
@@ -348,6 +349,11 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     "rg -n 'psql|PGHOST' docs | cut -c1-80",
     "rg -l 'psql|DATABASE_URL' docs | sort | uniq",
     'git add supabase/migrations/pg_cron.sql',
+    'git switch pg_repack',
+    'git add db/pg_partman',
+    'git checkout -b pg_cron_fix',
+    'mkdir pg_dumps',
+    'rm -rf pg_data',
     'grep -rn \'psql "$DATABASE_URL"\' scripts',
     'gh pr create --title t --body "Runs psql against the local stack; DATABASE_URL is no longer read"',
     'git -C /repo commit -m "psql guard: refuse PGHOST lines"',
@@ -362,6 +368,7 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     `PG''HOST=x ${P}`,
     `export PGHOST=x; rg -n psql docs`,
     "rg -l 'psql|PGHOST' docs | sort -o out.sh",
+    "rg -l 'psql|PGHOST' docs | uniq - out.sh",
     `rg -n psql docs; ${P}`,
     `gh pr create --title t --body "$(PGHOST=db.x.supabase.co psql -c 'select 1')"`,
     `gh pr create --title t --body "$(export PGHOST=x; ${P})"`,
