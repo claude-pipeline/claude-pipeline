@@ -200,14 +200,16 @@ function readyHeads(events, runs) {
     let best = null;
     for (const r of prRuns) {
       const t = ms(r.created_at);
-      if (t - e.t < 0 || t - e.t > WINDOW_MS) continue;
+      if (!inReadyWindow(events, e, t)) continue;
       if (!best || t < best.t || (t === best.t && Number(r.id) < Number(best.run.id))) best = { t, run: r };
     }
     if (best) heads.set(e.t, best.run.head_sha);
   }
   return heads;
 }
-const isReadyRun = (events, readyBy, t, headSha) => t !== null && events.some((e) => e.to === 'ready' && t - e.t >= 0 && t - e.t <= WINDOW_MS && readyBy.get(e.t) === headSha);
+// time `t` is within 120 s after the ready event `e` and before the next converted_to_draft (a PR sent back to draft ends what the ready event started)
+const inReadyWindow = (events, e, t) => t - e.t >= 0 && t - e.t <= WINDOW_MS && !events.some((d) => d.to === 'draft' && d.t > e.t && d.t <= t);
+const isReadyRun = (events, readyBy, t, headSha) => t !== null && events.some((e) => e.to === 'ready' && inReadyWindow(events, e, t) && readyBy.get(e.t) === headSha);
 
 // ---- the pushes (heads) of one PR -----------------------------------------------------------------------------------
 

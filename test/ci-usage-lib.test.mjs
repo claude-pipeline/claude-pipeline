@@ -183,3 +183,16 @@ test('review round 1 B3: a run created well after its head\'s first run (a reope
   assert.deepEqual(classifyRuns({ pr, timeline: [], commits: [], runs }).map((x) => x.class), ['opening', 'push-while-ready', 'push-while-ready', 'other']);
   assert.equal(pushedWhileReady({ pr, timeline: [], commits: [], runs }).count, 1);
 });
+
+test('review round 1 B4: the ready window ends at the next converted_to_draft: a draft push or the redraft run after it is not the ready-for-review suite', () => {
+  const pr = { createdAt: T('09:00'), draft: false };
+  // ready at 10:00:00 started no run; the PR went back to draft at 10:00:30; a push in draft at 10:00:40 is inside 120 s of the ready event
+  const tl = [ev('ready_for_review', T('10:00')), ev('converted_to_draft', T('10:00', 30))];
+  const pushed = [run(sha('d'), T('10:00', 40))];
+  assert.deepEqual(classifyRuns({ pr, timeline: tl, commits: [], runs: pushed }).map((x) => x.class), ['push-while-draft']);
+  assert.deepEqual(headPushes({ pr, timeline: tl, commits: [], runs: pushed }).map((h) => [h.kind, h.phase]), [['push', 'draft']]);
+  // ready run on sha 1 at 10:00:05; the redraft's own run on the same head at 10:00:40 is not part of the ready suite
+  const redraft = [run(sha('1'), T('10:00', 5)), run(sha('1'), T('10:00', 40), { conclusion: 'skipped' })];
+  const classes = classifyRuns({ pr, timeline: tl, commits: [], runs: redraft }).map((x) => x.class);
+  assert.deepEqual(classes, ['ready-for-review', 'push-while-draft']);
+});
