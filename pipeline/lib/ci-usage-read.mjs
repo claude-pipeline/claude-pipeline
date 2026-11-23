@@ -83,43 +83,53 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const draftWhileIterating = readDraftFlag(gh, slug, budget, warnings);
   let totalCount = null;
   let truncated = false; // a list was cut or capped (runs, timeline, commits, jobs): the report is partial
-  const listed = pages(gh, `repos/${slug}/actions/runs?created=${encodeURIComponent(`>=${sinceIso}`)}`, undefined,
-    () => { truncated = true; warn(`the list of workflow runs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} runs): runs further back are missing, so the totals are short (use a later --since)`); },
+  let runsCut = false; // the run list was cut or capped: its oldest runs are missing
+  const raw = pages(gh, `repos/${slug}/actions/runs?created=${encodeURIComponent(`>=${sinceIso}`)}`, undefined,
+    () => { truncated = true; runsCut = true; warn(`the list of workflow runs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} runs): runs further back are missing, so the totals are short (use a later --since)`); },
     { key: 'workflow_runs', onCall: () => budget.count(), onPage: (r) => { totalCount ??= Number.isFinite(r?.total_count) ? r.total_count : null; } });
-  if (totalCount !== null && totalCount > listed.length && listed.length < MAX_PAGES * PAGE) { truncated = true; warn(`GitHub lists ${totalCount} runs for this period but returned ${listed.length}: it caps a created= search at 1000 results, so the totals are short (use a later --since)`); }
+  // a run created while the pages are read pushes one run onto the next page: it is listed twice and must be charged once
+  const seenRuns = new Set();
+  const listed = raw.filter((r) => r?.id === undefined || (!seenRuns.has(r.id) && seenRuns.add(r.id)));
+  if (totalCount !== null && totalCount > listed.length && listed.length < MAX_PAGES * PAGE) { truncated = true; runsCut = true; warn(`GitHub lists ${totalCount} runs for this period but returned ${listed.length}: it caps a created= search at 1000 results, so the totals are short (use a later --since)`); }
   const keep = new Set(workflows);
   const runs = keep.size === 0 ? listed : listed.filter((r) => keep.has(r.name) || keep.has(r.path) || keep.has(String(r.path ?? '').split('/').pop()));
+
+  const kept = new Set(runs);
 
   // PRs: only the run's own pull_requests link
   // a re-run measures only its last attempt (elapsedMs): a short retry of a long run must still have its jobs read, which cover every attempt
   const isCandidate = (r) => elapsedMs(r) >= HEAVY_ELAPSED_MS || Number(r.run_attempt) > 1;
   const candidates = runs.filter(isCandidate);
   const prOfRun = new Map();
-  const prGroups = new Map(); // PR number -> { runs, candidateMs }
-  for (const run of runs) {
+  const prGroups = new Map(); // PR number -> { runs (the kept ones: the cost), all (of every workflow: which run came first on a head), candidateMs }
+  for (const run of listed) {
     if (run.event !== 'pull_request') continue;
     const n = run.pull_requests?.[0]?.number;
     if (!Number.isInteger(n)) continue;
-    prOfRun.set(run.id, n);
-    const g = prGroups.get(n) ?? { runs: [], candidateMs: 0 };
-    g.runs.push(run);
-    if (isCandidate(run)) g.candidateMs += Math.max(elapsedMs(run), 1);
+    const g = prGroups.get(n) ?? { runs: [], all: [], candidateMs: 0 };
+    g.all.push(run);
+    if (kept.has(run)) {
+      prOfRun.set(run.id, n);
+      g.runs.push(run);
+      if (isCandidate(run)) g.candidateMs += Math.max(elapsedMs(run), 1);
+    }
     prGroups.set(n, g);
   }
 
   // per PR with at least one heavy-candidate run, the biggest first: the PR itself, its timeline and its commits
   const readPr = new Map();
   const order = [...prGroups.entries()].filter(([, g]) => g.candidateMs > 0).sort((a, b) => b[1].candidateMs - a[1].candidateMs);
-  const cut = (what, n) => () => { truncated = true; warn(`#${n}: the ${what} were cut after ${MAX_PAGES} pages: the classification of this PR may be short`); };
   for (const [n] of order) {
+    let incomplete = false; // a list of this PR was cut: its phases or commits are missing, so none of its heads is judged
+    const cut = (what) => () => { truncated = true; incomplete = true; warn(`#${n}: the ${what} were cut after ${MAX_PAGES} pages: the classification of this PR is short and none of its heads could be checked`); };
     try {
       budget.tick(maxCalls * PR_SHARE);
       const pr = gh.api('GET', `repos/${slug}/pulls/${n}`);
-      const timeline = pages(gh, `repos/${slug}/issues/${n}/timeline`, undefined, cut('timeline events', n), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
-      const commits = pages(gh, `repos/${slug}/pulls/${n}/commits`, undefined, cut('commits', n), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
+      const timeline = pages(gh, `repos/${slug}/issues/${n}/timeline`, undefined, cut('timeline events'), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
+      const commits = pages(gh, `repos/${slug}/pulls/${n}/commits`, undefined, cut('commits'), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
       // GitHub returns at most 250 commits of a PR whatever the pages: a PR with more is short here, with no cut page to show it
-      if (Number.isInteger(pr?.commits) && pr.commits > commits.length) { truncated = true; warn(`#${n}: GitHub lists ${pr.commits} commits for this PR but returned ${commits.length} (it caps the commits of a PR at 250): the classification of this PR may be short`); }
-      readPr.set(n, { pr: { createdAt: pr?.created_at, draft: pr?.draft === true, baseRef: pr?.base?.ref, baseRepo: pr?.base?.repo?.full_name }, timeline, commits });
+      if (Number.isInteger(pr?.commits) && pr.commits > commits.length) { truncated = true; warn(`#${n}: GitHub lists ${pr.commits} commits for this PR but returned ${commits.length} (it caps the commits of a PR at 250): the heads of the commits it left out could not be checked`); }
+      readPr.set(n, { pr: { createdAt: pr?.created_at, draft: pr?.draft === true, baseRef: pr?.base?.ref, baseRepo: pr?.base?.repo?.full_name }, timeline, commits, incomplete });
     } catch (err) {
       if (err instanceof budget.stop) { skipped.prs += 1; continue; }
       warn(`#${n}: could not be read (${asciiLine(err?.message, 120)}): its runs stay unclassified`);
@@ -151,9 +161,15 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const prRows = [];
   const classified = [];
   // a head that also has a pull_request run GitHub did not link to any PR: which run came first on it cannot be proven, so it is not judged (see analysePrUsage)
-  const unlinkedHeads = new Set(runs.filter((r) => r.event === 'pull_request' && (r.pull_requests ?? []).length === 0 && r.head_sha).map((r) => r.head_sha));
-  for (const [n, data] of readPr) {
-    const row = analysePrUsage({ number: n, ...data, runs: prGroups.get(n).runs, jobsByRun, rates, viewer, sinceMs, isPrivate, ambiguousHeads: [...unlinkedHeads] });
+  const unlinkedHeads = new Set(listed.filter((r) => r.event === 'pull_request' && (r.pull_requests ?? []).length === 0 && r.head_sha).map((r) => r.head_sha));
+  // the runs before the oldest one kept were not read when the run list was cut: a head whose commit is older may have had its first run there
+  const oldest = Math.min(...listed.map((r) => Date.parse(r.created_at)).filter(Number.isFinite));
+  const evidenceFromMs = runsCut && Number.isFinite(oldest) ? Math.max(sinceMs, oldest) : sinceMs;
+  for (const [n, { incomplete, ...data }] of readPr) {
+    const { runs: prRuns, all } = prGroups.get(n);
+    const ambiguousHeads = incomplete ? all.map((r) => r.head_sha) : [...unlinkedHeads];
+    const row = analysePrUsage({ number: n, ...data, runs: prRuns, evidenceRuns: all, jobsByRun, rates, viewer, sinceMs, evidenceFromMs, isPrivate, ambiguousHeads });
+    if (viewer === null) row.wastedRedrafts = null; // whose redraft it was cannot be told
     classified.push(...row.classified);
     const { classified: _omit, ...plain } = row;
     prRows.push(plain);
@@ -167,9 +183,9 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   if (budget.reason === 'max-calls') warn(`--max-calls ${maxCalls} reached: the report is partial`);
   if (skipped.prs > 0) warn(`${skipped.prs} PR(s) with heavy runs were not read: their runs are unclassified`);
   const unchecked = agg.totals.uncheckedHeads;
-  if (unchecked > 0) warn(`${unchecked} head(s) pushed while the PR was ready also have a pull_request run GitHub did not link to a PR: they could not be checked, so they are left out of the pushed-while-ready and missed-redraft counts (their runs stay in the totals)`);
+  if (unchecked > 0) warn(`${unchecked} head(s) pushed while the PR was ready also have a pull_request run GitHub did not link to a PR, are missing from the PR's commit list (a force push dropped them, or GitHub's 250-commit cap), or may have had an earlier run before the period: they could not be checked, so they are left out of the pushed-while-ready and missed-redraft counts (their runs stay in the totals)`);
   const { unlinkedRuns } = agg.totals.attribution;
-  if (unlinkedRuns > 0) warn(`${unlinkedRuns} pull_request run(s) were not linked to a PR by GitHub: counted under class other, event pull_request, not given to any PR`);
+  if (unlinkedRuns > 0) warn(`${unlinkedRuns} pull_request run(s) were not linked to a PR by GitHub (a PR from a fork, or a PR merged or closed before this report: GitHub unlinks the runs of a PR that is no longer open): counted under class other, event pull_request, not given to any PR, so the per-PR rows and the pushed-while-ready and missed-redraft counts cover the PRs still open`);
   if (skipped.jobs > 0) warn(`${skipped.jobs} run(s) of a minute or more, or re-run, had their jobs unread: job minutes and the estimate cover ${agg.totals.coverage}% of the heavy runs`);
   return {
     slug, private: isPrivate, billing: agg.billing, draftWhileIterating, classifierVersion, since: sinceIso, partial, calls: budget.calls, rateLimit: budget.rate, skipped,

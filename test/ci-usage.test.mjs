@@ -24,6 +24,7 @@ const PR7 = { number: 7, created_at: T('09:00'), draft: false };
 const TIMELINE7 = [ev('ready_for_review', T('10:00')), ev('converted_to_draft', T('11:00')), ev('ready_for_review', T('12:00'))];
 const COMMITS7 = [
   { sha: sha('1'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } },
+  { sha: sha('3'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work', committer: { date: T('10:25') } } }, // the head pushed while ready (dated inside the period)
   { sha: sha('c'), parents: [{ sha: 'p' }, { sha: 'q' }], committer: { login: 'web-flow' }, commit: { message: "Merge branch 'main' into agent/x" } },
 ];
 const run = (id, over) => ({
@@ -254,7 +255,7 @@ test('ci-usage: an unlinked run on the same head as a linked push while ready le
   const p = repo.prs.find((x) => x.pr === 7);
   assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
   assert.deepEqual([repo.totals.pushesWhileReady, repo.totals.missedRedrafts, repo.totals.uncheckedHeads], [0, 0, 1]);
-  assert.match(r.json.warnings.join('\n'), /acme\/widgets: 1 head\(s\) pushed while the PR was ready also have a pull_request run GitHub did not link to a PR: they could not be checked/);
+  assert.match(r.json.warnings.join('\n'), /acme\/widgets: 1 head\(s\) pushed while the PR was ready also have a pull_request run GitHub did not link to a PR.* they could not be checked/);
   assert.equal(repo.totals.heavyRuns, 6, 'both runs of the head stay in the totals');
   assert.equal(repo.totals.jobMinutes.linux, 25 + 3);
   assert.equal(repo.totals.workflowElapsedMin, 12 + 10 + 2 + 6 + 2 + 3);
@@ -265,7 +266,7 @@ test('R3-B4: a PR with more commits than GitHub returned (it caps them at 250, w
   const r = usage(world({ extra: capped }), ['--json', '--since', '2026-11-05']);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.repos[0].partial, true);
-  assert.match(r.json.warnings.join('\n'), /acme\/widgets: #7: GitHub lists 251 commits for this PR but returned 2 /);
+  assert.match(r.json.warnings.join('\n'), /acme\/widgets: #7: GitHub lists 251 commits for this PR but returned 3 /);
 });
 
 test('R1-B7: a run re-run in under a minute still has its jobs read (the first attempt\'s 20 minutes are not lost)', () => {
@@ -323,4 +324,55 @@ test('ci-usage: a bad --repo-slug or --max-calls is a usage error', () => {
   assertExit(usage(world(), ['--json', '--repo-slug', 'nope']), 2);
   assertExit(usage(world(), ['--json', '--max-calls', '0']), 2);
   assertExit(usage(world(), ['--json', '--bogus']), 2);
+});
+
+test('PR #823 round 1 B3/F3/B5: a head missing from the PR commit list (a force push dropped a catch-up merge), or whose commit predates --since, is not counted as pushed while ready', () => {
+  // failure caught: the report naming a head with no commit record (or one whose first run may lie before the period) as a missed redraft; the summary leaves the same heads out
+  const without = COMMITS7.filter((c) => c.sha !== sha('3'));
+  const dropped = usage(world({ extra: [{ match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: without }] }), ['--json', '--since', '2026-11-05']);
+  const old = COMMITS7.map((c) => (c.sha === sha('3') ? { ...c, commit: { message: 'work', committer: { date: '2026-11-01T08:00:00Z' } } } : c));
+  const reopened = usage(world({ extra: [{ match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: old }] }), ['--json', '--since', '2026-11-05']);
+  for (const r of [dropped, reopened]) {
+    assertExit(r, 0, r.stderr + r.stdout);
+    const [repo] = r.json.repos;
+    const p = repo.prs.find((x) => x.pr === 7);
+    assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
+    assert.deepEqual([repo.totals.pushesWhileReady, repo.totals.missedRedrafts, repo.totals.uncheckedHeads], [0, 0, 1]);
+    assert.match(r.json.warnings.join('\n'), /1 head\(s\) pushed while the PR was ready .*commit list.*could not be checked/);
+  }
+});
+
+test('PR #823 round 1 B5: --workflow does not hide an earlier run of another workflow: the head first ran in draft, so the filtered run is no push while ready', () => {
+  // failure caught: with --workflow ci the draft-era guards run on the head is gone, the ci run at 10:30 looks like the head's first and is counted as a missed redraft
+  const draftEra = run(1301, { name: 'guards', path: '.github/workflows/guards.yml', created_at: T('09:45'), run_started_at: T('09:45'), updated_at: T('09:45', 10) }); // head sha('3'), as the ci run 1003 at 10:30
+  const r = usage(world({ runs: [...RUNS, draftEra] }), ['--json', '--since', '2026-11-05', '--workflow', 'ci']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  assert.deepEqual([repo.totals.pushesWhileReady, repo.totals.missedRedrafts, repo.prs.find((x) => x.pr === 7).pushedHeads], [0, 0, []]);
+});
+
+test('PR #823 round 1 B7: a run listed on two pages (a new run pushed it onto the next page) is charged once', () => {
+  // failure caught: the same run's job minutes and cost added twice
+  const heavy = { id: 5099, name: 'ci', path: '.github/workflows/ci.yml', event: 'push', head_sha: sha('a'), run_attempt: 1, created_at: T('10:00'), run_started_at: T('10:00'), updated_at: plus(T('10:00'), 10) };
+  const filler = Array.from({ length: 99 }, (_, i) => ({ ...heavy, id: 5000 + i, updated_at: T('10:00', 5) }));
+  const pagesOf = [
+    { match: '^api repos/acme/widgets/actions/runs\\?created.*page=1$', stdoutJson: { total_count: 101, workflow_runs: [...filler, heavy] } },
+    { match: '^api repos/acme/widgets/actions/runs\\?created.*page=2$', stdoutJson: { total_count: 101, workflow_runs: [heavy, { ...heavy, id: 5100, updated_at: T('10:00', 5) }] } },
+    { match: '^api repos/acme/widgets/actions/runs/5099/jobs', stdoutJson: { total_count: 1, jobs: [job(T('10:00'), 10)] } },
+  ];
+  const r = usage(world({ extra: pagesOf }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  assert.equal(repo.runsListed, 101);
+  assert.equal(repo.totals.jobMinutes.linux, 10);
+  assert.equal(repo.totals.estimatedUsd, round4(10 * 0.006));
+});
+
+test('PR #823 round 1 B9: when the viewer lookup fails, wasted redrafts are not counted (null), not attributed to everyone', () => {
+  // failure caught: another person's draft-then-ready cycle reported as the viewer's wasted redraft, with partial false
+  const r = usage(world({ extra: [{ match: '^api user', code: 1, stderr: 'gh: HTTP 401' }] }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  assert.deepEqual([repo.totals.wastedRedrafts, repo.prs.find((x) => x.pr === 7).wastedRedrafts], [null, null]);
+  assert.match(r.json.warnings.join('\n'), /the viewer login could not be read/);
 });

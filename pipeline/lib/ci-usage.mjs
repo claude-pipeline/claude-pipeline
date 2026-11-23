@@ -158,15 +158,16 @@ export function elapsedMs(run) {
 //   catch-up          its head is an update-branch merge of the base
 //   push-while-ready  created within 120 s of the first run of a head pushed while the PR was ready
 //   push-while-draft  the same while it was a draft
+// `evidenceRuns`: the runs that say which run came first on a head (default `runs`); the reader passes the PR's runs of every workflow when `runs` was cut down to --workflow.
 // `jobsByRun`: Map run id -> jobs for the runs whose jobs were read (a list the reader had to cut carries `cut: true`: priced as far as read, but not counted as fully read). -> one row per run, same order.
 // `unlinked: true` is for the reader's last pass over the runs no PR row holds (unlinked runs, and linked runs of PRs that were not read): each run's OWN link is checked, before the PR is. A linked run of an unread PR stays `unclassified`.
-export function classifyRuns({ pr = null, timeline = null, commits = [], runs, jobsByRun = new Map(), rates = DEFAULT_RATES, unlinked = false }) {
+export function classifyRuns({ pr = null, timeline = null, commits = [], runs, evidenceRuns = runs, jobsByRun = new Map(), rates = DEFAULT_RATES, unlinked = false }) {
   const readable = Array.isArray(timeline);
   const events = toggles(timeline);
   const catchups = catchUpShas(commits, pr?.baseRef, pr?.baseRepo);
-  const readyBy = readyHeads(events, runs);
-  const firstOf = firstRuns(runs);
-  const openingHeads = pr && readable ? new Set(headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind === 'opening').map((h) => h.sha)) : new Set();
+  const readyBy = readyHeads(events, evidenceRuns);
+  const firstOf = firstRuns(evidenceRuns);
+  const openingHeads = pr && readable ? new Set(headPushes({ pr, timeline, commits, runs: evidenceRuns }).filter((h) => h.kind === 'opening').map((h) => h.sha)) : new Set();
   return (runs ?? []).map((run) => {
     const created = ms(run.created_at);
     const updated = ms(run.updated_at);
@@ -257,6 +258,17 @@ export function headPushes({ pr, timeline, commits = [], runs }) {
   });
 }
 
+// A head pushed while the PR was ready is named only when it can be proven: the PR's commit list holds it (a head a force push dropped, or one past GitHub's 250-commit cap, has no record, and an
+// update-branch merge there would look like a push), and, when `fromMs` is given (the runs before it were not read), its commit is dated no earlier than that (an older commit may have had its first run before it).
+// Both callers (`pipeline summary`, `pipeline ci-usage`) leave a head that fails this out and say so.
+export function headProvable(sha, commits, fromMs = null) {
+  const c = (commits ?? []).find((k) => normalizeCommit(k).sha === sha);
+  if (c === undefined) return false;
+  if (fromMs === null) return true;
+  const d = commitDate(c);
+  return d !== null && d >= fromMs;
+}
+
 // Heads pushed while the PR was READY: the missed redrafts (when the repository iterates in draft). Excluded: the opening head, catch-ups, heads whose first run was the
 // ready one (ONE head per ready event), and re-runs (see headPushes). NOT excludable: a push after Rule 8's proven `convert-failed` rejection (GitHub refused the redraft, so the review skill pushes
 // anyway) leaves no trace on GitHub; it counts here like any other push while ready.
@@ -298,16 +310,19 @@ const addTo = (acc, minutes) => { for (const k of OS_KEYS) acc[k] += minutes[k] 
 const commitDate = (c) => ms(c?.commit?.committer?.date ?? c?.commit?.author?.date);
 
 // -> the PR's row and its classified runs.
+// `evidenceRuns`: the PR's linked runs of EVERY workflow (default `runs`, which --workflow may have cut down): the first run of a head, and so every push, is judged on them; the cost is of `runs`.
+// `evidenceFromMs`: the runs before it were not read (default none; the reader passes the period start, later when the run list was cut): a head whose commit is older than that, or has no commit date, is not judged (headProvable).
+// A ready-phase head that is not in `commits` is not judged either: both are counted in `uncheckedHeads` like an ambiguous head.
 // `ambiguousHeads` (head SHAs): heads that ALSO have a pull_request run GitHub did not link to any PR. Which run came first on such a head cannot be proven (the unlinked run may have been the first, while the PR was a draft),
 // so the head is left out of pushesWhileReady / pushedHeads and counted in `uncheckedHeads`; its runs stay in every class, elapsed, job and cost total.
 // `sinceMs` (the report's period): the whole timeline and commit list still set the phase, but only the ready cycles, wasted redrafts and catch-ups dated in the period are counted.
 // `isPrivate`: a public repository is free, so its PR rows are 0 too.
-export function analysePrUsage({ number, pr, timeline, commits = [], runs, jobsByRun = new Map(), rates = DEFAULT_RATES, viewer = null, sinceMs = null, isPrivate = true, ambiguousHeads = [] }) {
-  const classified = classifyRuns({ pr, timeline, commits, runs, jobsByRun, rates });
-  const pushes = headPushes({ pr, timeline, commits, runs });
+export function analysePrUsage({ number, pr, timeline, commits = [], runs, evidenceRuns = runs, jobsByRun = new Map(), rates = DEFAULT_RATES, viewer = null, sinceMs = null, evidenceFromMs = null, isPrivate = true, ambiguousHeads = [] }) {
+  const classified = classifyRuns({ pr, timeline, commits, runs, evidenceRuns, jobsByRun, rates });
+  const pushes = headPushes({ pr, timeline, commits, runs: evidenceRuns });
   const ambiguous = new Set(ambiguousHeads);
   const readyPushes = pushes.filter((h) => h.kind === 'push' && h.phase === 'ready');
-  const pushedReady = readyPushes.filter((h) => !ambiguous.has(h.sha));
+  const pushedReady = readyPushes.filter((h) => !ambiguous.has(h.sha) && headProvable(h.sha, commits, evidenceFromMs));
   const jobMinutes = zeroMinutes();
   let usd = 0;
   let workflowElapsedMin = 0;
@@ -336,7 +351,7 @@ export function analysePrUsage({ number, pr, timeline, commits = [], runs, jobsB
     pushedHeads: pushedReady.map((h) => sha12(h.sha)),
     uncheckedHeads: readyPushes.length - pushedReady.length,
     pushesWhileDraft: pushes.filter((h) => h.kind === 'push' && h.phase === 'draft').length,
-    wastedRedrafts: wastedRedrafts({ pr, timeline, commits, runs, viewer, sinceMs }),
+    wastedRedrafts: wastedRedrafts({ pr, timeline, commits, runs: evidenceRuns, viewer, sinceMs }),
     catchups: new Set((commits ?? []).filter((c) => isCatchUpCommit(c, pr?.baseRef, pr?.baseRepo) && (sinceMs === null || (commitDate(c) ?? sinceMs) >= sinceMs)).map((c) => normalizeCommit(c).sha)).size,
     heavyRuns, workflowElapsedMin: round(workflowElapsedMin), jobMinutes: roundMinutes(jobMinutes), estimatedUsd: isPrivate ? round(usd, 4) : 0,
     churnRuns, churnMinutes: round(churnMinutes), churnUnreadRuns,
@@ -348,9 +363,9 @@ const roundMinutes = (m) => Object.fromEntries(OS_KEYS.map((k) => [k, round(m[k]
 // ---- totals ---------------------------------------------------------------------------------------------------------
 
 // How much of the pull_request cost the report could not give to a PR: unlinkedRuns = every pull_request run GitHub did not link to a PR (any length); the *Heavy* fields count heavy runs only, the population the PR rows use
-// (linked = a pull_request run that is not `other`, which includes the linked runs of PRs that were not read; unlinked = the flagged rows of classifyRuns's `unlinked` pass).
+// (linked = a pull_request run that is not flagged unlinked, whatever its class (a linked run on an old head is `other`), which includes the linked runs of PRs that were not read; unlinked = the flagged rows of classifyRuns's `unlinked` pass).
 function attributionOf(classified) {
-  const linked = classified.filter((r) => r.event === 'pull_request' && !r.unlinked && r.class !== 'other' && r.heavy);
+  const linked = classified.filter((r) => r.event === 'pull_request' && !r.unlinked && r.heavy);
   const unlinkedAll = classified.filter((r) => r.unlinked);
   const unlinkedHeavy = unlinkedAll.filter((r) => r.heavy);
   const minutes = (rows) => round(rows.reduce((sum, r) => sum + r.elapsedMin, 0));
@@ -402,7 +417,8 @@ export function aggregateUsage({ classified, prRows, isPrivate, rates = DEFAULT_
     pushesWhileReady,
     // a push while ready is a MISSED redraft only where the repository iterates in draft (ci.draft_while_iterating: true); null = that setting could not be read
     missedRedrafts: draftWhileIterating === true ? pushesWhileReady : draftWhileIterating === false ? 0 : null,
-    wastedRedrafts: prRows.reduce((s, p) => s + p.wastedRedrafts, 0),
+    // null when a PR's count is unknown (the viewer login could not be read, so whose redraft it was cannot be told)
+    wastedRedrafts: prRows.some((p) => p.wastedRedrafts === null) ? null : prRows.reduce((s, p) => s + p.wastedRedrafts, 0),
     catchupsPerPr: prRows.length === 0 ? null : round(prRows.reduce((s, p) => s + p.catchups, 0) / prRows.length),
     churnRuns: prRows.reduce((s, p) => s + p.churnRuns, 0),
     churnMinutes: round(prRows.reduce((s, p) => s + p.churnMinutes, 0)),
@@ -438,7 +454,7 @@ export function renderUsageTable({ since, repos }) {
     out.push(cell(`CI usage since ${since} in ${r.slug} (${r.private ? 'private' : 'public'}; classifier v${r.classifierVersion}${r.partial ? '; PARTIAL' : ''})`), '');
     out.push(`${pad('PR', 8)}${pad('ready', 7)}${pad('push-rdy', 10)}${pad('push-dft', 10)}${pad('wasted', 8)}${pad('catchups', 10)}${pad('heavy', 7)}${pad('job min', 9)}${pad('est $', 9)}pushed-while-ready heads`);
     for (const p of r.prs) {
-      out.push(`${pad(`#${p.pr}`, 8)}${pad(p.readyCycles, 7)}${pad(p.pushesWhileReady, 10)}${pad(p.pushesWhileDraft, 10)}${pad(p.wastedRedrafts, 8)}${pad(p.catchups, 10)}${pad(p.heavyRuns, 7)}${pad(minText(Object.values(p.jobMinutes).reduce((s, v) => s + (v ?? 0), 0)), 9)}${pad(r.private ? usdText(p.estimatedUsd) : '-', 9)}${cell(p.pushedHeads.join(' '))}`);
+      out.push(`${pad(`#${p.pr}`, 8)}${pad(p.readyCycles, 7)}${pad(p.pushesWhileReady, 10)}${pad(p.pushesWhileDraft, 10)}${pad(p.wastedRedrafts ?? '-', 8)}${pad(p.catchups, 10)}${pad(p.heavyRuns, 7)}${pad(minText(Object.values(p.jobMinutes).reduce((s, v) => s + (v ?? 0), 0)), 9)}${pad(r.private ? usdText(p.estimatedUsd) : '-', 9)}${cell(p.pushedHeads.join(' '))}`);
     }
     out.push('', 'Heavy runs by class (runs, heavy runs, workflow elapsed min, job minutes by OS):');
     for (const [name, s] of Object.entries(t.byClass)) {
@@ -447,7 +463,8 @@ export function renderUsageTable({ since, repos }) {
     }
     out.push('', `PRs ${t.prs} · heavy runs ${t.heavyRuns} · workflow elapsed ${minText(t.workflowElapsedMin)} min (measured) · job minutes ${osText(t.jobMinutes)} · jobs read for ${t.coverage}% of the heavy runs`);
     out.push(r.private ? `Estimated cost ${usdText(t.estimatedUsd)} (an estimate, not a bill: ${cell(r.assumptions.note)})` : 'Public repository: Actions minutes are free (estimated cost $0.00)');
-    out.push(`Pushed while ready ${t.pushesWhileReady} · missed redrafts ${t.missedRedrafts === null ? 'unknown (ci.draft_while_iterating could not be read)' : t.missedRedrafts} (draft_while_iterating ${r.draftWhileIterating}) · wasted redrafts ${t.wastedRedrafts}`);
+    out.push(`Pushed while ready ${t.pushesWhileReady} · missed redrafts ${t.missedRedrafts === null ? 'unknown (ci.draft_while_iterating could not be read)' : t.missedRedrafts} (draft_while_iterating ${r.draftWhileIterating}) · wasted redrafts ${t.wastedRedrafts === null ? 'unknown (the viewer login could not be read)' : t.wastedRedrafts}`);
+    out.push('Per-PR rows and the pushed-while-ready / missed-redraft counts cover the PRs still open when this report runs: GitHub unlinks the runs of a merged or closed PR (they stay in the totals as unlinked runs)');
     out.push(`Base churn: ${t.churnRuns} heavy run(s) on catch-up heads, ${minText(t.churnMinutes)} job min · ${t.catchupsPerPr ?? '-'} catch-ups per PR`);
     out.push(`Calls ${r.calls}${r.rateLimit ? ` · rate limit remaining ${r.rateLimit.remaining}` : ''}${r.partial ? ` · skipped: ${cell(JSON.stringify(r.skipped))}` : ''}`);
     for (const u of r.unexcludable) out.push(cell(`Note: ${u}`));

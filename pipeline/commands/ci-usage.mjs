@@ -17,8 +17,8 @@ export const meta = {
     '     optionally only the --workflow NAME(s) (a name, a path or a file name). Every PR with a run of a minute or more has its timeline and commits read, and every such run its jobs (`actions/runs/{id}/jobs?filter=all`, every attempt).',
     '     totals {prs, heavyRuns (jobs add up to >= 1 min; with the jobs unread, the run lasted >= 1 min or was re-run), workflowElapsedMin (measured: run updated_at - run_started_at), jobMinutes {linux, windows, macos, self-hosted} (the sum of the job durations),',
     '     estimatedUsd (ESTIMATE: each job rounded up to a whole minute x the rate of its OS, self-hosted 0; a public repository is free-public and 0), coverage (% of the heavy runs whose jobs were read), byClass, byEvent, pushesWhileReady,',
-    '     missedRedrafts (= pushesWhileReady when the repository\'s .claude/pipeline.yml has ci.draft_while_iterating: true, 0 when false, null when it could not be read), wastedRedrafts, catchupsPerPr, churnRuns, churnMinutes, uncheckedHeads (heads pushed while ready that were left out because the head also has an unlinked run), attribution {unlinkedRuns, linkedHeavyRuns, linkedHeavyElapsedMin, unlinkedHeavyRuns, unlinkedHeavyElapsedMin}};',
-    '     class of a run: ready-for-review | opening (the head the PR was opened with) | push-while-ready | push-while-draft | converted-cancel | catch-up | rerun | other (not a pull_request run, by event in byEvent; or a pull_request run GitHub did not link to a PR, counted once under event pull_request and in attribution.unlinkedRuns) | unclassified (its PR was not read);',
+    '     missedRedrafts (= pushesWhileReady when the repository\'s .claude/pipeline.yml has ci.draft_while_iterating: true, 0 when false, null when it could not be read), wastedRedrafts (null when the viewer login could not be read: whose redraft it was cannot be told), catchupsPerPr, churnRuns, churnMinutes, uncheckedHeads (heads pushed while ready that were left out: the head also has an unlinked run, is not in the PR\'s commit list, or its commit may predate the period), attribution {unlinkedRuns, linkedHeavyRuns, linkedHeavyElapsedMin, unlinkedHeavyRuns, unlinkedHeavyElapsedMin}};',
+    '     class of a run: ready-for-review | opening (the head the PR was opened with) | push-while-ready | push-while-draft | converted-cancel | catch-up | rerun | other (not a pull_request run, by event in byEvent; or a pull_request run GitHub did not link to a PR (a PR from a fork, or a PR merged or closed: GitHub unlinks the runs of a PR that is no longer open, so the per-PR rows and the pushed-while-ready and missed-redraft counts cover the PRs still open when the command runs), counted once under event pull_request and in attribution.unlinkedRuns) | unclassified (its PR was not read);',
     '     prs [{pr, readyCycles, pushesWhileReady, pushedHeads, pushesWhileDraft, wastedRedrafts, catchups, heavyRuns, workflowElapsedMin, jobMinutes, estimatedUsd, churnRuns, churnMinutes, uncheckedHeads}];',
     '     unexcludable: what the numbers cannot tell apart. Rates (USD per minute, default linux 0.006, windows 0.010, macos 0.062) are overridden with --rate os=usd (os: linux | windows | macos).',
     '     Budget: --max-calls GitHub calls (one per page; the PRs\' reads stop at 60% of it so the biggest runs get their jobs read) and a stop when fewer than 1000 rate-limit calls are left (checked at the start and every 50 calls): `partial: true`',
@@ -69,9 +69,9 @@ export const run = guarded(async (argv, ctx) => {
     const warnings = [];
     let viewer = null;
     try {
-      viewer = gh.viewer(); // the converted_to_draft events of the pipeline are the viewer's: wasted redrafts count only those
+      viewer = gh.viewer(); // the converted_to_draft events of the pipeline are the viewer's: wasted redrafts count only those (without it they are null)
     } catch (err) {
-      warnings.push(`the viewer login could not be read (${asciiLine(err?.message, 100)}): wasted redrafts count a redraft by anyone`);
+      warnings.push(`the viewer login could not be read (${asciiLine(err?.message, 100)}): wasted redrafts are not counted (null), whose redraft it was cannot be told`);
     }
     const slugs = (values['repo-slug'] ?? []).length > 0 ? [...new Set(values['repo-slug'])] : [gh.repo().slug];
     const repos = slugs.map((slug) => readRepoUsage({ gh, slug, sinceMs, workflows: values.workflow ?? [], maxCalls, rates, viewer, warnings }));

@@ -233,7 +233,7 @@ test('R1-B6: the opening head of a PR opened ready is class "opening", not push-
   const pr = { createdAt: T('09:00'), draft: false };
   const runs = [longRun(sha('o'), T('09:00', 30), 5), longRun(sha('p'), T('09:30'), 5)];
   const jobsByRun = new Map(runs.map((r) => [r.id, [job(r.run_started_at, 5)]]));
-  const p = analysePrUsage({ number: 4, pr, timeline: [], commits: [], runs, jobsByRun });
+  const p = analysePrUsage({ number: 4, pr, timeline: [], commits: [commit('o'), commit('p')], runs, jobsByRun });
   assert.deepEqual(p.classified.map((x) => x.class), ['opening', 'push-while-ready']);
   assert.equal(p.pushesWhileReady, 1);
   const agg = aggregateUsage({ classified: p.classified, prRows: [p], isPrivate: true });
@@ -245,9 +245,9 @@ test('R1-B12: with sinceMs only the redrafts, ready cycles and catch-ups of the 
   const old = { ...caught, sha: sha('d'), commit: { message: 'm', committer: { date: T('08:00') } } };
   const recent = { ...caught, commit: { message: 'm', committer: { date: T('13:30') } } };
   const runs = [run(sha('2'), T('10:30'))];
-  const all = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [old, recent], runs, viewer: 'me' });
+  const all = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [old, recent, commit('2')], runs, viewer: 'me' });
   assert.deepEqual([all.readyCycles, all.wastedRedrafts, all.catchups], [2, 1, 2]);
-  const since = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [old, recent], runs, viewer: 'me', sinceMs: Date.parse(T('13:00')) });
+  const since = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [old, recent, commit('2')], runs, viewer: 'me', sinceMs: Date.parse(T('13:00')) });
   assert.deepEqual([since.readyCycles, since.wastedRedrafts, since.catchups], [0, 0, 1]);
   assert.equal(since.pushesWhileReady, 1, 'the phase at the run still comes from the whole timeline');
 });
@@ -291,7 +291,7 @@ test('aggregateUsage: private estimate with coverage and assumptions; public is 
     run(sha('6'), T('10:20'), { event: 'schedule' }), // tiny: not heavy
   ];
   const jobsByRun = new Map([[runs[0].id, [job(runs[0].run_started_at, 6), job(runs[0].run_started_at, 3.5, ['macos-latest'])]], [runs[2].id, [job(runs[2].run_started_at, 5)]]]);
-  const p = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs: runs.slice(0, 2), jobsByRun, viewer: 'me' });
+  const p = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3'), commit('4')], runs: runs.slice(0, 2), jobsByRun, viewer: 'me' });
   const classified = [...p.classified, ...classifyRuns({ runs: runs.slice(2), jobsByRun })];
   const priv = aggregateUsage({ classified, prRows: [p], isPrivate: true, draftWhileIterating: true });
   assert.equal(priv.billing, 'estimate-private');
@@ -323,7 +323,7 @@ test('aggregateUsage: private estimate with coverage and assumptions; public is 
 test('renderUsageTable: prints the PRs, the classes, the cost lines and the unexcludable note', () => {
   const runs = [longRun(sha('3'), T('10:30'), 10)];
   const jobsByRun = new Map([[runs[0].id, [job(runs[0].run_started_at, 6)]]]);
-  const p = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs, jobsByRun, viewer: 'me' });
+  const p = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3')], runs, jobsByRun, viewer: 'me' });
   const agg = aggregateUsage({ classified: p.classified, prRows: [p], isPrivate: true, draftWhileIterating: true });
   const { classified, ...row } = p;
   const text = renderUsageTable({ since: '2026-11-06', repos: [{ slug: 'acme/widgets', private: true, classifierVersion, partial: false, draftWhileIterating: true, prs: [row], calls: 5, rateLimit: { remaining: 4000 }, skipped: {}, unexcludable: ['a note'], ...agg }] });
@@ -353,11 +353,53 @@ test('analysePrUsage ambiguousHeads: a head that also has an unlinked run is lef
   // failure caught: a head whose first run may be the unlinked draft-era one reported as pushed while ready
   const runs = [run(sha('1'), T('09:30')), longRun(sha('3'), T('10:30'), 10)];
   const jobsByRun = new Map([[runs[1].id, [job(runs[1].run_started_at, 10)]]]);
-  const open = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs, jobsByRun });
+  const open = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3')], runs, jobsByRun });
   assert.deepEqual([open.pushesWhileReady, open.pushedHeads, open.uncheckedHeads], [1, [sha('3').slice(0, 12)], 0]);
-  const guarded = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs, jobsByRun, ambiguousHeads: [sha('3')] });
+  const guarded = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3')], runs, jobsByRun, ambiguousHeads: [sha('3')] });
   assert.deepEqual([guarded.pushesWhileReady, guarded.pushedHeads, guarded.uncheckedHeads], [0, [], 1]);
   assert.deepEqual([guarded.heavyRuns, guarded.jobMinutes.linux], [open.heavyRuns, open.jobMinutes.linux]);
   const agg = aggregateUsage({ classified: guarded.classified, prRows: [guarded], isPrivate: true, draftWhileIterating: true });
   assert.deepEqual([agg.totals.pushesWhileReady, agg.totals.missedRedrafts, agg.totals.uncheckedHeads], [0, 0, 1]);
+});
+
+test('PR #823 round 1 B3/F3/B5: a ready-phase head with no commit record, or whose commit predates the evidence window, is unchecked, not a push', () => {
+  // failure caught: a catch-up merge dropped by a force push (run still linked, commit gone) named as a missed redraft; a reopened old head counted as a new push
+  const runs = [run(sha('1'), T('09:30')), run(sha('3'), T('10:30'))];
+  const row = (commits, evidenceFromMs) => analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits, runs, evidenceFromMs });
+  const dated = (d) => commit('3', { commit: { message: 'work', committer: { date: d } } });
+  assert.deepEqual([row([commit('3')]).pushesWhileReady, row([commit('3')]).uncheckedHeads], [1, 0]);
+  assert.deepEqual([row([]).pushesWhileReady, row([]).uncheckedHeads], [0, 1], 'no commit record');
+  assert.deepEqual([row([dated(T('10:25'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('10:25'))], Date.parse(T('10:00'))).uncheckedHeads], [1, 0]);
+  assert.deepEqual([row([dated(T('08:00'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('08:00'))], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'older than the evidence window');
+  assert.deepEqual([row([commit('3')], Date.parse(T('10:00'))).pushesWhileReady, row([commit('3')], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'no commit date: not provable');
+});
+
+test('PR #823 round 1 B5: evidenceRuns (the runs of every workflow) say which run came first on a head, while the cost stays with the kept runs', () => {
+  // failure caught: --workflow cutting away the draft-era run of another workflow, so the kept run looks like the first of its head
+  const early = run(sha('3'), T('09:45'), { name: 'guards' });
+  const late = longRun(sha('3'), T('10:30'), 10);
+  const only = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3')], runs: [late] });
+  assert.deepEqual([only.pushesWhileReady, only.classified[0].class], [1, 'push-while-ready']);
+  const seen = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3')], runs: [late], evidenceRuns: [early, late] });
+  assert.deepEqual([seen.pushesWhileReady, seen.classified.length, seen.classified[0].class], [0, 1, 'other']);
+});
+
+test('PR #823 round 1 B6: a heavy linked run classed "other" (a reopen on an old head) stays in the linked heavy attribution', () => {
+  // failure caught: linked + unlinked heavy minutes not adding up to the pull_request heavy total
+  const first = run(sha('3'), T('09:30'));
+  const reopen = longRun(sha('3'), T('10:30'), 10);
+  const p = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3')], runs: [first, reopen] });
+  assert.equal(p.classified[1].class, 'other');
+  const { totals } = aggregateUsage({ classified: p.classified, prRows: [p], isPrivate: true });
+  assert.deepEqual([totals.attribution.linkedHeavyRuns, totals.attribution.linkedHeavyElapsedMin], [1, 10]);
+});
+
+test('PR #823 round 1 B9: a PR row with an unknown wasted-redraft count makes the total null, and the table says unknown', () => {
+  // failure caught: a null (viewer unknown) summed as 0 or printed as a number
+  const p = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [], runs: [], viewer: null });
+  const agg = aggregateUsage({ classified: [], prRows: [{ ...p, wastedRedrafts: null }], isPrivate: true });
+  assert.equal(agg.totals.wastedRedrafts, null);
+  const { classified, ...row } = p;
+  const text = renderUsageTable({ since: '2026-11-06', repos: [{ slug: 'acme/widgets', private: true, classifierVersion, partial: false, draftWhileIterating: true, prs: [{ ...row, wastedRedrafts: null }], calls: 1, rateLimit: null, skipped: {}, unexcludable: [], ...agg }] });
+  assert.match(text, /wasted redrafts unknown/);
 });
