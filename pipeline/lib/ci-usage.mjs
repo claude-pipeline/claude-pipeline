@@ -171,10 +171,10 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
     else if (run.conclusion === 'cancelled' && updated !== null && events.some((e) => e.to === 'draft' && updated - e.t >= 0 && updated - e.t <= WINDOW_MS)) cls = 'converted-cancel';
     else if (Number(run.run_attempt) > 1) cls = 'rerun';
     else if (isReadyRun(events, readyBy, created, run.head_sha)) cls = 'ready-for-review';
+    // a run created well after its head's first run is no push (a reopened PR, a converted_to_draft run on the old head), and no opening or catch-up suite either
+    else if (created !== null && created - (firstOf.get(run.head_sha)?.t ?? created) > WINDOW_MS) cls = 'other';
     else if (openingHeads.has(run.head_sha)) cls = 'opening';
     else if (catchups.has(run.head_sha)) cls = 'catch-up';
-    // a run created well after its head's first run is no push (a reopened PR, a converted_to_draft run on the old head)
-    else if (created !== null && created - (firstOf.get(run.head_sha)?.t ?? created) > WINDOW_MS) cls = 'other';
     else cls = prPhaseAt(timeline, pr, created) === 'ready' ? 'push-while-ready' : 'push-while-draft';
     const read = jobsByRun.has(run.id);
     const cost = read ? costOfJobs(jobsByRun.get(run.id), rates) : null;

@@ -203,3 +203,15 @@ test('review round 1 B5: two heads first seen in the same second: the opening he
   const b = run(sha('b'), T('09:00', 10)); // a fix pushed in the same second
   for (const runs of [[a, b], [b, a]]) assert.deepEqual(pushedWhileReady({ pr, timeline: [], commits: [], runs }).heads.map((h) => h.sha), [sha('b')]);
 });
+
+test('review round 2 B1: a reopen on the opening head or a catch-up head, long after its first run, is class "other", not another opening / catch-up', () => {
+  const pr = { createdAt: T('09:00'), draft: false };
+  // the PR opens on head o; it is reopened an hour later on the same head: charging that run to `opening` hides the reopen
+  const opening = [run(sha('o'), T('09:00', 30)), run(sha('o'), T('10:30'))];
+  assert.deepEqual(classifyRuns({ pr, timeline: [], commits: [], runs: opening }).map((x) => x.class), ['opening', 'other']);
+  // the same on an update-branch head
+  const merge = commit('m', { parents: [{ sha: 'a' }, { sha: 'b' }], committer: { login: 'web-flow' }, commit: { message: "Merge branch 'main' into feature" } });
+  const catchup = [run(sha('o'), T('09:00', 30)), run(sha('m'), T('09:30')), run(sha('m'), T('10:30'))];
+  assert.deepEqual(classifyRuns({ pr, timeline: [], commits: [merge], runs: catchup }).map((x) => x.class), ['opening', 'catch-up', 'other']);
+});
+
