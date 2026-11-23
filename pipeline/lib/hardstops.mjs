@@ -197,8 +197,8 @@ const PGTAP_MARKER = new RegExp(
     '\\b[a-z0-9_]+_(?:ok|eq|ne|are|is|isnt|like|unlike|has|hasnt|empty|returns|within|ilike|matching|imatching)"?\\s*\\(',
     '\\bcreate\\s+(?:or\\s+replace\\s+)?function\\s+(?:"?[a-z0-9_]+"?\\.)?"?(?:test|startup|setup|teardown|shutdown)[a-z0-9_]*"?\\s*\\(',
     '^\\uFEFF?[ \\t]*\\\\(?:i|ir|include|include_relative)[ \\t]+\\S',
-    // A statement that can fail the run (a DO-block privilege test: `raise exception`, PL/pgSQL `assert`) is a test even with no pgTAP call.
-    '\\braise\\s+exception\\b|\\bassert\\b',
+    // A statement that can fail the run (a DO-block privilege test: `raise exception`, a level-less `raise 'msg'` / `raise using` / `raise sqlstate`, which default to EXCEPTION; PL/pgSQL `assert`) is a test even with no pgTAP call. A notice/warning/info/log/debug raise does not fail it.
+    '\\braise\\b(?!\\s+(?:notice|warning|info|log|debug)\\b)|\\bassert\\b',
     // An entry point that only delegates to a routine (`select * from [schema.]routine(`, `select [schema.]routine(`; an unqualified `select count(`, `set_config(` or `has_*_privilege(` is a built-in, not a delegation), whatever its file name.
     '\\bselect\\s+\\*\\s+from\\s+(?:"?[a-z0-9_]+"?\\.)?"?[a-z0-9_]+"?\\s*\\(',
     '\\bselect\\s+(?:"?[a-z0-9_]+"?\\.\\s*"?[a-z0-9_]+"?|(?!(?:count|set_config|has_[a-z0-9_]*_privilege)"?\\s*\\()"?[a-z0-9_]+"?)\\s*\\(',

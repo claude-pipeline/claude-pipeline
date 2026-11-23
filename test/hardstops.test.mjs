@@ -934,18 +934,31 @@ test('IO: a helper using has_table_privilege() and set_config() is exempt when d
   assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(hits));
 });
 
-// Catches: a plain-SQL privilege test (DO block + RAISE EXCEPTION, no pgTAP call) losing R4 once set_config/has_*_privilege stopped counting as markers (R3-F1).
+// Catches: a plain-SQL privilege test (DO block + RAISE EXCEPTION, or a level-less RAISE that defaults to EXCEPTION, no pgTAP call) losing R4 once set_config/has_*_privilege stopped counting as markers (R3-F1, R4-B1).
 test('IO: deleting or moving a DO-block privilege test with an ordinary .sql name still trips R4', async () => {
-  const body = "select set_config('role', 'anon', true);\ndo $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise exception 'anon can read patients'; end if; end $$;\n";
-  const deleted = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
-    repo.rm('supabase/tests/anon_grants.sql');
-    repo.commit('delete do-block test');
+  const bodies = [
+    "select set_config('role', 'anon', true);\ndo $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise exception 'anon can read patients'; end if; end $$;\n",
+    "select set_config('role', 'anon', true);\ndo $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise 'anon can read patients'; end if; end $$;\n",
+    "do $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise using message = 'anon can read patients'; end if; end $$;\n",
+  ];
+  for (const body of bodies) {
+    const deleted = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
+      repo.rm('supabase/tests/anon_grants.sql');
+      repo.commit('delete do-block test');
+    });
+    assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), body + JSON.stringify(deleted));
+    const moved = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
+      repo.write('scripts/anon_grants.sql', body);
+      repo.rm('supabase/tests/anon_grants.sql');
+      repo.commit('move do-block test');
+    });
+    assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), body + JSON.stringify(moved));
+  }
+  // A notice-level RAISE does not fail the run: a helper that only logs stays exempt.
+  const logger = "do $$ begin raise notice 'seeding'; end $$;\n";
+  const exempt = await moveCollect({ 'supabase/tests/seed_log.sql': logger }, (repo) => {
+    repo.rm('supabase/tests/seed_log.sql');
+    repo.commit('delete logger');
   });
-  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
-  const moved = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
-    repo.write('scripts/anon_grants.sql', body);
-    repo.rm('supabase/tests/anon_grants.sql');
-    repo.commit('move do-block test');
-  });
-  assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
+  assert.deepEqual(exempt, [], JSON.stringify(exempt));
 });
