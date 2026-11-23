@@ -538,7 +538,7 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
     // The workflow runs of one check suite (their created_at tells a draft-era run from a ready-era one).
     workflowRunsOfSuite: (suiteId) => pagedList(`repos/${self.repo().slug}/actions/runs?check_suite_id=${encodeURIComponent(suiteId)}&per_page=100`, '.workflow_runs'),
 
-    // One workflow run by id (run_started_at, created_at, status): ci-wait dates a `Cross-model review` failure by when the run that posted it started.
+    // One workflow run by id (run_started_at, created_at, status): ci-wait dates a `Cross-model review` failure, and a passing status posted at/after ready, by when the run that posted it started.
     workflowRunOf: (id) => api('GET', `repos/${self.repo().slug}/actions/runs/${encodeURIComponent(id)}`),
 
     // The workflow runs of a head commit (status queued / in_progress / completed ..., created_at): ci-wait uses the unfinished ones created

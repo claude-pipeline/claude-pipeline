@@ -13,7 +13,7 @@ import { readClassicRequired } from '../lib/protection.mjs';
 
 export const meta = {
   summary: 'wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict',
-  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all] [--wait-others]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, on a PR with ci.e2e_label: [{name, status, url}] non-required checks still running or red), notOwed? (passed, or failed under --wait-all: ci.merge_checks names with no producer at all, not owed)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
+  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all] [--wait-others]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url, predatesReady? (true | null; true: a passing run or status dated before readyAt; null: the Actions run behind the status could not be read, unresolved; absent: not flagged; report only, the verdict is unchanged)}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, on a PR with ci.e2e_label: [{name, status, url}] non-required checks still running or red), notOwed? (passed, or failed under --wait-all: ci.merge_checks names with no producer at all, not owed)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
 };
 
 export const DEFAULT_APPEAR_SECONDS = 300;
@@ -60,7 +60,7 @@ export const run = guarded(async (argv, ctx) => {
     statuses: async (head) => gh.statusesOf(head),
     timeline: async () => gh.timelineOf(pr),
     reviewMarkers: async () => gh.listComments(pr), // the PR's issue comments (paginated); only read to date a `Cross-model review` failure
-    workflowRun: async (id) => gh.workflowRunOf(id), // one Actions run (run_started_at); only read to date a `Cross-model review` failure
+    workflowRun: async (id) => gh.workflowRunOf(id), // one Actions run (run_started_at); read to date a `Cross-model review` failure and a passing status posted at/after ready (an unreadable run reports predatesReady: null)
     suiteRuns: async (suiteId) => gh.workflowRunsOfSuite(suiteId),
     headRuns: async (head) => gh.workflowRunsOfHead(head), // no fallback: a gh without it must fail the read, not silently end the late-aggregate hold
   };
