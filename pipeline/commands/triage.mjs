@@ -14,7 +14,7 @@ import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requir
 import { Fail, guarded, requireConfig, resolveRepo, untrustedAnchorRefusal } from '../lib/cmd-common.mjs';
 import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
-import { GitError, git, headSha, isAncestor, isClean, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
+import { GitError, diffFiles, git, headSha, isAncestor, isClean, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { hashBranch, regressionOnlyFor } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
@@ -54,7 +54,7 @@ export const meta = {
     '  -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)',
     'pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd CMD --test-file FILE [--repo DIR]',
     '  -> the CLI runs CMD in the repo itself (free-text evidence is not accepted): bug-disproved needs exit 0, bug-confirmed needs a failing exit; FILE must be a committed, clean test file at HEAD named in CMD',
-    '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented',
+    '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented, or (error settle-head-moved, next `arbiter needed --pr N --round R --force`) when the tree differs from the round\'s reviewed head in a file that is not a test file, or a tracked file that is not a test file has uncommitted changes',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
     'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]',
@@ -267,6 +267,30 @@ function settleRefusal(item, id) {
   return null;
 }
 
+// A settle test runs in this checkout, so what it reads must be round R's reviewed code: refused (and the item goes to the arbiter, which rules on the recorded diff) when
+// (1) HEAD is another commit than R's reviewed head and the two trees differ in anything but test files (a direct two-tree diff: a HEAD that is not a descendant of the
+// reviewed head can lack its production change while the merge base shows only the test), or (2) a tracked file that is not a test file has staged or unstaged changes.
+const changedPaths = (args, root) => git(['diff', '--name-only', '--no-renames', '-z', ...args], { cwd: root }).split('\0').filter((p) => p !== '');
+
+function settleHeadMoved(root, config, round, id, pr) {
+  const globs = config.integrity?.test_globs ?? [];
+  const code = (args) => changedPaths(args, root).filter((p) => !matchAny(p, globs));
+  try {
+    if (typeof round.toHead === 'string' && headSha({ cwd: root }) !== round.toHead) {
+      const moved = code([revParse(round.toHead, { cwd: root }), 'HEAD', '--']);
+      if (moved.length > 0) return refusedSettle(id, round, pr, `production code changed after round ${round.n}'s reviewed head ${round.toHead.slice(0, 12)} (${moved.slice(0, 3).join(', ')})`);
+    }
+    const dirty = code(['HEAD', '--']);
+    if (dirty.length > 0) return refusedSettle(id, round, pr, `uncommitted change to a file that is not a test file (${dirty.slice(0, 3).join(', ')})`);
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+    return refusedSettle(id, round, pr, `the change from round ${round.n}'s reviewed head cannot be read`);
+  }
+  return null;
+}
+
+const refusedSettle = (id, round, pr, what) => ({ ok: false, error: 'settle-head-moved', id, round: round.n, reason: `${what}: a settle run cannot speak for round ${round.n}'s finding`, next: `arbiter needed --pr ${pr} --round ${round.n} --force` });
+
 // The pipeline runs the proving test itself; nothing the agent types is evidence. Throws Fail (exit 1) when the test
 // cannot be trusted as proof; otherwise returns what was run.
 async function runProvingTest({ root, config, result, cmd, file, id, round, env }) {
@@ -306,9 +330,12 @@ async function settle(rest, ctx) {
 
   // Check, then run the test WITHOUT the lock (it may take minutes), then check again and record under the lock.
   const preflight = await withStateLock(root, ctx, () => {
-    const { round, item } = findItem(requireState(root), id);
+    const state = requireState(root);
+    const { round, item } = findItem(state, id);
     const reason = settleRefusal(item, id);
-    return reason ? { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } } : { round: round.n };
+    if (reason) return { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } };
+    const moved = settleHeadMoved(root, config, round, id, state.pr);
+    return moved ? { exitCode: EXIT.FAILED, output: moved } : { round: round.n };
   });
   if (preflight.exitCode !== undefined) return preflight;
 
@@ -319,6 +346,10 @@ async function settle(rest, ctx) {
     const { round, item } = findItem(state, id);
     const reason = settleRefusal(item, id);
     if (reason) return { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason } };
+    // The test ran at proof.head: HEAD, or the files it read, may have changed during the run (it ran without the lock).
+    if (headSha({ cwd: root }) !== proof.head) return { exitCode: EXIT.FAILED, output: { ok: false, id, round: round.n, reason: `HEAD moved while the test ran (it ran at ${proof.head.slice(0, 12)}): nothing was recorded` } };
+    const moved = settleHeadMoved(root, config, round, id, state.pr);
+    if (moved) return { exitCode: EXIT.FAILED, output: moved };
     const settled = applyTestResult(item, result, proof.evidence, proof);
     saveState(root, updateItems(state, round.n, [settled]));
     return { exitCode: EXIT.OK, output: { ok: true, id, round: round.n, test: settled.test, final: settled.final } };

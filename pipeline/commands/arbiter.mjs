@@ -13,7 +13,7 @@ import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { CATEGORIES, categoryNotes, fingerprint, largeBinaryNote, normalizeFindingCategories, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
-import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, reviewPatch, showFile } from '../lib/git.mjs';
+import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, headSha, reviewPatch, revParse, showFile } from '../lib/git.mjs';
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
 import { BRIEFS, BRIEF_FIX_VERIFY, BRIEF_FULL, acceptedEfforts, countedOrdinal, expectationOf, fixRoundCandidate, fixRoundScope, postMaxSettings } from '../lib/fix-verify.mjs';
@@ -61,6 +61,7 @@ export const meta = {
     '    the stop is saved as round.arbiter.failure {cause, advice, at}',
     '  a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner\'s and Claude\'s rulings are kept; an item the arbiter no longer needs is settled by the judge again',
     '  mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none',
+    '  mode dispute, a round whose recorded toHead this clone does not have: exit 2 {ok:false, error: head-unavailable} before anything is written (the excerpts are read at that commit); fetch the commit, then run needed again',
     '  start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman',
     'pipeline arbiter apply --round R [--pr N] [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]',
     '  the proof is pinned to claude-fable- and to the round\'s STORED brief: agent `arbiter` at effort high (full; a round stored without a brief is full), agent `arbiter-fix` at effort medium or higher (fix-verify);',
@@ -110,24 +111,26 @@ function fence(text) {
   return '`'.repeat(Math.max(3, longest + 1));
 }
 
-function excerptBlock(item, root) {
+// The excerpt is read at the commit the round reviewed (round.toHead), so a HEAD that moved on after the round was recorded cannot show Fable code Codex never saw.
+function excerptBlock(item, root, rev = 'HEAD') {
   if (!item.file) return '_No file given._';
+  const at = rev === 'HEAD' ? 'HEAD' : `the reviewed head ${rev.slice(0, 12)}`;
   let content = null;
   try {
-    content = showFile('HEAD', item.file, { cwd: root });
+    content = showFile(rev, item.file, { cwd: root });
   } catch (err) {
     if (!(err instanceof GitError)) throw err;
   }
-  if (content === null) return `_${oneLine(item.file)} does not exist at HEAD._`;
+  if (content === null) return `_${oneLine(item.file)} does not exist at ${at}._`;
   const w = excerptWindow(content, item.line, { maxLines: 2 * 20 + 1 });
   if (!w) return `_No code at line ${item.line} of ${oneLine(item.file)}._`;
   const width = String(w.end).length;
   const body = w.lines.map((text, i) => `${String(w.start + i).padStart(width)} | ${text}`).join('\n');
   const f = fence(body);
-  return [`Code at HEAD, ${oneLine(item.file)} lines ${w.start}-${w.end}:`, '', `${f}`, body, f].join('\n');
+  return [`Code at ${at}, ${oneLine(item.file)} lines ${w.start}-${w.end}:`, '', `${f}`, body, f].join('\n');
 }
 
-function itemSection(item, root) {
+function itemSection(item, root, rev) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : '(no file)';
   const j = item.judge;
   const t = item.test ?? { status: 'none', evidence: '' };
@@ -152,7 +155,7 @@ function itemSection(item, root) {
     '',
     String(item.codexReasoning ?? '').trim(),
     '',
-    excerptBlock(item, root),
+    excerptBlock(item, root, rev),
     '',
   ].join('\n');
 }
@@ -480,6 +483,7 @@ async function neededLocked(values, n, root, ctx) {
   // A dispute round retries the same way (E8): an arbiter malfunction (model-proof failed, invalid output) is cleared so the item goes to the
   // arbiter again, while a judgement (low confidence, a security dismissal) and the owner's and Claude's finals stay. An item that no longer
   // needs the arbiter once its malfunction is gone is finalized again by the judge, so nothing is left pending without a way forward.
+  let clearedMalfunction = false;
   if (!review) {
     const isMalfunction = (item) => item.final?.by === 'arbiter' && item.final.needsHuman === true && !isOwnerRuled(item) && !isProtectedFinal(item)
       && MALFUNCTION_CAUSES.includes(needsHumanCause(item));
@@ -491,14 +495,26 @@ async function neededLocked(values, n, root, ctx) {
       const again = finalizeWithoutArbiter(cleared, { lightLane: state.lightLane, force: values.force === true || forceArbiter(ctx.env) });
       state = updateItems(state, n, again);
       round = findRound(state, n);
-      saveState(root, state);
+      clearedMalfunction = true; // saved with the retry metadata once the input is written (or on the nothing-to-rule-on return): a refused or failed retry writes nothing
     }
   }
 
   const force = review || values.force === true || forceArbiter(ctx.env);
   const items = round.items.filter((item) => arbiterNeeded(item, { lightLane: state.lightLane, force }));
-  if (!review && items.length === 0) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
+  if (!review && items.length === 0) {
+    if (clearedMalfunction) saveState(root, state);
+    return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
+  }
 
+  // The excerpts are read at the recorded toHead: a clone that lacks it must fail here, not tell the arbiter that a cited file does not exist (writeFableDiff fails loudly for a review round).
+  if (!review && typeof round.toHead === 'string') {
+    try {
+      revParse(`${round.toHead}^{commit}`, { cwd: root });
+    } catch (err) {
+      if (!(err instanceof GitError)) throw err;
+      throw new Fail(EXIT.USAGE, { ok: false, error: 'head-unavailable', message: `round ${round.n} was reviewed at ${round.toHead.slice(0, 12)}, which this clone does not have: fetch that commit, then run \`arbiter needed\` again` });
+    }
+  }
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
   // The files the Fable diff covers (shared by the threat-model lookup and chooseBrief); null when git cannot list them (no model is shown then, chooseBrief says why).
   let diffFileList = null;
@@ -509,14 +525,18 @@ async function neededLocked(values, n, root, ctx) {
   const tm = review ? await threatModelContext(round, diffFileList, items, root, forkPoint) : null;
   const { expectation, fix, reason: briefReason } = review ? await chooseBrief(state, round, diff, root, { forceFull: forcedFull, trusted: tm.config, ...(diffFileList === null ? {} : { files: diffFileList }) }) : { expectation: BRIEFS[BRIEF_FULL], fix: null, reason: null };
   const itemsPart = items.length > 0
-    ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root))]
+    ? [`# Items to rule on (${items.length})`, '', ...items.map((item) => itemSection(item, root, typeof round.toHead === 'string' ? round.toHead : 'HEAD'))]
     : ['# Items to rule on (0)', '', '_Codex raised nothing left to rule on in this round: your own review is the whole job._', ''];
   // The bar needs the merge-base view for the agent: without it (git cannot list the range) no bar is stated, and `apply` waives nothing.
   let regression = review ? tm.regression : null;
   if (regression) {
     try { regression = { ...regression, ...writeRegressionBase(round, root, regression) }; } catch { regression = null; }
   }
-  const body = [...(review ? [...(tm.section ? [tm.section.join('\n')] : []), ...(regression ? [regressionSection(regression).join('\n')] : []), reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
+  // The arbiter reads files in this checkout when it wants more context: after HEAD moved past the reviewed head they may hold later code than the round reviewed.
+  const moved = typeof round.toHead === 'string' && headSha({ cwd: root }) !== round.toHead
+    ? [`NOTE: the repository is checked out at a later commit than this round's reviewed head ${round.toHead.slice(0, 12)}; rule on the diff and excerpts given: a file read from the repository may hold later code, so do not rest a ruling on code that is in neither.`, '']
+    : [];
+  const body = [...moved, ...(review ? [...(tm.section ? [tm.section.join('\n')] : []), ...(regression ? [regressionSection(regression).join('\n')] : []), reviewSection(state, round, diff, fix), ''] : []), ...itemsPart].join('\n');
   const digest = sha256(body);
   const digest8 = digest.slice(0, 8);
   const tag = `pipeline-arbiter R${n} ${digest8}`;

@@ -733,3 +733,30 @@ test('arbiter apply: a stacked PR whose parent branch and working tree say follo
   const all = applyPastMax(t, 'follow-up', { parentPolicy: 'follow-up' });
   assert.equal(all.state().rounds[0].items.find((i) => i.id === 'R1-S1').final.decision, 'FOLLOW-UP', 'all three configs say follow-up');
 });
+
+// ---- a round finished after HEAD moved -------------------------------------------------------------------------------------------------------
+
+test('arbiter needed: the input says the checkout is at a later commit than the reviewed head only when HEAD moved past toHead', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  assertExit(w.needed(1), 0);
+  assert.doesNotMatch(w.inputText(1), /checked out at a later commit/);
+  w.repo.write('src/b.js', bFile(true));
+  w.repo.commit('moved');
+  assertExit(w.needed(1), 0);
+  const text = w.inputText(1);
+  assert.match(text, /checked out at a later commit than this round's reviewed head [0-9a-f]{12}/);
+  assert.ok(text.indexOf('checked out at a later commit') < text.indexOf('# Items to rule on'), 'near the top of the input');
+});
+
+test('arbiter needed: a round whose HEAD moved on before its Fable pass shows the code the round reviewed, not the moved HEAD (Fable ruling on code Codex never saw)', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([finding()])), 0);
+  w.repo.write('src/b.js', bFile(true));
+  w.repo.commit('moved');
+  const r = w.needed(1);
+  assertExit(r, 0, r.stdout + r.stderr);
+  const text = w.inputText(1);
+  assert.match(text, /export const w3 = 3;/);
+  assert.doesNotMatch(text, /normalise\(3\)/);
+});

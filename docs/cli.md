@@ -84,6 +84,7 @@ pipeline arbiter needed --round R [--pr N] [--force] [--full] [--repo DIR]
     the stop is saved as round.arbiter.failure {cause, advice, at}
   a retry clears an unproven or malformed ruling (model-proof / invalid-arbiter, in either mode) so the arbiter answers again; the owner's and Claude's rulings are kept; an item the arbiter no longer needs is settled by the judge again
   mode dispute (a judge round): only the items the dispute rules send; {needed:false} when there are none
+  mode dispute, a round whose recorded toHead this clone does not have: exit 2 {ok:false, error: head-unavailable} before anything is written (the excerpts are read at that commit); fetch the commit, then run needed again
   start the arbiter prompt with promptHeader, pasted verbatim (the two lines ROUND: / INPUT-DIGEST:): without them `arbiter apply` cannot prove the arbiter saw this input and marks every item needsHuman
 pipeline arbiter apply --round R [--pr N] [--tag TAG | --agent-id ID] [--projects-dir DIR] [--max-age-ms N] [--repo DIR]
   the proof is pinned to claude-fable- and to the round's STORED brief: agent `arbiter` at effort high (full; a round stored without a brief is full), agent `arbiter-fix` at effort medium or higher (fix-verify);
@@ -802,7 +803,7 @@ pipeline round codex --pr N --round R [--base B] [--head H] [--max-minutes M] [-
   the Codex run is the job codex-rR tagged <pr>:<R>:<base>:<head>: the same tag running is adopted (no second start), another tag running is exit 1 job-conflict
   the result is read from the job's whole stdout; when that is missing (an older runner) or was cut, and the state records round R, the report is built from the state, else {next:"job read"}
   a round already recorded picks up a job codex-rR only when its tag's base:head are the recorded round's fromHead:toHead (a job left by a discarded round is never used: exit 1 identity-mismatch);
-  a round that is ALREADY recorded in the state is only picked up from its finished or running job (no Codex run in this call): every JSON of that call carries pickedUp:true; the checked-out HEAD must still be the recorded toHead (an explicit --head is compared with the job's instead), else exit 1 head-moved-since-round {next:"round codex --pr N --round R+1"}: do not rerun round R, run round R+1
+  a round that is ALREADY recorded in the state is only picked up from its finished or running job (no Codex run in this call): every JSON of that call carries pickedUp:true; the checked-out HEAD must still be the recorded toHead (an explicit --head is compared with the job's instead), else exit 1 head-moved-since-round: do not rerun round R; next is `round codex --pr N --round R+1` only when round R is finished, else its finish step (`arbiter needed --pr N --round R` for a Fable round without a proven arbiter pass, or for judged items without a ruling; `triage light-lane --round R` on the light lane, else a judge-step pointer that is not a command, for items the judge has not seen; the arbiter reads the recorded range, not HEAD); a round no longer recorded at the job's range is exit 1 identity-mismatch
      a job that ended non-zero while the state already records round R at the job tag base:head (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON; a round recorded at another base:head (another writer, during the wait) leaves the job failure JSON as it is: never ok:true, never `arbiter needed`
      a job that exited 0 while the state records round R at another base:head (round discarded and recorded again during the wait) is exit 1 identity-mismatch with next `state show --pr N`: nothing reported, never `arbiter needed`
   the command exits early when the process that started it is gone (the job keeps running; rerun it)
@@ -987,7 +988,7 @@ pipeline triage validate --round R (--from-tag TAG | --file F) [--projects-dir D
   -> {ok, round, counts:{ACCEPT,FOLLOW-UP,REJECT}, settled, unsettled, judgeProof}; exit 1 + errors when the judge output is invalid (state untouched)
 pipeline triage settle --id ID --result bug-confirmed|bug-disproved --test-cmd CMD --test-file FILE [--repo DIR]
   -> the CLI runs CMD in the repo itself (free-text evidence is not accepted): bug-disproved needs exit 0, bug-confirmed needs a failing exit; FILE must be a committed, clean test file at HEAD named in CMD
-  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented
+  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented, or (error settle-head-moved, next `arbiter needed --pr N --round R --force`) when the tree differs from the round's reviewed head in a file that is not a test file, or a tracked file that is not a test file has uncommitted changes
   -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman
 pipeline triage light-lane --round R [--repo DIR]
 pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]
