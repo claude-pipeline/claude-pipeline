@@ -585,8 +585,10 @@ function variableHeadRefusal(words, state) {
 const PG_NAMES = ['psql', 'pg_dump', 'pg_restore', 'pg_dumpall', 'pgcli', 'usql', 'dropdb', 'createdb', 'vacuumdb', 'reindexdb', 'clusterdb', 'pgbench', 'pg_basebackup', 'pg_receivewal', 'createuser', 'dropuser', 'pg_amcheck', 'pg_recvlogical', 'pg_isready', 'vacuumlo', 'oid2name',
   'pg_upgrade', 'pg_ctl', 'pg_resetwal', 'pg_rewind', 'pg_controldata', 'pg_waldump', 'pg_verifybackup', 'pg_archivecleanup', 'pg_checksums', 'pg_test_fsync', 'pg_test_timing', 'pg_createsubscriber', 'pg_combinebackup', 'pg_walsummary', 'pg_ctlcluster', 'pg_lsclusters', 'pg_createcluster', 'pg_dropcluster', 'pg_upgradecluster', 'pg_conftool'];
 const PG_SET = new Set(PG_NAMES);
+// third-party clients without a `pg_` prefix: judged as a COMMAND word only (word 0, a launcher's operand), never in PG_TOKEN or PG_SET, so `git switch pgloader` and `rg pgbadger docs` stay plain operands
+const PG_CMD_ONLY = new Set(['pgloader', 'pgcenter', 'pgbadger', 'pgcopydb', 'pgbackrest']);
 // a family WORD (word 0 or a later word): psql, the always-refused tools and any other `pg_*` program but pg_config (some work offline; refusing them costs little)
-const pgWord = (w) => { const n = commandName(w); return PG_SET.has(n) || (n.startsWith('pg_') && n !== 'pg_config'); };
+const pgWord = (w) => { const n = commandName(w); return PG_SET.has(n) || PG_CMD_ONLY.has(n) || (n.startsWith('pg_') && n !== 'pg_config'); };
 // a family TOKEN in a line's text: the name as the LAST path component of a word (same shape as SB_TOKEN_SRC); `pg_class`, `psql_x`, `psql.md`, `@scope/psql-x` are not tokens
 const PG_TOKEN = new RegExp(String.raw`(?<![\w.@-])(?:${PG_NAMES.join('|')})(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`, 'i');
 const SDB_TEXT = /supabase_db_/i;
@@ -905,11 +907,14 @@ const uniqWrites = (args) => {
   return n > 1;
 };
 // a later word whose first token is a bare pg_* program name (`/usr/bin/pg_repack`, `pg_repack -h prod` inside `ssh host '…'`): never a name inside a word (`pg_class` in a SQL string) or a file with an extension
-const laterPgWord = (w) => { const t = String(w).trim().split(/\s+/)[0] ?? ''; return /^pg_[a-z0-9_]+$/i.test(commandName(t)) && pgWord(t); };
+// (the intact word is judged too: a quoted path with a space, `'/opt/Postgres Tools/pg_repack'`, has its program name after the last slash)
+const laterPgWord = (w) => { const s = String(w).trim(); return [s.split(/\s+/)[0] ?? '', s].some((t) => (/^pg_[a-z0-9_]+$/i.test(commandName(t)) || PG_CMD_ONLY.has(commandName(t))) && pgWord(t)); };
 // for a command that runs a program (`rg --pre=pg_repack`, `sort --compress-program=pg_repack`): the value attached to an option word is judged too
-const laterPgOpt = (w, runs) => laterPgWord(w) || (runs && /^--?[^=\s]+=/.test(String(w)) && laterPgWord(String(w).slice(String(w).indexOf('=') + 1)));
+const laterPgOpt = (w, runs) => laterPgWord(w) || (runs && /^[-+]-?[^=\s]+=/.test(String(w)) && laterPgWord(String(w).slice(String(w).indexOf('=') + 1)));
 // heads whose operands are data (git add / switch, mkdir, rm, gh …), but not find / make, which can run a word
-const dataOperands = (argv) => isDataWords(argv) && !['find', 'make'].includes(commandName(argv[0]));
+// (`gh codespace ssh -- pg_repack`, `gh extension exec …` run the words after them: no exemption there)
+const ghRuns = (argv) => commandName(argv[0]) === 'gh' && argv.some((w, i) => (w === 'ssh' && ['codespace', 'cs'].includes(argv[i - 1])) || (w === 'exec' && ['extension', 'ext'].includes(argv[i - 1])));
+const dataOperands = (argv) => isDataWords(argv) && !['find', 'make'].includes(commandName(argv[0])) && !ghRuns(argv);
 const pgDataOnly = (c, plain) => {
   if (!plain || runsProgram(c) || writesFile(c) || stdinFed(c) || Object.keys(c.env ?? {}).length) return false;
   const w = c.argv[0];
@@ -925,17 +930,19 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
   const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n')])].join('\n');
   // the text test misses a family program the parser unwrapped (a `pg_*` name that is not in the list, `timeout 30 pg_prove`): the command names are judged too
   // (a later word of a command that is not data-only is judged too, by its first token as a bare program name: `kubectl exec db -- /usr/bin/pg_repack -h x`, `ssh host 'pg_repack -h x'`; a file with an extension, `supabase/migrations/pg_cron.sql`, is no program name; a command whose operands are data, `git switch pg_repack`, `mkdir pg_dumps`, is skipped)
+  const feeds = reading.some((c) => stdinFed(c) && buildsProgram(c, () => true));
   const token = PG_TOKEN.test(seen) || reading.some((c) => {
     if (pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '')) return true;
     const runs = runsProgram(c); // once per command, not per word
-    return !pgDataOnly(c, true) && (runs || !dataOperands(c.argv)) && [...c.argv, ...typedWords(c)].some((w) => laterPgOpt(w, runs));
+    // (a data-only command that feeds a launcher built from stdin, `printf '%s\n' pg_repack | xargs -n1 env`, supplies the name the launcher runs: its words are judged too)
+    return (feeds || (!pgDataOnly(c, true) && (runs || !dataOperands(c.argv)))) && [...c.argv, ...typedWords(c)].some((w) => laterPgOpt(w, runs));
   });
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
   const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
   if (token) {
     if (cmds.dqTrans === true) return 'the line holds a `$"…"` string the parser reads untranslated, next to a psql family word';
-    if (reading.some((c) => stdinFed(c) && buildsProgram(c, () => true))) return '`xargs` / `parallel` builds a command from stdin and the line names a psql family program';
+    if (feeds) return '`xargs` / `parallel` builds a command from stdin and the line names a psql family program';
   }
   const infos = reading.map((c) => {
     const typed = typedWords(c);

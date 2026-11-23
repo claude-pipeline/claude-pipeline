@@ -351,6 +351,8 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     "rg -l 'psql|PGHOST' docs | uniq --skip-fields 1 -",
     'git add supabase/migrations/pg_cron.sql',
     'git switch pg_repack',
+    'rg -l pg_foo docs | xargs wc -l',
+    'git switch pgloader', 'rg pgbadger docs', 'gh issue create --title pg_repack',
     'git add db/pg_partman',
     'git checkout -b pg_cron_fix',
     'mkdir pg_dumps',
@@ -379,6 +381,11 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     'rg --pre=pg_repack x docs',
     'sort --compress-program=pg_repack f',
     'ack --pager=pg_repack x',
+    "printf '%s\\n' pg_repack | xargs -n1 env", // R7-B2: a data-only producer names the program a stdin launcher runs
+    'pgloader x.load', 'kubectl exec db -- pgloader x.load', // R7-B1: non-pg_ clients as a command word
+    'gh codespace ssh -- pg_repack', 'gh cs ssh -c x -- pg_dump db', 'gh extension exec pg_repack', 'gh ext exec pg_repack', // R7-B3: gh subcommands that run a program
+    'ack +pager=pg_repack needle', // R7-B4: ack's `+` option spelling
+    "kubectl exec db -- '/opt/Postgres Tools/pg_repack' --version", // R7-B5: a quoted path with a space
     'rg --pre=pg_autoctl x docs', 'rg --pre pg_autoctl x docs', 'sort --compress-program=pg_foo f', // an UNLISTED pg_* name as an executable-option value, both spellings
     `rg -n psql docs; ${P}`,
     `gh pr create --title t --body "$(PGHOST=db.x.supabase.co psql -c 'select 1')"`,
