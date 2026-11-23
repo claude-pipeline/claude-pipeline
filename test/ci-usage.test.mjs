@@ -239,6 +239,20 @@ test('R1-B2: two forks with a PR from the same branch name: an unlinked run goes
   assert.equal(r.json.warnings.length, 0, r.json.warnings.join('\n'));
 });
 
+test('R2-B1: two PRs open at once from the same head branch (different bases): an unlinked run cannot be told apart and stays unclassified, not given to the newest', () => {
+  const unlinked = RUNS.map((x) => ({ ...x, pull_requests: [] }));
+  const pulls = [{ match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [
+    { number: 9, created_at: T('09:30'), updated_at: T('13:00'), closed_at: null, head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+    { number: 7, created_at: T('09:00'), updated_at: T('13:00'), closed_at: null, head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+  ] }];
+  const r = usage(world({ runs: unlinked, extra: pulls }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.repos[0].prs.map((p) => p.pr), []);
+  assert.equal(r.json.repos[0].totals.byClass.unclassified.runs, 5, 'the five pull_request runs');
+  assert.ok(!r.fake.lines().some((l) => l.includes('pulls/9')), 'the newer PR was never read for them');
+  assert.equal(r.json.warnings.length, 0, r.json.warnings.join('\n'));
+});
+
 test('R1-B13: the optional PR-list lookup failing leaves the runs it was for unclassified and the report partial; it is not an exit 3', () => {
   const half = RUNS.map((x) => (x.id === 1003 ? { ...x, pull_requests: [] } : x));
   const down = [{ match: '^api repos/acme/widgets/pulls\\?state=all', code: 1, stderr: 'gh: HTTP 502' }];
@@ -260,6 +274,31 @@ test('R1-B7: a run re-run in under a minute still has its jobs read (the first a
   assert.ok(r.fake.lines().some((l) => l.includes('runs/2001/jobs')));
   assert.equal(Math.round(repo.totals.jobMinutes.linux * 10) / 10, 20.3);
   assert.deepEqual([repo.totals.byClass.rerun.heavyRuns, repo.totals.coverage], [1, 100]);
+});
+
+test('R2-B5: a short retry whose jobs could not be read is still a heavy run of unknown cost: coverage drops below 100', () => {
+  const retried = run(2001, { run_attempt: 2, created_at: T('10:30'), run_started_at: T('10:50'), updated_at: plus(T('10:50'), 1 / 3) });
+  const down = [{ match: '^api repos/acme/widgets/actions/runs/2001/jobs', code: 1, stderr: 'gh: HTTP 502' }];
+  const r = usage(world({ runs: [retried], extra: down }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const repo = r.json.repos[0];
+  assert.deepEqual([repo.totals.heavyRuns, repo.totals.coverage, repo.partial], [1, 0, true]);
+});
+
+test('R2-B3: a jobs list cut by the page limit makes the report partial', () => {
+  const many = Array.from({ length: 100 }, () => job(T('10:30'), 0.01));
+  const cut = [{ match: '^api repos/acme/widgets/actions/runs/1003/jobs', stdoutJson: { total_count: 5000, jobs: many } }];
+  const r = usage(world({ extra: cut }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(r.json.warnings.join('\n'), /run 1003: the jobs were cut after/);
+  assert.equal(r.json.repos[0].partial, true);
+});
+
+test('R2-B4: with the viewer unknown the warning says the review-complete comment of any author is accepted too', () => {
+  const noViewer = world().map((e) => (e.match === '^api user' ? { match: e.match, code: 1, stderr: 'gh: HTTP 502' } : e));
+  const r = usage(noViewer, ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(r.json.warnings.join('\n'), /the viewer login could not be read.*review-complete comment by anyone/);
 });
 
 test('R1-B10: a failed comments read is a warning, a partial report and an unknown (null, not 0) final catch-up total', () => {

@@ -15,9 +15,9 @@ export const meta = {
     '  -> {ok, classifierVersion, since, repos: [{slug, private, billing (free-public | estimate-private), draftWhileIterating (true | false | "unknown"), since, partial, calls, rateLimit, skipped {prs, jobs}, totals, assumptions, prs, unexcludable}], warnings}:',
     '     the workflow runs created since the date (default 7d: `Nd` = now minus N x 24 h, or a UTC midnight YYYY-MM-DD; anything else exits 2) in each --repo-slug (default: the repository gh resolves from the current directory),',
     '     optionally only the --workflow NAME(s) (a name, a path or a file name). Every PR with a run of a minute or more has its timeline and commits read, and every such run its jobs (`actions/runs/{id}/jobs?filter=all`, every attempt).',
-    '     totals {prs, heavyRuns (jobs add up to >= 1 min; with the jobs unread, the run lasted >= 1 min), workflowElapsedMin (measured: run updated_at - run_started_at), jobMinutes {linux, windows, macos, self-hosted} (the sum of the job durations),',
+    '     totals {prs, heavyRuns (jobs add up to >= 1 min; with the jobs unread, the run lasted >= 1 min or was re-run), workflowElapsedMin (measured: run updated_at - run_started_at), jobMinutes {linux, windows, macos, self-hosted} (the sum of the job durations),',
     '     estimatedUsd (ESTIMATE: each job rounded up to a whole minute x the rate of its OS, self-hosted 0; a public repository is free-public and 0), coverage (% of the heavy runs whose jobs were read), byClass, byEvent, pushesWhileReady,',
-    '     missedRedrafts (= pushesWhileReady when the repository\'s .claude/pipeline.yml has ci.draft_while_iterating: true, 0 when false, null when it could not be read), wastedRedrafts, catchupsPerPr, churnRuns, churnMinutes, finalCatchupReruns (heavy runs on a catch-up head after the viewer\'s last unedited review-complete comment; null when a PR that needed its comments could not have them read, which also sets `partial`)};',
+    '     missedRedrafts (= pushesWhileReady when the repository\'s .claude/pipeline.yml has ci.draft_while_iterating: true, 0 when false, null when it could not be read), wastedRedrafts, catchupsPerPr, churnRuns, churnMinutes, finalCatchupReruns (heavy runs on a catch-up head after the viewer\'s last unedited review-complete comment (a comment by any author when the viewer is unknown: warned); null when a PR that needed its comments could not have them read, which also sets `partial`)};',
     '     class of a run: ready-for-review | opening (the head the PR was opened with) | push-while-ready | push-while-draft | converted-cancel | catch-up | rerun | other (not a pull_request run, by event in byEvent) | unclassified (its PR was not read);',
     '     prs [{pr, readyCycles, pushesWhileReady, pushedHeads, pushesWhileDraft, wastedRedrafts, catchups, heavyRuns, workflowElapsedMin, jobMinutes, estimatedUsd, churnRuns, churnMinutes, finalCatchupReruns}];',
     '     unexcludable: what the numbers cannot tell apart. Rates (USD per minute, default linux 0.008, windows 0.016, macos 0.08) are overridden with --rate os=usd (os: linux | windows | macos).',
@@ -71,7 +71,7 @@ export const run = guarded(async (argv, ctx) => {
     try {
       viewer = gh.viewer(); // the converted_to_draft events of the pipeline are the viewer's: wasted redrafts count only those
     } catch (err) {
-      warnings.push(`the viewer login could not be read (${asciiLine(err?.message, 100)}): wasted redrafts count a redraft by anyone`);
+      warnings.push(`the viewer login could not be read (${asciiLine(err?.message, 100)}): wasted redrafts count a redraft by anyone, and a review-complete comment by anyone sets the cutoff of finalCatchupReruns`);
     }
     const slugs = (values['repo-slug'] ?? []).length > 0 ? [...new Set(values['repo-slug'])] : [gh.repo().slug];
     const repos = slugs.map((slug) => readRepoUsage({ gh, slug, sinceMs, workflows: values.workflow ?? [], maxCalls, rates, viewer, warnings }));

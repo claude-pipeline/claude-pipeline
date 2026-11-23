@@ -190,6 +190,9 @@ test("R1-B5: a catch-up is a merge of the PR's BASE branch (update-branch, or a 
   assert.equal(isCatchUpCommit(merge("Merge remote-tracking branch 'origin/release/1' into topic", 'me'), 'release/1'), true);
   assert.equal(isCatchUpCommit(merge("Merge remote-tracking branch 'origin/feature-x' into topic", 'me'), 'main'), false);
   assert.equal(isCatchUpCommit(merge("Merge remote-tracking branch 'origin/main' into topic", 'me')), true, 'no base known: any merge of a branch');
+  assert.equal(isCatchUpCommit(merge("Merge branch 'main' of github.com:acme/widgets into topic", 'me'), 'main'), true, 'R2-F1: git pull origin main');
+  assert.equal(isCatchUpCommit(merge("Merge branch 'owner:main' into topic"), 'main'), true, 'R2-F1: update-branch on a fork PR');
+  assert.equal(isCatchUpCommit(merge("Merge branch 'owner:feature-x' of https://github.com/owner/widgets into topic", 'me'), 'main'), false, 'R2-F1: still the base only');
   // the head of a feature merge pushed while ready is a push, not a catch-up
   const pr = { ...PR_DRAFT, baseRef: 'main' };
   const commits = [{ ...commit('c'), parents: [{}, {}], committer: { login: 'web-flow' }, commit: { message: "Merge branch 'feature-x' into topic" } }];

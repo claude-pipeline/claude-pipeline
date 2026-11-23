@@ -59,9 +59,10 @@ const prNumberOf = (run, byBranch) => {
   if (Number.isInteger(n)) return n;
   const key = branchKey(run.head_repository?.full_name, run.head_branch);
   const created = Date.parse(run.created_at);
-  // the newest PR of that repository and branch created before the run; two created at the same instant cannot be told apart: unattributed
+  // the newest PR of that repository and branch created before the run; if an older one was still open then (or two were created at the same instant) the run cannot be told apart: unattributed.
+  // An older one already closed (a reused branch name) is no ambiguity.
   const list = (key === null ? [] : byBranch?.get(key) ?? []).filter((p) => Date.parse(p.created_at) <= created).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
-  if (list.length > 1 && list[0].created_at === list[1].created_at) return null;
+  if (list.length > 1 && (list[0].created_at === list[1].created_at || list.slice(1).some((p) => !(Date.parse(p.closed_at) <= created)))) return null;
   return list[0]?.number ?? null;
 };
 
@@ -94,7 +95,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const isPrivate = repo?.private === true;
   const draftWhileIterating = readDraftFlag(gh, slug, budget, warnings);
   let totalCount = null;
-  let truncated = false; // the list of runs is known to be short: the report is partial
+  let truncated = false; // a list was cut or capped (runs, PRs, timeline, commits, comments, jobs): the report is partial
   const listed = pages(gh, `repos/${slug}/actions/runs?created=${encodeURIComponent(`>=${sinceIso}`)}`, undefined,
     () => { truncated = true; warn(`the list of workflow runs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} runs): runs further back are missing, so the totals are short (use a later --since)`); },
     { key: 'workflow_runs', onCall: () => budget.count(), onPage: (r) => { totalCount ??= Number.isFinite(r?.total_count) ? r.total_count : null; } });
@@ -114,7 +115,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   if (needsBranchLookup) {
     try {
       const list = pages(gh, `repos/${slug}/pulls?state=all&sort=updated&direction=desc`, (l) => l.every((p) => String(p.updated_at ?? '') < sinceIso),
-        () => warn(`the list of PRs was cut after ${MAX_PAGES} pages: runs on a PR from a fork or without a PR link may stay unclassified`), { onCall: () => budget.tick() });
+        () => { truncated = true; warn(`the list of PRs was cut after ${MAX_PAGES} pages: runs on a PR from a fork or without a PR link may stay unclassified`); }, { onCall: () => budget.tick() });
       byBranch = new Map();
       for (const p of list) {
         const key = branchKey(p.head?.repo?.full_name, p.head?.ref);
@@ -143,7 +144,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   // per PR with at least one heavy-candidate run, the biggest first: the PR itself, its timeline, its commits (and its comments, only when a catch-up head has heavy runs)
   const readPr = new Map();
   const order = [...prGroups.entries()].filter(([, g]) => g.candidateMs > 0).sort((a, b) => b[1].candidateMs - a[1].candidateMs);
-  const cut = (what, n) => () => warn(`#${n}: the ${what} were cut after ${MAX_PAGES} pages: the classification of this PR may be short`);
+  const cut = (what, n) => () => { truncated = true; warn(`#${n}: the ${what} were cut after ${MAX_PAGES} pages: the classification of this PR may be short`); };
   for (const [n] of order) {
     try {
       budget.tick(maxCalls * PR_SHARE);
@@ -166,7 +167,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   for (const run of bySize) {
     try {
       const jobs = pages(gh, `repos/${slug}/actions/runs/${encodeURIComponent(run.id)}/jobs?filter=all`, undefined,
-        () => warn(`run ${run.id}: the jobs were cut after ${MAX_PAGES} pages`), { key: 'jobs', onCall: () => budget.tick() });
+        () => { truncated = true; warn(`run ${run.id}: the jobs were cut after ${MAX_PAGES} pages: its job minutes are short`); }, { key: 'jobs', onCall: () => budget.tick() });
       jobsByRun.set(run.id, jobs);
     } catch (err) {
       if (err instanceof budget.stop) break;
@@ -207,7 +208,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   if (budget.reason === 'rate-limit') warn(`the rate limit is low (${budget.rate?.remaining} calls left, stopping below ${MIN_REMAINING}): the report is partial`);
   if (budget.reason === 'max-calls') warn(`--max-calls ${maxCalls} reached: the report is partial`);
   if (skipped.prs > 0) warn(`${skipped.prs} PR(s) with heavy runs were not read: their runs are unclassified`);
-  if (skipped.jobs > 0) warn(`${skipped.jobs} run(s) of a minute or more had their jobs unread: job minutes and the estimate cover ${agg.totals.coverage}% of the heavy runs`);
+  if (skipped.jobs > 0) warn(`${skipped.jobs} run(s) of a minute or more, or re-run, had their jobs unread: job minutes and the estimate cover ${agg.totals.coverage}% of the heavy runs`);
   return {
     slug, private: isPrivate, billing: agg.billing, draftWhileIterating, classifierVersion, since: sinceIso, partial, calls: budget.calls, rateLimit: budget.rate, skipped,
     runsListed: listed.length, runsRead: runs.length,

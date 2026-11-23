@@ -69,10 +69,11 @@ export function prPhaseAt(timeline, prCreated, t) {
 // PR branch: two parents, committed by GitHub itself (login `web-flow`), message "Merge branch '<base>' into <head-branch>". A local merge writes the same message
 // ("Merge branch '<base>' into ..." or "Merge remote-tracking branch 'origin/<base>' into ..."): the same base churn. With the PR's base known (`baseRef`) the merged
 // branch must BE the base (a merge of a feature branch is a push, whoever committed it); with it unknown any merge of a branch counts, or any web-flow merge.
-const MERGE_MESSAGE = /^Merge (remote-tracking )?branch '([^'\n]+)' into \S+/;
+// git pull adds " of <url>" after the name; GitHub's update-branch on a fork PR may name the base "owner:<base>".
+const MERGE_MESSAGE = /^Merge (remote-tracking )?branch '([^'\n]+)'(?: of \S+)? into \S+/;
 const mergedBranch = (message) => {
   const m = MERGE_MESSAGE.exec(String(message).split('\n')[0]);
-  return m === null ? null : (m[1] ? m[2].replace(/^[^/]+\//, '') : m[2]);
+  return m === null ? null : (m[1] ? m[2].replace(/^[^/]+\//, '') : m[2].replace(/^[^:/]+:/, ''));
 };
 export function normalizeCommit(c) {
   const parents = typeof c?.parents === 'number' ? c.parents : Array.isArray(c?.parents) ? c.parents.length : 0;
@@ -168,7 +169,8 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
     const cost = read ? costOfJobs(jobsByRun.get(run.id), rates) : null;
     const jobMinutes = cost ? sumMinutes(cost.minutes) : null;
     const elapsed = elapsedMs(run);
-    const heavy = read ? jobMinutes >= HEAVY_JOB_MINUTES : elapsed >= HEAVY_ELAPSED_MS;
+    // unread: the last attempt's time says nothing about the earlier attempts of a re-run, so a re-run is heavy (of unknown cost)
+    const heavy = read ? jobMinutes >= HEAVY_JOB_MINUTES : elapsed >= HEAVY_ELAPSED_MS || Number(run.run_attempt) > 1;
     return {
       id: run.id, name: run.name ?? null, event: run.event, class: cls, headSha: run.head_sha ?? null, createdAt: run.created_at ?? null,
       catchupHead: catchups.has(run.head_sha), elapsedMin: elapsed / 60_000, jobsRead: read, jobMinutes: cost ? cost.minutes : null, rerunJobMinutes: cost ? cost.rerunMinutes : 0,
