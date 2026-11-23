@@ -905,7 +905,7 @@ test('IO: deleting or moving a marker-free delegating entry point with an ordina
 
 // Catches: a UTF-8 byte-order mark in front of an include-only suite file hiding the psql include, so deleting it loses R4 (R2-B2).
 test('IO: deleting a BOM-prefixed include-only file still trips R4', async () => {
-  const hits = await moveCollect({ 'supabase/tests/0150_cases.sql': "﻿\\ir tenant_cases.sql\n" }, (repo) => {
+  const hits = await moveCollect({ 'supabase/tests/0150_cases.sql': "\uFEFF\\ir tenant_cases.sql\n" }, (repo) => {
     repo.rm('supabase/tests/0150_cases.sql');
     repo.commit('delete bom include');
   });
