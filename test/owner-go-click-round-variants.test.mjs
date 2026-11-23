@@ -4,12 +4,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { appendFileSync, mkdtempSync, readFileSync, readdirSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
+import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, unlinkSync, utimesSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { claimGrantMarkers, grantIdOf, ownerGrantLookups, ownerGrantedRounds, verifyOwnerGrant } from '../pipeline/hooks/lib/owner-go.mjs';
-import { CAPTURE_SKEW_MS, HUMAN_DECISION, ROUND_VARIANT_IDS, asksDir, clickNotes, clickProvenance, dialogSha256, followUpClickState, issueAsk, mergeAsk, mergeManyAsk, readAsk, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
-import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { CAPTURE_SKEW_MS, HUMAN_DECISION, ROUND_VARIANT_IDS, RULING_VARIANT_IDS, RULING_WHY, asksDir, clickNotes, clickProvenance, dialogSha256, followUpClickState, issueAsk, mergeAsk, mergeManyAsk, readAsk, roundAsk, rulingAsk, rulingWhyRow, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { mergeRequest, roundRequest, rulingRequest, rulingRequestWithRow } from './helpers/owner-go.mjs';
 import { HEAD, ITEMS, REPO, world } from './helpers/click-world.mjs';
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
 import { STATE_VERSION_CLICK_DIALOG, SUPPORTED_STATE_VERSION, requiredStateVersion, withStateVersion } from '../pipeline/lib/state.mjs';
@@ -596,7 +596,7 @@ const RULING_LINE = rulingRequest(58, RULING_IDS, REPO, 'c0ffee000000');
 const RULING_ASK_ID = 'ask-000000000000';
 const LEGACY_RULING_DIALOG_SHA256 = 'e9eaa8e744f7702276a2ce6ceb38b0676380b023fc7b922d1da64734a89bfcd6'; // canonical dialog with the fixed ask id above
 const LEGACY_RULING_ASK_FILE = '{"v":1,"askId":"ask-000000000000","kind":"ruling","repo":"acme/app","prs":[58],"dialog":{"question":"Your ruling on #58? (ask-000000000000)\\n\\nR1-B1 is waiting for your decision.\\n⚖️ Owner ruling needed #58: R1-B1, R1-B2 · content c0ffee000000 · repo acme/app","header":"Ruling","multiSelect":false,"options":[{"label":"Not now","description":"Rule on nothing now. Nothing is recorded."},{"label":"Accept all","description":"Accept every item asked (R1-B1, R1-B2)."},{"label":"Follow-up all","description":"Move every item asked (R1-B1, R1-B2) to a follow-up."},{"label":"Reject all","description":"Reject every item asked (R1-B1, R1-B2)."}]},"dialogSha256":"e9eaa8e744f7702276a2ce6ceb38b0676380b023fc7b922d1da64734a89bfcd6","actions":{"Not now":null,"Accept all":"R1-B1: accept, R1-B2: accept","Follow-up all":"R1-B1: follow-up, R1-B2: follow-up","Reject all":"R1-B1: reject, R1-B2: reject"},"issuedAt":"2023-11-14T22:13:20.000Z","hookLayersSha256":null}\n';
-const rulingParts = (variant) => rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line: RULING_LINE, variant });
+const rulingParts = (variant, line = RULING_LINE) => rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line, variant });
 
 test('the legacy ruling dialog is byte-identical to the one shipped before the variants: its canonical dialog hash and the ask file issueAsk writes match literals captured at 4bcf5647', () => {
   // failure caught: a refactor that drifts a legacy ruling label, description, action or ask-file key (every ruling ask issued before the upgrade would then fail to verify, or a click would map to another ruling)
@@ -611,4 +611,60 @@ test('the legacy ruling dialog is byte-identical to the one shipped before the v
   // the ask id and the hash that covers it are random per ask: normalise both, everything else is literal
   const normal = raw.split(r.askId).join(RULING_ASK_ID).replace(file.dialogSha256, LEGACY_RULING_DIALOG_SHA256);
   assert.equal(normal, LEGACY_RULING_ASK_FILE);
+});
+
+const RULING_ROW = { 'ruling-v2-accept': rulingWhyRow('accept', 'real-problem'), 'ruling-v2-follow-up': rulingWhyRow('follow-up', 'minor-later') };
+const rulingLine = (variant) => (variant === 'ruling-v1' ? RULING_LINE : rulingRequestWithRow(RULING_ROW[variant], 58, RULING_IDS, REPO, 'c0ffee000000'));
+const rulingPartsOf = (variant) => rulingParts(variant === 'ruling-v1' ? undefined : variant, rulingLine(variant));
+const RULING_PINNED = {
+  'ruling-v1': 'b4e2d35737d8c4a2742751ffae7b555db8b4a73877dc7ec29c6b43f39c39d116',
+  'ruling-v2-accept': 'a3aaf7a1585f55fe1b439881a04e25ca56029c3ed28b31272c37bc3afc6dd162',
+  'ruling-v2-follow-up': 'bf87969a573aaad2d15613144f195a725144a0a875f124dfaab884f2763c3f76',
+};
+const RULING_WHY_PINNED = '0f9554f4100d61cdc9c24b6fb7ed8067eafa986847d7c293954bd8f3b9fd312f';
+
+test('the ruling variants are immutable and shaped as the plan says: a pinned sha256 per id, the recommended option first, never Reject, Not now last and declining in every v2', () => {
+  // failure caught: a reworded label / description / answer under a ruling id that asks already carry, a recommended label that is not first, or a Reject that is recommended (every Reject is a critical dismissal)
+  assert.deepEqual(RULING_VARIANT_IDS, ['ruling-v1', 'ruling-v2-accept', 'ruling-v2-follow-up']);
+  const got = Object.fromEntries(RULING_VARIANT_IDS.map((id) => { const p = rulingPartsOf(id); return [id, sha(JSON.stringify({ header: p.header, options: p.options, actions: p.actions }))]; }));
+  assert.deepEqual(got, RULING_PINNED);
+  assert.equal(sha(JSON.stringify(RULING_WHY)), RULING_WHY_PINNED, 'the shipped recommendation texts are never edited: a different text is a new code');
+  assert.equal(new Set(Object.values(got)).size, RULING_VARIANT_IDS.length);
+  const legacy = rulingPartsOf('ruling-v1');
+  assert.equal(Object.hasOwn(legacy, 'variant'), false);
+  assert.deepEqual(legacy.options.map((o) => o.label), ['Not now', 'Accept all', 'Follow-up all', 'Reject all']);
+  for (const id of RULING_VARIANT_IDS.filter((x) => x !== 'ruling-v1')) {
+    const p = rulingPartsOf(id);
+    assert.equal(p.variant, id);
+    assert.equal(p.options.filter((o) => o.label.endsWith('(Recommended)')).length, 1);
+    assert.match(p.options[0].label, / \(Recommended\)$/);
+    assert.equal(p.options.at(-1).label, 'Not now');
+    assert.ok(!p.options.some((o) => /^Reject all.*Recommended/.test(o.label)));
+    // every deciding label maps to exactly the typed answer the legacy label of the same decision maps to, for both ids; Not now declines
+    const plain = (label) => label.replace(' (Recommended)', '');
+    for (const o of p.options) assert.equal(p.actions[o.label], legacy.actions[plain(o.label)], o.label);
+    assert.equal(p.actions['Not now'], null);
+    assert.deepEqual(p.options.map((o) => o.description).sort(), legacy.options.map((o) => o.description).sort(), 'only the label gains the suffix');
+  }
+  assert.equal(rulingPartsOf('ruling-v2-accept').actions['Accept all (Recommended)'], 'R1-B1: accept, R1-B2: accept');
+  assert.equal(rulingPartsOf('ruling-v2-follow-up').actions['Follow-up all (Recommended)'], 'R1-B1: follow-up, R1-B2: follow-up');
+});
+
+test('rulingAsk: an unknown variant id (or a non-string, or a round id) builds nothing', () => {
+  // failure caught: an ask naming an id this install does not know being built as some default dialog
+  for (const bad of ['ruling-v3', 'RULING-V1', 'ruling-v2-reject', 'round-v1', '', null, 1, {}, '__proto__', 'constructor']) assert.equal(rulingParts(bad, RULING_LINE), null, String(bad));
+});
+
+test('a ruling ask issued by the code before the variants (the literal from 4bcf5647) still verifies as the owner would see it', () => {
+  // failure caught: a change to the ask schema or the ruling verifier that makes every ruling ask issued before `pipeline update` invalid
+  const home = tmpHome();
+  mkdirSync(asksDir(home), { recursive: true });
+  const askId = 'ask-0123456789ab';
+  const text = LEGACY_RULING_ASK_FILE.split(RULING_ASK_ID).join(askId);
+  const file = JSON.parse(text);
+  file.dialogSha256 = dialogSha256(file.dialog); // (the literal's hash covers the placeholder id)
+  writeFileSync(join(asksDir(home), `${askId}.json`), `${JSON.stringify(file)}\n`);
+  const r = readAsk(askId, { home });
+  assert.equal(r.ok, true, JSON.stringify(r));
+  assert.equal(r.ask.v, 1);
 });

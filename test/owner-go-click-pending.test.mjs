@@ -13,10 +13,10 @@ import {
   MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantLookups, ownerGrantedRounds, ownerRuled, readApprovals, readGrantMarker, readRecords, recordRoundGrant, roundTicketKey,
   settleEnabled, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
-import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickNotes, clickProvenance, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickNotes, clickProvenance, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk, rulingWhyRow, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { OWNER_GO_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
 import { deferEligibility } from '../pipeline/lib/triage.mjs';
-import { OWNER_ENTRY, cleanupRoundClaims, linesOf, mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, cleanupRoundClaims, linesOf, mergeRequest, roundRequest, rulingRequest, rulingRequestWithRow } from './helpers/owner-go.mjs';
 
 const REPO = 'acme/app';
 const HEAD = '0123456789abcdef0123456789abcdef01234567';
@@ -34,6 +34,7 @@ const PARTS = {
   merge: (pr = 58) => mergeAsk({ repo: REPO, pr, closing: mergeRequest(pr, HEAD, ITEMS, REPO) }),
   round: () => roundAsk({ repo: REPO, pr: 58, line: roundRequest(58, 4, GHEAD, REPO) }),
   ruling: () => rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1', 'R2-S3'], line: rulingRequest(58, ['R1-B1', 'R2-S3'], REPO, 'c0ffee000000') }),
+  'ruling-v2': () => rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1', 'R2-S3'], line: rulingRequestWithRow(rulingWhyRow('accept', 'real-problem'), 58, ['R1-B1', 'R2-S3'], REPO, 'c0ffee000000'), variant: 'ruling-v2-accept' }),
   many: () => mergeManyAsk({ repo: REPO, entries: [58, 59].map((n) => ({ pr: n, lines: [`#${n} head ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}`] })), ready: '🔀 Ready to merge #58, #59 — say "merge"' }),
 };
 
@@ -138,6 +139,18 @@ test('the pending marker carries the hook fingerprint the hook check returned, a
   const r = await w.hook({ hookCheck: () => ({ ok: true, hookLayersSha256: fp }) });
   assert.deepEqual(r.pending, { ...w.expectedPending, quotes: { 'Accept all': 'R1-B1: accept, R2-S3: accept', 'Follow-up all': 'R1-B1: follow-up, R2-S3: follow-up', 'Reject all': 'R1-B1: reject, R2-S3: reject' } });
   assert.equal(JSON.parse(readFileSync(w.pendingFile(), 'utf8')).hookLayersSha256, fp);
+});
+
+test('a pending click on a v2 ruling ask names the quote of each deciding label (the recommended one too) and settles through ownerRuled like a v1 one', async (t) => {
+  // failure caught: the pending path dropping the variant, so a click on "Accept all (Recommended)" is captured with no quote or settles as ask-invalid and the ruling is never recorded
+  const w = pw(t, { kind: 'ruling-v2', answer: 'Accept all (Recommended)' });
+  const r = await w.hook();
+  assert.deepEqual(r.pending, { ...w.expectedPending, variant: 'ruling-v2-accept', quotes: { 'Accept all (Recommended)': 'R1-B1: accept, R2-S3: accept', 'Follow-up all': 'R1-B1: follow-up, R2-S3: follow-up', 'Reject all': 'R1-B1: reject, R2-S3: reject' } });
+  w.flush();
+  assert.equal(w.settle().outcomes[0]?.outcome, 'recorded');
+  const q = { repo: REPO, pr: 58, quote: 'R1-B1: accept, R2-S3: accept', decision: 'ACCEPT', contentOf: () => 'c0ffee000000', home: w.home, now: w.now };
+  assert.equal(ownerRuled({ ...q, id: 'R1-B1' }), true);
+  assert.equal(ownerRuled({ ...q, id: 'R2-S3' }), true);
 });
 
 test('the immediate path stays: an entry already there is recorded at once, no pending file, no extra wait', async (t) => {

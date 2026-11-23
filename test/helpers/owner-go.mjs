@@ -156,6 +156,9 @@ export const mergeRequest = (pr, head, items, repo = 'acme/widgets', areas = [])
 // #110: the line carries the content digest `P triage ruling-request` prints (a placeholder unless a test passes the real one).
 export const rulingRequest = (pr, ids, repo = 'acme/widgets', content = 'c0ffee000000') => `R1-B1 is waiting for your decision.\n⚖️ Owner ruling needed #${pr}: ${ids.join(', ')}${content === null ? '' : ` · content ${content}`} · repo ${repo}`;
 
+// The ruling request as a v2 (recommended) dialog's block carries it: the CLI's fixed recommendation row sits just before the binding last line (cp #771).
+export const rulingRequestWithRow = (row, pr, ids, repo = 'acme/widgets', content = 'c0ffee000000') => { const [first, last] = rulingRequest(pr, ids, repo, content).split('\n'); return `${first}\n${row}\n${last}`; };
+
 // A reply that asks for one more counted review round, as `P triage round-request` prints it (k = the counted ordinal; head >= 12 hex).
 export const roundRequest = (pr, k, head, repo = 'acme/widgets') => `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${head.slice(0, 12)} · repo ${repo}`;
 

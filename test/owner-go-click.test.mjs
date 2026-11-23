@@ -14,9 +14,9 @@ import {
   OWNER_GO_REL, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantedRounds, ownerRuled, readApprovals, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import {
-  ASKS_REL, CLICK_BUILDS, HUMAN_DECISION, MIN_ANSWER_MS, asksDir, canonicalDialog, clickEvidence, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk,
+  ASKS_REL, CLICK_BUILDS, HUMAN_DECISION, MIN_ANSWER_MS, asksDir, canonicalDialog, clickEvidence, clickProvenance, dialogSha256, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk, rulingWhyRow,
 } from '../pipeline/hooks/lib/owner-go-click.mjs';
-import { mergeRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { mergeRequest, roundRequest, rulingRequest, rulingRequestWithRow } from './helpers/owner-go.mjs';
 import { HEAD, ITEMS, OK, OLDEST, REPO, forgeAsk, loadFixture, mergeParts, noSleep, world } from './helpers/click-world.mjs';
 
 const HEAD2 = 'fedcba9876543210fedcba9876543210fedcba98';
@@ -582,4 +582,76 @@ test('clickProvenance: a record whose kind differs from the clicked ask is not t
   for (const kind of ['extra-round', 'past-round']) assert.equal(clickProvenance({ ...g, kind }, { home: ruling.home }), 'synthetic', `a ruling click relabelled ${kind}`);
   const { kind: _k2, ...rulingNoKind } = g;
   assert.equal(clickProvenance(rulingNoKind, { home: ruling.home }), 'synthetic', 'a ruling click with its kind removed');
+});
+
+// ---- cp #771: the ruling dialog's recommended variants -----------------------------------------------------------------------------------------
+const RULING_IDS = ['R1-B1', 'R2-S3'];
+const ROW_ACCEPT = rulingWhyRow('accept', 'real-problem');
+const ROW_FOLLOW = rulingWhyRow('follow-up', 'minor-later');
+const rulingV2 = (variant, row = variant === 'ruling-v2-accept' ? ROW_ACCEPT : ROW_FOLLOW) => rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line: rulingRequestWithRow(row, 58, RULING_IDS, REPO, 'c0ffee000000'), variant });
+const V2_LABELS = { 'ruling-v2-accept': ['Accept all (Recommended)', 'Follow-up all', 'Reject all'], 'ruling-v2-follow-up': ['Follow-up all (Recommended)', 'Accept all', 'Reject all'] };
+const legacyLabel = (l) => l.replace(' (Recommended)', '');
+
+test('a click on each deciding label of a v2 ruling ask records the same ruling as the same choice in a v1 ask (the v2 record only adds ask.variant); Not now declines', async (t) => {
+  // failure caught: a "(Recommended)" label that is not mapped, or mapped to another decision than its plain label (the owner clicks Accept all and Follow-up is recorded)
+  for (const variant of Object.keys(V2_LABELS)) {
+    for (const label of V2_LABELS[variant]) {
+      const v1 = world(t, { parts: rulingParts(), answer: legacyLabel(label) });
+      const want = (await v1.click()).recorded;
+      const v2 = world(t, { parts: rulingV2(variant), answer: label });
+      const got = (await v2.click()).recorded;
+      assert.equal(got?.kind, 'ruling', `${variant} ${label}: ${JSON.stringify(got)}`);
+      assert.equal(got.prompt, want.prompt, label);
+      assert.deepEqual([got.repo, got.pr, got.ids, got.content], [want.repo, want.pr, want.ids, want.content], label);
+      assert.deepEqual(Object.keys(got).sort(), Object.keys(want).sort(), 'the record has the same fields');
+      assert.equal(clickProvenance(got, { home: v2.home }), 'owner');
+      assert.equal(JSON.parse(readFileSync(join(asksDir(v2.home), `${v2.askId}.json`), 'utf8')).variant, variant);
+      const q = { repo: REPO, pr: 58, quote: want.prompt, decision: legacyLabel(label).startsWith('Accept') ? 'ACCEPT' : legacyLabel(label).startsWith('Follow') ? 'FOLLOW-UP' : 'REJECT', contentOf: () => 'c0ffee000000', home: v2.home, now: v2.now };
+      assert.equal(ownerRuled({ ...q, id: 'R1-B1' }), true, `${label} rules R1-B1`);
+      assert.equal(ownerRuled({ ...q, id: 'R2-S3' }), true, `${label} rules R2-S3`);
+    }
+    const no = world(t, { parts: rulingV2(variant), answer: 'Not now' });
+    const declined = await no.click();
+    assert.equal(declined.recorded ?? null, null, JSON.stringify(declined));
+    assert.deepEqual(no.records(), []);
+  }
+});
+
+test('a forged v2 ruling ask is refused: a tampered action map, another variant\'s dialog, a ruling id on a round ask (and a round id on a ruling ask), a variant on a v1 file', async (t) => {
+  // failure caught: the verifier trusting the file's own dialog / actions (a forged ask whose Accept all (Recommended) records a reject), or a variant id crossing kinds
+  const acc = rulingV2('ruling-v2-accept');
+  const asReject = { ...acc, actions: { ...acc.actions, 'Accept all (Recommended)': 'R1-B1: reject, R2-S3: reject' } };
+  const w = world(t, { parts: asReject, answer: 'Accept all (Recommended)', forge: { v: 2, variant: 'ruling-v2-accept' } });
+  assert.deepEqual(await w.click(), { refused: 'ask-invalid' });
+  assert.deepEqual(w.records(), []);
+  const invalid = (parts, forge) => { const x = world(t, { parts, forge }); return readAsk(x.askId, { home: x.home }); };
+  assert.equal(invalid(acc, { v: 2, variant: 'ruling-v2-accept' }).ok, true, 'the plain v2 ask reads');
+  assert.equal(invalid(acc, { v: 2, variant: 'ruling-v2-follow-up' }).ok, false, 'accept dialog under the follow-up id');
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up'), { v: 2, variant: 'ruling-v2-accept' }).ok, false, 'follow-up dialog under the accept id');
+  assert.equal(invalid(acc, { v: 1 }).ok, false, 'a v2 dialog as a legacy ask');
+  assert.equal(invalid(rulingParts(), { v: 2, variant: 'ruling-v2-accept' }).ok, false, 'the legacy dialog under a v2 id');
+  assert.equal(invalid(rulingParts(), { v: 1, variant: 'ruling-v2-accept' }).ok, false, 'v 1 carries no variant key');
+  assert.equal(invalid(rulingParts(), { v: 2, variant: 'ruling-v1' }).ok, false, 'the legacy id is never written');
+  assert.equal(invalid(roundParts(), { v: 2, variant: 'ruling-v2-accept' }).ok, false, 'a ruling id on a round ask');
+  assert.equal(invalid(rulingParts(), { v: 2, variant: 'round-v2-extra-round' }).ok, false, 'a round id on a ruling ask');
+  const home = mkdtempSync(join(tmpdir(), 'owner-go-click-'));
+  assert.equal(issueAsk({ ...roundParts(), variant: 'ruling-v2-accept', home }).error, 'invalid');
+  assert.equal(issueAsk({ ...rulingParts(), variant: 'round-v2-extra-round', home }).error, 'invalid');
+  assert.equal(issueAsk({ ...acc, variant: 'ruling-v2-follow-up', home }).error, 'unknown-dialog');
+  assert.ok(issueAsk({ ...acc, home }).askId, 'the real v2 parts issue');
+});
+
+test('a v2 ruling ask whose recommendation row is not installed text is invalid; a v1 ask carrying one is invalid too', async (t) => {
+  // failure caught: a recommendation row that installed code did not write (free prose arguing for the other button) reaching the owner inside a verified dialog
+  const invalid = (parts, variant) => { const x = world(t, { parts, forge: variant === undefined ? true : { v: 2, variant } }); return readAsk(x.askId, { home: x.home }).ok; };
+  assert.equal(invalid(rulingV2('ruling-v2-accept'), 'ruling-v2-accept'), true);
+  assert.equal(invalid(rulingV2('ruling-v2-accept', ROW_FOLLOW), 'ruling-v2-accept'), false, 'the other decision\'s row');
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up', ROW_ACCEPT), 'ruling-v2-follow-up'), false, 'the other decision\'s row (follow-up id)');
+  assert.equal(invalid(rulingV2('ruling-v2-accept', 'Claude recommends Accept all (when asked): trust me.'), 'ruling-v2-accept'), false, 'free prose');
+  assert.equal(invalid(rulingV2('ruling-v2-accept', rulingWhyRow('accept', 'unclear-safe')), 'ruling-v2-accept'), true, 'any installed code of the decision reads');
+  assert.equal(invalid(rulingV2('ruling-v2-accept', `${ROW_ACCEPT}!`), 'ruling-v2-accept'), false, 'an edited row');
+  assert.equal(invalid(rulingV2('ruling-v2-accept', `${ROW_ACCEPT}\n${ROW_ACCEPT}`), 'ruling-v2-accept'), false, 'two rows');
+  assert.equal(invalid(rulingV2('ruling-v2-accept', 'R1-B1 · SUGGESTION · a note'), 'ruling-v2-accept'), false, 'a v2 ask with no row');
+  const v1 = rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line: rulingRequestWithRow(ROW_ACCEPT, 58, RULING_IDS, REPO, 'c0ffee000000') });
+  assert.equal(invalid(v1), false, 'a v1 ask carrying a row');
 });
