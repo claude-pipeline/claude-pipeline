@@ -510,6 +510,10 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
     const actual = mergeTreeDetailed(m.parents[0], m.parents[1], o);
     const extra = actual.conflicts.map((c) => c.path).filter((p) => !known.has(p));
     if (extra.length > 0) throw fail('evidence', `the merge ${m.sha} also conflicts in ${shortList(extra)}, which the trial merge of the last reviewed head does not`);
+    // An own commit that edited a conflicted file before the merge changes that file's stage 2 here: a resolver restoring the reviewed blob would hide
+    // the edit from every review.
+    const changed = merged.conflicts.filter((c) => !sameEntry(c.stages[2], actual.conflicts.find((a) => a.path === c.path)?.stages[2])).map((c) => c.path);
+    if (changed.length > 0) throw fail('evidence', `an own commit before the merge ${m.sha} changed ${shortList(changed)}, which the trial merge of the last reviewed head conflicts in`);
   }
 
   // A: no merge-affecting attribute on any path a driver could have resolved silently: every merge-base path BOTH sides changed (with
@@ -566,7 +570,7 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
       marked = splitLines(marker).some((l) => l.startsWith('<') && isMarkerLine(l));
       if ((isText || marked) && s2 && s3 && textMode(s2) && textMode(s3) && !marker.includes('\0')) {
         const [t2, t3] = [s2, s3].map((e) => catBlob(e.oid, o));
-        if (![marker, t2, t3].some((t) => t.includes('\0') || t.includes('�'))) {
+        if (![marker, t2, t3].some((t) => t.includes('\0') || t.includes('\uFFFD'))) {
           const parsed = parseConflictBlocks(splitLines(marker), splitLines(t2), splitLines(t3), tick, labels);
           if (parsed.reason === 'too-many-blocks') throw fail('evidence', `${c.path} has more than ${MAX_BLOCKS} conflict blocks`);
           if (!parsed.reason) blocks = parsed.blocks;
@@ -578,8 +582,9 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
     if (blocks && blocks.length > 0 && !headEntry) throw fail('evidence', `${c.path} has conflict blocks but is not at that path in head (renamed or moved), so its markers cannot be checked`);
     if (headEntry && textMode(headEntry)) {
       const text = catBlob(headEntry.oid, o);
+      if (text.includes('\0') && blocks && blocks.length > 0) throw fail('evidence', `${c.path} (head) holds a NUL byte, so its conflict blocks cannot be checked`);
       if (!text.includes('\0')) {
-        if (text.includes('�')) throw fail('evidence', `${c.path} (head) is not valid UTF-8`);
+        if (text.includes('\uFFFD')) throw fail('evidence', `${c.path} (head) is not valid UTF-8`);
         const headLines = splitLines(text);
         if (blocks && blocks.length > 0) {
           const left = committedBlock(headLines, blocks);

@@ -1393,6 +1393,14 @@ for (const style of ['diff3', 'zdiff3']) {
   });
 }
 
+test('conflictReviewBase (R2-B3): an untouched conflict block plus a NUL byte elsewhere in head\'s file -> evidence, not a skipped check', () => {
+  // Prevents: a NUL in head's blob skipping the block check, so a committed unresolved block rides into a narrow round as a binary patch nobody can read.
+  const s = conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
+  try { s.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main', 'main']); } catch { /* the conflict is the point */ }
+  writeFileSync(join(s.repo.dir, 'f.txt'), readFileSync(join(s.repo.dir, 'f.txt'), 'utf8') + 'tail\0nul\n');
+  cNo(cdecide(s, s.repo.commit('merge main, f.txt untouched with a NUL')), 'evidence', 'f.txt');
+});
+
 test('conflictReviewBase (R1-B6): a conflicted file whose name starts with ":" is looked up as a literal path, so a kept modify/delete is recorded as kept', () => {
   // Prevents: `ls-tree -- :notes.txt` reading the name as a pathspec, so head looked absent at the path and the record said the file was deleted.
   if (process.platform === 'win32') return; // ':' cannot be in a Windows file name
@@ -1438,6 +1446,19 @@ test('conflictReviewBase (R1-B2): an own commit before the merge makes a second 
   assert.match(readWork(s.repo, 'b.txt'), /^<{7} HEAD$/m, 'the real merge conflicts in b.txt too');
   s.repo.write('a.txt', T('top', 'o', 'bottom'));
   cNo(cdecide(s, s.repo.commit('merge main, b.txt keeps its markers')), 'evidence', 'b.txt');
+});
+
+test('conflictReviewBase (R2-B1): an own commit edits a conflicted file before the merge and the resolver restores the reviewed blob -> evidence, not a narrow round', () => {
+  // Prevents: the discarded own edit of f.txt vanishing from every review (its stage 2 no longer equals the trial merge's), while g.txt keeps the patch non-empty.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'g.txt': T('top', 'x', 'bottom') },
+    ours: { 'f.txt': T('top', 'o', 'bottom'), 'g.txt': T('top', 'o', 'bottom') },
+    theirs: { 'f.txt': T('top', 't', 'bottom'), 'g.txt': T('top', 't', 'bottom') },
+  });
+  s.repo.write('f.txt', T('top', 'o2', 'bottom'));
+  s.repo.commit('own commit edits f.txt');
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom'), 'g.txt': T('top', 'o', 'bottom') });
+  cNo(cdecide(s, head), 'evidence', 'f.txt');
 });
 
 test('renderConflictSides (R1-B4, R1-B7): a recorded conflict that no longer conflicts, or a blob with hundreds of thousands of lines, is unavailable (whole PR), never an incomplete file or a throw', () => {
