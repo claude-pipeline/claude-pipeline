@@ -944,7 +944,7 @@ function evaluateMcp(tool, ti, input, opts) {
 // #687: a server not named supabase is refused as Supabase on evidence the owner can check, so a deny says how the call was recognised (the admin switch is named in words: a written literal assignment of it is refused).
 const SUPABASE_MATCH_HINT = {
   config: (seg) => `(recognised as Supabase from this session's MCP configuration of server ${seg})`,
-  shape: (seg) => `(recognised as Supabase by its input only, because this session's MCP configuration does not identify server ${seg}; if it is not a Supabase server, the owner runs this call in a session started with the admin switch, which skips this check)`,
+  shape: (seg) => `(recognised as Supabase by its input only, because this session's MCP configuration does not show server ${seg} to be Supabase and cannot rule it out (a server bound at launch is invisible to the guard); if it is not a Supabase server, the owner runs this call in a session started with the admin switch, which skips this check)`,
 };
 
 function evaluateMcpGeneric(tool, ti, input, opts) {

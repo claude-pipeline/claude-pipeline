@@ -91,10 +91,8 @@ next to the account file, makes that layer UNKNOWN (F-P3).
 **5c. Decide** (no precedence model: F-P2):
 - Any scanned entry for the name is SUPABASE ⇒ Supabase (also when a layer is UNKNOWN: a positive match wins).
 - Changed in review R1-B1: a configured vendor no longer skips the input check (launch-time bindings are invisible to the hook).
-- At least one entry found, every one of them OTHER, and no layer UNKNOWN ⇒ not Supabase; the generic decision stands (a configured vendor is never
-  judged by shape: Codex P1-2). An agent-added vendor entry cannot hide a Supabase one: the Supabase entry still triggers the first bullet.
-- Otherwise (no entry: plugin servers `plugin_<p>_<s>`, claude.ai connectors `claude_ai_<x>`, `--mcp-config`; a layer UNKNOWN; an entry
-  UNRESOLVED) ⇒ **5d**.
+- Otherwise (an entry for another vendor, no entry: plugin servers `plugin_<p>_<s>`, claude.ai connectors `claude_ai_<x>`, `--mcp-config`; a layer UNKNOWN; an entry
+  UNRESOLVED) ⇒ **5d**: recognised as Supabase by its input only, because the configuration does not show the server to be Supabase and cannot rule it out (a server bound at launch is invisible to the guard). An agent-added vendor entry cannot hide a Supabase one: the Supabase entry still triggers the first bullet.
 
 **5d. Shape fallback.** Supabase when `ti` is a plain object whose own keys are all within the name's key set AND include the required keys of at
 least one of its modes:
@@ -155,7 +153,7 @@ in words only (a literal assignment of it in a written file is refused by the gu
 ### Limits (in the code comment and the doc; not fixed here)
 - A deliberately disguised server (a local proxy or wrapper script launched by a literal command with no Supabase marker, renamed parameters, a
   foreign key added to a 5d call) is out of the guard threat model (pipeline.yml `threat_models.guards`).
-- A `--mcp-config` or managed server that shadows a same-named entry of the session's own files is identified by that entry.
+- A `--mcp-config` or managed server is judged by its input only when no scanned entry of its name is Supabase (otherwise by that entry).
 - Schema drift: a new optional Supabase key makes a real call fail the 5d key-set test on an unidentified server (no worse than main). The
   implementer adds a comment by `GENERIC_SIGNATURES` naming the source SHA / package version to re-check on a bump (F-P3).
 - An unidentified ancestor-directory Supabase entry of the same name over-denies a vendor server (positive match wins); rare and visible by its hint.
