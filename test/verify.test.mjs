@@ -750,7 +750,7 @@ test('a step that prints a node:test or vitest summary gets counts in report.jso
   const steps = [
     { name: 'node', cmd: say(['# tests 7', '# pass 4', '# fail 1', '# cancelled 0', '# skipped 1', '# todo 1']), quick: false },
     { name: 'vitest', cmd: say([' Test Files  2 passed (2)', '      Tests  12 passed | 2 failed | 1 skipped (15)']), quick: false },
-    { name: 'empty', cmd: say(['# pass 0', '# fail 0']), quick: false },
+    { name: 'empty', cmd: say(['# tests 0', '# pass 0', '# fail 0']), quick: false },
     pass('plain'),
   ];
   await verify(repo, [], steps);
@@ -759,4 +759,12 @@ test('a step that prints a node:test or vitest summary gets counts in report.jso
   assert.deepEqual(rep.steps[1].counts, { passed: 12, failed: 2, skipped: 1 });
   assert.deepEqual(rep.steps[2].counts, { passed: 0, failed: 0, skipped: 0 }, 'a pass that ran nothing is visible as counts.passed 0');
   assert.equal('counts' in rep.steps[3], false);
+});
+
+// Catches: a test that prints "pass 3" (node:test echoes it as a "# pass 3" diagnostic) being added to the reported passes.
+test('only the runner\'s own summary block is counted: a stray "# pass N" diagnostic before or after it is not', async () => {
+  const repo = await setup();
+  const say = (lines) => nodeCmd(lines.map((l) => `console.log('${l}')`).join(';'));
+  await verify(repo, [], [{ name: 'node', cmd: say(['# pass 3', '# tests 1', '# suites 0', '# pass 1', '# fail 0', '# cancelled 0', '# skipped 0', '# todo 0', '# duration_ms 12.5', '# pass 9']), quick: false }]);
+  assert.deepEqual(reportOf(repo).steps[0].counts, { passed: 1, failed: 0, skipped: 0 });
 });

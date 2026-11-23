@@ -90,14 +90,19 @@ export function excerpt(text, n = EXCERPT_LINES) {
 }
 
 // Test counts from a step's own summary lines, or null when it printed none (counts are never invented). node:test: `# pass N` /
-// `ℹ pass N` (also fail, skipped / skip, todo); vitest: `Tests  N passed | M failed | K skipped`. todo counts as skipped; several
+// `ℹ pass N` (also fail, skipped / skip, todo) inside the runner's summary block, which opens at its `tests N` line (a test's own
+// printed "# pass 3" is not counted); vitest: `Tests  N passed | M failed | K skipped`. todo counts as skipped; several
 // summaries in one step (a command that runs two suites) add up.
 export function testCounts(text) {
   const clean = String(text).replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
   const counts = { passed: 0, failed: 0, skipped: 0 };
   let found = false;
+  let inSummary = false;
   for (const line of clean.split('\n')) {
-    const node = /^\s*(?:#|ℹ)\s+(pass|fail|skipped|skip|todo)\s+(\d+)\s*$/.exec(line);
+    const summary = /^\s*(?:#|ℹ)\s+(tests|suites|pass|fail|cancelled|skipped|skip|todo|duration_ms)\s+(\d+(?:\.\d+)?)\s*$/.exec(line);
+    if (summary?.[1] === 'tests') inSummary = true;
+    else if (summary?.[1] === 'duration_ms' || (!summary && line.trim() !== '')) inSummary = false; // duration_ms closes the block
+    const node = inSummary && summary && /^(?:pass|fail|skipped|skip|todo)$/.test(summary[1]) ? summary : null;
     if (node) {
       counts[{ pass: 'passed', fail: 'failed' }[node[1]] ?? 'skipped'] += Number(node[2]);
       found = true;
