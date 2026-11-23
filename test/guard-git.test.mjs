@@ -1887,6 +1887,61 @@ test('#529: what a `&>` / `&>>` span changed is unknown after the span, certain 
   assert.equal(withEnv('B=agent/x && git push origin HEAD:$B &>/dev/null').decision, 'allow');
 });
 
+// #662: a branch switch in the LAST stage of a pipeline, proven by the `&&` after the pipeline (the status of a pipeline is its last stage's, with or without pipefail). Failure caught: a push judged on the branch of
+// a switch that did not happen, or that something else of the line moved on (an earlier background job, a one-operand `git checkout NAME` that restored a file). Each row: BASE -> CANDIDATE.
+test('#662: `echo x | git switch B && P` is proven by the &&; every other shape of a switch in a pipeline stays unknown', () => {
+  const files = { '/work/main/s.sh': 'echo x | git switch agent/y && git push\n', '/work/main/helper.sh': 'git checkout main &\n' };
+  const abs = Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
+  const o = { byDir: { '/work/main': 'main', '/work/repo': 'agent/x' }, cwd: '/work/main', labels: [], readText: (p) => abs[resolve(p)] ?? null, pathExists: (p) => resolve(p) in abs };
+  const P = 'git push';
+  const newAllow = [ // BASE deny -> CANDIDATE allow
+    `echo x | git switch agent/y && ${P}`,
+    `set -o pipefail; echo x | git switch agent/y && ${P}`, // both readings give the same answer: no pipefail tracking
+    `echo x | cat | git switch -c agent/z && ${P}`,
+    `echo x | git checkout -b agent/z && ${P}`,
+    `echo x | git switch agent/y && echo ok && ${P}`,
+  ];
+  for (const c of newAllow) assert.equal(evaluate(c, o).decision, 'allow', c);
+  const controls = [ // BASE deny -> CANDIDATE deny: they guard the new allowance
+    `echo x | git checkout agent/y && ${P}`, // one operand: may restore a file and leave HEAD (#789)
+    `git checkout main & sleep 1; echo x | git switch agent/y && ${P}`, // an earlier background writer
+    `git checkout main &>/dev/null; echo x | git switch agent/y && ${P}`,
+    `sleep 1 & echo x | git switch agent/y && ${P}`, // any earlier job withholds the proof (an accepted over-refusal)
+    `echo x |& git switch agent/y && ${P}`,
+    `command echo x | git switch agent/y && ${P}`, // a wrapper
+    `echo "$(git checkout main)" | git switch agent/y && ${P}`, // a substitution in the first stage
+    `cat <<EOF | git switch agent/y && ${P}\nbody\nEOF`, // a heredoc waits: no record
+    `bash helper.sh; echo x | git switch agent/y && ${P}`, // a returned helper that left a job
+    `cat <(git checkout main); echo x | git switch agent/y && ${P}`,
+    `nohup git checkout main; echo x | git switch agent/y && ${P}`,
+    'bash s.sh', // no proof inside a nested text
+    `echo x | git switch agent/y; ${P}`,
+    `set -o pipefail; echo x | git switch agent/y; ${P}`,
+    `echo x | git switch agent/y && echo ok; ${P}`,
+    `echo x | git switch agent/y || exit 1; ${P}`,
+    `git switch agent/y | cat && ${P}`,
+    `git checkout main | git switch agent/y && ${P}`,
+    `bash s.sh | git switch agent/y && ${P}`,
+    `echo $(git checkout main) | git switch agent/y && ${P}`,
+    `echo x > >(git checkout main) | git switch agent/y && ${P}`,
+    `echo ref > .git/HEAD | git switch agent/y && ${P}`,
+    `echo x | cd /other && ${P}`,
+    `echo x | git switch agent/y & ${P}`,
+    `echo x | git switch agent/y &>/dev/null && ${P}`,
+    `echo x | { git switch agent/y; } && ${P}`,
+    `true && echo x | git switch agent/y && ${P}`,
+    `! echo x | git switch agent/y && ${P}`,
+    `echo x | git switch -- f && ${P}`,
+    `echo x | git switch agent/y -- f && ${P}`,
+    `echo x | git symbolic-ref HEAD refs/heads/agent/y && ${P}`,
+    `echo x | git -C /work/repo switch agent/y && ${P}`,
+    `echo x | env git switch agent/y && ${P}`,
+    `echo x | git switch main && ${P}`, // the proven switch reaches main: refused for the protected branch, which only a proven switch can say
+  ];
+  for (const c of controls) assert.equal(evaluate(c, o).decision, 'deny', c);
+  assert.match(evaluate(`echo x | git switch main && ${P}`, o).reason, /main/);
+});
+
 // Background-scan finding on 4789b20 (state tracking): constructs that change where a later command runs, or what a
 // variable holds, without anything the walk follows. Each deny below pushes from the `main` checkout in a real shell.
 test('namerefs, function / alias / trap definitions, shell options and sourced files make the state unknown', () => {

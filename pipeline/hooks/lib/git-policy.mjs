@@ -3738,8 +3738,9 @@ function evalString(str, startDir, ctx, level, child = false) {
       noteSpans(c, i, { changed: changesStateWords || changedState || dir !== dirBefore, every: changedState || (changesStateWords && name === 'git'), names });
     }
     if (argv.length > 0 && (changesStateWords || changedState)) {
-      const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir', redir: how === 'redir', and: c.sep === '&&', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
+      const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
@@ -3807,6 +3808,43 @@ function certainChange(cmds, c, trusted, moves = true) {
   // and is not settled by a `;`. Redirected in a body keeps today's reading: unknown at once)
   if (moves && !redirectsFirm(c.redirects)) return inBody ? null : 'redir';
   return inBody ? 'chain' : 'certain';
+}
+
+// #662: `echo x | git switch agent/y && P`. A branch switch changes the repository, not the shell, so that the last stage of a pipeline is a subshell does not matter: what matters is that it SUCCEEDED (the `&&` after the
+// pipeline runs P only then, with or without pipefail: the status of a pipeline is its last stage's) and that nothing else of the pipeline or before it can still move HEAD. Everything not listed is today's answer: unknown.
+// The pipeline is the parser's record (pipeRec, on the last stage). ALL must hold: only `|` (no `|&`: a ksh coprocess / bash both-streams), no wrapper stripped, led by `;` or the start of the text, nothing negated, in the
+// background, in a subshell, a group, a level or a loop / branch / function body from the pipeline's start to the switch; the switch is exactly `git switch B`, `git switch -c B` or `git checkout -b B` (a one-operand
+// `git checkout NAME` can restore a deleted tracked file and leave HEAD: #789); every other command of the pipeline (substitutions inside the stages included) is a plain reader of data (PIPE_INERT) with no redirect but fd
+// dups and /dev/null and no process substitution; and, in the TOP-LEVEL text only, no earlier command of the text can have left work running (a background job, a coprocess, a launcher, a script / shell / interpreter run,
+// a function call, source, eval: #762 is the same race for an unpiped switch).
+const PIPE_INERT = new Set(['echo', 'printf', 'cat', 'true', 'yes', 'seq']);
+const PIPE_RUNNERS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'source', '.', 'eval', 'exec', 'nohup', 'setsid', 'disown', 'timeout', 'screen', 'tmux', 'at', 'batch', 'xargs', 'parallel', 'env', 'coproc', 'node', 'python', 'python3', 'ruby', 'perl', 'php', 'deno', 'bun', 'npx', 'npm', 'pnpm', 'yarn', 'make', 'sudo', 'nice', 'ionice', 'stdbuf', 'watch', 'command', 'builtin', 'time']);
+const dupOrNull = (r) => typeof r.target === 'string' && (r.target === '/dev/null' || /^&(?:\d+|-)$/.test(r.target)) && r.op !== '&>' && r.op !== '&>>';
+function pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) {
+  const rec = c.pipeRec;
+  if (!rec || !trusted || level !== 0 || child === true || cmds.truncated || cmds.ctlBroken || rec.pending || rec.wrapped || !rec.ops.every((o) => o === '|')) return false;
+  if (nextSep(cmds, i) !== '&&' || c.depth > 0 || (c.pipeLead ?? ';') !== ';') return false;
+  if (!(c.argv.length === 3 || c.argv.length === 4) || baseName(c.argv[0]) !== 'git' || Object.keys(c.env ?? {}).length > 0 || (c.redirects ?? []).length > 0) return false;
+  const [, sub, a, b] = c.argv;
+  const name = c.argv.length === 3 ? (sub === 'switch' ? a : null) : ((sub === 'switch' && a === '-c') || (sub === 'checkout' && a === '-b') ? b : null);
+  if (name === null || !/^[A-Za-z0-9_][\w./@+-]*$/.test(name)) return false;
+  const seg = cmds.slice(rec.from, i + 1);
+  if (seg[seg.length - 1] !== c) return false;
+  for (const x of seg) {
+    if (x.bg || x.maybeBg || x.paren || x.spawn || x.wrapped || x.negated || (x.up ?? []).length > 0 || Object.values(x.ctl ?? {}).some(Boolean)) return false;
+    if (x === c) continue;
+    const n = x.argv.length ? baseName(x.argv[0]) : '';
+    const words = [...x.argv, ...(x.redirects ?? []).map((r) => r.target ?? '')];
+    if (!PIPE_INERT.has(n) || Object.keys(x.env ?? {}).length > 0 || words.some((w) => /[<>]\(/.test(String(w))) || !(x.redirects ?? []).every(dupOrNull)) return false;
+    if (n === 'printf' && x.argv.slice(1).some((w) => /^-v/.test(w))) return false;
+    if (n === 'cat' && x.argv.slice(1).some((w) => !w.startsWith('-'))) return false;
+  }
+  for (const x of cmds.slice(0, rec.from)) { // (the earlier work, any depth)
+    const n = x.argv.length ? baseName(x.argv[0]) : '';
+    if (x.bg || x.maybeBg || x.spawn || x.wrapped || x.fan || PIPE_RUNNERS.has(n) || cmds.fns?.has(n) || (x.argv.length && x.argv[0].includes('/')) || scriptFileOf(x.argv, x.raw, str)) return false;
+    if ([...x.argv, ...(x.redirects ?? []).map((r) => r.target ?? '')].some((w) => /[<>]\(/.test(String(w)))) return false;
+  }
+  return true;
 }
 
 // Why (#84): text too long to parse inside the time budget is refused whatever it says. Judging it by the guarded words it

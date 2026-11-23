@@ -1366,3 +1366,14 @@ test('#529: `&>` / `&>>` mark the and-or list up to the command that carries it 
   assert.equal(simpleCommands('cd X &>/dev/null').truncated, false);
   for (const line of ['cd X &>/dev/null foo', 'x=1 &>/dev/null F=22', 'cd X &>>f g']) assert.equal(simpleCommands(line).truncated, true, line);
 });
+
+// #662: the pipeline record on the command of the LAST stage. Failure caught: a switch judged "proven" in a pipeline whose stages the parser could not tell apart (a `|&`, a wrapper, a stage that is a group, a heredoc that waits).
+test('#662: pipeRec names the stages, the operators and wrappers of a pipeline; none when the parser cannot tell', () => {
+  const rec = (s) => { const out = simpleCommands(s); const c = out.find((x) => x.pipeRec); return c ? { last: c.argv.join(' '), from: c.pipeRec.from, ops: c.pipeRec.ops, wrapped: c.pipeRec.wrapped, stages: c.pipeRec.stages.map((st) => st.map((y) => y.argv.join(' '))) } : null; };
+  assert.deepEqual(rec('a; echo x | cat | git switch b && P'), { last: 'git switch b', from: 1, ops: ['|', '|'], wrapped: false, stages: [['echo x'], ['cat'], ['git switch b']] });
+  assert.deepEqual(rec('echo x |& git switch b').ops, ['|&']);
+  assert.equal(rec('command echo x | git switch b').wrapped, true);
+  assert.equal(rec('echo "$(git checkout main)" | git switch b').from, 0); // the commands of a first-stage substitution come out BEFORE the stage: they are inside [from, last]
+  assert.equal(simpleCommands('echo "$(git checkout main)" | git switch b')[0].argv.join(' '), 'git checkout main');
+  for (const line of ['echo x | { git switch b; } && P', 'cat <<EOF | git switch b && P\nbody\nEOF', 'echo x', '(echo x) | git switch b']) assert.equal(rec(line), null, line);
+});

@@ -2696,6 +2696,7 @@ class Parser {
     let subTail = null;
     let tailUndo = null; // (#352 R13-F1: what the segment that took subTail would have had without it, to give it back when that segment turns out to hold a word: only a redirect list continues the subshell's command)
     let lastNeg = false; // (the stage before a `|` was negated: `! a | b` negates the pipeline, so b's commands too)
+    let pl = null; // (#662: the pipeline being read at this level: { from, segs, ops, bad, closed }, see plDone)
     let lastAfterClose = false; // (the `&&` just read follows the closer of a construct that may have skipped its body: the next segment takes it, see emit)
     // the operator before the command being read (a substitution in its words runs under it, see inGroup)
     this.lexOp = () => (seg ? { sep: seg.sep, afterClose: seg.afterClose, lead: seg.lead } : { sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose, lead: lastSep === '|' ? this.pipeLead : null });
@@ -2721,9 +2722,12 @@ class Parser {
         if (!tail && lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
         if (!tail && lastSep !== '|') { this.pipeHead = ctx.out.length; this.pipeLead = lastSep; }
         lastAfterClose = false;
+        // (#662: the pipeline record. A stage continues the pipeline of the segment before it only when a plain `|` / `|&` joined them; anything else begins a new one. A stage that is a subshell tail, or read while a heredoc waits, makes the record untrustworthy)
+        if (lastSep === '|' && pl && !pl.closed) { seg.pl = pl; if (tail || this.queue.length) pl.bad = true; } else { if (pl) { pl.closed = true; this.plDone(pl); } pl = { from: ctx.out.length, segs: [], ops: [], bad: !!tail || this.queue.length > 0, closed: false, attached: false }; seg.pl = pl; }
+        pl.segs.push(seg);
       }
     };
-    const mark = () => { if (qa < 0) qa = cur.length; inWord = true; };
+    const mark =() => { if (qa < 0) qa = cur.length; inWord = true; };
     const takeSubs = () => {
       if (this.subAcc.length) { wsubs.push(...this.subAcc); this.subAcc.length = 0; }
     };
@@ -3065,9 +3069,11 @@ class Parser {
         flushWord(); // (`}|cat`: the closing word first)
         if (depth === 0) ctx.notPlain = true; // (| |& ||)
         const closed = seg?.closesFrom;
+        const closedSeg = seg; // (#662: the stage this `|` ends)
         endSeg(this.i);
         if (nx !== '|') this.markClosedOut(closed);
         if (closed !== undefined) { this.pipeStart = Math.min(this.lastClosePS, this.pipeStart); if (nx !== '|') { this.pipeHead = Math.min(this.lastClosePH, this.pipeHead); this.pipeLead = this.lastClosePL; } }
+        if (nx !== '|') { if (pl && pl.segs.length && pl.segs[pl.segs.length - 1] === closedSeg && pl.ops.length === pl.segs.length - 1 && !pl.closed) pl.ops.push(nx === '&' ? '|&' : '|'); else if (pl) pl.bad = true; } // (#662)
         if (nx !== '|') this.markPipe(this.pipeHead); // (#352 R11-F1: the stage before a `|` ran in a subshell, whatever stage comes after it)
         if (nx === '|') { lastSep = '||'; this.i += 2; }
         else if (nx === '&') { lastSep = '|'; this.i += 2; }
@@ -3190,7 +3196,22 @@ class Parser {
     }
     if (lit > 0 && litGlob) { this.ctx.dynamic = true; this.qualifierCode(s.slice(gRaw), cur.slice(gCur), depth, false); } // never closed: cannot be delimited
     endSeg(n);
+    if (pl) { pl.closed = true; this.plDone(pl); }
     return false;
+  }
+
+  // (#662: the pipeline record, on the command of the LAST stage: pipeRec = { from: the ctx.out index where the pipeline began (its first stage's substitutions are inside), stages: the commands each stage emitted, ops: the operators as written
+  // (`|` or `|&`), wrapped: a stage had a wrapper stripped (command / env / nohup / exec / time ...), pending: false }. Attached once the pipeline has closed and every stage is finished. None when the parser cannot tell: a stage waiting for
+  // a heredoc, a group / subshell stage, a last stage that emitted anything but one command. Not enumerable.)
+  plDone(pl) {
+    if (pl.attached || !pl.closed || pl.bad || pl.segs.length < 2 || pl.ops.length !== pl.segs.length - 1) return;
+    if (!pl.segs.every((x) => x.span !== undefined && x.pending === 0 && !x.pipeOut && !x.words.some((w) => w.qa < 0 && (w.text === '{' || w.text === '}' || w.text === '(' || w.text === ')')))) return;
+    const last = pl.segs[pl.segs.length - 1];
+    if (last.span[1] - last.span[0] !== 1) return;
+    const out = this.ctx.out;
+    pl.attached = true;
+    const stages = pl.segs.map((x) => out.slice(x.span[0], x.span[1]));
+    Object.defineProperty(out[last.span[0]], 'pipeRec', { value: { from: pl.from, stages, ops: pl.ops, wrapped: out.slice(pl.from, last.span[1]).some((c) => c.wrapped === true), pending: false }, enumerable: false });
   }
 
   // The code a glob group runs (see qualifierCodes): each string is parsed as commands one level deeper, like a `-c` string.
@@ -3363,6 +3384,7 @@ class Parser {
       this.finalizeSeg(seg);
       // (#352 R10: every command of a pipeline (the stages, and what they hold) is marked: a change in one is its subshell's. A stage is marked when the stage after it is finished)
       seg.span = [out0, this.ctx.out.length];
+      if (seg.pl) this.plDone(seg.pl); // (#662)
       for (const s of seg.sep === '|' ? [seg, ...(seg.pipedFrom ?? []).filter((p) => !seg.pipeSkip?.includes(p))] : []) if (s.span) for (const c of this.ctx.out.slice(...s.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
       if (seg.pipeOut) for (const c of this.ctx.out.slice(...seg.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true }); // (#352 R11-F1: a | was read while it waited for its heredoc body: see markPipe)
       if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = { grp: seg.grp, depth: seg.depth }; // (it emitted nothing: the mark waits for the next command of ITS level, see emit)
