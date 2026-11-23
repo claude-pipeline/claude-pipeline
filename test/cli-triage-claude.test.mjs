@@ -1192,10 +1192,11 @@ test('owner-ruling: a click on "Follow-up all (Recommended)" is checked again ag
   // failure caught: a click on a recommended dialog that says "the pipeline rates this low" recording a follow-up after the item became serious (a same-file BLOCKING item appeared, or the dialog was forged for a BLOCKING finding), because only the ask was checked
   const FU = 'ruling-v2-follow-up';
   const docs = () => sugg({ file: 'src/a.js', category: 'docs' });
-  const mk = (blocking) => {
+  const mk = (blocking, more = []) => {
     const w = dWorld(t);
-    assertExit(w.codex(1, findingsOf(blocking, [docs()])), 0);
+    assertExit(w.codex(1, findingsOf(blocking, [docs(), ...more])), 0);
     w.wait('R1-S1');
+    for (const m of more) w.wait(`R1-S${more.indexOf(m) + 2}`);
     if (blocking.length > 0) w.wait('R1-B1');
     return w;
   };
@@ -1209,14 +1210,29 @@ test('owner-ruling: a click on "Follow-up all (Recommended)" is checked again ag
   const before = stale.stateText();
   const denied = typedFor(t, stale, ['R1-S1'], 'R1-S1: follow-up', FU)('R1-S1', 'FOLLOW-UP');
   assertExit(denied, 1, denied.stdout);
-  assert.match(denied.json.reason, /no longer does.*R1-B1.*ask again on the neutral dialog.*ruling-request --pr 7 --ids R1-S1 --ask/);
+  assert.match(denied.json.reason, /no longer holds.*R1-B1.*ask again on the neutral dialog.*ruling-request --pr 7 --ids R1-S1 --ask/);
   assert.equal(stale.stateText(), before);
+  // R2-B1: the dialog's claim covered the whole two-id batch. allow: both still qualify -> the first id is recorded
+  const second = () => sugg({ file: 'src/a.js', category: 'docs', title: 'Fix typo', line: 5 });
+  const both = mk([], [second()]);
+  const okBatch = typedFor(t, both, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up, R1-S2: follow-up', FU)('R1-S1', 'FOLLOW-UP');
+  assertExit(okBatch, 0, okBatch.stdout + okBatch.stderr);
+  assert.equal(both.item('R1-S1').final.decision, 'FOLLOW-UP');
+  // deny: the sibling was marked implemented after the ask (the batch digest is unchanged), so the first id is refused too, naming the sibling, state untouched
+  const drift = mk([], [second()]);
+  const applyFirst = typedFor(t, drift, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up, R1-S2: follow-up', FU);
+  drift.edit((st) => { st.rounds[0].items.find((i) => i.id === 'R1-S2').implemented = true; });
+  const beforeDrift = drift.stateText();
+  const driftDenied = applyFirst('R1-S1', 'FOLLOW-UP');
+  assertExit(driftDenied, 1, driftDenied.stdout);
+  assert.match(driftDenied.json.reason, /no longer holds.*R1-S2 is already implemented.*ask again on the neutral dialog.*--ids R1-S1,R1-S2 --ask/);
+  assert.equal(drift.stateText(), beforeDrift);
   // the same finding ruled by a typed answer, a click on the neutral dialog, or an ACCEPT click on the recommended one needs no recheck
-  for (const [what, variant, decision] of [['typed', undefined, 'FOLLOW-UP'], ['neutral click', 'ruling-v1', 'FOLLOW-UP']]) {
+  for (const [what, variant, decision] of [['typed', undefined, 'FOLLOW-UP'], ['neutral click', 'ruling-v1', 'FOLLOW-UP'], ['accept click on the recommended dialog', 'ruling-v2-follow-up', 'ACCEPT']]) {
     const w = mk([finding()]);
     const r = typedFor(t, w, ['R1-S1'], `R1-S1: ${decision.toLowerCase()}`, variant)('R1-S1', decision);
     assertExit(r, 0, `${what}: ${r.stdout}`);
-    assert.equal(w.item('R1-S1').final.decision, 'FOLLOW-UP', what);
+    assert.equal(w.item('R1-S1').final.decision, decision, what);
   }
 });
 
