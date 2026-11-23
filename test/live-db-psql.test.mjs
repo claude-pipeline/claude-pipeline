@@ -297,3 +297,74 @@ test('a psql family or supabase_db_ name split by empty quotes is refused like t
     "docker exec supa''base_db_x sh -c 'echo hi'",
   ]) mustRefuse(line);
 });
+
+// Catches (round 1, R1-B1): `sub/../t.sql` collapsed by the guard's path.resolve while the shell lets the kernel follow a symlink `sub` first, so the guard scans one file and psql reads another.
+test('docker psql: an input path with a `..` component is refused; a plain ./ path passes', () => {
+  dockerConfig(null);
+  sql(GOOD_FILE);
+  mkdirSync(join(work, 'sub'), { recursive: true });
+  const D = 'docker exec -i supabase_db_x psql -X -f -';
+  mustRefuse(`${D} < sub/../t.sql`);
+  mustRefuse(`${D} < ../t.sql`);
+  mustAllow(`${D} < ./t.sql`);
+});
+
+// Catches (round 1, R1-B2): a `pg_*` client that is not in the fixed name list (pg_repack, pg_prove) skipping the family check because the line text holds no listed name.
+test('any pg_* program (but pg_config) run as a command is refused, also spelled with empty quotes; catalog names in data pass', () => {
+  dockerConfig(null);
+  for (const line of ['pg_repack -h db.x.supabase.co -d postgres', 'pg_prove -h db.x.supabase.co -d postgres tests/a.sql', "pg''_repack -h db.x.supabase.co", 'timeout 30 pg_prove -d postgres t.sql']) mustRefuse(line);
+  for (const line of ['echo pg_class', 'grep -rn pg_repack docs', 'pg_config --version', 'psql_x --help']) mustAllow(line);
+});
+
+// Catches (round 1, R1-B4): Docker's Go decoder reads `CurrentContext` / `host` as the same field as `currentContext` / `Host`; an exact-key lookup saw no context and approved the default (local) endpoint.
+test('docker psql: a Docker config or context file spelling a key with other letter case is refused', () => {
+  const Q = "docker exec supabase_db_x psql -X -c 'select 1'";
+  for (const key of ['CurrentContext', 'currentcontext', 'CURRENTCONTEXT']) {
+    dockerConfig(JSON.stringify({ [key]: 'staging' }));
+    dockerMeta('staging', 'ssh://x');
+    mustRefuse(Q);
+  }
+  dockerConfig(JSON.stringify({ currentContext: 'staging' }));
+  const dir = join(dockerDir, 'contexts', 'meta', createHash('sha256').update('staging').digest('hex'));
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ Name: 'staging', Endpoints: { docker: { host: 'unix:///var/run/docker.sock' } } }));
+  mustRefuse(Q);
+  writeFileSync(join(dir, 'meta.json'), JSON.stringify({ Name: 'staging', endpoints: { docker: { Host: 'unix:///var/run/docker.sock' } } }));
+  mustRefuse(Q);
+  dockerMeta('staging', 'unix:///var/run/docker.sock');
+  mustAllow(Q);
+});
+
+// Catches (round 1, R1-B5, R1-F2, R1-F1): a read-only search, a PR body / commit message or `command -v` that merely NAMES psql and PGHOST being refused, while a line that sets those names next to a client still is.
+test('lines that run no client pass even when they name psql and PG* variables; setting a name next to a client is still refused', () => {
+  dockerConfig(null);
+  const P = `psql -X ${URI} -c 'select 1'`;
+  for (const line of [
+    "rg -n 'psql|PGHOST' docs",
+    'grep -rn \'psql "$DATABASE_URL"\' scripts',
+    'gh pr create --title t --body "Runs psql against the local stack; DATABASE_URL is no longer read"',
+    'git -C /repo commit -m "psql guard: refuse PGHOST lines"',
+    'command -v psql',
+    'command -v pg_dump >/dev/null && echo ok',
+    'if command -v psql; then echo ok; fi',
+  ]) mustAllow(line);
+  for (const line of [
+    `export PGHOST+=x; ${P}`,
+    `read PGHOST <<< x; ${P}`,
+    `: "\${PGHOST:=x}"; ${P}`,
+    `PG''HOST=x ${P}`,
+    `export PGHOST=x; rg -n psql docs`,
+    `rg -n psql docs; ${P}`,
+    `gh pr create --title t --body "$(PGHOST=db.x.supabase.co psql -c 'select 1')"`,
+    `gh pr create --title t --body "$(export PGHOST=x; ${P})"`,
+    'command psql -h db.x.supabase.co',
+  ]) mustRefuse(line);
+});
+
+// Catches (round 1, R1-F4, R1-F3): a SQL file with a time of day, a JSON number or a slice bound refused for `:<digit>` (never a psql variable); `\pset` with extra spaces before `pager` slipping through.
+test('docker psql: a colon followed by a digit passes; a colon followed by a name stays refused; \\pset with spaces before a pager setting is refused', () => {
+  dockerConfig(null);
+  sql("select '2026-11-23 08:00:00+08'::timestamptz, '08:30', 'http://localhost:54321', '{\"count\":5}'::jsonb, (a)[1:3];\n");
+  mustAllow(DOCKER_FILE);
+  for (const text of ['select :a1;\n', 'select :_x;\n', 'select :{?x};\n', '\\pset   \t PAGER on\n', 'select 1;\n\\pset x\n\\pset  pager\n']) { sql(text); mustRefuse(DOCKER_FILE); }
+});

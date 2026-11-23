@@ -631,12 +631,12 @@ export function psqlTextRefusal(text, { host = false } = {}) {
       const name = line.slice(bs + 1, j);
       if (!META_OK.has(name)) return `the meta-command \`\\${name}\` on line ${n + 1} is not on the allow-list`;
       if ((name === 'g' || name === 'gx') && line.slice(j).trim() !== '') return `\`\\${name}\` with text after it on line ${n + 1}`;
-      if (name === 'pset' && line.slice(j).trimStart().toLowerCase().startsWith('p')) return `\`\\pset\` of a pager setting on line ${n + 1}`;
+      if (name === 'pset') { let k = j; while (k < line.length && line[k].trim() === '') k += 1; if (line[k] === 'p' || line[k] === 'P') return `\`\\pset\` of a pager setting on line ${n + 1}`; }
       if (name === 'set' && !SET_LINE.test(line) && !SET_ON_ERROR_STOP.test(line)) return `a \`\\set\` on line ${n + 1} that is not \`\\set <name> [<plain value>]\``;
       bs = line.indexOf('\\', j);
     }
   }
-  // interpolation: only the quoted forms; a run of three or more colons, or any other colon followed by a name, a digit, a quote, `{` or a non-ASCII byte, is refused (unquoted `:name` inserts raw text and psql's own variables carry server text)
+  // interpolation: only the quoted forms; a run of three or more colons, or any other colon followed by a name, a quote, `{` or a non-ASCII byte, is refused (unquoted `:name` inserts raw text and psql's own variables carry server text)
   for (let i = 0; i < t.length;) {
     if (t[i] !== ':') { i += 1; continue; }
     let j = i;
@@ -644,7 +644,8 @@ export function psqlTextRefusal(text, { host = false } = {}) {
     const run = j - i;
     if (run >= 3) return 'a run of three or more colons';
     const ch = t[j];
-    if (ch !== undefined && (isNameChar(ch) || ch === "'" || ch === '"' || ch === '{' || ch.charCodeAt(0) >= 0x80)) {
+    // (a single colon and a digit is no psql variable: names start with a letter, `\set` and `-v` take only `[a-z]…`; `08:30`, `"a":5`, `a[1:3]` pass)
+    if (ch !== undefined && ((isNameChar(ch) && !(run === 1 && ch >= '0' && ch <= '9')) || ch === "'" || ch === '"' || ch === '{' || ch.charCodeAt(0) >= 0x80)) {
       const ok = (run === 1 && (ch === "'" || ch === '"') && quotedVariable(t, j)) || (run === 2 && isAlpha(ch));
       if (!ok) return `a \`:${ch}\` interpolation or colon form the guard does not read`;
     }
@@ -797,6 +798,9 @@ function hostPsqlRefusal(c, x, p) {
 
 // ---- docker psql: the Docker endpoint is proven local from the files Docker itself reads ----
 const strictUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+// Docker reads these files with Go's encoding/json, which matches a field name case-insensitively (`CurrentContext`, `host`, the Kelvin sign for k, the long s for s): any other spelling of the key is refused, not read as absent
+const foldKey = (k) => k.toUpperCase().toLowerCase();
+const oddKey = (obj, name) => Object.keys(obj).find((k) => k !== name && foldKey(k) === foldKey(name));
 function dockerEndpointRefusal(io) {
   const env = io.env ?? {};
   for (const n of ['DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG']) if (Object.hasOwn(env, n)) return `the hook's environment sets ${n}, which can point docker at another daemon`;
@@ -811,13 +815,18 @@ function dockerEndpointRefusal(io) {
   if (cfg.why) return cfg.why;
   if (cfg.absent) return null; // no config: the default context
   if (cfg.json === null || typeof cfg.json !== 'object' || Array.isArray(cfg.json)) return 'the Docker config is not a JSON object';
+  if (oddKey(cfg.json, 'currentContext')) return 'the Docker config spells currentContext with other letter case, which Docker still reads';
   const cur = cfg.json.currentContext;
   if (cur === undefined || cur === '' || cur === 'default') return null;
   if (typeof cur !== 'string') return 'the Docker config\'s currentContext is not a string';
   const meta = readJson(path.join(io.home, '.docker', 'contexts', 'meta', createHash('sha256').update(cur).digest('hex'), 'meta.json'));
   if (meta.why) return meta.why;
   if (meta.absent) return `the Docker context \`${cur}\` has no meta file the guard can read`;
-  const hostName = meta.json?.Endpoints?.docker?.Host;
+  const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+  const endpoints = isObj(meta.json) ? meta.json.Endpoints : undefined;
+  const dockerEp = isObj(endpoints) ? endpoints.docker : undefined;
+  if ((isObj(meta.json) && oddKey(meta.json, 'Endpoints')) || (isObj(dockerEp) && oddKey(dockerEp, 'Host'))) return `the Docker context \`${cur}\` spells a key with other letter case, which Docker still reads`;
+  const hostName = isObj(dockerEp) ? dockerEp.Host : undefined;
   const local = io.platform === 'win32' ? 'npipe:////./pipe/' : 'unix:///';
   if (typeof hostName !== 'string' || !hostName.startsWith(local)) return `the Docker context \`${cur}\` does not use a local socket`;
   return null;
@@ -865,6 +874,8 @@ function dockerPsqlRefusal(c, x, p) {
   const only = redirects[0];
   if (redirects.length !== 1 || only.op !== '<' || (only.fd !== null && only.fd !== undefined && only.fd !== 0) || typeof only.target !== 'string') return 'the line must hold exactly one redirect, a plain `<` from a literal file';
   if (only.target === '' || !/^[A-Za-z0-9_./@+=,-]+$/.test(only.target)) return `the input file \`${only.target}\` is not a plain literal path`;
+  // a `..` is collapsed by path.resolve before the filesystem sees a symlink in front of it, while the shell lets the kernel follow the symlink first: the guard would read another file than psql
+  if (only.target.split('/').includes('..')) return `the input file \`${only.target}\` has a \`..\` component`;
   const file = path.resolve(x.io.cwd ?? process.cwd(), only.target);
   const got = typeof x.io.readBytes === 'function' ? x.io.readBytes(file) : null;
   if (!got?.ok) return `the guard could not read \`${only.target}\``;
@@ -882,6 +893,7 @@ const PG_DATA_GIT = new Set(['commit', 'grep', 'log', 'show', 'diff', 'status', 
 const pgDataOnly = (c, plain) => {
   if (!plain || runsProgram(c) || writesFile(c) || stdinFed(c) || Object.keys(c.env ?? {}).length) return false;
   const w = c.argv[0];
+  if (w === 'command' && /^-[pP]*[vV]$/.test(c.argv[1] ?? '')) return true; // a lookup (`command -v psql`), the same shape files-policy reads
   return PG_DATA.has(w) || (w === 'git' && PG_DATA_GIT.has(c.argv[1]));
 };
 const F4_VERBS = new Set(['exec', 'cp', 'run', 'create', 'rename', 'commit']);
@@ -890,7 +902,8 @@ const F4_VERBS = new Set(['exec', 'cp', 'run', 'create', 'rename', 'commit']);
 function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
   // a name split by empty quotes (`p''sql`) is not in the raw text but is in the words, so both the raw text and every reading's words are judged
   const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n')])].join('\n');
-  const token = PG_TOKEN.test(seen);
+  // the text test misses a family program the parser unwrapped (a `pg_*` name that is not in the list, `timeout 30 pg_prove`): the command names are judged too
+  const token = PG_TOKEN.test(seen) || reading.some((c) => pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? ''));
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
   const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
@@ -906,8 +919,10 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
   });
   if (token) {
     // any NAME that can move a client (PGHOST …, DATABASE_URL, DOCKER_*) anywhere on a line with a family word, however it is set (`export PGHOST+=x`, `read PGHOST`, `${PGHOST:=x}`)
-    const text = [String(scanRaw ?? ''), ...infos.filter((i) => !i.data).map((i) => i.c.raw)].join('\n');
-    if (PG_ENV_NAME.test(text) || cmds.some((c) => Object.keys(c.env ?? {}).some((k) => PG_ENV_NAME.test(k)))) return 'the line names PG* / DATABASE_URL / DOCKER_* variables next to a psql family word';
+    // (scanRaw has the prose flags masked; a command's own words and env values stand in for its raw text, which would bring a PR body back; a line whose every command is data-only runs no client at all)
+    const noClient = cmds.length === reading.length && infos.every((i) => i.data);
+    const text = [String(scanRaw ?? ''), ...infos.filter((i) => !i.data).map((i) => [...wordsOf(i.c), ...Object.values(i.c.env ?? {})].join('\n'))].join('\n');
+    if ((!noClient && PG_ENV_NAME.test(text)) || cmds.some((c) => Object.keys(c.env ?? {}).some((k) => PG_ENV_NAME.test(k)))) return 'the line names PG* / DATABASE_URL / DOCKER_* variables next to a psql family word';
   }
   for (const { c, typed, cut, aligned, data } of infos) {
     if (data) continue;
