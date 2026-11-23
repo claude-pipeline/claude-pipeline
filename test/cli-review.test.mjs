@@ -1091,6 +1091,20 @@ test('arbiter needed on a dispute round whose recorded toHead this clone lacks: 
   assert.equal(r.json.error, 'head-unavailable');
   assert.ok(!existsSync(w.roundFile(1, 'arbiter-input.md')), 'no input without evidence');
   assert.equal(w.stateText(), before);
+
+  // A retry after a failed model proof clears that ruling only once the commit is there: a refused retry must not lose the recorded failure.
+  const w2 = world(t);
+  assertExit(w2.codex(1, standardFindings()), 0);
+  assertExit(w2.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT'] }), 0);
+  const st2 = w2.state();
+  st2.rounds[0].toHead = 'f'.repeat(40);
+  st2.rounds[0].items.find((i) => i.id === 'R1-B1').final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'model-proof failed' };
+  writeFileSync(join(w2.repo.dir, '.review', 'state.json'), JSON.stringify(st2));
+  const before2 = w2.stateText();
+  const r2 = w2.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(r2, 2, r2.stderr + r2.stdout);
+  assert.equal(r2.json.error, 'head-unavailable');
+  assert.equal(w2.stateText(), before2, 'the cleared model-proof final is not saved when the retry is refused');
 });
 
 test('arbiter needed: the excerpt is +/-20 lines of the file at the reviewed head, numbered, and cannot break out of its fence', (t) => {

@@ -483,6 +483,7 @@ async function neededLocked(values, n, root, ctx) {
   // A dispute round retries the same way (E8): an arbiter malfunction (model-proof failed, invalid output) is cleared so the item goes to the
   // arbiter again, while a judgement (low confidence, a security dismissal) and the owner's and Claude's finals stay. An item that no longer
   // needs the arbiter once its malfunction is gone is finalized again by the judge, so nothing is left pending without a way forward.
+  let clearedMalfunction = false;
   if (!review) {
     const isMalfunction = (item) => item.final?.by === 'arbiter' && item.final.needsHuman === true && !isOwnerRuled(item) && !isProtectedFinal(item)
       && MALFUNCTION_CAUSES.includes(needsHumanCause(item));
@@ -494,13 +495,16 @@ async function neededLocked(values, n, root, ctx) {
       const again = finalizeWithoutArbiter(cleared, { lightLane: state.lightLane, force: values.force === true || forceArbiter(ctx.env) });
       state = updateItems(state, n, again);
       round = findRound(state, n);
-      saveState(root, state);
+      clearedMalfunction = true; // saved once the reviewed commit is known to be here: a refused retry writes nothing
     }
   }
 
   const force = review || values.force === true || forceArbiter(ctx.env);
   const items = round.items.filter((item) => arbiterNeeded(item, { lightLane: state.lightLane, force }));
-  if (!review && items.length === 0) return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
+  if (!review && items.length === 0) {
+    if (clearedMalfunction) saveState(root, state);
+    return { exitCode: EXIT.OK, output: { needed: false, items: [], mode } };
+  }
 
   // The excerpts are read at the recorded toHead: a clone that lacks it must fail here, not tell the arbiter that a cited file does not exist (writeFableDiff fails loudly for a review round).
   if (!review && typeof round.toHead === 'string') {
@@ -511,6 +515,7 @@ async function neededLocked(values, n, root, ctx) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'head-unavailable', message: `round ${round.n} was reviewed at ${round.toHead.slice(0, 12)}, which this clone does not have: fetch that commit, then run \`arbiter needed\` again` });
     }
   }
+  if (clearedMalfunction) saveState(root, state);
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
   // The files the Fable diff covers (shared by the threat-model lookup and chooseBrief); null when git cannot list them (no model is shown then, chooseBrief says why).
   let diffFileList = null;
