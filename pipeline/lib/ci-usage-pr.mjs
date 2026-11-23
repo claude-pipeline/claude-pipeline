@@ -1,10 +1,12 @@
 // The "pushed while ready" check of ONE PR, for `pipeline summary`: the same classifier `pipeline ci-usage` uses (lib/ci-usage.mjs#pushedWhileReady) over this PR's timeline,
-// commits and pull_request runs. Only for a repository that iterates in draft (ci.draft_while_iterating: true), where a push to a ready PR means `pipeline redraft` was skipped and
-// the full CI suite ran on it. Report only: it never redrafts and never fails the caller; any read error becomes one warning. Bounded like `stats` (MAX_PAGES per list).
+// commits and pull_request runs. Only for a repository that iterates in draft (ci.draft_while_iterating: true), where a push to a ready PR means `pipeline redraft` was skipped
+// (and the push starts the full CI suite). Report only: it never redrafts and never fails the caller; any read error becomes one warning. Bounded like `stats` (MAX_PAGES per list).
 import { loadConfig } from './config.mjs';
 import { MAX_PAGES, PAGE, pages } from './gh-pages.mjs';
 import { pushedWhileReady } from './ci-usage.mjs';
 import { asciiLine } from './triage.mjs';
+
+const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 
 // -> { warnings: [], field?: { count, heads: [sha12, ...] }, note?: string }. Nothing is read from GitHub unless the config says true.
 export async function pushedWhileReadyOf({ root, gh, pr }) {
@@ -26,14 +28,15 @@ export async function pushedWhileReadyOf({ root, gh, pr }) {
     if (typeof branch !== 'string' || branch === '' || typeof pull?.created_at !== 'string') throw new Error('the PR has no branch or creation time');
     const created = Date.parse(pull.created_at);
     const runs = pages(gh, `repos/${slug}/actions/runs?event=pull_request&branch=${encodeURIComponent(branch)}`, undefined, cut('workflow runs'), { key: 'workflow_runs' })
-      // a branch name can have been used by an earlier PR: only the runs since this one was created, and not those linked to another PR
-      .filter((r) => Date.parse(r.created_at) >= created && ((r.pull_requests ?? []).length === 0 || r.pull_requests.some((p) => p?.number === pr)));
+      // a branch name can have been used by an earlier PR, or by a PR from another fork: only the runs since this one was created, those linked to this PR, and the unlinked ones
+      // whose head repository is this PR's (an unlinked run of an unknown or other repository stays unattributed)
+      .filter((r) => Date.parse(r.created_at) >= created && ((r.pull_requests ?? []).length === 0 ? sameRepo(r.head_repository?.full_name, pull.head?.repo?.full_name) : r.pull_requests.some((p) => p?.number === pr)));
     const found = pushedWhileReady({ pr: { createdAt: pull.created_at, draft: pull.draft === true }, timeline, commits, runs });
     if (found.count === 0) return { warnings };
     const heads = found.heads.map((h) => h.sha.slice(0, 12));
     const times = found.count === 1 ? 'once' : `${found.count} times`;
-    warnings.push(`pushed to the ready PR without \`P redraft\` first ${found.count} time(s): ${heads.join(', ')}; CI ran the full suite each time`);
-    return { warnings, field: { count: found.count, heads }, note: `Pushed to the ready PR without \`pipeline redraft\` first ${times}: ${heads.join(', ')} (CI ran the full suite each time).` };
+    warnings.push(`pushed to the ready PR without \`P redraft\` first ${found.count} time(s): ${heads.join(', ')}; a push to a ready PR starts the full CI suite`);
+    return { warnings, field: { count: found.count, heads }, note: `Pushed to the ready PR without \`pipeline redraft\` first ${times}: ${heads.join(', ')} (a push to a ready PR starts the full CI suite).` };
   } catch (err) {
     warnings.push(`pushed-while-ready check skipped: GitHub could not be read (${asciiLine(err?.message, 120)})`);
     return { warnings };

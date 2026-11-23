@@ -52,13 +52,17 @@ export function makeBudget(gh, { maxCalls, warnings, label }) {
   };
 }
 
+// A branch name is only unique within its repository (forks all have `main`): the fallback matches head repository AND branch, never the name alone.
+const branchKey = (repo, ref) => (typeof repo === 'string' && typeof ref === 'string' ? `${repo.toLowerCase()}#${ref}` : null);
 const prNumberOf = (run, byBranch) => {
   const n = run.pull_requests?.[0]?.number;
   if (Number.isInteger(n)) return n;
-  const list = byBranch?.get(run.head_branch) ?? [];
+  const key = branchKey(run.head_repository?.full_name, run.head_branch);
   const created = Date.parse(run.created_at);
-  // the newest PR of that branch created before the run
-  return list.filter((p) => Date.parse(p.created_at) <= created).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at))[0]?.number ?? null;
+  // the newest PR of that repository and branch created before the run; two created at the same instant cannot be told apart: unattributed
+  const list = (key === null ? [] : byBranch?.get(key) ?? []).filter((p) => Date.parse(p.created_at) <= created).sort((a, b) => Date.parse(b.created_at) - Date.parse(a.created_at));
+  if (list.length > 1 && list[0].created_at === list[1].created_at) return null;
+  return list[0]?.number ?? null;
 };
 
 // ci.draft_while_iterating of the repository's own .claude/pipeline.yml on its default branch: true | false | 'unknown'. A config without the setting is false (its default).
@@ -90,15 +94,19 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const isPrivate = repo?.private === true;
   const draftWhileIterating = readDraftFlag(gh, slug, budget, warnings);
   let totalCount = null;
+  let truncated = false; // the list of runs is known to be short: the report is partial
   const listed = pages(gh, `repos/${slug}/actions/runs?created=${encodeURIComponent(`>=${sinceIso}`)}`, undefined,
-    () => warn(`the list of workflow runs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} runs): runs further back are missing, so the totals are short (use a later --since)`),
+    () => { truncated = true; warn(`the list of workflow runs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} runs): runs further back are missing, so the totals are short (use a later --since)`); },
     { key: 'workflow_runs', onCall: () => budget.count(), onPage: (r) => { totalCount ??= Number.isFinite(r?.total_count) ? r.total_count : null; } });
-  if (totalCount !== null && totalCount > listed.length && listed.length < MAX_PAGES * PAGE) warn(`GitHub lists ${totalCount} runs for this period but returned ${listed.length}: it caps a created= search at 1000 results, so the totals are short (use a later --since)`);
+  if (totalCount !== null && totalCount > listed.length && listed.length < MAX_PAGES * PAGE) { truncated = true; warn(`GitHub lists ${totalCount} runs for this period but returned ${listed.length}: it caps a created= search at 1000 results, so the totals are short (use a later --since)`); }
   const keep = new Set(workflows);
   const runs = keep.size === 0 ? listed : listed.filter((r) => keep.has(r.name) || keep.has(r.path) || keep.has(String(r.path ?? '').split('/').pop()));
 
   // PRs: the run's own pull_requests, else its branch against the PRs list (read once, only when some run needs it)
-  const candidates = runs.filter((r) => elapsedMs(r) >= HEAVY_ELAPSED_MS);
+  // a re-run measures only its last attempt (elapsedMs): a short retry of a long run must still have its jobs read, which cover every attempt
+  const isCandidate = (r) => elapsedMs(r) >= HEAVY_ELAPSED_MS || Number(r.run_attempt) > 1;
+  const candidates = runs.filter(isCandidate);
+  let prListFailed = false;
   const prOfRun = new Map();
   let byBranch = null;
   const needsBranchLookup = candidates.some((r) => r.event === 'pull_request' && !Number.isInteger(r.pull_requests?.[0]?.number));
@@ -107,9 +115,16 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
       const list = pages(gh, `repos/${slug}/pulls?state=all&sort=updated&direction=desc`, (l) => l.every((p) => String(p.updated_at ?? '') < sinceIso),
         () => warn(`the list of PRs was cut after ${MAX_PAGES} pages: runs on a PR from a fork or without a PR link may stay unclassified`), { onCall: () => budget.tick() });
       byBranch = new Map();
-      for (const p of list) byBranch.set(p.head?.ref, [...(byBranch.get(p.head?.ref) ?? []), p]);
+      for (const p of list) {
+        const key = branchKey(p.head?.repo?.full_name, p.head?.ref);
+        if (key !== null) byBranch.set(key, [...(byBranch.get(key) ?? []), p]);
+      }
     } catch (err) {
-      if (!(err instanceof budget.stop)) throw err;
+      // optional like every other read after the first list: the runs without a PR link stay unclassified
+      if (!(err instanceof budget.stop)) {
+        prListFailed = true;
+        warn(`the list of PRs could not be read (${asciiLine(err?.message, 100)}): runs on a PR from a fork or without a PR link stay unclassified`);
+      }
     }
   }
   const prGroups = new Map(); // PR number -> { runs, candidateMs }
@@ -120,7 +135,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
     prOfRun.set(run.id, n);
     const g = prGroups.get(n) ?? { runs: [], candidateMs: 0 };
     g.runs.push(run);
-    if (elapsedMs(run) >= HEAVY_ELAPSED_MS) g.candidateMs += elapsedMs(run);
+    if (isCandidate(run)) g.candidateMs += Math.max(elapsedMs(run), 1);
     prGroups.set(n, g);
   }
 
@@ -175,7 +190,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const prRows = [];
   const classified = [];
   for (const [n, data] of readPr) {
-    const row = analysePrUsage({ number: n, ...data, runs: prGroups.get(n).runs, jobsByRun, rates, viewer });
+    const row = analysePrUsage({ number: n, ...data, runs: prGroups.get(n).runs, jobsByRun, rates, viewer, sinceMs, isPrivate });
     classified.push(...row.classified);
     const { classified: _omit, ...plain } = row;
     prRows.push(plain);
@@ -184,7 +199,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   classified.push(...classifyRuns({ runs: unread, jobsByRun, rates }));
   const agg = aggregateUsage({ classified, prRows, isPrivate, rates, draftWhileIterating });
 
-  const partial = budget.reason !== null || skipped.prs > 0 || skipped.jobs > 0;
+  const partial = budget.reason !== null || skipped.prs > 0 || skipped.jobs > 0 || truncated || prListFailed;
   if (budget.reason === 'rate-limit') warn(`the rate limit is low (${budget.rate?.remaining} calls left, stopping below ${MIN_REMAINING}): the report is partial`);
   if (budget.reason === 'max-calls') warn(`--max-calls ${maxCalls} reached: the report is partial`);
   if (skipped.prs > 0) warn(`${skipped.prs} PR(s) with heavy runs were not read: their runs are unclassified`);

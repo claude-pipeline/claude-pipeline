@@ -28,7 +28,7 @@ const COMMITS7 = [
   { sha: sha('c'), parents: [{ sha: 'p' }, { sha: 'q' }], committer: { login: 'web-flow' }, commit: { message: "Merge branch 'main' into agent/x" } },
 ];
 const run = (id, over) => ({
-  id, name: 'ci', path: '.github/workflows/ci.yml', event: 'pull_request', head_sha: sha('3'), run_attempt: 1, conclusion: 'success', head_branch: 'agent/x',
+  id, name: 'ci', path: '.github/workflows/ci.yml', event: 'pull_request', head_sha: sha('3'), run_attempt: 1, conclusion: 'success', head_branch: 'agent/x', head_repository: { full_name: 'acme/widgets' },
   pull_requests: [{ number: 7 }], created_at: T('10:30'), run_started_at: T('10:30'), updated_at: plus(T('10:30'), 10), ...over,
 });
 const job = (startedAt, minutes, labels = ['ubuntu-latest'], over = {}) => ({ run_attempt: 1, conclusion: 'success', labels, started_at: startedAt, completed_at: plus(startedAt, minutes), ...over });
@@ -61,7 +61,7 @@ const world = ({ priv = true, flag = true, runs = RUNS, remaining = 4000, extra 
   { match: '^api repos/acme/widgets/pulls/7\\b', stdoutJson: PR7 },
   { match: '^api repos/acme/widgets/issues/7/timeline', stdoutJson: TIMELINE7 },
   { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [] },
-  { match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [{ number: 7, created_at: T('09:00'), updated_at: T('13:00'), head: { ref: 'agent/x' } }] },
+  { match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [{ number: 7, created_at: T('09:00'), updated_at: T('13:00'), head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } }] },
 ];
 
 function usage(entries, args) {
@@ -110,6 +110,7 @@ test('ci-usage: a public repository is free (usd 0, billing free-public) but the
   assertExit(r, 0, r.stderr + r.stdout);
   const [repo] = r.json.repos;
   assert.deepEqual([repo.billing, repo.totals.estimatedUsd, repo.totals.jobMinutes.linux], ['free-public', 0, 25]);
+  assert.equal(repo.prs.every((p) => p.estimatedUsd === 0), true, 'R1-B8: the PR rows are free too');
 });
 
 test('ci-usage: ci.draft_while_iterating false => no missed redrafts; unreadable pipeline.yml => unknown (null), the pushes while ready are still counted', () => {
@@ -195,9 +196,18 @@ test('ci-usage: a run list cut by the page limit is a warning (and pages() repor
   const r = usage(world({ runs: light }), ['--json', '--since', '2026-11-05']);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.match(r.json.warnings.join('\n'), new RegExp(`acme/widgets: the list of workflow runs was cut after ${MAX_PAGES} pages`));
+  assert.equal(r.json.repos[0].partial, true, 'R1-B9: a cut list is not a complete report');
   let cuts = 0;
   const out = pages({ api: () => Array.from({ length: 100 }, () => ({})) }, 'repos/x/y/z', undefined, () => { cuts += 1; });
   assert.deepEqual([out.length, cuts], [MAX_PAGES * 100, 1]);
+});
+
+test('R1-B9: GitHub reporting more runs than it returned (the 1000-result cap) makes the report partial', () => {
+  const capped = [{ match: '^api repos/acme/widgets/actions/runs\\?created', stdoutJson: { total_count: 1200, workflow_runs: RUNS } }];
+  const r = usage(world({ extra: capped }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(r.json.warnings.join('\n'), /GitHub lists 1200 runs for this period but returned 6/);
+  assert.equal(r.json.repos[0].partial, true);
 });
 
 test('ci-usage: --workflow keeps only the runs of that workflow (by name, path or file name)', () => {
@@ -214,6 +224,42 @@ test('ci-usage: a run without a PR link finds its PR through the branch', () => 
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.repos[0].totals.pushesWhileReady, 1);
   assert.ok(r.fake.lines().some((l) => l.includes('pulls?state=all')));
+});
+
+test('R1-B2: two forks with a PR from the same branch name: an unlinked run goes to the PR of its own head repository, not the newest PR of that name', () => {
+  const unlinked = RUNS.map((x) => ({ ...x, pull_requests: [] }));
+  const pulls = [{ match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [
+    { number: 9, created_at: T('09:30'), updated_at: T('13:00'), head: { ref: 'agent/x', repo: { full_name: 'someone/widgets' } } },
+    { number: 7, created_at: T('09:00'), updated_at: T('13:00'), head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+  ] }];
+  const r = usage(world({ runs: unlinked, extra: pulls }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.repos[0].prs.map((p) => p.pr), [7]);
+  assert.equal(r.json.repos[0].totals.pushesWhileReady, 1);
+  assert.equal(r.json.warnings.length, 0, r.json.warnings.join('\n'));
+});
+
+test('R1-B13: the optional PR-list lookup failing leaves the runs it was for unclassified and the report partial; it is not an exit 3', () => {
+  const half = RUNS.map((x) => (x.id === 1003 ? { ...x, pull_requests: [] } : x));
+  const down = [{ match: '^api repos/acme/widgets/pulls\\?state=all', code: 1, stderr: 'gh: HTTP 502' }];
+  const r = usage(world({ runs: half, extra: down }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const repo = r.json.repos[0];
+  assert.equal(repo.partial, true);
+  assert.match(r.json.warnings.join('\n'), /acme\/widgets: the list of PRs could not be read/);
+  assert.equal(repo.totals.byClass.unclassified.runs, 1, 'only the unlinked run');
+  assert.equal(repo.prs.find((p) => p.pr === 7).heavyRuns, 3, 'the linked runs are still classified');
+});
+
+test('R1-B7: a run re-run in under a minute still has its jobs read (the first attempt\'s 20 minutes are not lost)', () => {
+  const retried = run(2001, { run_attempt: 2, created_at: T('10:30'), run_started_at: T('10:50'), updated_at: plus(T('10:50'), 1 / 3) });
+  const jobs = [{ match: '^api repos/acme/widgets/actions/runs/2001/jobs', stdoutJson: { total_count: 2, jobs: [job(T('10:30'), 20), job(T('10:50'), 1 / 3, ['ubuntu-latest'], { run_attempt: 2 })] } }];
+  const r = usage(world({ runs: [retried], extra: jobs }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const repo = r.json.repos[0];
+  assert.ok(r.fake.lines().some((l) => l.includes('runs/2001/jobs')));
+  assert.equal(Math.round(repo.totals.jobMinutes.linux * 10) / 10, 20.3);
+  assert.deepEqual([repo.totals.byClass.rerun.heavyRuns, repo.totals.coverage], [1, 100]);
 });
 
 test('ci-usage: without --json it prints a plain-text table with the warnings; GitHub unreachable for the first list is exit 3', () => {

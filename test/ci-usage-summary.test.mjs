@@ -20,7 +20,7 @@ const gh = ({ runs, timelineFail = false } = {}) => createFakeGh([
   { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget', headRefName: 'agent/feat', baseRefName: 'main', headRefOid: sha('b') } },
   ME, REPO,
   { match: '^api repos/acme/widgets/pulls/12/commits', stdoutJson: [{ sha: sha('a'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }] },
-  { match: '^api repos/acme/widgets/pulls/12\\b', stdoutJson: { number: PR, created_at: T('09:00'), draft: false, head: { ref: 'agent/feat' } } },
+  { match: '^api repos/acme/widgets/pulls/12\\b', stdoutJson: { number: PR, created_at: T('09:00'), draft: false, head: { ref: 'agent/feat', repo: { full_name: 'acme/widgets' } } } },
   timelineFail ? { match: '^api repos/acme/widgets/issues/12/timeline', code: 1, stderr: 'gh: HTTP 502' } : { match: '^api repos/acme/widgets/issues/12/timeline', stdoutJson: TIMELINE },
   { match: '^api repos/acme/widgets/actions/runs\\?event=pull_request&branch=agent%2Ffeat', stdoutJson: { total_count: runs?.length ?? 0, workflow_runs: runs ?? [] } },
   { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
@@ -41,10 +41,19 @@ test('summary: flag true and one push while ready => a warning, the JSON field a
   const r = summary(true, fake);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(r.json.pushedWhileReady, { count: 1, heads: [sha('b').slice(0, 12)] });
-  assert.ok(r.json.warnings.includes(`pushed to the ready PR without \`P redraft\` first 1 time(s): ${sha('b').slice(0, 12)}; CI ran the full suite each time`), r.json.warnings.join('\n'));
+  assert.ok(r.json.warnings.includes(`pushed to the ready PR without \`P redraft\` first 1 time(s): ${sha('b').slice(0, 12)}; a push to a ready PR starts the full CI suite`), r.json.warnings.join('\n'));
   const text = body(fake);
   assert.ok(text.startsWith(MARKERS.summary));
-  assert.match(text, /Pushed to the ready PR without `pipeline redraft` first once: b{12} \(CI ran the full suite each time\)\./);
+  assert.match(text, /Pushed to the ready PR without `pipeline redraft` first once: b{12} \(a push to a ready PR starts the full CI suite\)\./);
+});
+
+test('R1-B1: an unlinked run of a same-named branch from another fork is not this PR\'s push; an unlinked run of the PR\'s own repository is', () => {
+  const own = { head_repository: { full_name: 'acme/widgets' }, pull_requests: [] };
+  const fork = { head_repository: { full_name: 'someone/widgets' }, pull_requests: [] };
+  const fake = gh({ runs: [run(1, sha('a'), T('09:30')), run(2, sha('b'), T('10:30'), own), run(3, sha('f'), T('10:40'), fork), run(4, sha('g'), T('10:50'), { pull_requests: [] })] });
+  const r = summary(true, fake);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.pushedWhileReady, { count: 1, heads: [sha('b').slice(0, 12)] }, 'the fork head and the run with no known head repository stay unattributed');
 });
 
 test('summary: flag true but every push was made in draft => no warning, no field, no comment line', () => {
