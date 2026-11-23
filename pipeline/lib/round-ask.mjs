@@ -84,12 +84,20 @@ export function openItems(state, outcome, { config, files, baseConfig, baseProbl
   }).sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0));
 }
 
-// The reasons the outcome is not clean, in plain words. `changed` = { commits, files, lines } since the last review (only given when the coverage is invalid
-// and no accepted fix explains it).
+// The reasons the outcome is not clean, in plain words. `changed` = { commits, files, lines, own, resolution } since the last review (only given when the coverage is invalid
+// and no accepted fix explains it). own: the counts leave the default branch's merges out (round-status.mjs#sinceLastReview); resolution: and a conflict resolution is part of them.
+function changedSince(changed) {
+  const tail = `${plural(changed.files, 'file')}, ${plural(changed.lines, 'line')} that fix no item`;
+  if (changed.own !== true) return `changed since the last review: ${plural(changed.commits, 'commit')}, ${tail}`;
+  if (changed.commits > 0) return `changed since the last review (the PR's own changes, default-branch merges left out): ${plural(changed.commits, 'commit')}, ${tail}`;
+  const why = changed.resolution ? 'a default-branch merge and its conflict resolution' : changed.files > 0 ? 'edits inside a default-branch merge commit' : 'default-branch merges only';
+  return `changed since the last review: 0 own commits (${why}), ${tail}`;
+}
+
 export function notCleanReasons(outcome, changed) {
   const out = [];
   if (outcome.newAccepted.length > 0) out.push(`fixes not re-reviewed (${outcome.newAccepted.join(', ')})`);
-  if (changed) out.push(`changed since the last review: ${plural(changed.commits, 'commit')}, ${plural(changed.files, 'file')}, ${plural(changed.lines, 'line')} that fix no item`);
+  if (changed) out.push(changedSince(changed));
   if (outcome.needsHuman.length > 0) out.push(`needs a ruling (${outcome.needsHuman.join(', ')})`);
   if (outcome.fablePending.length > 0) out.push(`Fable pass owed (round ${outcome.fablePending.join(', ')})`);
   if (outcome.pending.length > 0) out.push(`pending (${outcome.pending.join(', ')})`);

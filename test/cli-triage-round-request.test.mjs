@@ -140,7 +140,7 @@ test('round-request: why the review is not clean is in plain words: commits that
   w.repo.commit('ci fix');
   const r = ask(w);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.match(r.json.notClean.join(';'), /changed since the last review: 2 commits, 2 files, \d+ lines that fix no item/);
+  assert.match(r.json.notClean.join(';'), /changed since the last review \(the PR's own changes, default-branch merges left out\): 2 commits, 2 files, \d+ lines that fix no item/);
   assert.equal(r.json.recommend, 'extra-round', 'nothing accepted is waiting, so a round is what it takes');
   assert.deepEqual([r.json.discard.count, r.json.discard.anchor], [2, w.state().rounds[1].toHead.slice(0, 12)]);
   w.edit((s) => { s.rounds[1].items[0].final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'x', cause: 'low-confidence' }; });
@@ -400,6 +400,123 @@ test('round-request nextRound: a main merge with a provable conflict resolution 
   assert.deepEqual([counted.json.nextRound.kind, counted.json.nextRound.sinceReviewed], ['conflict', { merges: 1, ownCommits: 1 }]);
   assert.match(counted.json.nextRound.resolutionIneligible, /^history-nonmerge/);
   assert.match(counted.json.summary, /^Prediction: the next round would be a counted round on the PR's own changes since the last reviewed head and its conflict resolutions \(the default branch's commits left out\)[^\n]*\.$/m);
+});
+
+// #423: "changed since the last review" counts the PR's own changes (the default branch's merges left out), not main's commits and files (EW #1901 round 16 reported 11 commits,
+// 232 files, 13405 lines for one function and three tests). Failure caught: the owner is told a tiny PR is huge because main moved.
+const changedLine = (r) => r.json.notClean.find((l) => l.startsWith('changed since the last review'));
+const ownRe = (commits, files) => new RegExp(`^changed since the last review \\(the PR's own changes, default-branch merges left out\\): ${commits}, ${files}, \\d+ lines? that fix no item$`);
+// The last reviewed head is h2 (every item deferred), then one own commit (src/c.js) on the branch.
+function ownCountWorld(t) {
+  const w = roundWorld(t);
+  const { h2 } = w.atCap();
+  w.edit((s) => { s.rounds[1].toHead = h2; for (const i of s.rounds[1].items) i.final = { decision: 'FOLLOW-UP', by: 'judge', needsHuman: false, reason: 'later' }; });
+  return w;
+}
+const ownCommit = (w) => {
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  w.repo.commit('own commit');
+};
+const mainAddsThreeFiles = (w) => {
+  w.repo.checkout('main');
+  for (const n of ['m1', 'm2', 'm3']) w.repo.write(`src/${n}.js`, `export const ${n} = 1;\n`);
+  w.repo.commit('main adds three files');
+  w.repo.checkout('feat/x');
+};
+
+test('round-request changed-since #423: a clean main merge bringing 3 files plus one own commit counts 1 commit, 1 file', (t) => {
+  const w = ownCountWorld(t);
+  ownCommit(w);
+  mainAddsThreeFiles(w);
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(changedLine(r), ownRe('1 commit', '1 file'));
+});
+
+test('round-request changed-since #423: after a conflicting merge the own commit and the resolved file are counted, not main\'s changes', (t) => {
+  const w = ownCountWorld(t);
+  ownCommit(w);
+  mainAddsThreeFiles(w);
+  mergeConflictingMain(w);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(changedLine(r), ownRe('1 commit', '2 files'));
+});
+
+test('round-request changed-since #423: a merge-only conflict catch-up says 0 own commits, a conflict resolution, and counts the resolved file', (t) => {
+  const w = ownCountWorld(t);
+  mainAddsThreeFiles(w);
+  mergeConflictingMain(w);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(changedLine(r), /^changed since the last review: 0 own commits \(a default-branch merge and its conflict resolution\), 1 file, \d+ lines? that fix no item$/);
+});
+
+test('round-request changed-since #423: a clean merge-only catch-up counts nothing as the PR\'s own', (t) => {
+  const w = ownCountWorld(t);
+  mainAddsThreeFiles(w);
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(changedLine(r), /^changed since the last review: 0 own commits \(default-branch merges only\), 0 files, 0 lines that fix no item$/);
+});
+
+test('round-request changed-since #423: with a whole-PR round owed one new own commit still counts as 1 commit (the increment, not the whole PR)', (t) => {
+  const w = ownCountWorld(t);
+  w.edit((s) => {
+    s.version = Math.max(s.version, 5);
+    s.rounds[0].substitute = { agent: 'substitute-opus' };
+    s.rounds[0].risk = 'low';
+    s.rounds[1].risk = 'high';
+  });
+  ownCommit(w);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.nextRound.kind, 'merge-base');
+  assert.match(changedLine(r), ownRe('1 commit', '1 file'));
+});
+
+test('round-request changed-since #423: a stacked PR (base is not the default branch) keeps the raw counts and wording', (t) => {
+  const w = ownCountWorld(t);
+  ownCommit(w);
+  mainAddsThreeFiles(w);
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  w.fake.setScript([
+    { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'parent', headRefOid: w.repo.git(['rev-parse', 'HEAD']).trim() } },
+    { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: w.slug, url: `https://github.com/${w.slug}` } },
+  ]);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(changedLine(r), /^changed since the last review: 3 commits, 4 files, \d+ lines? that fix no item$/);
+});
+
+test('round-request changed-since #423: a base branch GitHub cannot name keeps the raw counts', (t) => {
+  const w = ownCountWorld(t);
+  ownCommit(w);
+  mainAddsThreeFiles(w);
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']);
+  w.fake.setScript([
+    { match: '^pr view 7 --json baseRefName$', code: 1, stderr: 'GraphQL: could not resolve' },
+    { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: w.repo.git(['rev-parse', 'HEAD']).trim() } },
+    { match: '^repo view', stdoutJson: { ...REPO_VIEW, nameWithOwner: w.slug, url: `https://github.com/${w.slug}` } },
+  ]);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(changedLine(r), /^changed since the last review: 3 commits, 4 files, \d+ lines? that fix no item$/);
+});
+
+test('round-request changed-since #423: a trusted PR whose only merge since the last review is a foreign topic branch keeps the raw counts', (t) => {
+  const w = ownCountWorld(t);
+  w.repo.git(['checkout', '-q', '-b', 'topic', 'main']);
+  w.repo.write('src/topic.js', 'export const topic = 1;\n');
+  w.repo.commit('topic work');
+  w.repo.checkout('feat/x');
+  w.repo.git(['merge', '--no-ff', '-m', 'Merge topic into feat/x', 'topic']);
+  ownCommit(w);
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(changedLine(r), /^changed since the last review: 3 commits, 2 files, \d+ lines? that fix no item$/);
 });
 
 // Failure caught: the alternative promised a free recording after a CONFLICTING merge; the conflict keeps the PR whole-PR and the reverted commits stay in the history, so the round is counted.

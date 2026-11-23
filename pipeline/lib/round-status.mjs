@@ -1,7 +1,8 @@
 // The review's status as the owner reads it: how many rounds ran, what they cost, which items are open and how serious, why the review is not clean. One gatherer
 // feeds both the extra-round ask (`triage round-request`) and the park comment (`comment --kind needs-human`), so the two cannot drift. Display only: nothing here decides
 // anything. Untrusted text (titles, categories) goes through asciiLine inside round-ask.mjs.
-import { conflictReviewBase, diffFiles, git, isAncestor, mergeBase, mergeTree, resolutionReviewBase, revParse } from './git.mjs';
+import { conflictReviewBase, diffFiles, effectiveReviewBase, git, GitError, isAncestor, mergeBase, mergeTree, ownHistoryProblem, resolutionReviewBase, revParse } from './git.mjs';
+import { mergeInIneligible } from './fix-verify.mjs';
 import { trustedBase } from './risk.mjs';
 import { diffStats } from './diff.mjs';
 import { costFrom, notCleanReasons, openItems, roundsFrom, statusLines } from './round-ask.mjs';
@@ -38,8 +39,40 @@ export function reviewedDiff(root, config, state) {
   }
 }
 
+// The PR's own changes since the last reviewed head `full`, with the default branch's merges left out the way the next review round leaves them out (#423): the clean-merge
+// tree base (effectiveReviewBase), or, when that merge conflicted, the conflict round's marker tree (git.mjs#conflictReviewBase). Both hold only when the PR targets the trusted
+// default branch with a trusted anchor (fix-verify.mjs#mergeInIneligible) and the history since `full` is the PR's own commits plus merges of that branch (rule H,
+// git.mjs#ownHistoryProblem), so a foreign or octopus merge or a rewrite gives raw counts. A whole-PR round that is OWED does not matter here: it decides the next round's range, not what
+// changed since the last one. -> { commits, files, lines, own: true, resolution } (commits = the one-parent commits on the first-parent chain; resolution: the base is a conflict one), or
+// null for any doubt or git failure (the caller counts raw).
+function ownChanges({ root, config, pr, gh, full, o }) {
+  if (mergeInIneligible({ pr, gh, root, config }) !== undefined) return null;
+  try {
+    const baseRef = reviewBaseRef(root, config);
+    const head = revParse('HEAD', o);
+    if (ownHistoryProblem({ from: full, head, baseRef }, o) !== null) return null;
+    const forkPoint = mergeBase(baseRef, head, o);
+    let since = effectiveReviewBase({ from: full, forkPoint }, o);
+    let resolution = false;
+    if (since.kind === 'whole-pr') {
+      const conflict = conflictReviewBase({ from: full, forkPoint, head, baseRef }, o);
+      if (conflict.unavailable !== undefined) return null;
+      since = { base: conflict.base, kind: 'conflict' };
+      resolution = true;
+    }
+    const files = diffFiles(since.base, head, o, { treeBase: true });
+    return { commits: ownCommitCount(full, head, o), files, own: true, resolution };
+  } catch (err) {
+    if (err instanceof GitError) return null;
+    throw err;
+  }
+}
+
+const ownCommitCount = (full, head, o) => git(['rev-list', '--first-parent', '--parents', head, `^${full}`], o).split('\n').filter((l) => l !== '' && l.split(' ').length === 2).length;
+
 // The commits since the last reviewed head (what deferring would take out), and, when nothing explains them as fixes, how much changed.
-export function sinceLastReview(root, config, state, { withChanges }) {
+// changed = { commits, files, lines, own, resolution }: own true counts only the PR's own changes (ownChanges above); own false is the raw full..HEAD measure.
+export function sinceLastReview(root, config, state, { withChanges, pr, gh }) {
   const anchor = state.rounds.at(-1)?.toHead;
   const none = { anchor: null, count: 0, commits: [], changed: null };
   if (typeof anchor !== 'string' || anchor === '') return none;
@@ -48,8 +81,15 @@ export function sinceLastReview(root, config, state, { withChanges }) {
   const log = git(['log', '--format=%h %s', `${full}..HEAD`], o).split('\n').filter(Boolean);
   let changed = null;
   if (withChanges && log.length > 0) {
-    const files = diffFiles(full, 'HEAD', o).filter((f) => f.path !== config.agent_log && f.newPath !== config.agent_log);
-    changed = { commits: log.length, files: files.length, lines: diffStats(files).changedLines };
+    const notLog = (f) => f.path !== config.agent_log && f.newPath !== config.agent_log;
+    const own = gh === undefined ? null : ownChanges({ root, config, pr, gh, full, o });
+    if (own !== null) {
+      const files = own.files.filter(notLog);
+      changed = { commits: own.commits, files: files.length, lines: diffStats(files).changedLines, own: true, resolution: own.resolution };
+    } else {
+      const files = diffFiles(full, 'HEAD', o).filter(notLog);
+      changed = { commits: log.length, files: files.length, lines: diffStats(files).changedLines, own: false, resolution: false };
+    }
   }
   return { anchor: full.slice(0, 12), count: log.length, commits: log.slice(0, 20).map((l) => asciiLine(l, 100)), changed };
 }
@@ -72,7 +112,7 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
   const diff = reviewedDiff(root, config, state);
   let since = { anchor: null, count: 0, commits: [], changed: null };
   try {
-    since = sinceLastReview(root, config, state, { withChanges: !outcome.coverageValid && outcome.newAccepted.length === 0 });
+    since = sinceLastReview(root, config, state, { withChanges: !outcome.coverageValid && outcome.newAccepted.length === 0, pr, gh });
   } catch (err) {
     warnings.push(`the commits since the last review could not be listed (${asciiLine(err?.message, 120)})`);
   }
