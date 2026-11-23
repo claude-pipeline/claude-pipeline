@@ -2162,7 +2162,7 @@ const NAME_OPERAND_CMDS = new Set(['read', 'mapfile', 'readarray', 'getopts', 's
 function bindingIndex(text, cmds, f) {
   const events = new Set();
   const other = new Set();
-  const mark = (k, ok) => { events.add(k); if (!ok) other.add(k); };
+  const mark = (k, ok) => { events.add(k); f.binds.set(k, (f.binds.get(k) ?? 0) + 1); if (!ok) other.add(k); };
   // (the expansion-aware text: an append or a `${x:=v}` inside a single-quoted program, `python3 -c 'i+=1'`, is that program's)
   for (const m of f.g.matchAll(/\$\{([A-Za-z_]\w*)(?:\[[^\]\n]{0,64}\])?:{0,2}=/g)) mark(m[1], false); // (`${x:=v}`)
   for (const k of f.bodyTargets) mark(k, true);
@@ -2220,7 +2220,7 @@ function bindingIndex(text, cmds, f) {
     const gap = text.slice(cursor, at);
     if (!/^(?:\s|#[^\n]*)*$/.test(gap.replace(/;/g, ' ')) || (cursor > 0 && !/[;\n]/.test(gap))) break;
     cursor = at + c.raw.length;
-    for (const w of ws) { const m = ASSIGN_WORD.exec(w); if (m[2] === undefined && !m[3]) { f.certainScalar.add(m[1]); if (m[4].startsWith('(')) f.certainArray.add(m[1]); } }
+    for (const w of ws) { const m = ASSIGN_WORD.exec(w); if (m[2] === undefined && !m[3]) { f.certainScalar.add(m[1]); f.certainVal.set(m[1], m[4]); if (m[4].startsWith('(')) f.certainArray.add(m[1]); } }
   }
   f.events = events;
   f.other = other;
@@ -2239,9 +2239,28 @@ function readUnproven(k, r, f, outer, depth = 0) {
   if (SHELL_SUPPLIED_NUMBERS.has(k)) return false;
   return SHELL_SUPPLIED_TEXT.has(k) || SHELL_TEXT_PREFIX.test(k);
 }
+// Does an unquoted `$k` supply exactly ONE field (it cannot vanish or split)? Only a value known for certain here: bound once, by the leading run, or a known value of the caller; non-empty, no blank, no glob character, and no IFS bound anywhere.
+function oneField(k, f, outer) {
+  if (f.runner || f.nameref || f.other.has('IFS') || f.events.has('IFS')) return false;
+  if (outer && (outer.unknownAll === true || outer.unknown?.has('IFS') || [outer.vars, outer.env].some((src) => src && Object.hasOwn(src, 'IFS')))) return false;
+  let v;
+  if (f.certainScalar.has(k) && !f.certainArray.has(k)) {
+    if ((f.binds.get(k) ?? 0) !== 1) return false;
+    v = f.certainVal.get(k) ?? '';
+    if (provenIntegerWord(v) && !/\s/.test(v)) return true;
+    v = v.replace(/^(["'])(.*)\1$/, '$2');
+    if (/[$`\\"']/.test(v)) return false;
+  } else {
+    if (f.events.has(k) || !outer || outer.unknownAll === true || outer.unknown?.has(k)) return false;
+    const src = [outer.vars, outer.env].find((x) => x && Object.hasOwn(x, k));
+    if (!src) return false;
+    v = src[k];
+  }
+  return typeof v === 'string' && v !== '' && !/[\s*?[]/.test(v);
+}
 const ARITH_CACHE = new WeakMap();
 function arithFrame(text, cmds, depth) {
-  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, badBody: -1, spans: [], s: '', subs: [], copies: [], bodyTexts: [], g: '', modReads: new Map(), shiftedBodies: [] };
+  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, badBody: -1, spans: [], s: '', subs: [], copies: [], bodyTexts: [], g: '', modReads: new Map(), shiftedBodies: [], binds: new Map(), certainVal: new Map() };
   if (depth === 0 && !/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s|\bprintf\b|\bprint\b|\beval\b|\btrap\b|\b(?:declare|typeset|local)\s+[-+][A-Za-z]*n/.test(text)) return f;
   const s = quotedBodiesBlank(text, cmds);
   const g = expansionText(s, cmds);
@@ -2277,7 +2296,7 @@ function arithFrame(text, cmds, depth) {
       try { sub = arithFrame(t, simpleCommands(t, {}), depth + 1); } catch { f.why ??= 'the text of an eval or trap'; continue; }
       for (const k of sub.names) f.names.add(k);
       // (the text may bind any name it writes: the caller's reads see that; its own reads are judged in arithAssignedNames with the caller's bindings)
-      for (const k of sub.events ?? []) f.events.add(k);
+      for (const k of sub.events ?? []) { f.events.add(k); f.binds.set(k, (f.binds.get(k) ?? 0) + 2); }
       for (const k of sub.other ?? []) f.other.add(k);
       f.subs.push(sub);
       if (sub.dynamic || sub.why || sub.runner || sub.nameref) { f.dynamic = true; f.why ??= sub.why ?? 'the text of an eval or trap'; }
@@ -2306,11 +2325,11 @@ export function arithAssignedNames(raw, cmds = null, outer = null) {
     const merged = { other: new Set([...f.other, ...(sub.other ?? [])]), certainScalar: new Set([...f.certainScalar, ...sub.certainScalar]), certainArray: new Set([...f.certainArray, ...sub.certainArray]), copies: [...f.copies, ...sub.copies] };
     for (const [k, r] of [...sub.reads, ...sub.modReads]) if (readUnproven(k, r, merged, outer)) { proof = `an arithmetic in an eval or trap reads \`${k}\`, whose value is not a plain number here`; break; }
   }
-  // (a word after a bare `$name` printf argument is a body only when that name is not proven to be one number: `printf '%d %s' $count "$ref"` with `count=3` leaves `$ref` text)
+  // (a word after a bare `$name` printf argument is a body unless that name certainly supplies exactly one field: `printf '%d %s' $count "$ref"` with `count=3` or `label=files` leaves `$ref` text)
   const names = new Set(f.names);
   let dynamicShift = false;
-  for (const sb of f.shiftedBodies) {
-    if (!sb.guards.some((k) => readUnproven(k, { plain: true, sub: false }, f, outer))) continue;
+  for (const sb of [...f.shiftedBodies, ...f.subs.flatMap((sub) => sub.shiftedBodies)]) {
+    if (sb.guards.every((k) => oneField(k, f, outer))) continue;
     for (const k of sb.names) names.add(k);
     if (sb.dynamic) dynamicShift = true;
     if (proof === null) {

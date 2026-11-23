@@ -478,4 +478,10 @@ test('R3-B1 / R3-B2 / R3-F1: an unquoted bare $name printf argument moves only t
   // R4-B1: a bare name that is a proven number supplies exactly one field, so a text word after it stays text
   allow('ref=HEAD; count=3; printf \'%d %s\\n\' $count "$ref"; git show $ref');
   allow('ref=HEAD; count=3; printf \'%d %s\\n\' $count status=ok; git show $ref');
+  // R5-B1: what matters is that the name supplies exactly ONE field, not that it is a number: a text label does; an unset name, an empty value and a changed IFS do not
+  allow('label=files; ref=HEAD; printf \'%s %s %d\\n\' $label "$ref" 3; git show "$ref"');
+  deny(P("printf '%d %s\\n' $zz 'n=7'"));
+  deny(P("count=''; printf '%d %s\\n' $count 'n=7'"));
+  deny(P("IFS=3; count=3; printf '%d %s\\n' $count 'n=7'"));
+  deny(P("label=a; label=; printf '%s %d %s\\n' $label 1 'n=7'"));
 });
