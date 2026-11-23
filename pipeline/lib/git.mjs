@@ -506,7 +506,8 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
   // can conflict in the real merge and be absent from the trial list, with no evidence and no marker check. Any conflict a merge commit of the
   // chain has outside the trial list is refused (the whole PR is then reviewed).
   // Per conflicted path, in chain order (oldest merge first; `merges` is newest first). A merge with a conflict entry for the path must have the
-  // trial's stage 2 (an own commit that edited the file before the merge changes it: a resolver restoring the reviewed blob would hide the edit from
+  // trial's stage 1 (main moved between the merges: a different merge base means the real merge conflicts elsewhere than the trial, where a resolver
+  // taking the incoming text leaves no trace), stage 2 (an own commit that edited the file before the merge changes it: a resolver restoring the reviewed blob would hide the edit from
   // every review) AND stage 3 (an earlier main commit's side is not the one the trial merge shows, so the text the resolver accepted would reach no
   // reviewer), and only ONE merge of the chain may conflict on a path: the trial merge shows only the last main commit's side, so an earlier
   // merge's conflict would reach no reviewer. A merge with NO entry for the path is fine when the path's entry in its first parent is unchanged since the last reviewed head, or, once an earlier
@@ -528,7 +529,7 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
       const entry = actual.conflicts.find((a) => a.path === c.path);
       if (entry) {
         if (conflictedIn.has(c.path)) twice.push(c.path);
-        else if (!sameEntry(c.stages[2], entry.stages[2]) || !sameEntry(c.stages[3], entry.stages[3])) changed.push(c.path);
+        else if (!sameEntry(c.stages[1], entry.stages[1]) || !sameEntry(c.stages[2], entry.stages[2]) || !sameEntry(c.stages[3], entry.stages[3])) changed.push(c.path);
         conflictedIn.add(c.path);
       } else if (conflictedIn.has(c.path) ? !sameEntry(resultEntries.get(c.path), parentEntries.get(c.path)) : !sameEntry(parentEntries.get(c.path), fromEntries.get(c.path))) changed.push(c.path);
     }

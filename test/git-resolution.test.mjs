@@ -1557,6 +1557,25 @@ test('conflictReviewBase (R4-B2): an own commit edits f.txt after the conflict m
   cNo(cdecide(s, s.repo.commit('merge main cleanly, f.txt back to the first resolution')), 'evidence', 'f.txt');
 });
 
+test('conflictReviewBase (R5-B1): main moved between the merges, so the real conflict merge has a different base than the trial -> evidence, the PR\'s revert of main-1\'s change is in no record', () => {
+  // Prevents: a resolver taking main-2's text at the second setting (the real merge conflicted there, the trial did not), so the narrow patch omits it and the PR's revert of main-1's change goes unseen.
+  const file = (s1, s2) => T('top', s1, ...GAP, s2, 'bottom');
+  const s = conflictRepo({
+    base: { 'f.txt': file('x', 'A') },
+    ours: { 'f.txt': file('o', 'A') },
+    theirs: { 'f.txt': file('x', 'B') },
+  });
+  s.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main cleanly', 'main']);
+  s.repo.write('f.txt', file('o', 'A'));
+  s.repo.commit('own commit restores the second setting');
+  s.repo.checkout('main');
+  s.repo.write('f.txt', file('t', 'C'));
+  s.repo.commit('main changes both settings');
+  s.repo.checkout('feat');
+  const head = resolveMerge(s.repo, { 'f.txt': file('o', 'C') });
+  cNo(cdecide(s, head), 'evidence', 'f.txt');
+});
+
 test('renderConflictSides (R1-B4, R1-B7): a recorded conflict that no longer conflicts, or a blob with hundreds of thousands of lines, is unavailable (whole PR), never an incomplete file or a throw', () => {
   // Prevents: a file missing one conflict's sides being pinned as the Fable evidence, and `arbiter needed` crashing on a RangeError (a spread of every line into one call) instead of falling back.
   const s = conflictRepo({
