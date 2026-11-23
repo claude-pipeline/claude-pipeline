@@ -16,11 +16,11 @@ const run = (id, head, created, over = {}) => ({
 });
 // PR 12 opened as a draft at 09:00, marked ready at 10:00
 const TIMELINE = [ev('ready_for_review', T('10:00'))];
-const gh = ({ runs, timelineFail = false } = {}) => createFakeGh([
+const gh = ({ runs, timelineFail = false, pullCommits } = {}) => createFakeGh([
   { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget', headRefName: 'agent/feat', baseRefName: 'main', headRefOid: sha('b') } },
   ME, REPO,
   { match: '^api repos/acme/widgets/pulls/12/commits', stdoutJson: [{ sha: sha('a'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }] },
-  { match: '^api repos/acme/widgets/pulls/12\\b', stdoutJson: { number: PR, created_at: T('09:00'), draft: false, head: { ref: 'agent/feat', repo: { full_name: 'acme/widgets' } } } },
+  { match: '^api repos/acme/widgets/pulls/12\\b', stdoutJson: { number: PR, created_at: T('09:00'), draft: false, ...(pullCommits === undefined ? {} : { commits: pullCommits }), head: { ref: 'agent/feat', repo: { full_name: 'acme/widgets' } } } },
   timelineFail ? { match: '^api repos/acme/widgets/issues/12/timeline', code: 1, stderr: 'gh: HTTP 502' } : { match: '^api repos/acme/widgets/issues/12/timeline', stdoutJson: TIMELINE },
   { match: '^api repos/acme/widgets/actions/runs\\?event=pull_request&branch=agent%2Ffeat', stdoutJson: { total_count: runs?.length ?? 0, workflow_runs: runs ?? [] } },
   { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
@@ -54,6 +54,17 @@ test('R1-B1: an unlinked run of a same-named branch from another fork is not thi
   const r = summary(true, fake);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(r.json.pushedWhileReady, { count: 1, heads: [sha('b').slice(0, 12)] }, 'the fork head and the run with no known head repository stay unattributed');
+});
+
+test('R4-B4: past the 250-commit cap a head missing from the returned commits is not named as a push, and the warning says it could not be checked', () => {
+  // failure caught: the omitted newest head (an update-branch merge, say) has no commit record, so it was published as a push made without redrafting
+  const fake = gh({ runs: pushedReady, pullCommits: 251 });
+  const r = summary(true, fake);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.pushedWhileReady, undefined);
+  assert.match(r.json.warnings.join('\n'), /GitHub lists 251 commits for this PR but returned 1 .*could not be checked/);
+  assert.doesNotMatch(r.json.warnings.join('\n'), /may be short|without `P redraft`/);
+  assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
 });
 
 test('summary: flag true but every push was made in draft => no warning, no field, no comment line', () => {

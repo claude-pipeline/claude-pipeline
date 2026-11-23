@@ -24,7 +24,9 @@ export async function pushedWhileReadyOf({ root, gh, pr }) {
     const pull = gh.api('GET', `repos/${slug}/pulls/${pr}`);
     const timeline = pages(gh, `repos/${slug}/issues/${pr}/timeline`, undefined, cut('timeline events'));
     const commits = pages(gh, `repos/${slug}/pulls/${pr}/commits`, undefined, cut('commits'));
-    if (Number.isInteger(pull?.commits) && pull.commits > commits.length) warnings.push(`pushed-while-ready check: GitHub lists ${pull.commits} commits for this PR but returned ${commits.length} (it caps the commits of a PR at 250): the count may be short`);
+    // GitHub returns the OLDEST 250 commits, so the heads it left out are the newest; with no commit record the classifier would call an update-branch merge there a push, so such a head stays out of the count
+    const capped = Number.isInteger(pull?.commits) && pull.commits > commits.length;
+    if (capped) warnings.push(`pushed-while-ready check: GitHub lists ${pull.commits} commits for this PR but returned ${commits.length} (it caps the commits of a PR at 250): the heads of the commits it left out could not be checked`);
     const branch = pull?.head?.ref;
     if (typeof branch !== 'string' || branch === '' || typeof pull?.created_at !== 'string') throw new Error('the PR has no branch or creation time');
     const created = Date.parse(pull.created_at);
@@ -33,11 +35,14 @@ export async function pushedWhileReadyOf({ root, gh, pr }) {
       // whose head repository is this PR's (an unlinked run of an unknown or other repository stays unattributed)
       .filter((r) => Date.parse(r.created_at) >= created && ((r.pull_requests ?? []).length === 0 ? sameRepo(r.head_repository?.full_name, pull.head?.repo?.full_name) : r.pull_requests.some((p) => p?.number === pr)));
     const found = pushedWhileReady({ pr: { createdAt: pull.created_at, draft: pull.draft === true, baseRef: pull.base?.ref, baseRepo: pull.base?.repo?.full_name }, timeline, commits, runs });
-    if (found.count === 0) return { warnings };
-    const heads = found.heads.map((h) => h.sha.slice(0, 12));
-    const times = found.count === 1 ? 'once' : `${found.count} times`;
-    warnings.push(`pushed to the ready PR without \`P redraft\` first ${found.count} time(s): ${heads.join(', ')}; a push to a ready PR starts the full CI suite`);
-    return { warnings, field: { count: found.count, heads }, note: `Pushed to the ready PR without \`pipeline redraft\` first ${times}: ${heads.join(', ')} (a push to a ready PR starts the full CI suite).` };
+    const listed = new Set(commits.map((c) => c?.sha));
+    const checked = capped ? found.heads.filter((h) => listed.has(h.sha)) : found.heads;
+    if (checked.length === 0) return { warnings };
+    const count = checked.length;
+    const heads = checked.map((h) => h.sha.slice(0, 12));
+    const times = count === 1 ? 'once' : `${count} times`;
+    warnings.push(`pushed to the ready PR without \`P redraft\` first ${count} time(s): ${heads.join(', ')}; a push to a ready PR starts the full CI suite`);
+    return { warnings, field: { count, heads }, note: `Pushed to the ready PR without \`pipeline redraft\` first ${times}: ${heads.join(', ')} (a push to a ready PR starts the full CI suite).` };
   } catch (err) {
     warnings.push(`pushed-while-ready check skipped: GitHub could not be read (${asciiLine(err?.message, 120)})`);
     return { warnings };
