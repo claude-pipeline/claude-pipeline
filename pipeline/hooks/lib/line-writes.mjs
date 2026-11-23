@@ -1264,7 +1264,7 @@ function visible(frame, at, idx, late = false) {
   let lo = at;
   while (lo > 0 && cmds[lo].sep === '|') lo--;
   if (idx >= lo && idx <= hi) return true;
-  return cmds[hi + 1]?.sep === '&';
+  return cmds[hi + 1]?.sep === '&' || cmds[at]?.maybeBg === true; // (#529: a command the parser marks maybeBg may be a background job in dash: later writes may land before or while it runs)
 }
 
 // Is the record of command idx of frames[fi] visible to the command being judged (command `at` of that frame, or the call into the frames above it)? Why: background work started by a script judged
@@ -1289,7 +1289,7 @@ function placeOf(f, rec) {
   const c = f.cmds;
   const [lo, hi] = groupOf(c, rec.idx);
   return {
-    bg: rec.bg === true || f.opaque === true || c[hi + 1]?.sep === '&',
+    bg: rec.bg === true || f.opaque === true || c[hi + 1]?.sep === '&' || c[rec.idx]?.maybeBg === true, // (#529: a command of a `&>` span may run as a background job)
     opt: rec.opt === true || c[lo]?.sep === '&&' || c[lo]?.sep === '||' || c[hi + 1]?.sep === '||' || inFlow(f.from, rec.idx),
   };
 }
@@ -1315,7 +1315,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   const lone = typeof text === 'string' ? (text.match(/(?<![&|<>])&(?![&>])/g) ?? []).length : 0;
   const seps = cmds.filter((c) => c.sep === '&').length;
   const opaque = lone > seps || cmds.some(startsBackground);
-  const bgWork = seps > 0 || opaque;
+  const bgWork = seps > 0 || opaque || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
   return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
 }
 
