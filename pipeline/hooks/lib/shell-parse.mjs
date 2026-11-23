@@ -2107,7 +2107,7 @@ function withoutRedirects(ws) {
   }
   return out;
 }
-function printfBodies(c, add) {
+function printfBodies(c, add, addShifted) {
   // (the words the arguments are read from are the parser's own, brace lists expanded: `printf '%s %d' {a,total}` has two; the written words only tell how each was quoted)
   const ws = withoutRedirects(writtenWords(c.raw ?? ''));
   const k = ws.findIndex((w) => !ASSIGN_WORD.test(w)); // (the command word)
@@ -2143,11 +2143,13 @@ function printfBodies(c, add) {
   const isInt = (w) => wholeArith(w) !== null || /^"?\$[?#$!]"?$/.test(w) || /^"?\$\{#[A-Za-z_]\w*(?:\[[@*]\])?\}"?$/.test(w); // (one `$(( ))` / `$#` word is digits: no split, no glob, nothing to evaluate)
   const plainWord = (w) => isInt(w) || /^\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)$/.test(w) || (!/\$[@*]|\$\{[^}]*\[[@*]\]|`/.test(w) && !/^[^'"]*\$/.test(w.replace(/"[^"]*"|'[^']*'/g, '')) && !/[*?[]/.test(w.replace(/"[^"]*"|'[^']*'/g, '')));
   if (args.some((w) => !plainWord(w))) return 'a printf argument list that may split or glob';
-  // (an UNQUOTED bare `$name` may be empty and vanish, or split, which moves every later argument onto another conversion: each word after one may land on a numeric conversion, so it is a body; the proof decides)
-  const shifted = args.findIndex((w) => /^\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)$/.test(w));
+  // (an UNQUOTED bare `$name` may be empty and vanish, or split, which moves every later argument onto another conversion: each word after one may land on a numeric conversion, so it is a body when that name is not proven to supply exactly one field; the proof decides, with the bindings it has: addShifted)
+  const bare = args.map((w, i) => [i, /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))$/.exec(w)]).filter(([, m]) => m).map(([i, m]) => [i, m[1] ?? m[2]]);
   argvArgs.forEach((w, j) => {
-    if (isInt(w) || !(NUM_CONV.includes(convs[j % convs.length]) || (shifted >= 0 && j > shifted))) return;
-    add(w);
+    if (isInt(w)) return;
+    if (NUM_CONV.includes(convs[j % convs.length])) { add(w); return; }
+    const before = bare.filter(([i]) => i < j).map(([, n]) => n);
+    if (before.length) addShifted([...new Set(before)], w);
   });
   return null;
 }
@@ -2239,7 +2241,7 @@ function readUnproven(k, r, f, outer, depth = 0) {
 }
 const ARITH_CACHE = new WeakMap();
 function arithFrame(text, cmds, depth) {
-  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, badBody: -1, spans: [], s: '', subs: [], copies: [], bodyTexts: [], g: '', modReads: new Map() };
+  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, badBody: -1, spans: [], s: '', subs: [], copies: [], bodyTexts: [], g: '', modReads: new Map(), shiftedBodies: [] };
   if (depth === 0 && !/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s|\bprintf\b|\bprint\b|\beval\b|\btrap\b|\b(?:declare|typeset|local)\s+[-+][A-Za-z]*n/.test(text)) return f;
   const s = quotedBodiesBlank(text, cmds);
   const g = expansionText(s, cmds);
@@ -2250,7 +2252,15 @@ function arithFrame(text, cmds, depth) {
   for (const b of bodies.mod) bodyReads(b, f.modReads);
   if (bodies.capped || bodies.incomplete) { f.dynamic = true; f.why ??= bodies.capped ? 'too many subscripts to read' : 'a subscript or offset longer than the guard reads'; } // (the fail-closed reading, see the cap in arithBodies)
   const add = (b) => { bodies.push(b); bodies.src.push(null); bodies.span.push(null); };
-  if (cmds) for (const c of cmds) { const why = /(?:^|\/)(?:printf|print)$/.test(c.argv?.[0] ?? '') ? printfBodies(c, add) : null; if (why) { f.dynamic = true; f.why ??= why; } }
+  // (a word that a bare `$name` may have moved onto a number conversion: a body only when one of those names is not proven a single number, which arithAssignedNames knows)
+  const addShifted = (names, b) => {
+    const e = { names: new Set(), reads: new Map(), dynamic: false, why: null };
+    for (const m of b.matchAll(ARITH_ASSIGNED)) e.names.add(m[1] ?? m[2] ?? m[3] ?? m[4]);
+    if (ARITH_ASSIGNED_DYN.test(b)) e.dynamic = true;
+    e.why = bodyReads(b, e.reads);
+    f.shiftedBodies.push({ guards: names, ...e });
+  };
+  if (cmds) for (const c of cmds) { const why = /(?:^|\/)(?:printf|print)$/.test(c.argv?.[0] ?? '') ? printfBodies(c, add, addShifted) : null; if (why) { f.dynamic = true; f.why ??= why; } }
   bodies.forEach((body, i) => {
     for (const m of body.matchAll(ARITH_ASSIGNED)) { const k = m[1] ?? m[2] ?? m[3] ?? m[4]; f.names.add(k); if (m[4] === undefined) f.bodyTargets.add(k); }
     if (ARITH_ASSIGNED_DYN.test(body)) f.dynamic = true;
@@ -2296,10 +2306,22 @@ export function arithAssignedNames(raw, cmds = null, outer = null) {
     const merged = { other: new Set([...f.other, ...(sub.other ?? [])]), certainScalar: new Set([...f.certainScalar, ...sub.certainScalar]), certainArray: new Set([...f.certainArray, ...sub.certainArray]), copies: [...f.copies, ...sub.copies] };
     for (const [k, r] of [...sub.reads, ...sub.modReads]) if (readUnproven(k, r, merged, outer)) { proof = `an arithmetic in an eval or trap reads \`${k}\`, whose value is not a plain number here`; break; }
   }
+  // (a word after a bare `$name` printf argument is a body only when that name is not proven to be one number: `printf '%d %s' $count "$ref"` with `count=3` leaves `$ref` text)
+  const names = new Set(f.names);
+  let dynamicShift = false;
+  for (const sb of f.shiftedBodies) {
+    if (!sb.guards.some((k) => readUnproven(k, { plain: true, sub: false }, f, outer))) continue;
+    for (const k of sb.names) names.add(k);
+    if (sb.dynamic) dynamicShift = true;
+    if (proof === null) {
+      if (sb.why) proof = sb.why;
+      else for (const [k, r] of sb.reads) if (readUnproven(k, r, f, outer)) { proof = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
+    }
+  }
   const why = f.why ?? proof;
   // (the shell expands everything inside a body before it evaluates the body: when ONE body is the whole cause, the commands inside it -- `$(ps -p $pid)` -- run before its text can change a name, so their words are
   // not made unsure by it. Two unproven bodies, or any other cause, keep the whole-frame reading: `inBody` is then never true)
-  const solo = f.bodyWhy === 1 && !f.dynamic && !f.nameref && !f.runner && proof === null && f.spans[f.badBody] != null;
+  const solo = f.bodyWhy === 1 && !f.dynamic && !dynamicShift && !f.nameref && !f.runner && proof === null && f.spans[f.badBody] != null;
   // (the names a solo body expands and the rest of the text never mentions: the body cannot change them before it reads them)
   const bodyOnly = new Set();
   if (solo) {
@@ -2309,7 +2331,7 @@ export function arithAssignedNames(raw, cmds = null, outer = null) {
     const outside = refs(`${f.s.slice(0, a)} ${f.s.slice(b)}`);
     for (const k of refs(f.s.slice(a, b))) if (!outside.has(k)) bodyOnly.add(k);
   }
-  return { names: f.names, dynamic: f.dynamic || f.nameref || why !== null, reads: f.reads, dynamicRead: why, runner: f.runner, nameref: f.nameref, bodyOnly };
+  return { names, dynamic: f.dynamic || dynamicShift || f.nameref || why !== null, reads: f.reads, dynamicRead: why, runner: f.runner, nameref: f.nameref, bodyOnly };
 }
 
 // Why: `declare` / `typeset` / `local` attributes change the value a name holds: -l / -u lower / upper case it, zsh -L / -R / -Z pad or cut it to a width, -i

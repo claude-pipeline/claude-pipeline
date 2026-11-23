@@ -475,4 +475,7 @@ test('R3-B1 / R3-B2 / R3-F1: an unquoted bare $name printf argument moves only t
   const r = git('ref=HEAD; printf \'%d\\n\' $BUILD_NUMBER; git show $ref', fakeFs(GIT_ROOT, SPEC), { env: { BUILD_NUMBER: '42' } });
   assert.equal(r.decision, 'allow', r.reason);
   deny(P("label=''; value='count+1'; printf '%s %d\\n' $label 10 value"));
+  // R4-B1: a bare name that is a proven number supplies exactly one field, so a text word after it stays text
+  allow('ref=HEAD; count=3; printf \'%d %s\\n\' $count "$ref"; git show $ref');
+  allow('ref=HEAD; count=3; printf \'%d %s\\n\' $count status=ok; git show $ref');
 });
