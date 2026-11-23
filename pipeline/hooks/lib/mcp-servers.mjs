@@ -15,10 +15,12 @@ const normalise = (name) => String(name).replace(/[^A-Za-z0-9_-]/g, '_');
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // -> { state: 'absent' } | { state: 'ok', value } | { state: 'unknown' }
-// One open, then every check on that descriptor (no lstat/read gap): no symlink follow, a FIFO cannot block, only a regular file of at most MAX_BYTES is read.
+// One open, then every check on that descriptor: a FIFO cannot block, only a regular file of at most MAX_BYTES is read. No symlink follow: O_NOFOLLOW where the platform has it, an lstat first where it does not (Windows);
+// that lstat/open gap can only yield a file Claude Code itself would load.
 function readJsonFile(file) {
   let fd;
   try {
+    if (constants.O_NOFOLLOW === undefined && lstatSync(file).isSymbolicLink()) return { state: 'unknown' };
     fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   } catch (err) {
     return { state: err?.code === 'ENOENT' || err?.code === 'ENOTDIR' ? 'absent' : 'unknown' };
