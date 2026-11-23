@@ -149,7 +149,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let lastError = null;
   let readyAtMemo;
   let markerAtMemo; // ms of the newest review-complete marker of the head, or null; per poll, like readyAtMemo
-  let runStartMemo = new Map(); // Actions run id -> ms the run started, or null (unreadable); per poll, like markerAtMemo
+  let runStartMemo = new Map(); // Actions run id -> ms the run started (number) | null (no readable start time, no reader, or not an Actions run) | undefined (the read threw: never normalise it to null); per poll, like markerAtMemo
   let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
   let mergeRetried = false; // the one extra read of a mergeability GitHub had not computed yet
