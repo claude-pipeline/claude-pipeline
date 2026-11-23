@@ -69,14 +69,20 @@ export function prPhaseAt(timeline, prCreated, t) {
 // PR branch: two parents, committed by GitHub itself (login `web-flow`), message "Merge branch '<base>' into <head-branch>". A local merge writes the same message
 // ("Merge branch '<base>' into ..." or "Merge remote-tracking branch 'origin/<base>' into ..."): the same base churn. With the PR's base known (`baseRef`) the merged
 // branch must BE the base (a merge of a feature branch is a push, whoever committed it); with it unknown any merge of a branch counts, or any web-flow merge.
-// git pull adds " of <url>" after the name (the merge then counts only when that URL is the PR's base repository, when that is known: a fork's `main` is not the base); GitHub's update-branch on a fork PR may name the base "owner:<base>".
+// git pull adds " of <url>" after the name (the merge then counts only when that URL is the PR's base repository on github.com, when that is known: a fork's `main` is not the base); GitHub's update-branch on a fork PR may name the base "owner:<base>" (the owner must be the base repository's, when known).
 const MERGE_MESSAGE = /^Merge (remote-tracking )?branch '([^'\n]+)'(?: of (\S+))? into \S+/;
 const repoOfUrl = (url) => url.replace(/\.git$/, '').split(/[/:]/).filter(Boolean).slice(-2).join('/').toLowerCase();
+// the host of a pulled URL (https://host/o/r, ssh://git@host/o/r, git@host:o/r, host:o/r); GitHub's own repositories are on github.com
+const hostOfUrl = (url) => (/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url.replace(/^[^/]*\/\//, '').replace(/^[^@/]*@/, '').split(/[/:]/)[0] : url.replace(/^[^@/]*@/, '').split(/[/:]/)[0]).toLowerCase();
 const mergedBranch = (message, baseRepo = null) => {
   const m = MERGE_MESSAGE.exec(String(message).split('\n')[0]);
   if (m === null) return null;
-  if (m[3] !== undefined && typeof baseRepo === 'string' && baseRepo !== '' && repoOfUrl(m[3]) !== baseRepo.toLowerCase()) return null;
-  return m[1] ? m[2].replace(/^[^/]+\//, '') : m[2].replace(/^[^:/]+:/, '');
+  const known = typeof baseRepo === 'string' && baseRepo !== '';
+  if (m[3] !== undefined && known && (repoOfUrl(m[3]) !== baseRepo.toLowerCase() || hostOfUrl(m[3]) !== 'github.com')) return null;
+  if (m[1]) return m[2].replace(/^[^/]+\//, '');
+  const owner = /^([^:/]+):/.exec(m[2])?.[1];
+  if (owner !== undefined && known && owner.toLowerCase() !== baseRepo.split('/')[0].toLowerCase()) return null;
+  return m[2].replace(/^[^:/]+:/, '');
 };
 export function normalizeCommit(c) {
   const parents = typeof c?.parents === 'number' ? c.parents : Array.isArray(c?.parents) ? c.parents.length : 0;

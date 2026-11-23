@@ -4,7 +4,7 @@
 // counts, never a failure. Only the first list (repository, workflow runs) failing is a failure (GhError: the caller maps it to exit 3).
 import { MAX_PAGES, PAGE, pages } from './gh-pages.mjs';
 import {
-  HEAVY_ELAPSED_MS, UNEXCLUDABLE, aggregateUsage, analysePrUsage, classifierVersion, classifyRuns, elapsedMs,
+  HEAVY_ELAPSED_MS, UNEXCLUDABLE, WINDOW_MS, aggregateUsage, analysePrUsage, classifierVersion, classifyRuns, elapsedMs,
 } from './ci-usage.mjs';
 import { parseYaml } from './yaml.mjs';
 import { asciiLine } from './triage.mjs';
@@ -61,7 +61,10 @@ const prNumberOf = (run, byBranch) => {
   const created = Date.parse(run.created_at);
   // the PRs of that repository and branch that were open when the run was created (created before it, not closed before it); the run is theirs only when exactly one was: two open at once
   // (different bases, or created at the same instant) cannot be told apart, so it stays unattributed. A closed one (a reused branch name) is no ambiguity.
-  const open = (key === null ? [] : byBranch?.get(key) ?? []).filter((p) => Date.parse(p.created_at) <= created && !(Date.parse(p.closed_at) <= created));
+  const candidates = key === null ? [] : byBranch?.get(key) ?? [];
+  // a pull_request run created just after a sibling's close is most likely that close's own run (workflows on `closed`): not the open sibling's, by elimination
+  if (run.event === 'pull_request' && candidates.some((p) => { const gap = created - Date.parse(p.closed_at); return gap >= 0 && gap <= WINDOW_MS; })) return null;
+  const open = candidates.filter((p) => Date.parse(p.created_at) <= created && !(Date.parse(p.closed_at) <= created));
   return open.length === 1 ? open[0].number ?? null : null;
 };
 

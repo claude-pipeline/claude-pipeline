@@ -265,6 +265,19 @@ test('R3-B1: a newer PR from the same branch already closed when the run was cre
   assert.equal(r.json.repos[0].totals.pushesWhileReady, 1);
 });
 
+test('R4-B1: a pull_request run created right after a sibling PR closed is not given to the open sibling by elimination; runs well after the close still are (R3-B1)', () => {
+  // failure caught: closing PR 9 (workflows on `closed`) charged its run to the still-open PR 7 and could name it a missed redraft
+  const unlinked = RUNS.map((x) => ({ ...x, pull_requests: [] }));
+  const pulls = [{ match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [
+    { number: 9, created_at: T('09:10'), updated_at: T('13:00'), closed_at: T('10:29', 30), head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+    { number: 7, created_at: T('09:00'), updated_at: T('13:00'), closed_at: null, head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+  ] }];
+  const r = usage(world({ runs: unlinked, extra: pulls }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.repos[0].totals.byClass.unclassified.runs, 3, 'the 09:30 run (both PRs open) and the two 10:30 runs (within 120 s of the close) stay unattributed');
+  assert.equal(r.json.repos[0].totals.pushesWhileReady, 0);
+});
+
 test('R3-B4: a PR with more commits than GitHub returned (it caps them at 250, with no cut page) makes the report partial and warns', () => {
   const capped = [{ match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { ...PR7, commits: 251 } }];
   const r = usage(world({ extra: capped }), ['--json', '--since', '2026-11-05']);
