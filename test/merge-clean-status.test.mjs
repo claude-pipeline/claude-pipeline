@@ -104,6 +104,15 @@ for (const [route, go] of Object.entries(ROUTES)) {
     assert.match(closed.r.json.reason, /and the PR is not merged; the PR was closed without merging/);
   });
 
+  // Failure caught (R1-B2): the PR was open at the zero-wait read and closed before the read after the disable; the retry was withheld but the reason said only "the PR is not merged".
+  test(`${route}: the PR is closed when read after the disable: no retryable, and the reason names the closure`, (t) => {
+    const { r } = go(t, { STUB_ERR: OBSERVED }, { extra: [{ match: '^pr view 12 --json state,mergeCommit$', stdoutJson: { state: 'CLOSED', mergeCommit: null } }] });
+    assertExit(r, 1);
+    assert.equal(r.json.autoMergeDisabled, true);
+    assert.equal(r.json.retryable, undefined, 'a closed PR is not retryable');
+    assert.match(r.json.reason, /and the PR is not merged; the PR was closed without merging/);
+  });
+
   test(`${route}: auto-merge not proven off, or the state unreadable: no retryable (armed; unreadable; disable failed but GitHub confirms nothing is armed = retryable)`, (t) => {
     const armed = go(t, { STUB_ERR: OBSERVED }, { disableAutoCode: 1, autoMergeRequest: { enabledAt: '2026-11-17T00:00:00Z' } });
     assert.equal(armed.r.json.autoMergeDisabled, false);

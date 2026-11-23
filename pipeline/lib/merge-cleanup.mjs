@@ -62,10 +62,10 @@ export function cleanStatusRetry(ran, outcome, abandoned) {
   };
 }
 
-// What a zero-wait read found when the merge command failed: a 'blocked' outcome's problems or a 'closed' PR, as a sentence for the failure reason (null for any other outcome).
-export function waitFailureNote(outcome) {
+// What a zero-wait read found when the merge command failed: a 'blocked' outcome's problems or a 'closed' PR, as a sentence for the failure reason (null for any other outcome). `abandoned` is the read after auto-merge was disabled: a PR closed between the two reads (a zero-wait 'timeout' above) is named too.
+export function waitFailureNote(outcome, abandoned) {
   if (outcome?.state === 'blocked') return `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`;
-  if (outcome?.state === 'closed') return 'the PR was closed without merging';
+  if (outcome?.state === 'closed' || (outcome?.state === 'timeout' && !abandoned?.readError && abandoned?.state === 'CLOSED')) return 'the PR was closed without merging';
   return null;
 }
 

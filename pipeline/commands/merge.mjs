@@ -398,7 +398,7 @@ export const run = guarded(async (argv, ctx) => {
       if (behindHold) return holdRefuse(queuedBehindRefusal(behindHold), failure);
       if (ran.code !== 0) {
         // #567: the exact clean-status refusal with a proven clean state says a fresh run is safe (informational on this route: the owner re-runs their own command)
-        return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged${waitFailureNote(outcome) ? `; ${waitFailureNote(outcome)}` : ''}`, ...failure, ...cleanStatusRetry(ran, outcome, abandoned) } };
+        return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged${waitFailureNote(outcome, abandoned) ? `; ${waitFailureNote(outcome, abandoned)}` : ''}`, ...failure, ...cleanStatusRetry(ran, outcome, abandoned) } };
       }
       const base = {
         timeout: 'not merged in time',
@@ -584,7 +584,7 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
     if (behindHold) return holdRefuse(queuedBehindRefusal(behindHold), failure);
     // #567: set here, never after withHoldLifted (it spreads this output and adds the hold fields): a lifted or recovered hold means a fresh "merge" is needed, so no retryable.
     const retry = hold === null && recHold === null ? cleanStatusRetry(ran, outcome, abandoned) : {};
-    if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged${waitFailureNote(outcome) ? `; ${waitFailureNote(outcome)}` : ''}`, ...failure, ...retry } };
+    if (ran.code !== 0) return { exitCode: EXIT.FAILED, output: { ok: false, reason: `merge command failed (exit ${ran.code}${ran.timedOut ? ', timed out' : ''}) and the PR is not merged${waitFailureNote(outcome, abandoned) ? `; ${waitFailureNote(outcome, abandoned)}` : ''}`, ...failure, ...retry } };
     const base = {
       timeout: 'not merged in time', closed: 'the PR was closed without merging', error: `could not read the PR state while waiting (${outcome.error})`,
       blocked: `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`,
