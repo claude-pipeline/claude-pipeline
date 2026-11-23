@@ -27,7 +27,7 @@ import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } 
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
 import { RULING_VARIANT_LEGACY, clickNotes, followUpClickState, roundAsk, rulingAsk, rulingWhyRow } from '../hooks/lib/owner-go-click.mjs';
-import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
+import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRulingGap, ownerRulingRecords, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
   countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, ownerRulingRefusal, RULING_WHY, rulingRecommendationRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
@@ -422,7 +422,8 @@ async function ownerRuling(rest, ctx) {
     const prNum = state.pr ?? pr;
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
     const asked = { repo: slug, pr: prNum, id, quote: ownerQuote, decision };
-    if (!ownerRuled({ ...asked, contentOf: contentOfState(state) })) {
+    const answers = ownerRulingRecords({ ...asked, contentOf: contentOfState(state) });
+    if (answers.length === 0) {
       const again = `ask again: end the reply with the line \`pipeline triage ruling-request --pr ${prNum} --ids ${id}\` prints (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass all of it as --owner-quote`;
       // #110: the owner's answer exists but is bound to other text (or to none): say which.
       const gap = ownerRulingGap(asked);
@@ -430,6 +431,12 @@ async function ownerRuling(rest, ctx) {
       if (gap === 'no-content') return refuse(`the owner's ruling for ${slug} #${prNum} ${id} was asked with the old ruling line, which has no content digest, so it approves nothing; ${again}`);
       if (gap === 'changed') return refuse(`the finding text of ${id} (or of another item asked in the same request, or an item is gone) changed since the owner was asked, so the recorded ruling no longer applies; ${again}`);
       return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): ${again}${clickNotesText(slug, prNum)}`);
+    }
+    // R1-B1/B2 (cp #771): a click on "Follow-up all (Recommended)" rested on the pipeline's claim that the item is low severity, checked only when the dialog was issued. Check it again now (the item, a sensitive
+    // path or the severity config may have changed since); a typed answer or a click on any other dialog said no such thing.
+    if (decision === 'FOLLOW-UP' && answers.every((r) => r.ask?.variant === 'ruling-v2-follow-up')) {
+      const stale = recommendationRefusal({ root, config, state, items: [item], recommend: 'follow-up' });
+      if (stale !== null) return refuse(`the owner clicked "Follow-up all (Recommended)", which says the pipeline rates ${id} low severity, but it no longer does (${stale}), so the click approves nothing; ask again on the neutral dialog: \`pipeline triage ruling-request --pr ${prNum} --ids ${id} --ask\` with no --recommend`);
     }
     seedBaseline({ ctx, root, pr: prNum, state }); // the `comment --kind triage` that publishes this ruling needs the baseline too
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });

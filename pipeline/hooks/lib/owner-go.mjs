@@ -1231,9 +1231,11 @@ function rulingsFor({ repo, pr, id, quote, decision, ...opts }) {
 // current review state (null when any is gone); it is called with the record's FULL id list, and a record with no content (the line
 // shape before #110) or no `contentOf` approves nothing.
 // #128: only a record whose prompt is the owner's (promptProvenance) counts.
-export function ownerRuled({ contentOf, ...q }) {
-  return typeof contentOf === 'function' && ownedBy(rulingsFor(q), { home: q.home }).some((r) => typeof r.content === 'string' && r.content === contentOf(r.ids));
+// R1-B1/B2 (cp #771): ownerRulingRecords returns those records (a click's record carries `ask.variant`), ownerRuled says whether there is one.
+export function ownerRulingRecords({ contentOf, ...q }) {
+  return typeof contentOf === 'function' ? ownedBy(rulingsFor(q), { home: q.home }).filter((r) => typeof r.content === 'string' && r.content === contentOf(r.ids)) : [];
 }
+export const ownerRuled = (q) => ownerRulingRecords(q).length > 0;
 
 // Why ownerRuled said no, for the message: 'none' (no such answer recorded), 'provenance' (answers exist but none is confirmed as typed by
 // the owner: checked first), 'no-content' (every one is in the old line shape) or 'changed' (the finding text differs from the one the owner

@@ -729,6 +729,8 @@ export function rulingRecommendationRefusal(items, decision, ctx = {}) {
   }
   if (decision === 'ACCEPT') return null;
   for (const item of items) {
+    // R1-B3: an ACCEPT whose fix is already in the PR (a low-confidence one still waiting for a human) is not "fix it later"; FOLLOW-UP would also drop the built fix from the fix review.
+    if (item.implemented === true) return `${item.id} is already implemented, so a recommendation to follow up (fix it later) would be wrong`;
     let severity;
     try {
       severity = itemSeverity(item, ctx);

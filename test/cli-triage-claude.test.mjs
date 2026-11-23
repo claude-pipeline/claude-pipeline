@@ -19,6 +19,7 @@ import { RULING_WHY, reviewEligibilityProblems, rulingRecommendationRefusal, rul
 import { assertExit } from './helpers/assert-exit.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
 import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
+import { ownerGoDir } from '../pipeline/hooks/lib/owner-go.mjs';
 import { applyClaudeRuling, settleSecondReview } from '../pipeline/lib/triage.mjs';
 import { buildSecondReviewPrompt } from '../pipeline/lib/codex.mjs';
 
@@ -1060,9 +1061,14 @@ const arbiterAccepts = (w, id, by = 'arbiter') => w.edit((s) => {
   it.final = { decision: 'ACCEPT', by, needsHuman: false, reason: `${by} accepted it` };
 });
 // The owner's typed answer to a ruling request for `ids` (one prompt that names every id), then the owner-ruling call for `id`.
-function typedFor(t, w, ids, quote) {
+// `variant`: the answer is a click on that dialog (a click's record names its dialog in `ask.variant`). The click's own proof (a tool_result entry) is out of scope here, so the record keeps the typed shape and only gains `ask`.
+function typedFor(t, w, ids, quote, variant = undefined) {
   const asked = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ids.join(',')]);
-  ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
+  const record = ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
+  if (variant !== undefined) {
+    const file = join(ownerGoDir(), `${record.session}.jsonl`);
+    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: randomUUID(), toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
+  }
   return (id, decision) => w.cli(['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', 'owner confirmed', '--owner-quote', quote, '--pr', '7']);
 }
 const dWorld = (t) => world(t, { comments: true, slug: `acme/widgets-${randomUUID()}` });
@@ -1150,6 +1156,9 @@ test('rulingRecommendationRefusal: the recommendation is refused for what the cl
   const deferrable = settledAccept('R1-S2');
   assert.match(refusal([waits, deferrable], 'ACCEPT'), /R1-S2 does not need a human decision.*may only be deferred/, 'accept with one open deferrable ACCEPT in a mixed batch (second id only)');
   assert.match(refusal([settledAccept('R1-S3', { implemented: true })], 'FOLLOW-UP'), /already implemented|does not need a human decision/, 'an item that needs no human decision');
+  // R1-B3: a low-confidence ACCEPT still waiting for a human whose fix is already in the PR passes the owner-ruling check, but "fix it later" would be wrong (and drop the built fix from the fix review)
+  assert.match(refusal([recItem('R1-S3b', { implemented: true })], 'FOLLOW-UP'), /R1-S3b is already implemented/, 'a waiting item that is already implemented');
+  assert.equal(refusal([recItem('R1-S3c', { implemented: true })], 'ACCEPT'), null, 'accept stays allowed for it');
   const risky = [
     ['a non-blocking data-loss low-confidence item', recItem('R1-S4', { category: 'data-loss' }), /not low severity/],
     ['a BLOCKING low-confidence item', recItem('R1-B1', { bucket: 'BLOCKING', category: 'docs' }), /BLOCKING/],
@@ -1177,6 +1186,38 @@ test('rulingRecommendationRefusal: accept on needs-human items, and follow-up on
   assert.equal(refusal([recItem('R1-S5'), settledAccept('R1-S6')], 'FOLLOW-UP'), null, 'both kinds in one batch');
   assert.deepEqual(Object.keys(RULING_WHY), ['accept', 'follow-up']);
   assert.deepEqual(Object.keys(RULING_WHY['follow-up']), ['minor-later'], 'no reject code, and no code claims more than rule 3 proves');
+});
+
+test('owner-ruling: a click on "Follow-up all (Recommended)" is checked again against today\'s severity; a typed answer or a click on another dialog is not', (t) => {
+  // failure caught: a click on a recommended dialog that says "the pipeline rates this low" recording a follow-up after the item became serious (a same-file BLOCKING item appeared, or the dialog was forged for a BLOCKING finding), because only the ask was checked
+  const FU = 'ruling-v2-follow-up';
+  const docs = () => sugg({ file: 'src/a.js', category: 'docs' });
+  const mk = (blocking) => {
+    const w = dWorld(t);
+    assertExit(w.codex(1, findingsOf(blocking, [docs()])), 0);
+    w.wait('R1-S1');
+    if (blocking.length > 0) w.wait('R1-B1');
+    return w;
+  };
+  // allow: still low severity -> the clicked recommendation is recorded
+  const ok = mk([]);
+  const allowed = typedFor(t, ok, ['R1-S1'], 'R1-S1: follow-up', FU)('R1-S1', 'FOLLOW-UP');
+  assertExit(allowed, 0, allowed.stdout + allowed.stderr);
+  assert.equal(ok.item('R1-S1').final.decision, 'FOLLOW-UP');
+  // deny: a BLOCKING item on the same file waits for a human, so the "low severity" claim is false -> refused, state untouched, re-ask on the neutral dialog
+  const stale = mk([finding()]);
+  const before = stale.stateText();
+  const denied = typedFor(t, stale, ['R1-S1'], 'R1-S1: follow-up', FU)('R1-S1', 'FOLLOW-UP');
+  assertExit(denied, 1, denied.stdout);
+  assert.match(denied.json.reason, /no longer does.*R1-B1.*ask again on the neutral dialog.*ruling-request --pr 7 --ids R1-S1 --ask/);
+  assert.equal(stale.stateText(), before);
+  // the same finding ruled by a typed answer, a click on the neutral dialog, or an ACCEPT click on the recommended one needs no recheck
+  for (const [what, variant, decision] of [['typed', undefined, 'FOLLOW-UP'], ['neutral click', 'ruling-v1', 'FOLLOW-UP']]) {
+    const w = mk([finding()]);
+    const r = typedFor(t, w, ['R1-S1'], `R1-S1: ${decision.toLowerCase()}`, variant)('R1-S1', decision);
+    assertExit(r, 0, `${what}: ${r.stdout}`);
+    assert.equal(w.item('R1-S1').final.decision, 'FOLLOW-UP', what);
+  }
 });
 
 test('F1: an answer recorded while the item waited for a human cannot defer it after it became an ACCEPT; a multi-id request still applies its second id', (t) => {
