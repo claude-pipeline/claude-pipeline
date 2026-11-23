@@ -10,7 +10,8 @@
 import { createHash } from 'node:crypto';
 import { openSync, readSync, closeSync, lstatSync, readlinkSync } from 'node:fs';
 import { join } from 'node:path';
-import { run } from './proc.mjs';
+import { spawnSync } from 'node:child_process';
+import { planSpawn, run } from './proc.mjs';
 import { parseUnifiedDiff } from './diff.mjs';
 import { MAX_BLOCKS, SearchCap, checkSelection, committedBlock, isMarkerLine, makeBudget, parseConflictBlocks, splitLines } from './resolution.mjs';
 
@@ -282,6 +283,20 @@ function historyProblem({ from, head, baseRef }, o) {
   return null;
 }
 
+// A blob's bytes exactly (git() decodes UTF-8, which would turn a binary blob's bytes into U+FFFD), run the way git() runs git: the trusted executable lookup
+// of proc.planSpawn (a git.exe in the checkout never wins on Windows), the same forced config and scrubbed environment, and an over-buffer read is an error.
+export function catBlobBytes(oid, o) {
+  const args = [...FORCED_CONFIG, 'cat-file', 'blob', assertRef(oid, ['cat-file', 'blob', oid])];
+  const plan = planSpawn('git', args);
+  const r = spawnSync(plan.file, plan.args, {
+    cwd: o?.cwd, env: { ...process.env, ...SCRUBBED_ENV, ...GIT_ENV, ...o?.env }, maxBuffer: 256 * 1024 * 1024, killSignal: 'SIGKILL', windowsHide: true, windowsVerbatimArguments: plan.windowsVerbatimArguments,
+  });
+  if (r.error || r.status !== 0) {
+    throw new GitError({ args: ['cat-file', 'blob', oid], code: r.status ?? 1, stderr: r.error ? r.error.message : String(r.stderr ?? ''), abnormal: r.error !== undefined });
+  }
+  return r.stdout;
+}
+
 const catBlob = (ref, o) => git(['cat-file', 'blob', assertRef(ref, ['cat-file', 'blob', ref])], o);
 
 function resolutionChecks({ from, forkPoint, head, baseRef }, o) {
@@ -400,7 +415,7 @@ function walkOwnHistory({ from, head, baseRef }, o) {
     entries.set(sha, parents);
   }
   if (entries.size > MAX_OWN_HISTORY) throw fail('history', `${entries.size} commits since the last reviewed head`);
-  let merges = 0;
+  const merges = [];
   for (let cur = head; cur !== from; ) {
     const parents = entries.get(cur);
     if (!parents) throw fail('history', 'the last reviewed head is not on the first-parent chain of HEAD');
@@ -408,7 +423,7 @@ function walkOwnHistory({ from, head, baseRef }, o) {
     if (parents.length > 2) throw fail('history', `${cur} merges ${parents.length} parents`);
     if (parents.length === 2) {
       if (!isAncestor(parents[1], baseRef, o)) throw fail('history', `${cur} merges ${parents[1]}, which is not on ${displayRef(baseRef)}`);
-      merges++;
+      merges.push({ sha: cur, parents });
     }
     cur = parents[0];
   }
@@ -460,7 +475,7 @@ function treeEntries(tree, paths, o) {
   const out = new Map();
   for (let i = 0; i < paths.length; i += 200) {
     const chunk = paths.slice(i, i + 200);
-    const parts = git(['ls-tree', '-z', '--full-tree', assertRef(tree, ['ls-tree', tree]), '--', ...chunk], o).split('\0');
+    const parts = git(['--literal-pathspecs', 'ls-tree', '-z', '--full-tree', assertRef(tree, ['ls-tree', tree]), '--', ...chunk], o).split('\0');
     for (const part of parts) {
       if (part === '') continue;
       const m = /^(\d{6}) \w+ ([0-9a-f]{40,64})\t([^]+)$/.exec(part);
@@ -480,13 +495,22 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
   const [fromSha, forkSha, headFull] = [from, forkPoint, head].map((x) => revParse(`${assertRef(x, ['rev-parse', x])}^{commit}`, o));
 
   const { merges } = walkOwnHistory({ from: fromSha, head: headFull, baseRef }, o);
-  if (merges === 0) throw fail('history', 'no merge of the base branch since the last reviewed head');
+  if (merges.length === 0) throw fail('history', 'no merge of the base branch since the last reviewed head');
 
   const merged = mergeTreeDetailed(fromSha, forkSha, o);
   if (merged.clean || merged.conflicts.length === 0) throw fail('no-conflict', merged.clean ? 'the trial merge is clean' : 'merge-tree reported a conflict but listed no conflicted file');
   if (merged.conflicts.length > MAX_DISPLAY_CONFLICTS) throw fail('too-many-conflicts', `${merged.conflicts.length} conflicted paths`);
   const conflicted = merged.conflicts.map((c) => c.path);
   const known = new Set(conflicted);
+  // The trial merge uses the last reviewed head as its first parent, but an own commit may come before the real merge: a file that commit edited
+  // can conflict in the real merge and be absent from the trial list, with no evidence and no marker check. Any conflict a merge commit of the
+  // chain has outside the trial list is refused (the whole PR is then reviewed).
+  for (const m of merges) {
+    if (m.parents[0] === fromSha && m.parents[1] === forkSha) continue;
+    const actual = mergeTreeDetailed(m.parents[0], m.parents[1], o);
+    const extra = actual.conflicts.map((c) => c.path).filter((p) => !known.has(p));
+    if (extra.length > 0) throw fail('evidence', `the merge ${m.sha} also conflicts in ${shortList(extra)}, which the trial merge of the last reviewed head does not`);
+  }
 
   // A: no merge-affecting attribute on any path a driver could have resolved silently: every merge-base path BOTH sides changed (with
   // each side's rename destination), every conflicted path and every path an ort message names.
@@ -551,11 +575,26 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
     }
     if (isText && (blocks === null || blocks.length === 0)) throw fail('evidence', `the conflict blocks of ${c.path} could not be read`);
     if (!isText && marked && blocks === null) throw fail('evidence', `the conflict markers of ${c.path} could not be read`);
-    if (blocks && blocks.length > 0 && headEntry) {
+    if (blocks && blocks.length > 0 && !headEntry) throw fail('evidence', `${c.path} has conflict blocks but is not at that path in head (renamed or moved), so its markers cannot be checked`);
+    if (headEntry && textMode(headEntry)) {
       const text = catBlob(headEntry.oid, o);
-      if (text.includes('�')) throw fail('evidence', `${c.path} (head) is not valid UTF-8`);
-      const left = committedBlock(splitLines(text), blocks);
-      if (left >= 0) throw fail('evidence', `${c.path} still has conflict block ${left + 1} with its markers`);
+      if (!text.includes('\0')) {
+        if (text.includes('�')) throw fail('evidence', `${c.path} (head) is not valid UTF-8`);
+        const headLines = splitLines(text);
+        if (blocks && blocks.length > 0) {
+          const left = committedBlock(headLines, blocks);
+          if (left >= 0) throw fail('evidence', `${c.path} still has conflict block ${left + 1} with its markers`);
+        }
+        // Style-independent: a marker-shaped line of head that no stage blob holds is a conflict marker of a real merge (merge, diff3 or zdiff3 style),
+        // whatever its labels and whatever its block looks like; a file whose own content has such a line keeps it in a stage blob.
+        const stageLines = new Set();
+        for (const e of [s1, s2, s3]) {
+          if (!e || !textMode(e)) continue;
+          for (const l of splitLines(catBlob(e.oid, o))) if (isMarkerLine(l)) stageLines.add(l.replace(/\r?\n$/, ''));
+        }
+        const stray = headLines.find((l) => isMarkerLine(l) && !stageLines.has(l.replace(/\r?\n$/, '')));
+        if (stray !== undefined) throw fail('evidence', `${c.path} (head) holds a conflict marker line that no side of the conflict has`);
+      }
     }
     if (isText) continue;
 

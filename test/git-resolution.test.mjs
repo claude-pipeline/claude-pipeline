@@ -9,6 +9,7 @@ import {
   git, mergeBase, mergeTree, mergeTreeDetailed, effectiveReviewBase, resolutionReviewBase, conflictReviewBase, ensureReviewBase, reviewPatch, revParse, ReviewBaseUnavailable,
 } from '../pipeline/lib/git.mjs';
 import { splitLines, interleave, parseConflictBlocks, checkSelection, makeBudget, SearchCap, MAX_BLOCKS } from '../pipeline/lib/resolution.mjs';
+import { renderConflictSides } from '../pipeline/lib/conflict-sides.mjs';
 import { run } from '../pipeline/lib/proc.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 
@@ -1377,4 +1378,80 @@ test('ensureReviewBase (conflict): a fresh clone rebuilds the same tree id; anot
     writeFileSync(join(attr.dir, '.git', 'info', 'attributes'), 'z.txt conflict-marker-size=9\n');
     assert.throws(() => ensureReviewBase(round, { cwd: attr.dir }), (e) => unavailable(e) && /z\.txt/.test(e.message));
   } finally { attr.cleanup(); }
+});
+
+// ---------- conflictReviewBase: round-1 review fixes (R1-B2, B3, B6, F1) and the sides file (R1-B4, B7) ----------
+
+for (const style of ['diff3', 'zdiff3']) {
+  test(`conflictReviewBase (R1-B3): a block committed untouched with merge.conflictStyle=${style} markers -> evidence`, () => {
+    // Prevents: a developer whose git writes ${style} markers committing an untouched conflict and still getting the narrow round, because the
+    // block check expected `=======` right after the ours body (the ancestor section sits there) and the tree-equality guard cannot see it.
+    const s = conflictRepo({ base: { 'f.txt': T('top', 'x', 'bottom') }, ours: { 'f.txt': T('top', 'o', 'bottom') }, theirs: { 'f.txt': T('top', 't', 'bottom') } });
+    try { s.repo.git(['-c', `merge.conflictStyle=${style}`, 'merge', '--no-ff', '-q', '-m', 'merge main', 'main']); } catch { /* the conflict is the point */ }
+    assert.match(readWork(s.repo, 'f.txt'), /^\|{7} /m, `${style} writes an ancestor section`);
+    cNo(cdecide(s, s.repo.commit('merge main, f.txt untouched')), 'evidence', 'f.txt');
+  });
+}
+
+test('conflictReviewBase (R1-B6): a conflicted file whose name starts with ":" is looked up as a literal path, so a kept modify/delete is recorded as kept', () => {
+  // Prevents: `ls-tree -- :notes.txt` reading the name as a pathspec, so head looked absent at the path and the record said the file was deleted.
+  if (process.platform === 'win32') return; // ':' cannot be in a Windows file name
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), ':notes.txt': T('d') },
+    ours: { 'f.txt': T('top', 'o', 'bottom'), ':notes.txt': T('d modified by the PR') },
+    theirs: { 'f.txt': T('top', 't', 'bottom'), ':notes.txt': null },
+  });
+  const r = cdecide(s, resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') }));
+  cOk(r);
+  const rec = r.records.find((x) => x.path === ':notes.txt');
+  assert.ok(rec, JSON.stringify(r.records));
+  assert.equal(rec.head.absent, undefined, `head keeps the file: ${JSON.stringify(rec.head)}`);
+  assert.equal(rec.headEquals, 'ours');
+});
+
+test('conflictReviewBase (R1-F1): a conflicted text file moved by the resolver and committed with its markers -> evidence', () => {
+  // Prevents: the marker check being skipped because head has no file at the conflicted path, so a renamed file full of markers was admitted as a narrow round.
+  const lines = Array.from({ length: 12 }, (_, i) => `line ${i}`);
+  const s = conflictRepo({
+    base: { 'a.js': T(...lines.slice(0, 5), 'x', ...lines.slice(5)) },
+    ours: { 'a.js': T(...lines.slice(0, 5), 'o', ...lines.slice(5)) },
+    theirs: { 'a.js': T(...lines.slice(0, 5), 't', ...lines.slice(5)) },
+  });
+  mergeLeavingMarkers(s.repo);
+  const marked = readWork(s.repo, 'a.js');
+  assert.match(marked, /^<{7} HEAD$/m);
+  s.repo.rm('a.js');
+  s.repo.write('b.js', marked);
+  cNo(cdecide(s, s.repo.commit('merge main, moved with its markers')), 'evidence');
+});
+
+test('conflictReviewBase (R1-B2): an own commit before the merge makes a second file conflict; it is committed with its markers -> evidence, not a narrow round', () => {
+  // Prevents: b conflicting only in the real merge (an own commit edited it first), so the trial merge of the reviewed head never lists it and no check or record covers its markers.
+  const s = conflictRepo({
+    base: { 'a.txt': T('top', 'x', 'bottom'), 'b.txt': T('top', 'x', 'bottom') },
+    ours: { 'a.txt': T('top', 'o', 'bottom') },
+    theirs: { 'a.txt': T('top', 't', 'bottom'), 'b.txt': T('top', 't', 'bottom') },
+  });
+  s.repo.write('b.txt', T('top', 'o', 'bottom'));
+  s.repo.commit('own commit edits b.txt');
+  mergeLeavingMarkers(s.repo);
+  assert.match(readWork(s.repo, 'b.txt'), /^<{7} HEAD$/m, 'the real merge conflicts in b.txt too');
+  s.repo.write('a.txt', T('top', 'o', 'bottom'));
+  cNo(cdecide(s, s.repo.commit('merge main, b.txt keeps its markers')), 'evidence', 'b.txt');
+});
+
+test('renderConflictSides (R1-B4, R1-B7): a recorded conflict that no longer conflicts, or a blob with hundreds of thousands of lines, is unavailable (whole PR), never an incomplete file or a throw', () => {
+  // Prevents: a file missing one conflict's sides being pinned as the Fable evidence, and `arbiter needed` crashing on a RangeError (a spread of every line into one call) instead of falling back.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'big.txt': 'l\n'.repeat(300_000) },
+    ours: { 'f.txt': T('top', 'o', 'bottom'), 'big.txt': `${'l\n'.repeat(299_999)}changed\n` },
+    theirs: { 'f.txt': T('top', 't', 'bottom'), 'big.txt': null },
+  });
+  const round = { n: 1, from: s.from, forkPoint: revParse('main', s.o), records: [] };
+  const small = renderConflictSides({ ...round, conflicted: ['f.txt', 'gone.txt'] }, s.o);
+  assert.match(small.unavailable ?? '', /no longer conflicts at gone\.txt/, JSON.stringify(small).slice(0, 200));
+  const ok = renderConflictSides({ ...round, conflicted: ['f.txt'] }, s.o);
+  assert.ok(ok.text?.includes('ours:2| o'), JSON.stringify(ok).slice(0, 200));
+  const huge = renderConflictSides({ ...round, conflicted: ['big.txt'] }, s.o);
+  assert.match(huge.unavailable ?? '', /byte cap/, JSON.stringify(huge).slice(0, 200));
 });
