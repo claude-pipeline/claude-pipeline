@@ -319,3 +319,4 @@ full record.
 - 2026-11-23 · #800 · verify report records test counts per step (#644) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 733 runs (227 high)
 - 2026-11-23 · #801 · ci-wait flags a passing check that predates ready (#642) · risk high · rounds 3 · arbiter 3 · awaiting-review · Codex 7d: 741 runs (230 high)
 - 2026-11-23 · #801 · ci-wait flags a passing check that predates ready (#642) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 761 runs (236 high)
+- 2026-11-23 · #812 · CI usage, part 1: the shared CI-run classifier (split from #413) · risk medium · rounds 3 · arbiter 3 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 768 runs (238 high)
