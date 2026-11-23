@@ -577,12 +577,371 @@ function variableHeadRefusal(words, state) {
   return why;
 }
 
+// ---- Task 5 (B1b): the psql family -----------------------------------------------------------------------------------------------------
+// A tripwire, not a boundary: an agent-run line that runs psql or another Postgres client cannot, BY ITS OWN COMMAND LINE, point the client at a non-local database. Two psql shapes pass
+// (a strict host psql to one literal localhost URI; psql inside a local Supabase container through `docker exec`); every other family line is refused ("the owner runs this").
+// Fail closed, a false refusal over any bypass; every scan is one linear pass, no regex over flag shapes (#688), no quote / comment / dollar-quote tracking in the SQL text.
+// What the local server or a container does once connected, container configuration and a daemon behind a local socket are named residuals (docs/cli.md "Live database guard").
+const PG_NAMES = ['psql', 'pg_dump', 'pg_restore', 'pg_dumpall', 'pgcli', 'usql', 'dropdb', 'createdb', 'vacuumdb', 'reindexdb', 'clusterdb', 'pgbench', 'pg_basebackup', 'pg_receivewal', 'createuser', 'dropuser', 'pg_amcheck', 'pg_recvlogical', 'pg_isready', 'vacuumlo', 'oid2name',
+  'pg_upgrade', 'pg_ctl', 'pg_resetwal', 'pg_rewind', 'pg_controldata', 'pg_waldump', 'pg_verifybackup', 'pg_archivecleanup', 'pg_checksums', 'pg_test_fsync', 'pg_test_timing', 'pg_createsubscriber', 'pg_combinebackup', 'pg_walsummary', 'pg_ctlcluster', 'pg_lsclusters', 'pg_createcluster', 'pg_dropcluster', 'pg_upgradecluster', 'pg_conftool'];
+const PG_SET = new Set(PG_NAMES);
+// a family WORD (word 0 or a later word): psql, the always-refused tools and any other `pg_*` program but pg_config (some work offline; refusing them costs little)
+const pgWord = (w) => { const n = commandName(w); return PG_SET.has(n) || (n.startsWith('pg_') && n !== 'pg_config'); };
+// a family TOKEN in a line's text: the name as the LAST path component of a word (same shape as SB_TOKEN_SRC); `pg_class`, `psql_x`, `psql.md`, `@scope/psql-x` are not tokens
+const PG_TOKEN = new RegExp(String.raw`(?<![\w.@-])(?:${PG_NAMES.join('|')})(?:\.(?:exe|cmd|bat))?(?![\w/.\-_])`, 'i');
+const SDB_TEXT = /supabase_db_/i;
+const PG_ENV_NAME = /\b(?:PG[A-Z_]+|DATABASE_URL|DOCKER_[A-Z_]+)\b/;
+const DOCKER_HINT = 'the shape that passes is `docker exec -i supabase_db_<name> psql -X -U postgres -d postgres -f - < file.sql`';
+
+// ---- the SQL text scan (host -c, docker -c, the docker file): every rule over-reads, nothing is skipped ----
+const DESCRIBE_BASE = ['d', 'da', 'dA', 'dAc', 'dAf', 'dAo', 'dAp', 'db', 'dc', 'dC', 'dconfig', 'dd', 'dD', 'ddp', 'dE', 'des', 'det', 'deu', 'dew', 'df', 'dF', 'dFd', 'dFp', 'dFt', 'dg', 'di', 'dl', 'dL', 'dm', 'dn', 'do', 'dO', 'dp', 'dP', 'drds', 'drg', 'dRp', 'dRs', 'ds', 'dt', 'dT', 'du', 'dv', 'dx', 'dX', 'dy'];
+// exact meta-command names (`\` + the run up to a space, a tab or the next backslash): the separator ('') and `\.`, display and variable commands, the conditional family, the describe family
+const META_OK = new Set(['', '.', 'set', 'unset', 'echo', 'qecho', 'warn', 'pset', 'timing', 'x', 'a', 't', 'f', 'H', 'C', 'q', 'quit', 'if', 'elif', 'else', 'endif', 'conninfo', 'errverbose', 'gdesc', 'l', 'l+', 'list', 'list+', 'g', 'gx',
+  ...DESCRIBE_BASE.flatMap((n) => [n, `${n}+`, `${n}S`, `${n}S+`, `${n}+S`])]);
+const SET_LINE = /^[ \t]*\\set[ \t]+[a-z][a-z0-9_]*(?:[ \t]+(?:[A-Za-z0-9_.-]+|'[A-Za-z0-9_ .,@/-]*'))?[ \t]*$/;
+const SQL_WORDS = ['program', 'dblink', 'fdw', 'plpython', 'plperlu', 'pltclu', 'plsh'];
+const isMetaSpace = (ch) => ch === ' ' || ch === '\t' || ch === '\f' || ch === '\v';
+const isAlpha = (ch) => (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
+const isNameChar = (ch) => isAlpha(ch) || (ch >= '0' && ch <= '9') || ch === '_';
+// `:'name'` / `:"name"` at t[j] (the quote), name `^[a-z][a-z0-9_]*$`
+function quotedVariable(t, j) {
+  const q = t[j];
+  let k = j + 1;
+  if (!(t[k] >= 'a' && t[k] <= 'z')) return false;
+  while (k < t.length && ((t[k] >= 'a' && t[k] <= 'z') || (t[k] >= '0' && t[k] <= '9') || t[k] === '_')) k += 1;
+  return t[k] === q;
+}
+/** @returns {string|null} why the text may not be run through a local-only psql, or null */
+export function psqlTextRefusal(text, { host = false } = {}) {
+  const t = String(text).replace(/\r\n/g, '\n');
+  if (t.includes('\r')) return 'a carriage return that is not part of a CRLF line end';
+  if (t.includes('\0')) return 'a NUL byte';
+  const lines = t.split('\n');
+  for (let n = 0; n < lines.length; n += 1) {
+    const line = lines[n];
+    let bs = line.indexOf('\\');
+    if (bs < 0) continue;
+    if (host) return `a backslash on line ${n + 1} (a meta-command or an escape)`;
+    if (line.includes('`')) return `a backtick on line ${n + 1}, which also holds a backslash`;
+    while (bs >= 0) {
+      let j = bs + 1;
+      while (j < line.length && line[j] !== '\\' && !isMetaSpace(line[j])) j += 1;
+      const name = line.slice(bs + 1, j);
+      if (!META_OK.has(name)) return `the meta-command \`\\${name}\` on line ${n + 1} is not on the allow-list`;
+      if ((name === 'g' || name === 'gx') && line.slice(j).trim() !== '') return `\`\\${name}\` with text after it on line ${n + 1}`;
+      if (name === 'pset' && line.slice(j).trimStart().toLowerCase().startsWith('p')) return `\`\\pset\` of a pager setting on line ${n + 1}`;
+      if (name === 'set' && !SET_LINE.test(line)) return `a \`\\set\` on line ${n + 1} that is not \`\\set <name> [<plain value>]\``;
+      bs = line.indexOf('\\', j);
+    }
+  }
+  // interpolation: only the quoted forms; a run of three or more colons, or any other colon followed by a name, a digit, a quote, `{` or a non-ASCII byte, is refused (unquoted `:name` inserts raw text and psql's own variables carry server text)
+  for (let i = 0; i < t.length;) {
+    if (t[i] !== ':') { i += 1; continue; }
+    let j = i;
+    while (t[j] === ':') j += 1;
+    const run = j - i;
+    if (run >= 3) return 'a run of three or more colons';
+    const ch = t[j];
+    if (ch !== undefined && (isNameChar(ch) || ch === "'" || ch === '"' || ch === '{' || ch.charCodeAt(0) >= 0x80)) {
+      const ok = (run === 1 && (ch === "'" || ch === '"') && quotedVariable(t, j)) || (run === 2 && isAlpha(ch));
+      if (!ok) return `a \`:${ch}\` interpolation or colon form the guard does not read`;
+    }
+    i = j;
+  }
+  const lower = t.toLowerCase();
+  for (const w of SQL_WORDS) if (lower.includes(w)) return `the SQL word \`${w}\``;
+  if (/alter\s+system/.test(lower)) return 'the SQL words `alter system`';
+  return null;
+}
+
+// ---- psql's own command line: exact option names, every word a proven literal ----
+const PSQL_BOOL_SHORT = 'XAtqxaebEnw1Hz0';
+const PSQL_VALUE_SHORT = new Map([['c', 'command'], ['f', 'file'], ['d', 'dbname'], ['U', 'username'], ['v', 'set'], ['F', 'fsep'], ['R', 'rsep'], ['T', 'tattr'], ['P', 'pset']]);
+const PSQL_BOOL_LONG = new Set(['no-psqlrc', 'tuples-only', 'no-align', 'quiet', 'csv', 'html', 'expanded', 'echo-all', 'echo-errors', 'echo-queries', 'single-transaction', 'no-password', 'field-separator-zero', 'record-separator-zero']);
+const PSQL_VALUE_LONG = new Map([['command', 'command'], ['file', 'file'], ['dbname', 'dbname'], ['username', 'username'], ['set', 'set'], ['variable', 'set'], ['field-separator', 'fsep'], ['record-separator', 'rsep'], ['table-attr', 'tattr'], ['pset', 'pset']]);
+const IDENT = /^[A-Za-z0-9_][A-Za-z0-9_-]*$/;
+const SET_NAME = /^[a-z][a-z0-9_]*$/;
+const SET_VALUE = /^[A-Za-z0-9_.-]*$/;
+const UNQUOTED_CHANGES = /[*?[\]{}$~\\`\s]/;
+
+// -> { why } | { norc, command: [], file: [], dbname: [], username: [], set: [], pos: [] }; `lit`: the command's litWords
+function parsePsqlArgs(args, lit) {
+  const r = { norc: false, command: [], file: [], dbname: [], username: [], set: [], fsep: [], rsep: [], tattr: [], pset: [], pos: [] };
+  const bad = (why) => ({ why });
+  for (let i = 0; i < args.length; i += 1) {
+    const w = args[i];
+    if (!lit.has(w)) return bad(`\`${w}\` is not a plain literal word`);
+    const take = (inline) => {
+      if (inline !== undefined) return inline;
+      i += 1;
+      return i < args.length && lit.has(args[i]) ? args[i] : null;
+    };
+    if (w === '--' || w === '-') return bad(`\`${w}\``);
+    if (w.startsWith('--')) {
+      const eq = w.indexOf('=');
+      const name = eq < 0 ? w.slice(2) : w.slice(2, eq);
+      if (PSQL_BOOL_LONG.has(name)) {
+        if (eq >= 0) return bad(`\`${w}\``);
+        if (name === 'no-psqlrc') r.norc = true;
+        continue;
+      }
+      const kind = PSQL_VALUE_LONG.get(name);
+      if (!kind) return bad(`the option \`--${name}\` is not one the guard reads`);
+      const value = take(eq >= 0 ? w.slice(eq + 1) : undefined);
+      if (value === null) return bad(`\`--${name}\` has no literal value`);
+      r[kind].push(value);
+      continue;
+    }
+    if (w.startsWith('-')) {
+      for (let k = 1; k < w.length; k += 1) {
+        const ch = w[k];
+        if (PSQL_BOOL_SHORT.includes(ch)) { if (ch === 'X') r.norc = true; continue; }
+        const kind = PSQL_VALUE_SHORT.get(ch);
+        if (!kind) return bad(`the option \`-${ch}\` is not one the guard reads`);
+        const rest = w.slice(k + 1);
+        const value = take(rest === '' ? undefined : rest);
+        if (value === null) return bad(`\`-${ch}\` has no literal value`);
+        r[kind].push(value);
+        break;
+      }
+      continue;
+    }
+    r.pos.push(w);
+  }
+  return r;
+}
+
+// the text appears in the raw command between plain single quotes (`$'…'` is decoded by the parser's own reader, which may differ from the shell's)
+function singleQuotedIn(raw, t) {
+  const q = `'${t}'`;
+  for (let at = raw.indexOf(q); at >= 0; at = raw.indexOf(q, at + 1)) if (raw[at - 1] !== '$') return true;
+  return false;
+}
+
+// the checks both shapes share on a parsed command line; `host` picks the text rules
+function psqlArgsRefusal(r, c, host) {
+  for (const v of r.set) {
+    const eq = v.indexOf('=');
+    if (eq < 0 || !(SET_NAME.test(v.slice(0, eq)) || v.slice(0, eq) === 'ON_ERROR_STOP') || !SET_VALUE.test(v.slice(eq + 1))) return `the variable \`-v ${v}\` is not \`name=plain value\``;
+  }
+  if (r.pset.some((v) => v.toLowerCase().startsWith('p'))) return 'a `-P` pager setting';
+  for (const t of r.command) {
+    // written single-quoted in the raw command: no `$`, backtick or quote can change it between what the guard read and what runs
+    if (/['$`]/.test(t) || !singleQuotedIn(String(c.raw), t)) return `a \`-c\` text that is not written single-quoted without \`$\`, a backtick or a quote (\`${t.slice(0, 40)}\`)`;
+    const why = psqlTextRefusal(t, { host });
+    if (why) return `the \`-c\` text holds ${why}`;
+  }
+  return null;
+}
+
+// the strict host URI: `postgresql://user[:pw]@127.0.0.1|localhost|[::1]:port/db`, no query, no percent-encoding, one host
+function strictLocalUri(v) {
+  if (!v.startsWith('postgresql://')) return false;
+  for (const ch of v) if (!(isNameChar(ch) || ch === '.' || ch === ':' || ch === '@' || ch === '/' || ch === '[' || ch === ']' || ch === '-')) return false;
+  if (!localDbUrl(v)) return false;
+  const u = new URL(v);
+  return u.port !== '' && u.pathname.length > 1;
+}
+
+// `&` that is not part of `2>&1` / `&>`: a background job or `&&` (the parser drops a trailing `&`)
+const hasBareAmp = (text) => { for (let i = 0; i < text.length; i += 1) if (text[i] === '&' && text[i - 1] !== '>' && text[i + 1] !== '>') return true; return false; };
+
+// rule 0: the command is the only one on the line, at depth 0, with nothing around it
+function aloneRefusal(c, x) {
+  if (x.depth > 0) return 'psql inside script text the guard reads again (a here-doc or piped shell, a script, eval, a held command line) cannot be judged';
+  if (x.cmds.length !== 1) return 'the psql command is not the only command on the line (a separator, pipe, substitution or redirect-only command is around it)';
+  if (c.pipe === true || stdinFed(c)) return 'the psql command is in a pipe';
+  if (hasBareAmp(String(x.scanRaw ?? ''))) return 'the psql command is run in the background or joined with `&&`';
+  if (Object.keys(c.env ?? {}).length) return 'the psql command carries an environment assignment';
+  return null;
+}
+
+// the same string twice in a guarded argv, one copy quoted and one not, shares one literal verdict: refused when the string needs quoting to be literal
+function repeatRefusal(argv) {
+  const seen = new Set();
+  for (const w of argv) {
+    if (seen.has(w) && UNQUOTED_CHANGES.test(w)) return `the word \`${w.slice(0, 40)}\` appears twice`;
+    seen.add(w);
+  }
+  return null;
+}
+const hasInputRedirect = (c) => (c.redirects ?? []).some((r) => String(r.op).startsWith('<') || r.fd === 0);
+
+// -> reason | null. `p`: { aligned, cut, typed }
+function hostPsqlRefusal(c, x, p) {
+  const argv = c.argv;
+  const lit = c.litWords ?? new Set();
+  if (!lit.has(argv[0]) || !(argv[0] === 'psql' || argv[0].startsWith('/'))) return 'the psql program is not a plain literal `psql` or an absolute path';
+  const prefixOk = p.aligned && (p.cut === 0 || (p.cut === 2 && p.typed[0] === 'timeout' && /^[0-9]+[smhd]?$/.test(p.typed[1])));
+  if (!prefixOk) return 'psql is run through a wrapper or launcher (only a bare `timeout <seconds>` in front is read)';
+  const args = argv.slice(1);
+  if (args.length === 1 && ['--version', '-V', '--help', '-?'].includes(args[0]) && lit.has(args[0])) return null;
+  const alone = aloneRefusal(c, x);
+  if (alone) return alone;
+  const dup = repeatRefusal(argv);
+  if (dup) return dup;
+  const r = parsePsqlArgs(args, lit);
+  if (r.why) return `psql ${r.why}`;
+  if (!r.norc) return 'psql is run without `-X` (a psqlrc can run `\\c` or shell escapes)';
+  if (r.command.length === 0) return 'psql has no `-c` text for the guard to read';
+  if (r.file.length || r.username.length) return 'psql reads a file or names a user outside the URI';
+  const sources = [...r.dbname, ...r.pos];
+  if (sources.length !== 1 || !strictLocalUri(sources[0])) return 'psql names no single plain localhost URI (`postgresql://user:pw@127.0.0.1:<port>/<db>`, no `?`, no `-h` / `-p` / `-U`, no `host=` word)';
+  if (hasInputRedirect(c)) return 'psql reads input from a redirect or here-doc';
+  const env = x.io.env ?? {};
+  for (const n of ['PGHOSTADDR', 'PGSERVICE', 'PGSERVICEFILE', 'PGSYSCONFDIR', 'PGOPTIONS']) if (Object.hasOwn(env, n)) return `the hook's environment sets ${n}, which can move the host`;
+  return psqlArgsRefusal(r, c, true);
+}
+
+// ---- docker psql: the Docker endpoint is proven local from the files Docker itself reads ----
+const strictUtf8 = new TextDecoder('utf-8', { fatal: true, ignoreBOM: true });
+function dockerEndpointRefusal(io) {
+  const env = io.env ?? {};
+  for (const n of ['DOCKER_HOST', 'DOCKER_CONTEXT', 'DOCKER_CONFIG']) if (Object.hasOwn(env, n)) return `the hook's environment sets ${n}, which can point docker at another daemon`;
+  if (typeof io.readBytes !== 'function' || typeof io.home !== 'string' || io.home === '') return 'the guard cannot read the Docker config';
+  const readJson = (file) => {
+    const r = io.readBytes(file);
+    if (r?.absent) return { absent: true };
+    if (!r?.ok) return { why: `the guard could not read ${file}` };
+    try { return { json: JSON.parse(strictUtf8.decode(r.ok)) }; } catch { return { why: `${file} is not valid UTF-8 JSON` }; }
+  };
+  const cfg = readJson(path.join(io.home, '.docker', 'config.json'));
+  if (cfg.why) return cfg.why;
+  if (cfg.absent) return null; // no config: the default context
+  if (cfg.json === null || typeof cfg.json !== 'object' || Array.isArray(cfg.json)) return 'the Docker config is not a JSON object';
+  const cur = cfg.json.currentContext;
+  if (cur === undefined || cur === '' || cur === 'default') return null;
+  if (typeof cur !== 'string') return 'the Docker config\'s currentContext is not a string';
+  const meta = readJson(path.join(io.home, '.docker', 'contexts', 'meta', createHash('sha256').update(cur).digest('hex'), 'meta.json'));
+  if (meta.why) return meta.why;
+  if (meta.absent) return `the Docker context \`${cur}\` has no meta file the guard can read`;
+  const hostName = meta.json?.Endpoints?.docker?.Host;
+  const local = io.platform === 'win32' ? 'npipe:////./pipe/' : 'unix:///';
+  if (typeof hostName !== 'string' || !hostName.startsWith(local)) return `the Docker context \`${cur}\` does not use a local socket`;
+  return null;
+}
+
+function dockerPsqlRefusal(c, x, p) {
+  const argv = c.argv;
+  const lit = c.litWords ?? new Set();
+  const alone = aloneRefusal(c, x);
+  if (alone) return alone;
+  if (argv[0] !== 'docker' || !p.aligned || p.cut !== 0) return 'docker is run through a wrapper or is not the plain `docker` command';
+  if (!argv.every((w) => lit.has(w))) return 'a word of the docker line is not a plain literal';
+  const dup = repeatRefusal(argv);
+  if (dup) return dup;
+  let i = 1;
+  if (argv[i] === 'container') i += 1;
+  if (argv[i] !== 'exec') return 'the docker subcommand is not `exec`';
+  i += 1;
+  let interactive = false;
+  while (argv[i]?.startsWith('-')) {
+    if (argv[i] !== '-i' && argv[i] !== '--interactive') return `the docker exec option \`${argv[i]}\` is not allowed (only \`-i\`)`;
+    interactive = true;
+    i += 1;
+  }
+  const container = argv[i];
+  if (typeof container !== 'string' || !/^supabase_db_[A-Za-z0-9][A-Za-z0-9_.-]*$/.test(container)) return 'the container is not a literal `supabase_db_<name>`';
+  if (argv[i + 1] !== 'psql') return 'the program run in the container is not `psql`';
+  const r = parsePsqlArgs(argv.slice(i + 2), lit);
+  if (r.why) return `psql ${r.why}`;
+  if (!r.norc) return 'psql is run without `-X` (a psqlrc inside the container can run `\\c`)';
+  for (const v of [...r.dbname, ...r.username, ...r.pos]) if (!IDENT.test(v)) return `\`${v}\` is not a plain identifier`;
+  if (r.dbname.length > 1 || r.username.length > 1 || r.pos.length > 2) return 'psql names a database or user more than once';
+  if (r.file.length > 1 || (r.file.length === 1 && r.file[0] !== '-')) return 'psql reads a file other than stdin (`-f -`); a path would be inside the container';
+  const bad = psqlArgsRefusal(r, c, false);
+  if (bad) return bad;
+  const endpoint = dockerEndpointRefusal(x.io);
+  if (endpoint) return endpoint;
+  const stdin = r.file.length === 1 || r.command.length === 0;
+  const redirects = c.redirects ?? [];
+  if (!stdin) {
+    if (hasInputRedirect(c)) return 'psql is given input that it never reads (`-c` only); remove the redirect';
+    return null;
+  }
+  if (!interactive) return 'psql reads stdin, so `docker exec` needs `-i` (without it nothing is forwarded)';
+  const only = redirects[0];
+  if (redirects.length !== 1 || only.op !== '<' || (only.fd !== null && only.fd !== undefined && only.fd !== 0) || typeof only.target !== 'string') return 'the line must hold exactly one redirect, a plain `<` from a literal file';
+  if (only.target === '' || !/^[A-Za-z0-9_./@+=,-]+$/.test(only.target)) return `the input file \`${only.target}\` is not a plain literal path`;
+  const file = path.resolve(x.io.cwd ?? process.cwd(), only.target);
+  const got = typeof x.io.readBytes === 'function' ? x.io.readBytes(file) : null;
+  if (!got?.ok) return `the guard could not read \`${only.target}\``;
+  const bytes = got.ok;
+  if (bytes.length >= 3 && bytes[0] === 0xef && bytes[1] === 0xbb && bytes[2] === 0xbf) return `\`${only.target}\` starts with a byte-order mark`;
+  let text;
+  try { text = strictUtf8.decode(bytes); } catch { return `\`${only.target}\` is not valid UTF-8`; }
+  const why = psqlTextRefusal(text, { host: false });
+  return why ? `\`${only.target}\` holds ${why}` : null;
+}
+
+// data-only commands (a small positive list): a family word after them is an operand, never a program. A bare word 0, nothing that runs a program, writes a file, reads stdin as the command line or sets env; git only with no global option
+const PG_DATA = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'which', 'type', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls']);
+const PG_DATA_GIT = new Set(['commit', 'grep', 'log', 'show', 'diff', 'status', 'blame', 'ls-files']);
+const pgDataOnly = (c, plain) => {
+  if (!plain || runsProgram(c) || writesFile(c) || stdinFed(c) || Object.keys(c.env ?? {}).length) return false;
+  const w = c.argv[0];
+  return PG_DATA.has(w) || (w === 'git' && PG_DATA_GIT.has(c.argv[1]));
+};
+const F4_VERBS = new Set(['exec', 'cp', 'run', 'create', 'rename', 'commit']);
+
+// -> reason | null
+function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
+  const token = PG_TOKEN.test(lineText);
+  const sdb = SDB_TEXT.test(lineText);
+  if (!token && !sdb) return null;
+  const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
+  if (token) {
+    if (cmds.dqTrans === true) return 'the line holds a `$"…"` string the parser reads untranslated, next to a psql family word';
+    if (reading.some((c) => stdinFed(c) && buildsProgram(c, () => true))) return '`xargs` / `parallel` builds a command from stdin and the line names a psql family program';
+  }
+  const infos = reading.map((c) => {
+    const typed = typedWords(c);
+    const cut = typed.length - c.argv.length;
+    const aligned = cut >= 0 && c.argv.every((w, i) => typed[cut + i] === w);
+    return { c, typed, cut, aligned, data: token && pgDataOnly(c, aligned && cut === 0) };
+  });
+  if (token) {
+    // any NAME that can move a client (PGHOST …, DATABASE_URL, DOCKER_*) anywhere on a line with a family word, however it is set (`export PGHOST+=x`, `read PGHOST`, `${PGHOST:=x}`)
+    const text = [String(scanRaw ?? ''), ...infos.filter((i) => !i.data).map((i) => i.c.raw)].join('\n');
+    if (PG_ENV_NAME.test(text) || cmds.some((c) => Object.keys(c.env ?? {}).some((k) => PG_ENV_NAME.test(k)))) return 'the line names PG* / DATABASE_URL / DOCKER_* variables next to a psql family word';
+  }
+  for (const { c, typed, cut, aligned, data } of infos) {
+    if (data) continue;
+    const argv = c.argv;
+    const own = wordsOf(c);
+    if (token && (nonLiteralHead(argv) || nonLiteralHead(typed))) return 'the command is run through a variable on a line that names a psql family program';
+    const p = { aligned, cut, typed };
+    const name = commandName(argv[0]);
+    if (name === 'psql') {
+      const why = hostPsqlRefusal(c, x, p);
+      if (why) return why;
+      continue;
+    }
+    if (name === 'docker' && own.some(pgWord)) {
+      const why = dockerPsqlRefusal(c, x, p);
+      if (why) return `${why}; ${DOCKER_HINT}`;
+      continue;
+    }
+    if (sdb && [...argv, ...typed].some((w) => commandName(w) === 'docker') && [...argv, ...typed].some((w) => F4_VERBS.has(w)) && [...argv, ...typed].some((w) => SDB_TEXT.test(w))) return `a docker line that runs, copies into or changes a \`supabase_db_*\` container (${DOCKER_HINT})`;
+    if (!token || name === 'sed' || isPipelineBin(argv)) continue;
+    const words = [...own, ...(aligned ? typed.slice(0, cut) : typed)];
+    for (const [i, w] of words.entries()) {
+      if (i < own.length && isInlineProgram(own, i)) continue;
+      if (pgWord(w) || PG_TOKEN.test(w)) return `\`${w.slice(0, 40)}\` is a psql family program the guard does not know how to read here (a launcher, a quoted command string, or a client other than the two allowed psql shapes)`;
+    }
+  }
+  return null;
+}
+
 // `scanRaw` is the line with the prose flags (commit message, PR body) masked; `wordsOf(cmd)` the words of one command without those prose values (a command inside `$(…)` or backticks in a prose value is its own command, so its words are still read)
 // `reparse(text)` parses a quoted command string with the guard's own parser (same env and deadline as the outer parse, its own `bashState`); null = none given
-export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv, reparse = null) {
+// `io` ({ cwd, env, home, readBytes, platform, depth }): what the psql family reads from the world (the docker config, the SQL file); an absent seam refuses
+export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv, reparse = null, io = {}) {
   const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
   const reading = cmds.filter((c) => c.argv?.length);
   const lineText = [scanRaw, ...cmds.map((c) => c.raw)].join('\n');
+  const pg = pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io);
+  if (pg) return refuse(pg);
   // R10-F1: xargs / parallel append words from stdin that no reading shows; with a supabase token on the line the call cannot be judged
   let lineHead; // sbTokenHead(lineText), computed at most once
   const lineHeadOnce = () => (lineHead ??= sbTokenHead(lineText));
