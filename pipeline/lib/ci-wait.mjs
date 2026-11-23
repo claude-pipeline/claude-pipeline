@@ -65,7 +65,8 @@
 // ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
 // The residual is REPORTED instead: a `checks[]` entry that passed on a run (or status) dated before `readyAt` carries
 // `predatesReady: true` (absent otherwise; an unreadable time never sets it). A passing status dated after ready also counts when the
-// Actions run it links to started before ready (read lazily, only on the pass path). The verdict is unchanged.
+// Actions run it links to started before ready (read lazily, only on the pass path); a run whose read threw reports `predatesReady: null`
+// (unresolved, flagged for the hand-off). The verdict is unchanged.
 import { EXIT } from './cli.mjs';
 import { requiredFromRules } from './protection.mjs';
 import { REVIEW_CONTEXT, parseReviewRecord } from './review-marker.mjs';
@@ -183,7 +184,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   };
 
   // ms a GitHub Actions run started (run_started_at, else created_at) for a status's target_url, or null: no run reader, a url
-  // that is not `.../actions/runs/<id>` (a job suffix is ignored), an unreadable run, or an unreadable time. Never throws.
+  // that is not `.../actions/runs/<id>` (a job suffix is ignored), or an unreadable time. undefined: the read of a recognised run
+  // threw (a 503 may be transient, a 404 permanent), told apart so a pass is never reported fresh on it. Never throws.
   const getRunStartedAt = async (targetUrl) => {
     const id = /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(String(targetUrl ?? ''))?.[1];
     if (!id || !readers.workflowRun) return null;
@@ -194,7 +196,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       const t = Date.parse(run?.run_started_at ?? run?.created_at);
       at = Number.isFinite(t) ? t : null;
     } catch {
-      at = null;
+      at = undefined;
     }
     runStartMemo.set(id, at);
     return at;
@@ -296,7 +298,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       // A guards run that started before the marker can publish its failure after it (the recheck cancels it only later):
       // dated by when the run that posted it started, strictly before the marker.
       const started = await getRunStartedAt(status.target_url);
-      return started !== null && started < marker;
+      return typeof started === 'number' && started < marker;
     } catch {
       return false;
     }
@@ -317,6 +319,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   // timeline read cannot leave a pass dated before readyAt unflagged.
   const passStarts = new WeakMap(); // evaluate() result -> ms each passing producer started (NaN when unreadable)
   const passStatuses = new WeakMap(); // evaluate() result -> its passing commit statuses (their Actions run is read lazily, see markStatusRuns)
+  const passUnresolved = new WeakSet(); // evaluate() results with a passing status whose Actions run could not be read (predatesReady: null)
   const statusBasis = new WeakMap(); // evaluate() result -> the commit status it rests on (for the status re-read and its evidence)
   const evaluate = async (identity, obs, pr) => {
     const producers = [];
@@ -347,14 +350,16 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
 
   // A guards run can evaluate before ready and post its success after it (see statusPredatesReady), so a passing status dated at or after
   // ready is also dated by the Actions run it links to: one that started before ready is a draft-era pass. Read only on the pass path,
-  // and only for a status not already dated before ready; an unreadable run adds nothing (the status time alone stands).
+  // and only for a status not already dated before ready. A run with no readable start time adds nothing (the status time alone
+  // stands); a run whose read threw leaves the pass unresolved (predatesReady: null), like a timeline read that fails.
   const markStatusRuns = async (states, readyMs) => {
     if (!Number.isFinite(readyMs)) return;
     for (const s of states) {
       for (const status of passStatuses.get(s) ?? []) {
         if (Date.parse(status.created_at) < readyMs) continue;
         const started = await getRunStartedAt(status.target_url);
-        if (started !== null) passStarts.get(s)?.push(started);
+        if (started === undefined) passUnresolved.add(s);
+        else if (started !== null) passStarts.get(s)?.push(started);
       }
     }
   };
@@ -461,7 +466,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       const starts = passStarts.get(s);
       if (!starts) return s;
       const { predatesReady: _drop, ...rest } = s;
-      return Number.isFinite(readyMs) && starts.some((at) => Number.isFinite(at) && at < readyMs) ? { ...rest, predatesReady: true } : rest;
+      if (Number.isFinite(readyMs) && starts.some((at) => Number.isFinite(at) && at < readyMs)) return { ...rest, predatesReady: true };
+      return passUnresolved.has(s) ? { ...rest, predatesReady: null } : rest;
     });
     return {
       exitCode,

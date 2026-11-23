@@ -1716,13 +1716,20 @@ test('#642 R1-B1: a passing status created after ready by an Actions run that st
   const flag = Object.fromEntries(r.output.checks.map((c) => [c.name, c.predatesReady]));
   assert.deepEqual(flag, { late: true, fresh: undefined, norun: undefined });
   assert.deepEqual([...new Set(s.reads.runs)].sort(), ['77', '78'], 'a status without an Actions run url reads nothing');
-  // an unreadable run falls back to the status time alone: no flag, same verdict
-  for (const workflowRun of [() => { throw new Error('HTTP 404'); }, { id: 77 }, null]) {
+  // a run with no readable start time falls back to the status time alone: no flag, same verdict
+  for (const workflowRun of [{ id: 77 }, null]) {
     const u = await sim(world({ workflowRun })).run();
     assert.equal(u.output.verdict, 'passed', String(workflowRun));
-    assert.equal(u.output.checks.some((c) => c.predatesReady), false, String(workflowRun));
+    assert.equal(u.output.checks.some((c) => c.predatesReady !== undefined), false, String(workflowRun));
   }
+  // Catches (R2-B1): a THROWN read of a recognised Actions run (a 503 on a draft-era guard's run) must not read as an unflagged pass:
+  // it is reported unresolved (predatesReady: null, flagged for the hand-off), the verdict unchanged; a status with no run url stays clean
+  const failed = await sim(world({ workflowRun: () => { throw new Error('HTTP 503'); } })).run();
+  assert.equal(failed.output.verdict, 'passed', JSON.stringify(failed.output));
+  assert.equal(failed.exitCode, 0);
+  const unresolved = Object.fromEntries(failed.output.checks.map((c) => [c.name, c.predatesReady]));
+  assert.deepEqual(unresolved, { late: null, fresh: null, norun: undefined });
   // no run reader: the same fallback; and a failure never reads a run on this path
   const none = await sim(world({ workflowRun: undefined })).run();
-  assert.equal(none.output.checks.some((c) => c.predatesReady), false);
+  assert.equal(none.output.checks.some((c) => c.predatesReady !== undefined), false);
 });
