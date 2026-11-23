@@ -193,6 +193,10 @@ test("R1-B5: a catch-up is a merge of the PR's BASE branch (update-branch, or a 
   assert.equal(isCatchUpCommit(merge("Merge branch 'main' of github.com:acme/widgets into topic", 'me'), 'main'), true, 'R2-F1: git pull origin main');
   assert.equal(isCatchUpCommit(merge("Merge branch 'owner:main' into topic"), 'main'), true, 'R2-F1: update-branch on a fork PR');
   assert.equal(isCatchUpCommit(merge("Merge branch 'owner:feature-x' of https://github.com/owner/widgets into topic", 'me'), 'main'), false, 'R2-F1: still the base only');
+  assert.equal(isCatchUpCommit(merge("Merge branch 'main' of https://github.com/Acme/widgets.git into topic", 'me'), 'main', 'acme/widgets'), true, 'R3-B2: a pull from the base repository (https, any case, .git)');
+  assert.equal(isCatchUpCommit(merge("Merge branch 'main' of git@github.com:acme/widgets into topic", 'me'), 'main', 'acme/widgets'), true, 'R3-B2: the ssh form');
+  assert.equal(isCatchUpCommit(merge("Merge branch 'main' of https://github.com/contributor/widgets into topic", 'me'), 'main', 'acme/widgets'), false, "R3-B2: another fork's main is not the base");
+  assert.equal(isCatchUpCommit(merge("Merge branch 'main' into topic", 'me'), 'main', 'acme/widgets'), true, 'R3-B2: no URL, unchanged');
   // the head of a feature merge pushed while ready is a push, not a catch-up
   const pr = { ...PR_DRAFT, baseRef: 'main' };
   const commits = [{ ...commit('c'), parents: [{}, {}], committer: { login: 'web-flow' }, commit: { message: "Merge branch 'feature-x' into topic" } }];

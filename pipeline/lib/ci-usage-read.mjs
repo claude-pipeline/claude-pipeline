@@ -152,7 +152,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
       const commits = pages(gh, `repos/${slug}/pulls/${n}/commits`, undefined, cut('commits', n), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
       // GitHub returns at most 250 commits of a PR whatever the pages: a PR with more is short here, with no cut page to show it
       if (Number.isInteger(pr?.commits) && pr.commits > commits.length) { truncated = true; warn(`#${n}: GitHub lists ${pr.commits} commits for this PR but returned ${commits.length} (it caps the commits of a PR at 250): the classification of this PR may be short`); }
-      readPr.set(n, { pr: { createdAt: pr?.created_at, draft: pr?.draft === true, baseRef: pr?.base?.ref }, timeline, commits, comments: null });
+      readPr.set(n, { pr: { createdAt: pr?.created_at, draft: pr?.draft === true, baseRef: pr?.base?.ref, baseRepo: pr?.base?.repo?.full_name }, timeline, commits, comments: null });
     } catch (err) {
       if (err instanceof budget.stop) { skipped.prs += 1; continue; }
       warn(`#${n}: could not be read (${asciiLine(err?.message, 120)}): its runs stay unclassified`);
@@ -164,18 +164,21 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
 
   // the jobs of the biggest candidate runs first (the cost is there), one call each
   const jobsByRun = new Map();
+  let jobsCut = 0;
   const bySize = [...candidates].sort((a, b) => elapsedMs(b) - elapsedMs(a));
   for (const run of bySize) {
     try {
+      let cut = false;
       const jobs = pages(gh, `repos/${slug}/actions/runs/${encodeURIComponent(run.id)}/jobs?filter=all`, undefined,
-        () => { truncated = true; warn(`run ${run.id}: the jobs were cut after ${MAX_PAGES} pages: its job minutes are short`); }, { key: 'jobs', onCall: () => budget.tick() });
+        () => { cut = true; truncated = true; warn(`run ${run.id}: the jobs were cut after ${MAX_PAGES} pages: its job minutes are short`); }, { key: 'jobs', onCall: () => budget.tick() });
+      if (cut) { jobs.cut = true; jobsCut += 1; }
       jobsByRun.set(run.id, jobs);
     } catch (err) {
       if (err instanceof budget.stop) break;
       warn(`run ${run.id}: the jobs could not be read (${asciiLine(err?.message, 100)})`);
     }
   }
-  skipped.jobs = candidates.length - jobsByRun.size;
+  skipped.jobs = candidates.length - jobsByRun.size + jobsCut; // a run whose list was cut is not fully read
 
   // the review-complete marker, for the PRs whose catch-up heads had heavy runs (read after the jobs: the budget left over)
   for (const [n, data] of readPr) {

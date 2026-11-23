@@ -314,6 +314,15 @@ test('R2-B3: a jobs list cut by the page limit makes the report partial', () => 
   assert.equal(r.json.repos[0].partial, true);
 });
 
+test('R3-B3: one heavy run whose jobs list was cut is not fully read: coverage drops below 100 and the run counts in skipped.jobs', () => {
+  const many = Array.from({ length: 100 }, () => job(T('10:30'), 0.01));
+  const cut = [{ match: '^api repos/acme/widgets/actions/runs/1003/jobs', stdoutJson: { total_count: 5000, jobs: many } }];
+  const r = usage(world({ extra: cut }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const repo = r.json.repos[0];
+  assert.deepEqual([repo.partial, repo.totals.heavyRuns, repo.totals.coverage, repo.skipped.jobs], [true, 5, 80, 1]);
+});
+
 test('R2-B4: with the viewer unknown the warning says the review-complete comment of any author is accepted too', () => {
   const noViewer = world().map((e) => (e.match === '^api user' ? { match: e.match, code: 1, stderr: 'gh: HTTP 502' } : e));
   const r = usage(noViewer, ['--json', '--since', '2026-11-05']);
