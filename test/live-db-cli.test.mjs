@@ -190,8 +190,6 @@ const ALLOWED = [
   'python3 -c "print(max(1, 2))"',
   "jq 'map(select(.a == 1))' x.json",
   'claude -p "call foo(a, b) twice"',
-  'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 1 --built "Added helper parse(a, b) and tests"',
-  'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 1 --built "Owner runs supabase db push after merge"',
   // B1 (F2): find's own prefix is data
   'find supabase -type d -name functions -exec ls {} \\;',
   "find supabase -name '*.sql' -exec grep -l storage {} +",
@@ -549,6 +547,18 @@ const DENIED = [
 
 for (const line of ALLOWED) test(`allowed: ${line}`, () => {
   const v = verdict(line);
+  assert.equal(v.decision, 'allow', v.reason);
+});
+
+// B10 (F1/F4): the pipeline CLI's own lines. `~` must resolve to the pipeline CLI under the linux platform OPTS use, so these rows take a POSIX home:
+// the real temp home is a C:\ path on Windows, where `~/.claude/pipeline/...` would not resolve and the line would be refused as a protected-file write.
+// No registry is needed here (a missing one is empty).
+const PIPELINE_CLI_ALLOWED = [
+  'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 1 --built "Added helper parse(a, b) and tests"',
+  'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 1 --built "Owner runs supabase db push after merge"',
+];
+for (const line of PIPELINE_CLI_ALLOWED) test(`allowed: ${line}`, () => {
+  const v = verdict(line, { home: '/home/u' });
   assert.equal(v.decision, 'allow', v.reason);
 });
 
