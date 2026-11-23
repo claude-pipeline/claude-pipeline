@@ -26,11 +26,11 @@ import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
-import { clickNotes, followUpClickState, roundAsk, rulingAsk } from '../hooks/lib/owner-go-click.mjs';
+import { RULING_VARIANT_LEGACY, clickNotes, followUpClickState, roundAsk, rulingAsk, rulingWhyRow } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, ownerRulingRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, ownerRulingRefusal, RULING_WHY, rulingRecommendationRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
@@ -57,9 +57,10 @@ export const meta = {
     '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented, or (error settle-head-moved, next `arbiter needed --pr N --round R --force`) when the tree differs from the round\'s reviewed head in a file that is not a test file, or a tracked file that is not a test file has uncommitted changes',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
-    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--repo DIR]',
+    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--recommend accept|follow-up --why CODE] [--repo DIR]',
     '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
-    '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
+    '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all; with an accepted --recommend the recommended one is first and labelled "(Recommended)", see below) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
+    '  -> --recommend accept|follow-up --why CODE (only together; cp #771): the controller\'s recommendation for ALL the asked ids, as researched. CODE is one of accept: real-problem | unclear-safe; follow-up: minor-later (a code of the other decision is a usage error; there is no reject: every REJECT is a critical dismissal). The CLI decides only whether it may be SHOWN (triage.mjs#rulingRecommendationRefusal): every id must be one `owner-ruling` could record for that decision, and a follow-up only when every item is low severity (itemSeverity, as round-request / defer-fixes judge it) and waits for a human on low confidence or is an open deferrable ACCEPT. Accepted: the dialog is ruling-v2-accept / ruling-v2-follow-up (v 2 ask), the recommended option first as `Accept all (Recommended)` / `Follow-up all (Recommended)`, and the question gains one row `Claude recommends <Accept|Follow-up> all (when asked): <the fixed text of CODE>` just before the closing line. Refused (or no --recommend): exit 0 with the legacy ruling-v1 dialog, recommend null and recommendRefused (the reason): say in the reply that no bulk ruling can be recommended and per-item typed answers may be needed. Output adds {recommend, why, dialogVariant, recommendRefused?} with and without --ask. A recommendation records nothing: only the owner\'s click or typed answer does',
     'pipeline triage round-request --pr N [--ask] [--past] [--after-process-review] [--repo DIR]',
     '  -> the TRIP-WIRE (a prompt, not a gate; ON by default, review.trip_wire_extra_rounds / review.trip_wire_not_falling, the smaller of the working-tree and fork-point values): when the PR has reviewed max_rounds + extra counted rounds, or at least not_falling past-limit rounds',
     '     accepted (more than 0 and) at least as many new items as the round before, the ask does not print a line: exit 1 {ok:false, error:"trip-wire", tripWire: {tripped, reviewed, max, acceptsByRound, reasons}, processReview: {headline, summary}[, longReview][, nextRound], warnings}. Park the PR with the headline',
@@ -929,14 +930,32 @@ const contentOfState = (state) => (ids) => {
 const oneLine = (x) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
 const deferNote = (item, { id = true } = {}) => `${id ? `${item.id}: ` : ''}ACCEPTED by ${item.final?.ownerDeferral?.accepted ?? item.final?.by}, NOT fixed; follow-up = defer the fix to an issue; only when it is not a regression vs the default branch`;
 
+// Why the controller's recommendation may not be shown, or null (cp #771). The severity inputs are the ones round-request / defer-fixes give itemSeverity: the reviewed diff and the trusted base config
+// (a PR must not shrink its own sensitive-path list); a diff or config that cannot be read refuses a follow-up (it is a judgement of low severity). An accept needs neither.
+function recommendationRefusal({ root, config, state, items, recommend }) {
+  const decision = recommend === 'accept' ? 'ACCEPT' : 'FOLLOW-UP';
+  if (decision === 'ACCEPT') return rulingRecommendationRefusal(items, decision);
+  const diff = reviewedDiff(root, config, state);
+  if (diff.files === null) return `the reviewed diff could not be read (${diff.problem}), so no item can be judged low severity`;
+  const trusted = trustedBaseConfig(root, config);
+  if (trusted.problem) return `severity could not be judged: the trusted base config is unreadable (${asciiLine(trusted.problem, 160)})`;
+  return rulingRecommendationRefusal(items, decision, { state, config, files: diff.files, baseConfig: trusted.config });
+}
+
 // The line that ends the reply asking the owner to rule: the CLI writes it, so the agent cannot state a digest of its own choosing.
 async function rulingRequest(rest, ctx) {
-  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' }, ask: { type: 'boolean' } }, { allowPositionals: false });
+  const { values } = parseCommandArgs(rest, { pr: { type: 'string' }, ids: { type: 'string' }, repo: { type: 'string' }, ask: { type: 'boolean' }, recommend: { type: 'string' }, why: { type: 'string' } }, { allowPositionals: false });
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean).map((id) => id.toUpperCase()))]; // (R1-B1 and r1-b1 are one item)
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
+  // cp #771: the controller's recommendation. Both flags or neither; the code must be one the table has for THAT decision (its text is worded by installed code, never the controller's prose).
+  if ((values.recommend === undefined) !== (values.why === undefined)) throw new UsageError('--recommend and --why go together');
+  if (values.recommend !== undefined) {
+    if (!Object.hasOwn(RULING_WHY, values.recommend)) throw new UsageError(`--recommend must be ${Object.keys(RULING_WHY).join('|')} (a REJECT is never recommended)`);
+    if (!Object.hasOwn(RULING_WHY[values.recommend], values.why)) throw new UsageError(`--why for --recommend ${values.recommend} must be ${Object.keys(RULING_WHY[values.recommend]).join('|')}`);
+  }
   const root = resolveRepo(values, ctx);
-  const config = values.ask === true ? (await requireConfig(root)).config : null;
+  const config = values.ask === true || values.recommend !== undefined ? (await requireConfig(root)).config : null;
   const refuse = (reason) => ({ exitCode: EXIT.FAILED, output: { ok: false, reason } });
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => withStateLock(root, ctx, () => {
@@ -952,11 +971,16 @@ async function rulingRequest(rest, ctx) {
     const line = `⚖️ Owner ruling needed #${pr}: ${items.map((i) => i.id).join(', ')} · content ${rulingContentDigest(items)} · repo ${slug}`;
     // F1: an item that is an ACCEPT (not fixed) is said so, in the CLI's own words, so the owner knows "follow-up" defers an accepted fix (the closing line keeps its fixed shape: the owner-go hook parses it).
     const notes = items.filter((i) => isDeferrableAccept(i) || isOwnerDeferral(i)).map((i) => deferNote(i));
-    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}) } };
+    // May the recommendation be shown? Refused => the neutral legacy dialog and the reason, never a retry (exit 0).
+    const refused = values.recommend === undefined ? null : recommendationRefusal({ root, config, state, items, recommend: values.recommend });
+    const shown = values.recommend !== undefined && refused === null;
+    const dialogVariant = shown ? `ruling-v2-${values.recommend}` : RULING_VARIANT_LEGACY;
+    const recommendFields = { recommend: shown ? values.recommend : null, why: shown ? values.why : null, dialogVariant, ...(refused === null ? {} : { recommendRefused: refused }) };
+    if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields } };
     // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
-    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}`), line].join('\n');
-    const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block });
-    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
+    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}`), ...(shown ? [rulingWhyRow(values.recommend, values.why)] : []), line].join('\n');
+    const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: dialogVariant });
+    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
   }, pr));
 }
 
