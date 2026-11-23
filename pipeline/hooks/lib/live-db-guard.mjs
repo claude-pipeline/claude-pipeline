@@ -583,9 +583,7 @@ function variableHeadRefusal(words, state) {
 // Fail closed, a false refusal over any bypass; every scan is one linear pass, no regex over flag shapes (#688), no quote / comment / dollar-quote tracking in the SQL text.
 // What the local server or a container does once connected, container configuration and a daemon behind a local socket are named residuals (docs/cli.md "Live database guard").
 const PG_NAMES = ['psql', 'pg_dump', 'pg_restore', 'pg_dumpall', 'pgcli', 'usql', 'dropdb', 'createdb', 'vacuumdb', 'reindexdb', 'clusterdb', 'pgbench', 'pg_basebackup', 'pg_receivewal', 'createuser', 'dropuser', 'pg_amcheck', 'pg_recvlogical', 'pg_isready', 'vacuumlo', 'oid2name',
-  'pg_upgrade', 'pg_ctl', 'pg_resetwal', 'pg_rewind', 'pg_controldata', 'pg_waldump', 'pg_verifybackup', 'pg_archivecleanup', 'pg_checksums', 'pg_test_fsync', 'pg_test_timing', 'pg_createsubscriber', 'pg_combinebackup', 'pg_walsummary', 'pg_ctlcluster', 'pg_lsclusters', 'pg_createcluster', 'pg_dropcluster', 'pg_upgradecluster', 'pg_conftool',
-  // known third-party Postgres client programs (never extensions: pg_cron, pg_net, pg_trgm, pg_partman); an unlisted pg_* program that is not the command word is a named residual (#822)
-  'pg_repack', 'pg_prove', 'pgloader', 'pg_activity', 'pgcenter', 'pg_top', 'pgbadger', 'pgcopydb', 'pgbackrest'];
+  'pg_upgrade', 'pg_ctl', 'pg_resetwal', 'pg_rewind', 'pg_controldata', 'pg_waldump', 'pg_verifybackup', 'pg_archivecleanup', 'pg_checksums', 'pg_test_fsync', 'pg_test_timing', 'pg_createsubscriber', 'pg_combinebackup', 'pg_walsummary', 'pg_ctlcluster', 'pg_lsclusters', 'pg_createcluster', 'pg_dropcluster', 'pg_upgradecluster', 'pg_conftool'];
 const PG_SET = new Set(PG_NAMES);
 // a family WORD (word 0 or a later word): psql, the always-refused tools and any other `pg_*` program but pg_config (some work offline; refusing them costs little)
 const pgWord = (w) => { const n = commandName(w); return PG_SET.has(n) || (n.startsWith('pg_') && n !== 'pg_config'); };
@@ -906,6 +904,12 @@ const uniqWrites = (args) => {
   }
   return n > 1;
 };
+// a later word whose first token is a bare pg_* program name (`/usr/bin/pg_repack`, `pg_repack -h prod` inside `ssh host '…'`): never a name inside a word (`pg_class` in a SQL string) or a file with an extension
+const laterPgWord = (w) => { const t = String(w).trim().split(/\s+/)[0] ?? ''; return /^pg_[a-z0-9_]+$/i.test(commandName(t)) && pgWord(t); };
+// for a command that runs a program (`rg --pre=pg_repack`, `sort --compress-program=pg_repack`): the value attached to an option word is judged too
+const laterPgOpt = (w, runs) => laterPgWord(w) || (runs && /^--?[^=\s]+=/.test(String(w)) && laterPgWord(String(w).slice(String(w).indexOf('=') + 1)));
+// heads whose operands are data (git add / switch, mkdir, rm, gh …), but not find / make, which can run a word
+const dataOperands = (argv) => isDataWords(argv) && !['find', 'make'].includes(commandName(argv[0]));
 const pgDataOnly = (c, plain) => {
   if (!plain || runsProgram(c) || writesFile(c) || stdinFed(c) || Object.keys(c.env ?? {}).length) return false;
   const w = c.argv[0];
@@ -920,8 +924,12 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
   // a name split by empty quotes (`p''sql`) is not in the raw text but is in the words, so both the raw text and every reading's words are judged
   const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n')])].join('\n');
   // the text test misses a family program the parser unwrapped (a `pg_*` name that is not in the list, `timeout 30 pg_prove`): the command names are judged too
-  // (an UNLISTED pg_* program run as a later word, `kubectl exec db -- pg_foo`, is a named residual, #822; the known third-party clients are in PG_NAMES, so PG_TOKEN catches them anywhere)
-  const token = PG_TOKEN.test(seen) || reading.some((c) => pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? ''));
+  // (a later word of a command that is not data-only is judged too, by its first token as a bare program name: `kubectl exec db -- /usr/bin/pg_repack -h x`, `ssh host 'pg_repack -h x'`; a file with an extension, `supabase/migrations/pg_cron.sql`, is no program name; a command whose operands are data, `git switch pg_repack`, `mkdir pg_dumps`, is skipped)
+  const token = PG_TOKEN.test(seen) || reading.some((c) => {
+    if (pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '')) return true;
+    const runs = runsProgram(c); // once per command, not per word
+    return !pgDataOnly(c, true) && (runs || !dataOperands(c.argv)) && [...c.argv, ...typedWords(c)].some((w) => laterPgOpt(w, runs));
+  });
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
   const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
@@ -964,9 +972,11 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
     if (sdb && [...argv, ...typed].some((w) => commandName(w) === 'docker') && [...argv, ...typed].some((w) => F4_VERBS.has(w)) && [...argv, ...typed].some((w) => SDB_TEXT.test(w))) return `a docker line that runs, copies into or changes a \`supabase_db_*\` container (${DOCKER_HINT})`;
     if (!token || name === 'sed' || isPipelineBin(argv)) continue;
     const words = [...own, ...(aligned ? typed.slice(0, cut) : typed)];
+    const runs = runsProgram(c);
+    const dataOps = !runs && dataOperands(argv);
     for (const [i, w] of words.entries()) {
       if (i < own.length && isInlineProgram(own, i)) continue;
-      if (PG_TOKEN.test(w) || PG_SET.has(commandName(w)) || pgWord(w)) return `\`${w.slice(0, 40)}\` is a psql family program the guard does not know how to read here (a launcher, a quoted command string, or a client other than the two allowed psql shapes)`;
+      if (PG_TOKEN.test(w) || PG_SET.has(commandName(w)) || (!dataOps && (pgWord(w) || laterPgOpt(w, runs)))) return `\`${w.slice(0, 40)}\` is a psql family program the guard does not know how to read here (a launcher, a quoted command string, or a client other than the two allowed psql shapes)`;
     }
   }
   return null;

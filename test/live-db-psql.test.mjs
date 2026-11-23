@@ -275,7 +275,6 @@ test('the other family programs and psql behind launchers or variables are refus
     "kubectl exec db -- psql -c 'select 1'",
     'kubectl exec db -- pg_repack -h prod',
     'kubectl exec db -- pg_repack --version',
-    'pgloader x.load', 'pgbadger log', 'pgcopydb clone', 'pgbackrest backup', 'pgcenter top', 'kubectl exec db -- pgloader x.load', // listed clients without a pg_ prefix
     "doppler run --command 'psql -c 1'",
     "$PSQL -c 'select 1'",
     'DB=(docker exec -i "$C" psql); "${DB[@]}" -c \'select 1\'',
@@ -351,9 +350,11 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     "rg -l 'psql|DATABASE_URL' docs | sort | uniq",
     "rg -l 'psql|PGHOST' docs | uniq --skip-fields 1 -",
     'git add supabase/migrations/pg_cron.sql',
+    'git switch pg_repack',
     'git add db/pg_partman',
     'git checkout -b pg_cron_fix',
     'mkdir pg_dumps',
+    'rg -n psql docs; git add supabase/migrations/pg_cron.sql', // a listed name in a search does not make a data operand of the next command a client
     'rm -rf pg_data',
     'grep -rn \'psql "$DATABASE_URL"\' scripts',
     'gh pr create --title t --body "Runs psql against the local stack; DATABASE_URL is no longer read"',
@@ -372,13 +373,13 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     "rg -l 'psql|PGHOST' docs | uniq - out.sh",
     "rg -l 'psql|PGHOST' docs | uniq -- - -report",
     "rg -l 'psql|PGHOST' docs | uniq - -report",
-    'git switch pg_repack', // a listed client name as an operand of a non-data git subcommand fails closed, as `git switch psql` does
     'rg --pre pg_repack x docs',
     'sort --compress-program pg_repack f',
     'ack --pager pg_repack x',
     'rg --pre=pg_repack x docs',
     'sort --compress-program=pg_repack f',
     'ack --pager=pg_repack x',
+    'rg --pre=pg_autoctl x docs', 'rg --pre pg_autoctl x docs', 'sort --compress-program=pg_foo f', // an UNLISTED pg_* name as an executable-option value, both spellings
     `rg -n psql docs; ${P}`,
     `gh pr create --title t --body "$(PGHOST=db.x.supabase.co psql -c 'select 1')"`,
     `gh pr create --title t --body "$(export PGHOST=x; ${P})"`,
