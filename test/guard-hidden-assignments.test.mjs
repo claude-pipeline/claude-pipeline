@@ -407,3 +407,16 @@ test('the names a clean bash or zsh defines at start are all listed as text or a
   const r = git(P("i='n=7'; : $((i))"), fakeFs(GIT_ROOT, SPEC));
   assert.match(r.reason, /an arithmetic reads `i`, whose value is not a plain number here/, r.reason);
 });
+test('a dynamic body does not make unsure a name only that body expands, but the poison still reaches a later use; a status the environment gave as text is read as text; a certain array literal replaces an array of text', () => {
+  // (the shell expands `$pid` inside the body before it evaluates the body: `echo "$(( $(ps -o rss= -p $pid)/1024 ))"` alone stays allowed, as on main)
+  allow('echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"');
+  deny('n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; bash s$n.sh'); // (what main does for a `$(cat f)` body: the text evaluated can assign n)
+  deny('n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; echo $pid > out/$pid.txt');
+  const r = files('n=2; : $((status)); bash s$n.sh', fakeFs(PROJ, SPEC), { env: { status: 'n=7' } });
+  assert.equal(r.decision, 'deny', 'files allowed an arithmetic that reads a status the environment gave as text');
+  const cmds = simpleCommands('a=(0 1); a=5; : $(( a[1] ))', {});
+  const bad = { vars: { a: "(0 n=7)" }, unknown: new Set(), env: {} };
+  assert.equal(arithAssignedNames('a=(0 1); a=5; : $(( a[1] ))', cmds, bad).dynamic, false, 'a certain array literal in the leading run replaced the incoming array');
+  const cmds2 = simpleCommands('a=5; : $(( a[1] ))', {});
+  assert.equal(arithAssignedNames('a=5; : $(( a[1] ))', cmds2, bad).dynamic, true, 'a certain scalar replaces element 0 only');
+});

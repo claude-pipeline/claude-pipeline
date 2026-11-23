@@ -214,7 +214,7 @@ function recordAssigned(c, ctx, level) {
 
 // A variable whose value is unknown: assigned more than once (or where it may not run), or tainted (a script that may
 // or may not be the one sourced earlier on the line may have set it).
-const unsureVar = (ctx, k) => ctx.unknownAll === true || ctx.unsureVars.has(k) || ctx.tainted.has(k);
+const unsureVar = (ctx, k) => (ctx.unknownAll === true && !ctx.unknownAllExcept?.has(k)) || ctx.unsureVars.has(k) || ctx.tainted.has(k);
 
 // Every variable name assigned on the line so far, including the ones that became unknown by being assigned twice or
 // tainted. Anything that inspects WHICH variables are set (not their values) must use this, never Object.keys(ctx.vars) alone.
@@ -2581,6 +2581,7 @@ const movesBranch = (argv, ctx) => {
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
 function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = null) {
   // (#473: the frame this line's arithmetic reads names in: what the shell and the outer lines gave them BEFORE this line's own assignments, see arithAssignedNames)
+  ctx.unknownAllExcept = null; // (the exemption below holds for the line that made it, not for the lines after it)
   const outer = { vars: { ...ctx.vars }, unknown: new Set([...ctx.unsureVars, ...ctx.tainted]), env: ctx.env, unknownAll: ctx.unknownAll === true };
   const counts = new Map();
   const implicit = new Set();
@@ -2640,9 +2641,13 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
   // any variable: every name the line assigns or reads is unknown from here on.
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
   // (#473: `dynamic` marks every name from here on, not only the names the line gave: a name an outer frame, the environment or a sourced file gives later reads as unsure, see unsureVar)
-  if (ar?.dynamic) ctx.unknownAll = true;
+  if (ar?.dynamic) {
+    // (a body's own text cannot change a name that only that body expands, `$(( $(ps -p $pid)/1024 ))`: the shell expands before it evaluates. Not when an earlier line already poisoned, and never for a name used outside the body)
+    ctx.unknownAllExcept = ctx.unknownAll !== true && ar.bodyOnly.size ? ar.bodyOnly : null;
+    ctx.unknownAll = true;
+  }
   if (ar?.dynamicRead) ctx.arithReadWhy ??= ar.dynamicRead; // (the cause the refusal names, see arithReadReason)
-  if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds), ...(ar?.dynamic ? counts.keys() : [])]) { delete ctx.vars[k]; ctx.unsureVars.add(k); } // (#473: a dynamic arithmetic also makes unsure the names the line gives, wherever it gives them: an exported `n=2` a later script reads)
+  if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...[...namesReadOn(cmds)].filter((k) => !(ar?.dynamic && ar.bodyOnly.has(k))), ...(ar?.dynamic ? counts.keys() : [])]) { delete ctx.vars[k]; ctx.unsureVars.add(k); } // (#473: a dynamic arithmetic also makes unsure the names the line gives, wherever it gives them: an exported `n=2` a later script reads)
 }
 const arithReadReason = (n, why) => `$${n} is unsure because ${why}: evaluating a value that is not a plain number can assign any variable. Give the name a number first (\`i=3\`) or write the number out.`;
 const zshModifiedReason = (n) => `$${n} is followed by \`:\` and a letter or by \`[\` (\`$${n}:r\`, \`$${n}[1,6]\`): zsh reads that as a modifier or a subscript and applies it to the value, so the word it makes is only known at run time. Write the word out, or brace the name (\`\${${n}}:r\`) when the text after it is meant literally.`;

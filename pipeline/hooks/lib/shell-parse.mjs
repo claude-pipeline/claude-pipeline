@@ -2164,7 +2164,7 @@ function bindingIndex(text, cmds, f) {
     if (RUNNERS.has(nm) || ((nm === 'builtin' || nm === 'command' || nm === 'exec') && argv.slice(1).some((w) => RUNNERS.has(w)))) f.runner = true;
     if (nm === 'eval' || nm === 'trap') f.nested.push(argv.slice(1).join(' '));
   }
-  if (cmds.truncated || cmds.dynamic) f.runner = true; // (a command word known only at run time may be eval)
+  if (cmds.truncated || cmds.dynamic) f.dynWord = true; // (a command word known only at run time may be eval; the parser also reads `$(( $(c) ))` as a subshell with such a word)
   // The leading run: assignment-only commands at depth 0 joined only by `;` / newline from the frame's start, none carrying an arithmetic body: they replace the incoming value before any later command reads it.
   let cursor = 0;
   for (const c of cmds) {
@@ -2195,11 +2195,12 @@ function readUnproven(k, r, f, outer) {
 }
 const ARITH_CACHE = new WeakMap();
 function arithFrame(text, cmds, depth) {
-  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null };
+  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, bodyTexts: [], g: '', dynWord: false };
   if (!/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s|\bprintf\b|\bprint\b|\beval\b|\btrap\b|\b(?:declare|typeset|local)\s+[-+][A-Za-z]*n/.test(text)) return f;
   const s = quotedBodiesBlank(text, cmds);
   const g = expansionText(s, cmds);
   const bodies = arithBodies(s, g, cmds);
+  f.g = g;
   if (bodies.capped || bodies.incomplete) { f.dynamic = true; f.why ??= bodies.capped ? 'too many subscripts to read' : 'a subscript or offset longer than the guard reads'; } // (the fail-closed reading, see the cap in arithBodies)
   const add = (b) => bodies.push(b) && bodies.src.push(null);
   if (cmds) for (const c of cmds) { const why = /(?:^|\/)(?:printf|print)$/.test(c.argv?.[0] ?? '') ? printfBodies(c, add) : null; if (why) { f.dynamic = true; f.why ??= why; } }
@@ -2207,9 +2208,10 @@ function arithFrame(text, cmds, depth) {
     for (const m of body.matchAll(ARITH_ASSIGNED)) { const k = m[1] ?? m[2] ?? m[3] ?? m[4]; f.names.add(k); if (m[4] === undefined) f.bodyTargets.add(k); }
     if (ARITH_ASSIGNED_DYN.test(body)) f.dynamic = true;
     const why = /["'`\\]/.test(bodies.src[i] ?? '') ? 'a quote, backtick or backslash in the body' : bodyReads(body, f.reads);
-    if (why) f.why ??= why;
+    if (why) { f.bodyWhy++; f.why ??= why; }
   });
   for (const m of g.matchAll(ARITH_APPENDED)) f.names.add(m[1]);
+  f.bodyTexts = bodies.slice();
   if (cmds) bindingIndex(text, cmds, f);
   else { f.events = new Set(); f.other = new Set(); } // (without the parsed commands no binding is known: only the outer frame decides)
   if (cmds && depth < 3) {
@@ -2230,13 +2232,26 @@ export function arithAssignedNames(raw, cmds = null, outer = null) {
     if (cmds) ARITH_CACHE.set(cmds, hit);
   }
   const f = hit.f;
-  let why = f.why;
-  if (why === null && f.reads.size) {
-    if (f.runner) why = 'a command that runs code in this shell (eval, trap, source)';
-    else if (f.nameref) why = 'a nameref';
-    else for (const [k, r] of f.reads) if (readUnproven(k, r, f, outer)) { why = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
+  let proof = null;
+  if (f.reads.size) {
+    if (f.runner || f.dynWord) proof = 'a command that runs code in this shell (eval, trap, source)';
+    else if (f.nameref) proof = 'a nameref';
+    else for (const [k, r] of f.reads) if (readUnproven(k, r, f, outer)) { proof = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
   }
-  return { names: f.names, dynamic: f.dynamic || f.nameref || why !== null, reads: f.reads, dynamicRead: why, runner: f.runner, nameref: f.nameref };
+  const why = f.why ?? proof;
+  // (the shell expands everything inside a body before it evaluates the body: when ONE body is the whole cause, the commands inside it -- `$(ps -p $pid)` -- run before its text can change a name, so their words are
+  // not made unsure by it. Two unproven bodies, or any other cause, keep the whole-frame reading: `inBody` is then never true)
+  const solo = f.bodyWhy === 1 && !f.dynamic && !f.nameref && !f.runner && proof === null;
+  // (the names a solo body expands and the rest of the text never mentions: the body cannot change them before it reads them)
+  const bodyOnly = new Set();
+  if (solo) {
+    let rest = f.g;
+    for (const t of [...f.bodyTexts].sort((x, y) => y.length - x.length)) if (t) rest = rest.split(t).join(' ');
+    const refs = (t) => new Set([...t.matchAll(/\$\{?([A-Za-z_]\w*)/g)].map((m) => m[1]));
+    const outside = refs(rest);
+    for (const t of f.bodyTexts) for (const k of refs(t)) if (!outside.has(k)) bodyOnly.add(k);
+  }
+  return { names: f.names, dynamic: f.dynamic || f.nameref || why !== null, reads: f.reads, dynamicRead: why, runner: f.runner, nameref: f.nameref, bodyOnly };
 }
 
 // Why: `declare` / `typeset` / `local` attributes change the value a name holds: -l / -u lower / upper case it, zsh -L / -R / -Z pad or cut it to a width, -i

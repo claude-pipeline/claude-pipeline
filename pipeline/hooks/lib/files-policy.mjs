@@ -3157,7 +3157,7 @@ function globOptionRisky(name, args, raw, orig = args, lit = undefined) {
 // A sed / awk program keeps its exemption: `$1` and `$NF` of a quoted program are no shell variables, so only a substitution, `${`, `$@`, `$*` or a name the line touches counts.
 function judgedWords(name, args, ctx) {
   if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
-  const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
+  const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || (ctx.unknownAll === true && !ctx.unknownAllExcept?.has(n));
   // #298: `python -m json.tool IN [OUT]` writes its second operand, so how many operands the words make is what judges it: it is read like an option tool (no run-time word, the split reading of an expanded word)
   // (R1-B1: the module word is read as expanded: `M=json.tool; python3 -m "$M" $(…)` is the same call as the literal one; #463: so is the flag: `F=-m; python3 $F json.tool $(…)`)
   const optionLike = OPTION_TOOLS.has(name) || (/^python3?$/.test(name) && args.length > 1 && (RUNTIME_PART.test(args[0]) ? expandRefs(args[0], ctx) : args[0]) === '-m' && (RUNTIME_PART.test(args[1]) ? expandRefs(args[1], ctx) : args[1]) === 'json.tool');
@@ -4681,7 +4681,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
   // a variable the line set to a run-time value (`NVM_DIR=$(cmd)`) picks the script: which one is unknown
   // (the unknown line a SQL client may run is not a variable: it is dynamic, refused by the rule below when protected text is around)
-  if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => m[1] !== SQL_UNKNOWN_VAR && (ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1])))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
+  if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => m[1] !== SQL_UNKNOWN_VAR && (ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1]) && !ctx.unknownAllExcept?.has(m[1])))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   // Why: `bash $S/review-package ...` with S set on the line runs its first operand: a word made only of names the line set, with no run-time part, glob or space, not an option
   const first = sf.firstOperandRuns && sf.words?.length ? sf.ownPath ?? lineVarWord(sf.words[0], ctx) : null;
@@ -5278,6 +5278,7 @@ function evaluateBashForFilesFrame(command, opts) {
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
+  ctx.unknownAllExcept = opts._unknownAll !== true && ctx.arith.dynamic && ctx.arith.bodyOnly.size ? ctx.arith.bodyOnly : null; // (#473: names only the one dynamic body expands: the shell expands them before it evaluates the body)
   ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
@@ -5342,7 +5343,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // (every name of the line is seeded, exported or not, and wherever it was set: stricter than the shell, which only passes exported ones on; kept on purpose,
   // a missed name would hide the script a variable picks. The replay found no false block from it.)
   // (a name the line never set, after a source nothing could follow: it may have come from that file)
-  const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
+  const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n) && !ctx.unknownAllExcept?.has(n);
   const snaps = []; // per command: the names a sourced file may have changed / set at run time as that command runs (the checks after the loop would otherwise see the end state)
   const psCdHidden = ctx.shell === 'powershell' && !psUnparsed(raw) && psCdUnreadable([raw]); // (R14-F3: a plain PowerShell line holding a directory change the parse did not read as one; a not-plain line is refused below)
   // Is the directory the line works in only known at run time? (a `cd` into an unset / substituted / maybe-changed name, `cd -`, `popd`; or the frame was started in one)
