@@ -3409,8 +3409,11 @@ function evalString(str, startDir, ctx, level, child = false) {
   // anything, and the list is no part of snap / restore, so a level that closes does not drop it.)
   const spans = [];
   const settleSpan = (sp) => {
-    forgetState(sp.every); // (the directory, and the branches: every one when a git command may have moved it, else the names recorded)
-    aliasesUnsure(sp.al);
+    if (sp.changed) {
+      if (sp.moved) dir = null; // (R1-B4: only a span that moved the directory loses it: one that switched a branch or assigned a name keeps it)
+      forgetNames(sp.every); // (the branches: every one when a git command may have moved it, else the names recorded)
+      aliasesUnsure(sp.al);
+    }
     for (const k of sp.names) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
   };
   // (the spans that end before command i are settled; the spans command c is in are opened. A walk that ends settles the rest: its caller shares the state)
@@ -3419,20 +3422,20 @@ function evalString(str, startDir, ctx, level, child = false) {
     for (let k = 0; k < spans.length;) {
       if (spans[k].end >= i) { k++; continue; }
       const sp = spans.splice(k, 1)[0];
-      if (sp.changed) { settleSpan(sp); names ||= sp.names.size > 0; }
+      if (sp.changed || sp.names.size > 0) { settleSpan(sp); names ||= sp.names.size > 0; }
     }
     return names;
   };
   const openSpans = (c, i) => {
     if (c.maybeBgEnds === undefined) return;
-    for (const end of c.maybeBgEnds) if (end >= i && !spans.some((sp) => sp.end === end)) spans.push({ end, dir, changed: false, every: false, names: new Set(), al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
+    for (const end of c.maybeBgEnds) if (end >= i && !spans.some((sp) => sp.end === end)) spans.push({ end, dir, changed: false, moved: false, every: false, names: new Set(), al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
   };
-  const noteSpans = (c, i, { changed, every = false, names = [] }) => {
+  const noteSpans = (c, i, { changed, moved = false, every = false, names = [] }) => {
     if (!changed && names.length === 0) return;
-    for (const sp of spans) if (sp.end >= i && c.maybeBgEnds?.includes(sp.end)) { sp.changed = true; sp.every ||= every; for (const k of names) sp.names.add(k); }
+    for (const sp of spans) if (sp.end >= i && c.maybeBgEnds?.includes(sp.end)) { if (changed) { sp.changed = true; sp.moved ||= moved; sp.every ||= every; } for (const k of names) sp.names.add(k); }
   };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
-  const hazard =definesFunction(str, cmds) || cmds.some(isStateHazard);
+  const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
   // (#609 R1: one mark for the whole evaluation: a walked text defines / aliases / disables `exit` or exports a function (a child shell inherits it), so a written `exit` may not end the shell and no forget is deferred)
   if (hazard || cmds.some((c) => c.argv.length > 1 && baseName(c.argv[0]) === 'export' && c.argv.slice(1).some((a) => /^-[a-zA-Z]*f/.test(a)))) ctx.budget.exitMayBeRedefined = true; // (on the shared budget: a startup file is judged on a copy of ctx, and its mark must reach the script)
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
@@ -3735,7 +3738,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       const names = [];
       for (const k of new Set([...Object.keys(varsBefore.vars), ...Object.keys(ctx.vars)])) if (varsBefore.vars[k] !== ctx.vars[k]) names.push(k);
       for (const k of ctx.unsureVars) if (!varsBefore.unsure.has(k)) names.push(k);
-      noteSpans(c, i, { changed: changesStateWords || changedState || dir !== dirBefore, every: changedState || (changesStateWords && name === 'git'), names });
+      noteSpans(c, i, { changed: changesStateWords || changedState || dir !== dirBefore, moved: dir !== dirBefore || (DIR_CHANGERS.includes(name) && !childCd), every: changedState || (changesStateWords && name === 'git'), names });
     }
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
@@ -3773,7 +3776,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     else forgetBranches(ctx);
   }
   if (pendingForget) forgetBranches(ctx);
-  for (const sp of spans.splice(0)) if (sp.changed) settleSpan(sp); // (#529: the text ends inside a span: its caller shares the state)
+  for (const sp of spans.splice(0)) if (sp.changed || sp.names.size > 0) settleSpan(sp); // (#529: the text ends inside a span: its caller shares the state)
   // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop (#615: a body can leave early: break / continue / return / exit) made may not either; when the text ends nothing
   // after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text ends in: as if a command after `;` followed, it is forgotten
   // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). (#615: none is kept)

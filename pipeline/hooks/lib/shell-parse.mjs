@@ -2727,7 +2727,7 @@ class Parser {
         pl.segs.push(seg);
       }
     };
-    const mark =() => { if (qa < 0) qa = cur.length; inWord = true; };
+    const mark = () => { if (qa < 0) qa = cur.length; inWord = true; };
     const takeSubs = () => {
       if (this.subAcc.length) { wsubs.push(...this.subAcc); this.subAcc.length = 0; }
     };

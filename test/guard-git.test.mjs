@@ -1880,6 +1880,9 @@ test('#529: what a `&>` / `&>>` span changed is unknown after the span, certain 
     `cd /work/repo &>/dev/null; git status`,
   ];
   for (const c of allow) assert.equal(evaluate(c, o).decision, 'allow', c);
+  // R1-B4: a span that only assigned a name keeps the directory (a push from a feature branch with a safe destination). allow after the fix, deny on 49ca2b80 (the span forgot the directory)
+  const feature = { branch: 'agent/x', pushDest: 'origin/agent/x', labels: [] };
+  for (const c of ['MSG=done && echo "$MSG" &>build.log; ' + P, 'export X=1 && make &>/dev/null; ' + P]) assert.equal(evaluate(c, feature).decision, 'allow', c);
   // a variable: the shell takes the value inherited (B=main) in dash, the assigned one in bash. allow -> deny after the span; inside the span both read the assignment (allow -> allow)
   const env = { ...process.env, B: 'main' };
   const withEnv = (c) => evaluateGitCommand(c, { cwd: '/work/repo', home: '/home/u', env, currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false });
