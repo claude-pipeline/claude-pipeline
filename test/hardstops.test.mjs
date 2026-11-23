@@ -933,3 +933,19 @@ test('IO: a helper using has_table_privilege() and set_config() is exempt when d
   });
   assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(hits));
 });
+
+// Catches: a plain-SQL privilege test (DO block + RAISE EXCEPTION, no pgTAP call) losing R4 once set_config/has_*_privilege stopped counting as markers (R3-F1).
+test('IO: deleting or moving a DO-block privilege test with an ordinary .sql name still trips R4', async () => {
+  const body = "select set_config('role', 'anon', true);\ndo $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise exception 'anon can read patients'; end if; end $$;\n";
+  const deleted = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
+    repo.rm('supabase/tests/anon_grants.sql');
+    repo.commit('delete do-block test');
+  });
+  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
+  const moved = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
+    repo.write('scripts/anon_grants.sql', body);
+    repo.rm('supabase/tests/anon_grants.sql');
+    repo.commit('move do-block test');
+  });
+  assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
+});
