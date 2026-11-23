@@ -16,22 +16,23 @@ const run = (id, head, created, over = {}) => ({
 });
 // PR 12 opened as a draft at 09:00, marked ready at 10:00
 const TIMELINE = [ev('ready_for_review', T('10:00'))];
-const gh = ({ runs, timelineFail = false, pullCommits } = {}) => createFakeGh([
+const commitOf = (c) => ({ sha: sha(c), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } });
+const gh = ({ runs, timelineFail = false, pullCommits, commits = [commitOf('a'), commitOf('b')], totalRuns, state } = {}) => createFakeGh([
   { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget', headRefName: 'agent/feat', baseRefName: 'main', headRefOid: sha('b') } },
   ME, REPO,
-  { match: '^api repos/acme/widgets/pulls/12/commits', stdoutJson: [{ sha: sha('a'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }] },
-  { match: '^api repos/acme/widgets/pulls/12\\b', stdoutJson: { number: PR, created_at: T('09:00'), draft: false, ...(pullCommits === undefined ? {} : { commits: pullCommits }), head: { ref: 'agent/feat', repo: { full_name: 'acme/widgets' } } } },
+  { match: '^api repos/acme/widgets/pulls/12/commits', stdoutJson: commits },
+  { match: '^api repos/acme/widgets/pulls/12\\b', stdoutJson: { number: PR, created_at: T('09:00'), draft: false, ...(state === undefined ? {} : { state }), ...(pullCommits === undefined ? {} : { commits: pullCommits }), head: { ref: 'agent/feat', repo: { full_name: 'acme/widgets' } } } },
   timelineFail ? { match: '^api repos/acme/widgets/issues/12/timeline', code: 1, stderr: 'gh: HTTP 502' } : { match: '^api repos/acme/widgets/issues/12/timeline', stdoutJson: TIMELINE },
-  { match: '^api repos/acme/widgets/actions/runs\\?event=pull_request&branch=agent%2Ffeat', stdoutJson: { total_count: runs?.length ?? 0, workflow_runs: runs ?? [] } },
+  { match: '^api repos/acme/widgets/actions/runs\\?event=pull_request&branch=agent%2Ffeat', stdoutJson: { total_count: totalRuns ?? runs?.length ?? 0, workflow_runs: runs ?? [] } },
   { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
   { match: '^api -X POST repos/acme/widgets/issues/12/comments', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-5' } },
 ]);
-function summary(flag, fake) {
+function summary(flag, fake, outcome = 'blocked') {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', flag === null ? pipelineYml() : `${pipelineYml()}  draft_while_iterating: ${flag}\n`);
   repo.write('.gitignore', '.review/\n.verify/\n');
   repo.commit('init');
-  return cli(['summary', '--pr', String(PR), '--outcome', 'blocked'], { dir: repo.dir, fake });
+  return cli(['summary', '--pr', String(PR), '--outcome', outcome], { dir: repo.dir, fake });
 }
 const body = (fake) => JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
 const pushedReady = [run(1, sha('a'), T('09:30')), run(2, sha('b'), T('10:30')), run(3, sha('b'), T('10:30', 3), { name: 'guards' })];
@@ -72,7 +73,7 @@ test('mixed-link same head: an unlinked run while draft and a linked run on the 
 
 test('R4-B4: past the 250-commit cap a head missing from the returned commits is not named as a push, and the warning says it could not be checked', () => {
   // failure caught: the omitted newest head (an update-branch merge, say) has no commit record, so it was published as a push made without redrafting
-  const fake = gh({ runs: pushedReady, pullCommits: 251 });
+  const fake = gh({ runs: pushedReady, pullCommits: 251, commits: [commitOf('a')] });
   const r = summary(true, fake);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.pushedWhileReady, undefined);
@@ -109,4 +110,51 @@ test('summary: a read error becomes a warning; the summary still succeeds', () =
   assert.equal(r.json.pushedWhileReady, undefined);
   assert.match(r.json.warnings.join('\n'), /pushed-while-ready check skipped: GitHub could not be read/);
   assert.ok(fake.lines().some((l) => l.includes('-X POST')), 'the comment was still posted');
+});
+
+test('PR #823 round 1 B1: the run list is read before the timeline and the commits, so no listed run is newer than the phases it is judged against', () => {
+  // failure caught: a redraft and a push between the timeline read and the run-list read made the new draft-era run look like a push while ready
+  const fake = gh({ runs: pushedReady });
+  const r = summary(true, fake);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const at = (re) => fake.lines().findIndex((l) => re.test(l));
+  assert.ok(at(/actions\/runs\?event=pull_request/) >= 0 && at(/actions\/runs\?event=pull_request/) < at(/issues\/12\/timeline/), fake.lines().join('\n'));
+  assert.ok(at(/actions\/runs\?event=pull_request/) < at(/pulls\/12\/commits/));
+});
+
+test('PR #823 round 1 B2: a run list GitHub capped (more runs than returned) is not judged: a "could not be checked" warning, no head named', () => {
+  // failure caught: with the oldest runs of a head missing, a later run looked like the head's first and was published as a push without redrafting
+  const fake = gh({ runs: pushedReady, totalRuns: 1500 });
+  const r = summary(true, fake);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.pushedWhileReady, undefined);
+  assert.match(r.json.warnings.join('\n'), /GitHub lists 1500 workflow runs for this branch but returned 3 .*could not be checked, so no head is named/);
+  assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
+});
+
+test('PR #823 round 1 B3: a head the commit list does not hold (a force push dropped a catch-up merge) is not named as a push', () => {
+  // failure caught: the earlier update-branch merge, gone from the rebased branch but still linked to its run, published as a push without redrafting
+  const fake = gh({ runs: pushedReady, commits: [commitOf('a')] });
+  const r = summary(true, fake);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.pushedWhileReady, undefined);
+  assert.match(r.json.warnings.join('\n'), /1 head\(s\) pushed while the PR was ready are not in its commit list .*could not be checked/);
+  assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
+});
+
+test('PR #823 round 1 B10: an unlinked run from before this PR existed does not hide a genuine push while ready', () => {
+  // failure caught: a run on the same SHA from an earlier PR on a reused branch name made the head "ambiguous" and dropped the warning
+  const fake = gh({ runs: [...pushedReady, run(9, sha('b'), T('08:00'), { pull_requests: [] })] });
+  const r = summary(true, fake);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.pushedWhileReady, { count: 1, heads: [sha('b').slice(0, 12)] });
+});
+
+test('PR #823 round 1 F1: the final summary of a merged or closed PR (GitHub unlinks its runs) says it could not check, and names no head', () => {
+  // failure caught: every run of a merged PR is unlinked, so the check found nothing and said nothing: the owner read a summary with no trace of the check
+  const fake = gh({ runs: pushedReady.map((x) => ({ ...x, pull_requests: [] })), state: 'closed' });
+  const r = summary(true, fake, 'merged-externally');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.pushedWhileReady, undefined);
+  assert.match(r.json.warnings.join('\n'), /the PR is no longer open \(merged or closed\).*could not be checked/);
 });
