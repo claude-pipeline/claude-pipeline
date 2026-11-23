@@ -420,3 +420,44 @@ test('a dynamic body does not make unsure a name only that body expands, but the
   const cmds2 = simpleCommands('a=5; : $(( a[1] ))', {});
   assert.equal(arithAssignedNames('a=5; : $(( a[1] ))', cmds2, bad).dynamic, true, 'a certain scalar replaces element 0 only');
 });
+
+// ---- review round 1 (#817): over-refusals and bypasses of the first build ---------------------------------------------------------------------------------------------------------
+const SPEC2 = { ...SPEC, 'list.sh': 'ok' };
+test('R1-B1: an array of numbers ending in a text word is read in linear time (the integer-array test backtracked exponentially)', () => {
+  const t = 'ids=(1700000001 1700000002 1700000003 1700000004 latest); echo ${ids[@]}';
+  const t0 = Date.now();
+  arithAssignedNames(t, simpleCommands(t, {}));
+  assert.ok(Date.now() - t0 < 1000, `${Date.now() - t0} ms`);
+});
+test('R1-B2 / R1-F1 / R1-F2: a name used outside the one unproven body (quoted, or with another body or binder on the line) stays unknown', () => {
+  denyEach([
+    'n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; bash s"$pid".sh', // (R1-B2: a later double-quoted use)
+    'n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; echo ${a[d]}; echo $pid > out/$pid.txt', // (R1-F2: a one-letter body elsewhere cut `pid` to `pi`)
+    'read "$K" < cfg; echo "$(( $(wc -c < "$S") / 1024 ))"; bash "$S"', // (R1-F1: a run-time-named binder is a cause of its own)
+  ]);
+});
+test('R1-B3: a child script whose arithmetic is dynamic does not make the caller\'s names unknown', () => {
+  const r = git('ref=HEAD; read -r answer; bash calc.sh; git show "$ref"', fakeFs(GIT_ROOT, { 'calc.sh': ': $(( $(wc -l < data) + 1 ))\n', ...SPEC }));
+  assert.equal(r.decision, 'allow', r.reason);
+});
+test('R1-B4 / R1-B6: printf of a number to a redirect, a proven $name argument, and a brace list that shifts the arguments', () => {
+  allow('out=out.txt; printf \'%d\\n\' 42 > "$out"; bash s2.sh', SPEC2);
+  allow('count=3; out=list.sh; printf \'%d\' $count; bash "$out"', SPEC2);
+  deny(P("total=queued; printf '%s %d\\n' {prefix,total}"));
+  deny(P("total=queued; printf '%d' $total"));
+});
+test('R1-B5: a copy of a shell-supplied number holds the text the line bound that name to', () => {
+  deny(P('status=queued; i=$status; : $((i))'));
+  allow(P('t0=$SECONDS; : $((SECONDS - t0))'));
+});
+test('R1-B7 / R1-B8 / R1-B9 / R1-F4: program text in quotes, a nested $(( )), a hex literal and a `.` operand are no assignment, text or runner', () => {
+  allow(P("i=1; python3 -c 'i=0; i+=1'; echo \"$((i))\" > out.txt"));
+  allow('out=s2.sh; : $(( 1 + $((2 + 3)) )); bash "$out"', SPEC2);
+  allow(P('i=1; a=(1 2 3); echo ${a[$((i+1))]}'));
+  allow(P('mask=0xff; echo "$((mask & 15))" > out.txt'));
+  allow(P('i=1; command grep -r foo . ; echo $((i+1))'));
+});
+test('R1-F3: the text of a trap or eval written out is read with the caller\'s bindings; a source, or text built at run time, keeps every read unproven', () => {
+  allow('OUT=dist; trap \'echo failed\' ERR; count=0; for f in src/*; do count=$((count+1)); done; echo "$count" > "$OUT/count.txt"');
+  denyEach([P("i='n=7'; trap ': $((i))' DEBUG"), P("i='n=7'; eval ': $((i))'"), P('i=3; eval "$code"; : $((i))')]);
+});

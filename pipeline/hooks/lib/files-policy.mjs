@@ -5032,7 +5032,7 @@ function absorbSourced(rec, dirs, ctx, rep = false) { // (rep: the command that 
   const { texts, unknown } = sourcedTexts(rec, dirs, ctx);
   // (a file that can set any name: every name the line has set so far may have been changed, and any other may be set; a script they pick is refused. The values
   // stay for the paths a writer builds, which is what they were before the file ran)
-  const poison = () => { ctx.unknownAll = true; ctx.sourcedCdUnknown = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
+  const poison = () => { ctx.unknownAll = true; ctx.unknownAllExcept = null; ctx.sourcedCdUnknown = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
   if (unknown) poison();
   const merged = new Map();
   const effs = [];
@@ -5444,7 +5444,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const lineIndirect = typeof raw === 'string' && indirectExpansionOnLine(raw, cmds); // (only the text the shell expands: see indirectExpansionOnLine)
   const markBound = (c) => {
     // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
-    if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
+    if (lineIndirect) { ctx.unknownAll = true; ctx.unknownAllExcept = null; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     // (#352 R21-F1: a lone `{k}>f` redirect has no argv and still binds k)
     if (!c.argv.length) { for (const k of implicitBindsOf(c)) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); } return; }
     const cn = baseOf(c.argv[0]);
@@ -5455,7 +5455,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const anyName = (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-[A-Za-z]*v/.test(a))) && bindsOf(cn, c.argv).weird)
       || (['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'let'].includes(cn) && c.argv.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a)))
       || ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a))); // (#56, Codex recheck of d925d42: zsh binders whose operands are not read)
-    if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
+    if (anyName) { ctx.unknownAll = true; ctx.unknownAllExcept = null; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
     names.push(...implicitBindsOf(c)); // (`[[ x =~ y ]]` sets MATCH, a (#m) pattern flag too: see implicitBindsOf)
     // (#269 R10-F2) What a match or a `select` binds holds a word of the line (`[[ FILE =~ .+ ]] && cp x $MATCH`): only known at run time, so a writer that uses it is refused (unknownVars)

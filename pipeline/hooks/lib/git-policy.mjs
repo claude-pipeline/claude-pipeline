@@ -2445,6 +2445,7 @@ function judgeScopedIn(text, dir, ctx, level, sf, child) {
   const saved = Object.assign(Object.create(null), ctx.vars);
   const savedTaint = new Set(ctx.tainted);
   const savedUnsure = new Set(ctx.unsureVars);
+  const savedArith = [ctx.unknownAll, ctx.unknownAllExcept, ctx.arithReadWhy]; // (#473: a child shell's dynamic arithmetic cannot make its caller's names unknown)
   const spec = markChildState(ctx);
   try {
     return evalString(text, dir, ctx, level + 1, child);
@@ -2459,6 +2460,7 @@ function judgeScopedIn(text, dir, ctx, level, sf, child) {
       for (const k of savedTaint) ctx.tainted.add(k);
       ctx.unsureVars.clear();
       for (const k of savedUnsure) ctx.unsureVars.add(k);
+      [ctx.unknownAll, ctx.unknownAllExcept, ctx.arithReadWhy] = savedArith;
     } else {
       // uncertain from here on and only ever more so: unknown to every use ($F stays $F), and a word that picks the script is refused
       for (const k of new Set([...Object.keys(after), ...Object.keys(saved)])) {
@@ -2641,13 +2643,14 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
   // any variable: every name the line assigns or reads is unknown from here on.
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
   // (#473: `dynamic` marks every name from here on, not only the names the line gave: a name an outer frame, the environment or a sourced file gives later reads as unsure, see unsureVar)
+  // (a body's own text cannot change a name that only that body expands, `$(( $(ps -p $pid)/1024 ))`: the shell expands before it evaluates. Only when that body is the sole cause: not after an earlier poison, not with a run-time-named binder or an indirect expansion on the line)
+  const otherCause = cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || ((cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== 'string' || indirectExpansionOnLine(text, cmds)));
   if (ar?.dynamic) {
-    // (a body's own text cannot change a name that only that body expands, `$(( $(ps -p $pid)/1024 ))`: the shell expands before it evaluates. Not when an earlier line already poisoned, and never for a name used outside the body)
-    ctx.unknownAllExcept = ctx.unknownAll !== true && ar.bodyOnly.size ? ar.bodyOnly : null;
+    ctx.unknownAllExcept = ctx.unknownAll !== true && !otherCause && ar.bodyOnly.size ? ar.bodyOnly : null;
     ctx.unknownAll = true;
   }
   if (ar?.dynamicRead) ctx.arithReadWhy ??= ar.dynamicRead; // (the cause the refusal names, see arithReadReason)
-  if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...[...namesReadOn(cmds)].filter((k) => !(ar?.dynamic && ar.bodyOnly.has(k))), ...(ar?.dynamic ? counts.keys() : [])]) { delete ctx.vars[k]; ctx.unsureVars.add(k); } // (#473: a dynamic arithmetic also makes unsure the names the line gives, wherever it gives them: an exported `n=2` a later script reads)
+  if (ar?.dynamic || otherCause) for (const k of [...Object.keys(ctx.vars), ...[...namesReadOn(cmds)].filter((k) => !(ar?.dynamic && !otherCause && ar.bodyOnly.has(k))), ...(ar?.dynamic ? counts.keys() : [])]) { delete ctx.vars[k]; ctx.unsureVars.add(k); } // (#473: a dynamic arithmetic also makes unsure the names the line gives, wherever it gives them: an exported `n=2` a later script reads)
 }
 const arithReadReason = (n, why) => `$${n} is unsure because ${why}: evaluating a value that is not a plain number can assign any variable. Give the name a number first (\`i=3\`) or write the number out.`;
 const zshModifiedReason = (n) => `$${n} is followed by \`:\` and a letter or by \`[\` (\`$${n}:r\`, \`$${n}[1,6]\`): zsh reads that as a modifier or a subscript and applies it to the value, so the word it makes is only known at run time. Write the word out, or brace the name (\`\${${n}}:r\`) when the text after it is meant literally.`;

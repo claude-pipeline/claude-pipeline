@@ -1833,7 +1833,8 @@ function arithBodies(s, g, cmds) {
   const out = [];
   out.mod = []; // (offsets that are zsh modifiers, `${x:h}` `${0:A:h}`: read as a name only by bash, so they never make a frame that sources dynamic)
   out.src = []; // (#473: each body as WRITTEN, where it is a slice of `s` -- `g` blanks the words of a double-quoted string, which hides a quote the shell reads; null for a body built from parsed words)
-  const add = (body, from = -1, to = -1) => { out.push(body); out.src.push(from >= 0 && to <= s.length ? s.slice(from, to) : null); };
+  out.span = []; // (and where it sits in `s`, for the one body a name is exempt from)
+  const add = (body, from = -1, to = -1) => { out.push(body); const ok = from >= 0 && to <= s.length; out.src.push(ok ? s.slice(from, to) : null); out.span.push(ok ? [from, to] : null); };
   const stack = [];
   // (on `g`, what the shell expands: the `((` of a JavaScript program in quotes -- `.map((x) => …)` -- is no arithmetic; `let 'n=1'` and `[[ "n=1" -eq 1 ]]` keep quoted words and read `s`, below)
   for (let i = 0; i < g.length; i++) {
@@ -1973,9 +1974,11 @@ export const SHELL_SUPPLIED_TEXT = new Set(['_', 'argv', 'BASH', 'BASH_ARGC', 'B
   'psvar', 'reply', 'reswords', 'saliases', 'signals', 'termcap', 'terminfo', 'userdirs', 'usergroups', 'widgets', 'zsh_eval_context', 'zsh_scheduled_events', 'MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend',
   'watch']);
 const SHELL_TEXT_PREFIX = /^(?:BASH|ZSH_|COMP_|READLINE_|PROMPT)/;
-const INT_LITERAL = /^-?\d+$/;
-const INT_ARRAY = /^\(\s*(?:(?:\[[^\]]*\]=)?-?\d+\s*)*\)$/;
-const isIntegerValue = (v) => typeof v === 'string' && (INT_LITERAL.test(v) || INT_ARRAY.test(v));
+const INT_LITERAL = /^-?(?:\d+|0[xX][0-9a-fA-F]+)$/;
+const INT_ELEM = /^(?:\[[^\]]*\]=)?-?(?:\d+|0[xX][0-9a-fA-F]+)$/;
+// (each element on its own: one pattern over the whole list backtracked exponentially on `(1700000001 1700000002 1700000003 latest)`)
+const isIntArray = (v) => v.length >= 2 && v.startsWith('(') && v.endsWith(')') && v.slice(1, -1).trim().split(/\s+/).filter(Boolean).every((e) => INT_ELEM.test(e));
+const isIntegerValue = (v) => typeof v === 'string' && (INT_LITERAL.test(v) || isIntArray(v));
 // A word as the shell reads it: the text of a simple command split into words, quotes kept (so what was written can be told from what the quotes removed); parentheses (an array literal, `$( )`) group.
 function writtenWords(t) {
   const out = [];
@@ -2009,10 +2012,13 @@ function wholeArith(v) {
   return d === 0 ? t.slice(3, -2) : null;
 }
 // Is the value, AS WRITTEN, one of the forms that is an integer whatever it holds: an integer literal, one `$((…))` / `${#name}` / `$?` `$#` `$$` `$!` filling the word (not a zsh `[##16]` output base: it prints letters)?
-function provenIntegerWord(v) {
-  if (/^["']?-?\d+["']?$/.test(v)) return true;
+// `t0=$SECONDS`: a copy of a number the shell supplies. It is a number only while the name is no text here: readUnproven checks the source like a direct read (`status=queued; i=$status`)
+function suppliedCopy(v) {
   const sh = /^"?\$\{?([A-Za-z_]\w*)\}?"?$/.exec(v);
-  if (sh && SHELL_SUPPLIED_NUMBERS.has(sh[1])) return true; // (`t0=$SECONDS`: a number the shell supplies)
+  return sh && SHELL_SUPPLIED_NUMBERS.has(sh[1]) ? sh[1] : null;
+}
+function provenIntegerWord(v) {
+  if (/^["']?-?(?:\d+|0[xX][0-9a-fA-F]+)["']?$/.test(v)) return true;
   if (/^"?\$\{#[A-Za-z_]\w*(?:\[[@*]\])?\}"?$/.test(v) || /^"?\$[?#$!]"?$/.test(v)) return true;
   const body = wholeArith(v);
   return body !== null && !body.includes('[#');
@@ -2036,6 +2042,14 @@ function bodyReads(body, reads) {
     const ch = body[i];
     if (ch === '$') {
       const prev = i > 0 ? body[i - 1] : '';
+      if (body.startsWith('$((', i)) { // (a nested arithmetic expansion is a body of its own, read there: here it is one integer, unless it prints letters)
+        let d = 0;
+        let j = i + 1;
+        for (; j < n; j++) { if (body[j] === '(') d++; else if (body[j] === ')' && --d === 0) break; }
+        if (j >= n || body[j - 1] !== ')' || body.slice(i, j + 1).includes('[#')) return 'a nested arithmetic expansion the guard cannot prove';
+        if (/[A-Za-z_#.$}]/.test(prev) || /[A-Za-z_#.$]/.test(body[j + 1] ?? '')) return 'a nested arithmetic expansion next to other text in one token';
+        i = j + 1; continue;
+      }
       let m = exec(R_LEN, i) ?? exec(R_SPECIAL, i);
       if (m) { // (an integer: digits may touch it, letters, `#`, `.` and other expansions may not)
         if (/[A-Za-z_#.$}]/.test(prev) || /[A-Za-z_#.$]/.test(body[i + m[0].length] ?? '')) return `${m[0]} next to other text in one token`;
@@ -2070,25 +2084,43 @@ function bodyReads(body, reads) {
 // printf / print -f: a numeric conversion (%d %i %o %u %x %X) evaluates its argument as arithmetic in zsh. The arguments such a conversion takes are bodies; a format or argument list the guard cannot map exactly
 // (non-literal format, numbered or `*` conversions, an escape it cannot decode, an argument that may split or glob) is `dynamic` when the format may hold one. `%f %e %g` alone is #788: unchanged.
 const NUM_CONV = 'diouxX';
-function printfBodies(c, add) {
-  const ws = writtenWords(c.raw ?? '');
-  let k = ws.findIndex((w) => !ASSIGN_WORD.test(w)); // (the command word)
-  if (k < 0) return null;
-  const isPrint = commandName(ws[k]) === 'print';
-  k++;
-  let fmt = null;
+// where the format word is in a word list (k0: just after the command word): -1 when there is none (`print` without -f); `bad` for `print -rf`
+function printfFmtAt(ws, k0, isPrint) {
+  let k = k0;
   for (; k < ws.length; k++) {
     const w = ws[k];
     if (w === '--') { k++; break; }
-    if (isPrint ? w === '-f' : false) { fmt = ws[++k]; k++; break; }
+    if (isPrint && w === '-f') return { at: k + 1 };
     if (!isPrint && /^-[A-Za-z]*v$/.test(w)) { k++; continue; }
-    if (/^[-+][A-Za-z]/.test(w) && w !== '-') { if (isPrint && /f/.test(w) && w.length > 2) return 'print -f'; continue; }
+    if (/^[-+][A-Za-z]/.test(w) && w !== '-') { if (isPrint && /f/.test(w) && w.length > 2) return { bad: 'print -f' }; continue; }
     break;
   }
-  if (!isPrint && fmt === null) fmt = ws[k++];
-  if (fmt === undefined || fmt === null) return null;
-  const args = ws.slice(k);
-  if (!args.length) return null;
+  return { at: isPrint ? -1 : k };
+}
+// the written words of a command without its redirections (`> "$out"`, `2>&1`, `>f`)
+function withoutRedirects(ws) {
+  const out = [];
+  for (let i = 0; i < ws.length; i++) {
+    const m = /^[0-9]*(?:&>>?|>>?&?|<<?<?&?)(.*)$/.exec(ws[i]);
+    if (!m) { out.push(ws[i]); continue; }
+    if (m[1] === '') i++; // (the target is the next word)
+  }
+  return out;
+}
+function printfBodies(c, add) {
+  // (the words the arguments are read from are the parser's own, brace lists expanded: `printf '%s %d' {a,total}` has two; the written words only tell how each was quoted)
+  const ws = withoutRedirects(writtenWords(c.raw ?? ''));
+  const k = ws.findIndex((w) => !ASSIGN_WORD.test(w)); // (the command word)
+  if (k < 0) return null;
+  const isPrint = commandName(ws[k]) === 'print';
+  const wf = printfFmtAt(ws, k + 1, isPrint);
+  const af = printfFmtAt(c.argv, 1, isPrint);
+  if (wf.bad || af.bad) return wf.bad ?? af.bad;
+  if (wf.at < 0 || af.at < 0 || wf.at >= ws.length || af.at >= c.argv.length) return null;
+  const fmt = ws[wf.at];
+  const args = ws.slice(wf.at + 1);
+  const argvArgs = c.argv.slice(af.at + 1);
+  if (!argvArgs.length) return null;
   const lit = fmt.length >= 2 && /^(['"])[^]*\1$/.test(fmt) ? fmt.slice(1, -1) : fmt;
   if (!fmt.startsWith("'") && /[$`]/.test(fmt)) return 'a printf format that is not literal text';
   const dec = lit.replace(/\\(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|([0-7]{1,3}))/g, (_, a, b, o) => String.fromCharCode(parseInt(a ?? b ?? o, a || b ? 16 : 8)));
@@ -2109,16 +2141,17 @@ function printfBodies(c, add) {
   if (!anyNum && !numbered) return null;
   if (numbered || star) return 'a printf format with numbered or * conversions';
   const isInt = (w) => wholeArith(w) !== null || /^"?\$[?#$!]"?$/.test(w); // (one `$(( ))` / `$#` word is digits: no split, no glob, nothing to evaluate)
-  const plainWord = (w) => isInt(w) || (!/\$[@*]|\$\{[^}]*\[[@*]\]|`/.test(w) && !/^[^'"]*\$/.test(w.replace(/"[^"]*"|'[^']*'/g, '')) && !/[*?[]/.test(w.replace(/"[^"]*"|'[^']*'/g, '')));
-  if ((c.redirects ?? []).length || args.some((w) => !plainWord(w))) return 'a printf argument list that may split or glob';
-  args.forEach((w, j) => {
+  const plainWord = (w) => isInt(w) || /^\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)$/.test(w) || (!/\$[@*]|\$\{[^}]*\[[@*]\]|`/.test(w) && !/^[^'"]*\$/.test(w.replace(/"[^"]*"|'[^']*'/g, '')) && !/[*?[]/.test(w.replace(/"[^"]*"|'[^']*'/g, '')));
+  if (args.some((w) => !plainWord(w))) return 'a printf argument list that may split or glob';
+  argvArgs.forEach((w, j) => {
     if (!NUM_CONV.includes(convs[j % convs.length]) || isInt(w)) return;
-    add(/^'[^']*'$/.test(w) ? w.slice(1, -1) : /^"[^"\\`]*"$/.test(w) ? w.slice(1, -1) : w);
+    add(w);
   });
   return null;
 }
 const LEAD_KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '{', '!', 'time']);
 const RUNNERS = new Set(['eval', 'trap', 'source', '.']);
+
 const DECL_CMDS = new Set(['declare', 'typeset', 'local', 'readonly', 'export', 'integer', 'float', 'private']);
 const NAME_OPERAND_CMDS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'select', 'vared', 'coproc', 'unset']);
 // The binding events of a frame (every command, all depths): the names a command really binds, with whether every value is a proven integer, and the certain ones (an assignment-only command in the leading run).
@@ -2126,9 +2159,12 @@ function bindingIndex(text, cmds, f) {
   const events = new Set();
   const other = new Set();
   const mark = (k, ok) => { events.add(k); if (!ok) other.add(k); };
-  for (const m of text.matchAll(/\$\{([A-Za-z_]\w*)(?:\[[^\]\n]{0,64}\])?:{0,2}=/g)) mark(m[1], false); // (`${x:=v}`)
+  // (the expansion-aware text: an append or a `${x:=v}` inside a single-quoted program, `python3 -c 'i+=1'`, is that program's)
+  for (const m of f.g.matchAll(/\$\{([A-Za-z_]\w*)(?:\[[^\]\n]{0,64}\])?:{0,2}=/g)) mark(m[1], false); // (`${x:=v}`)
   for (const k of f.bodyTargets) mark(k, true);
-  for (const m of text.matchAll(ARITH_APPENDED)) mark(m[1], false);
+  for (const m of f.g.matchAll(ARITH_APPENDED)) mark(m[1], false);
+  // (a copy of a shell-supplied number: `t0=$SECONDS`)
+  const evid = (k, v) => { if (provenIntegerWord(v)) return true; const src = suppliedCopy(v); if (src) { f.copies.push([k, src]); return true; } return false; };
   for (const c of cmds) {
     const argv = c.argv ?? [];
     const ws = writtenWords(c.raw ?? '');
@@ -2141,7 +2177,7 @@ function bindingIndex(text, cmds, f) {
       const [, k, sub, plus, v] = m;
       const dup = seen.has(k);
       seen.add(k);
-      const ok = !dup && !plus && (v.startsWith('(') ? INT_ARRAY.test(v) : provenIntegerWord(v));
+      const ok = !dup && !plus && (v.startsWith('(') ? isIntArray(v) : evid(k, v));
       mark(k, ok);
     }
     for (const k of Object.keys(c.env ?? {})) if (!seen.has(k)) mark(k, false);
@@ -2154,7 +2190,7 @@ function bindingIndex(text, cmds, f) {
         if (w === '--') { opts = false; continue; }
         opts = false;
         const m = ASSIGN_WORD.exec(w);
-        if (m) mark(m[1], !m[3] && (m[4].startsWith('(') ? INT_ARRAY.test(m[4]) : provenIntegerWord(m[4])));
+        if (m) mark(m[1], !m[3] && (m[4].startsWith('(') ? isIntArray(m[4]) : evid(m[1], m[4])));
         else if (/^[A-Za-z_]\w*$/.test(w) && nm !== 'export' && nm !== 'readonly') mark(w, false);
       }
     }
@@ -2162,8 +2198,13 @@ function bindingIndex(text, cmds, f) {
     if (nm === 'for' && /^[A-Za-z_]\w*$/.test(argv[1] ?? '')) { const at = argv.indexOf('in'); mark(argv[1], at > 0 && argv.slice(at + 1).every((w) => INT_LITERAL.test(w))); }
     const elem = new Set(lead.filter((m) => m[2] !== undefined).map((m) => m[1]));
     for (const k of implicitBindsOf(c)) if (k === '_' || !SHELL_SET_NAMES.includes(k)) { if (!elem.has(k)) mark(k, false); }
-    if (RUNNERS.has(nm) || ((nm === 'builtin' || nm === 'command' || nm === 'exec') && argv.slice(1).some((w) => RUNNERS.has(w)))) f.runner = true;
-    if (nm === 'eval' || nm === 'trap') f.nested.push(argv.slice(1).join(' '));
+    // (`command grep -r foo .`: only the word after the prefix and its options is the command. A `.` / `source` runs a file; an `eval` / `trap` whose text is written out (no expansion outside single quotes) is read as a frame of its own)
+    const wrapped = (nm === 'builtin' || nm === 'command' || nm === 'exec') ? argv.slice(1).find((w) => !w.startsWith('-')) : undefined;
+    if (nm === 'source' || nm === '.' || (wrapped !== undefined && RUNNERS.has(wrapped))) f.runner = true;
+    else if (nm === 'eval' || nm === 'trap') {
+      f.nested.push(argv.slice(1).join(' '));
+      if (!ws.slice(L + 1).every((w) => !/[$`]/.test(w.replace(/'[^']*'/g, '')))) f.runner = true;
+    }
   }
   // The leading run: assignment-only commands at depth 0 joined only by `;` / newline from the frame's start, none carrying an arithmetic body: they replace the incoming value before any later command reads it.
   let cursor = 0;
@@ -2181,9 +2222,10 @@ function bindingIndex(text, cmds, f) {
   f.other = other;
 }
 // Is every value the read of `k` can see a proven integer?
-function readUnproven(k, r, f, outer) {
+function readUnproven(k, r, f, outer, depth = 0) {
   if (k === '_' || k === 'argv') return true;
   if (f.other.has(k)) return true;
+  for (const [ck, src] of f.copies) if (ck === k && depth < 3 && readUnproven(src, { plain: true, sub: false }, f, outer, depth + 1)) return true;
   // (a certain `a=5` replaces element 0 only: a subscripted read needs a certain array literal)
   if ((!r.sub || f.certainArray.has(k)) && (!r.plain || f.certainScalar.has(k) || f.certainArray.has(k))) return false;
   if (outer) {
@@ -2195,21 +2237,23 @@ function readUnproven(k, r, f, outer) {
 }
 const ARITH_CACHE = new WeakMap();
 function arithFrame(text, cmds, depth) {
-  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, bodyTexts: [], g: '', modReads: new Map() };
+  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, badBody: -1, spans: [], s: '', subs: [], copies: [], bodyTexts: [], g: '', modReads: new Map() };
   if (!/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s|\bprintf\b|\bprint\b|\beval\b|\btrap\b|\b(?:declare|typeset|local)\s+[-+][A-Za-z]*n/.test(text)) return f;
   const s = quotedBodiesBlank(text, cmds);
   const g = expansionText(s, cmds);
   const bodies = arithBodies(s, g, cmds);
   f.g = g;
+  f.s = s;
+  f.spans = bodies.span;
   for (const b of bodies.mod) bodyReads(b, f.modReads);
   if (bodies.capped || bodies.incomplete) { f.dynamic = true; f.why ??= bodies.capped ? 'too many subscripts to read' : 'a subscript or offset longer than the guard reads'; } // (the fail-closed reading, see the cap in arithBodies)
-  const add = (b) => bodies.push(b) && bodies.src.push(null);
+  const add = (b) => { bodies.push(b); bodies.src.push(null); bodies.span.push(null); };
   if (cmds) for (const c of cmds) { const why = /(?:^|\/)(?:printf|print)$/.test(c.argv?.[0] ?? '') ? printfBodies(c, add) : null; if (why) { f.dynamic = true; f.why ??= why; } }
   bodies.forEach((body, i) => {
     for (const m of body.matchAll(ARITH_ASSIGNED)) { const k = m[1] ?? m[2] ?? m[3] ?? m[4]; f.names.add(k); if (m[4] === undefined) f.bodyTargets.add(k); }
     if (ARITH_ASSIGNED_DYN.test(body)) f.dynamic = true;
     const why = /["'`\\]/.test(bodies.src[i] ?? '') ? 'a quote, backtick or backslash in the body' : bodyReads(body, f.reads);
-    if (why) { f.bodyWhy++; f.why ??= why; }
+    if (why) { f.bodyWhy++; f.badBody = i; f.why ??= why; }
   });
   for (const m of g.matchAll(ARITH_APPENDED)) f.names.add(m[1]);
   f.bodyTexts = bodies.slice();
@@ -2220,7 +2264,11 @@ function arithFrame(text, cmds, depth) {
       let sub = null;
       try { sub = arithFrame(t, simpleCommands(t, {}), depth + 1); } catch { f.why ??= 'the text of an eval or trap'; continue; }
       for (const k of sub.names) f.names.add(k);
-      if (sub.dynamic || sub.why || sub.reads.size) { f.dynamic = true; f.why ??= sub.why ?? `${[...sub.reads.keys()][0] ?? 'a name'} read in the text of an eval or trap`; }
+      // (the text may bind any name it writes: the caller's reads see that; its own reads are judged in arithAssignedNames with the caller's bindings)
+      for (const k of sub.events ?? []) f.events.add(k);
+      for (const k of sub.other ?? []) f.other.add(k);
+      f.subs.push(sub);
+      if (sub.dynamic || sub.why || sub.runner || sub.nameref) { f.dynamic = true; f.why ??= sub.why ?? 'the text of an eval or trap'; }
     }
   } else if (f.nested.length) f.why ??= 'the text of an eval or trap';
   return f;
@@ -2240,18 +2288,24 @@ export function arithAssignedNames(raw, cmds = null, outer = null) {
     else for (const [k, r] of f.reads) if (readUnproven(k, r, f, outer)) { proof = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
   }
   if (proof === null) for (const [k, r] of f.modReads) if (readUnproven(k, r, f, outer)) { proof = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
+  // (the text an eval / trap runs reads names under the caller's bindings and its own)
+  for (const sub of f.subs) {
+    if (proof !== null) break;
+    const merged = { other: new Set([...f.other, ...(sub.other ?? [])]), certainScalar: new Set([...f.certainScalar, ...sub.certainScalar]), certainArray: new Set([...f.certainArray, ...sub.certainArray]), copies: [...f.copies, ...sub.copies] };
+    for (const [k, r] of [...sub.reads, ...sub.modReads]) if (readUnproven(k, r, merged, outer)) { proof = `an arithmetic in an eval or trap reads \`${k}\`, whose value is not a plain number here`; break; }
+  }
   const why = f.why ?? proof;
   // (the shell expands everything inside a body before it evaluates the body: when ONE body is the whole cause, the commands inside it -- `$(ps -p $pid)` -- run before its text can change a name, so their words are
   // not made unsure by it. Two unproven bodies, or any other cause, keep the whole-frame reading: `inBody` is then never true)
-  const solo = f.bodyWhy === 1 && !f.dynamic && !f.nameref && !f.runner && proof === null;
+  const solo = f.bodyWhy === 1 && !f.dynamic && !f.nameref && !f.runner && proof === null && f.spans[f.badBody] != null;
   // (the names a solo body expands and the rest of the text never mentions: the body cannot change them before it reads them)
   const bodyOnly = new Set();
   if (solo) {
-    let rest = f.g;
-    for (const t of [...f.bodyTexts].sort((x, y) => y.length - x.length)) if (t) rest = rest.split(t).join(' ');
+    // (the line as written with exactly the one unproven body's span cut out: a later `"$pid"` or `$pid` is a use outside it)
+    const [a, b] = f.spans[f.badBody];
     const refs = (t) => new Set([...t.matchAll(/\$\{?([A-Za-z_]\w*)/g)].map((m) => m[1]));
-    const outside = refs(rest);
-    for (const t of f.bodyTexts) for (const k of refs(t)) if (!outside.has(k)) bodyOnly.add(k);
+    const outside = refs(`${f.s.slice(0, a)} ${f.s.slice(b)}`);
+    for (const k of refs(f.s.slice(a, b))) if (!outside.has(k)) bodyOnly.add(k);
   }
   return { names: f.names, dynamic: f.dynamic || f.nameref || why !== null, reads: f.reads, dynamicRead: why, runner: f.runner, nameref: f.nameref, bodyOnly };
 }
