@@ -277,7 +277,7 @@ test('abandonMerge: disables auto-merge, then re-reads the PR; a PR that merged 
   assert.deepEqual(r, { autoMergeDisabled: true, merged: true, mergeSha: 'ff' });
 
   const open = await abandonMerge({ gh: { prView: () => ({ state: 'OPEN' }) }, pr: 12, disable: () => true, pollMs: 1, ...clock() });
-  assert.deepEqual(open, { autoMergeDisabled: true, merged: false, mergeSha: null });
+  assert.deepEqual(open, { autoMergeDisabled: true, merged: false, mergeSha: null, state: 'OPEN' });
 
   // merged but the commit is not readable yet: still merged (the caller decides what a missing sha means)
   const noSha = await abandonMerge({ gh: { prView: () => ({ state: 'MERGED', mergeCommit: null }) }, pr: 12, disable: () => false, pollMs: 1, ...clock() });

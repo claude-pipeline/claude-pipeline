@@ -156,7 +156,7 @@ test('isCleanStatusRefusal: only the two whole-line forms, at least one, nothing
 });
 
 test('cleanStatusRetry: needs the exact refusal AND a proven clean state (disarmed, no read error, the wait did not fail to read)', () => {
-  const clean = { autoMergeDisabled: true };
+  const clean = { autoMergeDisabled: true, state: 'OPEN' };
   const got = cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, clean);
   assert.equal(got.retryable, 'clean-status');
   assert.match(got.next, /run this same merge once more/);
@@ -164,6 +164,8 @@ test('cleanStatusRetry: needs the exact refusal AND a proven clean state (disarm
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: false }), {}, 'not disarmed');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: undefined }), {}, 'absence of a flag is not proof');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: true, readError: 'HTTP 502' }), {}, 'the state after the disable was not read');
+  // Catches: a PR closed between the wait's read and the post-disable read still being marked retryable.
+  assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: true, state: 'CLOSED' }), {}, 'closed after the wait read it open');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'error', error: 'HTTP 502' }, clean), {}, 'the wait could not read the PR');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: false }, clean), {}, 'a zero wait whose one read failed ends as a timeout');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout' }, clean), {}, 'a timeout that does not say the read worked is no proof');
