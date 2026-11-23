@@ -103,7 +103,7 @@ function readQuoted(sql, start, quote, escapes) {
   return -1;
 }
 
-const ORDER = ['DROP', 'TRUNCATE', 'ALTER-DROP', 'RLS-DISABLE', 'SECURITY-DEFINER', 'GRANT', 'REVOKE', 'DO-BLOCK', 'UNPARSED'];
+const ORDER = ['DROP', 'TRUNCATE', 'DELETE-NO-WHERE', 'UPDATE-NO-WHERE', 'UPDATE-WHERE-TRUE', 'MERGE-UPDATE', 'MERGE-DELETE', 'ALTER-DROP', 'RLS-DISABLE', 'SECURITY-DEFINER', 'GRANT', 'REVOKE', 'DO-BLOCK', 'UNPARSED'];
 
 // the words of one statement, upper-cased, with every other token kept as a placeholder so positions stay meaningful
 const wordsOf = (stmt) => stmt.map((t) => (t.t === 'word' ? t.v.toUpperCase() : `\u0000${t.t}`));
@@ -112,6 +112,53 @@ const hasRun = (words, ...run) => {
   for (let i = 0; i + run.length <= words.length; i += 1) if (run.every((w, k) => words[i + k] === w)) return true;
   return false;
 };
+
+// #655 (the "changes every row" hint). FAIL CLOSED, no precise walk: when in doubt the warning shows. The hint may over-warn; it must never stay
+// silent on an UPDATE/DELETE without a WHERE of its own. In a statement that starts with WITH every UPDATE/DELETE word is a DML start unless the
+// full run around it proves otherwise (dmlKind); statements starting with anything else than UPDATE/DELETE/WITH/MERGE give no hint.
+
+// The WHERE of the UPDATE/DELETE keyword at `from`: only one at the keyword's own parenthesis depth and inside its own group counts (a WHERE in a
+// sub-select, or after the CTE group closed, belongs to another query). Returns 'none' (no own WHERE, or the scope cannot be determined: unbalanced
+// parentheses), 'true' (the condition is always true: `true`, `1 = 1`, up to the end, the group's end or a RETURNING) or 'ok'.
+function ownWhere(stmt, from) {
+  let depth = 0;
+  let at = -1;
+  let closed = false;
+  for (let k = from + 1; k < stmt.length; k += 1) {
+    const t = stmt[k];
+    if (t.t === 'punct' && t.v === '(') depth += 1;
+    else if (t.t === 'punct' && t.v === ')') {
+      depth -= 1;
+      if (depth < 0) { closed = true; break; }
+    } else if (depth === 0 && t.t === 'word' && t.v.toUpperCase() === 'WHERE') { at = k; break; }
+  }
+  if (at < 0) return 'none';
+  const rest = [];
+  depth = 0;
+  for (const t of stmt.slice(at + 1)) {
+    if (t.t === 'punct' && t.v === '(') depth += 1;
+    else if (t.t === 'punct' && t.v === ')') { depth -= 1; if (depth < 0) { closed = true; break; } }
+    if (depth === 0 && t.t === 'word' && t.v.toUpperCase() === 'RETURNING') break;
+    rest.push(t.v.toUpperCase());
+  }
+  // a depth left open at the end of the statement (outside a closed group) means the parentheses do not balance: scope unknown
+  if (depth > 0 && !closed) return 'none';
+  const text = rest.join(' ');
+  return text === 'TRUE' || /^(\d+) = \1$/.test(text) || text === '( TRUE )' ? 'true' : 'ok';
+}
+
+// What the UPDATE/DELETE word at `i` of a WITH or MERGE statement is: 'skip' (a locking clause or an upsert action: proven by the whole run, not
+// one previous word), 'merge' (a MERGE action) or 'dml' (anything else, including everything unproven).
+function dmlKind(words, depths, i) {
+  const merged = words.slice(0, i).some((w, j) => w === 'MERGE' && depths[j] <= depths[i]);
+  if (words[i - 1] === 'THEN' && merged) return 'merge';
+  if (words[i] === 'UPDATE') {
+    if (words[i - 1] === 'FOR' || (words[i - 3] === 'FOR' && words[i - 2] === 'NO' && words[i - 1] === 'KEY')) return 'skip';
+    const upsert = words[i - 1] === 'DO' && words[i + 1] === 'SET' && words.slice(0, i).some((w, j) => w === 'ON' && words[j + 1] === 'CONFLICT' && depths[j] === depths[i]);
+    if (upsert) return 'skip';
+  }
+  return 'dml';
+}
 
 export function describeSql(sql) {
   const tok = tokenizeSql(sql);
@@ -125,6 +172,24 @@ export function describeSql(sql) {
     const has = (w) => words.includes(w);
     if (first === 'DROP') found.add('DROP');
     if (first === 'TRUNCATE') found.add('TRUNCATE');
+    const starts = []; // [index, 'UPDATE' | 'DELETE'] of every UPDATE/DELETE that begins a change
+    if (first === 'UPDATE' || first === 'DELETE') starts.push([0, first]);
+    if (first === 'WITH' || first === 'MERGE') {
+      let depth = 0;
+      const depths = stmt.map((t) => { if (t.t === 'punct' && t.v === ')') depth -= 1; const d = depth; if (t.t === 'punct' && t.v === '(') depth += 1; return d; });
+      words.forEach((w, i) => {
+        if (w !== 'UPDATE' && w !== 'DELETE') return;
+        const kind = dmlKind(words, depths, i);
+        if (kind === 'merge') found.add(`MERGE-${w}`);
+        else if (kind === 'dml' && first === 'WITH') starts.push([i, w]);
+      });
+    }
+    for (const [at, kw] of starts) {
+      const w = ownWhere(stmt, at);
+      if (kw === 'DELETE' && w !== 'ok') found.add('DELETE-NO-WHERE');
+      if (kw === 'UPDATE' && w === 'none') found.add('UPDATE-NO-WHERE');
+      if (kw === 'UPDATE' && w === 'true') found.add('UPDATE-WHERE-TRUE');
+    }
     if (first === 'ALTER' && has('DROP')) found.add('ALTER-DROP');
     if (first === 'ALTER' && hasRun(words, 'DISABLE', 'ROW', 'LEVEL', 'SECURITY')) found.add('RLS-DISABLE');
     if (hasRun(words, 'SECURITY', 'DEFINER')) found.add('SECURITY-DEFINER');
