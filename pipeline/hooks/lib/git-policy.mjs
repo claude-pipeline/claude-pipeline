@@ -3816,7 +3816,7 @@ function certainChange(cmds, c, trusted, moves = true) {
 // #662: `echo x | git switch agent/y && P`. A branch switch changes the repository, not the shell, so that the last stage of a pipeline is a subshell does not matter: what matters is that it SUCCEEDED (the `&&` after the
 // pipeline runs P only then, with or without pipefail: the status of a pipeline is its last stage's) and that nothing else of the pipeline or before it can still move HEAD. Everything not listed is today's answer: unknown.
 // The pipeline is the parser's record (pipeRec, on the last stage). ALL must hold: only `|` (no `|&`: a ksh coprocess / bash both-streams), no wrapper stripped, led by `;` or the start of the text, nothing negated, in the
-// background, in a subshell, a group, a level or a loop / branch / function body from the pipeline's start to the switch; the switch is exactly `git switch B`, `git switch -c B` or `git checkout -b B` (a one-operand
+// background, in a subshell, a group, a level or a loop / branch / function body from the pipeline's start to the switch; the switch is exactly `git switch B`, the command word plain `git` (R1-B2: no path, no `./`) and no branch is created (R1-B1: `-c` / `-b` stay unknown, as on main; a one-operand
 // `git checkout NAME` can restore a deleted tracked file and leave HEAD: #789); every other command of the pipeline (substitutions inside the stages included) is a plain reader of data (PIPE_INERT) with no redirect but fd
 // dups and /dev/null and no process substitution; and, in the TOP-LEVEL text only, no earlier command of the text can have left work running (a background job, a coprocess, a launcher, a script / shell / interpreter run,
 // a function call, source, eval: #762 is the same race for an unpiped switch).
@@ -3827,9 +3827,9 @@ function pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) {
   const rec = c.pipeRec;
   if (!rec || !trusted || level !== 0 || child === true || cmds.truncated || cmds.ctlBroken || rec.pending || rec.wrapped || !rec.ops.every((o) => o === '|')) return false;
   if (nextSep(cmds, i) !== '&&' || c.depth > 0 || (c.pipeLead ?? ';') !== ';') return false;
-  if (!(c.argv.length === 3 || c.argv.length === 4) || baseName(c.argv[0]) !== 'git' || Object.keys(c.env ?? {}).length > 0 || (c.redirects ?? []).length > 0) return false;
-  const [, sub, a, b] = c.argv;
-  const name = c.argv.length === 3 ? (sub === 'switch' ? a : null) : ((sub === 'switch' && a === '-c') || (sub === 'checkout' && a === '-b') ? b : null);
+  if (c.argv.length !== 3 || c.argv[0] !== 'git' || Object.keys(c.env ?? {}).length > 0 || (c.redirects ?? []).length > 0) return false;
+  const [, sub, a] = c.argv;
+  const name = sub === 'switch' ? a : null;
   if (name === null || !/^[A-Za-z0-9_][\w./@+-]*$/.test(name)) return false;
   const seg = cmds.slice(rec.from, i + 1);
   if (seg[seg.length - 1] !== c) return false;

@@ -1900,8 +1900,6 @@ test('#662: `echo x | git switch B && P` is proven by the &&; every other shape 
   const newAllow = [ // BASE deny -> CANDIDATE allow
     `echo x | git switch agent/y && ${P}`,
     `set -o pipefail; echo x | git switch agent/y && ${P}`, // both readings give the same answer: no pipefail tracking
-    `echo x | cat | git switch -c agent/z && ${P}`,
-    `echo x | git checkout -b agent/z && ${P}`,
     `echo x | git switch agent/y && echo ok && ${P}`,
   ];
   for (const c of newAllow) assert.equal(evaluate(c, o).decision, 'allow', c);
@@ -1930,6 +1928,11 @@ test('#662: `echo x | git switch B && P` is proven by the &&; every other shape 
     `echo ref > .git/HEAD | git switch agent/y && ${P}`,
     `echo x | cd /other && ${P}`,
     `echo x | git switch agent/y & ${P}`,
+    // R1-B1 / R1-B2: a branch-creating switch and a command word that is not plain `git` get no proof (allow on 49ca2b80, deny now)
+    `echo x | git switch -c agent/z && ${P}`,
+    `echo x | cat | git switch -c agent/z && ${P}`,
+    `echo x | git checkout -b agent/z && ${P}`,
+    `echo x | ./tools/git switch agent/y && ${P}`,
     // R1-F1: the closer of a loop / if / case as the stage before the switch: its body ran concurrently with it and is no "earlier work" the proof may skip (allow on 49ca2b80, deny now)
     `while read l; do :; done | git switch agent/y && ${P}`,
     `for i in 1; do gh pr checkout 5; done | git switch agent/y && ${P}`,
