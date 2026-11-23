@@ -742,13 +742,14 @@ test('job runner nesting is bounded and still fails closed', () => {
 // ---- adversarial-review bypasses: state changed earlier on the same line, graphql, variables, wrappers -------
 
 const BYPASS_DENY = [
+  ['git checkout src/file.ts && git push', { pathExists: () => true }], // (#789: a one-operand checkout may restore a file or switch to a branch of that name: the branch after it is unknown)
   // 1. the branch changes earlier on the line, so a bare/HEAD push is judged against the new branch
-  ['git checkout main && git merge agent/x && git push'],
-  ['git checkout main; git push'],
+  ['git switch main && git merge agent/x && git push'],
+  ['git switch main; git push'],
   ['git switch main; git push origin HEAD'],
   ['git switch main && git pull && git merge agent/x && git push origin HEAD'],
-  ['git checkout main && git push origin'],
-  ['git stash; git checkout master; git push'],
+  ['git switch main && git push origin'],
+  ['git stash; git switch master; git push'],
   ['git checkout -B main origin/main && git push'],
   ['git checkout -b main && git push'],
   ['git switch -c main && git push'],
@@ -760,7 +761,7 @@ const BYPASS_DENY = [
   ['git checkout - && git push'],
   ['git switch - && git push'],
   ['git checkout --detach && git push'],
-  ['git checkout $B && git push'],
+  ['git switch $B && git push'],
   ['git rebase origin/main main && git push'],
   ['git symbolic-ref HEAD refs/heads/main && git push'],
   ['git worktree add ../wt main && cd ../wt && git push'],
@@ -772,10 +773,10 @@ const BYPASS_DENY = [
   ['C="git push origin main"; node ~/.claude/pipeline/bin/pipeline.mjs job start x -- $C'],
   ["gh api graphql -f query='mutation { ...addComment } fragment addComment on Mutation { mergePullRequest(input:{pullRequestId:\"X\"}) { clientMutationId } }'"],
   ['git switch -c agent/z origin/master && git push'],
-  ['git checkout agent/y && git push', { pushDest: (dir, x) => (x.branch === 'agent/y' ? 'origin/main' : null) }],
+  ['git switch agent/y && git push', { pushDest: (dir, x) => (x.branch === 'agent/y' ? 'origin/main' : null) }],
   ['git push origin HEAD:refs/heads/Main'],
   ['git push origin Main'],
-  ['git checkout MAIN && git push'],
+  ['git switch MAIN && git push'],
   // pushes whose destination depends on config changed on the same line (or passed with -c)
   ['git branch --set-upstream-to=origin/main && git push'],
   ['git branch -u origin/main && git push'],
@@ -872,17 +873,16 @@ const BYPASS_DENY = [
 ];
 
 const BYPASS_ALLOW = [
-  ['git checkout agent/y && git push'],
-  ['git checkout main && git checkout agent/y && git push'],
+  ['git switch agent/y && git push'],
+  ['git switch main && git switch agent/y && git push'],
   ['git switch -c agent/z && git push'],
   ['git checkout -b agent/z --no-track origin/main && git push'],
   ['git checkout -b agent/z main && git push'],
   ['git switch -c agent/z --no-track origin/main && git push'],
   ['git branch -m agent/renamed && git push'],
   ['git branch -m main agent/old && git push'],
-  ['cd /other && git checkout main && cd /work/repo && git push'],
-  ['git checkout agent/y && git push', { branch: 'main', pushDest: (dir, x) => (x.branch ? 'origin/agent/y' : 'origin/main') }],
-  ['git checkout src/file.ts && git push', { pathExists: () => true }],
+  ['cd /other && git switch main && cd /work/repo && git push'],
+  ['git switch agent/y && git push', { branch: 'main', pushDest: (dir, x) => (x.branch ? 'origin/agent/y' : 'origin/main') }],
   ['git checkout -- src/a.ts && git push'],
   ['git checkout HEAD && git push'],
   ['git checkout origin/main -- file && git push'],
@@ -992,19 +992,21 @@ test('disablePullRequestAutoMerge stays allowed, and the allowed list no longer 
 });
 
 test('an overridden branch is looked up by name, and only for the directory it changed', () => {
-  let v = evaluate('git checkout agent/y && git push', { pushDest: () => null });
+  let v = evaluate('git switch agent/y && git push', { pushDest: () => null });
   assert.deepEqual(v.calls.pushDirs, [{ dir: resolve('/work/repo'), gitDir: null, branch: 'agent/y' }]);
   assert.deepEqual(v.calls.branchDirs, [], 'the override replaces the real branch lookup');
-  v = evaluate('git checkout main && git push origin agent/x');
+  v = evaluate('git switch main && git push origin agent/x');
   assert.equal(v.decision, 'allow');
-  v = evaluate('git checkout main; cd /other; git push', { byDir: { '/other': 'agent/y', '/work/repo': 'agent/x' } });
+  v = evaluate('git switch main || exit 1; cd /other; git push', { byDir: { '/other': 'agent/y', '/work/repo': 'agent/x' } });
   assert.equal(v.decision, 'allow');
-  v = evaluate('git checkout main; cd /other; git push', { byDir: { '/other': 'main', '/work/repo': 'agent/x' } });
+  v = evaluate('git switch main || exit 1; cd /other; git push', { byDir: { '/other': 'main', '/work/repo': 'agent/x' } });
   assert.equal(v.decision, 'deny');
   v = evaluate('git checkout src/a.ts && git push', { branch: 'main', pathExists: () => true });
-  assert.equal(v.decision, 'deny', 'a path checkout leaves the real branch (main) in force');
+  assert.equal(v.decision, 'deny', '#789: a one-operand checkout may restore a file: the branch after it is unknown');
   v = evaluate('git checkout src/a.ts && git push', { branch: 'agent/x', pathExists: () => false });
-  assert.equal(v.decision, 'allow', 'a name that is not on disk is a branch');
+  assert.equal(v.decision, 'deny', '#789: a name that is not on disk may still be a tracked file deleted from the worktree');
+  v = evaluate('git switch agent/z && git push', { branch: 'main', pathExists: () => false });
+  assert.equal(v.decision, 'allow', 'git switch is always a branch switch');
 });
 
 test('the query of a graphql call is scanned, not just grepped', () => {
@@ -1207,15 +1209,15 @@ test('spawn: a branch switched earlier on the line is looked up as <branch>@{pus
   git('push', '-q', '-u', 'origin', 'agent/x'); // agent/x: upstream origin/agent/x
   const bare = (c) => hook(bashInput(c, dir), { env: GIT_ENV });
   assert.equal(bare('git push').stdout, '', 'current branch agent/x pushes to origin/agent/x');
-  assert.equal(verdictOf(bare('git checkout agent/y && git push')).permissionDecision, 'deny'); // agent/y@{push} = origin/main
-  assert.equal(verdictOf(bare('git checkout main && git push')).permissionDecision, 'deny');
+  assert.equal(verdictOf(bare('git switch agent/y && git push')).permissionDecision, 'deny'); // agent/y@{push} = origin/main
+  assert.equal(verdictOf(bare('git switch main && git push')).permissionDecision, 'deny');
   assert.equal(verdictOf(bare('git switch main; git push origin HEAD')).permissionDecision, 'deny');
   assert.equal(verdictOf(bare('git checkout -B main origin/main && git push')).permissionDecision, 'deny');
   assert.equal(verdictOf(bare('git branch -M main && git push')).permissionDecision, 'deny');
   assert.equal(bare('git checkout -b agent/new --no-track main && git push').stdout, '');
-  assert.equal(bare('git checkout agent/x && git push').stdout, '');
+  assert.equal(bare('git switch agent/x && git push').stdout, '');
   git('checkout', '-q', 'main');
-  assert.equal(bare('git checkout agent/x && git push').stdout, '', 'switching away from main makes the push safe');
+  assert.equal(bare('git switch agent/x && git push').stdout, '', 'switching away from main makes the push safe');
   assert.equal(verdictOf(bare('git push')).permissionDecision, 'deny');
 });
 
@@ -1818,13 +1820,13 @@ test('directory / branch / variable state from a command that may not have run i
     'cd /safe | cat; git push',
     'cd /safe || git push',
     'false && pushd /safe; git push',
-    'false && git checkout agent/y; git push',
-    'git checkout agent/y & git push',
-    '(git checkout agent/y); git push',
-    'git checkout agent/y || true; git push',
-    'git checkout agent/y; git push', // (#754: the switch may have failed and the push run on the old branch)
-    'echo $(git checkout agent/y); git push',
-    'git checkout agent/y | cat; git push',
+    'false && git switch agent/y; git push',
+    'git switch agent/y & git push',
+    '(git switch agent/y); git push',
+    'git switch agent/y || true; git push',
+    'git switch agent/y; git push', // (#754: the switch may have failed and the push run on the old branch)
+    'echo $(git switch agent/y); git push',
+    'git switch agent/y | cat; git push',
     // a variable bound by a builtin that has no NAME=value word
     'B=agent/x; read B <<< main; git push origin HEAD:$B',
     'B=agent/x; printf -v B main; git push origin HEAD:$B',
@@ -1840,9 +1842,9 @@ test('directory / branch / variable state from a command that may not have run i
     'cd /safe > /dev/null 2>&1 && git push',
     'cd /safe && git push',
     'true && cd /safe && git push',
-    'git checkout agent/y && git push',
+    'git switch agent/y && git push',
     'cd /safe; git push',
-    'git checkout agent/y || exit 1; git push',
+    'git switch agent/y || exit 1; git push',
     'cd /safe &>/dev/null; git status',
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
@@ -1853,30 +1855,47 @@ test('directory / branch / variable state from a command that may not have run i
 test('#754: a switch followed by ; may have failed: a push of HEAD / bare runs on the old branch, which can be main', () => {
   const o = { branch: 'main', labels: [] };
   const denyCmds = [
-    'git checkout agent/y; git push origin HEAD',
-    'git checkout agent/y\ngit push origin HEAD',
-    'git checkout agent/y; git push',
+    'git switch agent/y; git push origin HEAD',
+    'git switch agent/y\ngit push origin HEAD',
+    'git switch agent/y; git push',
     'git switch agent/y; git push -u origin HEAD',
     'git checkout -b agent/y; git push -u origin HEAD',
-    'git checkout agent/y && echo ok; git push origin HEAD', // the switch may have failed, echo skipped, the push still runs
-    '{ git checkout agent/y; }; git push origin HEAD',
-    'bash -c "git checkout agent/y; git push origin HEAD"',
-    'git checkout agent/y; git push origin "$(git branch --show-current)"',
-    'set -e; git checkout agent/y; git push origin HEAD', // (set -e is not modelled: fails closed)
-    '( git checkout agent/y ); git push origin HEAD',
-    'git checkout agent/y & git push origin HEAD',
-    'git checkout agent/y || true; git push origin HEAD',
+    'git switch agent/y && echo ok; git push origin HEAD', // the switch may have failed, echo skipped, the push still runs
+    '{ git switch agent/y; }; git push origin HEAD',
+    'bash -c "git switch agent/y; git push origin HEAD"',
+    'git switch agent/y; git push origin "$(git branch --show-current)"',
+    'set -e; git switch agent/y; git push origin HEAD', // (set -e is not modelled: fails closed)
+    '( git switch agent/y ); git push origin HEAD',
+    'git switch agent/y & git push origin HEAD',
+    'git switch agent/y || true; git push origin HEAD',
   ];
   for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
   const allowCmds = [
-    'git checkout agent/y && git push origin HEAD', // the push runs only when the switch did
-    'git checkout agent/y || exit 1; git push origin HEAD',
-    'git checkout agent/y || { echo no; exit 1; }; git push origin HEAD',
-    'git checkout agent/y; git push origin agent/y', // an explicit refspec does not read the branch
-    'git checkout agent/y; git status',
-    'git checkout agent/y; git checkout agent/z && git push origin HEAD', // a later switch proven by its own &&
+    'git switch agent/y && git push origin HEAD', // the push runs only when the switch did
+    'git switch agent/y || exit 1; git push origin HEAD',
+    'git switch agent/y || { echo no; exit 1; }; git push origin HEAD',
+    'git switch agent/y; git push origin agent/y', // an explicit refspec does not read the branch
+    'git switch agent/y; git status',
+    'git switch agent/y; git switch agent/z && git push origin HEAD', // a later switch proven by its own &&
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
+  // (R1-B3: a plain `|| exit` after `A && switch` proves both ran: the switch is as certain as after `switch || exit`)
+  assert.equal(evaluate('git fetch origin && git switch agent/y || exit 1; git push origin HEAD', o).decision, 'allow');
+  // (R1-B1: a switch that may have failed leaves EVERY branch unknown, also the one of a subfolder of the same worktree: `git -C src push` there reads the old branch, which is not agent/x any more)
+  assert.equal(evaluate('git checkout main; git -C src push origin HEAD', { branch: 'agent/x', labels: [] }).decision, 'deny');
+  assert.equal(evaluate('git switch main; git -C src push origin HEAD', { branch: 'agent/x', labels: [] }).decision, 'deny');
+});
+
+// #789: a one-operand `git checkout NAME` may restore a file (a tracked file deleted from the worktree; HEAD stays put) or switch to a branch that shares its name with a file: the branch after it is unknown, file on disk or not.
+// Failure caught: `git checkout README.md && git push origin HEAD` on main judged as a push of the branch "README.md"; `git checkout main && git push origin HEAD` from agent/x with a file called main judged as agent/x.
+test('#789: a one-operand git checkout leaves the branch unknown; git switch and checkout -b keep their reading', () => {
+  const fileMain = { pathExists: (p) => p.endsWith('/main') };
+  assert.equal(evaluate('git checkout README.md && git push origin HEAD', { branch: 'main', labels: [] }).decision, 'deny');
+  assert.equal(evaluate('git checkout main && git push origin HEAD', { branch: 'agent/x', labels: [], ...fileMain }).decision, 'deny');
+  assert.equal(evaluate('git checkout agent/y && git push origin HEAD', { branch: 'main', labels: [] }).decision, 'deny');
+  assert.equal(evaluate('git switch agent/y && git push origin HEAD', { branch: 'main', labels: [] }).decision, 'allow');
+  assert.equal(evaluate('git checkout -b agent/y && git push -u origin HEAD', { branch: 'main', labels: [] }).decision, 'allow');
+  assert.equal(evaluate('git checkout -B agent/y && git push -u origin HEAD', { branch: 'main', labels: [] }).decision, 'allow');
 });
 
 // #529: dash / Debian sh / ash read `A && B &>f` as `A && B &` (a background job) and then `>f`; bash / zsh / ksh read a redirect. What a command of such a span changed (the directory, a branch, a variable) is

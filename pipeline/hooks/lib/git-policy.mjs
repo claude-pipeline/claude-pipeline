@@ -643,7 +643,8 @@ function trackSwitch(sub, args, d, ctx) {
   const x = expandVars(positionals[0], ctx);
   if (x === '-' || /^@\{-\d*\}$/.test(x) || DYNAMIC.test(x)) { setBranch(ctx, d, null); return; }
   if (x === 'HEAD' || x === '@') return;
-  if (!isSwitch && d !== null && ctx.pathExists(path.resolve(d, x))) return; // a file on disk: path checkout, or git refuses
+  // (#789: a one-operand checkout restores a file when NAME is one (a tracked file deleted from the worktree: HEAD stays put) and switches when it is a branch, also one that shares its name with a file: unknowable from the text)
+  if (!isSwitch) { setBranch(ctx, d, null); return; }
   setBranch(ctx, d, x);
 }
 
@@ -3380,7 +3381,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     const exits = (x) => {
       let y = null;
       if (x.redir) y = { ...x, cond: x.and, redir: false }; else if (x.loopOnly) y = { ...x, soft: true };
-      if (x.unproven) y = { ...(y ?? x), unproven: false };
+      // (R1-B3: and when the switch came only from an `&&` before it (x.andOnly: not a chain, redirect or pipe), `A && switch || exit` proves A and the switch both ran: cond goes too)
+      if (x.unproven) y = { ...(y ?? x), unproven: false, ...(x.andOnly ? { cond: false } : {}) };
       if (y) proven.set(x, y);
       return true;
     };
@@ -3407,8 +3409,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
       if (op === '||' || x.cond) forget(x);
       // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
-      // leaves the branch names unknown. Only the directories the switch wrote, not every branch)
-      else if (x.unproven) { if (x.unproven === true) forgetNames(false); else for (const d of x.unproven) { const e = ctx.branches.get(d); if (e) e.name = null; } }
+      // leaves EVERY branch unknown (R1-B1, the doubtful-git-change rule of #505: a subfolder of the same worktree has no entry of its own and would read the branch the switch may not have left))
+      else if (x.unproven) forgetNames(true);
       return false;
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
@@ -3755,13 +3757,13 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? (ctx.budget.branchLog.length >= writesBefore ? ctx.budget.branchLog.slice(writesBefore) : true) : null, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? (ctx.budget.branchLog.length >= writesBefore ? ctx.budget.branchLog.slice(writesBefore) : true) : null, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
       // (an exit behind a wrapper (`env exit 1`, `command exit 1`, `/usr/bin/time exit 1`) may leave no shell: it proves nothing about the redirected move)
       const redirOnly = how === 'redir' && c.sep !== '&&';
-      if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly), from: i, byDir: DIR_CHANGERS.includes(name) };
+      if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly && !(x.andOnly && x.unproven)), from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);
         const top = levels?.[levels.length - 1];
