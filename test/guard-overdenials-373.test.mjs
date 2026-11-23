@@ -309,11 +309,14 @@ describe('#529 files: a `&>` span', () => {
     ['the same in a loop: the binder reaches the write above it (R2-F1)', 'for i in 1 2; do touch $D/f; D=/tmp/ok && true &>/dev/null; echo $D; read D; done'],
     ['a binder after a plain reassignment past the span end still reaches the write inside it (R3-B1: allowed on 9babc0e4, deny on main)', 'D=/tmp/ok && touch $D/f &>/dev/null; echo $D; D=/tmp/ok; read D'],
     ['a name built after the span from a span name, written past the span end (R3-F1: the closure hands it the source\'s index)', 'D=/tmp/ok &>/dev/null; F=$D/x; touch $F'],
+    ['a plain reassignment past the span end does not make the protected write inside it safe (R4-F1: allowed on 6ae30671, deny on main)', `F=settings.json && cp x ~/${PROT.split('/')[0]}/$F &>/dev/null; F=safe; echo $F`],
+    ['the same, the reassignment last (R4-F1)', `F=settings.json && cp x ~/${PROT.split('/')[0]}/$F &>/dev/null; echo $F; F=safe`],
     ['a protected round directory by a span name (BASE deny, CANDIDATE deny: control, the reason changes)', `F=22 &>/dev/null; echo '{}' > ${['.review', 'round-'].join('/')}$F/x.json`],
   ]);
   allows('variable', [
     ['the same assignment without a `&>` (BASE allow, CANDIDATE allow)', 'D=/tmp/ok; touch $D/f'],
     ['used inside the span (BASE allow, CANDIDATE allow)', 'D=/tmp/ok && touch $D/f &>/dev/null'],
+    ['a safe write inside the span, the name reassigned and read past it (R4-F1 control: allow on main and now)', 'F=notes.txt && cp x /tmp/$F &>/dev/null; F=safe; echo $F'],
     ['used inside the span, read again after it (R1-B5: allow; deny on 49ca2b80, where a later read made the name unknown for the whole line)', 'D=/tmp/ok && touch "$D/f" &>/dev/null; echo "$D"'],
     ['a name built from the span name, used inside the span, the source read again after it (R2-B1: allow; deny on ab3e4d96, where the derived name was unknown for the whole line)', 'D=/tmp/ok && F="$D/result" && touch "$F" &>/dev/null; echo "$D"'],
   ]);
