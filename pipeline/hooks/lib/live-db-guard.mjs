@@ -171,7 +171,7 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
 
 // ---- Task 5 (B1a): agent-run supabase CLI lines and Management API calls that can reach a non-local database ----
 // findLiveDbCli(cmds, raw, state) -> reason | null (null = nothing to refuse). A line passes only when the line itself proves a LOCAL target (or the owner's `dev` project); everything the guard does
-// not know is refused ("the owner runs it"). The psql family (psql, pg_dump…, usql, the pg utilities, PG* env) ships in B1b.
+// not know is refused ("the owner runs it"). The psql family (psql, pg_dump…, usql, the pg utilities, PG* env) is judged by pgFamilyRefusal below (B1b).
 //
 // One SHAPE rule, no list of launchers (rounds 8-10 each found a new wrapper or an over-refusal in one). Per command, two readings are judged and a refusal from either wins: the parsed argv (the parser
 // unwraps npx / timeout / xargs / sudo …) and the words as typed (`c.typed`, the parser's own words of the command: a quoted string, a substitution and a heredoc body stay one word, a comment is not a word).
