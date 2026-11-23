@@ -697,7 +697,7 @@ function trackConfig(args, ctx) {
 
 function trackGit(sub, args, g, ctx) {
   const { d } = g;
-  if (sub === 'checkout' || sub === 'switch') trackSwitch(sub, args, d, ctx);
+  if (sub === 'checkout' || sub === 'switch') { ctx.switches = (ctx.switches ?? 0) + 1; trackSwitch(sub, args, d, ctx); } // (#754: counted, so the walk can tell a command that switched a branch)
   else if (sub === 'branch') trackBranch(args, d, g.gitDir, ctx);
   else if (sub === 'config') return trackConfig(args, ctx);
   else if (sub === 'remote' && args.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true; // (aliases expanded: see directMergeVerdict)
@@ -3376,7 +3376,14 @@ function evalString(str, startDir, ctx, level, child = false) {
     const proven = new Map();
     // (D: a change made directly in a loop body (x.loopOnly: no other body mark, not after &&) proven by a plain `|| exit` is reached by every later command of that body: kept (soft) through ; and || until the body is
     // left, where the blk rule forgets it (an early break / continue skips the cd and everything after it). The `|| { …; exit 1; }` group form is not read in a text with a loop (no shape events there): still refused)
-    const exits = (x) => { if (x.redir) proven.set(x, { ...x, cond: x.and, redir: false }); else if (x.loopOnly) proven.set(x, { ...x, soft: true }); return true; };
+    // (#754: a branch switch not proven to have succeeded (x.unproven) is proven by the same plain `|| exit`: the copy goes on as before)
+    const exits = (x) => {
+      let y = null;
+      if (x.redir) y = { ...x, cond: x.and, redir: false }; else if (x.loopOnly) y = { ...x, soft: true };
+      if (x.unproven) y = { ...(y ?? x), unproven: false };
+      if (y) proven.set(x, y);
+      return true;
+    };
     trackers = trackers.filter((x) => {
       if (!x.up.every((e, k) => c.up[k] === e)) return false; // (its level has ended: the rule of that level took over)
       if (x.soft) return true;
@@ -3399,6 +3406,9 @@ function evalString(str, startDir, ctx, level, child = false) {
         if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.co !== true && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
       if (op === '||' || x.cond) forget(x);
+      // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
+      // leaves the branch names unknown. The names recorded, not every branch: the switch recorded its own directory's)
+      else if (x.unproven) forgetNames(false);
       return false;
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
@@ -3610,6 +3620,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     // (`nohup cd d`, `env cd d`, find -exec cd) is that child's, and leaves this shell where it was.)
     const childCd = c.spawn === true && argv.length > 0 && DIR_CHANGERS.includes(baseName(argv[0]));
     const before = argv.length ? stateMark(ctx) : null;
+    const switchesBefore = ctx.switches ?? 0;
     const changesStateWords = argv.length > 0 && !childCd && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
@@ -3743,7 +3754,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)

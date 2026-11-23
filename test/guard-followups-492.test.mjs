@@ -95,7 +95,7 @@ describe('#505: every branch is unknown, also the ones no entry was made for', (
     expect('deny', 'source env.sh; git checkout agent/y; cd /other; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('a branch recorded after the mark is known again (a checkout of the directory the push runs in)', () => {
-    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
+    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y && git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('reference: a build script whose failure group is a plain echo keeps the caller branch (allowed)', () => {
     expect('allow', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });

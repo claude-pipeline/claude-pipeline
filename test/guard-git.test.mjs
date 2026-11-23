@@ -1820,6 +1820,7 @@ test('directory / branch / variable state from a command that may not have run i
     'git checkout agent/y & git push',
     '(git checkout agent/y); git push',
     'git checkout agent/y || true; git push',
+    'git checkout agent/y; git push', // (#754: the switch may have failed and the push run on the old branch)
     'echo $(git checkout agent/y); git push',
     'git checkout agent/y | cat; git push',
     // a variable bound by a builtin that has no NAME=value word
@@ -1839,8 +1840,39 @@ test('directory / branch / variable state from a command that may not have run i
     'true && cd /safe && git push',
     'git checkout agent/y && git push',
     'cd /safe; git push',
-    'git checkout agent/y; git push',
+    'git checkout agent/y || exit 1; git push',
     'cd /safe &>/dev/null; git status',
+  ];
+  for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
+});
+
+// #754: a switch followed by ; (or a newline) may have failed (no such branch, local changes): the shell is still on the old branch, which can be main, and the push of HEAD / bare runs there.
+// Failure caught: `git checkout agent/y; git push origin HEAD` from main allowed because the guard judged the push as if it came from agent/y.
+test('#754: a switch followed by ; may have failed: a push of HEAD / bare runs on the old branch, which can be main', () => {
+  const o = { branch: 'main', labels: [] };
+  const denyCmds = [
+    'git checkout agent/y; git push origin HEAD',
+    'git checkout agent/y\ngit push origin HEAD',
+    'git checkout agent/y; git push',
+    'git switch agent/y; git push -u origin HEAD',
+    'git checkout -b agent/y; git push -u origin HEAD',
+    'git checkout agent/y && echo ok; git push origin HEAD', // the switch may have failed, echo skipped, the push still runs
+    '{ git checkout agent/y; }; git push origin HEAD',
+    'bash -c "git checkout agent/y; git push origin HEAD"',
+    'git checkout agent/y; git push origin "$(git branch --show-current)"',
+    'set -e; git checkout agent/y; git push origin HEAD', // (set -e is not modelled: fails closed)
+    '( git checkout agent/y ); git push origin HEAD',
+    'git checkout agent/y & git push origin HEAD',
+    'git checkout agent/y || true; git push origin HEAD',
+  ];
+  for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const allowCmds = [
+    'git checkout agent/y && git push origin HEAD', // the push runs only when the switch did
+    'git checkout agent/y || exit 1; git push origin HEAD',
+    'git checkout agent/y || { echo no; exit 1; }; git push origin HEAD',
+    'git checkout agent/y; git push origin agent/y', // an explicit refspec does not read the branch
+    'git checkout agent/y; git status',
+    'git checkout agent/y; git checkout agent/z && git push origin HEAD', // a later switch proven by its own &&
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });
