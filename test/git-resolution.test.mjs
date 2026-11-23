@@ -1522,6 +1522,41 @@ test('conflictReviewBase (R3-B2): two merges of the chain both conflict on f.txt
   cNo(cdecide(s, head), 'evidence', 'f.txt');
 });
 
+test('conflictReviewBase (R4-B1): a conflicting merge accepted main-1\'s text, then main-2 changes it again and the later merge is clean -> evidence, the accepted incoming text is in no record', () => {
+  // Prevents: t1, the incoming side the first resolver actually took, never reaching a reviewer: the trial merge shows o against t2 and the clean second merge hides the difference.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'f.txt': T('top', 't1', 'bottom') },
+  });
+  resolveMerge(s.repo, { 'f.txt': T('top', 't1', 'bottom') });
+  s.repo.checkout('main');
+  s.repo.write('f.txt', T('top', 't2', 'bottom'));
+  s.repo.commit('main edits f.txt again');
+  s.repo.checkout('feat');
+  s.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main cleanly', 'main']);
+  cNo(cdecide(s, revParse('HEAD', s.o)), 'evidence', 'f.txt');
+});
+
+test('conflictReviewBase (R4-B2): an own commit edits f.txt after the conflict merge and a later clean merge of main restores the earlier resolution -> evidence', () => {
+  // Prevents: a clean merge silently discarding an own edit made after the first conflict, which the narrow patch shows as a plain keep-ours.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'g.txt': T('g') },
+    ours: { 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'f.txt': T('top', 't', 'bottom') },
+  });
+  resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  s.repo.write('f.txt', T('top', 'o', 'a check', 'bottom'));
+  s.repo.commit('own commit adds a check to f.txt');
+  s.repo.checkout('main');
+  s.repo.write('g.txt', T('g2'));
+  s.repo.commit('main moves g.txt');
+  s.repo.checkout('feat');
+  s.repo.git(['merge', '--no-ff', '--no-commit', '-q', 'main']);
+  s.repo.write('f.txt', T('top', 'o', 'bottom'));
+  cNo(cdecide(s, s.repo.commit('merge main cleanly, f.txt back to the first resolution')), 'evidence', 'f.txt');
+});
+
 test('renderConflictSides (R1-B4, R1-B7): a recorded conflict that no longer conflicts, or a blob with hundreds of thousands of lines, is unavailable (whole PR), never an incomplete file or a throw', () => {
   // Prevents: a file missing one conflict's sides being pinned as the Fable evidence, and `arbiter needed` crashing on a RangeError (a spread of every line into one call) instead of falling back.
   const s = conflictRepo({
