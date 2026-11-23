@@ -373,6 +373,9 @@ test('PR #823 round 1 B3/F3/B5: a ready-phase head with no commit record, or who
   assert.deepEqual([row([dated(T('10:30'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('10:30'))], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'a commit dated within an hour after the start: its clock may be fast (PR #823 round 2 B1)');
   assert.deepEqual([row([dated(T('08:00'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('08:00'))], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'older than the evidence window');
   assert.deepEqual([row([commit('3')], Date.parse(T('10:00'))).pushesWhileReady, row([commit('3')], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'no commit date: not provable');
+  // PR #823 round 3 B2: a PR created after the period start has no earlier run; the one-hour allowance is for older PRs only (failure caught: a short --since window losing most of its pushes to "unchecked")
+  const fresh = analysePrUsage({ number: 7, pr: { createdAt: T('08:05'), draft: false }, timeline: TIMELINE, commits: [dated(T('08:10'))], runs, evidenceFromMs: Date.parse(T('08:00')) });
+  assert.deepEqual([fresh.pushesWhileReady, fresh.uncheckedHeads], [1, 0], 'created after the start, commit 10 minutes after it: counted');
 });
 
 test('PR #823 round 1 B5: evidenceRuns (the runs of every workflow) say which run came first on a head, while the cost stays with the kept runs', () => {

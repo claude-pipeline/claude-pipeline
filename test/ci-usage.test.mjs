@@ -331,7 +331,9 @@ test('PR #823 round 1 B3/F3/B5: a head missing from the PR commit list (a force 
   const without = COMMITS7.filter((c) => c.sha !== sha('3'));
   const dropped = usage(world({ extra: [{ match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: without }] }), ['--json', '--since', '2026-11-05']);
   const old = COMMITS7.map((c) => (c.sha === sha('3') ? { ...c, commit: { message: 'work', committer: { date: '2026-11-01T08:00:00Z' } } } : c));
-  const reopened = usage(world({ extra: [{ match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: old }] }), ['--json', '--since', '2026-11-05']);
+  // the PR itself predates --since (a PR created inside the period has no earlier run, so its commit dates prove nothing: PR #823 round 3 B2)
+  const olderPr = { match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { ...PR7, created_at: '2026-11-01T07:00:00Z' } };
+  const reopened = usage(world({ extra: [olderPr, { match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: old }] }), ['--json', '--since', '2026-11-05']);
   for (const r of [dropped, reopened]) {
     assertExit(r, 0, r.stderr + r.stdout);
     const [repo] = r.json.repos;
