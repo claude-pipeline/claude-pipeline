@@ -307,6 +307,8 @@ describe('#529 files: a `&>` span', () => {
     ['a name built from the span name, written past the span end (R2-B1 control: refused from where its source is)', 'D=/tmp/ok && F="$D/r" && true &>/dev/null; echo "$D"; touch "$F"'],
     ['a binder after the span end still reaches the write inside it (R2-F1: allowed on ab3e4d96, deny on main)', 'D=/tmp/ok && touch $D/f &>/dev/null; echo $D; read D'],
     ['the same in a loop: the binder reaches the write above it (R2-F1)', 'for i in 1 2; do touch $D/f; D=/tmp/ok && true &>/dev/null; echo $D; read D; done'],
+    ['a binder after a plain reassignment past the span end still reaches the write inside it (R3-B1: allowed on 9babc0e4, deny on main)', 'D=/tmp/ok && touch $D/f &>/dev/null; echo $D; D=/tmp/ok; read D'],
+    ['a name built after the span from a span name, written past the span end (R3-F1: the closure hands it the source\'s index)', 'D=/tmp/ok &>/dev/null; F=$D/x; touch $F'],
     ['a protected round directory by a span name (BASE deny, CANDIDATE deny: control, the reason changes)', `F=22 &>/dev/null; echo '{}' > ${['.review', 'round-'].join('/')}$F/x.json`],
   ]);
   allows('variable', [
