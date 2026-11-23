@@ -2328,8 +2328,11 @@ export function arithAssignedNames(raw, cmds = null, outer = null) {
     // (the line as written with exactly the one unproven body's span cut out: a later `"$pid"` or `$pid` is a use outside it)
     const [a, b] = f.spans[f.badBody];
     const refs = (t) => new Set([...t.matchAll(/\$\{?([A-Za-z_]\w*)/g)].map((m) => m[1]));
-    const outside = refs(`${f.s.slice(0, a)} ${f.s.slice(b)}`);
-    for (const k of refs(f.s.slice(a, b))) if (!outside.has(k)) bodyOnly.add(k);
+    // (a subscript's own array, `${a[$(cmd)]}`: the substitution runs before the subscript is evaluated, and the word is read by the command that holds it, so `${a[` counts as the body's)
+    const lead = f.s[a - 1] === '[' ? /\$\{?[A-Za-z_]\w*$/.exec(f.s.slice(0, a - 1)) : null;
+    const from = lead ? a - 1 - lead[0].length : a;
+    const outside = refs(`${f.s.slice(0, from)} ${f.s.slice(b)}`);
+    for (const k of refs(f.s.slice(from, b))) if (!outside.has(k)) bodyOnly.add(k);
   }
   return { names, dynamic: f.dynamic || dynamicShift || f.nameref || why !== null, reads: f.reads, dynamicRead: why, runner: f.runner, nameref: f.nameref, bodyOnly };
 }
