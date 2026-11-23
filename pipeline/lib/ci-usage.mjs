@@ -156,16 +156,17 @@ export function elapsedMs(run) {
 //   push-while-draft  the same while it was a draft
 // `jobsByRun`: Map run id -> jobs for the runs whose jobs were read (a list the reader had to cut carries `cut: true`: priced as far as read, but not counted as fully read). -> one row per run, same order.
 export function classifyRuns({ pr = null, timeline = null, commits = [], runs, jobsByRun = new Map(), rates = DEFAULT_RATES }) {
-  const events = timeline ? toggles(timeline) : [];
+  const readable = Array.isArray(timeline);
+  const events = toggles(timeline);
   const catchups = catchUpShas(commits, pr?.baseRef, pr?.baseRepo);
   const readyBy = readyHeads(events, runs);
-  const openingHeads = pr && timeline ? new Set(headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind === 'opening').map((h) => h.sha)) : new Set();
+  const openingHeads = pr && readable ? new Set(headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind === 'opening').map((h) => h.sha)) : new Set();
   return (runs ?? []).map((run) => {
     const created = ms(run.created_at);
     const updated = ms(run.updated_at);
     let cls;
     if (run.event !== 'pull_request') cls = 'other';
-    else if (!pr || !timeline) cls = 'unclassified';
+    else if (!pr || !readable) cls = 'unclassified';
     else if (run.conclusion === 'cancelled' && updated !== null && events.some((e) => e.to === 'draft' && updated - e.t >= 0 && updated - e.t <= WINDOW_MS)) cls = 'converted-cancel';
     else if (Number(run.run_attempt) > 1) cls = 'rerun';
     else if (isReadyRun(events, readyBy, created, run.head_sha)) cls = 'ready-for-review';
@@ -211,7 +212,7 @@ const isReadyRun = (events, readyBy, t, headSha) => t !== null && events.some((e
 //   { sha, createdAt, phase, kind: 'opening' | 'catch-up' | 'ready-run' | 'push' }
 // opening = the head the PR was opened with (its first run within 120 s of the PR's creation); catch-up = an update-branch merge; ready-run = the head's first run
 // was the one `ready_for_review` started (nothing ran on it before: the workflow skips drafts); push = a push of the agent. `phase` is the PR's phase when the first run was
-// created. A re-run keeps its original created_at, so a re-run never makes a push look newer; only the first run of a head counts.
+// created ('unknown' when the timeline is not an array: it could not be read). A re-run keeps its original created_at, so a re-run never makes a push look newer; only the first run of a head counts.
 export function headPushes({ pr, timeline, commits = [], runs }) {
   const events = toggles(timeline);
   const catchups = catchUpShas(commits, pr?.baseRef, pr?.baseRepo);
@@ -231,7 +232,7 @@ export function headPushes({ pr, timeline, commits = [], runs }) {
     if (i === 0 && opened !== null && Math.abs(t - opened) <= WINDOW_MS) kind = 'opening';
     else if (catchups.has(sha)) kind = 'catch-up';
     else if (isReadyRun(events, readyBy, t, sha)) kind = 'ready-run';
-    return { sha, createdAt: new Date(t).toISOString(), t, phase: prPhaseAt(timeline, pr, t), kind };
+    return { sha, createdAt: new Date(t).toISOString(), t, phase: Array.isArray(timeline) ? prPhaseAt(timeline, pr, t) : 'unknown', kind };
   });
 }
 
@@ -239,7 +240,9 @@ export function headPushes({ pr, timeline, commits = [], runs }) {
 // ready one (ONE head per ready event), and re-runs (see headPushes). NOT excludable: a push after Rule 8's proven `convert-failed` rejection (GitHub refused the redraft, so the review skill pushes
 // anyway) leaves no trace on GitHub; it counts here like any other push while ready.
 export const UNEXCLUDABLE = 'A push made after a proven convert-failed rejection of `pipeline redraft` (Rule 8: push anyway) leaves no trace on GitHub and counts as pushed while ready.';
+// -> { count, heads }; `count: null` (no heads) when the timeline could not be read: the phase of a push is then unknown, as classifyRuns' `unclassified`.
 export function pushedWhileReady({ pr, timeline, commits = [], runs }) {
+  if (!Array.isArray(timeline)) return { count: null, heads: [] };
   const heads = headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind === 'push' && h.phase === 'ready');
   return { count: heads.length, heads: heads.map((h) => ({ sha: h.sha, createdAt: h.createdAt })) };
 }

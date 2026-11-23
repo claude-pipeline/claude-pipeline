@@ -164,3 +164,14 @@ test('costOfJobs: three parallel shards plus one job are summed; an attempt-2 jo
   assert.equal(runnerOs(['self-hosted', 'linux', 'x64']), 'self-hosted');
   assert.equal(costOfJobs(jobs, { ...DEFAULT_RATES, linux: 0.01 }).usd > c.usd, true, 'a rate override is used');
 });
+
+test('review round 1 B2: an unreadable timeline gives an unknown pushedWhileReady (count null), not the PR current draft flag applied to every historical push', () => {
+  // a fix pushed in draft; the PR is ready now; the timeline read failed. Without the timeline the push cannot be called a missed redraft.
+  const pr = { createdAt: T('09:00'), draft: false };
+  const runs = [run(sha('o'), T('09:00', 30)), run(sha('f'), T('10:30'))];
+  assert.deepEqual(pushedWhileReady({ pr, timeline: null, commits: [], runs }), { count: null, heads: [] });
+  assert.equal(headPushes({ pr, timeline: null, commits: [], runs }).every((h) => h.phase === 'unknown'), true);
+  assert.deepEqual(classifyRuns({ pr, timeline: {}, commits: [], runs }).map((x) => x.class), ['unclassified', 'unclassified'], 'a non-array timeline is unreadable too');
+  // a timeline read successfully and empty is still a known history
+  assert.equal(pushedWhileReady({ pr, timeline: [], commits: [], runs }).count, 1);
+});
