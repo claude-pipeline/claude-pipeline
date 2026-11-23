@@ -632,11 +632,11 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (again.isDraft) return result(EXIT.FAILED, 'draft', { message: 'the PR went back to draft' });
     if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
-    await getReadyAt(pr); // a failed timeline read throws into the poll loop and is retried (like the label read below): the pass is dated against ready, never reported without readyAt / predatesReady
     const others = await otherChecks(obs, identities);
     const owedNote = notOwed.length > 0 ? { notOwed } : {};
     // --wait-others: the required checks are green but a non-required check of the run-e2e suite is still running: keep waiting for it (a red or finished one ends the wait as `passed` with `others`, as before).
     if (waitOthers && others !== null && others.some((o) => RUNNING_OTHER.has(o.status)) && elapsed() < timeoutMs) return null;
+    await getReadyAt(pr); // a failed timeline read throws into the poll loop and is retried (like the label read below): the pass is dated against ready, never reported without readyAt / predatesReady
     if (others !== null && others.length > 0) {
       return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
     }
