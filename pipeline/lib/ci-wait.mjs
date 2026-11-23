@@ -63,6 +63,8 @@
 // run is not created yet (seconds after `gh pr ready`) counts as pass. The window is narrow: the skipped job of the same workflow
 // keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge. Requiring a
 // ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
+// The residual is REPORTED instead: a `checks[]` entry that passed on a run (or status) dated before `readyAt` carries
+// `predatesReady: true` (absent otherwise; an unreadable time never sets it). The verdict is unchanged.
 import { EXIT } from './cli.mjs';
 import { requiredFromRules } from './protection.mjs';
 import { REVIEW_CONTEXT, parseReviewRecord } from './review-marker.mjs';
@@ -309,11 +311,23 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return era === 'stale' ? 'stale-fail' : era === 'superseded' ? 'superseded' : bad;
   };
 
+  // Report only (see RESIDUAL): did this PASSING check run start before the ready event? Dated by its own started_at (data the poll
+  // already holds: no extra read; a re-run is a new check run with its own start). Unreadable: false, never throws.
+  const passPredatesReady = async (run, pr) => {
+    try {
+      const at = Date.parse(run.started_at);
+      return Number.isFinite(at) && at < Date.parse(await getReadyAt(pr));
+    } catch {
+      return false;
+    }
+  };
+
   const statusBasis = new WeakMap(); // evaluate() result -> the commit status it rests on (for the status re-read and its evidence)
   const evaluate = async (identity, obs, pr) => {
     const producers = [];
     for (const run of latestRuns(obs.checkRuns, identity.name, identity.appId)) {
-      producers.push({ state: await runState(run, pr), url: run.html_url ?? null });
+      const state = await runState(run, pr);
+      producers.push({ state, url: run.html_url ?? null, ...(state === 'pass' && (await passPredatesReady(run, pr)) ? { predates: true } : {}) });
     }
     const status = latestStatus(obs.statuses, identity.name);
     if (status) {
@@ -322,13 +336,19 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       if (counts) {
         let state = statusState(status);
         if (state === 'fail' && (await statusPredatesReady(status, pr))) state = 'stale-fail';
-        producers.push({ state, url: status.target_url ?? null, status });
+        let predates = false;
+        if (state === 'pass') {
+          const at = Date.parse(status.created_at);
+          try { predates = Number.isFinite(at) && at < Date.parse(await getReadyAt(pr)); } catch { predates = false; }
+        }
+        producers.push({ state, url: status.target_url ?? null, status, ...(predates ? { predates: true } : {}) });
       }
     }
     if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null, ...(identity.source ? { source: identity.source } : {}) };
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
     const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url, ...(identity.source ? { source: identity.source } : {}) };
     if (worst.status) statusBasis.set(out, worst.status);
+    if (out.state === 'pass' && producers.some((p) => p.state === 'pass' && p.predates)) out.predatesReady = true;
     return out;
   };
 
