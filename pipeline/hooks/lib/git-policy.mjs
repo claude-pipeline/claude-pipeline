@@ -178,7 +178,7 @@ function expandVars(text, ctx) {
 
 // Everything a script judged here can depend on: the directory, the nesting level and the line's variable / branch / config / alias state.
 // (and the writes of the line that count for the command: a script the line wrote is judged on what was written)
-const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.branchesUnknown === true, ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames)]);
+const stateFingerprint = (ctx, dir, level) => JSON.stringify([dir, level, ctx.vars, [...ctx.unsureVars], [...ctx.tainted], [...ctx.branches], ctx.branchesUnknown === true, ctx.cfgDirty, ctx.envCfgDirty, ctx.ghRepoDirty === true, ctx.gitAliases, ctx.ghAliases, [...ctx.aliasUnsure], writeSignature(ctx.writeFrames), ctx.unknownAll === true]);
 
 // What the policy's own tracking knows about variable `n` for a use the command's prefix does not override: its value, and
 // `$n` when it is unsure or tainted (the callers read that as "run-time value").
@@ -214,7 +214,7 @@ function recordAssigned(c, ctx, level) {
 
 // A variable whose value is unknown: assigned more than once (or where it may not run), or tainted (a script that may
 // or may not be the one sourced earlier on the line may have set it).
-const unsureVar = (ctx, k) => ctx.unsureVars.has(k) || ctx.tainted.has(k);
+const unsureVar = (ctx, k) => ctx.unknownAll === true || ctx.unsureVars.has(k) || ctx.tainted.has(k);
 
 // Every variable name assigned on the line so far, including the ones that became unknown by being assigned twice or
 // tainted. Anything that inspects WHICH variables are set (not their values) must use this, never Object.keys(ctx.vars) alone.
@@ -2580,6 +2580,8 @@ const movesBranch = (argv, ctx) => {
 // Collects every assignment on the line BEFORE any command is judged. A name assigned more than once, or assigned
 // where it may not run (after && / ||, in a pipeline, a subshell, an if / loop / case), is unsure for the whole line.
 function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = null) {
+  // (#473: the frame this line's arithmetic reads names in: what the shell and the outer lines gave them BEFORE this line's own assignments, see arithAssignedNames)
+  const outer = { vars: { ...ctx.vars }, unknown: new Set([...ctx.unsureVars, ...ctx.tainted]), env: ctx.env, unknownAll: ctx.unknownAll === true };
   const counts = new Map();
   const implicit = new Set();
   const bump = (k, n) => { if (pinsAt(ctx, level)?.has(k)) return; counts.set(k, (counts.get(k) ?? (k in ctx.vars || ctx.unsureVars.has(k) ? 1 : 0)) + n); };
@@ -2630,13 +2632,16 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
   // Why (#81 security follow-up, on main too): the parser reads `$((n=7))` as an assignment but not `$(( n = 7 ))`, `((n++))`, `while ((n++ < 7))`, `$[n=7]`, a `[[ x -eq n=7 ]]` operand, a subscript
   // (`${a[n=7]}`, `a[n=7]=x`) or a substring offset (`${x:n=3:1}`), and not an append (`n+=7`, `export n+=7`): `n=2; [[ n=7 -eq 7 ]]; bash s$n.sh` ran s7.sh while the guard read s2.sh. A name
   // such text assigns is unsure, whether or not the line gave it a value (see arithAssignedNames); one that assigns through a name (`(( $m = 7 ))`) may set any name, as an indirect expansion does.
-  const ar = typeof text === 'string' ? arithAssignedNames(text, cmds) : null;
+  const ar = typeof text === 'string' ? arithAssignedNames(text, cmds, outer) : null;
+  cmds.arith = ar; // (onceAssignedNames reads the same answer: it runs after this call changed ctx, so a second call would read other values)
   if (ar) for (const k of ar.names) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
   // Why (#56, a live bypass on main): `F=ok.sh; export $N=run.sh; bash $F` ran run.sh when N held F, while the guard judged ok.sh. A binder whose
   // NAME is only known at run time (export / declare / local / typeset / readonly, read, mapfile, getopts, unset, let, select, printf -v) may set
   // any variable: every name the line assigns or reads is unknown from here on.
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
-  if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds)]) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  // (#473: `dynamic` marks every name from here on, not only the names the line gave: a name an outer frame, the environment or a sourced file gives later reads as unsure, see unsureVar)
+  if (ar?.dynamic) ctx.unknownAll = true;
+  if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds), ...(ar?.dynamic ? counts.keys() : [])]) { delete ctx.vars[k]; ctx.unsureVars.add(k); } // (#473: a dynamic arithmetic also makes unsure the names the line gives, wherever it gives them: an exported `n=2` a later script reads)
 }
 const zshModifiedReason = (n) => `$${n} is followed by \`:\` and a letter or by \`[\` (\`$${n}:r\`, \`$${n}[1,6]\`): zsh reads that as a modifier or a subscript and applies it to the value, so the word it makes is only known at run time. Write the word out, or brace the name (\`\${${n}}:r\`) when the text after it is meant literally.`;
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
@@ -3044,7 +3049,7 @@ function onceAssignedNames(cmds, ctx, str) {
       if (c.argv.slice(1).some((w) => DYNAMIC.test(w))) return [];
     }
   }
-  const ar = arithAssignedNames(str, cmds); // (an arithmetic can assign a name the text scan below does not show. Defence in depth for the skip of ar.names and ar.dynamic below: the mention scan already refuses a name whose assignment it sees, and collectAssignments made the names unsure)
+  const ar = cmds.arith ?? arithAssignedNames(str, cmds); // (an arithmetic can assign a name the text scan below does not show. Defence in depth for the skip of ar.names and ar.dynamic below: the mention scan already refuses a name whose assignment it sees, and collectAssignments made the names unsure)
   if (ar.dynamic) return [];
   const spans = /<</.test(str) ? cmds.heredocSpans : [];
   if (!Array.isArray(spans)) return [];

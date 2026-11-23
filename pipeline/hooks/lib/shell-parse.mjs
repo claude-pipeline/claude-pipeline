@@ -1829,26 +1829,27 @@ const ARITH_APPENDED = /(?<![\w$.\/-])([A-Za-z_]\w*)\+=/g;
 const ARITH_WORD = /(?:"[^"]*"|'[^']*'|\\.|[^\s"'\\])+/g;
 function arithBodies(s, g, cmds) {
   // $(( … )), (( … )) and $[ … ] in ONE pass (a scan per opener is quadratic on 150,000 of them): the text inside any of them, an unmatched opener taking the rest of the text
+  // (a body is a slice of `g`, so one that holds an inner `$(( ))` keeps the text before it: the names it reads are read)
   const out = [];
+  out.src = []; // (#473: each body as WRITTEN, where it is a slice of `s` -- `g` blanks the words of a double-quoted string, which hides a quote the shell reads; null for a body built from parsed words)
+  const add = (body, from = -1, to = -1) => { out.push(body); out.src.push(from >= 0 && to <= s.length ? s.slice(from, to) : null); };
   const stack = [];
-  let buf = '';
   // (on `g`, what the shell expands: the `((` of a JavaScript program in quotes -- `.map((x) => …)` -- is no arithmetic; `let 'n=1'` and `[[ "n=1" -eq 1 ]]` keep quoted words and read `s`, below)
   for (let i = 0; i < g.length; i++) {
     const ch = g[i];
-    if (g.startsWith('((', i)) { stack.push({ close: ')', need: 2, depth: 0 }); i += 1; continue; } // (also the `((` of `$((`)
-    if (g.startsWith('$[', i)) { stack.push({ close: ']', need: 1, depth: 0 }); i += 1; continue; }
+    if (g.startsWith('((', i)) { stack.push({ close: ')', need: 2, depth: 0, from: i + 2 }); i += 1; continue; } // (also the `((` of `$((`)
+    if (g.startsWith('$[', i)) { stack.push({ close: ']', need: 1, depth: 0, from: i + 2 }); i += 1; continue; }
     if (!stack.length) continue;
     const top = stack[stack.length - 1];
     if (ch === '(' || ch === '[') top.depth++;
     else if (ch === ')' || ch === ']') {
       if (top.depth > 0) top.depth--;
-      else if (ch === top.close && --top.need === 0) { stack.pop(); out.push(buf); buf = ''; continue; }
+      else if (ch === top.close && --top.need === 0) { stack.pop(); const to = ch === ')' ? i - 1 : i; add(g.slice(top.from, to), top.from, to); }
     }
-    buf += ch;
   }
-  if (buf) out.push(buf);
+  for (const top of stack) add(g.slice(top.from), top.from, g.length);
   // `let a=1 "b+=2"`: the words of a `let` COMMAND (quotes removed; a JavaScript `let s = …` inside a quoted program is no command). Without the parsed commands: the rest of the segment
-  if (cmds) { for (const c of cmds) if (/(?:^|\/)let$/.test(c.argv?.[0] ?? '')) out.push(...c.argv.slice(1)); } else for (const m of g.matchAll(/(?<![\w.$/-])let\s+([^;&|\n]*)/g)) out.push(m[1]);
+  if (cmds) { for (const c of cmds) if (/(?:^|\/)let$/.test(c.argv?.[0] ?? '')) for (const w of c.argv.slice(1)) add(w); } else for (const m of g.matchAll(/(?<![\w.$/-])let\s+([^;&|\n]*)/g)) add(m[1]);
   // `[[ a -eq b ]]`: the words next to a numeric comparison. One pass over the text: an open `[[` takes words up to the next `]]` (a second `[[` inside it changes nothing)
   let open = false;
   let prev = null;
@@ -1858,31 +1859,45 @@ function arithBodies(s, g, cmds) {
   for (const w of words) {
     if (!open) { if (w === '[[') { open = true; prev = null; cmp = false; } continue; }
     if (w.startsWith(']]')) { open = false; continue; }
-    if (cmp && prev !== null) out.push(w);
-    if (ARITH_COMPARE.has(w) && prev !== null) { out.push(prev); cmp = true; } else cmp = false;
+    if (cmp && prev !== null) add(w);
+    if (ARITH_COMPARE.has(w) && prev !== null) { add(prev); cmp = true; } else cmp = false;
     prev = w;
   }
-  // a subscript: `[` right after a name character or `}` (`${a[…]}`, `a[…]=x`, `$x[…]`), to its closing `]` (nested ones counted; at most 200 characters)
+  // a subscript: `[` right after a name character or `}` (`${a[…]}`, `a[…]=x`, `$x[…]`), to its closing `]` (nested ones counted; a body of at most 200 characters)
   // (Bounded: nested or unclosed subscripts overlap -- `a[a[a[…` gives one 200-character body per `[`, 20 million characters for a 200 kB line, ~100 times what the other scans cost on that line, and
   // a hook that runs past the host's 15 s is ALLOWED. Past SUBSCRIPT_BUDGET characters of bodies the scan stops and `out.capped` is set: arithAssignedNames then answers `dynamic`, the fail-closed
-  // reading (every name the line gave is unsure), never fewer names than the full scan.)
+  // reading, never fewer names than the full scan.)
+  // (#473: a subscript whose `]` is not within 200 characters while one follows later in the same word is `incomplete`: the names read after the cut are unseen, so it is `dynamic`)
   let spent = 0;
   for (let i = g.indexOf('['); i >= 0; i = g.indexOf('[', i + 1)) {
     if (i === 0 || !/[\w}]/.test(g[i - 1])) continue;
     let depth = 0;
     let j = i + 1;
-    for (; j < g.length && j < i + 200; j++) {
+    for (; j < g.length && j <= i + 201; j++) {
       if (g[j] === '[') depth++;
       else if (g[j] === ']') { if (depth === 0) break; depth--; }
     }
+    if (j > i + 201) { // (cut: look for a closing `]` further on in the same word)
+      let k = j;
+      for (; k < g.length && k < i + 700 && !/\s/.test(g[k]) && g[k] !== ']'; k++);
+      if (g[k] === ']') out.incomplete = true;
+      j = i + 201;
+    }
     spent += j - i;
     if (spent > SUBSCRIPT_BUDGET) { out.capped = true; break; }
-    out.push(g.slice(i + 1, j));
+    add(g.slice(i + 1, j), i + 1, j);
   }
   // (zsh reads a bare `$x[n=3]` as a subscript also inside double quotes, where `g` has blanked the letters: the text as written)
-  for (const m of s.matchAll(/\$[A-Za-z_]\w*\[([^\]\n]{0,200})\]/g)) out.push(m[1]);
-  // a substring: `${x:off:len}`, `${a[@]:off}`, `${x: off : len}` (the `:-` `:=` `:+` `:?` operators are no offset)
-  for (const m of g.matchAll(/\$\{[A-Za-z_]\w*(?:\[[^\]\n]{0,64}\])?:(?![-=+?])([^}\n]{0,200})\}/g)) out.push(m[1]);
+  for (const m of s.matchAll(/\$[A-Za-z_]\w*\[([^\]\n]{0,200})\]/g)) add(m[1], m.index + m[0].indexOf('[') + 1, m.index + m[0].length - 1);
+  // a substring: `${x:off:len}`, `${a[@]:off}`, `${x: off : len}` (the `:-` `:=` `:+` `:?` operators are no offset). #473: the subscript before it is read to 64 characters and the offset to 200; past either the
+  // expression is `incomplete`, and so is one whose `}` is not right after the offset while one follows on the line
+  for (const m of g.matchAll(/\$\{[A-Za-z_]\w*(\[[^\]\n]{0,200}\])?:(?![-=+?])([^}\n]{0,201})/g)) {
+    const at = m.index + m[0].length;
+    if (g[at] !== '}') { const e = g.indexOf('}', at); if (e >= 0 && e < at + 400 && !g.slice(at, e).includes('\n')) out.incomplete = true; continue; }
+    if (m[2].length > 200 || (m[1] && m[1].length - 2 > 64)) { out.incomplete = true; continue; }
+    add(m[2], at - m[2].length, at);
+    if (m[1]) add(m[1].slice(1, -1), m.index + m[0].indexOf('[') + 1, m.index + m[0].indexOf('[') + m[1].length - 1);
+  }
   return out;
 }
 // (Defence in depth for expansionText, which blanks a quoted body for the scans that read it: this one covers the zsh bare-subscript scan and the no-cmds fallback of the [[ scan)
@@ -1940,27 +1955,284 @@ const expansionText = (s, cmds) => {
   }
   return expandedOnly(main) + '\n' + live.join('\n');
 };
-const ARITH_CACHE = new WeakMap();
-export function arithAssignedNames(raw, cmds = null) {
-  const text = String(raw);
-  const hit = cmds ? ARITH_CACHE.get(cmds) : null;
-  if (hit && hit.text === text) return hit.res;
-  const names = new Set();
-  let dynamic = false;
-  if (/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s/.test(text)) {
-    const s = quotedBodiesBlank(text, cmds);
-    const g = expansionText(s, cmds);
-    const bodies = arithBodies(s, g, cmds);
-    if (bodies.capped) dynamic = true; // (too many overlapping subscripts to read them all: the fail-closed reading, see the cap in arithBodies)
-    for (const body of bodies) {
-      for (const m of body.matchAll(ARITH_ASSIGNED)) names.add(m[1] ?? m[2] ?? m[3] ?? m[4]);
-      if (ARITH_ASSIGNED_DYN.test(body)) dynamic = true;
-    }
-    for (const m of g.matchAll(ARITH_APPENDED)) names.add(m[1]);
+// Why (#473, C2b): bash and zsh evaluate a bare name's VALUE as an expression inside arithmetic (`i='n=7'; : $((i))` assigns n), a bypass the text scans above cannot see. A name READ in a body is
+// trusted only when EVERY value it can hold at the read is a proven plain integer: each binding of it in the frame, and its incoming value (the caller's, the environment's, or the shell's own) unless a
+// CERTAIN assignment in the frame's leading run replaces it first. Otherwise the answer is `dynamic` (the existing fail-closed outcome: every name given or inherited is unsure); `dynamicRead` says why.
+// Names the shell supplies as TEXT (generated from a clean `bash --norc --noprofile` / `zsh -f` parameter dump plus the bash(1) / zshparam(1) lists; a test compares it with the live dump), and the ones it
+// supplies as integers (an unset name reads 0, so one is proven unless the line binds it as text). `_` and `argv` are text whatever the frame says: every command resets `_`.
+export const SHELL_SUPPLIED_NUMBERS = new Set(['RANDOM', 'SRANDOM', 'SECONDS', 'LINENO', 'EPOCHSECONDS', 'BASHPID', 'HISTCMD', 'PPID', 'UID', 'EUID', 'OPTIND', 'ZSH_SUBSHELL', 'status', 'pipestatus', 'PIPESTATUS', 'ERRNO',
+  'SHLVL', 'BASH_SUBSHELL', 'COLUMNS', 'LINES', 'HISTSIZE', 'SAVEHIST', 'EGID', 'GID', 'ARGC', 'MAILCHECK', 'KEYTIMEOUT', 'LISTMAX', 'FUNCNEST', 'TTYIDLE', 'TRY_BLOCK_ERROR', 'TRY_BLOCK_INTERRUPT', 'OPTERR']);
+export const SHELL_SUPPLIED_TEXT = new Set(['_', 'argv', 'BASH', 'BASH_ARGC', 'BASH_ARGV', 'BASH_COMMAND', 'BASH_EXECUTION_STRING', 'BASH_LINENO', 'BASH_SOURCE', 'BASH_VERSINFO', 'BASH_VERSION', 'COMP_WORDBREAKS', 'DIRSTACK', 'GROUPS',
+  'HOSTNAME', 'HOSTTYPE', 'IFS', 'MACHTYPE', 'OSTYPE', 'PATH', 'PS4', 'PWD', 'SHELL', 'SHELLOPTS', 'TERM', 'BASHOPTS', 'BASH_ALIASES', 'BASH_ARGV0', 'BASH_CMDS', 'BASH_COMPAT', 'BASH_ENV', 'BASH_LOADABLES_PATH', 'BASH_REMATCH', 'BASH_XTRACEFD',
+  'COMP_CWORD', 'COMP_KEY', 'COMP_LINE', 'COMP_POINT', 'COMP_TYPE', 'COMP_WORDS', 'COMPREPLY', 'COPROC', 'EPOCHREALTIME', 'FUNCNAME', 'HISTFILE', 'HOME', 'MAIL', 'MAILPATH', 'MAPFILE', 'OLDPWD', 'OPTARG', 'PS0', 'PS1', 'PS2', 'PS3', 'READLINE_LINE',
+  'READLINE_MARK', 'READLINE_POINT', 'REPLY', 'TMPDIR', 'ARGC', 'CDPATH', 'CPUTYPE', 'FIGNORE', 'FPATH', 'HISTCHARS', 'HOST', 'KEYBOARD_HACK', 'LOGNAME', 'MANPATH', 'MODULE_PATH', 'NULLCMD', 'PROMPT', 'PROMPT2', 'PROMPT3', 'PROMPT4', 'PSVAR',
+  'READNULLCMD', 'SPROMPT', 'TIMEFMT', 'TMPPREFIX', 'TTY', 'USERNAME', 'VENDOR', 'WATCH', 'WORDCHARS', 'ZSH_ARGZERO', 'ZSH_EVAL_CONTEXT', 'ZSH_EXECUTION_STRING', 'ZSH_NAME', 'ZSH_PATCHLEVEL', 'ZSH_VERSION', 'aliases', 'builtins', 'cdpath',
+  'commands', 'dirstack', 'dis_aliases', 'dis_builtins', 'dis_functions', 'dis_functions_source', 'dis_galiases', 'dis_patchars', 'dis_reswords', 'dis_saliases', 'fignore', 'fpath', 'funcfiletrace', 'funcsourcetrace', 'funcstack', 'functions',
+  'functions_source', 'functrace', 'galiases', 'histchars', 'history', 'historywords', 'jobdirs', 'jobstates', 'jobtexts', 'keymaps', 'mailpath', 'manpath', 'module_path', 'modules', 'nameddirs', 'options', 'parameters', 'patchars', 'path', 'prompt',
+  'psvar', 'reply', 'reswords', 'saliases', 'signals', 'termcap', 'terminfo', 'userdirs', 'usergroups', 'widgets', 'zsh_eval_context', 'zsh_scheduled_events', 'MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend']);
+const SHELL_TEXT_PREFIX = /^(?:BASH|ZSH_|COMP_|READLINE_|PROMPT)/;
+const INT_LITERAL = /^-?\d+$/;
+const INT_ARRAY = /^\(\s*(?:(?:\[[^\]]*\]=)?-?\d+\s*)*\)$/;
+const isIntegerValue = (v) => typeof v === 'string' && (INT_LITERAL.test(v) || INT_ARRAY.test(v));
+// A word as the shell reads it: the text of a simple command split into words, quotes kept (so what was written can be told from what the quotes removed); parentheses (an array literal, `$( )`) group.
+function writtenWords(t) {
+  const out = [];
+  let cur = '';
+  let q = null;
+  let dp = 0;
+  for (let i = 0; i < t.length; i++) {
+    const ch = t[i];
+    if (q === "'") { cur += ch; if (ch === "'") q = null; continue; }
+    if (ch === '\\') { cur += t.slice(i, i + 2); i++; continue; }
+    if (q === '"' || q === '`') { cur += ch; if (ch === q) q = null; continue; }
+    if (ch === "'" || ch === '"' || ch === '`') { q = ch; cur += ch; continue; }
+    if (ch === '(') dp++;
+    else if (ch === ')' && dp > 0) dp--;
+    if (dp === 0 && /\s/.test(ch)) { if (cur) out.push(cur); cur = ''; continue; }
+    cur += ch;
   }
-  const res = { names, dynamic };
-  if (cmds) ARITH_CACHE.set(cmds, { text, res });
-  return res;
+  if (cur) out.push(cur);
+  return out;
+}
+const ASSIGN_WORD = /^([A-Za-z_]\w*)(?:\[([^\]]*)\])?(\+?)=([\s\S]*)$/;
+// `$(( … ))` filling the whole word (optionally in double quotes), with the body: null otherwise (`x$((1))`, `$((1))x$((2))`, `'$((1))'` and `\$((1))` are not one)
+function wholeArith(v) {
+  const t = v.startsWith('"') && v.endsWith('"') && v.length > 1 ? v.slice(1, -1) : v;
+  if (!t.startsWith('$((') || !t.endsWith('))')) return null;
+  let d = 0;
+  for (let i = 1; i < t.length; i++) {
+    if (t[i] === '(') d++;
+    else if (t[i] === ')' && --d === 0 && i !== t.length - 1) return null;
+  }
+  return d === 0 ? t.slice(3, -2) : null;
+}
+// Is the value, AS WRITTEN, one of the forms that is an integer whatever it holds: an integer literal, one `$((…))` / `${#name}` / `$?` `$#` `$$` `$!` filling the word (not a zsh `[##16]` output base: it prints letters)?
+function provenIntegerWord(v) {
+  if (/^["']?-?\d+["']?$/.test(v)) return true;
+  const sh = /^"?\$\{?([A-Za-z_]\w*)\}?"?$/.exec(v);
+  if (sh && SHELL_SUPPLIED_NUMBERS.has(sh[1])) return true; // (`t0=$SECONDS`: a number the shell supplies)
+  if (/^"?\$\{#[A-Za-z_]\w*(?:\[[@*]\])?\}"?$/.test(v) || /^"?\$[?#$!]"?$/.test(v)) return true;
+  const body = wholeArith(v);
+  return body !== null && !body.includes('[#');
+}
+// The names the arithmetic body reads (a Map: name -> {plain, sub}), and the first form it cannot prove (a string) or null. `$name` / `${name}` expand to text and are then evaluated: reads; `${#x}` / `$#` / `$?` / `$$` / `$!`
+// are integers; a command substitution, a positional, `$@`, `$*`, `$-`, `${name<op>…}`, `${(flags)…}`, `$'…'`, a quote, a backtick or a backslash cannot be proven. An expansion that touches an identifier character, `#`, `.`
+// or another expansion makes the shell read the assembled token, not the name written (`a${#x}`, `16#$x`, `$i$j`).
+const R_LEN = /\$\{#[A-Za-z_]\w*(?:\[[@*]\])?\}/y;
+const R_SPECIAL = /\$[#?$!]/y;
+const R_BRACED = /\$\{([A-Za-z_]\w*)\}/y;
+const R_PLAIN = /\$([A-Za-z_]\w*)/y;
+const R_NUM = /[0-9][\w@#]*/y;
+const R_BASEOUT = /\[#{1,2}\d*\]/y;
+const R_ID = /[A-Za-z_]\w*/y;
+const R_TARGET = /\s*(?:\[[^\]]*\]\s*)?=(?!=)/y;
+function bodyReads(body, reads) {
+  if (/["'`\\]/.test(body)) return 'a quote, backtick or backslash';
+  const n = body.length;
+  const exec = (re, at) => { re.lastIndex = at; return re.exec(body); };
+  for (let i = 0; i < n;) {
+    const ch = body[i];
+    if (ch === '$') {
+      const prev = i > 0 ? body[i - 1] : '';
+      let m = exec(R_LEN, i) ?? exec(R_SPECIAL, i);
+      if (m) { // (an integer: digits may touch it, letters, `#`, `.` and other expansions may not)
+        if (/[A-Za-z_#.$}]/.test(prev) || /[A-Za-z_#.$]/.test(body[i + m[0].length] ?? '')) return `${m[0]} next to other text in one token`;
+        i += m[0].length; continue;
+      }
+      m = exec(R_BRACED, i) ?? exec(R_PLAIN, i);
+      if (!m) return `\`${body.slice(i, i + 12)}\``;
+      const e = i + m[0].length;
+      if (/[\w#.$}]/.test(prev) || /[\w#.$]/.test(body[e] ?? '')) return `$${m[1]} next to other text in one token`;
+      const r = reads.get(m[1]) ?? { plain: false, sub: false };
+      if (body[e] === '[') r.sub = true; else r.plain = true;
+      reads.set(m[1], r);
+      i = e; continue;
+    }
+    if (ch === '[' && exec(R_BASEOUT, i)) { i = R_BASEOUT.lastIndex; continue; }
+    if (/[0-9]/.test(ch)) { exec(R_NUM, i); i = R_NUM.lastIndex; continue; }
+    if (/[A-Za-z_]/.test(ch)) {
+      exec(R_ID, i);
+      const name = body.slice(i, R_ID.lastIndex);
+      i = R_ID.lastIndex;
+      if (body[i] === '(') continue; // (zsh `abs(x)`: a function)
+      if (exec(R_TARGET, i)) continue; // (the target of a plain `=`: assigned, not read; the right side is scanned on)
+      const r = reads.get(name) ?? { plain: false, sub: false };
+      if (body[i] === '[') r.sub = true; else r.plain = true;
+      reads.set(name, r);
+      continue;
+    }
+    i++;
+  }
+  return null;
+}
+// printf / print -f: a numeric conversion (%d %i %o %u %x %X) evaluates its argument as arithmetic in zsh. The arguments such a conversion takes are bodies; a format or argument list the guard cannot map exactly
+// (non-literal format, numbered or `*` conversions, an escape it cannot decode, an argument that may split or glob) is `dynamic` when the format may hold one. `%f %e %g` alone is #788: unchanged.
+const NUM_CONV = 'diouxX';
+function printfBodies(c, add) {
+  const ws = writtenWords(c.raw ?? '');
+  let k = ws.findIndex((w) => !ASSIGN_WORD.test(w)); // (the command word)
+  if (k < 0) return null;
+  const isPrint = commandName(ws[k]) === 'print';
+  k++;
+  let fmt = null;
+  for (; k < ws.length; k++) {
+    const w = ws[k];
+    if (w === '--') { k++; break; }
+    if (isPrint ? w === '-f' : false) { fmt = ws[++k]; k++; break; }
+    if (!isPrint && /^-[A-Za-z]*v$/.test(w)) { k++; continue; }
+    if (/^[-+][A-Za-z]/.test(w) && w !== '-') { if (isPrint && /f/.test(w) && w.length > 2) return 'print -f'; continue; }
+    break;
+  }
+  if (!isPrint && fmt === null) fmt = ws[k++];
+  if (fmt === undefined || fmt === null) return null;
+  const args = ws.slice(k);
+  if (!args.length) return null;
+  const lit = fmt.length >= 2 && /^(['"])[^]*\1$/.test(fmt) ? fmt.slice(1, -1) : fmt;
+  if (!fmt.startsWith("'") && /[$`]/.test(fmt)) return 'a printf format that is not literal text';
+  const dec = lit.replace(/\\(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|([0-7]{1,3}))/g, (_, a, b, o) => String.fromCharCode(parseInt(a ?? b ?? o, a || b ? 16 : 8)));
+  const convs = [];
+  let star = false;
+  let numbered = false;
+  for (let i = 0; i < dec.length; i++) {
+    if (dec[i] !== '%') continue;
+    if (dec[i + 1] === '%') { i++; continue; }
+    const m = /^%(\d+\$)?[-+ #0']*(\*|\d*)(?:\.(\*|\d*))?[hlLqjzt]*(?:\([^)]*\)(T)|([A-Za-z]))/.exec(dec.slice(i, i + 80));
+    if (!m) continue;
+    if (m[1]) numbered = true;
+    if (m[2] === '*' || m[3] === '*') star = true;
+    convs.push(m[4] ?? m[5]);
+    i += m[0].length - 1;
+  }
+  const anyNum = convs.some((x) => NUM_CONV.includes(x));
+  if (!anyNum && !numbered) return null;
+  if (numbered || star) return 'a printf format with numbered or * conversions';
+  const plainWord = (w) => !/\$[@*]|\$\{[^}]*\[[@*]\]|`/.test(w) && !/^[^'"]*\$/.test(w.replace(/"[^"]*"|'[^']*'/g, '')) && !/[*?[]/.test(w.replace(/"[^"]*"|'[^']*'/g, ''));
+  if ((c.redirects ?? []).length || args.some((w) => !plainWord(w))) return 'a printf argument list that may split or glob';
+  args.forEach((w, j) => {
+    if (!NUM_CONV.includes(convs[j % convs.length])) return;
+    add(/^'[^']*'$/.test(w) ? w.slice(1, -1) : /^"[^"\\`]*"$/.test(w) ? w.slice(1, -1) : w);
+  });
+  return null;
+}
+const RUNNERS = new Set(['eval', 'trap', 'source', '.']);
+const DECL_CMDS = new Set(['declare', 'typeset', 'local', 'readonly', 'export', 'integer', 'float', 'private']);
+const NAME_OPERAND_CMDS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'select', 'vared', 'coproc', 'unset']);
+// The binding events of a frame (every command, all depths): the names a command really binds, with whether every value is a proven integer, and the certain ones (an assignment-only command in the leading run).
+function bindingIndex(text, cmds, f) {
+  const events = new Set();
+  const other = new Set();
+  const mark = (k, ok) => { events.add(k); if (!ok) other.add(k); };
+  for (const m of text.matchAll(/\$\{([A-Za-z_]\w*)(?:\[[^\]\n]{0,64}\])?:{0,2}=/g)) mark(m[1], false); // (`${x:=v}`)
+  for (const k of f.bodyTargets) mark(k, true);
+  for (const m of text.matchAll(ARITH_APPENDED)) mark(m[1], false);
+  for (const c of cmds) {
+    const argv = c.argv ?? [];
+    const ws = writtenWords(c.raw ?? '');
+    let L = 0;
+    const lead = [];
+    while (L < ws.length && ASSIGN_WORD.test(ws[L])) { lead.push(ASSIGN_WORD.exec(ws[L])); L++; }
+    const seen = new Set();
+    for (const m of lead) {
+      const [, k, sub, plus, v] = m;
+      const dup = seen.has(k);
+      seen.add(k);
+      const ok = !dup && !plus && (v.startsWith('(') ? INT_ARRAY.test(v) : provenIntegerWord(v));
+      mark(k, ok);
+    }
+    for (const k of Object.keys(c.env ?? {})) if (!seen.has(k)) mark(k, false);
+    const nm = argv.length ? commandName(argv[0]) : '';
+    const rest = ws.slice(L + 1);
+    if (DECL_CMDS.has(nm)) {
+      let opts = true;
+      for (const w of rest) {
+        if (opts && /^[-+][A-Za-z0-9]+$/.test(w)) { if (nm !== 'export' && nm !== 'readonly' && /^[-+][A-Za-z0-9]*n/.test(w)) f.nameref = true; continue; }
+        if (w === '--') { opts = false; continue; }
+        opts = false;
+        const m = ASSIGN_WORD.exec(w);
+        if (m) mark(m[1], !m[3] && (m[4].startsWith('(') ? INT_ARRAY.test(m[4]) : provenIntegerWord(m[4])));
+        else if (/^[A-Za-z_]\w*$/.test(w) && nm !== 'export' && nm !== 'readonly') mark(w, false);
+      }
+    }
+    if (NAME_OPERAND_CMDS.has(nm) || ZSH_NAME_BINDERS.has(nm)) for (const w of argv.slice(1)) if (/^[A-Za-z_]\w*$/.test(w)) mark(w, false);
+    if (nm === 'for' && /^[A-Za-z_]\w*$/.test(argv[1] ?? '')) { const at = argv.indexOf('in'); mark(argv[1], at > 0 && argv.slice(at + 1).every((w) => INT_LITERAL.test(w))); }
+    const elem = new Set(lead.filter((m) => m[2] !== undefined).map((m) => m[1]));
+    for (const k of implicitBindsOf(c)) if (k === '_' || !SHELL_SET_NAMES.includes(k)) { if (!elem.has(k)) mark(k, false); }
+    if (RUNNERS.has(nm) || ((nm === 'builtin' || nm === 'command' || nm === 'exec') && argv.slice(1).some((w) => RUNNERS.has(w)))) f.runner = true;
+    if (nm === 'eval' || nm === 'trap') f.nested.push(argv.slice(1).join(' '));
+  }
+  if (cmds.truncated || cmds.dynamic) f.runner = true; // (a command word known only at run time may be eval)
+  // The leading run: assignment-only commands at depth 0 joined only by `;` / newline from the frame's start, none carrying an arithmetic body: they replace the incoming value before any later command reads it.
+  let cursor = 0;
+  for (const c of cmds) {
+    if (c.depth !== 0) continue;
+    const at = text.indexOf(c.raw ?? '', cursor);
+    const ws = writtenWords(c.raw ?? '');
+    if (at < 0 || c.argv?.length || !ws.length || !ws.every((w) => ASSIGN_WORD.test(w)) || /\(\(|\$\[/.test(c.raw)) break;
+    const gap = text.slice(cursor, at);
+    if (!/^(?:\s|#[^\n]*)*$/.test(gap.replace(/;/g, ' ')) || (cursor > 0 && !/[;\n]/.test(gap))) break;
+    cursor = at + c.raw.length;
+    for (const w of ws) { const m = ASSIGN_WORD.exec(w); if (m[2] === undefined && !m[3]) { f.certainScalar.add(m[1]); if (m[4].startsWith('(')) f.certainArray.add(m[1]); } }
+  }
+  f.events = events;
+  f.other = other;
+}
+// Is every value the read of `k` can see a proven integer?
+function readUnproven(k, r, f, outer) {
+  if (k === '_' || k === 'argv') return true;
+  if (f.other.has(k)) return true;
+  // (a certain `a=5` replaces element 0 only: a subscripted read needs a certain array literal)
+  if ((!r.sub || f.certainArray.has(k)) && (!r.plain || f.certainScalar.has(k) || f.certainArray.has(k))) return false;
+  if (outer) {
+    if (outer.unknownAll === true || outer.unknown?.has(k)) return true;
+    for (const src of [outer.vars, outer.env]) if (src && Object.hasOwn(src, k)) return !isIntegerValue(src[k]);
+  }
+  if (SHELL_SUPPLIED_NUMBERS.has(k)) return false;
+  return SHELL_SUPPLIED_TEXT.has(k) || SHELL_TEXT_PREFIX.test(k);
+}
+const ARITH_CACHE = new WeakMap();
+function arithFrame(text, cmds, depth) {
+  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null };
+  if (!/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s|\bprintf\b|\bprint\b|\beval\b|\btrap\b|\b(?:declare|typeset|local)\s+[-+][A-Za-z]*n/.test(text)) return f;
+  const s = quotedBodiesBlank(text, cmds);
+  const g = expansionText(s, cmds);
+  const bodies = arithBodies(s, g, cmds);
+  if (bodies.capped || bodies.incomplete) { f.dynamic = true; f.why ??= bodies.capped ? 'too many subscripts to read' : 'a subscript or offset longer than the guard reads'; } // (the fail-closed reading, see the cap in arithBodies)
+  const add = (b) => bodies.push(b) && bodies.src.push(null);
+  if (cmds) for (const c of cmds) { const why = /(?:^|\/)(?:printf|print)$/.test(c.argv?.[0] ?? '') ? printfBodies(c, add) : null; if (why) { f.dynamic = true; f.why ??= why; } }
+  bodies.forEach((body, i) => {
+    for (const m of body.matchAll(ARITH_ASSIGNED)) { const k = m[1] ?? m[2] ?? m[3] ?? m[4]; f.names.add(k); if (m[4] === undefined) f.bodyTargets.add(k); }
+    if (ARITH_ASSIGNED_DYN.test(body)) f.dynamic = true;
+    const why = /["'`\\]/.test(bodies.src[i] ?? '') ? 'a quote, backtick or backslash in the body' : bodyReads(body, f.reads);
+    if (why) f.why ??= why;
+  });
+  for (const m of g.matchAll(ARITH_APPENDED)) f.names.add(m[1]);
+  if (cmds) bindingIndex(text, cmds, f);
+  else { f.events = new Set(); f.other = new Set(); if (f.reads.size) f.why ??= 'a body read without the parsed commands'; }
+  if (cmds && depth < 3) {
+    for (const t of f.nested) { // (the text eval / trap runs: the names it assigns are unsure here, and any name it reads is unproven)
+      let sub = null;
+      try { sub = arithFrame(t, simpleCommands(t, {}), depth + 1); } catch { f.why ??= 'the text of an eval or trap'; continue; }
+      for (const k of sub.names) f.names.add(k);
+      if (sub.dynamic || sub.why || sub.reads.size) { f.dynamic = true; f.why ??= sub.why ?? `${[...sub.reads.keys()][0] ?? 'a name'} read in the text of an eval or trap`; }
+    }
+  } else if (f.nested.length) f.why ??= 'the text of an eval or trap';
+  return f;
+}
+export function arithAssignedNames(raw, cmds = null, outer = null) {
+  const text = String(raw);
+  let hit = cmds ? ARITH_CACHE.get(cmds) : null;
+  if (!(hit && hit.text === text)) {
+    hit = { text, f: arithFrame(text, cmds, 0) };
+    if (cmds) ARITH_CACHE.set(cmds, hit);
+  }
+  const f = hit.f;
+  let why = f.why;
+  if (why === null && f.reads.size) {
+    if (f.runner) why = 'a command that runs code in this shell (eval, trap, source)';
+    else if (f.nameref) why = 'a nameref';
+    else for (const [k, r] of f.reads) if (readUnproven(k, r, f, outer)) { why = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
+  }
+  return { names: f.names, dynamic: f.dynamic || f.nameref || why !== null, reads: f.reads, dynamicRead: why, runner: f.runner, nameref: f.nameref };
 }
 
 // Why: `declare` / `typeset` / `local` attributes change the value a name holds: -l / -u lower / upper case it, zsh -L / -R / -Z pad or cut it to a width, -i

@@ -4880,8 +4880,8 @@ function setPositionals(argv) {
   }
   return null;
 }
-function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false) { // (rep: the file is sourced from a frame that can run it again, R18)
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
+function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false, inherited = null) { // (rep: the file is sourced from a frame that can run it again, R18)
+  const out = { vars: new Map(), cds: [], all: false, dyn: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => budgetExpired(ctx.budget) });
   // (#352 R23-F2: a script line whose shape the parser cannot follow (ctlBroken: a bare { or } argument that splits the word groups, `echo { F=x }`, a zsh condition-then-body form, a {fd} word) may or may
@@ -4889,6 +4889,10 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
   if (cmds.truncated || cmds.dynamic || cmds.ctlBroken) out.all = true;
   if (cmds.ctlBroken) out.unknownCd = true; // (`echo { cd d }`: the cd may not run either)
   if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd], true))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
+  // (#473: the file's own arithmetic, judged in the caller's frame -- the line's names, and what a file that sourced this one gave -- like a line: one that reads a name it cannot prove makes every name unknown, and the
+  // values the file set BEFORE that arithmetic must not be believed afterwards (`n=2; i='n=7'; : $((i))`): absorbSourced does not merge them back)
+  const ar = arithAssignedNames(text, cmds, { vars: { ...ctx.vars, ...(inherited ?? {}) }, unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown, ...ctx.srcChanged]), env: ctx.env, unknownAll: ctx.unknownAll === true });
+  if (ar.dynamic) { out.all = true; out.dyn = true; }
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -4901,6 +4905,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
     const val = sure && n === 1 && typeof v === 'string' ? substVars(v, local, ctx.budget) : null;
     if (val === null || /[$`]/.test(val)) { out.vars.set(k, null); delete local[k]; } else { out.vars.set(k, val); local[k] = val; }
   };
+  for (const k of ar.names) set(k, null, false);
   for (const [i, c] of cmds.entries()) {
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || c.maybeBg === true || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&'); // (#529: maybeBg: dash may have run it in a child)
     if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); for (const k of implicitBindsOf(c)) set(k, null, false); continue; } // (#352 R21-F1: a lone `{k}>f` binds k)
@@ -4950,7 +4955,8 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
       const t = abs && !seenFiles.has(abs) && !writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false }) ? ctx.readText(abs) : null;
       if (typeof t !== 'string') out.all = true;
       else {
-        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again, cdpNow());
+        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again, cdpNow(), { ...(inherited ?? {}), ...local });
+        if (sub.dyn) out.dyn = true;
         for (const [k, val] of sub.vars) set(k, val, sure && val !== null);
         out.cds.push(...sub.cds);
         if (sub.all) out.all = true;
@@ -5050,6 +5056,7 @@ function absorbSourced(rec, dirs, ctx, rep = false) { // (rep: the command that 
   }
   // Why: one of several files runs (a glob, a written file and the one on disk): a name that not every one sets keeps its old value in the others, so it is not definite
   if (effs.length > 1) for (const k of merged.keys()) if (!effs.every((e) => e.vars.has(k))) merged.set(k, null);
+  if (effs.some((e) => e.dyn)) return; // (#473: a file whose arithmetic reads a name it cannot prove: the poison above wins over the literals it set before that)
   for (const [k, v] of merged) {
     ctx.srcTouched.add(k);
     if (v === null || ctx.zshModified?.has(k)) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); ctx.srcChanged.add(k); continue; } // (#74: a sourced name this line reads as `$N:r` is only known at run time)
@@ -5264,7 +5271,8 @@ function evaluateBashForFilesFrame(command, opts) {
   modelZshSelfDirs(cmds, raw, ctx);
   ctx.inheritedVars = opts._vars ?? {}; // (#74: collectVars also marks a name the line only reads with a zsh modifier, when an outer line gave it its value)
   ctx.zshModified = zshModifiedNames(cmds.flatMap((c) => [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (the names this line reads as `$N:r` / `$N[1]`)
-  ctx.arith = arithAssignedNames(raw, cmds);
+  // (#473: the frame the arithmetic reads names in: the values the outer lines and the environment gave them, before this line's own assignments)
+  ctx.arith = arithAssignedNames(raw, cmds, { vars: opts._vars ?? {}, unknown: new Set([...(opts._unknown ?? []), ...(opts._unknownW ?? []), ...(opts._srcChanged ?? [])]), env: ctx.env, unknownAll: opts._unknownAll === true });
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
