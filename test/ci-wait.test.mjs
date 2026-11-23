@@ -1678,3 +1678,19 @@ test('a timeline read that fails once does not hide predatesReady: the flag is j
   assert.notEqual(r.output.readyAt, null, JSON.stringify(r.output));
   assert.equal(r.output.checks[0].predatesReady, true, JSON.stringify(r.output));
 });
+
+// Catches (R1-B2): a name with a draft-era success status AND a same-name check run skipped by a ready-era workflow: the fresh skip
+// outranks the pass, so the status's age was dropped and the entry read as a clean pass.
+test('#642 R1-B2: a fresh skip under the same name does not hide a draft-era passing status', async () => {
+  const s = sim({
+    classic: present('both'),
+    timeline: readyTimeline,
+    checkRuns: [cr('both', 'skipped', { check_suite: { id: 9 } })],
+    suiteRuns: () => () => [{ created_at: '2026-01-01T12:00:10Z' }],
+    statuses: [st('both', 'success', 'github-actions[bot]', { created_at: '2026-01-01T11:00:00Z' })],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(r.output.checks[0].state, 'fresh-skip');
+  assert.equal(r.output.checks[0].predatesReady, true, JSON.stringify(r.output));
+});

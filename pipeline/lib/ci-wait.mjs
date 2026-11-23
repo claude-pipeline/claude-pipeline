@@ -336,7 +336,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
     const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url, ...(identity.source ? { source: identity.source } : {}) };
     if (worst.status) statusBasis.set(out, worst.status);
-    if (out.state === 'pass') passStarts.set(out, producers.filter((p) => p.state === 'pass').map((p) => p.at));
+    if (isGood(out.state)) passStarts.set(out, producers.filter((p) => p.state === 'pass').map((p) => p.at));
     return out;
   };
 
