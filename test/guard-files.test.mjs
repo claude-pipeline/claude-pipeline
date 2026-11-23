@@ -2212,3 +2212,244 @@ test('#472 click state: asks/*.pending, asks/*.settled, consumed/*.json and roun
   }
   assert.equal(file('Write', { file_path: '~/.claude/pipeline-state/owner-go/round-claims/0123456789abcdef.2.json', content: '{}' }), 'deny');
 });
+
+// Item 5 (refused: `node -e "const s=require('./.review/state.json');console.log(Object.keys(s))"`, 141 times in a month): an inline node program is judged like a program file:
+// naming a protected path is a refusal only next to a write (or child_process); reading and printing it is not a write.
+test('item 5: inline node -e / -p that only reads a review file is allowed; a write, a child process or a redirect on the same names stays refused', () => {
+  for (const cmd of [
+    `node -e "const s=require('./.review/state.json');console.log(Object.keys(s))"`,
+    `node -e "const a=require('./.review/round-3/accepted.json');console.log(a.length)"`,
+    `node -p "require('/repo/.review/hardstops.json').items.length"`,
+    `node -e "console.log(JSON.parse(require('fs').readFileSync('.review/state.json','utf8')).pr)"`,
+    `node -e 'console.log(require("fs").readFileSync("/work/wt/.review/hardstops.json","utf8").length)'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    `node -e "require('fs').writeFileSync('.review/state.json','{}')"`,
+    `node -e "require('fs').writeFileSync('/home/u/.claude/pipeline/x','{}')"`,
+    `node -e "require('fs').rmSync('.review/state.json')"`,
+    `node -e "require('fs').appendFileSync('.review/state.json','x')"`,
+    `node -e "require('fs').openSync('.review/state.json','w')"`,
+    `node -e "require('child_process').execSync('node x.js .review/state.json')"`,
+    `node -e "console.log(require('./.review/state.json'))" > .review/state.json`,
+    `node -e "console.log(1)" >> /home/u/.claude/pipeline/x`,
+    `node -e "const f=process.argv[1];require('fs').writeFileSync(f,'x')" .review/state.json`,
+    `node -e "console.log(require('./.review/state.json'), $(cat /tmp/x))"`,
+    `node -e "require('fs')['wri'+'teFileSync']('.review/state.json','{}')"`,
+    `node -e "eval(process.argv[1]);require('./.review/state.json')" 'x'`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  // The exemption is an allowlist: a hard link (then a write through the other name), utimes / chown / mkdtemp, a worker, a watcher, a destructured or Reflect call, process internals, a preload option, NODE_OPTIONS, a trailing argument, another launcher word
+  // and a wrapper keep main's rule. Failure caught: `node -e "require('fs').linkSync('.review/state.json','/tmp/l')"` allowed, then `echo x > /tmp/l` rewrites the protected file.
+  for (const cmd of [
+    `node -e "require('fs').linkSync('.review/state.json','/tmp/l')"`,
+    `node -e "require('fs').link('.review/state.json','/tmp/l',()=>{})"`,
+    `node -e "require('fs').promises.link('.review/state.json','/tmp/l')"`,
+    `node -e "require('fs').utimesSync('.review/state.json',1,1)"`,
+    `node -e "require('fs').chownSync('.review/state.json',1,1)"`,
+    `node -e "require('fs').mkdtempSync('.review/state.json')"`,
+    `node -e "process.execve('/bin/sh',['sh','-c','x'],{});require('./.review/state.json')"`,
+    `node -e "new Worker('x',{eval:true});require('./.review/state.json')"`,
+    `node -e "require('fs').watch('.review/state.json',()=>{})"`,
+    `node -e "const {linkSync}=require('fs');linkSync('.review/state.json','/tmp/l')"`,
+    `node -e "Reflect.apply(require('fs').linkSync,0,['.review/state.json','/tmp/l'])"`,
+    `node -e "process.binding('fs');require('./.review/state.json')"`,
+    `node -r ./evil.js -e "console.log(require('./.review/state.json'))"`,
+    `node --require=./evil.js -e "console.log(require('./.review/state.json'))"`,
+    `node --import ./evil.mjs -e "console.log(require('./.review/state.json'))"`,
+    `NODE_OPTIONS='--require /repo/evil.js' node -e "console.log(require('./.review/state.json'))"`,
+    `export NODE_OPTIONS='--require /repo/evil.js'; node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('./.review/state.json'))" -- x`,
+    `node -e "console.log(require('./.review/state.json'))" evil.js`,
+    `nodejs -e "console.log(require('./.review/state.json'))"`,
+    `env node -e "console.log(require('./.review/state.json'))"`,
+    `command node -e "console.log(require('./.review/state.json'))"`,
+    `npx node -e "console.log(require('./.review/state.json'))"`,
+    `A=1 node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('child_process').spawnSync('id'), require('./.review/state.json'))"`,
+    `node -e "console.log(require('./evil.js'), require('./.review/state.json'))"`,
+    `node -e "[1].map(require('fs').unlinkSync);require('./.review/state.json')"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+// R1-B1 (#737): readFileSync takes a path and at most a plain string (an encoding). Failure caught: `readFileSync('.review/state.json', {flag:'w+'})` is allowed, and `w+` truncates the protected file before reading it
+// (so does the same options object held in a variable, or spread in).
+test('R1-B1: readFileSync with an options object (inline, held in a variable or spread) is refused; a path with an optional encoding string is allowed', () => {
+  for (const cmd of [
+    `node -e "require('fs').readFileSync('.review/state.json', {flag:'w+'})"`,
+    `node -e "const o={flag:'w+'};require('fs').readFileSync('.review/state.json',o)"`,
+    `node -e "const o={flag:'w+'};const fs=require('fs');fs.readFileSync('.review/state.json',o)"`,
+    `node -e "require('fs').readFileSync('.review/state.json', ...[{flag:'w+'}])"`,
+    `node -e "require('fs').readFileSync('.review/state.json', 'utf8', {flag:'w+'})"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e "console.log(require('fs').readFileSync('.review/state.json'))"`,
+    `node -e "console.log(require('fs').readFileSync(require('path').join('.review','state.json'), 'utf8'))"`,
+    `node -e 'console.log(require("fs").readFileSync(".review/state.json", "utf8").length)'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// R1-B2 (#737): a function taken from the fs module and not called (passed to reduce / map, held in a variable, destructured, put in an object) is called later by something the call scan does not see. Failure caught:
+// `['w'].reduce(require('fs').openSync, '.review/state.json')` is allowed and truncates the protected file. The fs module may only be used as a direct call to readFileSync / existsSync / readdirSync, or held in a
+// `const NAME = require('fs')` whose every later use is one of those calls (the same goes for the `fs` global that node -e predefines, and for the globals that reach it by name).
+test('R1-B2: an uncalled fs function (callback, alias, destructuring, object member) is refused; direct readFileSync / existsSync / readdirSync calls stay allowed', () => {
+  for (const cmd of [
+    `node -e "['w'].reduce(require('fs').openSync, '.review/state.json')"`,
+    `node -e "['.review/state.json'].map(require('fs').openSync)"`,
+    `node -e "['.review/state.json'].reduce(require('fs').linkSync)"`,
+    `node -e "const fs=require('fs');['.review/state.json'].map(fs.openSync)"`,
+    `node -e "['.review/state.json'].map(fs.openSync)"`,
+    `node -e "['.review/state.json'].reduce(fs.linkSync)"`,
+    `node -e "const readFileSync=require('fs').openSync;readFileSync('.review/state.json','w')"`,
+    `node -e "const {openSync:readFileSync}=require('fs');readFileSync('.review/state.json','w')"`,
+    `node -e "const o={map:require('fs').openSync};o.map('.review/state.json','w')"`,
+    `node -e "const fs=require('fs');const g=fs;['.review/state.json'].map(g.openSync)"`,
+    `node -e "const fs=require('fs'), g=fs.openSync;g('.review/state.json','w')"`,
+    `node -e "let fs=require('fs');fs=fs.openSync;fs('.review/state.json','w')"`,
+    `node -e "['.review/state.json'].map(this['f'+'s'].openSync)"`,
+    `node -e "['.review/state.json'].map(global['f'+'s'].openSync)"`,
+    `node -e "console.log(require('./.review/state.json'));['x'].map(vm.runInThisContext)"`,
+    // R2-F1: a JavaScript identifier escape (\uXXXX, \u{X}) hides fs / a write name from every word scan, so a program holding one is no read-only program
+    `node -e "['w'].reduce(f\\u0073.openSync,'.review/state.json')"`,
+    `node -e "['.review/state.json'].forEach(f\\u0073.unlinkSync)"`,
+    `node -e "['w'].reduce(f\\u{73}.openSync,'.review/state.json')"`,
+    `node -e "['.review/state.json'].forEach(f\\u{73}.unl\\u0069nkSync)"`,
+    // R3-F1: the ANSI-C spelling \UHHHHHHHH (zsh and bash decode 1 to 8 hex digits) hides the same names
+    `node -e $'["w"].reduce(f\\U00000073.openSync,".review/state.json")'`,
+    `node -e $'[".review/state.json"].forEach(f\\U73.unl\\U69nkSync)'`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e "console.log(require('fs').readFileSync('.review/state.json','utf8').split('\\n').length)"`,
+    `node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('fs').readFileSync('.review/round-3/accepted.json','utf8'))"`,
+    `node -e "const fs=require('fs');console.log(JSON.parse(fs.readFileSync('/abs/.review/hardstops.json','utf8')))"`,
+    `node -e 'const fs=require("node:fs");console.log(fs.existsSync(".review/state.json"), fs.readdirSync(".review").length)'`,
+    `node -e "console.log(fs.readFileSync('.review/state.json','utf8').length)"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// Items 5b/10 (refused: `node -e 'const r=require("./.review/risk.json");console.log((r.items||[]).length)'` and the double-quoted twin on .review/round-18/codex.json): the arithmetic gate (#266 R7-F3) must not read
+// the parentheses or a `let` of a JavaScript program that is the whole single- or double-quoted word after node -e / -p. Everything else keeps the gate: `$((`, `$[`, a lone `_` (zsh reads it as the last word of the
+// previous command), `((` / let in shell code, a program word with an unquoted part, a `$` or backtick inside a double-quoted program, and a `node -e` that is only text inside another quoted string.
+test('items 5b/10: a ((, a let or a (x||[]) inside a quoted node -e program is no arithmetic; the zsh _ attack and every other arithmetic shape on a line naming a review file stays refused', () => {
+  for (const cmd of [
+    `node -e 'const r=require("./.review/state.json");console.log((r.items||[]).length)'`,
+    `node -e "const t=require('fs').readFileSync('.review/round-18/codex.json','utf8');console.log((t.match(/x/g)||[]).join())"`,
+    `node -e 'let n=0;const r=require("./.review/state.json");for(let i=0;i<3;i++){n+=((r.a||0)+1)};console.log(n)'`,
+    `node -p '(require("./.review/state.json").items||[]).length' && cat .review/state.json`,
+    `cd /repo && node -e "console.log(((require('./.review/state.json').x)||1))"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    `echo 'path[$(cmd)]'; node -e "console.log($((_)))" .review/state.json`,
+    `echo 'path[$(cmd)]'; echo $((_)); cat .review/state.json`,
+    `node -e "console.log($((1+1)))" .review/state.json`,
+    `node -e "console.log($[1+1])" .review/state.json`,
+    `node -e 'console.log(_.keys(require("./.review/state.json")))'`,
+    `node -e "((_))" .review/state.json`,
+    `node -e "console.log(\`$(echo ((_)))\`)" .review/state.json`,
+    `node -e "x $( ((_)) ) y" .review/state.json`,
+    `((x=1)); cat .review/state.json`,
+    `let x=1; cat .review/state.json`,
+    `echo node -e '((x))'; cat .review/state.json`,
+    `eval "echo; node -e '$((_))' .review/state.json"`,
+    `node -e '((x))'"$X" .review/state.json`,
+    `node -e 'console.log(require("./.review/state.json"))' $((_))`,
+    `node -e '((x))' > .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+// Items 5b/10, quote desync (a live zsh exploit found by a probe): the gate's quote scan does not know ANSI-C `$'..\'..'` quoting, a backslash escape or `$"`, so a `$'\''` before a node -e word makes it read a `((x))` that
+// zsh really runs (with a planted `x`) as the inside of a quoted program, and rewrites it away. Failure caught: the line below is allowed and the planted `$(touch SENT)` runs.
+test('items 5b/10: an ANSI-C quote, a backslash or $" before a node -e word, and a backslash inside a double-quoted program, leave the arithmetic gate reading the line as written', () => {
+  const plants = [
+    `x=$'path[\\x24(touch SENT)]'`,
+    `x=path\\[\\$\\(touch\\ SENT\\)\\]`,
+    `printf -v x 'path[\\044(touch SENT)]'`,
+  ];
+  const shapes = [
+    (pl) => `${pl}; : $'\\'' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    (pl) => `${pl}; echo $'\\'' ' ; node -e '$((x))' ; true ; echo ' ; cat .review/state.json`,
+    (pl) => `${pl}; : $'a\\'b' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+  ];
+  for (const pl of plants) for (const sh of shapes) assert.equal(bash(sh(pl)), 'deny', sh(pl));
+  for (const cmd of [
+    `: $'a\\'b' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `: \\' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `: $"a" '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `node -e "console.log(\\"a\\", ((1)))" .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+// R1-B3 + R1-F1 (#737): the same desync with two other triggers: a quote inside a shell comment (`# a'`), and a quote inside a double-quoted `${…}` (`"${x:-" ' "}"`, a nested double quote: the shell is unquoted after it, a scan
+// that ends the quote at the first `"` is not). Failure caught: the line is allowed, and the shell runs the planted `x` subscript as arithmetic. The gate rewrites a `((` only when nothing before the node word holds a quote, `#`, `$`,
+// a backslash, a backtick or a heredoc (a node -e first on the line, or after `cd /repo && `, still passes).
+test('R1-B3 / R1-F1: a quote in a comment or in a nested "${…}" before a node -e word leaves the arithmetic gate reading the line as written', () => {
+  for (const cmd of [
+    `# '\n: '; node -e '; x="path[\\$(rm .review/sta\\te.json)]"; ((x)); : '\n'\ncat .review/state.json`,
+    `: # a'\nx';node -e '((x))';'; cat .review/state.json`,
+    `x=path; : # a'\nx';node -e '((x))';'; cat .review/state.json`,
+    `: "\${x:-" ' "}" '; node -e '; x="a[\\$(touch SENT)]"; ((x)); : ' '; cat .review/state.json`,
+    `: "\${x:-" ' "}" '; node -e '; ((x)); : ' '; cat .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e 'console.log((require("./.review/state.json").x||[]).length)'`,
+    `cd /repo && node -e 'console.log(((require("./.review/state.json").x)||1))'`,
+    `echo ok; node -e 'console.log(((require("./.review/state.json").x)||1))'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// Item 7b (refused: `for i in 1 2 3 4; do out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540); echo "$out"; done`): an assignment whose whole value is one command substitution is judged as the
+// command inside it (the bare pipeline CLI call is allowed on its own); that command is still judged, and any other text beside it, a redirect or a variable the shell reads keep the refusal.
+test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a write inside the substitution, extra text, a redirect and PATH= stay refused', () => {
+  const P = 'node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540';
+  for (const cmd of [
+    `out=$(${P}); echo "$out"`,
+    `for i in 1 2 3 4; do out=$(${P}); echo "$out"; done`,
+    `out="$(${P})"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    'out=$(rm ~/.claude/pipeline/x)',
+    'out=$(cp /tmp/a ~/.claude/pipeline/x)',
+    `out=$(${P}; rm ~/.claude/pipeline/y)`,
+    `out=$(${P} | tee ~/.claude/pipeline/y)`,
+    `out=$(${P}) > ~/.claude/pipeline/y`,
+    `out=x$(${P})`,
+    `out="$(${P}) ~/.claude/pipeline/y"`,
+    `out=$(${P})$(rm ~/.claude/pipeline/y)`,
+    `PATH=$(${P})`,
+    `PATH=/x$(${P})`,
+    `path=$(${P})`,
+    `OUT=$(${P})`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  // Every zsh special lower-case parameter, and the families by name (`*_functions` hook arrays, zsh*, zle*, dis_*), is a name the shell reads: assigning one a substitution is no plain variable.
+  // Failure caught: `precmd_functions=$(...)` allowed, then the planted function name runs before the next prompt.
+  for (const name of ['precmd_functions', 'chpwd_functions', 'zshexit_functions', 'reply', 'match', 'mbegin', 'psvar', 'watch', 'pipestatus', 'status', 'argv', 'dirstack', 'funcstack', 'userdirs', 'nameddirs', 'terminfo', 'region_highlight', 'prompt', 'cdpath', 'zsh_eval_context', 'zle_highlight', 'dis_aliases', 'dis_builtins', 'langinfo', 'epochtime', 'usernames', 'mapfile', 'compstate', 'history', 'options', 'commands', 'functions']) {
+    assert.equal(bash(`${name}=$(${P})`), 'deny', name);
+  }
+  assert.equal(bash(`result=$(${P})`), 'allow'); // (a plain name that only starts like one of them is still a plain variable)
+  // R1-F2 (#737): a name the hook's own environment already holds (an exported lower-case variable: npm_config_prefix, http_proxy) is not a plain variable: assigning it changes what the next program sees.
+  // Failure caught: `npm_config_prefix=$(echo ~/.claude/pipeline); npm install -g x` allowed, and npm then installs into the protected folder.
+  const seeded = { env: { npm_config_prefix: '/usr/local' } };
+  assert.equal(bash('npm_config_prefix=$(echo ~/.claude/pipeline); npm install -g x', seeded), 'deny');
+  assert.equal(bash(`npm_config_prefix=$(${P})`, seeded), 'deny');
+  assert.equal(bash(`npm_config_prefix=$(${P})`), 'allow'); // (the same name, not exported: a plain variable)
+});
+
+// cp #691 (refused: a 250 KB DRMed proof script run from a checkout that has a .review folder, "where it is could not be worked out in the time allowed"): the alias scan read a program only up to 200 KB and refused the
+// rest unread. It now reads up to MAX_SCRIPT_BYTES; a program over the word / lookup cap is still refused (fail closed), and the refusal says it is the size / scan limit, not a protected file.
+test('#691: a program over 200 KB that holds no link to the review folder is allowed from a checkout with .review; a link in it, or too many distinct words, is refused with the scan-limit wording', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const run = (text) => {
+    fs.writeFileSync(path.join(w.cwd, 'prog.mjs'), text);
+    return evaluateBashForFiles('node prog.mjs', { home: path.join(w.tmp, 'home'), env: {}, cwd: w.cwd, platform: process.platform });
+  };
+  const filler = 'const filler_a = "xxxxxxxxxxxxxxxxxxxx";\n'.repeat(8000); // (about 330 KB, a handful of distinct words)
+  const tail = "import fs from 'node:fs'; fs.writeFileSync('/tmp/proof-out.txt', 'ok');\n";
+  assert.ok(filler.length > 200_000);
+  assert.equal(run(filler + tail).decision, 'allow', 'allowed: clean program over 200 KB');
+  assert.equal(run(`${filler}${tail}fs.writeFileSync('${w.alias}/state.json', 'x');\n`).decision, 'deny', 'denied: the same text writing through a link to the review folder');
+  const many = Array.from({ length: 21_000 }, (_, i) => `const w${i} = ${i};`).join('\n');
+  const r = run(`${many}\n${tail}`);
+  assert.equal(r.decision, 'deny', 'denied: too many distinct words to scan');
+  assert.match(r.reason, /scan limit/);
+  assert.doesNotMatch(r.reason, /refers to a protected pipeline file/);
+});

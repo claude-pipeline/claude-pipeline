@@ -34,7 +34,7 @@ const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
 const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known; past it collection STOPS silently, so a hard link to a file beyond the cap is not seen: a documented residual, not a fail-closed. Which files fall past it depends on listing order. Depth: the protected names directly in .review, and a round folder's entries two levels down)
-const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
+const MAX_ALIAS_TEXT = MAX_SCRIPT_BYTES; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused; cp #691: no shorter than the largest program the guard reads, it was 200,000)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
 const SENSITIVE_WORDS = /\.claude|\.codex(?:\/*(?![\w.\-\/])|\W+sessions)|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|published-baseline|[\w.-]*smoke)/i;
@@ -1671,11 +1671,13 @@ function makeMatchers(ctx) {
   const ALIAS_WORD_WIDE = /[^\s'"`;|&<>(){}[\]*?$]+/g;
   const aliasInText = (v, dirs) => {
     if (!ctx.hasReviewDir()) return false; // (no review folder: nothing below can match, see hitReviewInode)
-    if (v.length > MAX_ALIAS_TEXT) return true;
+    if (v.length > MAX_ALIAS_TEXT) { ctx.aliasLimit = true; return true; } // (a refusal from a cap says so: ctx.aliasLimit, read by judgeFoundScript)
     const where = dirs?.length ? dirs : [ctx.cwd];
     const words = new Set([...(v.match(ALIAS_WORD) ?? []), ...(v.match(ALIAS_WORD_WIDE) ?? [])]);
-    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return true;
+    if (words.size * where.length > MAX_ALIAS_LOOKUPS) { ctx.aliasLimit = true; return true; }
+    let seen = 0;
     for (const word of words) {
+      if ((++seen & 511) === 0 && ctx.budget) checkDeadline(ctx.budget); // (a long text is scanned up to the evaluation's deadline, then the check fails closed)
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
       for (const d of isAbs(e) ? [''] : where) {
@@ -2520,6 +2522,21 @@ const LAST_WORD_RE = /\$(?:_|\{_)(?![A-Za-z0-9_])/; // `$_` / `${_}`: the last w
 // R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...), an integer declaration (`typeset -i`, `declare -i`, `local -i`, `integer`) and a lone `_` in ANY spelling (bare, quoted, escaped or assigned:
 // `${x:_}`, `$a[_]`, `printf %d "_"`, `n=_`, `[ "_" -gt 0 ]` read it as arithmetic; any `_` not touching a letter, digit or `_` fails closed; `$_` and `${_}` are expansions of the last word, not a name, and are judged by LAST_WORD_RE). Each alternative is a literal, a lookaround or a one-class run, so the scan is linear.
 const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s;&|(){`])(?:typeset|declare|local)\s+-[A-Za-z]*i|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?<![$\p{L}\p{N}_]|\$\{)_(?![\p{L}\p{N}_])/u;
+// Items 5b/10 (guard false refusals): the line as the arithmetic gate reads it. The JavaScript of `node -e` / `-p` PROGRAM, when PROGRAM is the whole of one word, written at command position with nothing before it
+// that can open a quote, a comment, an expansion or a heredoc (no quote, `#`, `$`, backslash, backtick or `<<`: `node -e …` first on the line, or after `cd /repo && `), is not shell code: in a SINGLE-quoted program `((` and a `let` word are no arithmetic, in a DOUBLE-quoted
+// program with no `$` and no backtick in it (so no expansion can run) a `((` is none. Only those two spellings are rewritten: `$((`, `$[`, a lone `_`, `((` / let in shell code, a program word with an
+// unquoted part and every other match of ARITH_CONTEXT are read as written.
+const INLINE_NODE_WORD = /(?<=^|[;&|(\n]\s*)node(?:js)?\s+(?:-e|-p|--eval|--print)\s+(?:'([^']*)'|"((?:[^"\\$`]|\\[^$`])*)")(?=\s|$|[;&|)])/g;
+function arithView(raw) {
+  return raw.replace(INLINE_NODE_WORD, (all, single, double, at) => {
+    const before = raw.slice(0, at);
+    if (/['"#$\\`]|<</.test(before)) return all; // (R1-B3 / R1-F1: a quote, a comment, an expansion, an escape or a heredoc anywhere before the word: a quote scan cannot tell where the shell is quoted once a comment, an ANSI-C quote, a nested "${…}" or an escape is in play, so the line is read as written)
+    const head = all.slice(0, all.search(/['"]/));
+    if (single !== undefined) return `${head}'${single.replace(/\((?=\()/g, '( ').replace(/(?<!\w)let(?=\s)/g, 'lXt')}'`;
+    if (double.includes('\\')) return all;
+    return `${head}"${double.replace(/\((?=\()/g, '( ')}"`;
+  });
+}
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
 const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
@@ -3994,6 +4011,77 @@ const INTERP_PROGRAM = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|p
 // Program text that names a protected path next to something that writes, moves or deletes.
 const WRITE_WORDS = String.raw`write|append|unlink|\brm\b|rmSync|rmtree|rmdir|rename|copy|\bcp(?:Sync)?\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|extractall|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install`;
 const WRITE_HINT = new RegExp(`${WRITE_WORDS}|open\\s*\\(`, 'i');
+// Item 5: an inline node -e / -p program that can only READ is described by an ALLOWLIST (no write-hint blocklist can name everything node can do): no run-time part, no word that reaches the process or loads code, every call on a short read-only list,
+// `require(` with one literal module. A program that is anything else keeps the rule for any text that names a protected file.
+const INLINE_NODE_WORDS = /[`$]|[)\]]\s*\(|\?\.\s*\(|\b(?:new|import|process|Reflect|globalThis|global|this|vm|binding|eval|Function|child_process)\b/;
+const INLINE_NODE_BARE = new Set(['require', 'readFileSync', 'existsSync', 'readdirSync', 'String', 'Number', 'Boolean', 'if', 'for', 'while', 'switch', 'catch']);
+const INLINE_NODE_QUALIFIED = new Set(['JSON.parse', 'JSON.stringify', 'console.log', 'console.error', 'Object.keys', 'Object.values', 'Object.entries', 'Array.isArray']);
+const INLINE_NODE_METHODS = new Set(['readFileSync', 'existsSync', 'readdirSync', 'map', 'filter', 'find', 'some', 'every', 'forEach', 'reduce', 'sort', 'flat', 'join', 'split', 'slice', 'includes', 'startsWith', 'endsWith', 'trim', 'match', 'test', 'toFixed', 'padStart', 'padEnd']);
+// R1-B1 (#737): readFileSync(PATH) or readFileSync(PATH, 'encoding'): the second argument, when there is one, is a plain string literal. An options object (inline, held in a variable, spread in) can carry `flag: 'w+'`, which truncates the file it
+// reads. `args` is the text after the opening parenthesis; a closing parenthesis that never comes, a spread, or an unquoted `/` (a regex literal the scan could misread) is not read-only.
+function readFileSyncArgsPlain(args) {
+  const parts = [''];
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === "'" || ch === '"') {
+      const end = args.indexOf(ch, i + 1);
+      if (end < 0 || args.slice(i, end).includes('\\')) return false;
+      parts[parts.length - 1] += args.slice(i, end + 1);
+      i = end;
+      continue;
+    }
+    if (ch === '/' || (ch === '.' && args.startsWith('...', i))) return false;
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (depth === 0) return ch === ')' && parts.length <= 2 && (parts.length === 1 || /^\s*(?:'[^']*'|"[^"]*")\s*$/.test(parts[1]));
+      depth--;
+    }
+    if (ch === ',' && depth === 0) parts.push('');
+    else parts[parts.length - 1] += ch;
+  }
+  return false;
+}
+function inlineNodeReadOnly(prog) {
+  if (/\\u/i.test(prog)) return false; // (R2-F1: an identifier escape, `fs` for `fs`, hides a name from every word scan below; `'\n'` and other escapes stay allowed)
+  if (INLINE_NODE_WORDS.test(prog) || WRITE_HINT.test(prog.replace(/[<>=]/g, ' '))) return false; // (a write name is refused even as a callback: .map(fs.unlinkSync))
+  if (/\brequire\b(?!\s*\(\s*(?:'[^'\\]*'|"[^"\\]*")\s*\))/.test(prog)) return false; // (every `require` is a call with one plain string)
+  for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'([^'\\]*)'|"([^"\\]*)")\s*\)/g)) {
+    const mod = r[1] ?? r[2];
+    if (!(['fs', 'node:fs', 'path', 'node:path'].includes(mod) || mod.endsWith('.json'))) return false;
+  }
+  // R1-B2 (#737): the fs module is used only as a direct call to readFileSync / existsSync / readdirSync (`require('fs').readFileSync(`), or held in `const NAME = require('fs')` (nothing else follows it) whose every later use is such a call; the `fs`
+  // node -e predefines is held the same way. A function taken from it and not called (`.map(fs.openSync)`, `const readFileSync = require('fs').openSync`, `const {openSync: x} = require('fs')`, `{m: require('fs').openSync}`) is called later by something the call scan does not see.
+  const fsCall = /^\s*\.\s*(?:readFileSync|existsSync|readdirSync)\s*\(/;
+  const fsOwn = []; // (text ranges that are the require itself or its declaration)
+  const fsNames = new Set(['fs']);
+  for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'(?:node:)?fs'|"(?:node:)?fs")\s*\)/g)) {
+    const end = r.index + r[0].length;
+    fsOwn.push([r.index, end]);
+    if (fsCall.test(prog.slice(end))) continue;
+    const decl = /(?<![\p{L}\p{N}_$.])(?:const|let|var)\s+([\p{L}_][\p{L}\p{N}_]*)\s*=\s*$/u.exec(prog.slice(0, r.index));
+    if (!decl || !/^\s*(?:;|$)/.test(prog.slice(end))) return false;
+    fsNames.add(decl[1]);
+    fsOwn.push([decl.index, r.index]);
+  }
+  for (const name of fsNames) {
+    for (const o of prog.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_$])${name}(?![\\p{L}\\p{N}_$])`, 'gu'))) {
+      if (fsOwn.some(([x, y]) => o.index >= x && o.index < y)) continue;
+      if (!fsCall.test(prog.slice(o.index + name.length))) return false;
+    }
+  }
+  for (const r of prog.matchAll(/([\p{L}_][\p{L}\p{N}_]*(?:\s*\.\s*[\p{L}_][\p{L}\p{N}_]*)*)\s*\(/gu)) {
+    const before = prog.slice(0, r.index).trimEnd();
+    if (/(?:^|\.)readFileSync$/.test(r[1].replace(/\s+/g, '')) && !readFileSyncArgsPlain(prog.slice(r.index + r[0].length))) return false;
+    if (before.endsWith('.')) { // (a method after something: `).readFileSync(`, `/x/.test(`, `?.(` is no allowed shape)
+      if (before.endsWith('?.') || !INLINE_NODE_METHODS.has(r[1].split(/\s*\.\s*/).at(-1))) return false;
+      continue;
+    }
+    const name = r[1].replace(/\s+/g, '');
+    if (name.includes('.') ? !(INLINE_NODE_QUALIFIED.has(name) || /^Math\.[A-Za-z]+$/.test(name) || INLINE_NODE_METHODS.has(name.split('.').at(-1))) : !INLINE_NODE_BARE.has(name)) return false;
+  }
+  return true;
+}
 
 // `bash f.sh`, `source f`, `./f`, `node f.mjs`, `python f.py`: the file is read (up to 1 MB) and judged like the same text
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
@@ -4311,8 +4399,10 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   const dynamicBefore = ctx.dynamic;
   ctx.braceChunks = true; // (#265 g: the text is brace-expanded in pieces, so a brace-split protected path in a long program is seen)
   let hitsProtected;
+  ctx.aliasLimit = false;
   try { hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true); } finally { ctx.braceChunks = false; }
   ctx.dynamic = dynamicBefore;
+  if (hitsProtected && ctx.aliasLimit === true && WRITE_HINT.test(text)) return deny(`the program ${sf.file} is refused for its size / scan limit: it is too long, or holds too many distinct words, to be checked word by word for a link to a repo's review folder (${PROTECTED_MSG}); split it up or keep what writes in a smaller file`);
   if (hitsProtected && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
   return null;
 }
@@ -5998,7 +6088,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // R7-F3 (#266): in arithmetic zsh reads a bare name `_` (the last word of the previous command) and evaluates its text again, a subscript with a substitution included. `echo 'path[$(cmd)]'; echo $((_))`
   // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line. The gate reads the UNMASKED line (post-push review of #288): a path inside a prose value
   // (a quoted echo argument, a commit message) is masked out of protectedInRaw, but the planted text can sit anywhere.
-  if (protectedAnywhere && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator, an integer declaration or a lone _), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
+  if (protectedAnywhere && ARITH_CONTEXT.test(arithView(raw))) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator, an integer declaration or a lone _), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
 
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   // Why: in a rerun that assumes the directory (after a cd only known at run time) every relative word resolves inside the assumed protected directory (`npm`, `test`), so a word counts only when it can name
@@ -6060,7 +6150,30 @@ function evaluateBashForFilesFrame(command, opts) {
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
   const harmless = assignmentOnlyHarmless(cmds, ctx, ctx.frames.indexOf(frame) === 0);
-  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c));
+  // Item 5 (guard false refusals): `node -e / -p PROGRAM` that can only read is not judged as a command that may write (an ALLOWLIST, inlineNodeReadOnly). The command is exactly `node -e|-p PROGRAM`: no other option, argument, `--`, env-prefix
+  // assignment, wrapper (env, command, npx ...: the raw text starts with node) or write redirect, no NODE_OPTIONS anywhere on the line. Anything else is judged as before.
+  const readsInlineNode = (c) => /^node$/.test(c.argv[0] ?? '') && /^(?:-e|-p)$/.test(c.argv[1] ?? '') && c.argv.length === 3 && /^node\s/.test(c.raw.trimStart())
+    && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && Object.keys(c.env ?? {}).length === 0 && !/NODE_OPTIONS/.test(raw)
+    && !/\$['"]/.test(c.raw) // (an ANSI-C or locale word is decoded by the shell into text the raw word does not show)
+    && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
+    && inlineNodeReadOnly(c.argv[2]);
+  // Item 7b (guard false refusals): `out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait …)`: an assignment that gives plain lower-case names (no shell variable the shell reads: PATH, IFS, the zsh `path` family ...) nothing but ONE whole
+  // command substitution is judged as the command inside it, which is a command of the line like any other (judged above and below: `out=$(rm …)` is still refused as rm). A value with any other text, a redirect, and every other name keep the rule above.
+  // (zsh's documented special lower-case parameters, and the families by name: the `*_functions` hook arrays, `zsh*`, `zle*` and `dis_*`)
+  const TIED_NAMES = /^(?:reply|match|mbegin|mend|psvar|signals|watch|fignore|mailpath|histchars|pipestatus|status|argv|dirstack|funcstack|funcfiletrace|funcsourcetrace|functrace|userdirs|nameddirs|widgets|keymaps|historywords|jobdirs|jobstates|jobtexts|modules|parameters|options|commands|aliases|galiases|saliases|builtins|reswords|functions|terminfo|termcap|errnos|sysparams|patchars|region_highlight|prompt|path|fpath|cdpath|manpath|module_path|langinfo|epochtime|usernames|mapfile|compstate|history|.*_functions|zsh.*|zle.*|dis_.*)$/;
+  const wholeSubstitution = (v) => {
+    const s = String(v).replace(/^"([^"]*)"$/, '$1');
+    if (!s.startsWith('$(') || s.startsWith('$((') || !s.endsWith(')') || /`/.test(s)) return false;
+    let depth = 0;
+    for (let i = 1; i < s.length; i++) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')' && --depth === 0 && i !== s.length - 1) return false;
+    }
+    return depth === 0;
+  };
+  const assignsSubstitution = (c) => c.argv.length === 0 && !(c.redirects ?? []).length && Object.keys(c.env ?? {}).length > 0
+    && Object.entries(c.env).every(([k, v]) => /^[a-z][a-z0-9_]*$/.test(k) && !TIED_NAMES.test(k) && !Object.hasOwn(ctx.env ?? {}, k) && wholeSubstitution(v)); // (a name the hook's environment holds: main's rule, assignmentOnlyHarmless)
+  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c) && !readsInlineNode(c) && !assignsSubstitution(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
     // #295: a command that is read-only in itself, refused only because the line's heredoc text holds an expansion that can evaluate (ctx.heredocPlants, R5-F3): say so, not "is not a read-only command"
