@@ -245,10 +245,28 @@ test('P cost --from-transcript: a transcript with no messages is still booked bu
   const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl']);
   assertExit(r, 0);
   assert.equal(r.json.recorded, true);
-  assert.match(r.json.warnings.join('\n'), /held no messages.*may be low.*only --from-transcript again/);
+  assert.match(r.json.warnings.join('\n'), /held no messages.*may be low/);
+  assert.match(r.json.warnings.join('\n'), /same --phase, --role and --round and only --from-transcript.*leave out --retry and hand token amounts/);
+  assert.doesNotMatch(r.json.warnings.join('\n'), /--usd 0/);
   s.repo.write('.review/full.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { output_tokens: 3 } } })}\n`);
   const ok = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/full.jsonl']);
   assert.doesNotMatch(ok.json.warnings.join('\n'), /no messages/);
+});
+
+// Failure caught: the replay advice said the retry and hand amounts "are already booked" even when the record write failed (nothing booked), so following it dropped them; and, after a --usd booking, it said to drop --usd, so the replay added the transcript's list price on top of the override.
+test('P cost --from-transcript: the empty-transcript replay advice says --usd 0 after a --usd booking, and after a failed write says to run the whole command again', () => {
+  const s = scenario();
+  s.repo.write('.review/empty.jsonl', '');
+  const withUsd = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl', '--usd', '5']);
+  assertExit(withUsd, 0);
+  assert.match(withUsd.json.warnings.join('\n'), /--usd 0/);
+  s.fake.setScript(ghEntries({ prHead: s.head, comments: [existing(written(s))], extra: [{ match: '-X PATCH repos/acme/widgets/issues/comments/77', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }));
+  const failed = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl', '--output', '5', '--retry']);
+  assertExit(failed, 1);
+  assert.equal(failed.json.recorded, false);
+  const text = failed.json.warnings.join('\n');
+  assert.match(text, /run the whole command again/);
+  assert.doesNotMatch(text, /already booked/);
 });
 
 // Failure caught: following the empty-transcript warning by repeating the whole command (with --retry and hand amounts) booked the retry and the hand tokens twice.

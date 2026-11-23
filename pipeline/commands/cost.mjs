@@ -81,7 +81,8 @@ export const run = guarded(async (argv, ctx) => {
   const patch = { cost: {} };
   const notes = [];
   // A file that appears before its lines are flushed reads as empty or partial: still booked, but the caller is told it may be low.
-  if (values['from-transcript'] && fromFile.messages === 0) notes.push('the transcript held no messages (it may not be flushed yet): the booking may be low; later book the rest by running only --from-transcript again (no --retry, --usd or hand amounts: those are already booked and would count twice)');
+  // The replay advice (what to repeat, what not to) is added after the write and only when it succeeded: after a failed write nothing was booked, so the whole command is run again.
+  const emptyTranscript = Boolean(values['from-transcript']) && fromFile.messages === 0;
   let bucketed = false;
   if (spent) {
     const own = { input: num('input'), output: num('output'), cacheRead: num('cache-read'), cacheWrite: num('cache-write') };
@@ -129,6 +130,12 @@ export const run = guarded(async (argv, ctx) => {
     const recorder = createRunRecorder({ gh, pr });
     const record = recorder.update(patch);
     const ok = record !== null;
+    if (emptyTranscript) {
+      notes.push('the transcript held no messages (it may not be flushed yet): the booking may be low');
+      notes.push(ok
+        ? `later book the rest by running again with the same --phase, --role and --round and only --from-transcript: leave out --retry and hand token amounts (already booked, they would count twice)${values.usd !== undefined ? ', and pass --usd 0 (the --usd amount is already booked)' : ''}`
+        : 'the booking was not recorded: once the transcript is flushed, run the whole command again');
+    }
     return {
       exitCode: ok ? EXIT.OK : EXIT.FAILED,
       output: { ok, recorded: ok, bucketed: ok && bucketed, cost: ok ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
