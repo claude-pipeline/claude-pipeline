@@ -140,7 +140,7 @@ export function predictNextRound({ root, config, state, head }) {
     // With a merge in the range, nothing is promised after the revert: the filter below only decides WHICH wording shows, and the owner confirms by running round-request again
     // (the revert's result is the only proof: identical edits on both sides, for one, are removed by the revert but kept by the synthetic base). The filter: a clean trial merge
     // (kind 'synthetic') AND every merge in the range is a clean, unedited, two-parent merge of the default branch: exactly two parents, the second on the default-branch ref (the
-    // check resolutionReviewBase's history rule makes), and the merge commit's tree equal to the clean trial merge of its parents. A conflicting merge keeps the PR whole-PR (the
+    // check resolutionReviewBase's history rule makes), and the merge commit's tree equal to the clean trial merge of its parents. A conflicting merge is never a free recording: it gives a counted conflict or whole-PR round (the
     // reverted commits stay in the history, so the resolution-only proof refuses too), and a merge of a topic branch or an edited merge leaves its changes in the range.
     const cleanDefaultMerge = ([sha, p1, p2, ...more]) => {
       if (more.length > 0 || !isAncestor(p2, baseRef, o)) return false;

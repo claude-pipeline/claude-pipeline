@@ -768,7 +768,8 @@ test('codex-review: main merged in before an accepted fix is made does not stran
   assert.equal(w.state().rounds.length, 3);
 });
 
-test('codex-review: a conflicting merge falls back to the whole PR against the new base, never main\'s own changes', (t) => {
+// Failure caught: a conflicting merge plus an own commit made Codex review the whole PR against the new base (the #1901 round 16 shape), main's own changes drowning the resolution.
+test('codex-review: a conflicting merge plus an own commit is a counted conflict round on the PR\'s own changes, never main\'s own changes', (t) => {
   const w = worldIgnoringReview(t);
   assertExit(w.codex(1, findingsOf()), 0);
   // Main edits the very line (src/a.js 12) that round 1 reviewed the PR changing, so merging what was reviewed with the new
@@ -780,12 +781,13 @@ test('codex-review: a conflicting merge falls back to the whole PR against the n
   const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
   assertExit(r, 0, r.stderr + r.stdout);
   const round = w.state().rounds[1];
-  assert.equal(round.reviewBaseKind, 'whole-pr');
-  assert.equal(round.reviewBase, w.repo.git(['merge-base', 'main', head2]).trim());
+  assert.equal(round.reviewBaseKind, 'conflict');
+  assert.notEqual(round.reviewBase, w.repo.git(['merge-base', 'main', head2]).trim(), 'the base is the marker tree, not the fork point');
   const patch = patchOf(w, 2);
   assert.doesNotMatch(patch, /from-main\.js/);
-  assert.match(patch, /src\/a\.js/, 'the whole PR is reviewed');
+  assert.match(patch, /src\/a\.js/, 'the resolution of the conflict is in the patch');
   assert.match(patch, /src\/c\.js/);
+  assert.doesNotMatch(patch, /src\/big\.js/, 'the PR\'s earlier, already reviewed files are not re-sent');
   assert.ok(merged);
 });
 
@@ -4014,6 +4016,70 @@ test('codex-review --plan: shows reviewKind, and resolutionIneligible for a whol
   assert.match(counted.json.plan.resolutionIneligible, /^history-nonmerge/);
   assert.equal(counted.json.plan.resolutionOnly, undefined);
   assert.equal(w.state().rounds.length, 1, '--plan records no round');
+});
+
+// Failure caught: a merge committed with git's own conflict markers still in the file was admitted as "the resolution is in the patch" and the markers, committed, were never judged;
+// the conflict round must fall back to the whole PR (the real merge writes `<<<<<<< HEAD`, the trial tree wrote full-sha labels: the check must not depend on the label).
+test('codex-review: a conflicting merge committed with its conflict markers left in, plus an own commit, stays a counted whole-PR round and says why', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  // resolve names another file only: src/a.js is committed exactly as git left it, markers and all.
+  mergeMainInto(w, { 'src/a.js': MAIN_EDITS_V12(), 'src/from-main.js': 'export const other = 1;\n' }, { resolve: { 'src/note.js': 'export const note = 1;\n' } });
+  assert.match(readFileSync(join(w.repo.dir, 'src/a.js'), 'utf8'), /^<<<<<<< HEAD$/m, 'precondition: the markers are committed');
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  w.prHead(head2);
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.reviewBaseKind, round.conflicted], ['whole-pr', undefined]);
+  assert.equal(round.reviewBase, w.repo.git(['merge-base', 'main', head2]).trim());
+  assert.match(round.resolutionIneligible, /^history-nonmerge/);
+  assert.equal(r.json.reviewKind, 'whole-pr');
+  assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 2, 'counted');
+});
+
+// Failure caught: a lone modify/delete conflict where head keeps the PR's file has marker tree == head, so a 'conflict' round would be COUNTED with an empty patch (nothing for Codex to review);
+// the plan's decision is whole-PR (evidence: records-only), exactly as the free proof's no-changes refusal.
+test('codex-review: a modify/delete conflict kept as the PR\'s file with nothing else changed is a counted whole-PR round, never a conflict round with an empty patch', (t) => {
+  const w = worldIgnoringReview(t, { featFiles: { 'src/b.js': 'export const w1 = "pr";\n' } });
+  assertExit(w.codex(1, findingsOf()), 0);
+  w.repo.checkout('main');
+  w.repo.git(['rm', '-q', 'src/b.js']);
+  w.repo.commit('main deletes b');
+  w.repo.checkout('feat/x');
+  try { w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']); } catch { /* modify/delete: the merge stops for the resolver */ }
+  w.repo.git(['add', 'src/b.js']); // the resolver keeps the PR's file
+  w.repo.git(['commit', '-q', '--no-edit']);
+  const merged = w.repo.git(['rev-parse', 'HEAD']).trim();
+  w.prHead(merged);
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.reviewBaseKind, round.conflicted, round.records], ['whole-pr', undefined, undefined]);
+  assert.equal(round.reviewBase, w.repo.git(['merge-base', 'main', merged]).trim());
+  assert.match(patchOf(w, 2), /src\/b\.js/, 'the whole PR, including the kept file, is what Codex reads');
+  assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 2, 'counted');
+});
+
+// Failure caught: the threat model and the regression-only bar were read from the tree base's file list, so a modelled file the PR changed earlier (not since) silently dropped out of the
+// Fable-lane prompt of a conflict round; they must come from the same whole-PR file list (fork point..head) as a whole-PR round's.
+test('codex-review: a Fable-lane conflict round still gets the threat model of a PR file that only changed before the last review (file list from the fork point)', (t) => {
+  const yml = `${SENSITIVE_YML}  threat_models:\n    - name: guards\n      paths: [src/guard.js]\n      text: "Attackers are other repo users, not the owner."\n`;
+  const w = worldIgnoringReview(t, { yml, featFiles: { 'src/guard.js': 'export const guard = 1;\n' } });
+  assertExit(w.codex(1, findingsOf()), 0);
+  assert.match(w.captured()[0].stdin, /## Threat model\n[\s\S]*Model guards \(paths: src\/guard\.js\)/, 'precondition: round 1 carries the model');
+  assertExit(w.cli(['arbiter', 'needed', '--round', '1']), 0);
+  assertExit(arbiterRun(w, { text: fenced(FABLE_CLEAN) }), 0);
+  conflictKeepingOurs(w);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  w.prHead(head2);
+  const r = w.codex(2, findingsOf(), { from: w.head, to: head2 });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(w.state().rounds[1].reviewBaseKind, 'conflict');
+  assert.doesNotMatch(patchOf(w, 2), /src\/guard\.js/, 'precondition: the modelled file is not in the conflict round\'s patch');
+  assert.match(w.captured()[1].stdin, /## Threat model\n[\s\S]*Model guards \(paths: src\/guard\.js\)/);
 });
 
 test('codex-review: an ineligible conflict round at the cap is refused (round-cap) exactly as before', (t) => {
