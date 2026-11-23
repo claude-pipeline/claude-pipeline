@@ -270,6 +270,27 @@ test('a config read cut off by its timeout is a time failure (GuardLimit), not "
   assert.throws(() => w.mergeTemplates(dir, { leftMs: () => 1 }), GuardLimit);
 });
 
+test('defaultGitShow: a timed-out show-ref and a timed-out show are each a GuardLimit; a git that never started is unknown, not "no config"; a plain missing ref or file is null', async () => {
+  // Failure caught: (1) the show-ref check or the show check dropped, and a cut-off read answering null, which switches the owner-approval check off;
+  // (2) a git child that never started (spawn EAGAIN: code 1, pid 0) read as "no config" for the same effect.
+  const { defaultGitShow } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const ok = { code: 0, stdout: '', stderr: '', timedOut: false, overBuffer: false, signal: null, pid: 4242 };
+  const ref = 'refs/remotes/origin/main';
+  const runner = (byVerb) => (cmd, args) => ({ ...ok, ...byVerb[args.includes('show-ref') ? 'show-ref' : 'show'] });
+  const cut = { code: 124, timedOut: true };
+  const neverStarted = { code: 1, stderr: 'spawn git EAGAIN', pid: 0 };
+
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': cut, show: {} })), GuardLimit, 'show-ref cut off');
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: cut })), GuardLimit, 'show cut off');
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': neverStarted, show: {} })), GuardLimit, 'show-ref never started');
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: neverStarted })), GuardLimit, 'show never started');
+  assert.throws(() => defaultGitShow('/x', 'HEAD', undefined, runner({ show: neverStarted })), GuardLimit, 'HEAD: show never started');
+
+  assert.equal(defaultGitShow('/x', ref, undefined, runner({ 'show-ref': { code: 1 }, show: {} })), null, 'ref missing');
+  assert.equal(defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: { code: 128, stderr: 'path not in tree' } })), null, 'file missing');
+  assert.equal(defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: { stdout: 'owner_approval: chat\n' } })), 'owner_approval: chat\n');
+});
+
 for (const hook of ['guard-git.mjs', 'guard-files.mjs']) {
   test(`${hook} passes HOOK_CLOCK to the evaluators (the shared wall cap is opt-in by the hook entry points)`, () => {
     const src = readFileSync(new URL(`../pipeline/hooks/${hook}`, import.meta.url), 'utf8');

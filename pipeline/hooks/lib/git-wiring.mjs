@@ -68,16 +68,16 @@ export function realGitWiring() {
 // (the remote's refs FULLY QUALIFIED: git resolves an abbreviated `origin/main` through refs/tags and refs/heads before refs/remotes, so a local branch or tag of that name would
 // otherwise stand in for the remote's copy and hide a chat config, #454)
 const COMMITTED_REFS = ['HEAD', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'];
-const defaultGitShow = (root, ref, leftMs) => {
+export const defaultGitShow = (root, ref, leftMs, runFn = run) => { // runFn: a test seam
   // a missing remote-tracking ref must read as missing: `git show` would fall through to a branch or tag literally named `refs/remotes/origin/<b>` (#455)
-  // (a read cut off by its timeout is unknown, not "no config": a chat config dropped that way would switch the owner-approval check off)
+  // (a read cut off by its timeout, or by a git that never started, is unknown, not "no config": a chat config dropped that way would switch the owner-approval check off)
   if (ref.startsWith('refs/')) {
-    const s = run('git', ['-C', root, 'show-ref', '--verify', '--quiet', ref], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
-    if (cutOff(s)) throw new GuardLimit(OUT_OF_TIME);
+    const s = runFn('git', ['-C', root, 'show-ref', '--verify', '--quiet', ref], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
+    if (cutOff(s) || !s.pid) throw new GuardLimit(OUT_OF_TIME);
     if (s.code !== 0) return null;
   }
-  const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
-  if (cutOff(r)) throw new GuardLimit(OUT_OF_TIME);
+  const r = runFn('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
+  if (cutOff(r) || !r.pid) throw new GuardLimit(OUT_OF_TIME);
   return r.code === 0 ? r.stdout : null;
 };
 const defaultRemotes = (dir, leftMs) => {
