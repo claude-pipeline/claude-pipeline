@@ -326,3 +326,4 @@ full record.
 - 2026-11-23 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · blocked · Codex 7d: 765 runs (246 high)
 - 2026-11-23 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · needs-human · Codex 7d: 766 runs (247 high)
 - 2026-11-23 · #817 · Guard: a name read in arithmetic is trusted only when proven a number (#473) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 765 runs (245 high)
+- 2026-11-23 · #829 · Live-db guard: recognise a Supabase MCP server under another name (#687) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 762 runs (243 high)
