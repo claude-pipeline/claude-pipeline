@@ -223,9 +223,17 @@ test('vendor --check on a never-vendored repo lists everything as missing', asyn
 // #550: the pipeline's own source repo (ci.guard_checks: false, no scripts/pipeline/, and its history contains the pipeline's root commit) is not a consumer: --check has nothing to compare there.
 // R2-B1 / R3-B1: guard_checks: false with scripts/pipeline/ merely absent is not enough (a consumer that deleted the folder must still see every file missing), and neither are placeholder files at the source paths: only the history identifies the source.
 const ROOT_COMMIT = PIPELINE_ROOT_COMMIT;
+// Skip only on a genuinely shallow checkout (CI depth 1), never on the predicate the code under test uses: a wrong PIPELINE_ROOT_COMMIT must fail these tests on a full clone, not skip them (#599).
+const isShallow = () => spawnSync('git', ['-C', root, 'rev-parse', '--is-shallow-repository'], { encoding: 'utf8' }).stdout.trim() === 'true';
+const SHALLOW_SKIP = 'this checkout is shallow: it lacks the pipeline root commit';
+test('PIPELINE_ROOT_COMMIT is a root commit (no parents) of this repo history (#550 must not regress silently)', (t) => {
+  if (isShallow()) return t.skip(SHALLOW_SKIP);
+  const roots = spawnSync('git', ['-C', root, 'rev-list', '--max-parents=0', 'HEAD'], { encoding: 'utf8' }).stdout.split('\n');
+  assert.ok(roots.includes(ROOT_COMMIT), 'PIPELINE_ROOT_COMMIT is one of the repo root commits');
+});
 test('vendor --check skips (exit 0, skipped says so) for the pipeline source repo: guard_checks false, no scripts/pipeline/, HEAD descending from the root commit', async (t) => {
   // (CI checks out at depth 1, where this checkout lacks the root commit: the unit tests of isPipelineSource below cover the rule there.)
-  if (spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', ROOT_COMMIT, 'HEAD']).status !== 0) return t.skip('this checkout is shallow: it lacks the pipeline root commit');
+  if (isShallow()) return t.skip(SHALLOW_SKIP);
   const dir = mkdtempSync(join(tmpdir(), 'cp-vendor-src-'));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const cloned = spawnSync('git', ['clone', '-q', '--no-checkout', '--bare', root, join(dir, 'bare.git')], { encoding: 'utf8' });
@@ -268,8 +276,8 @@ test('isPipelineSource: true for a repo whose HEAD descends from the given root 
 
 // R4-B1: holding the root commit's object is not sharing the history: a consumer that fetched the pipeline repo into some ref must still get the drift check.
 test('vendor --check with ci.guard_checks: false in a consumer that only fetched the pipeline root commit into an unrelated ref is still drift (R4-B1)', async (t) => {
-  const reachable = spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', ROOT_COMMIT, 'HEAD']).status === 0;
-  if (!reachable) return t.skip('this checkout is shallow: it lacks the pipeline root commit');
+  if (isShallow()) return t.skip(SHALLOW_SKIP);
+  assert.equal(spawnSync('git', ['-C', root, 'merge-base', '--is-ancestor', ROOT_COMMIT, 'HEAD']).status, 0, 'PIPELINE_ROOT_COMMIT is an ancestor of HEAD');
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml('github', ['ci'], { guardChecks: false }));
   repo.git(['fetch', '-q', root, `${ROOT_COMMIT}:refs/heads/unrelated`]);
