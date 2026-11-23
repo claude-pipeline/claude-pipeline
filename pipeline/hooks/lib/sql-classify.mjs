@@ -114,7 +114,7 @@ const hasRun = (words, ...run) => {
 };
 
 // #655 (the "changes every row" hint). FAIL CLOSED, no precise walk: when in doubt the warning shows. The hint may over-warn; it must never stay
-// silent on an UPDATE/DELETE without a WHERE of its own. In a statement that starts with WITH, EXPLAIN, COPY, PREPARE or a parenthesis, or that is a CREATE TABLE ... AS (after its AS) (they run or wrap the
+// silent on an UPDATE/DELETE without a WHERE of its own. In a statement that starts with WITH, EXPLAIN, COPY, PREPARE, INSERT or a parenthesis, or that is a CREATE TABLE ... AS (after its AS) (they run or wrap the
 // change) every UPDATE/DELETE word is a DML start unless the full run around it proves otherwise (dmlKind); a statement starting with UPDATE/DELETE
 // is scanned at its first word, MERGE for its actions, and anything else (policies, foreign keys, GRANT) gives no hint.
 
@@ -200,7 +200,7 @@ export function describeSql(sql) {
     // CREATE [..] TABLE ... AS runs what follows its AS (a data-modifying CTE): scan only the words after that AS; PREPARE ... AS runs it at EXECUTE
     const tableAt = words.indexOf('TABLE');
     const createAs = first === 'CREATE' && tableAt > 0 && tableAt <= 3 ? words.findIndex((w, i) => w === 'AS' && depths[i] === 0) : -1;
-    const scanned = first === 'WITH' || first === 'EXPLAIN' || first === 'COPY' || first === 'PREPARE' || createAs >= 0 || (stmt[0]?.t === 'punct' && stmt[0].v === '(');
+    const scanned = first === 'WITH' || first === 'EXPLAIN' || first === 'COPY' || first === 'PREPARE' || first === 'INSERT' || createAs >= 0 || (stmt[0]?.t === 'punct' && stmt[0].v === '(');
     if (scanned || first === 'MERGE') {
       words.forEach((w, i) => {
         if (w !== 'UPDATE' && w !== 'DELETE') return;

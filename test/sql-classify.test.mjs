@@ -94,6 +94,13 @@ test('describeSql: #655 a change that runs behind EXPLAIN, COPY or a leading par
   assert.deepEqual(flags('explain select 1 from t for update'), []);
 });
 
+test('describeSql: #655 an INSERT whose query carries a data-modifying CTE is scanned like WITH', () => {
+  assert.deepEqual(flags('insert into archived with moved as (delete from events returning *) select * from moved'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('insert into archived with moved as (delete from events where id = 1 returning *) select * from moved'), []);
+  // ON CONFLICT DO UPDATE is not a change of its own
+  assert.deepEqual(flags('insert into t values (1) on conflict do update set a = 1'), []);
+});
+
 test('describeSql: #655 inside WITH every UPDATE/DELETE word warns unless the whole run proves it is something else', () => {
   // a DELETE that follows a closing parenthesis (or any single word) is still a DML start
   assert.deepEqual(flags('with x as (select 1) delete from t'), ['DELETE-NO-WHERE']);
