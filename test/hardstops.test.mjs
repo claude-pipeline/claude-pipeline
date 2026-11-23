@@ -886,6 +886,7 @@ test('IO: deleting or moving a marker-free delegating entry point with an ordina
     selectFrom: "select * from tests.check_tenant_visibility();\n",
     selectFromBare: "select * from check_tenant_visibility();\n",
     selectCall: "select tests.check_tenant_visibility();\n",
+    selectCallBare: "select check_tenant_visibility();\n",
   };
   for (const [label, entry] of Object.entries(bodies)) {
     const deleted = await moveCollect({ 'supabase/tests/tenant_visibility.sql': entry }, (repo) => {
@@ -913,7 +914,7 @@ test('IO: deleting a BOM-prefixed include-only file still trips R4', async () =>
 
 // Catches: PostgreSQL built-ins (has_table_privilege, set_config) read as pgTAP assertions, so a plain data-check helper still trips R4 (R2-F1).
 test('IO: a helper using has_table_privilege() and set_config() is exempt when deleted or moved; wrapped in ok() it still trips R4', async () => {
-  const helper = "select set_config('request.jwt.claims', '{}', true);\nselect c.relname, has_table_privilege('anon', c.oid, 'SELECT') as anon_select from pg_class c;\n";
+  const helper = "select count(*) from pg_class;\nselect set_config('request.jwt.claims', '{}', true);\nselect c.relname, has_table_privilege('anon', c.oid, 'SELECT') as anon_select from pg_class c;\n";
   const deleted = await moveCollect({ 'supabase/tests/0150_verify.sql': helper }, (repo) => {
     repo.rm('supabase/tests/0150_verify.sql');
     repo.commit('delete helper');
