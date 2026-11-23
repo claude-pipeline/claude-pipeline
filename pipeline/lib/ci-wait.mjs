@@ -31,6 +31,23 @@
 // GitHub Actions run (`.../actions/runs/<id>`, job suffix ignored) whose run_started_at (else created_at) is strictly before
 // T_marker. The run is read lazily through the optional `readers.workflowRun(id)`, once per run per poll; an absent reader, an
 // unreadable run, an unreadable time or a url that is not an Actions run falls back to the created_at rule alone (never a pass).
+// A PR that CONFLICTS with its base gets no pull_request workflow run at all, so its required checks stay absent and the
+// wait would end `missing` / `stale-skipped` and send the session looking for a CI problem that is not there (#471). At that
+// terminal point (and only there: a pass or a failure never reads it) the optional reader `readers.mergeable()` (gh's
+// {mergeable, mergeStateStatus}) is asked: CONFLICTING / DIRTY => verdict `conflicting` (merge the base, then the resolution round).
+// UNKNOWN (GitHub still computing it) is re-read once after one interval inside the wait loop, then the old verdict stands; an
+// absent or throwing reader leaves the old verdict as well (never a guess, never a pass).
+// `options.mergeChecks` (config ci.merge_checks): names the repo's own merge command requires although branch protection does not
+// (EagleWatch "Replay from zero"). Each is one more unpinned identity (listed in `checks` with source: 'merge_checks'); a name that is
+// already required is not doubled. One that reports is judged like a required one (pending waits, a failure fails). One with no
+// producer at all (a path-filtered workflow that did not run) is notOwed: once the appear window is over and nothing on the head could
+// still produce it, it is listed in `notOwed` (and left out of `checks`) instead of ending the wait `missing`, and a failed required check still ends
+// `failed` (a --wait-all `failed` carries `notOwed` too).
+// They never decide `unverified` / `no-required-checks`: those speak about the policy sources alone.
+// `options.e2eLabel` (config ci.e2e_label): on a PR carrying that label (`readers.labels()`, read once at the end) a `passed` result
+// also reports `others: [{name, status, url}]`, the head's NON-required check runs / statuses that are still running or red, so a
+// green required set never hides a pending or failed e2e suite. Report only: the verdict is not changed. A failed label read is
+// retried like every other read and ends `github` after repeated failures; it never leaves the plain result.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -110,8 +127,11 @@ function identitiesOf(sources) {
   return [...seen.values()];
 }
 
+// The `status` an `others` entry carries while its check is not finished (a check run's status, or a commit status's pending).
+const RUNNING_OTHER = new Set(['queued', 'in_progress', 'pending', 'waiting', 'requested']);
+
 export async function waitForCi({ readers, options, clock, onProgress = () => {} }) {
-  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, configChecks = [] } = options;
+  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, waitOthers = false, configChecks = [], mergeChecks = [], e2eLabel = null } = options;
   const start = clock.now();
   const elapsed = () => clock.now() - start;
 
@@ -128,6 +148,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let runStartMemo = new Map(); // Actions run id -> ms the run started, or null (unreadable); per poll, like markerAtMemo
   let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
+  let mergeRetried = false; // the one extra read of a mergeability GitHub had not computed yet
 
   const getReadyAt = async (pr) => {
     if (readyAtMemo !== undefined) return readyAtMemo;
@@ -304,9 +325,9 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         producers.push({ state, url: status.target_url ?? null, status });
       }
     }
-    if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null };
+    if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null, ...(identity.source ? { source: identity.source } : {}) };
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
-    const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url };
+    const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url, ...(identity.source ? { source: identity.source } : {}) };
     if (worst.status) statusBasis.set(out, worst.status);
     return out;
   };
@@ -349,6 +370,53 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       }
     }
     return predating;
+  };
+
+  // 'conflicting' | 'unknown' | 'clear', with the raw state for the output. Never throws: an unreadable one is 'clear' (no verdict change).
+  const getMergeability = async () => {
+    if (!readers.mergeable) return { kind: 'clear' };
+    try {
+      const v = await readers.mergeable();
+      const mergeable = typeof v?.mergeable === 'string' ? v.mergeable.toUpperCase() : null;
+      const state = typeof v?.mergeStateStatus === 'string' ? v.mergeStateStatus.toUpperCase() : null;
+      const mergeState = { mergeable, state };
+      if (mergeable === 'CONFLICTING' || state === 'DIRTY') return { kind: 'conflicting', mergeState };
+      if (mergeable === null || mergeable === 'UNKNOWN') return { kind: 'unknown', mergeState };
+      return { kind: 'clear', mergeState };
+    } catch {
+      return { kind: 'clear' };
+    }
+  };
+
+  // The head's checks that nobody requires (not an identity) and that are still running or red, on a PR carrying the e2e label; null
+  // when this does not apply (no label configured, no reader, the label absent). A failed label read throws into the poll loop, which
+  // retries it like every other read: it must never look like a PR without the label. A check run is judged by its latest NON-skipped
+  // run per app (every other `labeled` event on the head starts a no-op run whose jobs skip, with a higher id than the real suite's;
+  // a name whose only runs are skipped is not listed); a status by its latest per context. Check runs and commit statuses are
+  // separate producers, so a name seen on one side never hides the other.
+  const otherChecks = async (obs, identities) => {
+    if (!e2eLabel || !readers.labels) return null;
+    if (!(await readers.labels()).includes(e2eLabel)) return null;
+    const known = new Set(identities.map((i) => i.name));
+    const out = [];
+    const seenRuns = new Set();
+    const judged = obs.checkRuns.filter((r) => !(r?.status === 'completed' && r.conclusion === 'skipped'));
+    for (const name of judged.map((r) => r?.name)) {
+      if (typeof name !== 'string' || known.has(name) || seenRuns.has(name)) continue;
+      seenRuns.add(name);
+      for (const run of latestRuns(judged, name, null)) {
+        if (run.status === 'completed' && GOOD.has(run.conclusion)) continue;
+        out.push({ name, status: run.status === 'completed' ? run.conclusion : run.status ?? 'unknown', url: run.html_url ?? null });
+      }
+    }
+    const seenStatuses = new Set();
+    for (const context of obs.statuses.map((x) => x?.context)) {
+      if (typeof context !== 'string' || known.has(context) || seenStatuses.has(context)) continue;
+      seenStatuses.add(context);
+      const status = latestStatus(obs.statuses, context);
+      if (status.state !== 'success') out.push({ name: context, status: status.state, url: status.target_url ?? null });
+    }
+    return out;
   };
 
   const statusEvidenceOf = (failures) => failures.map((f) => statusBasis.get(f)).filter(Boolean).map((x) => ({ context: x.context, id: x.id ?? null, state: x.state, createdAt: x.created_at ?? null }));
@@ -406,7 +474,9 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       return result(EXIT.FAILED, 'no-required-checks', { message: 'neither branch protection nor a ruleset requires any status check on the base branch' });
     }
     const unverified = sources.classic.kind === 'unreadable' || sources.rules.kind === 'unreadable';
-    const identities = identitiesOf(sources);
+    const required = identitiesOf(sources);
+    const mergeIdentities = [...new Set(mergeChecks)].filter((name) => !required.some((i) => i.name === name)).map((name) => ({ name, appId: null, source: 'merge_checks' }));
+    const identities = [...required, ...mergeIdentities];
 
     // Everything from the evaluation to the verdict. `confirmed` is true on the second pass, which a failure read from a commit
     // status, or an absence verdict past --appear-timeout, triggers: the head's check runs and statuses are read again first, so a
@@ -423,7 +493,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const confirmStatusFailures = async (failures) => (confirmed || !failures.some((f) => statusBasis.has(f)) ? undefined : decide(await reread(), true));
     const failedResult = (message, failures) => {
       const statusEvidence = statusEvidenceOf(failures);
-      return result(EXIT.FAILED, 'failed', { message, failures, ...(statusEvidence.length > 0 ? { statusEvidence } : {}) });
+      return result(EXIT.FAILED, 'failed', { message, failures, ...(notOwed.length > 0 ? { notOwed } : {}), ...(statusEvidence.length > 0 ? { statusEvidence } : {}) });
     };
 
     // Nothing known to wait for (both sources unreadable, or one unreadable and the other absent): report the config's list.
@@ -440,8 +510,13 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         configChecks: diagnostics,
       });
     };
-    if (identities.length === 0) return unverifiedResult();
+    if (required.length === 0) return unverifiedResult();
 
+    // A merge check is judged only when it reports (pending waits, a failure fails, a draft-era skip is stale). One with no producer
+    // at all is not owed (its workflow is path-filtered and did not run on this PR): it ends the wait neither as `missing` nor as a
+    // pass-blocker, but only once the required set is final and the appear window is over with nothing on the head that could still produce it.
+    const notOwedState = (s) => s.source === 'merge_checks' && s.state === 'missing';
+    let notOwed = [];
     const bad = states.filter((s) => isBad(s.state));
     const waiting = states.filter((s) => isWaiting(s.state));
     const signature = waiting.map((s) => `${s.name}=${s.state}`).join(', ');
@@ -461,41 +536,79 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       // Past --appear-timeout an absent identity is final only if nothing that could still produce it is running on the head: a
       // needs:-gated aggregate is created late by design (#159), also when the run started before ready (#196, see findHolder).
       // Until --timeout the wait goes on, naming what holds it.
-      const holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr, absent.filter((s) => s.state === 'missing')) : null;
+      let holder = absent.length > 0 && elapsed() >= appearTimeoutMs ? await findHolder(obs, pr, absent.filter((s) => s.state === 'missing')) : null;
+      // A required identity still `pending` as a commit status (Vercel, an external CI) has no run for findHolder to find, yet it is
+      // exactly what the wait is for: it holds like a run does (#214), bounded by --timeout.
+      if (holder === null && absent.length > 0 && elapsed() >= appearTimeoutMs) {
+        const pending = waiting.find((s) => s.state === 'pending' && statusBasis.get(s)?.state === 'pending');
+        if (pending !== undefined) {
+          const basis = statusBasis.get(pending);
+          holder = { kind: 'status', id: basis.id ?? null, name: pending.name, status: 'pending', createdAt: basis.created_at ?? null, url: pending.url ?? null, predatesReady: null };
+        }
+      }
       if (holder !== null) {
         held = holder;
-        const note = `still running past the appear window: ${holder.kind} ${holder.name ?? holder.id} (${holder.status})${holder.predatesReady === true ? ', started before ready' : holder.predatesReady === null ? ', start time unknown' : ''}`;
+        const note = `still running past the appear window: ${holder.kind} ${holder.name ?? holder.id} (${holder.status})${holder.predatesReady === true ? ', started before ready' : holder.predatesReady === null && holder.kind !== 'status' ? ', start time unknown' : ''}`;
         if (note !== heldSignature) {
           heldSignature = note;
           onProgress(note);
         }
       }
-      if (absent.length > 0 && elapsed() >= appearTimeoutMs && holder === null) {
+      const onlyNotOwed = waiting.every(notOwedState);
+      if (absent.length > 0 && elapsed() >= appearTimeoutMs && holder === null && (onlyNotOwed || absent.some((s) => !notOwedState(s)))) {
         // The snapshot was taken before findHolder read the workflow runs: an aggregate created and finished in between (or a lagging
         // check-runs read) would otherwise be reported absent. Look once more before the terminal verdict.
         if (!confirmed) return decide(await reread(), true);
-        const missing = absent.filter((s) => s.state === 'missing');
+        const missing = absent.filter((s) => s.state === 'missing' && !notOwedState(s));
         const stale = absent.filter((s) => s.state === 'stale-skip');
         const staleFails = absent.filter((s) => s.state === 'stale-fail' || s.state === 'superseded');
         const skipNote = stale.length ? `only a draft-era skip for: ${stale.map((s) => s.name).join(', ')}` : '';
-        if (missing.length > 0) {
-          const named = (state) => staleFails.filter((s) => s.state === state).map((s) => s.name).join(', ');
-          const failNote = named('stale-fail') ? `a draft-era failure stands for: ${named('stale-fail')}` : '';
-          const supersededNote = named('superseded') ? `a superseded failure stands for: ${named('superseded')}` : '';
-          const notes = [skipNote, failNote, supersededNote].filter(Boolean);
-          return result(EXIT.FAILED, 'missing', { message: `no result appeared for: ${missing.map((s) => s.name).join(', ')}${notes.length ? `; ${notes.join('; ')}` : ''}` });
+        if (missing.length === 0 && stale.length === 0 && staleFails.length === 0) {
+          notOwed = absent.map((s) => s.name); // only merge checks with no producer remain: the required set is final
         }
-        if (staleFails.length > 0) {
-          // The failure was never replaced by a ready-era result, so it stands (a draft-era skip, if any, is listed with it).
-          const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (${s.state === 'superseded' ? 'superseded by a newer attempt that never reported' : 'result predates ready'})`).join('; ');
-          const rechecked = await confirmStatusFailures(staleFails);
-          if (rechecked !== undefined) return rechecked;
-          return failedResult(`failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, staleFails);
+        if (notOwed.length === 0) {
+          if (missing.length > 0 || stale.length > 0 || staleFails.some((s) => s.state === 'stale-fail')) {
+            // An absence verdict (missing / stale-skipped / a draft-era failure never replaced: a ready-era run never happened for it,
+            // a `superseded` one did): is the PR conflicting with its base, so that no workflow ran at all?
+            const m = await getMergeability();
+            if (m.kind === 'unknown' && !mergeRetried && elapsed() < timeoutMs) {
+              mergeRetried = true;
+              return null;
+            }
+            if (m.kind === 'conflicting') {
+              return result(EXIT.FAILED, 'conflicting', { message: `merge conflict with ${pr.base ?? 'the base branch'}: merge the base, then run the resolution round`, mergeState: m.mergeState });
+            }
+          }
+          if (missing.length > 0) {
+            const named = (state) => staleFails.filter((s) => s.state === state).map((s) => s.name).join(', ');
+            const failNote = named('stale-fail') ? `a draft-era failure stands for: ${named('stale-fail')}` : '';
+            const supersededNote = named('superseded') ? `a superseded failure stands for: ${named('superseded')}` : '';
+            const notes = [skipNote, failNote, supersededNote].filter(Boolean);
+            return result(EXIT.FAILED, 'missing', { message: `no result appeared for: ${missing.map((s) => s.name).join(', ')}${notes.length ? `; ${notes.join('; ')}` : ''}` });
+          }
+          if (staleFails.length > 0) {
+            // The failure was never replaced by a ready-era result, so it stands (a draft-era skip, if any, is listed with it).
+            const listed = staleFails.map((s) => `${s.name}=fail${s.url ? ` (${s.url})` : ''} (${s.state === 'superseded' ? 'superseded by a newer attempt that never reported' : 'result predates ready'})`).join('; ');
+            const rechecked = await confirmStatusFailures(staleFails);
+            if (rechecked !== undefined) return rechecked;
+            return failedResult(`failed: ${listed}${skipNote ? `; ${skipNote}` : ''}`, staleFails);
+          }
+          return result(EXIT.FAILED, 'stale-skipped', { message: `only a draft-era skipped result exists for: ${stale.map((s) => s.name).join(', ')}: their workflow did not run on the ready event: re-run it or ask the owner` });
         }
-        return result(EXIT.FAILED, 'stale-skipped', { message: `only a draft-era skipped result exists for: ${stale.map((s) => s.name).join(', ')}: their workflow did not run on the ready event: re-run it or ask the owner` });
       }
-      if (elapsed() >= timeoutMs) return result(EXIT.FAILED, 'timeout', { message: `still waiting after ${Math.round(elapsed() / 1000)}s: ${describe(waiting)}` });
-      return null;
+      if (notOwed.length === 0) {
+        if (elapsed() >= timeoutMs) return result(EXIT.FAILED, 'timeout', { message: `still waiting after ${Math.round(elapsed() / 1000)}s: ${describe(waiting)}` });
+        return null;
+      }
+      // reported in `notOwed`, not as a check that is missing (the failed result below and the pass path both use this)
+      last = { ...last, states: states.filter((s) => !notOwedState(s)) };
+      if (bad.length > 0) {
+        // --wait-all skipped the failure branch above while a merge check was still waiting: now that it is notOwed, a failed required
+        // check must still end the wait `failed`, never `passed`.
+        const rechecked = await confirmStatusFailures(bad);
+        if (rechecked !== undefined) return rechecked;
+        return failedResult(`failed: ${bad.map((s) => `${s.name}=${s.state}${s.url ? ` (${s.url})` : ''}`).join('; ')}`, bad);
+      }
     }
 
     // Everything is terminal-good. Re-read the PR once more: the head must not have moved, and it must not be a draft again.
@@ -504,7 +617,14 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (again.isDraft) return result(EXIT.FAILED, 'draft', { message: 'the PR went back to draft' });
     if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
-    return result(EXIT.OK, 'passed');
+    const others = await otherChecks(obs, identities);
+    const owedNote = notOwed.length > 0 ? { notOwed } : {};
+    // --wait-others: the required checks are green but a non-required check of the run-e2e suite is still running: keep waiting for it (a red or finished one ends the wait as `passed` with `others`, as before).
+    if (waitOthers && others !== null && others.some((o) => RUNNING_OTHER.has(o.status)) && elapsed() < timeoutMs) return null;
+    if (others !== null && others.length > 0) {
+      return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
+    }
+    return result(EXIT.OK, 'passed', { ...owedNote, ...(others === null ? {} : { others }) });
     };
     return decide({ checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) }, false);
   };

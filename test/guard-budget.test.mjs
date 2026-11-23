@@ -11,7 +11,11 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
-import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, wallLeftMs, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { HOOK_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
+import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -103,6 +107,194 @@ for (const [name, run] of both) {
     // the same chain on a clock that stands still is fine
     const fast = name === 'guard-git' ? git('bash a.sh', inner, { now: () => 5 }) : files('bash a.sh', inner, { now: () => 5 });
     assert.equal(fast.decision, 'allow');
+  });
+}
+
+// ---- CPU limit + hard wall cap (#627) -------------------------------------------------------------------------------
+// Why: the limit counts the hook's CPU time, so a loaded machine (wall runs ahead of the work) no longer refuses ordinary commands; a hook that
+// runs past the host timeout (HOOK_TIMEOUT_S) is ALLOWED by Claude Code, so a hard wall cap below it still refuses whatever the CPU says.
+
+test('the hard wall cap leaves margin under the host hook timeout (a hook past its timeout is allowed)', () => {
+  assert.ok(EVAL_WALL_CAP_MS > EVAL_DEADLINE_MS, 'the wall cap is above the CPU limit');
+  assert.ok(EVAL_WALL_CAP_MS <= HOOK_TIMEOUT_S * 1000 - 3000, `wall cap ${EVAL_WALL_CAP_MS} ms must leave >= 3 s of the ${HOOK_TIMEOUT_S} s hook timeout for startup and output`);
+});
+
+// wall and cpu are two fake clocks that start at 0 (ms)
+const clocks = (wall = 0, cpu = 0) => { const c = { wall, cpu }; return { c, budget: newEvalBudget(() => c.wall, () => c.cpu) }; };
+
+test('budget: wall 6 s but CPU 1 s is not expired; CPU past the limit and wall past the cap each are, and the scanners agree with checkDeadline', () => {
+  const cases = [
+    ['busy machine: wall 6 s, cpu 1 s', 6000, 1000, 'ok'],
+    ['at the CPU limit exactly', 5000, 5000, 'ok'],
+    ['real blow-up: cpu past 5 s', 5600, 5600, 'cpu'],
+    ['cpu cannot exceed wall: a clock that over-reports cpu never refuses early', 3000, 9000, 'ok'],
+    ['little cpu but wall past the hard cap', EVAL_WALL_CAP_MS + 1, 100, 'wall'],
+    ['wall at the cap exactly, little cpu', EVAL_WALL_CAP_MS, 100, 'ok'],
+  ];
+  for (const [label, wall, cpu, want] of cases) {
+    const { c, budget } = clocks();
+    Object.assign(c, { wall, cpu });
+    assert.equal(budgetExpired(budget), want !== 'ok', label);
+    if (want === 'ok') assert.doesNotThrow(() => checkDeadline(budget), label);
+    else assert.throws(() => checkDeadline(budget), (e) => e instanceof GuardLimit && (want === 'wall' ? /too busy/ : /script chain or a command line too large/).test(e.message), label);
+  }
+});
+
+test('budget: the limit counts from the start of the evaluation, not from the process start', () => {
+  const { c, budget } = clocks(1_000_000, 900_000);
+  Object.assign(c, { wall: 1_004_000, cpu: 903_000 });
+  assert.equal(budgetExpired(budget), false);
+  Object.assign(c, { wall: 1_007_000, cpu: 906_000 });
+  assert.equal(budgetExpired(budget), true);
+});
+
+// the same through both policies: script reads advance the fake clocks (a chain of four scripts, so several checkpoints see them)
+const CHAIN4 = { 'a.sh': 'bash b.sh', 'b.sh': 'bash c.sh', 'c.sh': 'bash d.sh', 'd.sh': 'echo hi' };
+for (const [name] of both) {
+  const slowBy = (dWall, dCpu) => {
+    const c = { wall: 0, cpu: 0 };
+    const inner = name === 'guard-git' ? gitFs(CHAIN4) : filesFs(CHAIN4);
+    const fs = { ...inner, readText: (p) => { c.wall += dWall; c.cpu += dCpu; return inner.readText(p); } };
+    const o = { now: () => c.wall, cpu: () => c.cpu };
+    return name === 'guard-git' ? git('bash a.sh', fs, o) : files('bash a.sh', fs, o);
+  };
+  test(`${name}: a busy machine (wall 8 s, CPU 1 s over the evaluation) still allows an ordinary chain`, () => {
+    const r = slowBy(2000, 250);
+    assert.equal(r.decision, 'allow', `${r.decision}: ${r.reason}`);
+  });
+  test(`${name}: CPU past the limit is still denied with the "took too long" reason`, () => {
+    const r = slowBy(2000, 2000);
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /took too long \(a script chain/);
+  });
+  test(`${name}: little CPU but wall past the hard cap is denied (a hook past the host timeout is allowed)`, () => {
+    const r = slowBy(4000, 10);
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /too busy/);
+  });
+}
+
+// ---- one wall cap per hook process (#627 review) ----------------------------------------------------------------------
+// Why: the host timeout (HOOK_TIMEOUT_S) covers the whole hook PROCESS, and Claude Code ALLOWS a hook that runs past it. A per-evaluation wall cap let an MCP
+// call with several command fields (guard-git runs one evaluation per field) take 2 x 10 s, and node startup was not counted at all. The hooks therefore pass
+// HOOK_CLOCK: the wall cap counts from process start (origin 0) and is shared by every evaluation of the process. Long-lived CLI callers (command-guard,
+// preflight) do not, and keep the cap per evaluation.
+for (const [name] of both) {
+  const evaluate = name === 'guard-git' ? git : files;
+  // each script read advances the fake clock by 1 s (the first evaluation reads a.sh once)
+  const ticking = (clock) => { const fs = (name === 'guard-git' ? gitFs : filesFs)({ 'a.sh': 'echo hi' }); return { ...fs, readText: (p) => { clock.t += 1000; return fs.readText(p); } }; };
+  const one = (clock) => evaluate('bash a.sh', ticking(clock), { now: () => clock.t, cpu: () => 0, wall0: 0 });
+  test(`${name}: two evaluations in one hook process share one wall cap (a hook past HOOK_TIMEOUT_S is allowed by Claude Code)`, () => {
+    const clock = { t: 5000 };
+    // the first evaluation ends at about 6 s: under the cap on its own
+    assert.equal(one(clock).decision, 'allow');
+    assert.ok(clock.t >= 6000 && clock.t < EVAL_WALL_CAP_MS, `first ends at ${clock.t}`);
+    // the second starts there and runs to about 10.5 s: under the cap on its own, over it counted from process start
+    clock.t = 9500;
+    const r = one(clock);
+    assert.equal(r.decision, 'deny', `${r.decision}: ${r.reason}`);
+    assert.match(r.reason, /too busy/);
+  });
+  test(`${name}: startup counts (an evaluation starting 9.5 s after process start that runs 1 s is denied)`, () => {
+    const r = one({ t: 9500 });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /too busy/);
+  });
+  test(`${name}: without the hook origin an evaluation counts from its own start (a long-lived CLI process is not refused)`, () => {
+    const clock = { t: 60_000 };
+    const r = evaluate('bash a.sh', ticking(clock), { now: () => clock.t, cpu: () => 0 });
+    assert.equal(r.decision, 'allow', `${r.decision}: ${r.reason}`);
+  });
+}
+
+test('budget: HOOK_CLOCK is only the epoch origin of the wall cap (process start); the default counts from the evaluation start', () => {
+  assert.deepEqual(Object.keys(HOOK_CLOCK), ['wall0'], 'no `now` or `cpu` override: the owner-go records are judged by the real epoch clock');
+  assert.equal(HOOK_CLOCK.wall0, performance.timeOrigin);
+  const c = { t: 60_000 };
+  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0)), false, 'default budget created at 60 s');
+  c.t += 1000;
+  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0)), false);
+  c.t = HOOK_CLOCK.wall0 + 11_000;
+  assert.equal(budgetExpired(newEvalBudget(() => c.t, () => 0, HOOK_CLOCK.wall0)), true, 'a hook budget created 11 s after process start');
+});
+
+test('budget (hook origin): the CPU limit counts from the evaluation start, not from process start (a later command field is not refused for the time before it)', () => {
+  // Failure caught: the CPU clamp used the wall since process start, so an evaluation that began 2 s in was refused after 5 s of CPU although only 4 s of its own wall had passed.
+  const c = { wall: 2000, cpu: 0 };
+  const budget = newEvalBudget(() => c.wall, () => c.cpu, 0);
+  Object.assign(c, { wall: 6000, cpu: 5200 });
+  assert.equal(budgetExpired(budget), false, '4 s of own wall bounds the 5.2 s of CPU');
+  Object.assign(c, { wall: 8000, cpu: 5200 });
+  assert.equal(budgetExpired(budget), true, '6 s of own wall and 5.2 s of CPU is past the CPU limit');
+  assert.equal(wallLeftMs(budget), 2000, 'the wall cap is 10 s from process start');
+});
+
+test('guard-git: a bare push does not start its second lookup once the wall cap is gone, and the first one is bounded by what is left (a hook past HOOK_TIMEOUT_S is allowed)', () => {
+  // Failure caught: the branch (5 s) and push-destination (3 s) lookups ran back to back after the last deadline check; at 9 s that could end past the host timeout.
+  const clock = { t: 9000 };
+  const seen = { branchLeft: null, destStarted: false };
+  const r = git('git push', gitFs({}), {
+    now: () => clock.t, cpu: () => 0, wall0: 0,
+    currentBranch: (dir, o) => { seen.branchLeft = o?.leftMs?.(); clock.t = 10_500; return 'agent/x'; },
+    pushDestination: () => { seen.destStarted = true; return 'origin/agent/x'; },
+  });
+  assert.equal(seen.branchLeft, 1000, 'the branch lookup is told what the cap has left');
+  assert.equal(r.decision, 'deny');
+  assert.equal(seen.destStarted, false);
+});
+
+test('the wiring lookups start nothing when no wall time is left (a throw: unknown, which the policy denies)', async () => {
+  const { realGitWiring } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const w = realGitWiring();
+  assert.throws(() => w.currentBranch(process.cwd(), { leftMs: () => 0 }));
+  assert.throws(() => w.pushDestination(process.cwd(), { leftMs: () => 0 }));
+  assert.throws(() => w.issueLabels(1, [], process.cwd(), { leftMs: () => 0 }));
+});
+
+test('a fractional wall remainder still starts a lookup (spawnSync takes whole milliseconds only); less than one whole millisecond starts none', async () => {
+  // Failure caught: 4000.25 ms left (the hook's origin is a fractional epoch) passed straight to spawnSync, which throws, so an ordinary `git push` was refused with time to spare.
+  const { realGitWiring } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const w = realGitWiring();
+  assert.doesNotThrow(() => w.currentBranch(process.cwd(), { leftMs: () => 4000.25 }));
+  assert.doesNotThrow(() => w.pushDestination(process.cwd(), { leftMs: () => 4000.25 }));
+  assert.throws(() => w.currentBranch(process.cwd(), { leftMs: () => 0.5 }), GuardLimit);
+});
+
+test('a config read cut off by its timeout is a time failure (GuardLimit), not "no config" that lets the owner-approval check pass', async () => {
+  // Failure caught: `git show` killed at its timeout returned null, the chat config was dropped, mode() answered none and a direct `gh pr merge` ran with no owner record.
+  const { ownerGoWiring } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'cfg-cut-'));
+  writeFileSync(join(dir, '.git'), 'gitdir: x\n');
+  const w = ownerGoWiring('sess');
+  assert.throws(() => w.mode(dir, { leftMs: () => 1 }), GuardLimit);
+  assert.throws(() => w.mergeTemplates(dir, { leftMs: () => 1 }), GuardLimit);
+});
+
+test('defaultGitShow: a timed-out show-ref and a timed-out show are each a GuardLimit; a git that never started is unknown, not "no config"; a plain missing ref or file is null', async () => {
+  // Failure caught: (1) the show-ref check or the show check dropped, and a cut-off read answering null, which switches the owner-approval check off;
+  // (2) a git child that never started (spawn EAGAIN: code 1, pid 0) read as "no config" for the same effect.
+  const { defaultGitShow } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const ok = { code: 0, stdout: '', stderr: '', timedOut: false, overBuffer: false, signal: null, pid: 4242 };
+  const ref = 'refs/remotes/origin/main';
+  const runner = (byVerb) => (cmd, args) => ({ ...ok, ...byVerb[args.includes('show-ref') ? 'show-ref' : 'show'] });
+  const cut = { code: 124, timedOut: true };
+  const neverStarted = { code: 1, stderr: 'spawn git EAGAIN', pid: 0 };
+
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': cut, show: {} })), GuardLimit, 'show-ref cut off');
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: cut })), GuardLimit, 'show cut off');
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': neverStarted, show: {} })), GuardLimit, 'show-ref never started');
+  assert.throws(() => defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: neverStarted })), GuardLimit, 'show never started');
+  assert.throws(() => defaultGitShow('/x', 'HEAD', undefined, runner({ show: neverStarted })), GuardLimit, 'HEAD: show never started');
+
+  assert.equal(defaultGitShow('/x', ref, undefined, runner({ 'show-ref': { code: 1 }, show: {} })), null, 'ref missing');
+  assert.equal(defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: { code: 128, stderr: 'path not in tree' } })), null, 'file missing');
+  assert.equal(defaultGitShow('/x', ref, undefined, runner({ 'show-ref': {}, show: { stdout: 'owner_approval: chat\n' } })), 'owner_approval: chat\n');
+});
+
+for (const hook of ['guard-git.mjs', 'guard-files.mjs']) {
+  test(`${hook} passes HOOK_CLOCK to the evaluators (the shared wall cap is opt-in by the hook entry points)`, () => {
+    const src = readFileSync(new URL(`../pipeline/hooks/${hook}`, import.meta.url), 'utf8');
+    assert.ok(src.includes('...HOOK_CLOCK'), `${hook} does not spread HOOK_CLOCK`);
   });
 }
 
@@ -250,9 +442,14 @@ const PROTECTED_WRITE = `echo x > ~/.claude/${'sett'}${'ings.json'}`; // what gu
 for (const [name, run] of both) {
   const decide = (cmd, o) => run(cmd, {}, o);
   const BAD = name === 'guard-git' ? MAIN_PUSH : PROTECTED_WRITE;
-  test(`${name}: the parenthesis scan inside \${...} is linear (CPU time at 2n vs n)`, () => {
-    const sample = (n) => () => cpuTime(() => decide(parenBomb(n, 'echo hi')));
-    assertLinear(sample(20_000), sample(40_000), { label: `${name} paren scan` });
+  // 100,000 parentheses against 25,000 (linear 4x, quadratic 16x), ratio 8 is 2x from each, as in guard-r10-288 B1; a span of 2x (20,000 vs 40,000) had only 1.5x of margin and flaked under load. The line cap is 200,000 characters (MAX_LINE_CHARS): past it the guard refuses the line by its size, which costs nothing and would read as "fast", so the test below pins that 100,000 is still scanned (allowed on a frozen clock), not refused.
+  // One call is only 1-20 ms there, so a sample repeats it (the baseline is tens of ms, well above the helper's slack, and a quadratic cannot hide in it).
+  test(`${name}: the parenthesis scan inside \${...} is linear (CPU time at 4n vs n)`, () => {
+    // both sizes are scanned, not refused by size: a frozen clock lets the harmless line through, a refusal would deny it
+    for (const n of [25_000, 100_000]) assert.equal(decide(parenBomb(n, 'echo hi'), { now: () => 5 }).decision, 'allow', `${n} parentheses`);
+    const REPS = 20;
+    const sample = (n) => () => cpuTime(() => { for (let i = 0; i < REPS; i++) decide(parenBomb(n, 'echo hi')); });
+    assertLinear(sample(25_000), sample(100_000), { label: `${name} paren scan`, factor: 4, ratio: 8 });
   });
 
   test(`${name}: 150,000 open parentheses in \${...} then a guarded command is denied, and fast`, () => {

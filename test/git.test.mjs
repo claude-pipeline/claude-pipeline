@@ -92,6 +92,19 @@ test('diffFiles uses the merge-base: unrelated commits that landed on main are n
   assert.match(twoDot, /D\tunrelated\.txt/);
 });
 
+test('diffFiles: a tree base is an explicit opt-in (treeBase); without it a tree id still throws, so the fail-closed callers behave as before; a commit with no common ancestor throws either way', () => {
+  const { repo, o } = baseRepo();
+  repo.branch('feat');
+  repo.write('src/feature.js', 'feature\n');
+  repo.commit('feature');
+  const tree = repo.git(['rev-parse', 'main^{tree}']).trim();
+  assert.throws(() => diffFiles(tree, 'feat', o), GitError);
+  assert.deepEqual(diffFiles(tree, 'feat', o, { treeBase: true }).map((f) => f.path), ['src/feature.js']);
+  const unrelated = repo.git(['commit-tree', tree, '-m', 'unrelated root']).trim();
+  assert.throws(() => diffFiles(unrelated, 'feat', o), GitError);
+  assert.throws(() => diffFiles(unrelated, 'feat', o, { treeBase: true }), GitError);
+});
+
 test('diffFiles ignores replace refs: a replacement commit cannot hide the real change (GIT_NO_REPLACE_OBJECTS)', () => {
   const { repo, base, o } = baseRepo();
   repo.branch('feat');
@@ -630,6 +643,20 @@ test('diffFiles still returns lines for files git would call binary (NUL byte, -
     assert.match(by[p].added[0].text, /^it\.skip\("drops", \(\) => \{\}\);/, p);
   }
   assert.ok(by['src/y.test.js'].added[0].text.includes('\0'));
+  // R1-B2: git's own binary verdict survives --text as `gitBinary` (the regression-only waiver reads it); a text file never carries it
+  assert.equal(by['src/x.test.ts'].gitBinary, true);
+  assert.equal(by['src/y.test.js'].gitBinary, true);
+});
+
+test('diffFiles: a plain text change carries no gitBinary flag', () => {
+  const { repo, o } = baseRepo();
+  repo.write('src/t.js', 'a\n');
+  repo.commit('t');
+  repo.branch('feat');
+  repo.write('src/t.js', 'b\n');
+  repo.commit('edit');
+  const [f] = diffFiles('main', 'feat', o);
+  assert.equal(Object.hasOwn(f, 'gitBinary'), false);
 });
 
 // ---- large binary documents are named, not dumped ---------------------------------------------------------------

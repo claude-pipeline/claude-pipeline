@@ -2,7 +2,7 @@
 // The "clock" here is fake (numbers computed from the size), so these tests cannot flake themselves.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { assertLinear, bestOf, cpuTime, cpuTimed } from './helpers/timing.mjs';
+import { assertLinear, bestOf, cpuTime, cpuTimed, measureWith } from './helpers/timing.mjs';
 
 const fake = (cost, n) => () => cost(n);
 
@@ -72,9 +72,72 @@ test('bestOf takes the minimum; cpuTime measures a callback in ms', () => {
 
 test("cpuTimed returns fn's value; CPU burn counts, a sleep does not (so machine load cannot trip a cap)", () => {
   assert.equal(cpuTimed(() => 42).r, 42);
-  const burn = cpuTimed(() => { const t0 = process.cpuUsage(); let x = 0; for (;;) { const d = process.cpuUsage(t0); if (d.user + d.system >= 50_000) return x; x++; } });
+  const clock = typeof process.threadCpuUsage === 'function' ? (p) => process.threadCpuUsage(p) : (p) => process.cpuUsage(p); // (the clock cpuTimed reads: stop the burn on it, not on helper-thread time it ignores)
+  const burn = cpuTimed(() => { const t0 = clock(); let x = 0; for (;;) { const d = clock(t0); if (d.user + d.system >= 50_000) return x; x++; } });
   assert.ok(burn.ms >= 30, `50 ms of CPU read ${burn.ms} ms`);
   const sleep = cpuTimed(() => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 50));
   assert.ok(sleep.ms < 25, `a 50 ms sleep read ${sleep.ms} ms of CPU`);
   assert.ok(sleep.ms < burn.ms);
+});
+
+// Fake clocks for measureWith: the process clock reports `cpuMs` of CPU for the sample, the wall clock `wallMs` of elapsed time.
+const fakeClocks = (cpuMs, wallMs) => {
+  const cpu = (prev) => (prev ? { user: cpuMs * 1000 - prev.user, system: 0 } : { user: 0, system: 0 });
+  const walls = [100, 100 + wallMs];
+  return [cpu, () => walls.shift()];
+};
+
+test("measureWith: on a process clock that also counts helper threads (CPU 2x the wall time), a sample is capped at the wall time, so Node 20 cannot read more CPU than time passed", () => {
+  const [cpu, wall] = fakeClocks(40, 20);
+  assert.equal(measureWith(cpu, wall, () => 7).ms, 20);
+  assert.equal(measureWith(...fakeClocks(40, 20), () => 7).r, 7);
+});
+
+test("measureWith: on a loaded machine (wall 3x the CPU) the CPU time is reported, not the wall, so load still cannot trip a cap", () => {
+  assert.equal(measureWith(...fakeClocks(20, 60), () => 0).ms, 20);
+});
+
+// ---- rounds: a burst of load that slows a whole round is absorbed by a fresh round; a real quadratic is slow in every round ----
+// Each fake below is a script of numbers, one per call: no real timing.
+const script = (xs, fallback) => () => (xs.length > 0 ? xs.shift() : fallback);
+
+test('assertLinear rounds: a round that is slow throughout (load) is followed by a fresh, linear round, which passes', () => {
+  // round 1: warm-up 50, baselines 50 x3, then 5 slow large samples; round 2: warm-up, baselines 50 x3, a linear large sample
+  const smalls = script([50, 50, 50, 50, 50, 50, 50, 50], 50);
+  const larges = script([900, 900, 900, 900, 900, 100], 100);
+  const out = assertLinear(smalls, larges);
+  assert.deepEqual(out, { lo: 50, hi: 100 });
+});
+
+test('assertLinear rounds: the baseline is re-measured in a fresh round (a baseline that was noisy-slow in round 1 does not stay)', () => {
+  // round 1: baseline 50, every large sample 900 (fails); round 2: warm-up 50, then baselines of 20 and a large of 30
+  const smalls = script([50, 50, 50, 50, /* round 2 */ 50, 20, 20, 20], 20);
+  const larges = script([900, 900, 900, 900, 900, /* round 2 */ 30], 30);
+  const out = assertLinear(smalls, larges);
+  assert.equal(out.lo, 20); // round 2's own baseline, not round 1's 50
+});
+
+test('assertLinear rounds: a quadratic cost fails every round, and the message lists each round', () => {
+  let calls = 0;
+  const small = () => { calls++; return 50; };
+  const large = () => { calls++; return 200; }; // 4x for double the input
+  assert.throws(
+    () => assertLinear(small, large, { label: 'fake' }),
+    (e) => /fake: 50ms at n\/2 -> 200ms at n \(best of 5\): not linear in all 3 rounds/.test(e.message) && /\(lo\/hi ms per round: 50\/200, 50\/200, 50\/200\)/.test(e.message),
+  );
+  assert.equal(calls, 3 * (1 + 3 + 5)); // three rounds, each: warm-up + 3 baselines + 5 large samples
+});
+
+test('assertLinear rounds: the option sets the count (rounds: 1 is the old single measure; rounds: 2 stops after two)', () => {
+  let rounds = 0;
+  const small = () => { rounds++; return 50; };
+  assert.throws(() => assertLinear(small, () => 200, { rounds: 1 }), /not linear in all 1 rounds/);
+  assert.equal(rounds, 1 + 3);
+  rounds = 0;
+  assert.throws(() => assertLinear(small, () => 200, { rounds: 2 }), /not linear in all 2 rounds \(lo\/hi ms per round: 50\/200, 50\/200\)/);
+  assert.equal(rounds, 2 * (1 + 3));
+});
+
+test('assertLinear rounds: each round keeps the ratio / factor / slack semantics (factor 4 reports n/4, a quadratic still fails)', () => {
+  assert.throws(() => assertLinear(() => 50, () => 800, { factor: 4, ratio: 8, label: 'fake' }), /fake: 50ms at n\/4 -> 800ms at n .*not linear in all 3 rounds/);
 });

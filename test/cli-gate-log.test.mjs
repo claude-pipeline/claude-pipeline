@@ -74,6 +74,90 @@ test('summary: upserts the marker comment from the state and prints the agent-lo
   assert.match(body, /\*\*merged\*\*/);
 });
 
+// Failure caught: a summary posted after the PR's commits are already inside the base ref (a merge-commit merge) replaced the real "Tests added" line with zeros.
+test('summary: the Tests added line is left out when the diff against the base ref is empty, and present when a line changed', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  saveState(repo.dir, summaryState());
+
+  const empty = summaryGh();
+  const none = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: empty });
+  assertExit(none, 0, none.stderr + none.stdout);
+  assert.equal(none.json.testsAdded, undefined, 'HEAD is the base ref: nothing changed, no line of zeros');
+  assert.doesNotMatch(JSON.parse(empty.calls().find((c) => c.argv.includes('POST')).stdin).body, /Tests added/);
+
+  repo.branch('feat/x');
+  repo.write('src/a.js', 'export const a = 1;\n');
+  repo.commit('add a');
+  const changed = summaryGh();
+  const some = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: changed });
+  assertExit(some, 0, some.stderr + some.stdout);
+  assert.match(some.json.testsAdded, /^Tests added: 0 files, 0 cases; changed source lines : test lines = 1 : 0$/);
+  assert.match(JSON.parse(changed.calls().find((c) => c.argv.includes('POST')).stdin).body, /Tests added: 0 files, 0 cases; changed source lines : test lines = 1 : 0/);
+});
+
+// Failure caught: a PR stacked on another PR's branch reported the files and lines of both PRs in its Tests added line, because the diff was measured against the default branch, not the PR's own base.
+test('summary: the Tests added line is measured against the PR base branch (a stacked PR), falling back to the default branch when that ref is missing', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  saveState(repo.dir, summaryState());
+  repo.branch('feat/parent');
+  repo.write('src/parent.js', 'export const p = 1;\nexport const q = 2;\nexport const r = 3;\n');
+  repo.commit('parent work');
+  repo.branch('feat/child');
+  repo.write('src/child.js', 'export const c = 1;\n');
+  repo.commit('child work');
+  const ghFor = (baseRefName) => createFakeGh([
+    { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget', baseRefName } },
+    ME, REPO,
+    { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
+    { match: '^api -X POST repos/acme/widgets/issues/12/comments', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-5' } },
+  ]);
+
+  const stacked = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: ghFor('feat/parent') });
+  assertExit(stacked, 0, stacked.stderr + stacked.stdout);
+  assert.match(stacked.json.testsAdded, /source lines : test lines = 1 : 0$/, 'only the child PR own line');
+
+  const missing = cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: ghFor('gone/branch') });
+  assertExit(missing, 0, missing.stderr + missing.stdout);
+  assert.match(missing.json.testsAdded, /source lines : test lines = 4 : 0$/, 'no such base ref: the default branch');
+});
+
+test('summary: the agent-log line ends with the weekly Codex figure (7 days, every repo); codexUsage is in the JSON; the pending line carries it too', () => {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', pipelineYml());
+  repo.write('.gitignore', '.review/\n');
+  repo.commit('init');
+  saveState(repo.dir, summaryState());
+  const ledger = join(mkdtempSync(join(tmpdir(), 'cp-usage-')), 'codex-usage.jsonl');
+  const ago = (days) => new Date(Date.now() - days * 24 * 3600 * 1000).toISOString();
+  const entry = (days, effort, over = {}) => JSON.stringify({ v: 1, ts: ago(days), repo: 'acme/other', pr: 3, round: 1, effort, model: 'm', ok: true, ...over });
+  const env = { PIPELINE_CODEX_USAGE_FILE: ledger };
+  const run = () => cli(['summary', '--pr', String(PR), '--outcome', 'merged'], { dir: repo.dir, fake: summaryGh(), env });
+
+  const none = run();
+  assertExit(none, 0);
+  assert.match(none.json.agentLogLine, /· merged$/, 'no ledger, no figure');
+  assert.deepEqual(none.json.codexUsage, { runs: 0, high: 0, xhigh: 0, failed: 0 });
+
+  writeFileSync(ledger, `${[entry(8, 'high'), entry(1, 'high'), entry(2, 'high', { ok: false }), entry(3, 'medium')].join('\n')}\nnot json\n`);
+  const some = run();
+  assertExit(some, 0);
+  assert.match(some.json.agentLogLine, / · merged · Codex 7d: 3 runs \(2 high\)$/, 'the 8-day-old run and the bad line are not counted; no xhigh text when none');
+  assert.deepEqual(some.json.codexUsage, { runs: 3, high: 2, xhigh: 0, failed: 1 });
+  assert.equal(some.json.pendingLogLine, some.json.agentLogLine.replace(' · merged · Codex', ' · merged — prod smoke pending · Codex'));
+
+  writeFileSync(ledger, `${[entry(1, 'high'), entry(1, 'xhigh'), entry(1, 'xhigh')].join('\n')}\n`);
+  const x = run();
+  assert.match(x.json.agentLogLine, / · merged · Codex 7d: 3 runs \(1 high, 2 xhigh\)$/);
+  assert.deepEqual(x.json.codexUsage, { runs: 3, high: 1, xhigh: 2, failed: 0 });
+  rmSync(join(ledger, '..'), { recursive: true, force: true });
+});
+
 test('summary: edits the existing summary comment in place (marker + same author) and needs a review state', () => {
   const repo = createTmpRepo();
   repo.write('.claude/pipeline.yml', pipelineYml());

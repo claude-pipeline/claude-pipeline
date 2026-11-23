@@ -21,6 +21,7 @@ const HEAD = 'c'.repeat(40);
 const JOB = 'test (ubuntu)';
 const NUM = 7;
 const RUN_ID = 555;
+const MG_RUN_ID = 777;
 
 const pr = (over = {}) => ({ number: NUM, merged_at: '2026-10-07T10:00:00Z', base: { ref: 'main' }, head: { sha: HEAD }, ...over });
 
@@ -33,6 +34,9 @@ function gh(tree, over = {}, extra = []) {
     compare: { stdoutJson: { status: 'ahead' } },
     runs: { stdoutJson: { workflow_runs: [{ id: RUN_ID, status: 'completed', conclusion: 'success', html_url: `https://github.example/runs/${RUN_ID}` }] } },
     jobs: { stdoutJson: { jobs: [{ name: 'test (windows)', conclusion: 'failure' }, { name: JOB, conclusion: 'success' }] } },
+    // merge-queue evidence: none by default, so every PR-path test keeps its result
+    mgRuns: { stdoutJson: { workflow_runs: [] } },
+    mgJobs: { stdoutJson: { jobs: [{ name: JOB, conclusion: 'success' }] } },
     ...over,
   };
   const entry = (match, key) => (e[key] === 'fail' ? { match, code: 1, stderr: 'HTTP 500' } : { match, ...e[key] });
@@ -44,6 +48,8 @@ function gh(tree, over = {}, extra = []) {
     entry(`^api repos/${REPO}/compare/${PARENT}\\.\\.\\.${HEAD}$`, 'compare'),
     entry(`^api repos/${REPO}/actions/workflows/ci\\.yml/runs\\?head_sha=${HEAD}&event=pull_request`, 'runs'),
     entry(`^api repos/${REPO}/actions/runs/${RUN_ID}/jobs\\?filter=all`, 'jobs'),
+    entry(`^api repos/${REPO}/actions/workflows/ci\\.yml/runs\\?head_sha=${SHA}&event=merge_group&per_page=100$`, 'mgRuns'),
+    entry(`^api repos/${REPO}/actions/runs/${MG_RUN_ID}/jobs\\?filter=all&per_page=100$`, 'mgJobs'),
   ];
 }
 
@@ -171,16 +177,83 @@ test('missing inputs -> run', async () => {
   assert.equal(r.output, 'run=true');
 });
 
+// ---- merge-queue evidence: the queue fast-forwards main to the commit its merge_group run tested ----
+const mgRun = (over = {}) => ({ id: MG_RUN_ID, status: 'completed', conclusion: 'success', event: 'merge_group', head_sha: SHA, head_repository: { full_name: REPO }, html_url: `https://github.example/runs/${MG_RUN_ID}`, ...over });
+const mgRuns = (...workflow_runs) => ({ mgRuns: { stdoutJson: { workflow_runs } } });
+// A PR path that cannot prove anything (different tree): only the merge_group evidence can skip.
+const NO_PR_EVIDENCE = 'd'.repeat(40);
+
+test('a queue merge is not re-run: a green merge_group run on the pushed sha skips even when the PR path says run', async () => {
+  const r = await decide({ over: mgRuns(mgRun()), headTree: NO_PR_EVIDENCE });
+  assert.equal(r.code, 0, r.stderr);
+  assert.equal(r.output, 'run=false', r.stdout);
+  assert.match(r.stdout, new RegExp(`evidence: run ${MG_RUN_ID} .* job "test \\(ubuntu\\)" concluded success in the merge_group run on ${SHA}`));
+  assert.match(r.stdout, /SKIP: this exact commit already passed this job in the merge queue/);
+  assert.doesNotMatch(r.stdout, /RUN: /);
+});
+
+test('a merge_group run that proves nothing is not used: another sha, failed, cancelled, in progress, wrong event, or from a fork -> run', async () => {
+  const cases = {
+    'different sha': mgRun({ head_sha: 'e'.repeat(40) }),
+    failed: mgRun({ conclusion: 'failure' }),
+    cancelled: mgRun({ conclusion: 'cancelled' }),
+    'in progress': mgRun({ status: 'in_progress', conclusion: null }),
+    'not a merge_group run': mgRun({ event: 'pull_request' }),
+    'other repository': mgRun({ head_repository: { full_name: 'fork/app' } }),
+    'no repository': mgRun({ head_repository: undefined }),
+  };
+  for (const [name, run] of Object.entries(cases)) {
+    const r = await decide({ over: mgRuns(run), headTree: NO_PR_EVIDENCE });
+    assert.equal(r.code, 0, name);
+    assert.equal(r.output, 'run=true', `${name}: ${r.stdout}`);
+    assert.match(r.stdout, /merge_group: no completed successful ci\.yml merge_group run/, name);
+    assert.match(r.stdout, /RUN: tree differs/, `${name}: the PR path's reason closes the log`);
+  }
+});
+
+test('a green merge_group run without this job green (only another shard passed, or the job is missing) is not used -> run', async () => {
+  for (const jobs of [
+    [{ name: 'test (windows 1/3)', conclusion: 'success' }],
+    [{ name: JOB, conclusion: 'failure' }, { name: 'test (windows 1/3)', conclusion: 'success' }],
+    [{ name: JOB, conclusion: 'skipped' }],
+    [],
+  ]) {
+    const r = await decide({ over: { ...mgRuns(mgRun()), mgJobs: { stdoutJson: { jobs } } }, headTree: NO_PR_EVIDENCE });
+    assert.equal(r.output, 'run=true', JSON.stringify(jobs));
+    assert.match(r.stdout, /merge_group: no completed successful/);
+  }
+});
+
+test('a failing or garbled merge_group lookup falls through to the PR evidence (skip) and never fails the step', async () => {
+  const bad = [
+    { mgRuns: 'fail' },
+    { mgRuns: { stdout: 'not json' } },
+    { mgRuns: { stdoutJson: {} } },
+    { ...mgRuns(mgRun()), mgJobs: 'fail' },
+    { ...mgRuns(mgRun()), mgJobs: { stdoutJson: {} } },
+  ];
+  for (const over of bad) {
+    const r = await decide({ over });
+    assert.equal(r.code, 0, JSON.stringify(over));
+    assert.equal(r.output, 'run=false', `${JSON.stringify(over)}: ${r.stdout}`);
+    assert.match(r.stdout, /merge_group: /);
+    assert.match(r.stdout, /SKIP: this exact tree already passed this job on the PR/);
+  }
+  const noPr = await decide({ over: { mgRuns: 'fail' }, headTree: NO_PR_EVIDENCE });
+  assert.equal(noPr.code, 0);
+  assert.equal(noPr.output, 'run=true');
+});
+
 // ---- how ci.yml wires it in ----
 const ci = read('.github/workflows/ci.yml');
-const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu|windows-shard|windows):)/m).slice(1);
+const jobBlocks = () => ci.split(/^ {2}(?=test-(?:ubuntu-node|ubuntu|windows-shard|windows):)/m).slice(1);
 const blockOf = (id) => jobBlocks().find((b) => b.startsWith(`test-${id}:`));
 const stepsOf = (block) => block.split(/^ {6}(?=- )/m).slice(1);
 
-test('the test jobs open with the skip step, push only, naming their own job (ubuntu and each Windows shard)', () => {
+test('the test jobs open with the skip step, push only, naming their own job (each Ubuntu Node version and each Windows shard)', () => {
   const blocks = jobBlocks();
-  assert.equal(blocks.length, 3, 'ubuntu, the Windows shard job and the aggregate');
-  for (const block of blocks.filter((b) => !b.startsWith('test-windows:'))) {
+  assert.equal(blocks.length, 4, 'the Ubuntu Node job, its aggregate, the Windows shard job and its aggregate');
+  for (const block of blocks.filter((b) => !b.startsWith('test-windows:') && !b.startsWith('test-ubuntu:'))) {
     const jobName = block.match(/^ {4}name: (.+)$/m)[1].trim();
     const steps = stepsOf(block);
     const at = steps.findIndex((s) => s.includes('tested-tree.mjs'));
@@ -218,6 +291,24 @@ test('the Windows shard job: JOB_NAME is the per-shard name, shards run `--shard
   assert.match(installer[0], /if: matrix\.shard == 3 && \(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\)/);
 });
 
+test('the Ubuntu Node job: JOB_NAME is the per-Node-version name, the suite and the installer run for every Node version', () => {
+  const block = blockOf('ubuntu-node');
+  assert.match(block, /^ {4}name: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
+  assert.match(block, /JOB_NAME: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
+  assert.match(block, /run: node scripts\/test\.mjs$/m);
+  const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
+  assert.equal(installer.length, 1);
+  assert.match(installer[0], /^ {8}if: github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'$/m);
+});
+
+test('the aggregate test (ubuntu) job has no skip step and always evaluates the Node jobs result', () => {
+  const block = blockOf('ubuntu');
+  assert.ok(!block.includes('tested-tree.mjs'), 'nothing to skip: it only reads the Node jobs');
+  assert.match(block, /^ {4}name: test \(ubuntu\)$/m);
+  assert.match(block, /^ {4}needs: test-ubuntu-node$/m);
+  assert.match(block, /^ {4}if: always\(\) && \(github\.event_name != 'pull_request' \|\| !github\.event\.pull_request\.draft\)$/m);
+});
+
 test('the aggregate test (windows) job has no skip step and always evaluates the shard result', () => {
   const block = blockOf('windows');
   assert.ok(!block.includes('tested-tree.mjs'), 'nothing to skip: it only reads the shards');
@@ -237,4 +328,5 @@ test('the header comment explains the skip', () => {
   const header = ci.split(/^name: CI/m)[0];
   assert.match(header, /skip/i);
   assert.match(header, /identical tree/i);
+  assert.match(header, /merge_group run/i, 'a queue merge skips on the queue run of the same commit');
 });

@@ -221,6 +221,33 @@ test('recordForOutcome: no record makes one; a record for another PR is replaced
   assert.match(other.warnings[0], /does not belong/);
 });
 
+// R9-F1: replacing a record bound to another PR / branch must not drop the merge gate's resumed mark (the comment is still this PR's).
+test('recordForOutcome: a resumed record bound to another branch is replaced by one that is still resumed', () => {
+  const resumed = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) };
+  const old = applyCheckpoint(emptyRecord({ ...ID, branch: 'feat/old-branch' }), { resumed }, CTX);
+  const { record, warnings } = recordForOutcome(old, { ...ID, outcome: 'merged', ...CTX });
+  assert.deepEqual([record.branch, record.resumed], ['feat/x', resumed]);
+  assert.match(warnings[0], /does not belong/);
+  assert.equal(recordForOutcome(emptyRecord({ ...ID, branch: 'feat/old-branch' }), { ...ID, outcome: 'merged', ...CTX }).record.resumed, undefined, 'an ordinary one stays ordinary');
+});
+
+// #641: a repo rename / transfer is the ONLY mismatch -> the record (booked cost included) is carried over, not replaced by an empty one.
+test('recordForOutcome: a repo rename / transfer carries the whole record over (cost, resumed), with a warning naming both slugs', () => {
+  const resumed = { at: '2026-10-12T08:00:00.000Z', host: 'pc-2', head: 'a'.repeat(40) };
+  const entry = { phase: 'build', role: 'implementer', input: 10, output: 5, cacheRead: 0, cacheWrite: 0, usd: 1.25 };
+  const old = applyCheckpoint(emptyRecord({ ...ID, repo: 'old/x' }), { resumed, round: 3, request: 'keep me', cost: { entry } }, CTX);
+  const { record, warnings } = recordForOutcome(old, { ...ID, repo: 'new/x', outcome: 'merged', ...CTX });
+  assert.equal(record.repo, 'new/x');
+  assert.deepEqual(record.cost, old.cost, 'the booked cost survives');
+  assert.ok(JSON.stringify(record.cost).includes('1.25'), 'the booked usd is in it');
+  assert.deepEqual([record.resumed, record.round, record.request], [resumed, 3, 'keep me']);
+  assert.deepEqual(warnings, ['the repo moved (the run record said "old/x", the PR is in "new/x"): carried the run record over']);
+  // the repo AND another field differ: not a rename of this PR's comment, so today's fresh start (cost dropped)
+  const other = recordForOutcome({ ...old, pr: 99 }, { ...ID, repo: 'new/x', outcome: 'merged', ...CTX });
+  assert.equal(other.record.cost, undefined);
+  assert.match(other.warnings[0], /does not belong/);
+});
+
 test('renderStatusBlock: shape, and hostile text cannot forge or close a marker or mention anyone', () => {
   const rec = applyCheckpoint(emptyRecord(ID), {
     step: 'review',

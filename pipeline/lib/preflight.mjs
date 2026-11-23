@@ -11,6 +11,10 @@ import { createGitHub } from './github.mjs';
 import { claudeCodeStatus } from './claude-code-version.mjs';
 import { evaluateBashForFiles } from '../hooks/lib/files-policy.mjs';
 import { MIN_FABLE, readFloor, readableAllowedIds, standingBypasses } from './model-floor.mjs';
+import { readDbRefs } from '../hooks/lib/db-refs.mjs';
+import { accountHome } from './paths.mjs';
+import { existsSync } from 'node:fs';
+import { join } from 'node:path';
 
 const CODEX_TIMEOUT_MS = 15_000;
 
@@ -151,6 +155,16 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     } catch { /* the guard could not judge it: nothing to warn about */ }
   }
 
+  // #262: every hosted Supabase project counts as live unless the owner declared it dev in the registry (hooks/lib/db-refs.mjs). A repo with supabase/migrations and no registry
+  // is where the next apply is refused for want of a name and a go: say so before an agent hits it. Informational: it never changes canMerge.
+  try {
+    if (existsSync(join(root, 'supabase', 'migrations'))) {
+      const reg = readDbRefs(env.HOME || env.USERPROFILE || accountHome());
+      if (reg.ok && reg.missing) warnings.push('this repo has supabase/migrations and the owner has no database registry (~/.claude/pipeline-state/db-refs.json): every hosted Supabase project counts as live and needs a typed go. The owner registers the projects in their own terminal: `pipeline db-refs set --ref <20 chars> --name "<label>" --repo <owner/name> [--dev]`');
+      else if (!reg.ok) warnings.push(`the database registry (~/.claude/pipeline-state/db-refs.json) is ${reg.reason}: every Supabase write is refused until the owner fixes it with \`pipeline db-refs set …\` in their own terminal`);
+    }
+  } catch { /* the registry could not be looked at: nothing to warn about */ }
+
   // A standing owner allowance or a hold below MIN_FABLE lets a Fable proof through that the shipped floor would refuse: say so until it is cleared.
   // Informational like the build check: it never changes canMerge (an unreadable registry is for arbiter apply to report).
   try {
@@ -174,6 +188,12 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   if (off) reasons.push('PIPELINE_OFF=1 is set: the pipeline is switched off');
   reasons.push(...issueReasons('pipeline-pause', pause), ...issueReasons('pipeline-rollback', rollback));
   if (config.ok && !enforcementOk) reasons.push(protectionReason(enforcement));
+  // #430: the pipeline supports only GitHub's default branch as its main (the gate, the guard and branch protection all read it); a pipeline.yml naming another one is reported here and
+  // refused at the merge gate, with the fix. A config that did not load (cfg null) or a default branch GitHub did not answer for says nothing.
+  const defaultBranchMismatch = cfg && typeof enforcement.branch === 'string' && cfg.default_branch !== enforcement.branch
+    ? `pipeline.yml names default_branch "${cfg.default_branch}" but GitHub's default branch is "${enforcement.branch}": the pipeline supports only GitHub's default branch as its main — set default_branch: ${enforcement.branch}, or make ${cfg.default_branch} the default branch on GitHub`
+    : null;
+  if (defaultBranchMismatch !== null) reasons.push(defaultBranchMismatch);
 
   return {
     ok: config.ok && authed,
@@ -186,7 +206,7 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
     codex: codexState,
     clean,
     claudeCode,
-    canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk,
+    canMerge: config.ok && authed && !off && !pause.open && !rollback.open && enforcementOk && defaultBranchMismatch === null,
     reasons,
     warnings,
   };

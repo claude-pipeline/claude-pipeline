@@ -34,9 +34,17 @@ test('protectedRoots lists the pipeline files under <home>/.claude in POSIX form
     '/home/u/.claude/agents/judge.md',
     '/home/u/.claude/agents/arbiter.md',
     '/home/u/.claude/agents/arbiter-fix.md',
+    '/home/u/.claude/agents/substitute-opus.md',
+    '/home/u/.claude/agents/substitute-fable.md',
     '/home/u/.claude/pipeline',
     '/home/u/.claude/settings.json',
+    '/home/u/.claude/hooks', // (#261)
+    '/home/u/.claude/settings.local.json', // (#261)
     '/home/u/.claude/pipeline-state/owner-go',
+    '/home/u/.claude/pipeline-state/db-refs.json', // (#262)
+    '/home/u/.claude/pipeline-state/codex',
+    '/home/u/.codex/sessions',
+    '/home/u/.claude/pipeline-local', // (#648)
   ]);
   assert.equal(protectedRoots('C:\\Users\\u\\')[0], 'C:/Users/u/.claude/skills/ship');
 });
@@ -47,6 +55,8 @@ const FILE_DENY = [
   ['Edit ship skill via ~', 'Edit', { file_path: '~/.claude/skills/ship/SKILL.md', old_string: 'a', new_string: 'b' }],
   ['Write arbiter agent', 'Write', { file_path: '/home/u/.claude/agents/arbiter.md', content: 'x' }],
   ['Write arbiter-fix agent', 'Write', { file_path: '/home/u/.claude/agents/arbiter-fix.md', content: 'x' }],
+  ['Write substitute-opus agent', 'Write', { file_path: '/home/u/.claude/agents/substitute-opus.md', content: 'x' }],
+  ['Edit substitute-fable agent via ~', 'Edit', { file_path: '~/.claude/agents/substitute-fable.md', old_string: 'a', new_string: 'b' }],
   ['Edit arbiter-fix agent via ~', 'Edit', { file_path: '~/.claude/agents/arbiter-fix.md', old_string: 'a', new_string: 'b' }],
   ['Edit installed hook', 'Edit', { file_path: '/home/u/.claude/pipeline/hooks/guard-git.mjs', old_string: 'a', new_string: 'b' }],
   ['Write global settings', 'Write', { file_path: '/home/u/.claude/settings.json', content: '{}' }],
@@ -207,6 +217,19 @@ const BASH_DENY = [
   ['sudo wrapper', 'sudo rm -rf ~/.claude/pipeline'],
   ['xargs wrapper', 'echo ~/.claude/pipeline | xargs rm -rf'],
   ['xargs fan-out from a read-only listing', 'find ~/.claude/pipeline -type f | xargs rm'],
+  // (#563 R1-B2: a wrapper that runs a quoted string keeps its text; only a plain data command's quoted text is blanked)
+  ['env -S runs a quoted string that fans out', "find ~/.claude/pipeline -type f | env -S 'nice xargs rm'"],
+  ['flock -c runs a quoted string that fans out', "find ~/.claude/pipeline -type f | flock f -c 'cat | xargs rm'"],
+  // (#563 R2-F1: a head the parser unwraps but WRAPPER_CMDS lacks, and a shell named behind an unlisted runner, keep their quoted text too)
+  ['noglob env -S runs a quoted string that fans out', "find ~/.claude/pipeline -type f | noglob env -S 'nice xargs rm'"],
+  ['gtimeout runs sh -c with a fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 sh -c 'cat | xargs rm'"],
+  // (#563 R3-F1: every INTERPRETERS name keeps its quoted text, not only the SHELL_NAMES list)
+  ['ash -c runs a quoted fan-out', "find ~/.claude/pipeline -type f | ash -c 'cat | xargs rm'"],
+  ['mksh behind gtimeout runs a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 mksh -c 'cat | xargs rm'"],
+  // (#563 R4-F1: a shell the parser runs but no name list holds (rbash, yash) keeps its quoted text: only a known non-runner is blanked)
+  ['rbash -c runs a quoted fan-out', "find ~/.claude/pipeline -type f | rbash -c 'cat | xargs rm'"],
+  ['yash behind gtimeout runs a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 yash -c 'cat | xargs rm'"],
+  ['xargs inside a substitution in a quoted argument (#563: quoted prose is blanked, a substitution is not)', 'echo "$(find ~/.claude/pipeline -type f | xargs rm)"'],
   ['sh fed by a read-only listing', "find ~/.claude/pipeline -type f -printf 'rm %p\\n' | sh"],
   ['eval of a substitution', 'eval "$(cat ~/.claude/pipeline/VERSION)"'],
   ['assignment then use', 'D=~/.claude/pipeline; rm -rf $D'],
@@ -257,6 +280,29 @@ const BASH_ALLOW = [
   ['pwsh Get-Content', `pwsh -NoProfile -Command "Get-Content ~/.claude/settings.json"`],
   ['PowerShell word in an unrelated path', 'ls /repo/docs/PIPELINE.md'],
   ['pipeline protect without --apply', 'node ~/.claude/pipeline/bin/pipeline.mjs protect --repo .'],
+  // #563, second case: the word `parallel` / `xargs` inside a quoted prose argument (a PR title in `summary --built`, `agent-log publish --line`) is data, not a fan-out command
+  ['summary text that says parallel', 'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 561 --outcome awaiting-owner-merge --built "Load-proof guard timing tests and parallel ubuntu Node 20 and 24 CI jobs"'],
+  ['agent-log line that says parallel', "node ~/.claude/pipeline/bin/pipeline.mjs agent-log publish --line 'Load-proof guard timing tests and parallel ubuntu Node jobs (#477, #243)'"],
+  // #610 #617 #620 #624: quoted prose that says parallel / xargs is data when it is a named operand of a command that cannot run it (a pattern, the pipeline's prose flags, a git log message filter)
+  ['env + assignment then rg with a quoted pattern (#610)', "env LC_ALL=C rg ' xargs ' ~/.claude/pipeline"],
+  ['env + assignment then grep -n with a quoted pattern (#610)', "env LC_ALL=C grep -n ' parallel ' ~/.claude/pipeline/VERSION"],
+  ['rg -e patterns, one of them the word exec (#610)', "rg -e ' xargs ' -e exec ~/.claude/pipeline"],
+  ['summary --built after a $(...) assignment (#617-1)', 'GH_TOKEN="$(gh auth token)" node ~/.claude/pipeline/bin/pipeline.mjs summary --built "x parallel y"'],
+  ['summary --built behind a leading if (#617-2)', 'if node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 561 --built "x parallel y"; then echo ok; fi'],
+  ['quoted head run of the trusted tool with --built prose (#617-4)', '"~/.claude/pipeline/bin/pipeline.mjs" summary --built "x parallel y"'],
+  ['--built prose ending in an interpreter-looking R1/R2 (#620)', 'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 606 --outcome awaiting-owner-merge --built "Guard tests run in parallel jobs; fixes R1/R2"'],
+  ['git log --grep= with a fan-out word (#624)', 'git -C ~/.claude/pipeline log --grep="use parallel workers"'],
+  ['git log --grep with a fan-out word and --oneline (#624)', 'git -C ~/.claude/pipeline log --grep "use parallel workers" --oneline'],
+  // (green before this change: every prose flag of the trusted command keeps main's blanking)
+  ['summary --built with an apostrophe', `node ~/.claude/pipeline/bin/pipeline.mjs summary --built "don't run jobs in parallel"`],
+  ['comment --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs comment --pr 5 --reason 'a parallel b'"],
+  ['triage --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs triage --pr 5 --reason 'a parallel b'"],
+  ['triage --owner-quote prose', "node ~/.claude/pipeline/bin/pipeline.mjs triage --pr 5 --owner-quote 'a parallel b'"],
+  ['checkpoint --next prose', "node ~/.claude/pipeline/bin/pipeline.mjs checkpoint --next 'a parallel b'"],
+  ['checkpoint --detail prose', "node ~/.claude/pipeline/bin/pipeline.mjs checkpoint --detail 'a parallel b'"],
+  ['redraft --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs redraft --pr 5 --reason 'a parallel b'"],
+  ['merge-hold --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs merge-hold --pr 5 --reason 'a parallel b'"],
+  ['live-db --summary prose', "node ~/.claude/pipeline/bin/pipeline.mjs live-db present --summary 'a parallel b'"],
   ['a different repo .claude dir', 'cat /repo/.claude/settings.json > /dev/null'],
   ['empty command', ''],
 ];
@@ -267,6 +313,41 @@ for (const [name, cmd] of BASH_ALLOW) {
     assert.equal(r.decision, 'allow', `${cmd} -> ${r.reason}`);
   });
 }
+
+// #618 #610 #617 #624: the fan-out gate. Each row is refused BY that gate ("hands work to xargs or a shell"): the protected path is only on the producer side of the pipe (or a data operand
+// sits next to something that runs), and the quoted text is a command line a wrapper, pager, preprocessor, git config or file program hands to a shell. Catches: a quote hiding 'xargs rm' from the gate.
+const FAN_OUT_DENY = [
+  ["env -S 'xargs rm' (a quote before the word)", "find ~/.claude/pipeline -type f | env -S 'xargs rm'"],
+  ['gtimeout sh -c with a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 sh -c 'xargs rm'"],
+  ['/usr/bin/time -f with a quoted fan-out (wrapper option with a side effect)', "find ~/.claude/pipeline -type f | /usr/bin/time -o out.txt -f 'xargs rm' cat x"],
+  ['rg --pre behind env', "find ~/.claude/pipeline -type f | env LESS=x rg --pre 'xargs rm' x"],
+  ['rg --pre', "find ~/.claude/pipeline -type f | rg --pre 'xargs rm' x"],
+  ['bat --pager', "find ~/.claude/pipeline -type f | bat --pager 'xargs rm' x"],
+  ['git -c core.pager after a producer', "find ~/.claude/pipeline -type f | git -c core.pager='xargs rm' log"],
+  ['git -c core.pager after a read of the tree', "cat ~/.claude/pipeline/VERSION | git -c core.pager='xargs rm' log"],
+  ['a non-trusted file program given a compound argument', "find ~/.claude/pipeline -type f | node /tmp/x.mjs 'ls; xargs rm'"],
+  ['triage settle --test-cmd is run by a shell', "find ~/.claude/pipeline -type f | node ~/.claude/pipeline/bin/pipeline.mjs triage settle --id 1 --result bug-confirmed --test-cmd 'xargs rm x' --test-file x"],
+  ['LESSOPEN pipe', "find ~/.claude/pipeline -type f | LESSOPEN='|xargs rm %s' less x"],
+  // (the same operands as the ALLOW rows, next to something that runs)
+  ['git log --grep piped to xargs', 'git -C ~/.claude/pipeline log --grep="a parallel b" | xargs rm'],
+  ['a second quoted word on an rg line is scanned', "env LC_ALL=C rg -e ' xargs ' ~/.claude/pipeline 'q; xargs rm'"],
+  ['a wrapper other than env + assignments keeps the text', "wsl grep -e 'x; xargs rm' ~/.claude/pipeline/VERSION"],
+  ['an assignment-only line stays refused (a value may be run later)', 'TITLE="a parallel b"; ls ~/.claude/pipeline'],
+];
+for (const [name, cmd] of FAN_OUT_DENY) {
+  test(`bash DENY (fan-out gate): ${name}`, () => {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /hands work to xargs or a shell/, cmd);
+  });
+}
+
+test('bash DENY: a git -c core.pager config before -C ... log --grep stays refused (not a read-only command)', () => {
+  assert.equal(bash(`git -c core.pager='xargs rm' -C ~/.claude/pipeline log --grep="use workers"`), 'deny');
+});
+test('bash DENY: git log --grep piped to a shell stays refused', () => {
+  assert.equal(bash(`git -C ~/.claude/pipeline log --grep="a parallel b" --format='%s' | sh`), 'deny');
+});
 
 test('bash: PIPELINE_ADMIN=1 in the process env allows everything', () => {
   const env = { PIPELINE_ADMIN: '1' };
@@ -336,7 +417,8 @@ test('bash: job start unwraps the inner command', () => {
 // ---- Windows --------------------------------------------------------------------------------
 
 test('bash on win32: PowerShell and cmd forms of the home path', () => {
-  const w = (cmd) => evaluateBashForFiles(cmd, { ...WIN, cwd: 'C:\\repo' }).decision;
+  // (these are PowerShell lines: the raw-text route for a backslash CLI path is for the PowerShell tool only, so the tool is named; Git Bash drops those backslashes)
+  const w = (cmd) => evaluateBashForFiles(cmd, { ...WIN, cwd: 'C:\\repo', shell: 'powershell' }).decision;
   assert.equal(w('Set-Content $env:USERPROFILE\\.claude\\settings.json x'), 'deny');
   assert.equal(w('Set-Content $ENV:userprofile\\.claude\\settings.json x'), 'deny');
   assert.equal(w('del %USERPROFILE%\\.claude\\agents\\judge.md'), 'deny');
@@ -522,7 +604,8 @@ const MCP_ALLOW = [
   ['write_file mentioning disableAllHooks outside a settings file', 'mcp__filesystem__write_file', { path: '/repo/docs/n.md', content: 'about disableAllHooks' }],
   ['write_file documenting the guard without assigning PIPELINE_ADMIN', 'mcp__filesystem__write_file', { path: '/repo/docs/n.md', content: 'the PIPELINE_ADMIN guard' }],
   ['write tool with no path keys', 'mcp__notes__create_note', { title: 't', text: 'launch with PIPELINE_ADMIN=1 claude' }],
-  ['database tool', 'mcp__plugin_supabase_supabase__apply_migration', { name: 'x', query: 'select 1' }],
+  // (#262: a Supabase WRITE with no project_id is refused now, test/live-db-guard.test.mjs; the allow row keeps a read-class database tool)
+  ['database tool', 'mcp__plugin_supabase_supabase__list_tables', { project_id: 'abcdefghij0123456789', schemas: ['public'] }],
   ['issue update with no path keys', 'mcp__sentry__update_issue', { issueId: 'A-1', status: 'resolved' }],
   ['no tool_input', 'mcp__filesystem__write_file', undefined],
   ['non-string path values', 'mcp__filesystem__write_file', { path: 7, paths: [null, {}], content: 'x' }],
@@ -827,6 +910,8 @@ test('hook: an evaluator that throws, or returns no decision, is denied for a co
   fs.mkdirSync(path.join(dir, 'lib'));
   const copy = path.join(dir, 'guard-files.mjs');
   fs.copyFileSync(HOOK, copy);
+  // (the hook also loads the wall-cap clock from script-candidates.mjs, which needs the two modules it imports; only files-policy.mjs is stubbed)
+  for (const m of ['script-candidates.mjs', 'shell-parse.mjs', 'sql-clients.mjs']) fs.copyFileSync(path.join(path.dirname(HOOK), 'lib', m), path.join(dir, 'lib', m));
   const stub = (body) => fs.writeFileSync(path.join(dir, 'lib', 'files-policy.mjs'), body);
   const calls = [
     { tool_name: 'Bash', tool_input: { command: 'ls -la' } },
@@ -968,6 +1053,7 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
     'bun ./pipeline/hooks/owner-go.mjs',
     './pipeline/hooks/owner-go.mjs < /tmp/in.json',
     `node -e "import('./pipeline/hooks/lib/owner-go.mjs').then((m) => m.recordApproval({}))"`,
+    `node --input-type=module <<'EOF'\nimport { recordApproval } from './pipeline/hooks/lib/owner-go.mjs';\nEOF`, // (#472: a program read from stdin)
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [
     'cat pipeline/hooks/owner-go.mjs',
@@ -978,10 +1064,150 @@ test('#58 owner-go: running the recorder by hand (installed or a source copy) is
   ]) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// #472 (Task 7): the click libraries record an owner "merge" from a dialog answer. A pending marker keeps the capture-time hook fingerprint the hook passed in, so a hand-run
+// recorder with an injected check would write a pending with a made-up capture. Running them by hand is refused on every route, like the recorder itself.
+test('#472 owner-go-click: running the click libraries by hand (a path, program text, a heredoc, a here-string) is refused; reading, testing and committing them is not', () => {
+  const LIBS = ['owner-go-click.mjs', 'owner-go-click-hook.mjs'];
+  for (const lib of LIBS) {
+    const inst = `/home/u/.claude/pipeline/hooks/lib/${lib}`;
+    for (const cmd of [
+      `node ${inst}`,
+      `node ~/.claude/pipeline/hooks/lib/${lib}`,
+      `node ${CHECKOUT}/pipeline/hooks/lib/${lib} < /tmp/in.json`,
+      `node pipeline/hooks/lib/${lib}`,
+      `bun ./pipeline/hooks/lib/${lib}`,
+      `./pipeline/hooks/lib/${lib} < /tmp/in.json`,
+      `node -e "import('./pipeline/hooks/lib/${lib}').then((m) => m.recordClick({ hookCheck: () => ({ ok: true }) }))"`,
+      `node --input-type=module -e "import('./pipeline/hooks/lib/${lib}').then((m) => m.recordClick({ check: () => null }))"`,
+      `node --input-type=module -e "import { recordClick } from '${inst}'; recordClick({})"`,
+      `node --input-type=module <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nrecordClick({ check: () => null });\nEOF`,
+      `node --input-type=module <<EOF\nconst m = await import('${inst}');\nEOF`,
+      `node --input-type=module <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `node - <<< "await import('${inst}')"`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type=module`,
+      // (R1-B1: whether the command reads stdin is decided from its own stdin source, not from the shape of its words)
+      `node --input-type module <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node --input-type=module - x <<'EOF'\nimport { recordClick } from './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node - <<EOF\nawait import('${CHECKOUT}/pipeline/hooks/lib/${lib}')\nEOF`,
+      `node /dev/stdin <<'EOF'\nimport './pipeline/hooks/lib/${lib}';\nEOF`,
+      `node /dev/fd/0 <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node /dev/stdin`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type module`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | node --input-type=module - x`,
+      `printf '%s' "import('./pipeline/hooks/lib/${lib}')" | bun -`,
+      `cat <<'EOF' | node --input-type module\nimport './pipeline/hooks/lib/${lib}';\nEOF`,
+      `echo x && echo "import('./pipeline/hooks/lib/${lib}')" | cat | node --input-type module`,
+      `node --input-type module <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `bun - <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `node --input-type module < <(echo "import('./pipeline/hooks/lib/${lib}')")`,
+      // (R2: a line that is not flat (a group, a subshell, a compound command, a function, an exec redirect, nested text) is read as a whole: the stdin a runtime gets there is not followed command by command)
+      `printf '%s\\n' "import('./pipeline/hooks/lib/${lib}')" | (node --input-type=module)`,
+      `(echo "import('./pipeline/hooks/lib/${lib}')"; true) | node --input-type=module`,
+      `{ echo "import('./pipeline/hooks/lib/${lib}')"; true; } | node --input-type=module`,
+      `(node --input-type=module) <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `{ node -; } <<'EOF'\nimport('./pipeline/hooks/lib/${lib}')\nEOF`,
+      `bash -c 'node --input-type=module' <<< "import('./pipeline/hooks/lib/${lib}')"`,
+      `exec <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module`,
+      `exec 3<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&3`,
+      `f() { node --input-type=module; }; echo "import('./pipeline/hooks/lib/${lib}')" | f`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | while :; do node -; break; done`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | if true; then node -; fi`,
+      // (R3-B1: the whole-line reading also reads the DECODED words of every command, so a name split by shell quotes cannot hide behind an unrelated `(true)`)
+      `printf '%s\\n' "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')" | node --input-type=module; (true)`,
+      `printf '%s\\n' "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')" | node --input-type=module && (true)`,
+      `node --input-type=module -e "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; (true)`,
+      `P=./pipeline/hooks/lib/owner-"${lib.slice(6)}"; node -e "import('\$P')"; (true)`,
+      `node --input-type=module <<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; (true)`,
+      `node - < <(echo "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"); (true)`,
+      // (R3-F1: stdin that arrives through a run-time variable, a kept-open or duplicated descriptor, or a file is not known text: the whole line is read)
+      `read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `read -r P <<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; node --input-type=module <<< "$P"`,
+      `: {fd}<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&$fd`,
+      `: 10<<< "import('./pipeline/hooks/lib/${lib}')"; node - <&10`,
+      `: 10<<< "import('./pipeline/hooks/lib/owner-"'${lib.slice(6)}'"')"; node - <&10`,
+      `: 10<> /tmp/p.mjs; echo "import('./pipeline/hooks/lib/${lib}')" >&10; node - <&10`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node - < /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node --input-type=module 0< /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; node - <> /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat < /tmp/p.mjs | node -`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat /tmp/p.mjs | tee /dev/null < /tmp/p.mjs | node -`,
+      // (R4-B1: every stage feeding a runtime must be a literal printer; a file operand, a decoder or any other command makes the text unknown)
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat /tmp/p.mjs | node --input-type=module`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs; cat -- /tmp/p.mjs | node -`,
+      `base64 -d <<< "aW1wb3J0KCcuL3BpcGVsaW5lL2hvb2tzL2xpYi8ke2xpYn0nKQ==" | node --input-type=module; echo "import('./pipeline/hooks/lib/${lib}')" > /tmp/p.mjs`,
+      `echo "import('./pipeline/hooks/lib/${lib}')" | sed s/a/b/ | node -`,
+      // (R5-F1: a line that redefines echo / printf / cat with an alias does not get the literal-printer reading; the alias words are read as part of the whole line)
+      `alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
+      // (a precommand wrapper or `hash -p` hides the redefiner; any redefinition the parser sees keeps the whole-line reading)
+      `builtin alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
+      `command alias echo='print -r -- "import(\\"./pipeline/hooks/lib/${lib}\\").then((m) => m.recordClick({ check: () => null }))"'\necho | node --input-type=module`,
+      `hash -p pipeline/hooks/lib/${lib} echo\necho | node --input-type=module`,
+      `builtin hash echo=pipeline/hooks/lib/${lib}\necho | node --input-type=module`,
+      // (zsh's command hash table rebinds a name too: `commands[echo]=path`, `read -A commands`)
+      `commands[echo]=pipeline/hooks/lib/${lib}\necho | node --input-type=module`,
+      `read -A commands <<< "echo pipeline/hooks/lib/${lib}"\necho | node --input-type=module`,
+      // (R4-F1: a name the line gave a value and then rebinds at run time still reads as its stale value after expansion: the text AS WRITTEN decides)
+      `P=x true; read -r P <<< "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      `export P=x; printf -v P '%s' "import('./pipeline/hooks/lib/${lib}')"; node --input-type=module <<< "$P"`,
+      // (a backslash-newline inside an unquoted heredoc splits the name in the raw text; the shell joins it)
+      `node --input-type=module <<EOF\nimport('./pipeline/hooks/lib/${lib.slice(0, 9)}\\\n${lib.slice(9)}')\nEOF`,
+    ]) assert.equal(bash(cmd), 'deny', cmd);
+    for (const cmd of [
+      `cat pipeline/hooks/lib/${lib}`,
+      `git add pipeline/hooks/lib/${lib}`,
+      `git diff -- pipeline/hooks/lib/${lib}`,
+      `grep -n recordClick pipeline/hooks/lib/${lib}`,
+      // (a library named in one command of a line, a runtime that reads no program from stdin in another)
+      `git add pipeline/hooks/lib/${lib} && node scripts/test.mjs owner-go-click.test.mjs`,
+      `git add pipeline/hooks/lib/${lib} && node --test`,
+      `git add pipeline/hooks/lib/${lib} && node --input-type module scripts/x.mjs`,
+      `git add pipeline/hooks/lib/${lib}; echo ok | node scripts/test.mjs owner-go-click.test.mjs`,
+      `cat pipeline/hooks/lib/${lib} && node --test test/owner-go-click.test.mjs`,
+      `git diff -- pipeline/hooks/lib/${lib} | grep recordClick`,
+      `git diff -- pipeline/hooks/lib/${lib} | grep recordClick || node scripts/test.mjs owner-go-click.test.mjs`,
+    ]) assert.equal(bash(cmd), 'allow', cmd);
+  }
+  // (R3-F2: a line that is not flat and names a library next to a runtime is refused as a whole, with a message that names the cause and the way out; a commit message is the deliberate cost)
+  for (const cmd of [
+    "node scripts/test.mjs owner-go-click.test.mjs && git commit -m \"$(cat <<'EOF'\nguard: refuse owner-go-click.mjs read from stdin\nEOF\n)\"",
+    "node scripts/test.mjs owner-go-click-hook.test.mjs; (true); git add pipeline/hooks/lib/owner-go-click-hook.mjs",
+    // (R5-F2: another command's output can feed the runtime; the message names that cause too)
+    'git add pipeline/hooks/lib/owner-go-click.mjs; git status --short | node scripts/x.mjs',
+  ]) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /runs a JavaScript runtime and is not a plain command line/, cmd);
+    assert.match(r.reason, /Run the runtime on a line of its own, or keep the library name off that line/, cmd);
+    assert.match(r.reason, /or the output of another command/, cmd);
+  }
+  // (#533: a line with a command that can rename another (REDEF_CMDS) or a bare `commands` word is not flat either; the message names that cause too)
+  for (const cmd of [
+    'source ~/.nvm/nvm.sh && git add pipeline/hooks/lib/owner-go-click.mjs && node scripts/test.mjs x.test.mjs',
+    "trap 'rm -f \"$t\"' EXIT; git add pipeline/hooks/lib/owner-go.mjs; node scripts/x.mjs",
+    'hash -r; git add pipeline/hooks/lib/owner-go-click.mjs; node scripts/x.mjs',
+    'ls commands && git add pipeline/hooks/lib/owner-go-click.mjs && node scripts/x.mjs',
+  ]) {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /not a plain command line/, cmd);
+    assert.match(r.reason, /a command that can rename another \(alias, hash, source, eval, trap\)/, cmd);
+    assert.match(r.reason, /anything else that cannot be followed command by command/, cmd);
+    assert.match(r.reason, /Run the runtime on a line of its own/, cmd);
+  }
+  for (const cmd of [
+    'node scripts/test.mjs owner-go-click.test.mjs',
+    'node scripts/test.mjs owner-go-click-hook.test.mjs owner-go-click-pending.test.mjs',
+    'node --test test/owner-go-click.test.mjs',
+    'node --test test/owner-go-click-hook.test.mjs',
+    'node /home/u/.claude/pipeline/bin/pipeline.mjs merge --pr 5 --owner-go',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
 // Phase 3b (Fable attacker pass on #107): review-complete trusts .review/state.json, so a repo's review state and the proofs beside it
 // are written only by the pipeline commands (their own process, which the hook never sees), in any checkout or worktree.
 test('Phase 3b: a repo\'s review state is protected from every write, wherever the checkout is', () => {
-  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/published-baseline.json', '.review/published-baseline.json.123.tmp', '/other/wt/.review/published-baseline.json', '.review/state.json.123.tmp']) {
+  for (const p of ['/repo/.review/state.json', '.review/state.json', '/other/wt/.review/round-2/codex.json', '.review/round-1/model-proof.json', '.review/final-gate.json', '.review/preview-smoke.json', '.review/prod-before.json', '.review/published-baseline.json', '.review/published-baseline.json.123.tmp', '/other/wt/.review/published-baseline.json', '.review/state.json.123.tmp', '.review/substitute-attempts.json', '/repo/.review/substitute-attempts.json.9.tmp']) {
     assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
     assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
   }
@@ -1242,6 +1468,9 @@ test('#128 R2-B1: ~/.claude-eaglewatch (any home-level .claude* folder) is a tra
     'rsync -a x/ /home/u/proj/.claude-eaglewatch/',
   ]) assert.equal(bash(cmd), 'allow', cmd);
   assert.equal(file('Edit', { file_path: '/repo/.claude/settings.local.json', old_string: 'a', new_string: 'b' }), 'allow');
+  // (#261: a permissions edit of the project's local settings stays allowed; one that adds hooks is denied, see guard-click-hooks.test.mjs)
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"permissions":{"allow":["Bash(ls:*)"]}}' }), 'allow');
+  assert.equal(file('Write', { file_path: '/repo/.claude/settings.local.json', content: '{"hooks":{"PreToolUse":[]}}' }), 'deny');
 });
 
 // R2-B2: a wildcard segment is asked whether it can stand for ANY name that starts with .claude, not for two sample names.
@@ -1859,7 +2088,9 @@ test('#128 R6-F1: program text naming a bare config root is refused whatever it 
     "python3 -c \"import shutil; shutil.rmtree('/mnt/home/u/claude-config')\"",
     "node -e \"require('fs').writeFileSync('/tmp/x',JSON.stringify({a:1}))\"",
     "python3 -c \"import shutil; shutil.rmtree('/repo/.claude/cache')\"",
-    "node -e \"require('fs').writeFileSync('.claude/settings.local.json','{}')\"",
+    // (#261 R2-F7: .claude/settings*.json can declare hooks, so an inline write to it is refused now — test/guard-click-hooks.test.mjs R2-F7;
+    // the point here, a repo's own .claude/ is not a config root, is kept with a file that declares nothing)
+    "node -e \"require('fs').writeFileSync('.claude/notes.json','{}')\"",
     "python3 -c \"import os,shutil; shutil.rmtree(os.path.join('/repo','.claude','cache'))\"",
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
   // (a literal root that is not configured is just a folder)
@@ -1898,12 +2129,20 @@ test('#128 R7-F1: the home .claude folder spelled as a quoted piece with a path 
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
-test('#128 R7-F3: a repo path with a home word, and text naming no root, stay open', () => {
+test('#128 R7-F3: text naming no root stays open (the repo settings.local.json write moved to #269 R26-F3)', () => {
+  const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
+  for (const cmd of [
+    "python3 -c \"print('x', 'a')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+});
+
+test("#269 R26-F3: a run-time-built path to a repo's .claude/settings.local.json is refused (moved from the R7-F3 allow list)", () => {
   const env = { CLAUDE_CONFIG_DIR: '/home/u/claude-config' };
   for (const cmd of [
     "python3 -c \"import os; open(os.path.join('/home/u/repo', '.claude', 'settings.local.json'), 'w').write('{}')\"",
-    "python3 -c \"print('x', 'a')\"",
-  ]) { assert.equal(bash(cmd, { env }), 'allow', cmd); assert.equal(bash(cmd), 'allow', cmd); }
+    "node -e \"fs.writeFileSync(join(dir, '.claude', 'settings.local.json'), '{}')\"",
+    "node -e \"fs.writeFileSync(['..', '.claude', 'settings.local.json'].join('/'), '{}')\"",
+  ]) { assert.equal(bash(cmd, { env }), 'deny', cmd); assert.equal(bash(cmd), 'deny', cmd); }
 });
 
 // R5-F1: a wildcard root/projects segment with a literal folder below the project is the session folder the literal rule protects (mirrors TRANSCRIPT_BELOW).
@@ -1928,4 +2167,346 @@ test('#128 R5-F1: a glob root or projects segment followed by a literal session 
     'cp -R /tmp/forged/. ~/.cache/*/projects/-repo/abc',
     'cat ~/.claud?/projects/-repo/abc/subagents/agent-1.jsonl',
   ]) assert.equal(bash(cmd, { env }), 'allow', cmd);
+});
+
+// ---- cp #256: the substitute reviewer's evidence is written by pipeline commands only ------------------------------------------------------------
+
+test('#256 route.json, attempt folders, substitute packets and second-review inputs under .review/round-N are protected from every write; reading them is open', () => {
+  const names = [
+    'route.json', 'route-2nd-0a1b2c3d.json', 'attempt-0123456789abcdef/codex-raw.json', 'attempt-0123456789abcdef/prompt.md', 'substitute/diff.patch',
+    'substitute/rules/AGENTS.md', 'substitute-input.md', 'second-review-input.md', 'second-review-0a1b2c3d.md',
+  ];
+  for (const n of names) {
+    const p = `/repo/.review/round-2/${n}`;
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', `Write ${n}`);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', `Edit ${n}`);
+    for (const cmd of [`echo '{}' > ${p}`, `cp /tmp/forged.json ${p}`, `rm ${p}`, `tee ${p} < /tmp/x`]) assert.equal(bash(cmd), 'deny', cmd);
+    assert.equal(bash(`cat ${p}`), 'allow', `cat ${n}`);
+  }
+  // a hand-written route.json (plan test 17), relative and through a glob spelling of the folder
+  for (const cmd of [
+    'echo \'{"evidence":"quota"}\' > .review/round-1/route.json',
+    "printf '{}' > .review/round-1/route.json",
+    'cp /tmp/forged.json .rev*/round-1/route.json',
+    "sed -i 's/pending/quota/' .review/round-1/route.json",
+    'rm -rf .review/round-1/attempt-0123456789abcdef',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+test('#256 the machine-wide Codex record and Codex\'s session logs are protected from every write; reading them stays open', () => {
+  const R = '/home/u/.claude/pipeline-state/codex';
+  const S = '/home/u/.codex/sessions';
+  for (const p of [`${R}/status.json`, `${S}/2026/11/11/rollout-a.jsonl`]) {
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
+  }
+  for (const cmd of [
+    `echo '{}' > ${R}/status.json`, `cp /tmp/forged.json ${R}/status.json`, `rm -rf ${R}`, `rm ${R}/status.json`,
+    `cp /tmp/forged.jsonl ${S}/2026/11/11/rollout-a.jsonl`, `echo x >> ${S}/2026/11/11/rollout-a.jsonl`, `rm -rf ${S}`, 'rm -rf ~/.codex/sessions',
+    "echo '{}' > ~/.claude/pipeline-state/codex/status.json",
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`cat ${R}/status.json`, `ls ${S}`, `grep token_count ${S}/2026/11/11/rollout-a.jsonl`, 'ls ~/.codex', 'cat ~/.codex/config.toml']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// cp #648: failure caught = an agent that keeps hitting outbound-scan-blocked deletes or repoints the scan config, and every later write goes out unscanned.
+test('#648 the outbound-scan config folder (~/.claude/pipeline-local) is protected from every write, move and delete, in every account config dir; reading it stays open', () => {
+  const F = '/home/u/.claude/pipeline-local/outbound-scan.json';
+  for (const p of [F, '~/.claude/pipeline-local/outbound-scan.json']) {
+    assert.equal(file('Write', { file_path: p, content: '{}' }), 'deny', p);
+    assert.equal(file('Edit', { file_path: p, old_string: 'a', new_string: 'b' }), 'deny', p);
+  }
+  for (const cmd of [
+    `echo '{"command":"/usr/bin/true"}' > ${F}`, `cp /tmp/forged.json ${F}`, `rm ${F}`, `rm -rf ~/.claude/pipeline-local`, `mv ${F} /tmp/x.json`,
+    'mv ~/.claude/pipeline-local /tmp/x && mkdir ~/.claude/pipeline-local', 'cp -R /tmp/forged/. ~/.claude/pipeline-local',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [`cat ${F}`, 'ls ~/.claude/pipeline-local', `grep command ${F}`, 'echo x > ~/.claude/pipeline-locale/x']) assert.equal(bash(cmd), 'allow', cmd);
+  assert.equal(file('Write', { file_path: '/home/u/.claude/pipeline-local-notes/a.md', content: 'x' }), 'allow', 'a prefix lookalike');
+  // another account's config dir (~/.claude-eaglewatch) holds the same folder
+  const acct = { readDir: (d) => (d === '/home/u' ? ['.claude-eaglewatch', '.claude'] : null) };
+  assert.equal(file('Write', { file_path: '/home/u/.claude-eaglewatch/pipeline-local/outbound-scan.json', content: '{}' }, acct), 'deny');
+  assert.equal(file('Write', { file_path: '/home/u/.claude-eaglewatch/notes.md', content: 'x' }, acct), 'allow');
+});
+
+test('#256 R5-B1 the ~/.codex folder itself is a protected reference: a recursive copy, move, remove or cd+relative write into it is denied, plain reads stay open', () => {
+  for (const cmd of [
+    'cp -R /tmp/forged/. ~/.codex', 'cp -r /tmp/forged/. /home/u/.codex/', 'cp -a /tmp/forged/sessions ~/.codex/',
+    'mv ~/.codex /tmp/x && mv /tmp/forged ~/.codex', 'rm -rf ~/.codex', 'rsync -a /tmp/forged/ ~/.codex/',
+    'cd ~/.codex && cp -R /tmp/forged/sessions .', 'cd /home/u/.codex && tar -xf /tmp/forged.tar',
+    // R6-F1: the same with a home prefix only known at run time
+    'cp -R /tmp/forged/. "$(echo ~)/.codex"', 'rsync -a /tmp/forged/ "$(printenv HOME)/.codex/"', 'tar -xf /tmp/forged.tar -C `echo ~`/.codex',
+    'mv "$(echo ~)/.codex" /tmp/x && mv /tmp/forged "$(echo ~)/.codex"', 'cp -R /tmp/forged/. $H/.codex', 'rsync -a /tmp/forged/ $H/.codex/',
+    'mv $H/.codex /tmp/x && mv /tmp/forged $H/.codex', 'rm -rf "$(echo ~)/.codex"',
+    // R6-F1 hardening: the same folder spelled with `.`, `//` or `x/..` segments
+    'cp -R /tmp/forged/. $H/.codex/.', 'cp -R /tmp/forged/. $H/./.codex', 'rsync -a /tmp/forged/ "$(echo ~)/.codex/./"', 'cp -R /tmp/forged/. $H/.codex/x/..',
+    'tar -xf /tmp/f.tar -C "$(echo ~)//.codex//"',
+    // R6-F1 hardening: nesting deeper than any fixed collapse count
+    `cp -R /tmp/f/. $H/.codex/` + 'a/'.repeat(30) + '../'.repeat(30),
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['ls ~/.codex', 'ls -la /home/u/.codex/', 'cat ~/.codex/config.toml', 'cd ~/.codex && ls', 'cd ~/.codex && cat config.toml', 'echo x > ~/.codex/notes.txt',
+    'ls "$(echo ~)/.codex"', 'cat "$H/.codex/sessions/x.jsonl"', 'cat "$H/.codex/config.toml"', 'codex --version', 'echo the .codex folder']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+test('#256 R5-F4 a Codex session-log write whose home prefix is only known at run time is denied', () => {
+  for (const cmd of [
+    `echo x >> "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"`,
+    'echo x >> "$(printenv HOME)/.codex/sessions/2026/11/12/rollout-x.jsonl"',
+    'echo x >> $H/.codex/sessions/2026/11/12/rollout-x.jsonl',
+    'cp /tmp/f.jsonl `echo ~`/.codex/sessions/2026/11/12/rollout-x.jsonl',
+    'bash -c "echo x >> $(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of ['cat "$(echo ~)/.codex/sessions/2026/11/12/rollout-x.jsonl"', 'echo ".codex is a folder"']) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// #472 (Task 6): the click state lives INSIDE the protected owner-go folder, so no guard rule had to change; the explicit rows keep it that way.
+test('#472 click state: asks/*.pending, asks/*.settled, consumed/*.json and round-claims/*.json are protected from Write, Edit and every shell write; reading them is open', () => {
+  const R = '/home/u/.claude/pipeline-state/owner-go';
+  const targets = [`${R}/asks/ask-0123456789ab.0123456789abcdef.pending`, `${R}/asks/ask-0123456789ab.0123456789abcdef.settled`, `${R}/consumed/0123456789abcdef.json`, `${R}/round-claims/0123456789abcdef.1.json`];
+  for (const f of targets) {
+    assert.equal(file('Write', { file_path: f, content: '{}' }), 'deny', f);
+    assert.equal(file('Edit', { file_path: f, old_string: 'a', new_string: 'b' }), 'deny', f);
+    for (const cmd of [`echo '{}' > ${f}`, `cp /tmp/x.json ${f}`, `rm -f ${f}`, `touch ${f}`, `tee ${f} < /tmp/x`, `mv /tmp/x.json ${f}`]) assert.equal(bash(cmd), 'deny', cmd);
+    for (const cmd of [`cat ${f}`, `ls -la ${path.dirname(f)}`]) assert.equal(bash(cmd), 'allow', cmd);
+  }
+  assert.equal(file('Write', { file_path: '~/.claude/pipeline-state/owner-go/round-claims/0123456789abcdef.2.json', content: '{}' }), 'deny');
+});
+
+// Item 5 (refused: `node -e "const s=require('./.review/state.json');console.log(Object.keys(s))"`, 141 times in a month): an inline node program is judged like a program file:
+// naming a protected path is a refusal only next to a write (or child_process); reading and printing it is not a write.
+test('item 5: inline node -e / -p that only reads a review file is allowed; a write, a child process or a redirect on the same names stays refused', () => {
+  for (const cmd of [
+    `node -e "const s=require('./.review/state.json');console.log(Object.keys(s))"`,
+    `node -e "const a=require('./.review/round-3/accepted.json');console.log(a.length)"`,
+    `node -p "require('/repo/.review/hardstops.json').items.length"`,
+    `node -e "console.log(JSON.parse(require('fs').readFileSync('.review/state.json','utf8')).pr)"`,
+    `node -e 'console.log(require("fs").readFileSync("/work/wt/.review/hardstops.json","utf8").length)'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    `node -e "require('fs').writeFileSync('.review/state.json','{}')"`,
+    `node -e "require('fs').writeFileSync('/home/u/.claude/pipeline/x','{}')"`,
+    `node -e "require('fs').rmSync('.review/state.json')"`,
+    `node -e "require('fs').appendFileSync('.review/state.json','x')"`,
+    `node -e "require('fs').openSync('.review/state.json','w')"`,
+    `node -e "require('child_process').execSync('node x.js .review/state.json')"`,
+    `node -e "console.log(require('./.review/state.json'))" > .review/state.json`,
+    `node -e "console.log(1)" >> /home/u/.claude/pipeline/x`,
+    `node -e "const f=process.argv[1];require('fs').writeFileSync(f,'x')" .review/state.json`,
+    `node -e "console.log(require('./.review/state.json'), $(cat /tmp/x))"`,
+    `node -e "require('fs')['wri'+'teFileSync']('.review/state.json','{}')"`,
+    `node -e "eval(process.argv[1]);require('./.review/state.json')" 'x'`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  // The exemption is an allowlist: a hard link (then a write through the other name), utimes / chown / mkdtemp, a worker, a watcher, a destructured or Reflect call, process internals, a preload option, NODE_OPTIONS, a trailing argument, another launcher word
+  // and a wrapper keep main's rule. Failure caught: `node -e "require('fs').linkSync('.review/state.json','/tmp/l')"` allowed, then `echo x > /tmp/l` rewrites the protected file.
+  for (const cmd of [
+    `node -e "require('fs').linkSync('.review/state.json','/tmp/l')"`,
+    `node -e "require('fs').link('.review/state.json','/tmp/l',()=>{})"`,
+    `node -e "require('fs').promises.link('.review/state.json','/tmp/l')"`,
+    `node -e "require('fs').utimesSync('.review/state.json',1,1)"`,
+    `node -e "require('fs').chownSync('.review/state.json',1,1)"`,
+    `node -e "require('fs').mkdtempSync('.review/state.json')"`,
+    `node -e "process.execve('/bin/sh',['sh','-c','x'],{});require('./.review/state.json')"`,
+    `node -e "new Worker('x',{eval:true});require('./.review/state.json')"`,
+    `node -e "require('fs').watch('.review/state.json',()=>{})"`,
+    `node -e "const {linkSync}=require('fs');linkSync('.review/state.json','/tmp/l')"`,
+    `node -e "Reflect.apply(require('fs').linkSync,0,['.review/state.json','/tmp/l'])"`,
+    `node -e "process.binding('fs');require('./.review/state.json')"`,
+    `node -r ./evil.js -e "console.log(require('./.review/state.json'))"`,
+    `node --require=./evil.js -e "console.log(require('./.review/state.json'))"`,
+    `node --import ./evil.mjs -e "console.log(require('./.review/state.json'))"`,
+    `NODE_OPTIONS='--require /repo/evil.js' node -e "console.log(require('./.review/state.json'))"`,
+    `export NODE_OPTIONS='--require /repo/evil.js'; node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('./.review/state.json'))" -- x`,
+    `node -e "console.log(require('./.review/state.json'))" evil.js`,
+    `nodejs -e "console.log(require('./.review/state.json'))"`,
+    `env node -e "console.log(require('./.review/state.json'))"`,
+    `command node -e "console.log(require('./.review/state.json'))"`,
+    `npx node -e "console.log(require('./.review/state.json'))"`,
+    `A=1 node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('child_process').spawnSync('id'), require('./.review/state.json'))"`,
+    `node -e "console.log(require('./evil.js'), require('./.review/state.json'))"`,
+    `node -e "[1].map(require('fs').unlinkSync);require('./.review/state.json')"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+// R1-B1 (#737): readFileSync takes a path and at most a plain string (an encoding). Failure caught: `readFileSync('.review/state.json', {flag:'w+'})` is allowed, and `w+` truncates the protected file before reading it
+// (so does the same options object held in a variable, or spread in).
+test('R1-B1: readFileSync with an options object (inline, held in a variable or spread) is refused; a path with an optional encoding string is allowed', () => {
+  for (const cmd of [
+    `node -e "require('fs').readFileSync('.review/state.json', {flag:'w+'})"`,
+    `node -e "const o={flag:'w+'};require('fs').readFileSync('.review/state.json',o)"`,
+    `node -e "const o={flag:'w+'};const fs=require('fs');fs.readFileSync('.review/state.json',o)"`,
+    `node -e "require('fs').readFileSync('.review/state.json', ...[{flag:'w+'}])"`,
+    `node -e "require('fs').readFileSync('.review/state.json', 'utf8', {flag:'w+'})"`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e "console.log(require('fs').readFileSync('.review/state.json'))"`,
+    `node -e "console.log(require('fs').readFileSync(require('path').join('.review','state.json'), 'utf8'))"`,
+    `node -e 'console.log(require("fs").readFileSync(".review/state.json", "utf8").length)'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// R1-B2 (#737): a function taken from the fs module and not called (passed to reduce / map, held in a variable, destructured, put in an object) is called later by something the call scan does not see. Failure caught:
+// `['w'].reduce(require('fs').openSync, '.review/state.json')` is allowed and truncates the protected file. The fs module may only be used as a direct call to readFileSync / existsSync / readdirSync, or held in a
+// `const NAME = require('fs')` whose every later use is one of those calls (the same goes for the `fs` global that node -e predefines, and for the globals that reach it by name).
+test('R1-B2: an uncalled fs function (callback, alias, destructuring, object member) is refused; direct readFileSync / existsSync / readdirSync calls stay allowed', () => {
+  for (const cmd of [
+    `node -e "['w'].reduce(require('fs').openSync, '.review/state.json')"`,
+    `node -e "['.review/state.json'].map(require('fs').openSync)"`,
+    `node -e "['.review/state.json'].reduce(require('fs').linkSync)"`,
+    `node -e "const fs=require('fs');['.review/state.json'].map(fs.openSync)"`,
+    `node -e "['.review/state.json'].map(fs.openSync)"`,
+    `node -e "['.review/state.json'].reduce(fs.linkSync)"`,
+    `node -e "const readFileSync=require('fs').openSync;readFileSync('.review/state.json','w')"`,
+    `node -e "const {openSync:readFileSync}=require('fs');readFileSync('.review/state.json','w')"`,
+    `node -e "const o={map:require('fs').openSync};o.map('.review/state.json','w')"`,
+    `node -e "const fs=require('fs');const g=fs;['.review/state.json'].map(g.openSync)"`,
+    `node -e "const fs=require('fs'), g=fs.openSync;g('.review/state.json','w')"`,
+    `node -e "let fs=require('fs');fs=fs.openSync;fs('.review/state.json','w')"`,
+    `node -e "['.review/state.json'].map(this['f'+'s'].openSync)"`,
+    `node -e "['.review/state.json'].map(global['f'+'s'].openSync)"`,
+    `node -e "console.log(require('./.review/state.json'));['x'].map(vm.runInThisContext)"`,
+    // R2-F1: a JavaScript identifier escape (\uXXXX, \u{X}) hides fs / a write name from every word scan, so a program holding one is no read-only program
+    `node -e "['w'].reduce(f\\u0073.openSync,'.review/state.json')"`,
+    `node -e "['.review/state.json'].forEach(f\\u0073.unlinkSync)"`,
+    `node -e "['w'].reduce(f\\u{73}.openSync,'.review/state.json')"`,
+    `node -e "['.review/state.json'].forEach(f\\u{73}.unl\\u0069nkSync)"`,
+    // R3-F1: the ANSI-C spelling \UHHHHHHHH (zsh and bash decode 1 to 8 hex digits) hides the same names
+    `node -e $'["w"].reduce(f\\U00000073.openSync,".review/state.json")'`,
+    `node -e $'[".review/state.json"].forEach(f\\U73.unl\\U69nkSync)'`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e "console.log(require('fs').readFileSync('.review/state.json','utf8').split('\\n').length)"`,
+    `node -e "console.log(require('./.review/state.json'))"`,
+    `node -e "console.log(require('fs').readFileSync('.review/round-3/accepted.json','utf8'))"`,
+    `node -e "const fs=require('fs');console.log(JSON.parse(fs.readFileSync('/abs/.review/hardstops.json','utf8')))"`,
+    `node -e 'const fs=require("node:fs");console.log(fs.existsSync(".review/state.json"), fs.readdirSync(".review").length)'`,
+    `node -e "console.log(fs.readFileSync('.review/state.json','utf8').length)"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// Items 5b/10 (refused: `node -e 'const r=require("./.review/risk.json");console.log((r.items||[]).length)'` and the double-quoted twin on .review/round-18/codex.json): the arithmetic gate (#266 R7-F3) must not read
+// the parentheses or a `let` of a JavaScript program that is the whole single- or double-quoted word after node -e / -p. Everything else keeps the gate: `$((`, `$[`, a lone `_` (zsh reads it as the last word of the
+// previous command), `((` / let in shell code, a program word with an unquoted part, a `$` or backtick inside a double-quoted program, and a `node -e` that is only text inside another quoted string.
+test('items 5b/10: a ((, a let or a (x||[]) inside a quoted node -e program is no arithmetic; the zsh _ attack and every other arithmetic shape on a line naming a review file stays refused', () => {
+  for (const cmd of [
+    `node -e 'const r=require("./.review/state.json");console.log((r.items||[]).length)'`,
+    `node -e "const t=require('fs').readFileSync('.review/round-18/codex.json','utf8');console.log((t.match(/x/g)||[]).join())"`,
+    `node -e 'let n=0;const r=require("./.review/state.json");for(let i=0;i<3;i++){n+=((r.a||0)+1)};console.log(n)'`,
+    `node -p '(require("./.review/state.json").items||[]).length' && cat .review/state.json`,
+    `cd /repo && node -e "console.log(((require('./.review/state.json').x)||1))"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    `echo 'path[$(cmd)]'; node -e "console.log($((_)))" .review/state.json`,
+    `echo 'path[$(cmd)]'; echo $((_)); cat .review/state.json`,
+    `node -e "console.log($((1+1)))" .review/state.json`,
+    `node -e "console.log($[1+1])" .review/state.json`,
+    `node -e 'console.log(_.keys(require("./.review/state.json")))'`,
+    `node -e "((_))" .review/state.json`,
+    `node -e "console.log(\`$(echo ((_)))\`)" .review/state.json`,
+    `node -e "x $( ((_)) ) y" .review/state.json`,
+    `((x=1)); cat .review/state.json`,
+    `let x=1; cat .review/state.json`,
+    `echo node -e '((x))'; cat .review/state.json`,
+    `eval "echo; node -e '$((_))' .review/state.json"`,
+    `node -e '((x))'"$X" .review/state.json`,
+    `node -e 'console.log(require("./.review/state.json"))' $((_))`,
+    `node -e '((x))' > .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+// Items 5b/10, quote desync (a live zsh exploit found by a probe): the gate's quote scan does not know ANSI-C `$'..\'..'` quoting, a backslash escape or `$"`, so a `$'\''` before a node -e word makes it read a `((x))` that
+// zsh really runs (with a planted `x`) as the inside of a quoted program, and rewrites it away. Failure caught: the line below is allowed and the planted `$(touch SENT)` runs.
+test('items 5b/10: an ANSI-C quote, a backslash or $" before a node -e word, and a backslash inside a double-quoted program, leave the arithmetic gate reading the line as written', () => {
+  const plants = [
+    `x=$'path[\\x24(touch SENT)]'`,
+    `x=path\\[\\$\\(touch\\ SENT\\)\\]`,
+    `printf -v x 'path[\\044(touch SENT)]'`,
+  ];
+  const shapes = [
+    (pl) => `${pl}; : $'\\'' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    (pl) => `${pl}; echo $'\\'' ' ; node -e '$((x))' ; true ; echo ' ; cat .review/state.json`,
+    (pl) => `${pl}; : $'a\\'b' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+  ];
+  for (const pl of plants) for (const sh of shapes) assert.equal(bash(sh(pl)), 'deny', sh(pl));
+  for (const cmd of [
+    `: $'a\\'b' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `: \\' '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `: $"a" '; node -e '; ((x)); echo ' ; true ; cat .review/state.json`,
+    `node -e "console.log(\\"a\\", ((1)))" .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
+// R1-B3 + R1-F1 (#737): the same desync with two other triggers: a quote inside a shell comment (`# a'`), and a quote inside a double-quoted `${…}` (`"${x:-" ' "}"`, a nested double quote: the shell is unquoted after it, a scan
+// that ends the quote at the first `"` is not). Failure caught: the line is allowed, and the shell runs the planted `x` subscript as arithmetic. The gate rewrites a `((` only when nothing before the node word holds a quote, `#`, `$`,
+// a backslash, a backtick or a heredoc (a node -e first on the line, or after `cd /repo && `, still passes).
+test('R1-B3 / R1-F1: a quote in a comment or in a nested "${…}" before a node -e word leaves the arithmetic gate reading the line as written', () => {
+  for (const cmd of [
+    `# '\n: '; node -e '; x="path[\\$(rm .review/sta\\te.json)]"; ((x)); : '\n'\ncat .review/state.json`,
+    `: # a'\nx';node -e '((x))';'; cat .review/state.json`,
+    `x=path; : # a'\nx';node -e '((x))';'; cat .review/state.json`,
+    `: "\${x:-" ' "}" '; node -e '; x="a[\\$(touch SENT)]"; ((x)); : ' '; cat .review/state.json`,
+    `: "\${x:-" ' "}" '; node -e '; ((x)); : ' '; cat .review/state.json`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  for (const cmd of [
+    `node -e 'console.log((require("./.review/state.json").x||[]).length)'`,
+    `cd /repo && node -e 'console.log(((require("./.review/state.json").x)||1))'`,
+    `echo ok; node -e 'console.log(((require("./.review/state.json").x)||1))'`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+});
+
+// Item 7b (refused: `for i in 1 2 3 4; do out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540); echo "$out"; done`): an assignment whose whole value is one command substitution is judged as the
+// command inside it (the bare pipeline CLI call is allowed on its own); that command is still judged, and any other text beside it, a redirect or a variable the shell reads keep the refusal.
+test('item 7b: out=$(pipeline job wait ...) is allowed like the bare call; a write inside the substitution, extra text, a redirect and PATH= stay refused', () => {
+  const P = 'node ~/.claude/pipeline/bin/pipeline.mjs job wait ci --run-id X --timeout 540';
+  for (const cmd of [
+    `out=$(${P}); echo "$out"`,
+    `for i in 1 2 3 4; do out=$(${P}); echo "$out"; done`,
+    `out="$(${P})"`,
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    'out=$(rm ~/.claude/pipeline/x)',
+    'out=$(cp /tmp/a ~/.claude/pipeline/x)',
+    `out=$(${P}; rm ~/.claude/pipeline/y)`,
+    `out=$(${P} | tee ~/.claude/pipeline/y)`,
+    `out=$(${P}) > ~/.claude/pipeline/y`,
+    `out=x$(${P})`,
+    `out="$(${P}) ~/.claude/pipeline/y"`,
+    `out=$(${P})$(rm ~/.claude/pipeline/y)`,
+    `PATH=$(${P})`,
+    `PATH=/x$(${P})`,
+    `path=$(${P})`,
+    `OUT=$(${P})`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+  // Every zsh special lower-case parameter, and the families by name (`*_functions` hook arrays, zsh*, zle*, dis_*), is a name the shell reads: assigning one a substitution is no plain variable.
+  // Failure caught: `precmd_functions=$(...)` allowed, then the planted function name runs before the next prompt.
+  for (const name of ['precmd_functions', 'chpwd_functions', 'zshexit_functions', 'reply', 'match', 'mbegin', 'psvar', 'watch', 'pipestatus', 'status', 'argv', 'dirstack', 'funcstack', 'userdirs', 'nameddirs', 'terminfo', 'region_highlight', 'prompt', 'cdpath', 'zsh_eval_context', 'zle_highlight', 'dis_aliases', 'dis_builtins', 'langinfo', 'epochtime', 'usernames', 'mapfile', 'compstate', 'history', 'options', 'commands', 'functions']) {
+    assert.equal(bash(`${name}=$(${P})`), 'deny', name);
+  }
+  assert.equal(bash(`result=$(${P})`), 'allow'); // (a plain name that only starts like one of them is still a plain variable)
+  // R1-F2 (#737): a name the hook's own environment already holds (an exported lower-case variable: npm_config_prefix, http_proxy) is not a plain variable: assigning it changes what the next program sees.
+  // Failure caught: `npm_config_prefix=$(echo ~/.claude/pipeline); npm install -g x` allowed, and npm then installs into the protected folder.
+  const seeded = { env: { npm_config_prefix: '/usr/local' } };
+  assert.equal(bash('npm_config_prefix=$(echo ~/.claude/pipeline); npm install -g x', seeded), 'deny');
+  assert.equal(bash(`npm_config_prefix=$(${P})`, seeded), 'deny');
+  assert.equal(bash(`npm_config_prefix=$(${P})`), 'allow'); // (the same name, not exported: a plain variable)
+});
+
+// cp #691 (refused: a 250 KB DRMed proof script run from a checkout that has a .review folder, "where it is could not be worked out in the time allowed"): the alias scan read a program only up to 200 KB and refused the
+// rest unread. It now reads up to MAX_SCRIPT_BYTES; a program over the word / lookup cap is still refused (fail closed), and the refusal says it is the size / scan limit, not a protected file.
+test('#691: a program over 200 KB that holds no link to the review folder is allowed from a checkout with .review; a link in it, or too many distinct words, is refused with the scan-limit wording', (t) => {
+  const w = reviewAliasWorld(t);
+  if (!w) return;
+  const run = (text) => {
+    fs.writeFileSync(path.join(w.cwd, 'prog.mjs'), text);
+    return evaluateBashForFiles('node prog.mjs', { home: path.join(w.tmp, 'home'), env: {}, cwd: w.cwd, platform: process.platform });
+  };
+  const filler = 'const filler_a = "xxxxxxxxxxxxxxxxxxxx";\n'.repeat(8000); // (about 330 KB, a handful of distinct words)
+  const tail = "import fs from 'node:fs'; fs.writeFileSync('/tmp/proof-out.txt', 'ok');\n";
+  assert.ok(filler.length > 200_000);
+  assert.equal(run(filler + tail).decision, 'allow', 'allowed: clean program over 200 KB');
+  assert.equal(run(`${filler}${tail}fs.writeFileSync('${w.alias}/state.json', 'x');\n`).decision, 'deny', 'denied: the same text writing through a link to the review folder');
+  const many = Array.from({ length: 21_000 }, (_, i) => `const w${i} = ${i};`).join('\n');
+  const r = run(`${many}\n${tail}`);
+  assert.equal(r.decision, 'deny', 'denied: too many distinct words to scan');
+  assert.match(r.reason, /scan limit/);
+  assert.doesNotMatch(r.reason, /refers to a protected pipeline file/);
 });

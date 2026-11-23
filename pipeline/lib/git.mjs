@@ -275,7 +275,7 @@ function historyProblem({ from, head, baseRef }, o) {
     if (parents.length === 1) return fail('history-nonmerge', `${cur} is not a merge commit`);
     if (parents.length > 2) return fail('history-octopus', `${cur} merges ${parents.length} parents`);
     if (parents.length === 0) return fail('history-not-first-parent', `${cur} is a root commit`);
-    if (!isAncestor(parents[1], baseRef, o)) return fail('history-foreign-merge', `${cur} merges ${parents[1]}, which is not on ${baseRef}`);
+    if (!isAncestor(parents[1], baseRef, o)) return fail('history-foreign-merge', `${cur} merges ${parents[1]}, which is not on ${displayRef(baseRef)}`);
     cur = parents[0];
   }
   return null;
@@ -484,7 +484,7 @@ function largeBinaryChanges(from, to, o) {
     if (m[1] === '-' && m[2] === '-') binary.add(key);
     i += renamed ? 3 : 1;
   }
-  if (binary.size === 0) return { skipped: [], order: new Map() };
+  if (binary.size === 0) return { skipped: [], order: new Map(), binary };
 
   const changes = rawChanges(from, to, o);
   const order = new Map(changes.map((c, i) => [c.newPath ?? c.oldPath, i]));
@@ -497,7 +497,7 @@ function largeBinaryChanges(from, to, o) {
     && c.oldId !== c.newId
     && [c.oldPath, c.newPath].filter(Boolean).every(isBinaryFormat)
     && !hasDescendant(c));
-  if (candidates.length === 0) return { skipped: [], order };
+  if (candidates.length === 0) return { skipped: [], order, binary };
 
   const ids = [...new Set(candidates.flatMap((c) => [c.oldId, c.newId]).filter((id) => !/^0+$/.test(id)))];
   const sizes = new Map();
@@ -520,7 +520,7 @@ function largeBinaryChanges(from, to, o) {
     skipped.push(c);
     total -= c.printed;
   }
-  return { skipped, order };
+  return { skipped, order, binary };
 }
 
 // Literal, repo-root pathspecs that leave the given changes (old and new path) out of a diff, as in contentHash: a name like
@@ -538,16 +538,26 @@ const excludeSpecs = (changes) => changes.flatMap((c) => [c.oldPath, c.newPath])
 // is not printed: it comes back path-only, in the shape parseUnifiedDiff gives a binary change plus `skippedLargeBinary:
 // true`. The path rules still see its paths; there are simply no lines to read. Everything else keeps --text however big it
 // is, so a NUL byte in a source file cannot be used to hide it.
-export function diffFiles(base, head, o) {
-  const mb = mergeBase(base, head, o);
+// A 'synthetic' review base (effectiveReviewBase) is a tree id, which has no merge base: it is already the exact base. Only a caller that passes `{ treeBase: true }` (the third argument) diffs against
+// it as it is (fix-verify.mjs#fixRoundFiles); every other caller keeps the old behaviour, a throw, which the threat-model and out-of-model-waiver paths read as "no readable range" and fail closed on.
+export function diffFiles(base, head, o, { treeBase = false } = {}) {
+  let mb;
+  try {
+    mb = mergeBase(base, head, o);
+  } catch (err) {
+    if (!treeBase || !(err instanceof GitError) || git(['cat-file', '-t', assertRef(base, ['cat-file', '-t', base])], o).trim() !== 'tree') throw err;
+    mb = base;
+  }
   const range = `${mb}..${assertRef(head, ['diff', head])}`;
-  const { skipped, order } = largeBinaryChanges(mb, head, o);
+  const { skipped, order, binary } = largeBinaryChanges(mb, head, o);
   const exclude = excludeSpecs(skipped);
   const text = git([
     ...STABLE_CONFIG, 'diff', '-M', '--unified=0', '--no-color', '--no-ext-diff', '--no-textconv', '--text', '--src-prefix=a/', '--dst-prefix=b/',
     range, ...(exclude.length > 0 ? ['--', ':/', ...exclude] : []),
   ], o);
   const files = parseUnifiedDiff(text);
+  // --text prints a binary file as text (binary: false); git's own numstat verdict is kept as `gitBinary` (only when true) for a caller that must not treat such a file as text.
+  for (const f of files) if (binary.has(f.path)) f.gitBinary = true;
   if (skipped.length === 0) return files;
   for (const c of skipped) {
     files.push({
@@ -705,34 +715,59 @@ export function reviewPatch(from, to, o) {
   return { patch, skipped: names };
 }
 
-// `origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
-// a test) falls back to the local branch. Any other git failure is not swallowed.
+// Does this EXACT ref exist? `git rev-parse --verify refs/remotes/origin/<b>` resolves the exact ref first, but with it MISSING it falls through to refs/tags/<name> and refs/heads/<name> (and
+// refs/<name>): a local branch or tag literally named `refs/remotes/origin/<b>` would then read as the remote ref (#455). `git show-ref --verify` looks up the one name only: exit 1 with
+// nothing on stderr is 'missing'; anything else (not a repository, a broken ref store) is a real failure and throws.
+export const refExists = (ref, o) => gitOrNull(['show-ref', '--verify', '--quiet', assertRef(ref, ['show-ref', '--verify', ref])], 1, o) !== null;
+
+// Is the remote-tracking ref refs/remotes/origin/<branch> there, by exact name (see refExists)?
+export const remoteRefExists = (branch, o) => refExists(`refs/remotes/origin/${branch}`, o);
+
+// `refs/remotes/origin/<branch>` is what a PR will be merged into; a repo without that remote ref (a fresh clone of a local fixture,
+// a test) falls back to `refs/heads/<branch>`. Both are returned FULLY QUALIFIED: git resolves an abbreviated `origin/<b>` (or a bare `<b>`) through refs/tags and refs/heads
+// first, so a PR that pushes a branch or a tag named `origin/main` would otherwise move the base every hash and fork point measures from (Fable F1, #448). The remote ref is looked up by exact name (remoteRefExists): a local branch or tag literally named `refs/remotes/origin/<branch>` is not it (#455). Any other git failure
+// is not swallowed.
 export function reviewBaseRef(branch, o) {
-  const remote = `origin/${branch}`;
-  try {
-    revParse(remote, o);
-    return remote;
-  } catch (err) {
-    if (err instanceof GitError) return branch;
-    throw err;
-  }
+  return remoteRefExists(branch, o) ? `refs/remotes/origin/${branch}` : `refs/heads/${branch}`;
 }
+
+// The short, human-facing form of a ref reviewBaseRef returned (refs/remotes/origin/main -> origin/main).
+export const displayRef = (ref) => String(ref).replace(/^refs\/remotes\//, '');
 
 // The branch the remote itself calls its default (what refs/remotes/origin/HEAD points at), or null when the clone has none or it is not a plain
 // origin/<branch>, or that ref does not resolve (a dangling symref after a rename fetched with prune: git symbolic-ref does not need the target to exist). A
-// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review.
+// source a PR cannot edit: unlike .claude/pipeline.yml it is not part of the tree under review. The target is looked up by exact name (remoteRefExists), like the symref was read.
 export function remoteDefaultBranch(o) {
   const out = gitOrNull(['symbolic-ref', '-q', 'refs/remotes/origin/HEAD'], 1, o);
   const m = /^refs\/remotes\/origin\/(.+)\n?$/.exec(out ?? '');
   if (!m) return null;
-  try {
-    revParse(`origin/${m[1]}`, o);
-    return m[1];
-  } catch (err) {
-    if (err instanceof GitError) return null;
-    throw err;
-  }
+  return remoteRefExists(m[1], o) ? m[1] : null;
 }
+
+// Is an `origin` remote configured at all? (`git config --get` answers exit 1 with nothing on stderr for a missing key.) A repo without one (a local-only clone, a fixture)
+// has no remote to anchor the default branch on.
+export const hasOriginRemote = (o) => gitOrNull(['config', '--get', 'remote.origin.url'], 1, o) !== null;
+
+// What the remote says its default branch is, asked over the wire (`git ls-remote --symref origin HEAD`), for a clone that has no refs/remotes/origin/HEAD (#377). The
+// answer of the remote is a source a PR cannot edit, like origin/HEAD. Read-only (no ref is written), best effort (a network failure, a timeout or a remote that names no
+// branch is null, never a throw) and bounded by NETWORK_TIMEOUT_MS. Asked once per repository per process: the callers (trustedBase) run many times and must not each
+// wait on the network, and a failure is remembered too. GIT_TERMINAL_PROMPT=0: a remote that wants credentials fails instead of waiting for a person.
+const lsRemoteAnswers = new Map();
+export function lsRemoteDefaultBranch(o) {
+  const key = o?.cwd ?? process.cwd();
+  if (lsRemoteAnswers.has(key)) return lsRemoteAnswers.get(key);
+  let branch = null;
+  try {
+    const out = git(['ls-remote', '--symref', 'origin', 'HEAD'], { ...o, timeoutMs: NETWORK_TIMEOUT_MS, env: { ...o?.env, GIT_TERMINAL_PROMPT: '0' } });
+    branch = /^ref: refs\/heads\/(?!-)(\S+)\tHEAD$/m.exec(out)?.[1] ?? null;
+  } catch (err) {
+    if (!(err instanceof GitError)) throw err;
+  }
+  lsRemoteAnswers.set(key, branch);
+  return branch;
+}
+// For tests that change a repository's remote inside one process.
+export const forgetLsRemoteAnswers = () => lsRemoteAnswers.clear();
 
 // THE content hash of "the code that was reviewed": what HEAD changes relative to where it forked from the PR base,
 // minus the agent log the pipeline itself appends to. The review loop (round coverage, review-complete) and the final

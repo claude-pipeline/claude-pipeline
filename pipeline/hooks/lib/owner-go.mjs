@@ -33,17 +33,18 @@ import { createHash } from 'node:crypto';
 import { closeSync, constants, fstatSync, fsyncSync, lstatSync, mkdirSync, openSync, readdirSync, readSync, realpathSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { REPO_NAME, readRepoMoves, sameRepo } from './repo-moves.mjs';
+import { clickProvenance, pendingClickProblems, settlePendingClicks } from './owner-go-click.mjs';
 import { accountHome, isInside, isTranscriptFile, TRANSCRIPT_PROJECT_RE, transcriptConfigDirs } from '../../lib/paths.mjs';
 
 export const OWNER_GO_REL = '.claude/pipeline-state/owner-go';
 export const MAX_AGE_MS = 24 * 60 * 60 * 1000; // a "merge" older than a day approves nothing
-const FUTURE_SKEW_MS = 5 * 60 * 1000;
+export const FUTURE_SKEW_MS = 5 * 60 * 1000;
 const TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024;
 const PROVENANCE_CHUNK_BYTES = 4 * 1024 * 1024; // promptProvenance reads the transcript backwards in chunks this big …
 const PROVENANCE_CAP_BYTES = 64 * 1024 * 1024; // … and gives up (missing) this far back
 const FALLBACK_WINDOW_MS = 120 * 1000; // a record with no prompt_id is matched to a transcript entry by its text within this much time
 const MAX_RECORD_BYTES = 1024 * 1024; // one session file; a bigger one is not read
-const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
+export const SESSION_RE = /^[A-Za-z0-9][A-Za-z0-9_-]{0,127}$/;
 export const HEAD_CHARS = 12; // the head is shown (and matched) by its first 12 characters at least
 
 // The account's home from the OS user database, NOT $HOME: `HOME=/tmp/x P merge …` must not point the check at a folder the agent
@@ -54,13 +55,30 @@ export { accountHome };
 
 export const ownerGoDir = (home = accountHome()) => path.join(home, ...OWNER_GO_REL.split('/'));
 
+// #190.3b: the owner copies an answer out of a terminal and the prompt glyph comes with it ("❯ R4-B1: reject", "> merge"). answerBody is the words every answer parser reads: the prompt
+// trimmed, with at most ONE leading glyph from ❯ › > $ removed when at least one space follows it, and only on a single-line prompt. `>merge` and `$5 …` keep their first character, two glyphs
+// leave one (so the parser refuses it), a glyph mid-line is never touched, and the words after the glyph must still be the whole answer. promptProvenance still proves the owner typed the
+// entry, and the glyph adds no word, so it grants no authority the bare words did not have. Callers: parseApproval, parseRoundGrant, rulingsIn and the PAIRS_ONLY nudge sites. The stored
+// prompt and the --owner-quote comparison stay verbatim (the record is the audit trail); a length cap applies to the body, after the strip.
+export const answerBody = (s) => {
+  const t = String(s ?? '').trim();
+  return /[\r\n]/.test(t) ? t : t.replace(/^[❯›>$][ \t ]+/, '').trim();
+};
+
+// Why (#472): readRecords settles pending clicks (owner-go-click.mjs settlePendingClicks) unless the caller says `settle: false` (the read-only paths: the merge dry run's gate, click replay).
+// `settle: true` forces it. Otherwise the environment switch PIPELINE_CLICK_SETTLE=off, which the test runner and the test helpers set, turns it off, so a test can never settle the owner's real
+// pending clicks. Already recorded clicks still count: the switch only stops pending clicks from becoming records through the readers. Strict lookups still see unresolved round clicks, so
+// setting it never widens what is approved. The environment is the agent's own word (lib/paths.mjs), so it gates NOTHING but this: a consumption write (a spent marker, a round-claim sweep or
+// repair) is never gated by it.
+export const settleEnabled = (settle, env = process.env) => settle === true || (settle !== false && env.PIPELINE_CLICK_SETTLE !== 'off');
+
 // The words that may follow "merge" in an approval besides its targets (#N, N, a head prefix).
 const FILLER = /^(?:and|it|both|all|them|these|those|please|pls|now|go|ok|okay|thanks|thank|you|thx|ty)$/i;
 
 // A prompt that approves: "merge", "merge #58", "merge 1318 1319", "Merge it.", "merge a1b2c3d4e5f6". Anything else is not an
 // approval: "do not merge", "merge?", "merge later", "merge after CI", "why merge". Returns null or { prs, shas }.
 export function parseApproval(prompt) {
-  const t = String(prompt ?? '').trim();
+  const t = answerBody(prompt);
   const m = /^merge(?![A-Za-z0-9_-])([\s\S]*)$/i.exec(t);
   if (!m) return null;
   const rest = m[1];
@@ -90,7 +108,7 @@ export function parseApproval(prompt) {
 // `items …` and `repo …`, and a canonical `Hold <id> by <login> at <ISO>` line (holdBlock) DIRECTLY above that Head line. Block order, top to bottom: Areas (optional),
 // Hold, Head; Areas binds above Head or above a Hold that sits above its Head. UNLIKE Areas, a Hold-shaped line (the canonical prefix `Hold <id> by `, HOLD_START; prose such as
 // "Hold on, …" is none) anywhere in the reply that is not consumed exactly so (prose between it and its Head, two in a row, against the 🔀 line, ahead of Areas, another PR's, an id
-// other than its Head's `hold` field, a malformed rest) makes the WHOLE reply bind nothing, and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated
+// other than its Head's `hold` field, a malformed rest) makes the WHOLE reply bind nothing (one exception, #585: an earlier line that is an identical copy of a Hold line the block consumed, see below), and so does a Head line with `hold X` and no Hold line right above it; a hold field repeated
 // or after `repo` is no Head line at all. The record keeps the hold id and sha256 of the block (holdDigest). And a request with a hold binds only when the 🔀 line says it lifts the hold
 // (readyLine, LIFT_PHRASE) AND every request bound carries one (singular: the one PR; plural: all listed): the phrase with no hold in the bound requests, or a hold with no phrase, binds nothing.
 // Returns { prs: [N…] (every PR on the 🔀 line; [] when the reply does not end with it), requests: [{ pr, head, items, repo, areas?, hold?, holdBlock? }] } (repo: the
@@ -172,6 +190,7 @@ export function presentedRequests(text) {
     if (!h && !a && !o) break;
     block.unshift({ h, a, o });
   }
+  const blockStart = i + 1; // (lines[blockStart + j] is block[j])
   // The rulings block, if any, sits directly above the Areas / Hold / Head lines: rows walked up while contiguous, then exactly one header. A run of rows with no header directly above, a
   // header with no rows, prose in between, or a second header / run above the one found binds nothing (rulings stay absent; the lines are then plain prose to every rule below).
   let rulings = null;
@@ -190,7 +209,9 @@ export function presentedRequests(text) {
   }
   if (rulings !== null && prs.length !== 1) return none(prs); // a rulings block belongs to ONE PR: with several on the 🔀 line the whole reply binds nothing
   if (i >= 0 && AREAS_START.test(lines[i])) return none(prs); // an Areas line of any other shape against the block: malformed
-  if (lines.slice(0, i + 1).some((l) => HOLD_START.test(l))) return none(prs); // a canonical-prefix Hold line outside the block (prose between it and its Head, an earlier block's): review note 6
+  // a canonical-prefix Hold line outside the block (prose between it and its Head, an earlier block's) voids the reply (review note 6), unless it is an identical copy of a Hold line the block consumed (#585, below)
+  const earlierHolds = lines.slice(0, i + 1).filter((l) => HOLD_START.test(l));
+  const holdsOf = []; // [{ pr, text }]: the Hold line above each Head line that carries one
   const bound = new Map();
   for (let j = 0; j < block.length; j++) {
     const { h } = block[j];
@@ -205,16 +226,25 @@ export function presentedRequests(text) {
       if (holdBlock(rebuilt) === '') return none(prs); // (the regex reads T / Z in any case; the block is canonical only in upper case)
       hasHold = rebuilt;
     }
+    const holdText = o ? lines[blockStart + j - 1] : null;
     const above = o ? block[j - 2]?.a ?? null : block[j - 1]?.a ?? null;
     if (above && (above[1] ?? null) !== (h[1] ?? null)) return none(prs); // another PR's Areas line
     const pr = h[1] ? Number(h[1]) : prs.length === 1 ? prs[0] : null;
     if (pr === null || !prs.includes(pr)) continue;
+    if (holdText !== null) holdsOf.push({ pr, text: holdText });
     const areas = above ? createHash('sha256').update(`Areas ${above[2].trim().split(/\s+/).join(' ')}`).digest('hex') : null;
     bound.set(pr, bound.has(pr) ? null : { pr, head: h[2].toLowerCase(), items: h[3].toLowerCase(), repo: h[5] ? h[5].toLowerCase() : null, ...(areas ? { areas } : {}), ...(rulings !== null ? { rulings } : {}), ...(hasHold ? { hold: hasHold.id, holdBlock: holdDigest(hasHold) } : {}) });
   }
   // An Areas line that no Head line below it takes (a second one in a row, one against the 🔀 line) is a malformed block; so is a Hold line no Head line right below takes.
   const takesHead = (j) => block[j + 1]?.h || (block[j + 1]?.o && block[j + 2]?.h);
   if (block.some((b, j) => (b.a && !takesHead(j)) || (b.o && !block[j + 1]?.h))) return none(prs);
+  // #585: a re-shown request (the closing lines written again, in the same turn) holds the Hold line twice. A Hold line names one GitHub event (node id, actor, time), so an earlier copy that is the SAME text as a Hold line
+  // the terminal block CONSUMED shows the owner the same event and changes nothing about what is approved; it binds nothing itself (only the terminal block binds). Consumed = the Hold line of a request that survives binding:
+  // its Head's PR is on the 🔀 line and bound exactly once (a Hold line next to an unlisted or duplicate PR's Head is not). Compared as exact text after stripping spaces and tabs at the ends (never trim(): a non-breaking
+  // space is not stripped), and a line with a lone \r (it redraws on a terminal) is never tolerated. Anything else above the block (another id, actor, time, prefix, case, spacing; a copy of nothing consumed) still voids the reply.
+  const trimmed = (l) => l.replace(/^[ \t]+|[ \t]+$/g, '');
+  const consumed = new Set(holdsOf.filter((x) => bound.get(x.pr)).map((x) => trimmed(x.text)));
+  if (earlierHolds.some((l) => l.includes('\r') || !consumed.has(trimmed(l)))) return none(prs);
   // rev 4 item 2a: a hold binds only under the lift wording, and the wording only when EVERY request bound carries a hold (singular: the one PR; plural: all listed). A Hold-bearing
   // Head line that binds nothing itself (a PR not on the 🔀 line, an unprefixed Head in the several-PR form, a duplicate) neither makes the wording legitimate nor forbids it.
   const requests = [...bound.values()].filter(Boolean);
@@ -246,7 +276,7 @@ export function presentedRuling(text) {
 const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
 // (round 4: a user message is a prompt unless it carries a tool_result: an image-only message is one too, with no text)
 const isPromptEntry = (e) => e?.type === 'user' && (typeof e.message?.content === 'string' || (Array.isArray(e.message?.content) && !e.message.content.some((b) => b?.type === 'tool_result')));
-const promptTextOf = (e) => {
+export const promptTextOf = (e) => {
   const c = e?.message?.content;
   return plain(typeof c === 'string' ? c : Array.isArray(c) ? c.filter((b) => b?.type === 'text' && typeof b.text === 'string').map((b) => b.text).join('\n') : '');
 };
@@ -285,6 +315,11 @@ const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource
 // set (a value this list does not know stays invisible, fail closed) or an entrypoint other than "cli" (a headless sdk-cli is synthetic already, so that is an unknown future one).
 const isSet = (v) => v !== undefined && v !== null;
 const unplacedProvenance = (e) => isSet(e.promptSource) || isSet(e.origin) || isSet(e.turnOrigin) || (isSet(e.entrypoint) && e.entrypoint !== 'cli');
+// #253, NOT SUPPORTED: a pre-provenance transcript (Claude Code older than 2.1.258: no prompt carries promptSource, origin, entrypoint or turnOrigin) has nothing to say who wrote a prompt, so
+// every one of its prompts is an unplaced note below, and the chain walk of invisibleNote ends at the first prompt, whose parentUuid (the SessionStart attachment, or an entry older than the tail
+// window) resolves to no prompt: all of them are hidden and no merge, extra-round or ruling request binds. That is deliberate and fails closed: "no provenance field" must never become authority
+// (a hidden headless run is the case it would let through), and no machine here runs such a client. The readers do not exempt such a file; the owner is asked again after upgrading
+// (promptProvenance's legacy branch for a stored record predates this and is unchanged). Pinned by test/owner-go-visible-turns.test.mjs (#253).
 const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
@@ -299,17 +334,30 @@ const invisibleTurn = (e) => {
 // (invisible), and so does a chain that ends at a non-prompt root (e.g. the SessionStart attachment above the /clear caveat and command notes: they sit before the first owner prompt and carry no
 // assistant text, so what they mute is never an ask; pinned by R6-F1); only an entry with no parentUuid at all (a legacy transcript) leaves its own fields to decide (visible); a chain of notes
 // resolves transitively, a cycle fails closed.
-function invisibleNote(entries, parent, first) {
+// #246: a visibleSynthetic turn (a task notice, a peer or plugin message: system + cli) is no exception. Its own fields say the interactive UI renders it, but a headless process that was
+// started under an invisible turn (an sdk prompt) can write one under ITS prompt, and nothing of that is on the owner's screen. So it follows parent[] like an unplaced note: to a typed owner
+// prompt (or any other visible boundary): visible; to an invisible turn: invisible; and ancestry that does not resolve (a parent outside the window, a duplicate uuid, a cycle, a chain that ends
+// at a non-prompt root such as a SessionStart attachment with no typed prompt behind it) fails closed. Compaction and `--resume` need nothing here: resolve() in originsOf already steps over
+// a compact_boundary / hidden summary by logicalParentUuid, and a resumed session continues the SAME chain through its SessionStart attachments (probed on 2.1.3xx transcripts), so both reach
+// the typed prompt behind them. An entry with no parentUuid at all (not even null) leaves its own fields to decide, as an unplaced note does. The walk keeps a visited set and `memo` (index ->
+// verdict, shared across the calls of one lastReply), so n chained notes cost O(n), not O(n^2).
+function invisibleNote(entries, parent, first, memo = new Map()) {
+  const path = [];
   const seen = new Set();
-  for (let i = first; ; ) {
+  let verdict;
+  for (let i = first; verdict === undefined; ) {
+    if (memo.has(i)) { verdict = memo.get(i); break; }
     const e = entries[i];
-    if (invisibleTurn(e)) return true;
-    if (!unplacedNote(e)) return false; // the owner's prompt, a visibleSynthetic turn or a plain boundary of its own: its own fields said so
-    if (typeof e.parentUuid !== 'string') return false;
-    if (seen.has(i) || parent[i] < 0) return true; // a cycle, or a parent outside the window
+    path.push(i);
     seen.add(i);
-    i = parent[i];
+    if (invisibleTurn(e)) verdict = true;
+    else if (!unplacedNote(e) && !visibleSynthetic(e)) verdict = false; // the owner's prompt, or a plain boundary of its own: its own fields said so
+    else if (typeof e.parentUuid !== 'string') verdict = false;
+    else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
+    else i = parent[i];
   }
+  for (const i of path) memo.set(i, verdict);
+  return verdict;
 }
 
 // The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);
@@ -494,9 +542,12 @@ function originsOf(entries) {
 }
 
 export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
-  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  return replyOf(tailEntries(transcriptPath, tailBytes).entries, { prompt, skipSynthetic });
+}
+function replyOf(entries, { prompt, skipSynthetic = false } = {}) {
   const { origin, parent } = originsOf(entries);
-  const hidden = (i) => invisibleNote(entries, parent, i);
+  const verdicts = new Map(); // memoised hidden(i), shared by every chain walk (#246)
+  const hidden = (i) => invisibleNote(entries, parent, i, verdicts);
   // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
   const turns = [];
   const turnAt = new Map(); // prompt entry index -> turn
@@ -547,13 +598,14 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
         else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
       }
     }
-    if (visibleSynthetic(t.e) && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
+    const visible = visibleSynthetic(t.e) && !hidden(t.pos); // (#246: a system turn written under an invisible one is on nobody's screen)
+    if (visible && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
     else if (anything) {
       const before = slots[slots.length - 1];
       if (before && before.lastPos < t.pos) before.voided = true; // (a slot still being written when this turn opened was not replaced by it: interleaved, not later)
       // R3-F1: ... but a VISIBLE synthetic turn's text or surfaced ask is on the owner's screen wherever its prompt opened: when it lands after the selected slot's last shown entry (checked below),
       // that request is stale. An invisible turn (sdk, non-human origin, unknown source) is never shown, so the interleaved exemption above stays for it.
-      if (visibleSynthetic(t.e)) shownSkips.push(t.shownPos);
+      if (visible) shownSkips.push(t.shownPos);
     }
   }
   // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
@@ -570,6 +622,55 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
   return { text: last.text, promoted: last.promoted };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
+
+// #262 (Fable F5): the reply slot right BEFORE the prompt entry with that promptId, read as it stood when the owner typed (the ruling reader's rules: skipSynthetic), whatever came after:
+// the live-database claim rebuilds the block the owner was shown from it, so a record a script appended with a different hash than that block fails. { text } | { reason }.
+// (A bigger window than the recorders': the claim can come up to two hours after the prompt.)
+const REPLY_BEFORE_TAIL_BYTES = 16 * 1024 * 1024;
+export function replyBefore(transcriptPath, promptId, { tailBytes = REPLY_BEFORE_TAIL_BYTES } = {}) {
+  if (typeof promptId !== 'string' || promptId === '') return { reason: 'the record has no prompt id' };
+  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  const at = [];
+  entries.forEach((e, i) => { if (isPromptEntry(e) && e.promptId === promptId) at.push(i); });
+  if (at.length === 0) return { reason: 'the owner\'s prompt is not in the transcript window' };
+  if (at.length > 1) return { reason: 'two prompt entries carry that prompt id' };
+  return { text: replyOf(entries.slice(0, at[0] + 1), { prompt: promptTextOf(entries[at[0]]), skipSynthetic: true }).text };
+}
+
+// #262 (R6-F1): what the owner could read right BEFORE an AskUserQuestion call: the assistant text of the call's own turn (the entries that chain to the same prompt as the tool_use entry, in transcript
+// order, plus the text blocks of the tool_use entry itself that come before the tool_use block). The live-database click claim requires it to end with the block the dialog carries, as the typed
+// go does. A text another turn printed between that text and the call (an interleaved process the owner may have seen) is a refusal, never skipped. { text } | { reason }.
+export function replyBeforeToolUse(transcriptPath, toolUseId, { tailBytes = REPLY_BEFORE_TAIL_BYTES } = {}) {
+  if (typeof toolUseId !== 'string' || toolUseId === '') return { reason: 'the click has no tool use id' };
+  const entries = tailEntries(transcriptPath, tailBytes).entries;
+  const blocksOf = (e) => (Array.isArray(e?.message?.content) ? e.message.content : []);
+  const at = [];
+  entries.forEach((e, i) => { if (e?.type === 'assistant' && blocksOf(e).some((b) => b?.type === 'tool_use' && b.id === toolUseId)) at.push(i); });
+  if (at.length === 0) return { reason: 'the AskUserQuestion call is not in the transcript window' };
+  if (at.length > 1) return { reason: 'two entries carry that tool use id' };
+  const { origin } = originsOf(entries);
+  const useAt = at[0];
+  if (origin[useAt] < 0) return { reason: 'the AskUserQuestion call does not chain to a prompt in the transcript window' };
+  const textOf = (e, until = Infinity) => {
+    let t = '';
+    for (const b of blocksOf(e).slice(0, until)) if (b?.type === 'text' && typeof b.text === 'string') t += `${b.text}\n`;
+    return t;
+  };
+  let text = '';
+  let lastTextAt = -1;
+  for (let i = origin[useAt] + 1; i <= useAt; i++) {
+    const e = entries[i];
+    if (e?.type !== 'assistant' || origin[i] !== origin[useAt]) continue;
+    const t = i === useAt ? textOf(e, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : textOf(e);
+    if (showsText(t)) lastTextAt = i;
+    text += t;
+  }
+  for (let i = Math.max(lastTextAt, origin[useAt]) + 1; i < useAt; i++) {
+    const e = entries[i];
+    if (e?.type === 'assistant' && origin[i] !== origin[useAt] && showsText(textOf(e))) return { reason: 'another turn printed text between the reply and the dialog' };
+  }
+  return { text };
+}
 
 // ---- #128: is this prompt the owner's words? --------------------------------------------------------------------------------------
 
@@ -615,10 +716,10 @@ export function notOwnerWords(input, transcriptPath) {
 // is read as the answer to the LAST ask of that reply, which may be newer than what the owner had on screen when typing; the transcript cannot tell (the queue-operation entries are no
 // record of when the owner typed). So it records nothing and approves nothing, for a "merge", an "extra round" and a ruling alike: the agent shows the request again, the owner answers once more.
 // True only when the transcript already holds the entry; for a hook that runs before it does, promptProvenance refuses the record at use time.
-const queuedAnswer = (input) => currentPromptEntry(String(input?.transcript_path ?? ''), input?.prompt)?.promptSource === 'queued';
+export const queuedAnswer = (input) => currentPromptEntry(String(input?.transcript_path ?? ''), input?.prompt)?.promptSource === 'queued';
 
 // Is this hook input a subagent's (or not a prompt at all)? Those never approve anything.
-function notOwnerPrompt(input) {
+export function notOwnerPrompt(input) {
   if (input?.hook_event_name !== undefined && input.hook_event_name !== 'UserPromptSubmit') return true;
   if (input?.agent_id !== undefined && input.agent_id !== null && input.agent_id !== '') return true;
   const tp = String(input?.transcript_path ?? '').replaceAll('\\', '/');
@@ -637,11 +738,26 @@ export function realDirChain(home, rel) {
       if (!lstatSync(p).isDirectory()) return false;
     } catch (err) {
       if (err?.code !== 'ENOENT') return false;
-      try { mkdirSync(p, { mode: 0o700 }); } catch { return false; }
-      if (!lstatSync(p).isDirectory()) return false;
+      // (#472: two claimers creating the folder at once: the loser's mkdir says EEXIST, which is fine when what is there is a real directory, checked just below)
+      try { mkdirSync(p, { mode: 0o700 }); } catch (e) { if (e?.code !== 'EEXIST') return false; }
+      try { if (!lstatSync(p).isDirectory()) return false; } catch { return false; }
     }
   }
   return true;
+}
+
+// The binding a "merge" answer makes, as one pure function of the answer and the text it answers (#261: the typed recorder runs it on the owner's prompt and the reply's last request; the
+// click recorder, owner-go-click.mjs, on the chosen answer and the dialog's question, which carries the same closing lines). Returns { prs, requests } or null (the answer is no approval).
+export function approvalBinding(answer, shownText) {
+  const a = parseApproval(answer);
+  if (!a) return null;
+  const shown = presentedRequests(shownText);
+  const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
+  const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
+  const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
+  // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
+  const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
+  return { prs, requests };
 }
 
 // The recorder. Writes one line to <home>/.claude/pipeline-state/owner-go/<session>.jsonl for an owner prompt that approves;
@@ -655,12 +771,7 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
     if (!a) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's "merge")
     if (queuedAnswer(input)) return null; // (#191 B1)
-    const shown = presentedRequests(lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
-    const wanted = (pr) => a.prs.length === 0 || a.prs.includes(pr);
-    const shaOk = (head) => a.shas.length === 0 || a.shas.some((s) => head.startsWith(s) || s.startsWith(head));
-    const requests = shown.requests.filter((r) => wanted(r.pr) && shaOk(r.head));
-    // PRs the owner approved for a direct merge: those the reply asked about (narrowed by the prompt), plus any the prompt names
-    const prs = [...new Set([...shown.prs.filter(wanted), ...a.prs])];
+    const { prs, requests } = approvalBinding(String(input.prompt), lastRequestText(String(input?.transcript_path ?? ''), { prompt: String(input.prompt) }));
     const record = {
       v: 1,
       ts: new Date(now()).toISOString(),
@@ -682,11 +793,11 @@ export function recordApproval(input, { home = accountHome(), now = Date.now } =
 const promptRefs = (input) => ({
   prompt_id: typeof input?.prompt_id === 'string' && input.prompt_id !== '' ? input.prompt_id : null,
   transcript_path: typeof input?.transcript_path === 'string' && input.transcript_path !== '' ? input.transcript_path : null,
-  prompt: typeof input?.prompt === 'string' && input.prompt.length <= RULING_PROMPT_MAX ? input.prompt : null,
+  prompt: typeof input?.prompt === 'string' && answerBody(input.prompt).length <= RULING_PROMPT_MAX ? input.prompt : null, // (the cap is on the words after a pasted glyph, #190.3b)
 });
 
 // Appends one record to <home>/.claude/pipeline-state/owner-go/<session>.jsonl; the record, or null when it cannot be written safely.
-function appendRecord(home, session, record) {
+export function appendRecord(home, session, record) {
   if (!realDirChain(home, OWNER_GO_REL)) return null;
   const file = path.join(ownerGoDir(home), `${session}.jsonl`);
   try {
@@ -706,17 +817,24 @@ function appendRecord(home, session, record) {
 
 export const RULING_PROMPT_MAX = 1000; // a ruling answer is only decisions (rulingsIn); a longer prompt is no answer and is not recorded (never cut)
 
+// The binding a ruling answer makes: the ruling line the text ENDS with (presentedRuling) when the answer is a plausible one (non-empty, at most RULING_PROMPT_MAX; what it decides per item is
+// rulingsIn's job at use time). Pure, shared with the click recorder (#261). Returns { repo, pr, ids, content } or null.
+export function rulingBinding(answer, shownText) {
+  if (typeof answer !== 'string' || answer.trim() === '' || answerBody(answer).length > RULING_PROMPT_MAX) return null;
+  return presentedRuling(shownText);
+}
+
 // Phase 3b, the ruling recorder (same hook, same folder): when the reply right before the owner's prompt ends with the ruling line
 // (presentedRuling), writes the prompt's words, bound to that repository, PR and those item ids. Returns the record, or null. Never throws.
 export function recordRuling(input, { home = accountHome(), now = Date.now } = {}) {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
-    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > RULING_PROMPT_MAX) return null;
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || answerBody(input.prompt).length > RULING_PROMPT_MAX) return null; // (#190.3b: the cap applies after the glyph strip, as the nudges' does)
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: a notice, a peer's or a scheduled turn's words)
     if (queuedAnswer(input)) return null; // (#191 B1)
     const reply = lastReply(String(input?.transcript_path ?? ''), { prompt: input.prompt, skipSynthetic: true });
-    const asked = presentedRuling(reply.text);
+    const asked = rulingBinding(input.prompt, reply.text);
     if (!asked) return null;
     // (#189 finding 2 refused a queued answer to a PROMOTED ask only; #191 B1 refuses every queued answer above. The record still says which kind of ask it answers: ask_turn is the audit trail.)
     return appendRecord(home, session, {
@@ -739,7 +857,7 @@ export function rulingNudge(input) {
   try {
     if (notOwnerPrompt(input) || !SESSION_RE.test(String(input?.session_id ?? ''))) return null;
     const answer = input?.prompt;
-    if (typeof answer !== 'string' || answer.length > RULING_PROMPT_MAX || !PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim())) return null;
+    if (typeof answer !== 'string' || answerBody(answer).length > RULING_PROMPT_MAX || !PAIRS_ONLY.test(answerBody(answer).replace(/\s+/g, ' ').trim())) return null;
     return notOwnerWords(input, String(input?.transcript_path ?? '')) ? null : RULING_NUDGE;
   } catch {
     return null;
@@ -750,14 +868,23 @@ export function rulingNudge(input) {
 // agent (plain text on stdout, never blocking): re-run the request command so the closing lines are FRESH (a stale Head line re-shown by hand would bind a stale head) and ask again. Said
 // whether or not an ask was shown (over-nudging is harmless); not for a prompt that is evidently not the owner's. Takes precedence over the ruling nudge.
 export const QUEUED_NUDGE = '[claude-pipeline owner-go] the owner\'s answer was typed while the agent was still working, so it was not recorded: re-run the dry run (`P merge --pr N --dry-run --owner-go`), `P triage round-request` or `P triage ruling-request`, show the FRESH closing lines, and ask the owner once more after the reply ends.';
+// #262: the owner's typed go for a live-database change: `go migration <name>` or `go data <sha12>` and nothing else. (Here, not in live-db-go.mjs, so queuedNudge can read it without an import cycle.)
+export const GO_PROMPT_MAX = 300;
+export function parseGo(prompt) {
+  if (typeof prompt !== 'string' || prompt.length > GO_PROMPT_MAX) return null;
+  const m = /^\s*go (migration|data) ([A-Za-z0-9_.-]{0,119}[A-Za-z0-9_-])[.!]?\s*$/i.exec(prompt);
+  return m ? { op: m[1].toLowerCase(), arg: m[2] } : null;
+}
 export function queuedNudge(input) {
   try {
     if (notOwnerPrompt(input)) return null;
     const answer = input?.prompt;
     if (typeof answer !== 'string') return null;
+    const body = answerBody(answer); // (#190.3b: the caps apply to the words after a pasted glyph)
     const readsAsAnswer = parseApproval(answer) !== null
-      || (answer.length <= ROUND_GRANT_PROMPT_MAX && (parseRoundGrant(answer) !== null || parsePastRoundGrant(answer) !== null))
-      || (answer.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(answer.replace(/\s+/g, ' ').trim()));
+      || parseGo(answer) !== null
+      || (body.length <= ROUND_GRANT_PROMPT_MAX && (parseRoundGrant(answer) !== null || parsePastRoundGrant(answer) !== null))
+      || (body.length <= RULING_PROMPT_MAX && PAIRS_ONLY.test(body.replace(/\s+/g, ' ').trim()));
     if (!readsAsAnswer || notOwnerWords(input, String(input?.transcript_path ?? ''))) return null;
     return queuedAnswer(input) ? QUEUED_NUDGE : null;
   } catch {
@@ -773,6 +900,7 @@ export function readApprovals(opts = {}) {
     prompt_id: typeof r.prompt_id === 'string' ? r.prompt_id : null,
     transcript_path: typeof r.transcript_path === 'string' ? r.transcript_path : null,
     prompt: typeof r.prompt === 'string' ? r.prompt : null,
+    ...(r.via === 'ask' ? { via: 'ask', ask: r.ask } : {}),
     prs: Array.isArray(r.prs) ? r.prs.filter(Number.isInteger) : [],
     requests: Array.isArray(r.requests) ? r.requests.filter((q) => Number.isInteger(q?.pr) && typeof q.head === 'string' && typeof q.items === 'string').map((q) => ({ ...q, repo: typeof q.repo === 'string' ? q.repo : null })) : [],
   }));
@@ -781,11 +909,22 @@ export function readApprovals(opts = {}) {
 // Every valid record (any kind) younger than maxAgeMs, as written. Never throws.
 // `problems` (an array; the strict lookup ownerGrantLookups passes one): each read that was skipped is described in it (the folder or a file that cannot be read, a
 // file that is not a regular file or is over maxBytes); an absent folder or a file that vanished is no problem. Without it a skipped read is silent, as before.
-function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES, problems = null } = {}) {
+// Why (#472) `settle`: on Claude Code 2.1.323 a click is only a PENDING pointer when its hook runs (the answer's transcript entry is written after the hooks return), so the readers verify pending
+// clicks first (settlePendingClicks, with the caller's `session`) and then read the records. `settle: false` is for the read-only paths (the merge dry run's gate, click replay), which must write
+// nothing; `settle: true` forces it; otherwise settleEnabled decides (the test switch PIPELINE_CLICK_SETTLE=off). A settle that fails never breaks the read: the fault is a problem, the records already
+// written still count, and strict lookups report it.
+export function readRecords({ home = accountHome(), session = null, now = Date.now, maxAgeMs = MAX_AGE_MS, maxBytes = MAX_RECORD_BYTES, problems = null, settle } = {}) {
   const dir = ownerGoDir(home);
   const out = [];
   let names = [];
   const note = (why) => { if (Array.isArray(problems)) problems.push(why); };
+  if (settleEnabled(settle)) {
+    try {
+      for (const why of settlePendingClicks({ home, now, session }).problems) note(why);
+    } catch {
+      note('pending clicks could not be settled');
+    }
+  }
   try {
     if (!lstatSync(dir).isDirectory()) {
       note(`${dir} is not a real folder`);
@@ -797,6 +936,7 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
     return out;
   }
   const t = now();
+  const clicks = new Set(); // #261: a click's record is written after its marker, so a crash-and-retry can leave two of one click: readers keep the first (the click id is the identity)
   for (const name of names) {
     const file = path.join(dir, name);
     let text = '';
@@ -824,6 +964,7 @@ function readRecords({ home = accountHome(), session = null, now = Date.now, max
       if (r?.v !== 1 || `${r.session}.jsonl` !== name) continue;
       const at = Date.parse(r.ts);
       if (!Number.isFinite(at) || at > t + FUTURE_SKEW_MS || t - at > maxAgeMs) continue;
+      if (r.via === 'ask' && typeof r.ask?.clickId === 'string') { if (clicks.has(r.ask.clickId)) continue; clicks.add(r.ask.clickId); }
       out.push(r);
     }
   }
@@ -849,9 +990,14 @@ export const repoKey = (repo) => (typeof repo === 'string' && new RegExp(`^${REP
 // otherwise pass for the owner's words) and NOT $CLAUDE_CONFIG_DIR (this runs in the agent's shell: `CLAUDE_CONFIG_DIR=/tmp/.claude-x P merge`). `home` is the account's home (accountHome, never $HOME); tests pass a temp one.
 // An entry of unknown source (no provenance field) counts as the owner's ONLY when no prompt in the scanned transcript carries any
 // such field (a genuinely old Claude Code); in a modern transcript it is untrusted, and so is an unknown one when the scan fell short of the start.
-export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, home = accountHome() } = {}) {
+export function promptProvenance(record, opts = {}) {
+  return promptEntryOf(record, opts).source;
+}
+// The same lookup, with the entry it found: { source: 'owner'|'synthetic'|'missing', entry } (entry only when one was found). #262: the live-database claim reads the entry's text and timestamp.
+export function promptEntryOf(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, capBytes = PROVENANCE_CAP_BYTES, home = accountHome() } = {}) {
+  const missing = { source: 'missing' };
   const file = record?.transcript_path;
-  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { home })) return 'missing';
+  if (typeof file !== 'string' || file === '' || !path.isAbsolute(file) || /(?:^|[\\/])subagents[\\/]/.test(file) || !isTranscriptFile(file, { home })) return missing;
   let match;
   if (typeof record.prompt_id === 'string' && record.prompt_id !== '') {
     const id = record.prompt_id;
@@ -859,27 +1005,31 @@ export function promptProvenance(record, { chunkBytes = PROVENANCE_CHUNK_BYTES, 
   } else if (typeof record.prompt === 'string' && record.prompt.trim() !== '') {
     const at = Date.parse(record.ts);
     const words = plain(record.prompt);
-    if (!Number.isFinite(at)) return 'missing';
+    if (!Number.isFinite(at)) return missing;
     match = { wants: (line) => line.includes('"user"'), is: (e) => isPromptEntry(e) && promptTextOf(e) === words && Math.abs(Date.parse(e.timestamp) - at) <= FALLBACK_WINDOW_MS };
   } else {
-    return 'missing';
+    return missing;
   }
+  // #418: the harness writes a hidden note (isMeta, entrypoint cli and no promptSource / origin / turnOrigin: an opened image, an attachment) under the prompt's own id; it is no second prompt.
+  // An entry with unplaced provenance (unplacedProvenance) counts, so a forged twin of the owner's prompt still reads as two. (When every match is such a note, they are judged as before.)
   const found = [];
-  const scan = scanBackwards(file, (e) => { if (match.is(e)) found.push(e); return found.length >= 2; }, match.wants, { chunkBytes, capBytes });
-  if (scan === null || found.length === 0) return 'missing';
-  if (found.length > 1) return 'synthetic';
-  if (found[0].promptSource === 'queued') return 'synthetic'; // (#191 B2, every record kind: a queued answer may land on an ask newer than what the owner had on screen; #189 refused only a promoted ask's)
+  const real = [];
+  const scan = scanBackwards(file, (e) => { if (match.is(e)) { found.push(e); if (!(e.isMeta === true && !unplacedProvenance(e))) real.push(e); } return real.length >= 2; }, match.wants, { chunkBytes, capBytes });
+  if (scan === null || found.length === 0) return missing;
+  if (real.length > 0) found.splice(0, found.length, ...real);
+  if (found.length > 1) return { source: 'synthetic' };
+  if (found[0].promptSource === 'queued') return { source: 'synthetic', entry: found[0] }; // (#191 B2, every record kind: a queued answer may land on an ask newer than what the owner had on screen; #189 refused only a promoted ask's)
   const source = entrySource(found[0]);
-  if (source !== 'unknown') return source;
+  if (source !== 'unknown') return { source, entry: found[0] };
   // unknown: legacy only if the whole transcript is free of provenance fields
   let modern = false;
   const whole = scanBackwards(file, (e) => { if (isPromptEntry(e) && hasProvenanceField(e)) modern = true; return modern; }, (line) => line.includes('"user"'), { chunkBytes, capBytes });
-  return whole !== null && whole.reachedStart && !modern ? 'owner' : 'synthetic';
+  return { source: whole !== null && whole.reachedStart && !modern ? 'owner' : 'synthetic', entry: found[0] };
 }
 
 // Visits the parsed lines of a file newest first, in chunk-sized reads, at most capBytes back from the end; `wants(line)` filters before the
 // parse and `visit(entry)` returns true to stop. Returns { reachedStart } (did the scan cover the whole file?) or null when it cannot be read.
-function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
+export function scanBackwards(file, visit, wants, { chunkBytes, capBytes }) {
   let fd;
   try {
     if (!lstatSync(file).isFile()) return null;
@@ -967,8 +1117,12 @@ export function legacyTranscriptOf(session, { home = accountHome() } = {}) {
 function ownedBy(list, { grant = false, home } = {}) {
   const memo = new Map();
   return list.filter((r) => {
-    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${r.ask_turn}\0${grant ? r.session : ''}`;
+    const key = `${r.transcript_path}\0${r.prompt_id}\0${r.prompt}\0${r.ts}\0${r.ask_turn}\0${grant ? r.session : ''}\0${r.via}\0${r.ask?.clickId}`;
     if (!memo.has(key)) {
+      if (r.via === 'ask') { // #261: the answer to a click dialog, not a typed prompt: its proof is the dialog's tool_result entry (clickProvenance)
+        memo.set(key, clickProvenance(r, { home }));
+        return memo.get(key) === 'owner';
+      }
       const derive = grant && (typeof r.transcript_path !== 'string' || r.transcript_path === '');
       const file = derive ? legacyTranscriptOf(r.session, { home }) : r.transcript_path;
       memo.set(key, derive && file === null ? 'missing' : promptProvenance(derive ? { ...r, transcript_path: file } : r, { home }));
@@ -1048,7 +1202,7 @@ const SEP = '(?:\\s*[,;.]\\s*|\\s+and\\s+|\\s+)';
 const PAIR = `${ITEM}\\s*[:=–—-]?\\s*${DECISION}`;
 const PAIRS_ONLY = new RegExp(`^${PAIR}(?:${SEP}${PAIR})*[.!]?$`, 'i');
 export function rulingsIn(answer, askedIds) {
-  const a = String(answer ?? '').replace(/\s+/g, ' ').trim();
+  const a = answerBody(answer).replace(/\s+/g, ' ').trim();
   const asked = (askedIds ?? []).map((x) => String(x).toUpperCase());
   const out = new Map();
   if (!PAIRS_ONLY.test(a)) return out;
@@ -1152,7 +1306,7 @@ export function parsePastRoundGrant(prompt) {
 }
 
 function parseRoundWords(prompt, opener) {
-  const t = String(prompt ?? '').trim();
+  const t = answerBody(prompt); // (#190.3b: a pasted prompt glyph is stripped)
   const m = opener.exec(t);
   if (!m) return null;
   const rest = m[1];
@@ -1166,6 +1320,18 @@ function parseRoundWords(prompt, opener) {
     else if (!FILLER.test(tok)) return null;
   }
   return { prs: [...new Set(prs)], numbers: [...new Set(numbers)] };
+}
+
+// The binding an "extra round" answer makes (pure, shared with the click recorder, #261): the request line the text ENDS with, when the answer is a grant (parseRoundGrant, at most
+// ROUND_GRANT_PROMPT_MAX) and every PR or round it names is the line's. Returns { pr, k, head, repo } or null.
+export function roundBinding(answer, shownText, { parse = parseRoundGrant, present = presentedRoundRequest } = {}) {
+  if (typeof answer !== 'string' || answer.trim() === '' || answerBody(answer).length > ROUND_GRANT_PROMPT_MAX) return null;
+  const g = parse(answer);
+  if (!g) return null;
+  const asked = present(shownText);
+  if (!asked) return null;
+  if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
+  return asked;
 }
 
 // The extra-round recorder (same hook, same folder): when the reply right before the owner's prompt ends with the request line, writes the
@@ -1184,14 +1350,12 @@ function recordRoundKind(input, { home = accountHome(), now = Date.now } = {}, {
   try {
     if (notOwnerPrompt(input)) return null;
     const session = String(input?.session_id ?? '');
-    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || input.prompt.length > ROUND_GRANT_PROMPT_MAX) return null;
-    const g = parse(input.prompt);
-    if (!g) return null;
+    if (!SESSION_RE.test(session) || typeof input?.prompt !== 'string' || input.prompt.trim() === '' || answerBody(input.prompt).length > ROUND_GRANT_PROMPT_MAX) return null; // (#190.3b: after the glyph strip)
+    if (!parse(input.prompt)) return null;
     if (notOwnerWords(input, String(input?.transcript_path ?? ''))) return null; // (#128: strict like a "merge" — a notice, a peer's or a scheduled turn's "extra round")
     if (queuedAnswer(input)) return null; // (#191 B1)
-    const asked = present(lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }));
+    const asked = roundBinding(input.prompt, lastReplyText(String(input?.transcript_path ?? ''), { prompt: input.prompt }), { parse, present });
     if (!asked) return null;
-    if (!g.prs.every((n) => n === asked.pr) || !g.numbers.every((n) => n === asked.pr || n === asked.k)) return null;
     return appendRecord(home, session, {
       v: 1, kind, ts: new Date(now()).toISOString(), session,
       prompt_sha256: createHash('sha256').update(input.prompt).digest('hex'),
@@ -1210,7 +1374,7 @@ const isPastRoundRecord = (r) => isGrantRecord(r, 'past-round');
 function isGrantRecord(r, kind) {
   return r?.kind === kind && typeof r.session === 'string' && typeof r.ts === 'string' && typeof r.prompt_sha256 === 'string'
     && repoKey(r.repo) === r.repo && Number.isInteger(r.pr) && Number.isInteger(r.k) && /^[0-9a-f]{12,40}$/.test(String(r.head))
-    && typeof r.prompt === 'string' && r.prompt.trim() !== '' && r.prompt.length <= ROUND_GRANT_PROMPT_MAX
+    && typeof r.prompt === 'string' && r.prompt.trim() !== '' && answerBody(r.prompt).length <= ROUND_GRANT_PROMPT_MAX
     && createHash('sha256').update(r.prompt).digest('hex') === r.prompt_sha256;
 }
 
@@ -1246,16 +1410,244 @@ function spentMarker(record, { home, problems = null } = {}) {
   return marker.spent;
 }
 
+// ---- #472: round tickets, coverage and the per-grant marker every covered grant ends up with ------------------------------------------------------
+// Why: a click is verified late on Claude Code 2.1.323 (settlePendingClicks), so a round grant can become a record AFTER an extra-round claim of its round was made, and two claimers with disjoint
+// snapshots (one holds the typed word, the other the late click) would each claim a "different" grant: two runs for one round. So every extra-round claim first creates ONE O_EXCL ticket
+// `round-claims/<key16>.<n>.json` for (repository, PR, counted round k) (claimGrantMarkers, `ticket: true`): the claims of a round are totally ordered by their tickets, and a claim may only take
+// ticket n+1 while it holds a grant answered after ticket n. A grant answered at or before a ticket is COVERED by it: spent for every new reader (roundCoverage), and, so that readers that know
+// nothing about tickets (an older checkout's `pipeline.mjs`, a downgrade) see it spent too, it gets its own ordinary per-grant marker (the claim's sweep, settlePendingClicks, or the reader repair in
+// grantRecordsFor). Coverage governs the availability of a grant for another claim ONLY: verifyOwnerGrant keeps judging historical proof by record + own marker, at any age.
+export const ROUND_CLAIMS_REL = `${OWNER_GO_REL}/round-claims`;
+const TICKET_NAME = /^([0-9a-f]{16})\.([1-9]\d{0,5})\.json$/;
+const CONSUMED_NAME = /^([0-9a-f]{16})\.json$/;
+const SOURCE_MAX_BYTES = 64 * 1024;
+
+// Why (#472): the key one round's tickets are named by, sha256(repoKey|pr|k)[:16]; null for a repository that is none.
+export const roundTicketKey = (repo, pr, k) => {
+  const key = repoKey(repo);
+  return key === null ? null : createHash('sha256').update(`${key}|${pr}|${k}`).digest('hex').slice(0, 16);
+};
+
+// A ticket or marker file read for coverage: { state: 'ok', value, mtimeMs } | { state: 'bad', mtimeMs } (there, but not JSON, too big or unreadable: UNPARSEABLE) | { state: 'error' } (it cannot even be
+// looked at, or it is no plain file: a link, a folder). `io.lstatSync` is a test seam.
+function readSourceFile(file, io) {
+  let st;
+  try {
+    st = (io.lstatSync ?? lstatSync)(file);
+    if (!st.isFile()) return { state: 'error' };
+  } catch {
+    return { state: 'error' };
+  }
+  try {
+    const fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
+    try {
+      const got = fstatSync(fd);
+      if (!got.isFile() || got.size > SOURCE_MAX_BYTES) return { state: 'bad', mtimeMs: st.mtimeMs };
+      const buf = Buffer.alloc(got.size);
+      readSync(fd, buf, 0, got.size, 0);
+      return { state: 'ok', value: JSON.parse(buf.toString('utf8')), mtimeMs: st.mtimeMs };
+    } finally {
+      closeSync(fd);
+    }
+  } catch {
+    return { state: 'bad', mtimeMs: st.mtimeMs };
+  }
+}
+const isPlainObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+const validTicket = (v, key, n) => isPlainObject(v) && v.v === 1 && repoKey(v.repo) === v.repo && Number.isInteger(v.pr) && Number.isInteger(v.k) && v.n === n && roundTicketKey(v.repo, v.pr, v.k) === key
+  && FULL_HEAD.test(String(v.head)) && typeof v.consumedAt === 'string' && Number.isFinite(Date.parse(v.consumedAt)) && Array.isArray(v.grantIds) && v.grantIds.every((g) => GRANT_ID.test(String(g)));
+const validMarker = (v, id) => isPlainObject(v) && v.v === 1 && v.grantId === id && repoKey(v.repo) === v.repo && Number.isInteger(v.pr) && Number.isInteger(v.k) && FULL_HEAD.test(String(v.head))
+  && typeof v.consumedAt === 'string' && Number.isFinite(Date.parse(v.consumedAt));
+const indeterminate = (why) => ({ state: 'indeterminate', why });
+
+// Why (#472): the round tickets of (repo, pr, k) (and of the names the recorded repository moves map them to), read for coverage and for the claim's ticket number. -> { state: 'ok', tickets: [{ id:
+// '<key16>.<n>', n, parseable, repo, pr, k, head, consumedAt, grantIds, checkout: null, mtimeMs }] sorted by n } | { state: 'indeterminate', why }. A missing folder is no ticket; an unsafe folder, a listing that
+// fails, a name that is no ticket name, and a ticket that cannot be looked at or is no plain file make it INDETERMINATE (fail closed). A ticket that is there but unparseable is kept with its mtime and no
+// head: it covers by time only and is never a repair source (it has no head to copy). `io.readdirSync` / `io.lstatSync` are test seams.
+export function readRoundTickets({ home = accountHome(), repo, pr, k, moves = [], io = {} } = {}) {
+  const chain = chainState(home, ROUND_CLAIMS_REL);
+  if (chain === 'missing') return { state: 'ok', tickets: [] };
+  if (chain === 'unsafe') return indeterminate('the round-claims folder is not a real folder');
+  const names = [repo, ...moves.flatMap((m) => [m?.from, m?.to])].map((r) => roundTicketKey(r, pr, k)).filter((x) => x !== null);
+  const wanted = new Set(names);
+  let listing;
+  try {
+    listing = (io.readdirSync ?? readdirSync)(path.join(home, ...ROUND_CLAIMS_REL.split('/')));
+  } catch (err) {
+    return indeterminate(`the round-claims folder cannot be listed (${err?.code ?? 'error'})`);
+  }
+  const tickets = [];
+  for (const name of listing) {
+    const m = TICKET_NAME.exec(name);
+    if (m === null) return indeterminate(`the round-claims folder holds ${name}, which is no ticket`);
+    if (!wanted.has(m[1])) continue;
+    const n = Number(m[2]);
+    const r = readSourceFile(path.join(home, ...ROUND_CLAIMS_REL.split('/'), name), io);
+    if (r.state === 'error') return indeterminate(`the ticket ${name} cannot be checked`);
+    const id = `${m[1]}.${n}`;
+    tickets.push(r.state === 'ok' && validTicket(r.value, m[1], n)
+      ? { id, n, parseable: true, repo: r.value.repo, pr: r.value.pr, k: r.value.k, head: r.value.head, consumedAt: r.value.consumedAt, grantIds: r.value.grantIds, checkout: null, mtimeMs: r.mtimeMs }
+      : { id, n, parseable: false, mtimeMs: r.mtimeMs });
+  }
+  return { state: 'ok', tickets: tickets.sort((a, b) => a.n - b.n) };
+}
+
+// The ordinary consumed markers as coverage sources (a claim by ticket-less code leaves nothing else, F1). A verifiable marker WITHOUT `coveredBy` is a source with its own fields; one WITH `coveredBy`
+// is derived (its source is present) and skipped; an unparseable one is a source by mtime. Same indeterminate rules as the tickets (names must be `<16 hex>.json`).
+function readConsumedSources({ home, io }) {
+  const chain = chainState(home, CONSUMED_REL);
+  if (chain === 'missing') return { state: 'ok', sources: [] };
+  if (chain === 'unsafe') return indeterminate('the consumed-grants folder is not a real folder');
+  const dir = path.join(home, ...CONSUMED_REL.split('/'));
+  let listing;
+  try {
+    listing = (io.readdirSync ?? readdirSync)(dir);
+  } catch (err) {
+    return indeterminate(`the consumed-grants folder cannot be listed (${err?.code ?? 'error'})`);
+  }
+  const sources = [];
+  for (const name of listing) {
+    const m = CONSUMED_NAME.exec(name);
+    if (m === null) return indeterminate(`the consumed-grants folder holds ${name}, which is no marker`);
+    const r = readSourceFile(path.join(dir, name), io);
+    if (r.state === 'error') return indeterminate(`the marker ${name} cannot be checked`);
+    if (r.state === 'ok' && validMarker(r.value, m[1])) {
+      if (typeof r.value.coveredBy === 'string') continue;
+      sources.push({ id: m[1], parseable: true, repo: r.value.repo, pr: r.value.pr, k: r.value.k, head: r.value.head, consumedAt: r.value.consumedAt, checkout: typeof r.value.checkout === 'string' ? r.value.checkout : null, mtimeMs: r.mtimeMs });
+    } else {
+      sources.push({ id: m[1], parseable: false, mtimeMs: r.mtimeMs });
+    }
+  }
+  return { state: 'ok', sources };
+}
+
+// Tickets + consumed markers for one round. -> { state: 'ok', tickets, sources } | { state: 'indeterminate', why }.
+function coverageSources({ home, repo, pr, k, moves, io }) {
+  const t = readRoundTickets({ home, repo, pr, k, moves, io });
+  if (t.state !== 'ok') return t;
+  const c = readConsumedSources({ home, io });
+  if (c.state !== 'ok') return c;
+  return { state: 'ok', tickets: t.tickets, sources: [...t.tickets, ...c.sources] };
+}
+
+// The sources that cover `record` (answered at or before the source's consumedAt, or before an unparseable source's mtime; same PR and round, the source's head starting with the record's, the source's
+// repository the current one or moved to it after the claim), parseable ones in front.
+function coveringSources(record, sources, key, moves) {
+  const at = Date.parse(record.ts);
+  const hits = sources.filter((s) => (s.parseable
+    ? s.pr === record.pr && s.k === record.k && sameRepo({ recorded: s.repo, recordedAt: s.consumedAt, current: key, moves }) && s.head.startsWith(record.head) && Date.parse(s.consumedAt) >= at
+    : s.mtimeMs >= at));
+  return [...hits.filter((s) => s.parseable), ...hits.filter((s) => !s.parseable)];
+}
+
+// Why (#472): is this extra-round grant spent by a claim of its round that was made after it was answered? 'covered' | 'absent' | 'indeterminate' (a folder that is unsafe or cannot be listed, a stray name, an
+// lstat that fails: the grant then counts as spent, strict lookups report it, and a claim is refused `unsafe`). Extra-round records only (a past-round record, which shares the readers, is always 'absent': F6).
+// `repo` is the repository the caller asks about (default the record's own); `moves` the recorded repository moves. Sources: the round tickets and every ordinary consumed marker (see readConsumedSources).
+export function roundCoverage(record, { home = accountHome(), moves = [], repo, io = {} } = {}) {
+  if (!isRoundRecord(record)) return 'absent';
+  const key = repoKey(repo ?? record.repo);
+  if (key === null) return 'absent';
+  const s = coverageSources({ home, repo: key, pr: record.pr, k: record.k, moves, io });
+  if (s.state !== 'ok') return 'indeterminate';
+  return coveringSources(record, s.sources, key, moves).length > 0 ? 'covered' : 'absent';
+}
+
+// The first covering source with a parseable body, as { id, repo, pr, k, head, consumedAt, checkout }: what the sweep and the repair copy into the grant's own marker (its head and consumedAt, never `now`).
+// null when nothing parseable covers it (an unparseable source covers by time but has no head to copy: F3) or coverage is indeterminate.
+export function roundCoverageSource(record, { home = accountHome(), moves = [], repo, io = {} } = {}) {
+  if (!isRoundRecord(record)) return null;
+  const key = repoKey(repo ?? record.repo);
+  if (key === null) return null;
+  const s = coverageSources({ home, repo: key, pr: record.pr, k: record.k, moves, io });
+  if (s.state !== 'ok') return null;
+  const hit = coveringSources(record, s.sources, key, moves).find((x) => x.parseable);
+  return hit === undefined ? null : sourceCopy(hit);
+}
+const sourceCopy = (s) => ({ id: s.id, repo: s.repo, pr: s.pr, k: s.k, head: s.head, consumedAt: s.consumedAt, checkout: s.checkout });
+
+// Exclusively creates consumed/<grantId>.json holding `body` (written and fsynced; the folder too). 'ok' | 'exists' | 'error'. Any error AFTER the file exists leaves it behind: it reads as SPENT (and
+// unverifiable), as everywhere. `io.writeSync` / `io.fsyncSync` are the tests' fault seams.
+function writeMarkerFile(grantId, body, { home, io = {} }) {
+  const file = markerPath(grantId, { home });
+  if (file === null) return 'error';
+  let fd;
+  try {
+    fd = openSync(file, OPEN_EXCL, 0o600);
+  } catch (err) {
+    return err?.code === 'EEXIST' ? 'exists' : 'error';
+  }
+  try {
+    (io.writeSync ?? writeSync)(fd, `${JSON.stringify(body)}\n`);
+    (io.fsyncSync ?? fsyncSync)(fd);
+  } catch {
+    try { closeSync(fd); } catch { /* spent either way */ }
+    return 'error';
+  }
+  try { closeSync(fd); } catch { return 'error'; }
+  return 'ok';
+}
+const derivedMarker = (grantId, source) => ({ v: 1, grantId, repo: source.repo, pr: source.pr, k: source.k, head: source.head, consumedAt: source.consumedAt, checkout: source.checkout ?? null, coveredBy: source.id });
+
+// Why (#472): a covered grant's OWN per-grant marker, copied from the parseable source that covers it (head and consumedAt of the source, `coveredBy` = its id). Called by settlePendingClicks (before and
+// after it appends a click's record), and by the reader repair. Never gated by the environment (F8). -> { coverage: 'absent' | 'covered' | 'indeterminate', marked: 'none' | 'written' | 'exists' | 'error' }
+// ('none': nothing to write, no parseable source covers it or it is not covered).
+export function markCoveredGrant(record, { home = accountHome(), moves, repo, io = {} } = {}) {
+  if (!isRoundRecord(record)) return { coverage: 'absent', marked: 'none' };
+  const key = repoKey(repo ?? record.repo);
+  const id = grantIdOf(record);
+  if (key === null || id === null) return { coverage: 'absent', marked: 'none' };
+  const m = moves ?? readRepoMoves({ home }).moves;
+  const s = coverageSources({ home, repo: key, pr: record.pr, k: record.k, moves: m, io });
+  if (s.state !== 'ok') return { coverage: 'indeterminate', marked: 'none' };
+  const hits = coveringSources(record, s.sources, key, m);
+  if (hits.length === 0) return { coverage: 'absent', marked: 'none' };
+  const source = hits.find((x) => x.parseable);
+  if (source === undefined) return { coverage: 'covered', marked: 'none' };
+  if (!realDirChain(home, CONSUMED_REL)) return { coverage: 'covered', marked: 'error' };
+  const made = writeMarkerFile(id, derivedMarker(id, sourceCopy(source)), { home, io });
+  return { coverage: 'covered', marked: made === 'ok' ? 'written' : made };
+}
+
 // The unspent records (before the provenance check) for this repository, PR, counted round k, newest first (see ownerGrantedRounds).
+// #472: an extra-round record is also spent when a claim of its round covers it (roundCoverage: indeterminate counts as spent and, in strict mode, is a problem), and a covered one whose own marker is
+// missing gets it written here (the repair; `settle: false` is the read-only paths' opt-out; the environment never gates it). Past-round records are never covered (F6).
+// `opts.io.afterSpentCheck(record)` (tests): runs once for each record this call keeps, after its spent and coverage checks.
 const grantsFor = (q = {}) => grantRecordsFor(isRoundRecord, q);
 function grantRecordsFor(isKind, { repo, pr, k, head, anyHead = false, ...opts } = {}) {
   const key = repoKey(repo);
   if (key === null || !Number.isInteger(pr) || !Number.isInteger(k) || (!anyHead && !FULL_HEAD.test(String(head)))) return [];
   const moves = movesOf(opts);
+  const extra = isKind === isRoundRecord;
+  let sources = null; // read once, and only when a record gets this far
   return readRecords(opts)
-    .filter((r) => isKind(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head))
-      && !spentMarker(r, opts))
+    .filter((r) => {
+      if (!(isKind(r) && sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) && r.pr === pr && r.k === k && r.head.length >= HEAD_CHARS && (anyHead || head.startsWith(r.head)))) return false;
+      if (spentMarker(r, opts)) return false;
+      if (extra) {
+        sources ??= coverageSources({ home: opts.home ?? accountHome(), repo: key, pr, k, moves, io: opts.io ?? {} });
+        if (sources.state !== 'ok') {
+          if (Array.isArray(opts.problems) && !opts.problems.some((p) => p.startsWith("a grant's round claims"))) opts.problems.push(`a grant's round claims cannot be checked (${sources.why})`);
+          return false;
+        }
+        const hits = coveringSources(r, sources.sources, key, moves);
+        if (hits.length > 0) {
+          const source = hits.find((x) => x.parseable);
+          if (source !== undefined && opts.settle !== false) repairMarker(r, source, { home: opts.home ?? accountHome(), io: opts.io });
+          return false;
+        }
+      }
+      opts.io?.afterSpentCheck?.(r);
+      return true;
+    })
     .sort((a, b) => Date.parse(b.ts) - Date.parse(a.ts));
+}
+// The reader repair: the covered grant's own marker, if it is still missing. A failure is ignored (the grant stays spent for new readers; the next read tries again).
+function repairMarker(record, source, { home, io }) {
+  try {
+    const id = grantIdOf(record);
+    if (id === null || !realDirChain(home, CONSUMED_REL)) return;
+    writeMarkerFile(id, derivedMarker(id, sourceCopy(source)), { home, io });
+  } catch { /* spent for new readers either way */ }
 }
 
 // Every record for this repository, PR, counted round k whose recorded head starts the full head under review, younger than 24 h, with NO
@@ -1301,6 +1693,9 @@ export function ownerGrantLookups({ repo, pr, home = accountHome(), now = Date.n
   const read = (k) => {
     const problems = [...base];
     const found = grantsFor({ repo, pr, k, anyHead: true, home, now, repoMoves: moves.moves, problems });
+    // #472: a round click that is still unverified (read AFTER the grants, so one this read just settled is no longer in it; computed in every read, never cached in `base`, so a lookup made after the
+    // grace still sees it) is a grant this lookup could not see: defer-fixes / round-request must not read "no grant" over it. It stays a problem until its evidence could no longer matter.
+    problems.push(...pendingClickProblems({ home, repo, pr, kinds: ['round'], now, moves: moves.moves }));
     if (problems.length > 0) throw new Error(problems.slice(0, 3).join('; '));
     return found;
   };
@@ -1322,25 +1717,70 @@ export const ownerGrantConfigDirHint = (q = {}) => configDirHint(grantsFor(q), {
 // and fsynced (the folder too, except on Windows), and any error after the marker exists leaves it SPENT. Returns { ok:true, claimed:[{ grantId,
 // file }] } or { ok:false, reason: 'used' (a marker was there) | 'spent' (we created it, then failed) | 'unsafe' | 'invalid' | 'none' }.
 // `io` replaces writeSync / fsyncSync (tests).
-export function claimGrantMarkers(records, body, { home = accountHome(), now = Date.now, io = {} } = {}) {
+// Why (#472) `ticket: true` (the extra-round claim of review-round.mjs; the past-round claim in state.mjs stays ticket-less): the claim first takes ONE O_EXCL round ticket for (repo, pr, k), so claims of a
+// round are totally ordered and two claimers with disjoint snapshots cannot both win (see the block above grantRecordsFor). 1. read the tickets (indeterminate -> `unsafe`; n = the highest ticket); 2. re-run
+// roundCoverage on every record: at least ONE must be `absent` (head-aware, the predicate admission applies), else `used` (indeterminate -> `unsafe`); 3. create ticket n + 1 (EEXIST -> `used`; an error
+// after it exists -> `spent`, the ticket stands); 4. write the per-grant markers (as without a ticket, but with `coveredBy`, the ticket's head and consumedAt; an EEXIST marker that is verifiable, for
+// this repo / PR / round / head and `coveredBy` this very ticket was written by a reader's repair between steps 3 and 4 and counts as ours: F2); 5. sweep: every extra-round grant of the round
+// covering `body.head` that was answered at or before the ticket gets the missing marker too (a failed write -> `spent`; the ticket stands and readers repair the rest). Returns the same shapes, plus
+// `ticket` ('<key16>.<n>') on success. Test seams in `io`: writeSync / fsyncSync (every write of the claim), readdirSync / lstatSync (coverage), afterTicket (between steps 3 and 4).
+export function claimGrantMarkers(records, body, { home = accountHome(), now = Date.now, io = {}, ticket = false, repoMoves } = {}) {
   const ids = [...new Set((records ?? []).map(grantIdOf))];
   if ((records ?? []).length === 0) return { ok: false, reason: 'none' };
   const key = repoKey(body?.repo);
   if (ids.includes(null) || key === null || !Number.isInteger(body?.pr) || !Number.isInteger(body?.k) || !FULL_HEAD.test(String(body?.head))) return { ok: false, reason: 'invalid' };
   if (!realDirChain(home, CONSUMED_REL)) return { ok: false, reason: 'unsafe' };
-  const write = io.writeSync ?? writeSync;
   const sync = io.fsyncSync ?? fsyncSync;
   const claimed = [];
+  let round = null; // the ticket this claim holds: { id, head, consumedAt }
+  if (ticket) {
+    const moves = movesOf({ home, repoMoves });
+    const read = coverageSources({ home, repo: key, pr: body.pr, k: body.k, moves, io });
+    if (read.state !== 'ok') return { ok: false, reason: 'unsafe' };
+    const coverage = records.map((r) => (coveringSources(r, read.sources, key, moves).length > 0 ? 'covered' : 'absent'));
+    if (!coverage.includes('absent')) return { ok: false, reason: 'used' };
+    const n = read.tickets.reduce((most, t) => Math.max(most, t.n), 0) + 1;
+    const id = `${roundTicketKey(key, body.pr, body.k)}.${n}`;
+    const consumedAt = new Date(now()).toISOString();
+    if (!realDirChain(home, ROUND_CLAIMS_REL)) return { ok: false, reason: 'unsafe' };
+    const file = path.join(home, ...ROUND_CLAIMS_REL.split('/'), `${id}.json`);
+    let fd;
+    try {
+      fd = openSync(file, OPEN_EXCL, 0o600);
+    } catch (err) {
+      return { ok: false, reason: err?.code === 'EEXIST' ? 'used' : 'unsafe', claimed };
+    }
+    try {
+      (io.writeSync ?? writeSync)(fd, `${JSON.stringify({ v: 1, repo: key, pr: body.pr, k: body.k, n, head: body.head, consumedAt, grantIds: [...ids].sort() })}\n`);
+      sync(fd);
+    } catch {
+      try { closeSync(fd); } catch { /* the ticket stands either way */ }
+      return { ok: false, reason: 'spent', claimed };
+    }
+    try { closeSync(fd); } catch { return { ok: false, reason: 'spent', claimed }; }
+    if (process.platform !== 'win32') {
+      try {
+        const dfd = openSync(path.dirname(file), constants.O_RDONLY);
+        try { sync(dfd); } finally { closeSync(dfd); }
+      } catch {
+        return { ok: false, reason: 'spent', claimed };
+      }
+    }
+    round = { id, head: body.head, consumedAt };
+    io.afterTicket?.({ id });
+  }
+  const write = io.writeSync ?? writeSync;
   for (const grantId of ids.sort()) {
     const file = markerPath(grantId, { home });
     let fd;
     try {
       fd = openSync(file, OPEN_EXCL, 0o600);
     } catch (err) {
+      if (err?.code === 'EEXIST' && round !== null && repairedByThisTicket(grantId, { home, key, body, ticket: round })) { claimed.push({ grantId, file }); continue; }
       return { ok: false, reason: err?.code === 'EEXIST' ? 'used' : 'unsafe', grantId, claimed };
     }
     try {
-      write(fd, `${JSON.stringify({ v: 1, grantId, repo: key, pr: body.pr, k: body.k, head: body.head, consumedAt: new Date(now()).toISOString(), checkout: typeof body.checkout === 'string' ? body.checkout : null })}\n`);
+      write(fd, `${JSON.stringify({ v: 1, grantId, repo: key, pr: body.pr, k: body.k, head: body.head, consumedAt: round === null ? new Date(now()).toISOString() : round.consumedAt, checkout: typeof body.checkout === 'string' ? body.checkout : null, ...(round === null ? {} : { coveredBy: round.id }) })}\n`);
       sync(fd);
     } catch {
       try { closeSync(fd); } catch { /* spent either way */ }
@@ -1357,7 +1797,31 @@ export function claimGrantMarkers(records, body, { home = accountHome(), now = D
       return { ok: false, reason: 'spent', claimed };
     }
   }
-  return { ok: true, claimed };
+  if (round !== null && !sweepCovered({ home, now, io, key, body, ticket: round, repoMoves, held: new Set(ids) })) return { ok: false, reason: 'spent', claimed };
+  return { ok: true, claimed, ...(round === null ? {} : { ticket: round.id }) };
+}
+
+// F2: a marker that already stands for this grant is OUR claim's when it is verifiable, for this repository / PR / round / head, and `coveredBy` this very ticket (a reader's repair wrote it between the ticket
+// and the marker step).
+function repairedByThisTicket(grantId, { home, key, body, ticket }) {
+  const m = readGrantMarker(grantId, { home });
+  return m.verifiable && m.marker.repo === key && m.marker.pr === body.pr && m.marker.k === body.k && m.marker.head === body.head && m.marker.coveredBy === ticket.id;
+}
+
+// The claim's sweep (step 5): every extra-round grant of (repo, pr, k) covering the claimed head that was answered at or before the ticket, settled records included, gets its own marker from this ticket
+// when it has none (a marker that already stands is fine: that grant is spent). false when a write failed.
+function sweepCovered({ home, now, io, key, body, ticket, repoMoves, held }) {
+  const moves = movesOf({ home, repoMoves });
+  const upTo = Date.parse(ticket.consumedAt);
+  const source = { id: ticket.id, repo: key, pr: body.pr, k: body.k, head: ticket.head, consumedAt: ticket.consumedAt, checkout: typeof body.checkout === 'string' ? body.checkout : null };
+  for (const r of readRecords({ home, now })) {
+    if (!isRoundRecord(r) || !sameRepo({ recorded: r.repo, recordedAt: r.ts, current: key, moves }) || r.pr !== body.pr || r.k !== body.k || !body.head.startsWith(r.head) || Date.parse(r.ts) > upTo) continue;
+    const id = grantIdOf(r);
+    if (id === null || held.has(id)) continue;
+    const made = writeMarkerFile(id, derivedMarker(id, source), { home, io });
+    if (made === 'error') return false;
+  }
+  return true;
 }
 
 // What is on disk for a grant id: { spent: false, verifiable: false } (no marker), { spent: true, verifiable: true, marker } or

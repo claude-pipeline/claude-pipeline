@@ -6,7 +6,7 @@
 // finding can never forge or close a marker the pipeline looks for, and "@" becomes the fullwidth
 // commercial at (U+FF20) so it can never notify anyone (it looks the same, also inside code).
 // Single-line values are flattened, and pipes in table cells become &#124;.
-import { encodeForComment } from './state.mjs';
+import { encodeForComment, secondReviewerOf } from './state.mjs';
 import { skipOf } from './verify-steps.mjs';
 
 export const MARKERS = {
@@ -44,12 +44,13 @@ const ownerReason = (final) => (typeof final?.ownerQuote === 'string' && final.o
 
 // A Claude-ruled item names who decided: claude alone, or claude+codex when a second review (Codex) is stored in the item.
 const claudeRuled = (item) => item?.final?.by === 'claude';
-const claudeBy = (item) => (item.secondReview !== undefined ? 'claude+codex' : 'claude');
+const claudeBy = (item) => (item.secondReview !== undefined ? `claude+${secondReviewerOf(item.secondReview)}` : 'claude');
 
+const isPlainOwnerDeferral = (final) => final !== null && typeof final?.ownerDeferral === 'object' && final.ownerDeferral !== null && !Array.isArray(final.ownerDeferral);
 function triageRow(n, item) {
   const { final, judge, arbiter } = item;
   let decision = 'pending';
-  if (final) decision = `${final.decision ?? 'unknown'}${final.needsHuman ? ' (needs human)' : ''}`;
+  if (final) decision = `${final.decision ?? 'unknown'}${final.needsHuman ? ' (needs human)' : ''}${isPlainOwnerDeferral(final) ? ` (owner deferral of ${line(final.ownerDeferral.accepted, 20)} ACCEPT)` : ''}`;
   else if (judge) decision = `${judge.decision} (pending)`;
   const by = claudeRuled(item) ? claudeBy(item) : final?.by ?? '—';
   const conf = arbiter?.confidence ?? judge?.confidence ?? '—';
@@ -68,7 +69,7 @@ const grantLabel = (g) => `round ${line(g.k ?? g.n)}`;
 function claudeRulingLines(rounds) {
   return rounds.flatMap((r) => (r.items ?? []).filter(claudeRuled).map((item) => {
     const sr = item.secondReview;
-    const codex = sr ? `Codex ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
+    const codex = sr ? `${secondReviewerOf(sr) === 'codex' ? 'Codex' : `Substitute (${secondReviewerOf(sr)})`} ${line(sr.decision)}, ${line(sr.confidence)}` : 'no Codex check';
     // A fix taken out at the round limit (triage defer-fixes) says so: it is a FOLLOW-UP whose fix is NOT in this merge.
     if (item.roundCapDeferral) return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (deferred past the round limit; its fix was taken out, NOT in this merge) - ${line(item.final.reason, 300)}`;
     return `- ${line(item.id)}: ${line(item.final.decision ?? 'unknown')} (${claudeBy(item)}; ${codex}) - ${line(item.final.reason, 300)}`;
@@ -86,6 +87,38 @@ function reraisedLines(rounds) {
   }));
 }
 
+// "Round 2 — substitute review (Claude Opus; Codex quota, resets 4:21 PM)": who reviewed a round Codex did not, why, and which attempt. The record is
+// agent-written, so every value goes through line(). The ids in the rows above are unchanged.
+const SUBSTITUTE_NAMES = { 'substitute-opus': 'Claude Opus', 'substitute-fable': 'Claude Fable' };
+function substituteWhy(sub) {
+  if (sub.evidence === 'budget') return isObject(sub.budget) ? `Codex round budget ${line(sub.budget.used)} used` : 'Codex round budget spent';
+  if (sub.evidence === 'governor') return isObject(sub.governor) ? `Codex weekly ${line(sub.governor.usedPct)}% ≥ ${line(sub.governor.threshold)}%` : 'Codex weekly quota high';
+  // Codex refused review.codex_model (cp #431). Older pipeline copies render an evidence kind they do not know as "Codex quota" (no state version bump: documented in docs/cli.md).
+  if (sub.evidence === 'model') return typeof sub.codexModelRefused === 'string' && sub.codexModelRefused.trim() !== '' ? `Codex model ${line(sub.codexModelRefused, 100)} refused (fix review.codex_model)` : 'Codex model refused (fix review.codex_model)';
+  const reset = typeof sub.resetText === 'string' && sub.resetText.trim() !== '' ? sub.resetText : typeof sub.resetAt === 'string' ? sub.resetAt : '';
+  return reset ? `Codex quota, resets ${line(reset, 40)}` : 'Codex quota';
+}
+function substituteLines(rounds) {
+  return rounds.filter((r) => isObject(r?.substitute)).map((r) => {
+    const sub = r.substitute;
+    const attempt = Number(sub.attempts) > 1 ? `, attempt ${line(sub.attempts)}` : '';
+    return `- Round ${line(r.n)} — substitute review (${SUBSTITUTE_NAMES[sub.agent] ?? 'Claude stand-in'}; ${substituteWhy(sub)}${attempt})`;
+  });
+}
+
+// A second review a substitute gave because Codex refused its model is shown whatever the item's final is: claudeRulingLines lists only items Claude ruled, and a REJECT or FOLLOW-UP
+// second review on an item the arbiter ruled keeps final.by arbiter. One line per refused model (several items share one), the repair step in it. The model is agent-written: line().
+function modelRefusalLines(rounds) {
+  const models = new Set();
+  for (const r of rounds) {
+    for (const item of r.items ?? []) {
+      const sr = item?.secondReview;
+      if (isObject(sr) && sr.evidence === 'model') models.add(typeof sr.codexModelRefused === 'string' && sr.codexModelRefused.trim() !== '' ? line(sr.codexModelRefused, 100) : '');
+    }
+  }
+  return [...models].map((m) => `- Codex refused the configured model${m ? ` ${m}` : ''} (model_not_found), so a substitute gave the second review: fix review.codex_model on the default branch, then bring that fix into this branch`);
+}
+
 export function triageComment(state) {
   const rounds = state.rounds ?? [];
   const rows = rounds.flatMap((r) => (r.items ?? []).map((item) => triageRow(r.n, item)));
@@ -94,6 +127,10 @@ export function triageComment(state) {
   else if (rows.length === 0) out.push('', '_Codex raised no findings._');
   const claudeLines = claudeRulingLines(rounds);
   if (claudeLines.length > 0) out.push('', '#### Claude rulings', '', ...claudeLines);
+  const standIns = substituteLines(rounds);
+  if (standIns.length > 0) out.push('', '#### Substitute reviews', '', ...standIns);
+  const refusals = modelRefusalLines(rounds);
+  if (refusals.length > 0) out.push('', '#### Codex model refusals', '', ...refusals);
   const reraised = reraisedLines(rounds);
   if (reraised.length > 0) out.push('', '#### Raised again after a deferral', '', ...reraised);
   const granted = grantedRounds(state);
@@ -165,7 +202,8 @@ function outliersSection(entries, modelProofs, state) {
     out.push(`- ${findingLabel(item)} · ${codexView(item)} · ${judgeView(item)} · ${settled} _(${strong ? 'strong disagreement' : 'close call'})_`);
   }
   for (const { item } of unique(entries.filter(({ item: i }) => i.final?.ownerQuote))) {
-    out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)} — "${line(item.final.ownerQuote, 300)}"`);
+    const deferral = isPlainOwnerDeferral(item.final) ? ` (deferral of the ${line(item.final.ownerDeferral.accepted, 20)}'s ACCEPT, not fixed)` : '';
+    out.push(`- ${findingLabel(item)} · Owner (chat): ${line(item.final.decision)}${deferral} — "${line(item.final.ownerQuote, 300)}"`);
   }
   for (const g of grantedRounds(state)) {
     out.push(`- Owner (chat) granted ${grantLabel(g)} - "${line(g.quote, 300)}"`);
@@ -208,7 +246,7 @@ function followupsSection(entries, followups) {
 
 // The body of the summary comment without its marker (the run record's writer composes marker + status block + this +
 // record marker; see summary-comment.mjs).
-export function summarySections(state, { outcome, built, followups = [], modelProofs = [], ciNote = null }) {
+export function summarySections(state, { outcome, built, followups = [], modelProofs = [], testsAdded, ciNote = null }) {
   const entries = entriesOf(state);
   const implemented = unique(entries.filter(({ item }) => item.final?.decision === 'ACCEPT' && item.implemented)).map(
     ({ item, n }) => `- ${findingLabel(item)} (round ${n})`,
@@ -221,7 +259,7 @@ export function summarySections(state, { outcome, built, followups = [], modelPr
   return [
     section('### Outliers', outliersSection(entries, modelProofs, state)),
     '',
-    section('### What was built', built ? defuse(String(built).trim()) : '_Not provided_'),
+    section('### What was built', (built ? defuse(String(built).trim()) : '_Not provided_') + (typeof testsAdded === 'string' && testsAdded !== '' ? `\n\n${line(testsAdded)}` : '')),
     '',
     section('### Suggestions implemented', implemented.length ? implemented.join('\n') : '_None_'),
     '',
@@ -348,8 +386,9 @@ export function awaitingReviewComment(reason) {
 // by people and may be pasted into a table).
 // A run with fix-verify Fable passes reads `arbiter F (fix-verify K)` (F = every Fable pass, K of them the narrow fix-verify brief); one without reads
 // `arbiter F` as it always did, so old and new lines keep one label for the same count.
-export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, fixVerifyCalls = 0, outcome }) {
+export function agentLogLine({ date, pr, title, risk, rounds, arbiterCalls, fixVerifyCalls = 0, substituteCalls = 0, outcome }) {
   const f = (v) => line(v).replace(/\|/g, '&#124;');
   const passes = Number(fixVerifyCalls) > 0 ? `arbiter ${f(arbiterCalls)} (fix-verify ${f(fixVerifyCalls)})` : `arbiter ${f(arbiterCalls)}`;
-  return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · ${passes} · ${f(outcome)}`;
+  const standIn = Number(substituteCalls) > 0 ? ` · substitute ${f(substituteCalls)}` : '';
+  return `- ${f(date)} · #${f(pr)} · ${f(title)} · risk ${f(risk)} · rounds ${f(rounds)} · ${passes}${standIn} · ${f(outcome)}`;
 }

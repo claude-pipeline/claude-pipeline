@@ -7,7 +7,7 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 // Who spent the tokens. Anything not named here is booked as `other` (never dropped, never a new key).
-export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'verifier', 'controller', 'other']);
+export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'substitute-opus', 'substitute-fable', 'verifier', 'controller', 'other']);
 // The run's phases are the record steps (a test pins this list to run-record's STEPS: that module imports this one, so it
 // cannot be imported back); a phase the caller invents is booked as `other`.
 export const PHASES = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended', 'other']);
@@ -89,6 +89,51 @@ export function addCostEntry(cost, entry) {
     next.priceTables = tables;
   }
   return next;
+}
+
+// A transcript already booked for this PR (an agent continued by SendMessage is booked after each leg): only what it gained since the last booking is new. `booking` = { key, usage }, usage the
+// transcript's WHOLE totals ({input, output, cacheRead, cacheWrite, usd, byPrice}); the ledger cost.transcripts[key] keeps what was booked. Returns { cost, entry } with the entry's amounts reduced by the
+// booked ones (never below 0; hand amounts the caller added on top stay) and the ledger set to the whole totals. The ledger keeps the last MAX_TRANSCRIPTS keys.
+const MAX_TRANSCRIPTS = 200;
+export function deductBookedTranscript(cost, entry, booking) {
+  const key = String(booking?.key ?? '');
+  if (!/^[\w.-]{1,120}$/.test(key)) throw new Error('transcript key must be a plain file name');
+  const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
+  const ledger = isPlainObject(next.transcripts) ? next.transcripts : {};
+  const before = isPlainObject(ledger[key]) ? ledger[key] : null;
+  const usage = booking.usage;
+  const sub = (now, was) => Math.max(0, (Number(now) || 0) - (Number(was) || 0));
+  const out = { ...entry };
+  if (before) {
+    for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = sub(entry[k], before[k]);
+    out.usd = Math.round(sub(entry.usd, before.usd) * 1e6) / 1e6;
+    if (isPlainObject(entry.byPrice)) {
+      out.byPrice = {};
+      for (const [price, b] of Object.entries(entry.byPrice)) {
+        const was = isPlainObject(before.byPrice?.[price]) ? before.byPrice[price] : {};
+        const d = Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'messages'].map((k) => [k, sub(b[k], was[k])]));
+        if (d.messages > 0 || d.input + d.output + d.cacheRead + d.cacheWrite5m + d.cacheWrite1h > 0) out.byPrice[price] = d;
+      }
+    }
+  }
+  delete ledger[key];
+  // The ledger is a high-water mark: a stale, smaller snapshot (a booking that read the transcript before another one grew it) must not lower it, or the next booking re-adds the difference.
+  const hi = (a, b) => Math.max(Number(a) || 0, Number(b) || 0);
+  const priceBefore = isPlainObject(before?.byPrice) ? before.byPrice : {};
+  const priceNow = isPlainObject(usage.byPrice) ? usage.byPrice : {};
+  const byPrice = {};
+  for (const price of new Set([...Object.keys(priceBefore), ...Object.keys(priceNow)])) {
+    const a = isPlainObject(priceBefore[price]) ? priceBefore[price] : {};
+    const b = isPlainObject(priceNow[price]) ? priceNow[price] : {};
+    byPrice[price] = Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'messages'].map((k) => [k, hi(a[k], b[k])]));
+  }
+  ledger[key] = {
+    input: hi(before?.input, usage.input), output: hi(before?.output, usage.output), cacheRead: hi(before?.cacheRead, usage.cacheRead), cacheWrite: hi(before?.cacheWrite, usage.cacheWrite),
+    usd: hi(before?.usd, usage.usd), byPrice,
+  };
+  for (const old of Object.keys(ledger).slice(0, Math.max(0, Object.keys(ledger).length - MAX_TRANSCRIPTS))) delete ledger[old];
+  next.transcripts = ledger;
+  return { cost: next, entry: out };
 }
 
 export function addSessions(cost, ids) {

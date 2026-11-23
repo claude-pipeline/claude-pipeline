@@ -746,3 +746,36 @@ test('triage comment: no lane line for a sticky-Fable PR, even when its last rou
   const stickyLow = laneTriageComment({ ...base, reviewer: 'fable', risk: 'low', rounds: [{ n: 1, baseOnly: true, items: [] }] });
   assert.doesNotMatch(stickyLow, /Second reviewer:/);
 });
+
+// ---- owner deferral of an accepted fix (#559) ----
+
+const deferralFinal = (by = 'owner') => ownerFinal({ by, overruled: final('ACCEPT', 'arbiter', 'accepted', false), ownerDeferral: { accepted: 'arbiter', ruledAt: '2026-11-17T01:02:03.000Z' } });
+
+test('triageComment / summaryComment: an owner deferral of an arbiter ACCEPT says so in the row and the outliers line, also on a cached copy', () => {
+  const s = stateWith([[item({ id: 'R1-B1', title: 'Null deref', final: deferralFinal() }), item({ id: 'R2-B1', title: 'Null deref', final: deferralFinal('cache') })]]);
+  const rows = triageComment(s).split('\n').filter((l) => /^\| \d+ \| R/.test(l));
+  assert.match(rows[0], /\| FOLLOW-UP \(owner deferral of arbiter ACCEPT\) \| owner \|/);
+  assert.match(rows[1], /\| FOLLOW-UP \(owner deferral of arbiter ACCEPT\) \| cache \|/);
+  const outliers = summaryComment(s, { outcome: 'awaiting-owner-merge' }).split('### What was built')[0];
+  assert.match(outliers, /Owner \(chat\): FOLLOW-UP \(deferral of the arbiter's ACCEPT, not fixed\) — "yes, make it a follow-up"/);
+  const plain = triageComment(stateWith([[item({ id: 'R1-B1', final: ownerFinal() })]])).split('\n').find((l) => l.startsWith('| 1 | R1-B1'));
+  assert.doesNotMatch(plain, /deferral/, 'an ordinary owner ruling reads as before');
+});
+
+test('triageComment / summaryComment: the deferral text names the actual accepter (judge, cache), never a fixed word', () => {
+  const fin = (accepted) => ownerFinal({ overruled: final('ACCEPT', accepted, 'accepted', false), ownerDeferral: { accepted, ruledAt: '2026-11-17T01:02:03.000Z' } });
+  const s = stateWith([[item({ id: 'R1-B1', final: fin('judge') }), item({ id: 'R1-B2', final: fin('cache') })]]);
+  const rows = triageComment(s).split('\n').filter((l) => /^\| \d+ \| R/.test(l));
+  assert.match(rows[0], /\(owner deferral of judge ACCEPT\)/);
+  assert.match(rows[1], /\(owner deferral of cache ACCEPT\)/);
+  const outliers = summaryComment(s, { outcome: 'awaiting-owner-merge' }).split('### What was built')[0];
+  assert.match(outliers, /deferral of the judge's ACCEPT/);
+  assert.match(outliers, /deferral of the cache's ACCEPT/);
+});
+
+// Failure caught: the owner reads the PR comment, not the JSON, so a soft "Tests added" line that is only in the output never reaches them (and one that is absent must leave no stray text).
+test('summaryComment: the soft Tests added line sits under What was built, and is absent when not given', () => {
+  const withLine = summaryComment(richState(), { ...richOpts(), testsAdded: 'Tests added: 2 files, 5 cases; changed source lines : test lines = 40 : 90' });
+  assert.ok(section(withLine, '### What was built').includes('\n\nTests added: 2 files, 5 cases; changed source lines : test lines = 40 : 90'));
+  assert.doesNotMatch(section(summaryComment(richState(), richOpts()), '### What was built'), /Tests added/);
+});

@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { ownerGoWiring, defaultResolved } from '../pipeline/hooks/lib/git-wiring.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 // /chat is an owner_approval: chat repo whose merge command is `npm run merge -- {pr} --expect-head {sha}`; the owner said "merge" for
 // #7 at head H7 only.
@@ -140,7 +141,7 @@ test('#58 ownerGoWiring: the repository root\'s pipeline.yml in every version at
   writeFileSync(join(none, 'src', 'deep', '.claude', 'pipeline.yml'), CHAT);
   assert.equal(w.mode(join(none, 'src', 'deep')), 'none');
   // a committed copy (HEAD or the remote's default branch) saying chat wins over a working-tree edit to label
-  const shown = ownerGoWiring('sess', { gitShow: (r, ref) => (ref === 'origin/main' ? CHAT : null) });
+  const shown = ownerGoWiring('sess', { gitShow: (r, ref) => (ref === 'refs/remotes/origin/main' ? CHAT : null) });
   assert.equal(shown.mode(label), 'chat');
   assert.deepEqual(shown.mergeTemplates(label).map((t) => t.prefix[0]).sort(), ['gh', 'npm']);
   const broken = repo('broken', 'owner_approval: [chat\n  : :');
@@ -252,6 +253,9 @@ test('#58 a package-manager wrapper or an unreadable option never hides the merg
   const broken = { ...o, ownerGo: { ...ownerGo, mergeTemplates: () => { throw new Error('bad yml'); } } };
   assert.equal(evaluateGitCommand(`npm run merge -- 8 --expect-head ${H8}`, broken).decision, 'deny');
   assert.equal(evaluateGitCommand('npm run build', broken).decision, 'allow');
+  // a lookup that ran out of time is not an unreadable yml: no guess, the evaluation is refused (a non-npm merge command would otherwise pass unrecorded)
+  const slow = { ...o, ownerGo: { ...ownerGo, mergeTemplates: () => { throw new GuardLimit('the lookup ran out of time'); } } };
+  assert.equal(evaluateGitCommand('node scripts/m.mjs 8', slow).decision, 'deny');
   // directory unknown after a cd the guard cannot follow
   assert.equal(evaluateGitCommand(`false && cd /x; npm run merge -- 8 --expect-head ${H8}`, o).decision, 'deny');
   assert.equal(evaluateGitCommand('false && cd /x; npm run build', o).decision, 'allow');
@@ -537,4 +541,30 @@ test('defaultResolved: exit 1 is "no override" only from a git that finished; a 
   for (const patch of [{ overBuffer: true }, { signal: 'SIGKILL' }, { timedOut: true, code: 124 }, { code: 128 }]) {
     assert.equal(defaultResolved('/x', res(patch)), null, JSON.stringify(patch));
   }
+});
+
+// Guard false-alarm batch, item 1: `sh ~/claude-memory/.setup/memory-commit.sh ...` (a 33-line script) was refused "the check took too long"
+// because every simple command re-read the repository's pipeline.yml in four committed refs (190 git spawns, 2.3 s of a 5 s deadline).
+test('ownerGoWiring reads a repository\'s configs once per wiring, not once per simple command; a failed read is not remembered', () => {
+  const root = mkdtempSync(join(tmpdir(), 'owner-go-memo-'));
+  mkdirSync(join(root, '.claude'), { recursive: true });
+  writeFileSync(join(root, '.git'), 'gitdir: x\n');
+  const CHAT = 'owner_approval: chat\nmerge:\n  command: npm run merge -- {pr} --expect-head {sha}\n';
+  writeFileSync(join(root, '.claude', 'pipeline.yml'), CHAT);
+  let shows = 0;
+  const counting = ownerGoWiring('sess', { gitShow: () => { shows++; return null; }, remotes: () => null });
+  const line = Array.from({ length: 30 }, (_, i) => `echo ${i}`).join('; ');
+  const v = evaluateGitCommand(line, { cwd: root, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo: counting });
+  assert.equal(v.decision, 'allow', v.reason);
+  assert.ok(shows <= 4, `git show ran ${shows} times for 30 commands in one repository (at most once per committed ref)`);
+  // deny control: the cached answer is still the chat one, so an unapproved merge on the same line is refused
+  const merge = evaluateGitCommand(`${line}; npm run merge -- 12 --expect-head ${H8}`, { cwd: root, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ownerGo: counting });
+  assert.equal(merge.decision, 'deny');
+  // a throwing read (an unreadable pipeline.yml) is not cached: the next question fails closed again, and recovers once the file reads
+  let broken = true;
+  const flaky = ownerGoWiring('sess', { readText: () => { if (broken) throw new Error('EACCES'); return CHAT; }, gitShow: () => null });
+  assert.throws(() => flaky.mode(root));
+  assert.throws(() => flaky.mode(root));
+  broken = false;
+  assert.equal(flaky.mode(root), 'chat');
 });

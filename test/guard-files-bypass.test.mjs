@@ -173,11 +173,12 @@ table('redirect', [
   ['D=$HOME/.claude; cat /tmp/x > $D/settings.json'],
   ['cat /tmp/x > $X/.claude/settings.json'],
   ['echo x > /home/u/proj/../.claude/pipeline/x'],
+  ['echo x > .claude/settings.local.json', HOME_CWD], // (#261)
 ], 'deny');
 
 table('redirect', [
   ['echo x > .claude/settings.json', PROJ],
-  ['echo x > .claude/settings.local.json', HOME_CWD],
+  ['echo x > .claude/settings.local.json', PROJ], // (#261: the PROJECT's local settings stay open; the home's own is protected, see the deny table below)
   ['echo x > .claude/agents/new.md', HOME_CWD],
   ['echo x > .claude/skills/other/x.md', HOME_CWD],
   ['echo x > ~/.claude/skills/ship-it/SKILL.md'],
@@ -241,7 +242,9 @@ table('code-built path', [
   'cat ~/proj/.claude/settings.json',
   'echo x > /repo/.claude/settings.json',
   'cat "$X/.claude/settings.json"',
-  `python3 -c "print(open('.claude/settings.json').read())"`,
+  // (#261 R4-B1: program text naming a hook surface such as .claude/settings.json is refused read or not — guard-click-hooks R4-B1;
+  // the point here, a repo's own .claude/ is not a config root, is kept with a file that declares nothing)
+  `python3 -c "print(open('.claude/notes.json').read())"`,
 ], 'allow');
 
 // R6-F1: program text that writes under a config root is refused whatever the file (the program may build the path of a transcript at run time); a CLAUDE.md note is written with the Write tool or a shell cp
@@ -278,6 +281,8 @@ table('admin/hook switch built from pieces', [
   `python3 -c "d['disable'+'AllHooks']=True"`,
   'X=PIPELINE_ADMIN; export $X=1',
   'N=PIPELINE_ADMIN; env $N=1 claude',
+  // R3-F1: ANSI-C \UHHHHHHHH decodes to a letter (zsh / bash), so the name is built from pieces
+  "env $'PIPELINE_\\U00000041DMIN=1' claude",
 ], 'deny');
 
 table('variable', [
@@ -344,7 +349,8 @@ const MCP_ALLOW = [
   ['mcp__desktop__start_process', { command: 'cat ~/.claude/settings.json' }],
   ['mcp__desktop__start_process', { command: 'npm test' }],
   ['mcp__sentry__search_issues', { query: 'x' }],
-  ['mcp__plugin_supabase_supabase__execute_sql', { query: 'select 1' }],
+  // (#262: a live project takes only a fixed catalog look-up without a go; any other execute_sql needs the owner's typed go: test/live-db-guard.test.mjs)
+  ['mcp__plugin_supabase_supabase__execute_sql', { project_id: 'abcdefghij0123456789', query: 'select e.extname, e.extversion from pg_catalog.pg_extension e order by e.extname' }],
   ['mcp__claude_ai_Claude_Docs__update', { path: 'x', content: 'y' }],
   ['mcp__claude_ai_Google_Drive__create_file', { title: 'x', content: 'install to ~/.claude/pipeline' }],
   ['mcp__notes__create_note', { title: 't', text: 'the files live in ~/.claude/pipeline/hooks' }],

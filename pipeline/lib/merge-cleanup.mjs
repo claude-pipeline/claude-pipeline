@@ -33,6 +33,35 @@ function isWorktreeCase(ran) {
   return found;
 }
 
+// #567: gh's auto-merge request sometimes refuses an already-green PR with this GraphQL error, nothing merged and auto-merge off; a plain re-run works. The matcher accepts EXACTLY two whole lines
+// (the doubled "Pull request" is what gh printed in a real capture), needs at least one, ignores blank lines, and any other line (a second diagnostic, a prefix or suffix, a wrapper's banner) means false:
+// a command wrapped by another tool (an npm banner) never matches, a false negative by design. Exit code exactly 1, no timeout, no signal.
+const CLEAN_STATUS_LINES = new Set([
+  'GraphQL: Pull request Pull request is in clean status (enablePullRequestAutoMerge)',
+  'GraphQL: Pull request is in clean status (enablePullRequestAutoMerge)',
+]);
+export function isCleanStatusRefusal(ran) {
+  if (ran.code !== 1 || ran.timedOut || ran.signal) return false;
+  let found = false;
+  for (const raw of `${ran.stdout ?? ''}\n${ran.stderr ?? ''}`.split(/\r?\n/)) {
+    const line = raw.trim();
+    if (line === '') continue;
+    if (!CLEAN_STATUS_LINES.has(line)) return false;
+    found = true;
+  }
+  return found;
+}
+
+// The fields a NOT-merged failure gets when that refusal is the whole story AND the state is proven clean: auto-merge confirmed disabled (absence of a flag is not proof), the PR state after the disable
+// was read, and the wait itself read the PR. A zero wait (every non-zero exit) that fails its one read ends as a 'timeout', not an 'error', so the proof is the outcome's `readOk` (a 'timeout' without it, or an 'error', is not proof). Then a fresh run of the merge command (every gate, hold and recovery step again) is safe; this never retries anything itself.
+export function cleanStatusRetry(ran, outcome, abandoned) {
+  if (!isCleanStatusRefusal(ran) || outcome?.state === 'error' || (outcome?.state === 'timeout' && outcome.readOk !== true) || abandoned?.autoMergeDisabled !== true || abandoned.readError) return {};
+  return {
+    retryable: 'clean-status',
+    next: "GitHub refused to arm auto-merge on a PR it already sees as mergeable; run this same merge once more (a fresh run re-checks everything); the owner's approval still applies when the dry run shows the same closing lines",
+  };
+}
+
 // The fields to add to a MERGED result. Exit 0 adds nothing.
 export function classifyMergeCommand(ran) {
   if (ran.code === 0) return {};

@@ -66,7 +66,10 @@ function world(t, { baseYml = pipelineYml(), feature = (r) => r.write('src/big.j
     codex(round, { from = base, to = head, findings = CLEAN } = {}) {
       const out = join(scratch, `findings-${round}.json`);
       writeFileSync(out, JSON.stringify(findings));
-      return w.cli(['codex-review', '--pr', '7', '--round', String(round), '--base', from, '--head', to, '--effort', 'high'], { FAKE_CODEX_OUTPUT: out });
+      // The command refuses an --effort that is not the configured one for the round (review.effort), so ask the plan for it.
+      const args = ['codex-review', '--pr', '7', '--round', String(round), '--base', from, '--head', to];
+      const effort = w.cli([...args, '--plan'], { FAKE_CODEX_OUTPUT: out }).json?.expectedEffort;
+      return w.cli([...args, '--effort', effort], { FAKE_CODEX_OUTPUT: out });
     },
     state: () => JSON.parse(readFileSync(join(repo.dir, '.review', 'state.json'), 'utf8')),
     saveState(st) { writeFileSync(join(repo.dir, '.review', 'state.json'), JSON.stringify(st)); },
@@ -121,6 +124,9 @@ test('codex-review: the judge PR that gains a hit in round 2 escalates, and that
   const round = w.state().rounds[1];
   assert.equal(round.fableRequired, true);
   assert.deepEqual([round.reviewBase, round.reviewBaseKind], [w.base, 'whole-pr']);
+  // Failure caught: `stats rounds` counted this whole-PR round as an `unknown` conflict-resolution refusal, because nothing on the round said it was a judge-to-Fable escalation (#539).
+  assert.equal(round.escalated, true);
+  assert.equal(w.state().rounds[0].escalated, undefined);
 });
 
 test('codex-review: a PR once on Fable stays on Fable, whatever a later round rates', (t) => {
@@ -265,4 +271,27 @@ test('codex-review + review-complete: the same disagreement where the lenient co
   const done = w.cli(['review-complete', '--pr', '7']);
   assertExit(done, 1);
   assert.match(done.json.reason, /needs the Fable review pass/);
+});
+
+// #367: the origin/HEAD note is a note, never a reason for Fable, and it shows in codex-review's output for either lane. pipeline.yml names develop, origin/HEAD names main.
+const headNote = (w) => {
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', 'main']);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  return w;
+};
+test('codex-review: a judge-lane PR shows the origin/HEAD note in laneNotes, with no reviewer reason', (t) => {
+  const w = headNote(world(t, { baseYml: withBlocks('default_branch: develop\n') }));
+  const r = w.codex(1);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.reviewerReasons], ['judge', []]);
+  assert.equal(r.json.laneNotes.length, 1, JSON.stringify(r.json.laneNotes));
+  assert.match(r.json.laneNotes[0], /origin\/HEAD names default branch "main", pipeline\.yml names "develop"/);
+});
+test('codex-review: a Fable-lane PR keeps the origin/HEAD note out of the Fable reasons (laneNotes only)', (t) => {
+  const w = headNote(world(t, { baseYml: withBlocks('default_branch: develop\nreview:\n  size_only_medium_reviewer: fable\n') }));
+  const r = w.codex(1);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.reviewer, r.json.reviewerReasons], ['fable', ['medium risk']]);
+  assert.match(r.json.laneNotes[0], /origin\/HEAD names default branch/);
+  assert.deepEqual(w.state().rounds[0].fableReasons, ['medium risk']);
 });

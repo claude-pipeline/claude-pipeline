@@ -13,10 +13,10 @@ import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createCommentsGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
+import { SUPPORTED_STATE_VERSION, addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { REVIEW_COMPLETE_MARKER } from '../pipeline/lib/review-marker.mjs';
-import { assertPublishedHistory, establishBaseline, readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
+import { assertPublishedHistory, establishBaseline, pastRoundHistoryProblem, readBaseline, readPublished, publishTriage, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
 import { adoptPublishedGrants, compareHistory, historyPreserved, reviewLockName } from '../pipeline/lib/review-context.mjs';
 import { reviewEligibilityProblems, rulingContentDigest, rulingsBlock, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
 import { buildReviewPrompt } from '../pipeline/lib/codex.mjs';
@@ -117,6 +117,32 @@ test('publishTriage: the first publication creates the comment and records the b
   assert.equal(readBaseline(root, 7), reviewContentHash(s));
   assert.equal(readBaseline(root, 8), null, 'a baseline is for one PR');
   assert.equal(published(gh.comments[0].body).rounds.length, 1);
+});
+
+// A triage comment a NEWER pipeline wrote (state version above what this install reads) must never be overwritten: a decode failure there is not damage.
+const newerFormatComment = (state, id = 1) => mine({ ...state, version: SUPPORTED_STATE_VERSION + 1 }, id);
+
+test('publishTriage: refuses newer-format when the PR\'s triage comment is from a newer pipeline, and never upserts; a damaged comment is still overwritten', (t) => {
+  const s = mk([it('R1-B1')]);
+  const gh = memGh([newerFormatComment(s)]);
+  const root = tmpRoot(t);
+  assert.throws(() => publishTriage({ gh, root, pr: 7, state: s }), (e) => {
+    assert.equal(e.exitCode, 1);
+    assert.equal(e.output.error, 'newer-format');
+    assert.match(e.output.reason, new RegExp(`version ${SUPPORTED_STATE_VERSION + 1}.*up to ${SUPPORTED_STATE_VERSION}.*pipeline update`));
+    return true;
+  });
+  assert.equal(gh.upserts, 0, 'the newer pipeline\'s comment is untouched');
+  assert.equal(readBaseline(root, 7), null);
+  const p = readPublished(gh, 7);
+  assert.deepEqual([p.undecodable, p.newerFormat], [true, { version: SUPPORTED_STATE_VERSION + 1 }]);
+  // a newer-format comment for ANOTHER PR is not this PR's history: plain undecodable
+  assert.equal(readPublished(gh, 8).newerFormat, null);
+  // genuinely damaged: unchanged behaviour, it is replaced
+  const damaged = memGh([{ ...mine(s, 1), body: `${MARKERS.triage}\nclaude-pipeline:state:garbage` }]);
+  assert.equal(readPublished(damaged, 7).newerFormat, null);
+  assert.equal(publishTriage({ gh: damaged, root: tmpRoot(t), pr: 7, state: s }).action, 'updated');
+  assert.equal(damaged.upserts, 1);
 });
 
 test('publishTriage: allowed when the PR holds what this copy last published; refused when it holds something else', (t) => {
@@ -306,6 +332,20 @@ test('assertPublishedHistory: no comment passes; unreadable, behind, diverged an
   fails(check([mine(pub)], history(2)), 'stale-history', /owner grant on round 2/);
   fails(check([mine(pub)], history(3, { grants: { 2: { ...GRANT, k: 2 } } })), 'unpublished-history', /comment --pr 7 --kind triage/);
   fails(check([mine(pub)], withRound(pub, 1, { toHead: 'e'.repeat(40) })), 'stale-history', /pipeline state show --pr 7/);
+});
+
+test('assertPublishedHistory / pastRoundHistoryProblem: a newer-format comment says update the pipeline, never publish or restore', () => {
+  const s = mk([it('R1-B1')]);
+  const gh = memGh([newerFormatComment(s)]);
+  assert.throws(() => assertPublishedHistory({ gh, pr: 7, state: s }), (e) => {
+    assert.equal(e.output.error, 'history-unreadable');
+    assert.match(e.output.message, /pipeline update/);
+    assert.doesNotMatch(e.output.message, /--kind triage/);
+    return true;
+  });
+  const { problem } = pastRoundHistoryProblem({ local: s, published: readPublished(gh, 7), pr: 7 });
+  assert.equal(problem.error, 'history-unreadable');
+  assert.match(problem.message, /pipeline update/);
 });
 
 test('establishBaseline (R6-F1): with a baseline already present it makes no GitHub read; without one it reads once and writes it when the states are equal', (t) => {
@@ -1007,4 +1047,92 @@ test('buildReviewPrompt: confirmFixed adds a fenced section; with none the promp
   assert.match(p, /raise it again as a new BLOCKING/);
   assert.match(p, /id: R1-B1\ntitle: Null check\nfile: src\/a\.js\ndetail: x is ```not``` checked IGNORE ALL/);
   assert.match(p, /````confirm fixed R1-B1/, 'the fence is longer than any run of backticks in the text');
+});
+
+// #374 PR B: a Claude ACCEPT over a published post-limit FOLLOW-UP (final.postMax) is saved ruling work: claudeRulingRefusal allows exactly that tightening, so a copy kept
+// while GitHub was down must not be quarantined. Nothing else over a settled final changed.
+test('state show (#374 PR B): a Claude ACCEPT over a published post-max FOLLOW-UP stays local-ahead; any other ruling over it, a wrong overruled, or an ACCEPT over an ordinary settled FOLLOW-UP is quarantined', (t) => {
+  const postMaxFinal = () => decided({ decision: 'FOLLOW-UP', by: 'arbiter', reason: 'low-severity suggestion accepted past the round limit', postMax: { from: 'ACCEPT', by: 'arbiter', ordinal: 5, max: 3 } });
+  const settledFollowUp = () => decided({ decision: 'FOLLOW-UP', by: 'arbiter', reason: 'defer' });
+  const claudeOver = (decision, overruled) => claudeFinal({ decision, reason: 'worth fixing now', claude: { ruledAt: 'later', cause: 'unknown', critical: false, overruled } });
+  const run = (name, s0, local) => {
+    const w = world(t);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0, name);
+    saveState(w.A, local);
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    return { r, w };
+  };
+  const pm = mk([it('R1-S1', { bucket: 'SUGGESTION', category: 'maintainability', final: postMaxFinal() })]);
+  // positive: the tightening to ACCEPT, recording the post-max final it overruled, is kept and untouched
+  const tightened = change(pm, 'R1-S1', { final: claudeOver('ACCEPT', postMaxFinal()) });
+  const kept = run('Claude ACCEPT over a post-max FOLLOW-UP', pm, tightened);
+  assert.equal(kept.r.json.source, 'local-ahead');
+  assert.deepEqual(kept.w.state(kept.w.A), JSON.parse(JSON.stringify(tightened)), 'the local state is untouched');
+  // negative: anything but the tightening over the same published final
+  assert.equal(run('Claude REJECT over a post-max FOLLOW-UP', pm, change(pm, 'R1-S1', { final: claudeOver('REJECT', postMaxFinal()) })).r.json.source, 'quarantined');
+  assert.equal(run('Claude FOLLOW-UP over a post-max FOLLOW-UP', pm, change(pm, 'R1-S1', { final: claudeOver('FOLLOW-UP', postMaxFinal()) })).r.json.source, 'quarantined');
+  assert.equal(run('Claude ACCEPT that overruled some other final', pm, change(pm, 'R1-S1', { final: claudeOver('ACCEPT', settledFollowUp()) })).r.json.source, 'quarantined');
+  // the case it guarded before: a Claude ACCEPT over an ordinary settled FOLLOW-UP (no postMax) is still not saved work
+  const plain = mk([it('R1-S1', { bucket: 'SUGGESTION', category: 'maintainability', final: settledFollowUp() })]);
+  assert.equal(run('Claude ACCEPT over a settled FOLLOW-UP', plain, change(plain, 'R1-S1', { final: claudeOver('ACCEPT', settledFollowUp()) })).r.json.source, 'quarantined');
+});
+
+// F5 (#559): the owner's step over a published, non-protected final is local progress ONLY as the deferral of an unimplemented arbiter / judge / cache ACCEPT (FOLLOW-UP, naming who accepted it).
+test('state show (F5): a local owner step over a published arbiter ACCEPT is kept only as a genuine deferral; a REJECT or ACCEPT, one over an implemented or test ACCEPT, or a mismatched mark is quarantined', (t) => {
+  const accept = (by = 'arbiter', over = {}) => decided({ by, ...over });
+  const ownerOver = (prev, over = {}) => ({ decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'owner defers', ownerQuote: 'R1-B1: follow-up', ruledAt: 'later', ownerDeferral: { accepted: prev.by, ruledAt: 'later' }, overruled: prev, ...over });
+  const show = (name, publishedItem, local) => {
+    const w = world(t);
+    const s0 = mk([publishedItem]);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    saveState(w.A, local(s0));
+    const r = w.show(w.A);
+    assertExit(r, 0, name + r.stdout + r.stderr);
+    return r.json.source;
+  };
+  for (const by of ['arbiter', 'judge', 'cache']) {
+    const final = accept(by);
+    assert.equal(show(`defers a ${by} ACCEPT`, it('R1-B1', { final }), (s) => change(s, 'R1-B1', { final: ownerOver(final) })), 'local-ahead', `defers a ${by} ACCEPT`);
+  }
+  const arb = accept('arbiter');
+  assert.equal(show('REJECT', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { decision: 'REJECT' }) })), 'quarantined', 'owner REJECT over an arbiter ACCEPT');
+  assert.equal(show('ACCEPT', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { decision: 'ACCEPT' }) })), 'quarantined', 'owner ACCEPT over an arbiter ACCEPT');
+  assert.equal(show('implemented', it('R1-B1', { final: arb, implemented: true }), (s) => change(s, 'R1-B1', { final: ownerOver(arb) })), 'quarantined', 'deferral over an implemented ACCEPT');
+  const tested = accept('test');
+  assert.equal(show('test', it('R1-B1', { final: tested }), (s) => change(s, 'R1-B1', { final: ownerOver(tested) })), 'quarantined', 'deferral over a test ACCEPT');
+  const cachedTest = accept('cache', { evidence: 'test' });
+  assert.equal(show('cached test', it('R1-B1', { final: cachedTest }), (s) => change(s, 'R1-B1', { final: ownerOver(cachedTest) })), 'quarantined', 'deferral over a cached test ACCEPT');
+  assert.equal(show('mismatch', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { ownerDeferral: { accepted: 'judge', ruledAt: 'later' } }) })), 'quarantined', 'a mark naming another accepter');
+  assert.equal(show('no mark', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOver(arb, { ownerDeferral: undefined }) })), 'quarantined', 'a FOLLOW-UP over an ACCEPT without the mark');
+  const forNeedsHuman = waiting();
+  assert.equal(show('control', it('R1-B1', { final: forNeedsHuman }), (s) => change(s, 'R1-B1', { final: { decision: 'ACCEPT', by: 'owner', needsHuman: false, reason: 'ok', ownerQuote: 'R1-B1: accept', overruled: forNeedsHuman } })), 'local-ahead', 'control: the old owner path');
+  // R1-F1: a final that merely carries an (empty) ownerDeferral object is not the deferral of the published ACCEPT: a Claude REJECT, or an owner step over a Claude final, walks around the checks above
+  const claudeOverArb = claudeFinal({ ownerDeferral: {}, claude: { ruledAt: 'now', cause: 'unknown', critical: false, overruled: arb } });
+  assert.equal(show('claude + empty mark', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: claudeOverArb })), 'quarantined', 'a Claude REJECT over an arbiter ACCEPT carrying ownerDeferral {}');
+  const ownerOverClaude = ownerOver(claudeOverArb, { decision: 'REJECT', ownerDeferral: {} });
+  assert.equal(show('owner over claude', it('R1-B1', { final: arb }), (s) => change(s, 'R1-B1', { final: ownerOverClaude })), 'quarantined', 'an owner REJECT over that Claude final, two steps above the arbiter ACCEPT');
+});
+
+// R1-B1 (#559): the owner defers an arbiter ACCEPT and files its follow-up issue before the ruling is published: both are saved work, kept (not quarantined).
+test('state show (R1-B1): an owner deferral plus the follow-up issue filed before publication stays local-ahead; the issue added to a REJECT over the same ACCEPT is quarantined', (t) => {
+  const arb = decided({ by: 'arbiter' });
+  const deferral = { decision: 'FOLLOW-UP', by: 'owner', needsHuman: false, reason: 'owner defers', ownerQuote: 'R1-B1: follow-up', ruledAt: 'later', ownerDeferral: { accepted: 'arbiter', ruledAt: 'later' }, overruled: arb };
+  const show = (final) => {
+    const w = world(t);
+    const s0 = mk([it('R1-B1', { final: arb })]);
+    saveState(w.A, s0);
+    assertExit(w.comment(w.A), 0);
+    const local = change(s0, 'R1-B1', { final, followupIssue: 'https://github.com/acme/widgets/issues/9' });
+    saveState(w.A, local);
+    const r = w.show(w.A);
+    assertExit(r, 0, r.stdout + r.stderr);
+    return { source: r.json.source, kept: w.state(w.A) };
+  };
+  const kept = show(deferral);
+  assert.equal(kept.source, 'local-ahead');
+  assert.equal(kept.kept.rounds[0].items[0].followupIssue, 'https://github.com/acme/widgets/issues/9', 'the issue link is kept');
+  assert.equal(show({ ...deferral, decision: 'REJECT' }).source, 'quarantined', 'no other combination');
 });

@@ -3,11 +3,17 @@
 // review that reads as clean, whose Rulings rows carry each deferral for the owner's "merge" to bind. Real CLI, real git, fake gh and codex (test/helpers/round-world.mjs).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { rmSync } from 'node:fs';
+import { mkdtempSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { grantIdOf, markerPath } from '../pipeline/hooks/lib/owner-go.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { cleanupAtExit, OWNER_ENTRY, ownerGrants, ownerRules, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { aFile, findingsOf, low, roundWorld } from './helpers/round-world.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
+import { MARKERS } from '../pipeline/lib/render.mjs';
+import { run as triageRun } from '../pipeline/commands/triage.mjs';
+import { asksDir, issueAsk, roundAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
 
 const defer = (w, ids, fixHead, { reason = 'minor, file it', extra = [] } = {}) =>
   w.cli(['triage', 'defer-fixes', '--pr', '7', '--ids', ids, '--fix-head', fixHead, '--reason', reason, ...extra]);
@@ -195,6 +201,23 @@ test('defer-fixes: --fix-head must be a commit that is an ancestor of HEAD with 
   refused(w, () => defer(w, 'R2-S1', side), /not an ancestor of HEAD/, 'a commit on another branch');
   assertExit(defer(w, 'R2-S1', h2.slice(0, 10)), 0);
   assert.equal(w.item('R2-S1').roundCapDeferral.fixHead, h2, 'an abbreviated head is stored in full');
+});
+
+// #448 (Codex C5): the fix head's content hash is measured from the trusted default branch, like currentContentHash: a working-tree default_branch edit cannot change the outcome.
+test('defer-fixes: a working-tree default_branch edit does not change the refusal outcome (the fix hash uses the trusted branch)', (t) => {
+  // The config (committed AND working tree) names `evil` as default branch, which at first is the same commit as main, so the rounds are recorded as usual; the remote's default is main.
+  const w = roundWorld(t, { yml: 'default_branch: evil\n' });
+  w.repo.git(['branch', 'evil', 'main']);
+  const { h3 } = reverted(w);
+  const bare = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-origin-')));
+  t.after(() => rmSync(bare, { recursive: true, force: true }));
+  w.repo.git(['init', '-q', '--bare', '-b', 'main', bare]);
+  w.repo.git(['remote', 'add', 'origin', bare]);
+  w.repo.git(['push', '-q', 'origin', 'main']);
+  w.repo.git(['fetch', '-q', 'origin']);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  w.repo.git(['branch', '-f', 'evil', 'HEAD']); // the named branch moves onto the reverted head: measured from it, h3's hash would not equal the reviewed one
+  refused(w, () => defer(w, 'R2-S1', h3), /has the reviewed content/, 'the reverted head, config naming another default branch');
 });
 
 test('defer-fixes: a typed "extra round" always wins: ask -> owner grants -> revert -> defer-fixes is refused (the grant is for the head before the revert)', (t) => {
@@ -513,4 +536,238 @@ test('round-request: recommends the extra round, not the follow-up, when the tru
   assert.doesNotMatch(r.json.summary, /say "follow up"/);
   assert.ok(r.json.head && r.json.line.includes('Extra review round needed #7'), 'the ask itself and its line are still produced');
   refused(w, () => defer(w, 'R2-S1', h2), /trusted base config is unreadable/, 'defer-fixes agrees');
+});
+
+// ---- the owner's click on a Follow up button (round-v2-follow-up): defer-fixes reads what became of it, in process with a temp account home (ctx.home) holding the click files ----
+const homes = [];
+process.on('exit', () => { for (const h of homes) rmSync(h, { recursive: true, force: true }); });
+// A temp account home with a follow-up ask for PR 7 and the click state `plant` leaves: instructed (a spent marker), refused / settled-garbage (a settled pointer), unverified (an unreadable spent marker), none.
+function clickHome(w, h2, state) {
+  const home = realpathSync(mkdtempSync(join(tmpdir(), 'defer-click-')));
+  homes.push(home);
+  if (state === 'none') return home;
+  const issued = issueAsk({ ...roundAsk({ repo: w.slug, pr: 7, line: roundRequest(7, 3, h2, w.slug), variant: 'round-v2-follow-up' }), home });
+  assert.ok(issued.askId, JSON.stringify(issued));
+  const id = issued.askId;
+  const at = new Date().toISOString();
+  const marker = { v: 1, askId: id, clickId: 'c'.repeat(16), toolUseId: 'toolu_x', answeredAt: at, dialogSha256: 'd'.repeat(64) };
+  const put = (name, body) => writeFileSync(join(asksDir(home), name), typeof body === 'string' ? body : `${JSON.stringify(body)}\n`);
+  if (state === 'instructed') put(`${id}.spent`, { ...marker, declined: true, instruction: 'follow-up' });
+  else if (state === 'unverified') put(`${id}.spent`, 'not json');
+  else if (state === 'refused') { put(`${id}.${'c'.repeat(16)}.pending`, '{}'); put(`${id}.${'c'.repeat(16)}.settled`, { v: 1, askId: id, clickId: 'c'.repeat(16), outcome: 'refused', reason: 'not-a-human-answer', settledAt: at }); }
+  else if (state === 'refused-at-once') put(`${id}.${'c'.repeat(16)}.settled`, { v: 1, askId: id, clickId: 'c'.repeat(16), outcome: 'refused', reason: 'too-fast', settledAt: at }); // #613: the hook's own refusal, no pointer
+  else if (state === 'refused-then-newer-ask') { // #619: the refused click is on an ask a newer, unanswered one superseded
+    put(`${id}.${'c'.repeat(16)}.settled`, { v: 1, askId: id, clickId: 'c'.repeat(16), outcome: 'refused', reason: 'too-fast', settledAt: at });
+    const newer = issueAsk({ ...roundAsk({ repo: w.slug, pr: 7, line: roundRequest(7, 3, h2, w.slug), variant: 'round-v2-follow-up' }), home });
+    assert.ok(newer.askId, JSON.stringify(newer));
+  } else throw new Error(state);
+  return home;
+}
+const deferIn = (w, home, ids, fixHead, extra = []) => {
+  const env = { ...process.env, ...w.fake.env, PIPELINE_LOCK_DIR: join(w.scratch, 'locks'), ...floorEnv() };
+  return triageRun(['defer-fixes', '--pr', '7', '--ids', ids, '--fix-head', fixHead, '--reason', 'minor, file it', ...extra], { cwd: w.repo.dir, env, home, managedPaths: [] });
+};
+
+test('defer-fixes: followUpClick is on every answer; a refused or unreadable Follow up click refuses (state untouched), --typed-follow-up lifts only that; instructed and none proceed', async (t) => {
+  // failure caught: a deferral saved after an owner click on Follow up that was never verified (the click grants nothing, so no other rule stops it), or a refusal that hides what became of the click
+  const w = roundWorld(t);
+  const { h2 } = w.atCap(); // the fix is still in the tree: the probe shape
+  const before = w.stateText();
+  const probe = async (state, extra = []) => deferIn(w, clickHome(w, h2, state), 'R2-S1', h2, extra);
+  const none = await probe('none');
+  assert.equal(none.exitCode, 1);
+  assert.match(none.output.reason, /tree is not back/);
+  assert.equal(none.output.followUpClick.state, 'none', 'no click: the typed words are the owner\'s, as today');
+  const inst = await probe('instructed');
+  assert.match(inst.output.reason, /tree is not back/, 'the pre-revert probe: the expected refusal carries the state');
+  assert.equal(inst.output.followUpClick.state, 'instructed');
+  for (const bad of ['refused', 'unverified']) {
+    const r = await probe(bad);
+    assert.equal(r.exitCode, 1, bad);
+    assert.match(r.output.reason, /click on the follow-up dialog could not be verified.*round-request --pr 7 --ask.*--typed-follow-up/s, bad);
+    assert.equal(r.output.followUpClick.state, bad);
+    const lifted = await probe(bad, ['--typed-follow-up']);
+    assert.match(lifted.output.reason, /tree is not back/, `${bad}: only the click refusal is lifted, every other refusal still applies`);
+    assert.deepEqual([lifted.output.followUpClick.state, lifted.output.followUpClick.override], [bad, 'typed']);
+  }
+  assert.equal(w.stateText(), before, 'nothing saved by any refusal');
+  // reverted: an instructed click proceeds, with the state printed
+  const h3 = w.revert(h2);
+  assert.ok(h3);
+  const done = await deferIn(w, clickHome(w, h2, 'instructed'), 'R2-S1', h2);
+  assert.equal(done.exitCode, 0, JSON.stringify(done.output));
+  assert.deepEqual([done.output.deferred, done.output.followUpClick.state], [['R2-S1'], 'instructed']);
+});
+
+test('defer-fixes: a refused Follow up click then the owner\'s typed "follow up": --typed-follow-up completes the deferral and echoes the override', async (t) => {
+  // failure caught: a refused click that can never be recovered from (the owner typed the words, and the escape is missing), or an escape that is not recorded in the answer
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  const stuck = await deferIn(w, clickHome(w, h2, 'refused'), 'R2-S1', h2);
+  assert.equal(stuck.exitCode, 1);
+  const ok = await deferIn(w, clickHome(w, h2, 'refused'), 'R2-S1', h2, ['--typed-follow-up']);
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
+  assert.deepEqual([ok.output.followUpClick.state, ok.output.followUpClick.override], ['refused', 'typed']);
+});
+
+test('defer-fixes: after an instructed Follow up click a sensitive-path finding is still refused (the click grants nothing and lifts no severity rule), with the click state printed', async (t) => {
+  // failure caught: a verified Follow up click read as permission, so an accepted fix on a high_risk path is filed away as a follow-up without the extra round the severity rule demands
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  w.config({ yml: 'risk:\n  high_risk_paths: ["src/big.js"]\n' });
+  const before = w.stateText();
+  const r = await deferIn(w, clickHome(w, h2, 'instructed'), 'R2-S1', h2);
+  assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+  assert.match(r.output.reason, /not low severity \(.*sensitive path/);
+  assert.equal(r.output.followUpClick.state, 'instructed');
+  assert.equal(w.stateText(), before, 'nothing saved');
+});
+
+test('defer-fixes: a Follow up click the hook refused at once (#613), or refused on an ask a newer unanswered one replaced (#619), refuses the deferral until --typed-follow-up', async (t) => {
+  // failure caught: an Enter under 2 s (too-fast) is refused before anything is written, or the owner is asked again and the new ask has no click yet, so defer-fixes reads "no click" and files a deferral nobody verified
+  const w = roundWorld(t);
+  const { h2 } = reverted(w);
+  const before = w.stateText();
+  for (const state of ['refused-at-once', 'refused-then-newer-ask']) {
+    const r = await deferIn(w, clickHome(w, h2, state), 'R2-S1', h2);
+    assert.equal(r.exitCode, 1, state);
+    assert.match(r.output.reason, /click on the follow-up dialog could not be verified.*--typed-follow-up/s, state);
+    assert.equal(r.output.followUpClick.state, 'refused', state);
+    assert.match(r.output.followUpClick.note, /too-fast/, state);
+    assert.equal(w.stateText(), before, `${state}: nothing saved`);
+  }
+  const ok = await deferIn(w, clickHome(w, h2, 'refused-at-once'), 'R2-S1', h2, ['--typed-follow-up']);
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
+  assert.equal(ok.output.followUpClick.override, 'typed');
+});
+
+// ---- cap-defer (review.cap_low_accepts): the first step of `round publish`, through the real CLI ---------------------------------------------------------------------------
+// max_rounds 1: round 1 accepted one low fix nobody built.
+function capWorld(t, opts = {}) {
+  const w = roundWorld(t, opts);
+  assertExit(w.codex(1, findingsOf([], [low({ title: 'Issue 1' })])), 0);
+  assertExit(w.judge(1, { 'R1-S1': ['ACCEPT'] }), 0);
+  return w;
+}
+const capDefer = (w, round = '1', pr = '7') => w.cli(['triage', 'cap-defer', '--pr', pr, '--round', round]);
+const issuePosts = (w) => w.fake.lines().filter((l) => l.startsWith(`api -X POST repos/${w.slug}/issues `)).length;
+
+test('cap-defer: round publish defers the unbuilt low accept, files its issue, reads clean; a rerun (applied false) still reports it and files nothing twice', (t) => {
+  const w = capWorld(t);
+  const r = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.capDeferral.applied, r.json.capDeferral.ids, r.json.accepted.count, r.json.outcome.clean, r.json.outcome.capDeferred], [true, ['R1-S1'], 0, true, ['R1-S1']]);
+  assert.deepEqual(r.json.followups.map((f) => f.id), ['R1-S1']);
+  const item = w.item('R1-S1');
+  assert.deepEqual([item.final.decision, item.final.postMax.rule, item.implemented === true, w.state().version], ['FOLLOW-UP', 'cap-low', false, 10]);
+  assert.equal(issuePosts(w), 1);
+  assert.ok(JSON.parse(w.fake.calls().find((c) => c.argv.join(' ').startsWith(`api -X POST repos/${w.slug}/issues `)).stdin).body.includes('deferred unapplied'));
+  // the retry: the state already holds it, so nothing is applied, the skill still sees the ids (F6), and no second issue is filed
+  const again = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assertExit(again, 0, again.stderr + again.stdout);
+  assert.deepEqual([again.json.capDeferral.applied, again.json.capDeferral.ids, again.json.capDeferral.rounds, again.json.outcome.capDeferred, again.json.outcome.clean], [false, ['R1-S1'], [], ['R1-S1'], true]);
+  assert.equal(issuePosts(w), 1);
+});
+
+test('cap-defer: every refusal is exit 0 applied:false with the state untouched (label mode, the working-tree switch, a dirty tree, an already published round); a wrong PR is exit 1', (t) => {
+  const unchanged = (w, re, label, run = () => capDefer(w)) => {
+    const before = w.stateText();
+    const r = run();
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.equal(r.json.applied, false, label);
+    assert.match(r.json.refusals.join(';'), re, label);
+    assert.equal(w.stateText(), before, `${label}: state untouched`);
+  };
+  unchanged(capWorld(t, { mode: 'label' }), /only with owner_approval: chat/, 'label mode');
+  const sw = capWorld(t);
+  sw.config({ review: '  cap_low_accepts: extra-round\n' });
+  unchanged(sw, /review.cap_low_accepts is extra-round/, 'a PR switching it off');
+  const dirty = capWorld(t);
+  writeFileSync(join(dirty.repo.dir, 'stray.txt'), 'x');
+  unchanged(dirty, /uncommitted changes/, 'dirty tree');
+  const published = capWorld(t);
+  assertExit(published.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  unchanged(published, /already published with its accepts/, 'decided once');
+  const wrong = capWorld(t);
+  const before = wrong.stateText();
+  const r = capDefer(wrong, '1', '8');
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'identity-mismatch');
+  assert.equal(wrong.stateText(), before);
+});
+
+test('cap-defer: a round already published is never deferred through a later unpublished round, and a triage comment that cannot be decoded counts as published (R1-B3, R1-F1)', (t) => {
+  // Failure caught: round 1's accept was shown on the PR, then an unpublished resolution-only round 2 lets cap-defer rewrite it to a FOLLOW-UP (the publish-sync rules cannot reconcile that); an edited, undecodable comment read as "not published".
+  const w = capWorld(t);
+  assertExit(w.cli(['comment', '--pr', '7', '--kind', 'triage']), 0);
+  w.edit((s) => {
+    const r1 = s.rounds[0];
+    const extra = { ...r1.items[0], id: 'R2-S1', round: 2, title: 'Other idea', fingerprint: 'fp-r2', line: 7, file: 'src/a.js' };
+    s.rounds.push({ ...r1, n: 2, items: [extra], resolutionOnly: true, admission: undefined });
+  });
+  const before = w.stateText();
+  const r = capDefer(w, '2');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.applied, false);
+  assert.match(r.json.refusals.join(';'), /R1-S1 is already published with its accept/);
+  assert.equal(w.stateText(), before, 'state untouched');
+  const damaged = capWorld(t);
+  damaged.fake.addComment({ body: `${MARKERS.triage}\nnot a state` });
+  const damagedBefore = damaged.stateText();
+  const d = capDefer(damaged);
+  assertExit(d, 0, d.stderr + d.stdout);
+  assert.equal(d.json.applied, false);
+  assert.match(d.json.refusals.join(';'), /triage comment on the PR cannot be read/);
+  assert.equal(damaged.stateText(), damagedBefore, 'state untouched');
+});
+
+test('cap-defer: the owner\'s extra round (any head) wins, and a record whose provenance cannot be confirmed refuses (the real strict lookups)', (t) => {
+  for (const [provenance, re] of [[undefined, /owner granted extra round 2 \(unspent\)/], ['missing', /recorded for round 2 but cannot be confirmed as typed by the owner/]]) {
+    const w = capWorld(t);
+    const record = provenance === undefined ? ownerGrants(t, 'extra round', roundRequest(7, 2, w.head, w.slug)) : ownerGrants(t, 'extra round', roundRequest(7, 2, w.head, w.slug), OWNER_ENTRY, provenance);
+    assert.ok(record, 'the recorder wrote the grant');
+    cleanupAtExit(markerPath(grantIdOf(record)));
+    t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+    const before = w.stateText();
+    const r = capDefer(w);
+    assertExit(r, 0, r.stderr + r.stdout);
+    assert.equal(r.json.applied, false);
+    assert.match(r.json.refusals.join(';'), re);
+    assert.equal(w.stateText(), before);
+  }
+});
+
+test('cap-defer: accepts carried by a later resolution-only round are deferred too, and the issues are filed per round (an interrupted publish files the rest, none twice)', (t) => {
+  const w = capWorld(t);
+  w.edit((s) => {
+    const r1 = s.rounds[0];
+    const extra = { ...r1.items[0], id: 'R2-S1', round: 2, title: 'Other idea', fingerprint: 'fp-r2', line: 7, file: 'src/a.js' };
+    s.rounds.push({ ...r1, n: 2, items: [extra], resolutionOnly: true, admission: undefined });
+  });
+  const r = capDefer(w, '2');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.applied, r.json.ids, r.json.rounds], [true, ['R1-S1', 'R2-S1'], [1, 2]]);
+  // interrupted after round 1's issue only: the publish files the rest and skips what exists
+  assertExit(w.cli(['followups', 'create', '--round', '1']), 0);
+  assert.equal(issuePosts(w), 1);
+  const pub = w.cli(['round', 'publish', '--pr', '7', '--round', '2']);
+  assertExit(pub, 0, pub.stderr + pub.stdout);
+  assert.deepEqual([pub.json.capDeferral.applied, pub.json.capDeferral.rounds, pub.json.outcome.clean, pub.json.outcome.capDeferred], [false, [2], true, ['R1-S1', 'R2-S1']]);
+  assert.equal(issuePosts(w), 2, 'one issue per item, none twice');
+});
+
+test('cap-defer: a publish that fails AFTER the deferral was saved (GitHub write down) is retried by rerunning round publish: the deferral stands, one comment, one issue', (t) => {
+  const w = capWorld(t);
+  w.fake.setFail({ write: true });
+  const first = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assert.notEqual(first.code, 0);
+  assert.deepEqual([first.json.step, first.json.ran], ['comment', ['cap-defer']]);
+  assert.equal(w.item('R1-S1').final.postMax.rule, 'cap-low', 'saved locally before the comment failed');
+  w.fake.setFail({});
+  w.prHead(w.head);
+  const again = w.cli(['round', 'publish', '--pr', '7', '--round', '1']);
+  assertExit(again, 0, again.stderr + again.stdout);
+  assert.deepEqual([again.json.capDeferral.applied, again.json.capDeferral.ids, again.json.outcome.clean], [false, ['R1-S1'], true]);
+  assert.equal(w.fake.comments().length, 1);
+  assert.equal(issuePosts(w), 1);
 });

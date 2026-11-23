@@ -1,8 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { GhError } from '../pipeline/lib/proc.mjs';
-import { createGitHub, parseConcatenatedJson, classifyApiError } from '../pipeline/lib/github.mjs';
+import { createGitHub, parseConcatenatedJson, classifyApiError, OutboundScanBlocked, runScanner } from '../pipeline/lib/github.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { PLANTED, makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
 
 const cwd = process.cwd();
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -296,6 +300,171 @@ test('protection / updateBranch / checks: an overBuffer reply throws (its text i
   assert.deepEqual(mkGh(cut('gh: Branch not protected (HTTP 404)', { overBuffer: false })).protection('main').reason, 'not-protected');
 });
 
+// ---- rate-limit retry of idempotent operations (#190 item 5) ----------------------------------
+// ghFn is a JS function here: `script(args, n)` answers the n-th call (1-based); every call and every sleep is recorded.
+const SECONDARY_LIMIT = 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)';
+const mkRetry = (answer, { env, maxMs } = {}) => {
+  const calls = [];
+  const waits = [];
+  const logs = [];
+  const ghFn = (args, opts) => {
+    calls.push({ line: args.join(' '), input: opts?.input });
+    if (args[0] === 'repo') return { code: 0, stdout: JSON.stringify(REPO_VIEW), stderr: '' };
+    if (args.join(' ') === 'api user -q .login') return { code: 0, stdout: 'me\n', stderr: '' };
+    return answer(args, calls.length, opts);
+  };
+  const gh = createGitHub({ cwd, env, ghFn, retry: { sleep: (ms) => waits.push(ms), log: (l) => logs.push(l), now: () => 0, ...(maxMs === undefined ? {} : { maxMs }) } });
+  return { gh, calls, waits, logs };
+};
+const limitedReply = { code: 1, stdout: '', stderr: SECONDARY_LIMIT };
+const okJson = (v) => ({ code: 0, stdout: JSON.stringify(v), stderr: '' });
+
+test('upsertComment: a POST that failed with a rate limit but was stored is PATCHed on the retry (one comment, no duplicate)', () => {
+  const stored = [];
+  let posts = 0;
+  const { gh, waits } = mkRetry((args, _n, opts) => {
+    const line = args.join(' ');
+    if (line.includes('comments --paginate')) return okJson(stored);
+    if (line.startsWith('api -X POST')) {
+      posts += 1;
+      stored.push({ id: 10, body: JSON.parse(opts.input).body, user: { login: 'me' } }); // the write landed...
+      return limitedReply; // ...but the answer was a rate limit
+    }
+    if (line.startsWith('api -X PATCH')) return okJson({ id: 10, html_url: 'u' });
+    throw new Error(`unexpected ${line}`);
+  });
+  const r = gh.upsertComment(4, MARKER, `${MARKER}\nbody`, { retry: true });
+  assert.equal(r.action, 'updated');
+  assert.equal(posts, 1);
+  assert.equal(stored.length, 1);
+  assert.deepEqual(waits, [60_000]);
+});
+
+test('upsertComment: secondary limit twice, then success: waits recorded (60 s, then the capped remainder)', () => {
+  let n = 0;
+  const { gh, waits, logs } = mkRetry((args) => {
+    const line = args.join(' ');
+    if (line.includes('comments --paginate')) return okJson([]);
+    n += 1;
+    return n <= 2 ? limitedReply : okJson({ id: 1, html_url: 'u' });
+  });
+  assert.equal(gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }).action, 'created');
+  assert.deepEqual(waits, [60_000, 40_000]);
+  assert.equal(logs.length, 2);
+  assert.match(logs[0], /100 s retry cap/);
+});
+
+test('retry: a rate limit on a later page restarts the whole paged list; a half list is never used', () => {
+  let listCalls = 0;
+  const page1 = [{ id: 1, body: 'x', user: { login: 'me' } }];
+  const page2 = [{ id: 2, body: `${MARKER}\nold`, user: { login: 'me' } }];
+  const { gh, calls } = mkRetry((args) => {
+    const line = args.join(' ');
+    if (line.includes('comments --paginate')) {
+      listCalls += 1;
+      // gh --paginate got page 1, then the limit on page 2: non-zero exit with page 1 already on stdout
+      return listCalls === 1 ? { code: 1, stdout: JSON.stringify(page1), stderr: SECONDARY_LIMIT } : okJson([...page1, ...page2]);
+    }
+    if (line.startsWith('api -X PATCH repos/acme/widgets/issues/comments/2 ')) return okJson({ id: 2, html_url: 'u' });
+    throw new Error(`unexpected ${line}`);
+  });
+  assert.equal(gh.upsertComment(4, MARKER, `${MARKER}\nnew`, { retry: true }).action, 'updated');
+  assert.equal(listCalls, 2);
+  assert.ok(!calls.some((c) => c.line.startsWith('api -X POST')), 'the half list (page 1 only) did not make it create a duplicate');
+  // and listComments itself, opted in, returns the full list
+  listCalls = 0;
+  assert.equal(gh.listComments(4, { retry: true }).length, 2);
+});
+
+test('retry: Retry-After is honoured and a permission 403 / timeout is one call with no sleep', () => {
+  const a = mkRetry(() => ({ code: 1, stdout: '', stderr: `${SECONDARY_LIMIT}\nRetry-After: 7` }));
+  let n = 0;
+  const b = mkRetry(() => (++n === 1 ? { code: 1, stdout: '', stderr: `${SECONDARY_LIMIT}\nRetry-After: 7` } : okJson([])));
+  assert.deepEqual(b.gh.listComments(4, { retry: true }), []);
+  assert.deepEqual(b.waits, [7000]);
+  void a;
+  const perm = mkRetry(() => ({ code: 1, stdout: '', stderr: 'gh: Resource not accessible by integration (HTTP 403)' }));
+  assert.throws(() => perm.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
+  assert.equal(perm.calls.filter((c) => c.line.includes('comments --paginate')).length, 1);
+  assert.deepEqual(perm.waits, []);
+  const slow = mkRetry(() => ({ code: 1, stdout: '', stderr: SECONDARY_LIMIT, timedOut: true }));
+  assert.throws(() => slow.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
+  assert.equal(slow.calls.filter((c) => c.line.includes('comments --paginate')).length, 1);
+  assert.deepEqual(slow.waits, []);
+});
+
+test('retry: PIPELINE_GH_RETRY_MS=0 is off; a larger value cannot exceed the default; a smaller one shortens', () => {
+  const off = mkRetry(() => limitedReply, { env: { PIPELINE_GH_RETRY_MS: '0' } });
+  assert.throws(() => off.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
+  assert.deepEqual(off.waits, []);
+  assert.equal(off.calls.filter((c) => c.line.includes('comments --paginate')).length, 1);
+  const big = mkRetry(() => limitedReply, { env: { PIPELINE_GH_RETRY_MS: '9999999' } });
+  assert.throws(() => big.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
+  assert.equal(big.waits.reduce((a, b) => a + b, 0), 100_000);
+  const short = mkRetry(() => limitedReply, { env: { PIPELINE_GH_RETRY_MS: '5000' } });
+  assert.throws(() => short.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), GhError);
+  assert.deepEqual(short.waits, [5000]);
+});
+
+test('retry: cap exceeded surfaces the last stderr', () => {
+  const { gh, waits } = mkRetry(() => limitedReply);
+  assert.throws(() => gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), (e) => e instanceof GhError && /secondary rate limit/.test(e.stderr));
+  assert.deepEqual(waits, [60_000, 40_000]);
+});
+
+test('retry: primary limit reads gh api rate_limit; a reset beyond the cap throws at once naming it; the earliest exhausted resource counts', () => {
+  const primary = { code: 1, stdout: '', stderr: 'gh: API rate limit exceeded for user ID 1. (HTTP 403)' };
+  const limits = (core, graphql) => okJson({ resources: { core: { remaining: 0, reset: core }, graphql: { remaining: 0, reset: graphql } } });
+  const far = mkRetry((args) => (args[1] === 'rate_limit' ? limits(3600, 7200) : primary));
+  assert.throws(() => far.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }), (e) => /resets at 1970-01-01T01:00:00\.000Z/.test(e.message));
+  assert.deepEqual(far.waits, []);
+  // core resets in 3600 s, graphql in 30 s: the 30 s one is the earliest, it fits the cap, and the retry goes through
+  let first = true;
+  const near = mkRetry((args) => {
+    if (args[1] === 'rate_limit') return limits(3600, 30);
+    if (args.join(' ').includes('comments --paginate')) {
+      if (first) { first = false; return primary; }
+      return okJson([]);
+    }
+    return okJson({ id: 1, html_url: 'u' });
+  });
+  assert.equal(near.gh.upsertComment(4, MARKER, `${MARKER}\nx`, { retry: true }).action, 'created');
+  assert.deepEqual(near.waits, [31_000]);
+});
+
+test('addLabels and removeLabels retry only when opted in (hold and merge paths keep no-retry, no-sleep)', () => {
+  let n = 0;
+  const optIn = mkRetry(() => (++n === 1 ? limitedReply : { code: 0, stdout: '', stderr: '' }));
+  optIn.gh.addLabels(3, ['x'], { retry: true });
+  assert.deepEqual(optIn.waits, [60_000]);
+  n = 0;
+  optIn.gh.removeLabels(3, ['x'], { retry: true });
+  assert.equal(n, 2);
+  const plain = mkRetry(() => limitedReply);
+  assert.throws(() => plain.gh.addLabels(3, ['x']), GhError);
+  assert.throws(() => plain.gh.removeLabels(3, ['x']), GhError);
+  assert.throws(() => plain.gh.deleteLabel(3, 'x'), GhError);
+  assert.throws(() => plain.gh.listComments(3), GhError);
+  assert.deepEqual(plain.waits, []);
+  assert.equal(plain.calls.filter((c) => !c.line.startsWith('repo') && !c.line.startsWith('api user')).length, 4);
+});
+
+test('the hold route (lib/hold.mjs restoreLabel, readTimeline) does not retry a rate-limited call and never sleeps', async () => {
+  const { restoreLabel, readTimeline } = await import('../pipeline/lib/hold.mjs');
+  const { gh, calls, waits } = mkRetry(() => limitedReply);
+  const reason = restoreLabel(gh, 3);
+  assert.match(String(reason), /rate limit/);
+  assert.equal(readTimeline(gh, 3).ok, false);
+  assert.deepEqual(waits, []);
+  assert.equal(calls.filter((c) => !c.line.startsWith('repo') && !c.line.startsWith('api user')).length, 2, 'one call each, no retry');
+});
+
+test('a nested retrying() shares the outermost cap', () => {
+  const { gh, waits } = mkRetry(() => limitedReply);
+  assert.throws(() => gh.retrying(() => gh.listComments(4, { retry: true })), GhError);
+  assert.equal(waits.reduce((a, b) => a + b, 0), 100_000);
+});
+
 // ---- #268: the creator issue scan ---------------------------------------------------------------------------
 
 function scanGh(reply = { code: 0, stdout: '[]', stderr: '', timedOut: false }) {
@@ -334,4 +503,159 @@ test('listIssuesByCreator: since is URL-encoded into the query; the listing help
 test('listIssuesByCreator: a 180 s timeout and a mid-pagination failure are GhErrors', () => {
   assert.throws(() => scanGh({ code: 124, stdout: '[{"number":1}]', stderr: '', timedOut: true }).gh.listIssuesByCreator({ creator: 'me' }), GhError);
   assert.throws(() => scanGh({ code: 1, stdout: '[{"number":1}]', stderr: 'HTTP 502', timedOut: false }).gh.listIssuesByCreator({ creator: 'me', since: '2026-11-09T23:30:00Z' }), GhError);
+});
+
+// #396: writeSummaryComment holds the id of its own fresh read, so the write PATCHes that id; the comments are listed once (the read), not again for the write.
+test('writeSummaryComment PATCHes the id it read: no second listing of the comments; with no comment yet it creates one', async () => {
+  const { writeSummaryComment, readSummaryComment } = await import('../pipeline/lib/summary-comment.mjs');
+  const { MARKERS } = await import('../pipeline/lib/render.mjs');
+  const listings = (fake) => fake.lines().filter((l) => l.includes('issues/4/comments --paginate')).length;
+  const a = mk([
+    REPO, ME,
+    comments(
+      { id: 10, body: `${MARKERS.summary}\nold`, user: { login: 'me' } },
+      { id: 12, body: `${MARKERS.summary}\nnewer`, user: { login: 'me' } },
+      { id: 13, body: `${MARKERS.summary}\nsomeone else's`, user: { login: 'other' } },
+    ),
+    { match: '^api -X PATCH repos/acme/widgets/issues/comments/12 ', stdoutJson: { id: 12, html_url: 'https://x/12' } },
+  ]);
+  const existing = readSummaryComment(a.gh, 4);
+  assert.equal(listings(a.fake), 1);
+  const r = writeSummaryComment(a.gh, 4, { sections: 'new sections', existing });
+  assert.deepEqual([r.id, r.action], [12, 'updated']);
+  assert.equal(listings(a.fake), 1, 'the write did not list the comments again');
+  assert.ok(a.fake.lines().some((l) => l.includes('-X PATCH repos/acme/widgets/issues/comments/12 ')));
+
+  const b = mk([REPO, ME, comments(), { match: '^api -X POST repos/acme/widgets/issues/4/comments ', stdoutJson: { id: 99, html_url: 'https://x/99' } }]);
+  const created = writeSummaryComment(b.gh, 4, { sections: 'first' });
+  assert.equal(created.action, 'created');
+});
+
+// ---- outbound text guard (lib/github.mjs): a listed repository's text goes through a machine-local scanner first ----
+
+const scanKit = (t, mode = 'scan', { listed = 'acme/widgets' } = {}) => {
+  const { fake, gh } = mk([REPO, { match: '^api -X', stdoutJson: { id: 5, number: 5, html_url: 'https://x/5' } }, { match: '^(label|pr edit)', stdout: '' }, { match: '^api graphql', stdoutJson: { data: { ok: true } } }]);
+  const dir = mkdtempSync(join(tmpdir(), 'cp-outscan-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const scanner = makeScanner(dir, mode);
+  if (listed !== null) writeScanConfig(fake.scanHome, { [listed]: { command: scanner.command } });
+  const writes = () => fake.lines().filter((l) => !l.startsWith('repo view'));
+  return { fake, gh, scanner, dir, writes };
+};
+const caught = (fn) => {
+  try {
+    fn();
+  } catch (e) {
+    return e;
+  }
+  return null;
+};
+
+test('blocks a comment when the scanner exits 1', (t) => {
+  const { gh, scanner, writes } = scanKit(t);
+  const err = caught(() => gh.createComment(7, `hello ${PLANTED}`));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.deepEqual(writes(), [], 'nothing reached GitHub');
+  assert.match(err.message, /scanned: body/);
+  assert.match(err.message, /exited 1/);
+  // the hit: neither the scanner's stdout nor the scanned text, and the masked stderr line hides the word it found
+  assert.doesNotMatch(err.message, new RegExp(PLANTED));
+  assert.doesNotMatch(err.message, /HIT/);
+  // text travelled on stdin, never argv
+  const [run] = scanner.runs();
+  assert.match(run.stdin, new RegExp(`hello ${PLANTED}`));
+  assert.deepEqual(run.argv, ['--flag']);
+});
+
+test('blocks a PR title-only hit', (t) => {
+  const { gh, writes } = scanKit(t);
+  const err = caught(() => gh.issueCreate({ title: `Re: ${PLANTED}`, body: 'all clean here', labels: ['agent-suggestion'] }));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.match(err.message, /title/);
+  assert.ok(!err.message.includes(PLANTED));
+  assert.deepEqual(writes(), []);
+});
+
+test('fails closed when the scanner crashes (a signal, or a spawn error)', (t) => {
+  const { gh, writes } = scanKit(t, 'crash');
+  assert.ok(caught(() => gh.createComment(7, 'a clean comment')) instanceof OutboundScanBlocked);
+  assert.deepEqual(writes(), [], 'a crashed scanner is not a pass');
+  const failing = (code) => () => runScanner({ command: ['/x'], fields: [{ kind: 'body', text: 'x' }], spawnFn: () => ({ error: Object.assign(new Error('spawn'), { code }), status: null }) });
+  assert.match(caught(failing('ENOENT')).message, /could not run \(ENOENT\)/);
+  assert.match(caught(failing('ETIMEDOUT')).message, /timed out/);
+});
+
+test('fails closed when the slug is listed but the scanner path is missing', (t) => {
+  const { gh, fake, writes } = scanKit(t, 'scan', { listed: null });
+  writeScanConfig(fake.scanHome, { 'ACME/Widgets': { command: ['/no/such/scanner'] } }); // the slug match is case-insensitive
+  const err = caught(() => gh.createComment(7, 'a clean comment'));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.match(err.message, /scanner is missing or not executable/);
+  assert.deepEqual(writes(), []);
+});
+
+test('unlisted slug posts unchanged: no scanner is spawned, and gh gets exactly the arguments and stdin it always did', (t) => {
+  const { gh, scanner, writes, fake } = scanKit(t, 'scan', { listed: 'other/repo' });
+  const body = `a body with ${PLANTED} that only a listed repository would refuse`;
+  gh.createComment(7, body);
+  assert.deepEqual(writes(), ['api -X POST repos/acme/widgets/issues/7/comments --input -']);
+  assert.deepEqual(JSON.parse(fake.calls().at(-1).stdin), { body });
+  assert.deepEqual(scanner.runs(), []);
+});
+
+test('an invalid scan config blocks every write, listed or not', (t) => {
+  const { gh, fake, writes } = scanKit(t, 'scan', { listed: null });
+  // a key that can never match a `gh repo view` name would leave a repository looking listed while nothing is scanned
+  const keyed = (key) => JSON.stringify({ [key]: { command: ['/x'] } });
+  for (const bad of ['{ not json', '[]', '"x"', keyed('https://github.com/acme/widgets'), keyed('acme/widgets.git'), keyed('acme/widgets '), keyed('widgets')]) {
+    writeScanConfig(fake.scanHome, bad);
+    const err = caught(() => gh.createComment(7, 'a clean comment'));
+    assert.ok(err instanceof OutboundScanBlocked, bad);
+    assert.match(err.message, /every write is blocked/);
+  }
+  assert.deepEqual(writes(), [], 'nothing reached GitHub');
+});
+
+test('every free-text write of a listed repository is scanned (label create, a GraphQL mutation variable); a query and the id-only stop controls are not', (t) => {
+  const { gh, scanner, writes } = scanKit(t);
+  assert.match(caught(() => gh.createLabel({ name: 'ok', color: 'ffffff', description: `d ${PLANTED}` })).message, /label description/);
+  assert.match(caught(() => gh.graphql('mutation M($b:String!){m(input:{b:$b}){id}}', { b: PLANTED })).message, /graphql variable b/);
+  assert.deepEqual(writes(), []);
+  assert.equal(scanner.runs().length, 2);
+  gh.graphql('query Q($o:String!){x(o:$o){id}}', { o: PLANTED }); // a read: nothing to scan
+  gh.addLabels(7, ['needs-human']); // an existing label's name: not free text
+  gh.updateBranch(7, 'a'.repeat(40));
+  assert.equal(scanner.runs().length, 2, 'none of those reached the scanner');
+  assert.equal(writes().length, 3);
+});
+
+test('dequeue, enqueue and convert-to-draft still reach gh when the scan config is invalid (a stop control never depends on the scanner)', (t) => {
+  const { fake, gh, writes } = scanKit(t, 'scan', { listed: null });
+  writeScanConfig(fake.scanHome, '{ not json');
+  fake.setScript([REPO, { match: '^api graphql', stdoutJson: { data: { repository: { pullRequest: { id: 'PR_x' } }, dequeuePullRequest: { mergeQueueEntry: { id: 'Q' } }, enqueuePullRequest: { mergeQueueEntry: { id: 'Q', state: 'QUEUED', position: 1 } }, convertPullRequestToDraft: { pullRequest: { isDraft: true, autoMergeRequest: null } } } } }]);
+  gh.dequeue(7);
+  gh.enqueue(7, 'a'.repeat(40));
+  assert.equal(gh.convertToDraft(7).isDraft, true);
+  assert.equal(writes().filter((l) => l.startsWith('api graphql')).length, 6, 'three node-id lookups and three mutations');
+  assert.ok(caught(() => gh.createComment(7, 'text')) instanceof OutboundScanBlocked, 'free text is still blocked by the invalid config');
+});
+
+test('a blocked write never echoes the scanner output, whatever punctuation wraps the hit', () => {
+  const secret = 'alice@example.test';
+  for (const stderr of [`found "${secret}"`, `${secret}.`, `email=${secret}`]) {
+    const err = caught(() => runScanner({ command: ['/x'], fields: [{ kind: 'body', text: `mail ${secret}` }], spawnFn: () => ({ status: 1, stdout: secret, stderr }) }));
+    assert.ok(err instanceof OutboundScanBlocked);
+    assert.ok(!err.message.includes('alice'), err.message);
+    assert.match(err.message, /exited 1/);
+  }
+});
+
+test('a scanner that ignores SIGTERM is killed at the timeout and the write is blocked', (t) => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-outscan-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const stubborn = join(dir, 'stubborn.mjs');
+  writeFileSync(stubborn, "process.on('SIGTERM', () => {}); setInterval(() => {}, 1000);\n");
+  const err = caught(() => runScanner({ command: [process.execPath, stubborn], fields: [{ kind: 'body', text: 'x' }], timeoutMs: 1500 }));
+  assert.ok(err instanceof OutboundScanBlocked, String(err));
+  assert.match(err.message, /timed out/);
 });

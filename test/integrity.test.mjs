@@ -106,6 +106,15 @@ test('15. pgTAP SELECT skip(...) added to a supabase test is a violation', () =>
   assert.deepEqual(rules(r), ['skip-or-only-added']);
 });
 
+test('15b. a pgTAP description that says "pending (" is not a skip; a real pgTAP skip / todo on the same file still is', () => {
+  // Failure caught: the JS pending( pattern was applied to .sql files, so ok(..., 'a pending (unpaid) bill') blocked a merge as a skipped test.
+  const clean = check([modified('supabase/tests/bills.test.sql', { added: ["SELECT ok(true, 'a pending (unpaid) bill stays open');", "SELECT is(status, 'pending', 'x');"] })]);
+  assert.deepEqual(clean, CLEAN);
+  assert.deepEqual(rules(check([modified('supabase/tests/bills.test.sql', { added: ["SELECT ok(true, 'pending (x)');", "SELECT skip('later', 1);"] })])), ['skip-or-only-added']);
+  assert.deepEqual(rules(check([modified('supabase/tests/bills.test.sql', { added: ['SELECT todo_start(1);'] })])), ['skip-or-only-added']);
+  assert.deepEqual(rules(check([modified('lib/a.test.ts', { added: ['pending();'] })])), ['skip-or-only-added'], 'the JS pattern still applies to JS test files');
+});
+
 test('16. label test-change-approved makes it ok + overridden but still lists the violations', () => {
   const r = check([deleted('lib/a.test.ts'), modified('lib/b.test.ts', { added: ["it.skip('x', () => {})"] })], ['bug', 'test-change-approved']);
   assert.equal(r.ok, true);

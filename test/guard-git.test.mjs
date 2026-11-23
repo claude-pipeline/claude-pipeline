@@ -23,12 +23,12 @@ function evaluate(command, o = {}) {
   const verdict = evaluateGitCommand(command, {
     cwd: o.cwd ?? '/work/repo',
     home: '/home/u',
-    currentBranch: (dir, extra) => {
+    currentBranch: (dir, { leftMs, ...extra } = {}) => { // (leftMs, the wall-cap bound every lookup is given, is checked in guard-budget.test.mjs)
       calls.branchDirs.push({ dir, ...extra });
       if (byDir) return byDir[dir] ?? null;
       return o.branch === undefined ? 'agent/x' : o.branch;
     },
-    pushDestination: (dir, extra) => {
+    pushDestination: (dir, { leftMs, ...extra } = {}) => {
       calls.pushDirs.push({ dir, ...extra });
       if (o.pushDest instanceof Error) throw o.pushDest;
       if (typeof o.pushDest === 'function') return o.pushDest(dir, extra);
@@ -210,6 +210,43 @@ const DENY = [
   ['git -c push.default=${V:-up}stream push'],
   ['git config $K v; git push'],
   ['git config ${K:-remote.origin.push} v; git push'],
+  // cp #661: switching off the repository's git hooks (the pre-push hook is a safety gate): core.hooksPath in any form, --no-verify, a config write of the key
+  ['git -c core.hooksPath=/dev/null push origin agent/x'],
+  ['git -c core.HooksPath=/dev/null push origin agent/x'], // any key casing
+  ['git -c CORE.HOOKSPATH=/dev/null push -u origin agent/x'],
+  ['git --config-env=core.hooksPath=HP push origin agent/x'],
+  ['git --config-env core.hooksPath=HP push origin agent/x'],
+  ['GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null git push origin agent/x'],
+  ['export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=core.hooksPath GIT_CONFIG_VALUE_0=/dev/null; git push origin agent/x'],
+  ['K=core.hooksPath; git -c $K=/dev/null push origin agent/x'],
+  ['git push --no-verify origin agent/x'],
+  ['git push origin agent/x --no-verify'],
+  ['git push --no-verify -u origin agent/x'], // (moved from the allow list: cp #661)
+  ['git push --no-v origin agent/x'], // git takes any unambiguous prefix
+  ['git push --no-ver origin agent/x'],
+  ['git config core.hooksPath /dev/null'],
+  ['git config core.hooksPath /dev/null && git push origin agent/x'],
+  ['git config --global core.HOOKSPATH /dev/null'],
+  ['git config --unset core.hooksPath'],
+  ['git config --global --unset-all core.hooksPath'],
+  ['git config --add core.hooksPath /dev/null'],
+  ['git config --replace-all core.hooksPath /dev/null'],
+  ['git config --local core.hooksPath ""'],
+  ['git config set core.hooksPath /dev/null'],
+  ['git config unset core.hooksPath'],
+  ['git config --remove-section core'],
+  ['K=core.hooksPath; git config $K /dev/null'],
+  // only a literal repo-relative value, local scope, is let through (R1-F1)
+  ['git config core.hooksPath ../x'],
+  ['git config core.hooksPath ~/hooks'],
+  ['git config core.hooksPath $H'],
+  ['git config core.hooksPath .'],
+  ['git config --global core.hooksPath .githooks'],
+  ['git config --system core.hooksPath .githooks'],
+  ['git config --worktree core.hooksPath .githooks'],
+  ['git config --file x.cfg core.hooksPath .githooks'],
+  ['git config --add core.hooksPath .githooks'],
+  ['git config --unset core.hooksPath .githooks'],
 ];
 
 const ALLOW = [
@@ -254,6 +291,18 @@ const ALLOW = [
 ];
 
 const label = (command, o) => (o ? `${command}  ${JSON.stringify(o, (k, v) => (v instanceof Error ? `Error(${v.message})` : v))}` : command);
+
+// R1-F1: the usual `prepare` script that installs a repo's own hooks dir must not make every install refuse
+const prepareOf = (prepare) => ({ pathExists: (p) => p === resolve('/work/repo/package.json'), readText: (p) => (p === resolve('/work/repo/package.json') ? JSON.stringify({ name: 'x', scripts: { prepare } }) : null) });
+for (const cmd of ['npm ci', 'npm install', 'npm run prepare']) {
+  test(`ALLOW ${cmd} when prepare sets core.hooksPath to .githooks`, () => {
+    const v = evaluate(cmd, prepareOf('git config core.hooksPath .githooks || true'));
+    assert.equal(v.decision, 'allow', v.reason);
+  });
+  test(`DENY ${cmd} when prepare points core.hooksPath elsewhere`, () => {
+    assert.equal(evaluate(cmd, prepareOf('git config core.hooksPath /dev/null || true')).decision, 'deny');
+  });
+}
 
 for (const [command, o] of DENY) {
   test(`DENY ${label(command, o)}`, () => {
@@ -328,6 +377,11 @@ const MORE_DENY = [
   ['find . -name x -exec git push origin main ;'],
   // cwd tracking
   ['cd /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }],
+  ['chdir /other && git push', { byDir: { '/work/repo': 'agent/x', '/other': 'main' } }], // (#372: zsh's chdir is cd)
+  // #425 R1-F2: chdir is a zsh builtin only (bash: command not found, the line goes on in the old directory), so the directory after it is unknown
+  ['chdir /wt; git push', { byDir: { '/work/repo': 'main', '/wt': 'agent/x' } }],
+  ['chdir /wt && git push', { byDir: { '/work/repo': 'main', '/wt': 'agent/x' } }],
+  ['chdir /other && git push', { byDir: { '/work/repo': 'main', '/other': 'agent/x' } }],
   ['git -C /other push', { byDir: { '/work/repo': 'agent/x', '/other': 'master' } }],
   ['git -C ../other push', { cwd: '/work/repo', byDir: { '/work/other': 'main' } }],
   ['git -C a -C b push', { cwd: '/w', byDir: { '/w/a/b': 'main' } }],
@@ -501,7 +555,6 @@ const MORE_ALLOW = [
   ['git push', { pushDest: new Error('boom'), branch: 'agent/x' }],
   ['git push origin agent/x', { pushDest: 'origin/main' }], // explicit refspec: @{push} is irrelevant
   ['git push origin HEAD:agent/x', { pushDest: 'origin/main' }],
-  ['git push --no-verify -u origin agent/x'],
   ['git push --no-force-with-lease origin agent/x'],
   ['git push --follow-tags --atomic origin agent/x'],
   ['git push --dry-run origin agent/x'],
@@ -844,6 +897,31 @@ const BYPASS_ALLOW = [
   ['git -c user.name=x push'],
   ['git -c push.default=simple push'],
   ['git -c push.followTags=true push'],
+  // cp #661: other keys, reads and ordinary pushes stay open
+  ['git push -u origin agent/x'],
+  ['git -c user.name=x push -u origin agent/x'],
+  ['git -c core.pager=cat push origin agent/x'],
+  ['git --config-env=user.name=NAME push origin agent/x'],
+  ['GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=user.name GIT_CONFIG_VALUE_0=x git push origin agent/x'],
+  ['git push --no-thin origin agent/x'],
+  ['git push --verify origin agent/x'],
+  ['git config --get core.hooksPath'],
+  ['git config core.hooksPath'],
+  ['git config --global --get core.hooksPath'],
+  ['git config get core.hooksPath'],
+  // read actions with a value filter are not writes (R1-B1); a repo installing its own hooks dir is not refused (R1-F1)
+  ['git config --get core.hooksPath .githooks'],
+  ['git config --get-all core.hooksPath .githooks'],
+  ['git config --get-regexp core.hooksPath .githooks'],
+  ['git config get core.hooksPath .githooks'],
+  ['git config core.hooksPath .githooks'],
+  ['git config --local core.hooksPath .githooks'],
+  ['git config core.hooksPath tools/git-hooks'],
+  ['git config --list --show-origin'],
+  ['git config -l'],
+  ['git config user.name x'],
+  ['git config --unset user.name'],
+  ['git commit -m "do not use core.hooksPath or --no-verify" && git push origin agent/x'],
   ['git config alias.st status && git st'],
   ['gh alias set pv "pr view" && gh pv 5'],
   ['LABEL=bug; gh pr edit 3 --add-label $LABEL'],
@@ -1244,6 +1322,12 @@ test('the installed matchers cover Monitor and MCP tools for guard-git', async (
   }
 });
 
+test('the installed guard-files matcher covers the Supabase MCP apply_migration tool (#262)', async () => {
+  const { GUARD_FILES_MATCHER } = await import('../pipeline/lib/installer.mjs');
+  const re = new RegExp(`^(?:${GUARD_FILES_MATCHER})$`);
+  for (const tool of ['mcp__plugin_supabase_supabase__apply_migration', 'mcp__plugin_supabase_supabase__execute_sql']) assert.ok(re.test(tool), `${GUARD_FILES_MATCHER} must match ${tool}`);
+});
+
 // ---- time budget (review finding 12) ----------------------------------------------------------------------
 
 test('an oversized command line is not parsed: denied whatever it says (#84)', () => {
@@ -1577,6 +1661,14 @@ test('string-running wrappers are unwrapped or scanned', () => {
   for (const c of allow) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'allow', c);
 });
 
+// #563 (owner's choice, option 1): the scan of interpreter program text is deliberate: a program that only WRITES a file whose text names a guarded command is refused too. It is pinned so that the refusal
+// stays a recorded decision, not an accident; the workaround is in the implementer brief (write such a test file with the Write tool, or build the string at run time).
+test('a node -e that only writes a file whose text names a push to main is refused (deliberate, #563)', () => {
+  const v = evaluate("node -e \"require('fs').writeFileSync('t.mjs','git push origin main')\"");
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /node was given a string that contains a guarded command/);
+});
+
 test('spawn: a script file in the real working directory is read by the hook', () => {
   const dir = join(TMP, 'scripts');
   execFileSync('mkdir', ['-p', dir]);
@@ -1741,12 +1833,13 @@ test('directory / branch / variable state from a command that may not have run i
   ];
   for (const c of denyCmds) assert.equal(evaluate(c, o).decision, 'deny', c);
   const allowCmds = [
+    // (#530 / #545: a redirected cd chained with &&: a failed redirection stops the cd and gives status 1, so the push runs only when the cd did; a text ENDING in one hands nothing on, see guard-loop-carry R36)
+    'cd /safe > /dev/null 2>&1 && git push',
     'cd /safe && git push',
     'true && cd /safe && git push',
     'git checkout agent/y && git push',
     'cd /safe; git push',
     'git checkout agent/y; git push',
-    'cd /safe > /dev/null 2>&1 && git push', // redirects and &> are not a background job
     'cd /safe &>/dev/null; git status',
   ];
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
@@ -1827,6 +1920,7 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     'true && cd /other; bash step.sh',
     'false || cd /other; ./step.sh',
     'cd /other || exit 1 & git push', // `|| exit` does not help a backgrounded cd
+    'cd /other || return; git push', // #427: a top-level `return` is an error and the shell goes on (this was an allow before; the files guard's cd narrowing refused it since #425)
     // a ( subshell is still found in the text
     '(B=main); git push origin HEAD:$B',
   ];
@@ -1842,7 +1936,6 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     'B=agent/x; git commit -m "fix for loop"; git push origin "$B"',
     'git commit -m "fix (again)"; B=agent/x; git push origin HEAD:$B',
     'cd /other || exit 1; git push',
-    'cd /other || return; git push',
     'cd /other; bash ok.sh',
     'source env.sh && npm test',
   ];

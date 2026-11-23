@@ -199,9 +199,12 @@ test('t4 state-union: a branch or alias changed by an earlier reading of a scrip
   for (const tail of [`git ${PUSH} origin HEAD`, `git ${PUSH}`]) assert.equal(git(`${first}; ${tail}`, mk(MOVE, BAD_GIT)).decision, 'deny', tail);
   // (the same with the move in the last reading was refused before: kept so)
   assert.equal(git(`${first}; git ${PUSH} origin HEAD`, mk({ 'scripts/s.sh': 'for b in agent/x main; do git checkout $b; done\n' }, BAD_GIT)).decision, 'deny');
-  // control: no reading moves the branch -> it is still the one the line is on, and a push of it is allowed
+  // control: no reading moves the branch -> it is still the one the line is on
+  // #352 R38-F2: a script's change never carries over to its caller (owner decision): a script that switches (even to the branch the line is on) leaves it unknown, so the HEAD push is refused; naming it (below) and a script that switches nothing are the twins
   const STAY = { 'scripts/s.sh': 'for b in agent/x agent/x; do git checkout $b; done\n' };
-  assert.equal(git(`${first}; git ${PUSH} origin HEAD`, mk(STAY, BAD_GIT)).decision, 'allow');
+  assert.equal(git(`${first}; git ${PUSH} origin HEAD`, mk(STAY, BAD_GIT)).decision, 'deny');
+  assert.equal(git(`${first}; git ${PUSH} origin agent/x`, mk(STAY, BAD_GIT)).decision, 'allow');
+  assert.equal(git(`${first}; git ${PUSH} origin HEAD`, mk({ 'scripts/s.sh': 'for b in agent/x agent/x; do echo $b; done\n' }, BAD_GIT)).decision, 'allow');
   // a push that names its branch does not depend on where the line is
   assert.equal(git(`${first}; git ${PUSH} origin agent/x`, mk(MOVE, BAD_GIT)).decision, 'allow');
   // an alias the first reading redefines and the last puts back: the alias is unknown afterwards

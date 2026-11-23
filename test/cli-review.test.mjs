@@ -13,7 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createHash } from 'node:crypto';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { createFakeGh, fakeGhPath, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { contentHash } from '../pipeline/lib/git.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { currentContentHash, excerptWindow, reviewBaseRef } from '../pipeline/lib/review-context.mjs';
@@ -23,7 +23,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { SHARED_FLOOR_DIR, floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
 import { resetFloor } from '../pipeline/lib/model-floor.mjs';
 import { leasesDir } from '../pipeline/lib/review-lease.mjs';
-import { cleanupAtExit, ownerApprovesPast, ownerGrants, ownerRules, pastRoundRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
+import { cleanupAtExit, cleanupRoundClaims, ownerApprovesPast, ownerGrants, ownerRules, pastRoundRequest, roundRequest, rulingRequest } from './helpers/owner-go.mjs';
 import { grantIdOf, markerPath, presentedRoundRequest, readGrantMarker } from '../pipeline/hooks/lib/owner-go.mjs';
 import { fableFindingItems, rulingContentDigest } from '../pipeline/lib/triage.mjs';
 import { reviewCheck } from '../pipeline/lib/finalgate.mjs';
@@ -62,6 +62,7 @@ const noIssues = (slug) => [
   { match: `^api repos/${slug}/issues\\?creator=me&state=all&per_page=100 --paginate`, stdout: '[]' },
 ];
 const NO_ISSUES = noIssues('acme/widgets');
+const SEQ_GH = `node "${join(dirname(fakeGhPath), 'fake-gh-seq.mjs')}"`;
 
 // codex-review reads the PR's triage comment before it admits a counted round (published history): a world answers "no comment" unless a test
 // scripts the comments itself (these entries come LAST, so a test's own entries win).
@@ -103,7 +104,7 @@ const fenced = (obj) => `Done.\n\n\`\`\`json\n${JSON.stringify(obj)}\n\`\`\``;
 // baseFiles / featFiles: extra { path: content } committed in the base commit / the feature commit.
 // slug: the repository name the fake gh reports (`repo view`). Tests that record the owner's chat words use ownerWorld (below).
 function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {}, featFiles = {}, slug = 'acme/widgets' } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', yml);
   // As pipeline-setup leaves a real repo: the review's own files are never part of a commit (a fix commit would
@@ -146,7 +147,7 @@ function world(t, { gh = GH, light = false, yml = pipelineYml(), baseFiles = {},
       for (const k of [
         'PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_ARBITER_MODEL_OVERRIDE', 'PIPELINE_TEST_MODE', 'PIPELINE_CODEX_TIMEOUT_MS',
         'PIPELINE_LOCK_WAIT_MS', 'FAKE_CODEX_EXIT', 'FAKE_CODEX_STDERR', 'FAKE_CODEX_NO_WRITE', 'FAKE_CODEX_OUTPUT',
-        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT',
+        'FAKE_CODEX_HANG', 'FAKE_CODEX_DURING', 'FAKE_CODEX_DURING_OUTPUT', 'FAKE_CODEX_TURN_FAILED',
         // the suite runs inside Claude Code: a real terminal's versions must not decide whether a Fable round is stopped as stale (cli-stale-terminal pins that)
         'AI_AGENT', 'CLAUDE_CODE_EXECPATH',
       ]) {
@@ -222,7 +223,7 @@ test('excerptWindow: +/-20 lines around a line, clamped; line 0 means the whole 
 test('currentContentHash: hashes against origin/<default> when that ref exists, else the local default branch', async (t) => {
   const w = world(t);
   const { config } = await loadConfig(w.repo.dir);
-  assert.equal(reviewBaseRef(w.repo.dir, config), 'main');
+  assert.equal(reviewBaseRef(w.repo.dir, config), 'refs/heads/main');
   const local = currentContentHash(w.repo.dir, config);
   assert.equal(local, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
 
@@ -233,7 +234,7 @@ test('currentContentHash: hashes against origin/<default> when that ref exists, 
   w.repo.checkout('feat/x');
   w.repo.git(['rebase', '-q', 'main']);
   w.repo.git(['update-ref', 'refs/remotes/origin/main', w.base]);
-  assert.equal(reviewBaseRef(w.repo.dir, config), 'origin/main');
+  assert.equal(reviewBaseRef(w.repo.dir, config), 'refs/remotes/origin/main');
   const viaOrigin = currentContentHash(w.repo.dir, config);
   assert.equal(viaOrigin, contentHash('origin/main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
   assert.notEqual(viaOrigin, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
@@ -257,7 +258,7 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   assert.deepEqual([state.pr, state.repo, state.branch, state.risk, state.lightLane, state.maxRounds], [7, 'acme/widgets', 'feat/x', 'low', false, 2]);
   assert.equal(r.json.reviewer, 'judge', 'a low-risk PR with no sensitive path is triaged by the judge');
   assert.equal(state.reviewer, 'judge');
-  assert.deepEqual([state.rounds[0].fableRequired, state.rounds[0].codexModel, state.rounds[0].forkPoint], [undefined, 'gpt-6-astra', w.base]);
+  assert.deepEqual([state.rounds[0].fableRequired, state.rounds[0].codexModel, state.rounds[0].forkPoint], [undefined, 'gpt-6.2-astra', w.base]);
   const round = state.rounds[0];
   assert.deepEqual([round.n, round.fromHead, round.toHead], [1, w.base, w.head]);
   assert.equal(round.contentHashAtToHead, contentHash('main', 'HEAD', { cwd: w.repo.dir, exclude: ['docs/agent-log.md'] }));
@@ -278,10 +279,10 @@ test('codex-review: a valid findings file becomes round 1 with ids, state, codex
   const [call] = w.captured();
   const at = (flag) => call.argv[call.argv.indexOf(flag) + 1];
   assert.equal(call.argv[0], 'exec');
-  assert.equal(at('-o'), w.roundFile(1, 'codex-raw.json'));
+  assert.match(at('-o'), /[\\/]round-1[\\/]attempt-[0-9a-f]{16}[\\/]codex-raw\.json$/, 'Codex writes into the attempt\'s own folder; the winner\'s copy is round-1/codex-raw.json');
   assert.equal(at('-C'), w.repo.dir);
   assert.match(at('--output-schema'), /codex-findings\.schema\.json$/);
-  assert.ok(call.argv.includes('model="gpt-6-astra"') && call.argv.includes('model_reasoning_effort="high"'));
+  assert.ok(call.argv.includes('model="gpt-6.2-astra"') && call.argv.includes('model_reasoning_effort="high"'));
   assert.equal(call.argv.at(-1), '-');
   assert.match(call.stdin, /PR: #7/);
   assert.match(call.stdin, /Title: Add compute/);
@@ -319,32 +320,57 @@ test('codex-review: a large binary document in the range is left out of diff.pat
   assert.equal(w.state().rounds[0].contentHashAtToHead, contentHash('main', 'HEAD', { cwd: repo.dir, exclude: ['docs/agent-log.md'] }));
 });
 
-test('codex-review: --model overrides the configured model; a bad effort or model is a usage error before anything runs', (t) => {
-  const w = world(t);
+// #389: the model is the TRUSTED config's (the one committed at the default branch's fork point), so --model may only name it; the working-tree value is the PR's to edit.
+const withModel = (m) => `${pipelineYml()}review:\n  codex_model: ${m}\n`;
+test('codex-review: --model must be the configured (trusted) model; a bad effort or model is a usage error before anything runs', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1') });
   const ok = w.codex(1, findingsOf(), { extra: ['--model', 'gpt-test-1'] });
   assertExit(ok, 0);
   assert.ok(w.captured()[0].argv.includes('model="gpt-test-1"'));
   assert.equal(w.state().rounds[0].items.length, 0, 'an empty review is a valid round with no items');
 
-  const w2 = world(t);
+  const w2 = world(t, { yml: withModel('gpt-test-1') });
   const badEffort = w2.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w2.base, '--head', w2.head, '--effort', 'ultra']);
   assertExit(badEffort, 2);
   const badModel = w2.cli(['codex-review', '--pr', '7', '--round', '1', '--base', w2.base, '--head', w2.head, '--effort', 'high', '--model', 'x"; rm']);
   assertExit(badModel, 2);
+  assert.match(badModel.stderr + badModel.stdout, /invalid model/, 'a malformed --model is a usage error about its shape, not a model-mismatch');
   assert.equal(w2.captured().length, 0);
   assert.ok(!existsSync(join(w2.repo.dir, '.review', 'state.json')));
 });
 
+test('codex-review: a well-formed --model that is not the trusted model is refused with model-mismatch (exit 2), before anything runs (#389)', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1') });
+  const r = w.codex(1, findingsOf(), { extra: ['--model', 'gpt-other-9'] });
+  assertExit(r, 2);
+  assert.equal(r.json.error, 'model-mismatch');
+  assert.equal(r.json.expected, 'gpt-test-1');
+  assert.equal(w.captured().length, 0);
+  assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')));
+});
+
+test('codex-review: a working-tree review.codex_model change is ignored: Codex runs with the base config\'s model, and --model naming the edited one is refused (#389)', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1') });
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), withModel('gpt-evil-2'));
+  const refused = w.codex(1, findingsOf(), { extra: ['--model', 'gpt-evil-2'] });
+  assertExit(refused, 2);
+  assert.deepEqual([refused.json.error, refused.json.expected], ['model-mismatch', 'gpt-test-1']);
+  const ok = w.codex(1, findingsOf());
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.ok(w.captured()[0].argv.includes('model="gpt-test-1"'), 'the trusted model ran');
+  assert.equal(w.state().rounds[0].codexModel, 'gpt-test-1');
+});
+
 test('codex-review: quota, auth and a missing binary are exit 3 with unavailable:true and a reason; no state is written', (t) => {
   const w = world(t);
-  const quota = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'ERROR: You hit your usage limit. Try again later.' } });
+  const quota = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'You hit your usage limit. Try again later.' } });
   assertExit(quota, 3);
   assert.equal(quota.json.ok, false);
   assert.equal(quota.json.unavailable, true);
   assert.equal(quota.json.reason, 'quota');
   assert.match(quota.json.detail, /usage limit/);
 
-  const auth = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'Not logged in. Run codex login.' } });
+  const auth = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'Not logged in. Run codex login.' } });
   assertExit(auth, 3);
   assert.equal(auth.json.reason, 'auth');
 
@@ -361,6 +387,47 @@ test('codex-review: quota, auth and a missing binary are exit 3 with unavailable
   assert.equal(missing.json.reason, 'unavailable');
 
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')), 'a failed Codex run must not leave a round behind');
+});
+
+// The weekly Codex figure: every real run (answered or failed) adds one line to the usage ledger (PIPELINE_CODEX_USAGE_FILE moves it into the scratch dir).
+const ledgerOf = (file) => (existsSync(file) ? readFileSync(file, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)) : []);
+
+test('codex-review: each real Codex run, answered or failed, is logged in the usage ledger; a ledger that cannot be written only warns', (t) => {
+  const w = world(t);
+  const file = join(w.scratch, 'usage', 'codex-usage.jsonl');
+  const env = { PIPELINE_CODEX_USAGE_FILE: file };
+  assert.deepEqual(ledgerOf(file), []);
+
+  const failed = w.codex(1, findingsOf(), { env: { ...env, FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'ERROR: You hit your usage limit.' } });
+  assertExit(failed, 3);
+  assert.equal(failed.json.warnings, undefined, 'a written ledger adds no warning');
+  const ok = w.codex(1, standardFindings(), { env });
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+
+  const lines = ledgerOf(file);
+  assert.equal(lines.length, 2);
+  assert.deepEqual(lines.map((l) => l.ok), [false, true]);
+  for (const l of lines) {
+    assert.deepEqual([l.v, l.kind, l.repo, l.pr, l.round, l.effort, l.model], [1, 'review', 'acme/widgets', 7, 1, 'high', 'gpt-6.2-astra']);
+    assert.ok(Math.abs(Date.parse(l.ts) - Date.now()) < 60_000, 'ts is the run time');
+    assert.equal('resolutionOnly' in l, false);
+  }
+});
+
+test('codex-review: an unwritable usage ledger never fails the round: a warning in the reply (also when Codex fails)', (t) => {
+  const w = world(t);
+  const blocked = join(w.scratch, 'plain-file');
+  writeFileSync(blocked, 'x'); // the ledger's folder is a regular file
+  const env = { PIPELINE_CODEX_USAGE_FILE: join(blocked, 'codex-usage.jsonl') };
+  const failed = w.codex(1, findingsOf(), { env: { ...env, FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'segfault' } });
+  assertExit(failed, 3);
+  assert.equal(failed.json.reason, 'error');
+  assert.match(failed.json.warnings[0], /^codex usage ledger not written/);
+  const ok = w.codex(1, standardFindings(), { env });
+  assertExit(ok, 0, ok.stderr + ok.stdout);
+  assert.equal(ok.json.round, 1);
+  assert.match(ok.json.warnings[0], /^codex usage ledger not written/);
+  assert.equal(w.state().rounds.length, 1, 'the round is recorded all the same');
 });
 
 test('codex-review: output that is not valid findings is exit 3 reason malformed, never "no findings"', (t) => {
@@ -393,7 +460,10 @@ test('codex-review: a leftover raw file from an earlier run is never read as thi
   assertExit(r, 3);
   assert.equal(r.json.reason, 'malformed');
   assert.ok(!existsSync(join(w.repo.dir, '.review', 'state.json')));
-  assert.ok(!existsSync(stale), 'the stale file was removed before Codex ran');
+  // Codex now writes into the attempt's own folder (cp #256), so a file left at round-1/codex-raw.json is never even the output path: it is not read, and an
+  // attempt that fails publishes nothing over it. The remove-before-run guard for the attempt's own output path is pinned in codex-exec.test.mjs.
+  const attempt = readdirSync(join(w.repo.dir, '.review', 'round-1')).find((n) => n.startsWith('attempt-'));
+  assert.ok(!existsSync(join(w.repo.dir, '.review', 'round-1', attempt, 'codex-raw.json')), 'nothing was read from, or written to, the attempt folder');
 });
 
 test('codex-review: an answer Codex writes during the run is read even when its source bytes are old (fake writes fresh, not a Windows copy)', (t) => {
@@ -733,6 +803,25 @@ test('codex-review: a PR that targets a branch other than the default branch exc
   assert.equal(w.state().rounds[1].reviewBaseKind, 'previous');
 });
 
+// #398: "is this PR's base the default branch" is answered by the trusted default branch (origin/HEAD), never by the working-tree config's default_branch, which the PR
+// can edit: naming its own base branch there must not make that branch's merged-in commits count as "from the default branch" and drop out of the next round.
+test('codex-review: a PR whose own pipeline.yml names its base branch as default_branch still has that branch\'s merged-in commits reviewed (#398)', (t) => {
+  const gh = GH.map((e) => (e.match === '^pr view 7' ? { ...e, stdoutJson: { ...e.stdoutJson, baseRefName: 'release' } } : e));
+  const w = worldIgnoringReview(t, { gh, featFiles: { '.claude/pipeline.yml': `${pipelineYml()}default_branch: release\n` } });
+  w.repo.git(['branch', 'release', w.base]);
+  // the remote's own default branch (what origin/HEAD names) is main: the anchor the PR cannot edit
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', w.base]);
+  w.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main']);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-release.js': 'export const x = 1;\n' }, { branch: 'release' });
+  const r = w.codex(2, findingsOf(), { from: w.head, to: merged });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseOnly, undefined, 'not a base-only round');
+  assert.equal(w.captured().length, 2, 'Codex ran');
+  assert.match(patchOf(w, 2), /from-release\.js/, 'the PR-chosen base branch\'s code is reviewed');
+  assert.equal(w.state().rounds[1].reviewBaseKind, 'previous');
+});
+
 test('codex-review: code merged in from a branch other than the PR\'s base is reviewed (only the default branch is left out)', (t) => {
   const w = worldIgnoringReview(t);
   w.repo.git(['branch', 'side', w.base]);
@@ -980,7 +1069,7 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
     '## R1-S1', '## R1-S2', 'SUGGESTION', 'maintainability', 'Rename helper', 'src/b.js:3',
     'Codex detail:', 'x is dereferenced before it is checked', 'Codex reasoning:', 'compute(x.y) throws',
     'REJECT (confidence high) - judge: REJECT R1-S1', 'REJECT (confidence low)', 'Test result: none',
-    'Code at HEAD, src/b.js lines 1-8:', 'export const w3 = 3;',
+    `Code at the reviewed head ${w.head.slice(0, 12)}, src/b.js lines 1-8:`, 'export const w3 = 3;',
   ]) assert.ok(text.includes(needle), `missing ${needle}`);
   assert.ok(!text.includes('## R1-B1') && !text.includes('## R1-W1'), 'only items that need the arbiter are in the input');
 
@@ -989,7 +1078,49 @@ test('arbiter needed: nothing to arbitrate is {needed:false}; otherwise writes t
   assert.equal(w.cli(['arbiter', 'needed', '--round', '1']).json.digest, r.json.digest, 'deterministic for unchanged state');
 });
 
-test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, and cannot break out of its fence', (t) => {
+test('arbiter needed on a dispute round whose recorded toHead this clone lacks: an error, no input written (never "the file does not exist at the reviewed head")', (t) => {
+  const w = world(t);
+  assertExit(w.codex(1, standardFindings()), 0);
+  assertExit(w.judge(1, STANDARD_JUDGE), 0);
+  const st = w.state();
+  st.rounds[0].toHead = 'f'.repeat(40);
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(st));
+  const before = w.stateText();
+  const r = w.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(r, 2, r.stderr + r.stdout);
+  assert.equal(r.json.error, 'head-unavailable');
+  assert.ok(!existsSync(w.roundFile(1, 'arbiter-input.md')), 'no input without evidence');
+  assert.equal(w.stateText(), before);
+
+  // A retry after a failed model proof clears that ruling only once the commit is there: a refused retry must not lose the recorded failure.
+  const w2 = world(t);
+  assertExit(w2.codex(1, standardFindings()), 0);
+  assertExit(w2.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT'] }), 0);
+  const st2 = w2.state();
+  st2.rounds[0].toHead = 'f'.repeat(40);
+  st2.rounds[0].items.find((i) => i.id === 'R1-B1').final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'model-proof failed' };
+  writeFileSync(join(w2.repo.dir, '.review', 'state.json'), JSON.stringify(st2));
+  const before2 = w2.stateText();
+  const r2 = w2.cli(['arbiter', 'needed', '--round', '1']);
+  assertExit(r2, 2, r2.stderr + r2.stdout);
+  assert.equal(r2.json.error, 'head-unavailable');
+  assert.equal(w2.stateText(), before2, 'the cleared model-proof final is not saved when the retry is refused');
+
+  // The same retry with the commit present but the input file unwritable (a directory sits where it goes): the failed write must not have erased the prior final.
+  const w3 = world(t);
+  assertExit(w3.codex(1, standardFindings()), 0);
+  assertExit(w3.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT'] }), 0);
+  const st3 = w3.state();
+  st3.rounds[0].items.find((i) => i.id === 'R1-B1').final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'model-proof failed' };
+  writeFileSync(join(w3.repo.dir, '.review', 'state.json'), JSON.stringify(st3));
+  mkdirSync(w3.roundFile(1, 'arbiter-input.md'), { recursive: true });
+  const before3 = w3.stateText();
+  const r3 = w3.cli(['arbiter', 'needed', '--round', '1']);
+  assert.notEqual(r3.status, 0, 'the input write fails: ' + r3.stderr + r3.stdout);
+  assert.equal(w3.stateText(), before3, 'the cleared model-proof final is saved only after the arbiter input is written');
+});
+
+test('arbiter needed: the excerpt is +/-20 lines of the file at the reviewed head, numbered, and cannot break out of its fence', (t) => {
   const w = world(t);
   w.repo.write('src/f.js', Array.from({ length: 60 }, (_, i) => (i === 29 ? '// ``` closes a naive fence' : `const f${i + 1} = ${i + 1};`)).join('\n') + '\n');
   const head2 = w.repo.commit('add f');
@@ -997,7 +1128,7 @@ test('arbiter needed: the excerpt is +/-20 lines of the file at HEAD, numbered, 
   assertExit(w.judge(1, { 'R1-B1': ['REJECT'] }), 0);
   const r = w.cli(['arbiter', 'needed', '--round', '1']);
   const text = readFileSync(r.json.inputPath, 'utf8');
-  assert.match(text, /Code at HEAD, src\/f\.js lines 10-50:/);
+  assert.match(text, /Code at the reviewed head [0-9a-f]{12}, src\/f\.js lines 10-50:/);
   assert.match(text, /^10 \| const f10 = 10;$/m);
   assert.match(text, /^50 \| const f50 = 50;$/m);
   assert.doesNotMatch(text, /const f9 = 9;/);
@@ -1244,7 +1375,13 @@ test('state show: filters by round, accepted, disputed and needs-human; mark-imp
 
   w.repo.write('src/a.js', aFile(true).replace('compute(x.y)', 'compute(x?.y)'));
   w.repo.commit('fix');
-  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1']);
+  // --pr N (like discard-round): a PR the state does not belong to is refused before anything is marked; the right one (or none) marks
+  const beforeMark = w.stateText();
+  const wrongPr = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1', '--pr', '8']);
+  assertExit(wrongPr, 2);
+  assert.equal(wrongPr.json.error, 'state-pr-mismatch');
+  assert.equal(w.stateText(), beforeMark, 'a mismatched --pr marks nothing');
+  const marked = w.cli(['state', 'mark-implemented', '--ids', 'R1-B1,R1-S1', '--pr', '7']);
   assertExit(marked, 0);
   assert.deepEqual(w.cli(['state', 'show', '--accepted']).json.items, []);
   assert.equal(w.item('R1-B1').implemented, true);
@@ -1781,7 +1918,7 @@ test('review-complete: unresolved items or an unimplemented ACCEPT keep the labe
 
 test('review-complete: Codex outage then recovery (exit 3, then a clean review, then the label comes off)', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
-  const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_STDERR: 'usage limit reached' } });
+  const outage = w.codex(1, findingsOf(), { env: { FAKE_CODEX_EXIT: '1', FAKE_CODEX_TURN_FAILED: 'usage limit reached' } });
   assertExit(outage, 3);
   assertExit(w.cli(['review-complete', '--pr', '7']), 1, 'nothing was reviewed yet');
 
@@ -1796,6 +1933,19 @@ test('review-complete: a gh failure while removing the label is exit 3, not succ
   assertExit(w.cli(['review-complete', '--pr', '7']), 3);
 });
 
+test('review-complete: the marker\'s fallback codexModel (a newest round that recorded none) is the trusted model, not a working-tree review.codex_model edit (#389, R1-F2)', (t) => {
+  const w = world(t, { yml: withModel('gpt-test-1'), gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
+  assertExit(w.codex(1, findingsOf()), 0);
+  const s = w.state();
+  delete s.rounds[0].codexModel; // a round that never recorded its model: only the configured default can name it
+  writeFileSync(join(w.repo.dir, '.review', 'state.json'), JSON.stringify(s, null, 2));
+  writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), withModel('gpt-evil-2'));
+  const r = w.cli(['review-complete', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.review.codexModel, 'gpt-test-1');
+  assert.equal(reviewJson(postedBodies(w)[0]).codexModel, 'gpt-test-1');
+});
+
 test('review-complete: posts the marker comment with {contentHash, base, head, rounds, codexModel, modelProofDigest, stateHash}; an identical one is reused', (t) => {
   const w = world(t, { gh: [...GH, REMOVE_LABEL, ...REVIEW_COMMENT] });
   assertExit(w.codex(1, findingsOf()), 0);
@@ -1808,7 +1958,7 @@ test('review-complete: posts the marker comment with {contentHash, base, head, r
   const record = reviewJson(body);
   assert.deepEqual(Object.keys(record), ['contentHash', 'base', 'head', 'rounds', 'codexModel', 'modelProofDigest', 'stateHash']);
   assert.deepEqual(record, {
-    contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6-astra', modelProofDigest: null,
+    contentHash: w.state().rounds[0].contentHashAtToHead, base: w.base, head: w.head, rounds: 1, codexModel: 'gpt-6.2-astra', modelProofDigest: null,
     stateHash: reviewContentHash(w.state()), // the state review-complete published: the owner-go check binds the marker to it
   });
   assert.deepEqual(r.json.review, record);
@@ -2116,6 +2266,32 @@ test('followups create: a gh failure is exit 3 and nothing is recorded as filed'
   assert.equal(w.item('R1-W1').followupIssue ?? null, null);
 });
 
+test('followups create: a rate limit on the issue POST that DID land is retried with a fresh lookup, so no duplicate issue is filed (#190)', (t) => {
+  const url = 'https://github.com/acme/widgets/issues/11';
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf([], [], [finding({ title: 'Idea', category: 'other' })])), 0);
+  assertExit(w.judge(1, { 'R1-W1': ['FOLLOW-UP'] }), 0);
+  const marker = `<!-- claude-pipeline:followup pr=7 fp=${w.item('R1-W1').fingerprint} -->`;
+  const limited = { code: 1, stderr: 'gh: You have exceeded a secondary rate limit. Please wait a few minutes before you try again. (HTTP 403)' };
+  w.fake.setScript([
+    { match: '^repo view', stdoutJson: REPO_VIEW },
+    { match: '^api user', stdout: 'me\n' },
+    // the lookup: empty the first time; the second time the issue the limited POST had actually created is there
+    { match: '^api repos/acme/widgets/issues\\?creator=me&state=all&per_page=100 --paginate', sequence: [
+      { stdout: '[]' },
+      { stdoutJson: [{ number: 11, html_url: url, state: 'open', body: `${marker}\nbody`, user: { login: 'me' } }] },
+    ] },
+    { match: '^api -X POST repos/acme/widgets/issues ', sequence: [limited, { stdoutJson: { number: 12, html_url: 'https://github.com/acme/widgets/issues/12' } }] },
+  ]);
+  const r = w.cli(['followups', 'create', '--round', '1'], { PIPELINE_GH: SEQ_GH, PIPELINE_GH_RETRY_MS: '50' });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.created, []);
+  assert.deepEqual(r.json.reused.map((x) => x.number), [11]);
+  assert.equal(w.fake.calls().filter((c) => c.argv.join(' ').startsWith('api -X POST repos/acme/widgets/issues ')).length, 1, 'one POST only');
+  assert.match(r.stderr, /secondary rate limit; retrying in/);
+  assert.equal(w.item('R1-W1').followupIssue, url);
+});
+
 // ---- a whole round, end to end ----------------------------------------------------------------
 
 test('a full round: codex -> judge -> arbiter -> implement -> follow-ups -> clean second round -> label off', (t) => {
@@ -2250,7 +2426,7 @@ test('codex-review: a finding path that tries to leave the repository reads noth
   assertExit(needed, 0);
   const input = readFileSync(needed.json.inputPath, 'utf8');
   assert.ok(!input.includes('root:') && !input.includes('/bin/'), 'no file outside the repository is quoted');
-  assert.equal((input.match(/does not exist at HEAD/g) ?? []).length >= 2, true);
+  assert.equal((input.match(/does not exist at the reviewed head/g) ?? []).length >= 2, true);
 });
 
 // -- the ruled cache
@@ -2563,12 +2739,17 @@ test('arbiter apply: an installed copy ignores PIPELINE_TEST_MODE (with a warnin
   const w = readyForArbiter(t);
   w.cli(['arbiter', 'needed', '--round', '1']);
   const asked = ['--expect-model', 'claude-opus-', '--expect-effort', 'low'];
-  const r = arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
+  const run = () => arbiterRun(w, { model: 'claude-opus-5-1', effort: 'low', extraArgs: asked, env: { PIPELINE_TEST_MODE: '1', TEST_BIN: join(installed, 'bin', 'pipeline.mjs'), ...noClaudeSession() } });
+  // #589: the installed copy takes REAL admission in the account's folder (no seam points it elsewhere, by design) and waits up to 20 s for it. Under load, or while a real
+  // `pipeline update` or another suite's installed-copy child holds it, that wait can run out: the CLI then refuses BEFORE it reads anything (error update-in-progress, state
+  // untouched), so the same call can safely be made once more. Only that one refusal is retried; any other result, or a second refusal, is asserted below as before.
+  let r = run();
+  if (r.json?.error === 'update-in-progress') r = run();
   assertAllNeedHuman(w, r, /unexpected model claude-opus-5-1/);
   assert.match(r.stderr, /ignoring PIPELINE_TEST_MODE/);
   // R4-6: an installed copy ignores PIPELINE_REVIEW_LEASE_DIR, so this child (a plain process: noClaudeSession) took a REAL, momentary process lease and real admission in the
   // account's folder - no opt-out is wanted here, it is the path the owner's terminal takes. It must have closed it: no proc-* file of that child's pid is left. (If a real
-  // update holds admission while this runs, the child waits up to 20 s and then refuses with update-in-progress; the assertions above would fail loudly rather than hang.)
+  // update holds admission while this runs, the child waits up to 20 s and then refuses with update-in-progress; the call is made once more, and a second refusal fails the assertions above loudly rather than hanging.)
   const leaseFolder = leasesDir();
   const left = existsSync(leaseFolder) ? readdirSync(leaseFolder).filter((n) => n.startsWith(`proc-${r.pid}-`)) : [];
   assert.deepEqual(left, [], `the child's process lease was closed (${leaseFolder})`);
@@ -2828,6 +3009,44 @@ test('triage settle: the CLI runs the test; the command, file, exit code and hea
   assert.equal(w.item('R1-B1').final.needsHuman, false, 'a non-security dismissal by test is final');
 });
 
+test('triage settle: production code changed after the round\'s reviewed head refuses before the test runs (settle-head-moved), nothing recorded', (t) => {
+  const w = disputedWorld(t);
+  w.repo.write('src/b.js', `${bFile}export const later = 1;\n`); // a later fix: it could make the settle test pass and give round 1's finding a REJECT
+  w.repo.commit('fix after the reviewed head');
+  const snapshot = w.stateText();
+  const r = w.cli(settleArgs(w, 'R1-B1', 'bug-disproved'));
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.match(r.json.next, /^arbiter needed --pr 7 --round 1/);
+  assert.equal(w.stateText(), snapshot, 'nothing recorded, nothing run');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
+test('triage settle: a HEAD that is not a descendant of the reviewed head and lacks its production change refuses (settle-head-moved), though only a test differs from the merge base', (t) => {
+  const w = disputedWorld(t);
+  w.repo.git(['reset', '-q', '--hard', w.base]); // HEAD forks from round 1's reviewed head: the reviewed fix (src/a.js, src/big.js) is not in it
+  const args = settleArgs(w, 'R1-B1', 'bug-disproved'); // the only change from the merge base is the proving test
+  const snapshot = w.stateText();
+  const r = w.cli(args);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.equal(w.stateText(), snapshot, 'nothing recorded');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
+test('triage settle: an uncommitted change to a tracked production file refuses (settle-head-moved): the run would read code the reviewed head does not have', (t) => {
+  const w = disputedWorld(t);
+  const args = settleArgs(w, 'R1-B1', 'bug-disproved'); // the proving test is committed
+  w.repo.write('src/b.js', `${bFile}export const wip = 1;\n`); // a fix in the file the test imports, not committed
+  const snapshot = w.stateText();
+  const r = w.cli(args);
+  assertExit(r, 1, r.stdout + r.stderr);
+  assert.equal(r.json.error, 'settle-head-moved');
+  assert.match(r.json.reason, /src\/b\.js/);
+  assert.equal(w.stateText(), snapshot, 'nothing recorded');
+  assert.equal(w.item('R1-B1').test, undefined);
+});
+
 test('triage settle: a passing test cannot confirm a bug, a failing test cannot disprove one (state untouched)', (t) => {
   const w = disputedWorld(t);
   const before = () => w.stateText();
@@ -3057,6 +3276,23 @@ test('state discard-round: refuses a round the PR comment holds, a round that is
   assert.equal(w.cli(['state', 'discard-round', '--round', '2', '--pr', '8']).json.error, 'state-pr-mismatch');
   assertExit(w.cli(['state', 'discard-round']), 2);
   assert.match(w.cli(['state', 'bogus']).stdout + w.cli(['state', 'bogus']).stderr, /discard-round/);
+});
+
+// A newer pipeline's triage comment decodes to no state here; that must not read as "round not published" (the round would be discarded from the local copy).
+test('state discard-round / state show: a newer-format triage comment refuses the discard and serves the local state as local-unverified', (t) => {
+  const { w, published } = publishedWorld(t);
+  const script = JSON.parse(readFileSync(join(w.fake.dir, 'script.json'), 'utf8'));
+  w.fake.setScript([...COMMENTS(mine({ ...published, version: 99 })), ...script]);
+  const d = w.cli(['state', 'discard-round', '--round', '1', '--pr', '7']);
+  assertExit(d, 2);
+  assert.equal(d.json.error, 'history-unreadable');
+  assert.match(d.json.message, /pipeline update/);
+  assert.equal(w.state().rounds.length, 1);
+  assert.deepEqual(staleDirs(w), []);
+  const show = w.cli(['state', 'show', '--pr', '7']);
+  assertExit(show, 0, show.stderr + show.stdout);
+  assert.equal(show.json.source, 'local-unverified');
+  assert.match(show.json.warnings.join(' '), /pipeline update/);
 });
 
 test('state discard-round: a gh outage is exit 3 and nothing is moved', (t) => {
@@ -3831,8 +4067,29 @@ test('codex-review: PR work after the conflict merge is NOT eligible: whole-pr, 
   assert.match(r.json.resolutionIneligible, /^history-nonmerge/);
   const round = w.state().rounds[1];
   assert.deepEqual([round.reviewBaseKind, round.resolutionOnly, round.conflicted], ['whole-pr', undefined, undefined]);
+  assert.equal(round.resolutionIneligible, 'history-nonmerge', 'the short proof-failure code is stored on the round (stats rounds reads it); the detail is not');
+  assert.equal(r.json.reviewKind, 'whole-pr');
   assert.equal(w.cli(['state', 'outcome']).json.reviewedRounds, 2, 'counted');
   assert.match(patchOf(w, 2), /src\/c\.js/);
+});
+
+// Failure caught: the controller (and the owner's ask) cannot see BEFORE a round why it would be a counted whole-PR round, so a merge of main plus one own commit looks free.
+test('codex-review --plan: shows reviewKind, and resolutionIneligible for a whole-PR fallback; a provable resolution shows reviewKind resolution + resolutionOnly', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = conflictKeepingOurs(w);
+  const planAt = (to) => w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', w.head, '--head', to, '--plan']);
+  const free = planAt(merged);
+  assertExit(free, 0, free.stderr + free.stdout);
+  assert.deepEqual([free.json.plan.reviewKind, free.json.plan.resolutionOnly, free.json.plan.resolutionIneligible], ['resolution', true, undefined]);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const head2 = w.repo.commit('later pr commit');
+  const counted = planAt(head2);
+  assertExit(counted, 0, counted.stderr + counted.stdout);
+  assert.equal(counted.json.plan.reviewKind, 'whole-pr');
+  assert.match(counted.json.plan.resolutionIneligible, /^history-nonmerge/);
+  assert.equal(counted.json.plan.resolutionOnly, undefined);
+  assert.equal(w.state().rounds.length, 1, '--plan records no round');
 });
 
 test('codex-review: an ineligible conflict round at the cap is refused (round-cap) exactly as before', (t) => {
@@ -3945,8 +4202,14 @@ test('resolution round end to end: publish, replay in a fresh clone, arbiter reb
   const clone = join(w.scratch, 'clone');
   const gitIn = (...args) => spawnSync('git', args, { cwd: clone, encoding: 'utf8' });
   assert.equal(spawnSync('git', ['clone', '-q', '--no-local', w.repo.dir, clone], { encoding: 'utf8' }).status, 0);
+  // The fixture's "remote" is a working repo with the PR branch checked out, so the clone's origin/HEAD names feat/x; a real remote's HEAD is its default branch
+  // (the hash is measured from the trusted default branch = origin/HEAD, #448), so point it at main as GitHub's would be.
+  assert.equal(gitIn('remote', 'set-head', 'origin', 'main').status, 0);
   const hasTree = () => gitIn('cat-file', '-e', markerTree).status === 0;
   assert.equal(hasTree(), false, 'precondition: the marker tree exists only where the round was made');
+  // The fixture repo has the PR branch checked out, so the clone's origin/HEAD would name feat/x; a real remote's HEAD is its default branch, which is the anchor every
+  // content hash is measured from (#369, EW #2056). Point it there, as GitHub's clone does.
+  assert.equal(gitIn('remote', 'set-head', 'origin', 'main').status, 0);
   // The clone's own git would write a different marker style: the forced config must make the rebuilt tree identical.
   gitIn('config', 'merge.conflictStyle', 'zdiff3');
   const cloneCli = (args, env = {}) => {
@@ -4043,6 +4306,8 @@ function ownerGrantsRound(w, t, { pr = 7, k, head, prompt = 'extra round', repo 
   assert.ok(record, 'the recorder wrote the grant');
   cleanupAtExit(markerPath(grantIdOf(record)));
   t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+  // #472 (F4): the codex-review that claims the grant also writes a round ticket and sweeps the markers of the round's other grants into the account home: remove exactly those (w.slug is unique to the test).
+  cleanupRoundClaims({ slug: w.slug, pr, k, grantIds: [grantIdOf(record)], t });
   return record;
 }
 const codexThree = (w, from, to, extra = {}) => w.codex(3, findingsOf(), { from, to, ...extra });
@@ -4079,6 +4344,7 @@ test('codex-review owner grant: an "extra round" whose prompt is synthetic or mi
     const record = ownerGrants(t, 'extra round', roundRequest(7, 3, h2, w.slug), undefined, after);
     assert.ok(record, 'the hook could not tell at record time');
     t.after(() => rmSync(markerPath(grantIdOf(record)), { force: true }));
+    cleanupRoundClaims({ slug: w.slug, pr: 7, k: 3, grantIds: [grantIdOf(record)], t }); // (the claim below sweeps it: #472 F4)
   }
   const calls = w.captured().length;
   const capped = codexThree(w, h1, h2);
@@ -4486,6 +4752,26 @@ test('review-complete and the final gate refuse a PR whose Fable round was prove
   assertExit(refreshOf(w), 2, 'nothing is stale any more');
 });
 
+test('R1-B3: a substitute-fable round under a raised floor is refused by review-complete with the working advice, and a proven fable-refresh round clears it', (t) => {
+  const w = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
+  editState(w, (s) => {
+    s.rounds[0].firstReviewer = 'substitute';
+    s.rounds[0].substitute = { agent: 'substitute-fable', models: { [OLD_FABLE]: 1 }, evidence: 'quota', resetAt: null, outageAt: '2026-11-11T07:23:00.000Z', attempts: 1, proof: { transcript: '/t/x.jsonl', models: { [OLD_FABLE]: 1 }, effort: 'high' } };
+    s.version = 4;
+  });
+  const refused = w.cli(['review-complete', '--pr', '7']);
+  assertExit(refused, 1, refused.stdout + refused.stderr);
+  assert.equal(refused.json.error, 'substitute-unproven');
+  assert.match(refused.json.reason, /run `pipeline state fable-refresh --pr 7`/);
+  const r = refreshOf(w);
+  assertExit(r, 0, r.stdout + r.stderr);
+  assert.deepEqual([r.json.round, r.json.scope, r.json.staleRounds], [2, 'whole-pr', [{ round: 1, models: [OLD_FABLE] }]]);
+  const { applied } = proveRound(w, 2);
+  assertExit(applied, 0, applied.stdout);
+  const ok = w.cli(['review-complete', '--pr', '7']);
+  assertExit(ok, 0, ok.stdout + ok.stderr);
+});
+
 test('state fable-refresh is refused with a named reason when nothing is stale, work is unfinished, the content moved or the head is not pushed', (t) => {
   const fresh = oldProofWorld(t, { models: { 'claude-fable-5-2': 1 } });
   const none = refreshOf(fresh);
@@ -4721,4 +5007,44 @@ test('R1-F4: state fable-refresh accepts a head that only added ledger rows (doc
   moved.repo.write('src/b.js', `${bFile}export const extra = 1;\n`);
   moved.prHead(moved.repo.commit('unreviewed change'));
   assert.equal(refreshOf(moved).json.error, 'content-moved');
+});
+
+// S1: state fable-refresh measures its whole-PR range from the PR's base branch; when GitHub names none and the default branch cannot be anchored on the remote (an origin remote that
+// answered neither origin/HEAD nor ls-remote), the working tree's default branch is the PR's to choose, so the refresh REFUSES (untrusted-anchor, #456) and records nothing. The refusal
+// comes before any range is measured, so the recorded fork point cannot move. The origin is added by hand and never fetched, so no git version creates origin/HEAD.
+test('state fable-refresh: an untrusted anchor refuses (exit 3 untrusted-anchor) and records no round, so the recorded fork point cannot move', (t) => {
+  const w = oldProofWorld(t);
+  w.repo.git(['remote', 'add', 'origin', '/nonexistent/cp-no-such-origin-s1']);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('docs.md', 'main moves\n');
+  w.repo.commit('main moves');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']); // the PR's content is unchanged, but its merge base with main is now main's new tip
+  w.setGh([{ match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'x', headRefName: 'feat/x', baseRefName: null } }, { match: '^repo view', stdoutJson: REPO_VIEW }], w.repo.git(['rev-parse', 'HEAD']).trim()); // GitHub names no base branch
+  const before = w.state();
+  const r = refreshOf(w);
+  assertExit(r, 3, r.stdout + r.stderr);
+  assert.deepEqual([r.json.ok, r.json.unavailable, r.json.error, r.json.reason], [false, true, 'untrusted-anchor', 'untrusted-anchor']);
+  assert.deepEqual(w.state(), before, 'nothing recorded');
+  assert.equal(w.state().rounds.length, 1);
+});
+
+// ---- `--plan` prints the base the next round must use (Item 3, F10) ----------------------------------------------------------------------------------
+
+test('codex-review --plan after a non-free merge of main: plan.base is the base --base admits (round 1\'s toHead, = state outcome nextRound.base), plan.reviewBase is the reviewed range and is refused as --base', (t) => {
+  const w = worldIgnoringReview(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const merged = mergeMainInto(w, { 'src/from-main.js': 'export const other = 1;\n' }, { evil: { 'src/extra.js': 'export const extra = 1;\n' } });
+  const planOf = (from) => w.cli(['codex-review', '--pr', '7', '--round', '2', '--base', from, '--head', merged, '--plan']);
+  const outcome = w.cli(['state', 'outcome']);
+  assertExit(outcome, 0);
+  assert.equal(outcome.json.nextRound.base, w.head, 'the next round starts at round 1\'s toHead');
+  const p = planOf(w.head);
+  assertExit(p, 0, p.stderr + p.stdout);
+  assert.equal(p.json.plan.base, outcome.json.nextRound.base, 'plan.base is nextRound.base (F10)');
+  assert.notEqual(p.json.plan.reviewBase, p.json.plan.base, 'the reviewed range starts elsewhere after the merge');
+  assert.ok(['whole-pr', 'synthetic'].includes(p.json.plan.reviewBaseKind), p.json.plan.reviewBaseKind);
+  const refused = planOf(p.json.plan.reviewBase);
+  assert.notEqual(refused.code, 0, 'the reviewed range\'s start is not a base --base admits');
+  assert.equal(refused.json.ok, false);
 });

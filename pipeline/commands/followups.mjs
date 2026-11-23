@@ -6,6 +6,7 @@ import { defuseMarkdown } from '../lib/codex.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { saveState, updateItems } from '../lib/state.mjs';
+import { isCapLowFinal, isOwnerDeferral } from '../lib/triage.mjs';
 import { createHash } from 'node:crypto';
 import { allItems, findRound, oneLine, requireState, withStateLock } from '../lib/review-context.mjs';
 
@@ -62,7 +63,7 @@ export function followupMarker(pr, item) {
 export function issueBody(item, pr) {
   const where = item.file ? (item.line > 0 ? `${item.file}:${item.line}` : item.file) : null;
   const deferral = item.roundCapDeferral;
-  const decidedBy = item.final?.by === 'owner' ? 'Owner' : deferral ? 'Claude (round limit)' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
+  const decidedBy = item.final?.by === 'owner' || isOwnerDeferral(item) ? 'Owner' : deferral ? 'Claude (round limit)' : item.arbiter && item.final?.by === 'arbiter' ? 'Arbiter' : 'Judge';
   const lines = [
     String(item.detail ?? '').trim(),
     '',
@@ -73,6 +74,14 @@ export function issueBody(item, pr) {
     `**${decidedBy} (why this is a follow-up, not part of the PR):** ${String(item.final?.reason ?? item.judge?.reason ?? '').trim()}`,
     '',
   ];
+  // An ACCEPT the owner deferred (also a cached copy of it): a fix was accepted, and it is left out of this PR by the owner's typed ruling.
+  if (isOwnerDeferral(item)) {
+    lines.push(`The ${item.final.ownerDeferral.accepted === 'judge' ? 'judge' : item.final.ownerDeferral.accepted === 'cache' ? 'review' : 'arbiter'} ACCEPTED a fix for this finding and the owner deferred it to this issue (typed ruling); it is NOT in PR #${pr}.`, '');
+  }
+  // An ACCEPT deferred unapplied at the last allowed round (review.cap_low_accepts, final.postMax.rule cap-low): nothing was built.
+  if (isCapLowFinal(item)) {
+    lines.push(`The ${item.final.postMax.by === 'judge' ? 'judge' : 'arbiter'} ACCEPTED a fix at the round limit; it was deferred unapplied (review.cap_low_accepts); it is NOT in PR #${pr}.`, '');
+  }
   if (where) lines.push(`Location: \`${oneLine(where)}\``, '');
   // A fix deferred past the round limit (triage defer-fixes) was written and taken out again: say where it is. No cherry-pick claim: the fix head may hold other work.
   if (deferral && typeof deferral.fixHead === 'string' && typeof deferral.reviewedHead === 'string') {
@@ -116,7 +125,8 @@ export const run = guarded(async (argv, ctx) => {
       const reused = [];
       const duplicates = [];
       // Issues of ours already carrying a marker for this PR: a previous run (or the other machine) may have filed one
-      // whose URL never reached the state. Read once, and only when something is left to file.
+      // whose URL never reached the state. Read once, and only when something is left to file; a rate-limit retry (below) reads it
+      // again, because the POST that was rate limited may have been stored.
       let known = null;
       const findFiled = (item) => {
         if (known === null) {
@@ -137,7 +147,21 @@ export const run = guarded(async (argv, ctx) => {
           skipped.push(item.id);
           continue;
         }
-        const found = findFiled(item);
+        // One idempotent unit, re-run whole on a GitHub rate limit: look up first, file only if nothing is there. Every retry drops
+        // the cached lookup, so an issue that landed before the limit answer is found and reused, never filed twice.
+        let issue = null;
+        const found = gh.retrying((attempt) => {
+          if (attempt > 1) known = null;
+          const have = findFiled(item);
+          if (have.length === 0) {
+            issue = gh.issueCreate({
+              title: clip(`${TITLE_PREFIX}${oneLine(item.title)}`, TITLE_MAX),
+              body: issueBody(item, state.pr),
+              labels: [FOLLOWUP_LABEL],
+            });
+          }
+          return have;
+        });
         if (found.length > 0) {
           const [canonical, ...others] = found;
           state = updateItems(state, n, [{ ...item, followupIssue: canonical.url }]);
@@ -147,11 +171,6 @@ export const run = guarded(async (argv, ctx) => {
           if (others.length > 0) duplicates.push({ id: item.id, canonical: canonical.url, others: others.map((o) => o.url) });
           continue;
         }
-        const issue = gh.issueCreate({
-          title: clip(`${TITLE_PREFIX}${oneLine(item.title)}`, TITLE_MAX),
-          body: issueBody(item, state.pr),
-          labels: [FOLLOWUP_LABEL],
-        });
         state = updateItems(state, n, [{ ...item, followupIssue: issue.url }]);
         saveState(root, state); // record before the next call: a later failure must not lose this one
         if (item.fingerprint) filed.set(item.fingerprint, issue.url);

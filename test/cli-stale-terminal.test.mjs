@@ -11,7 +11,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
-import { scratchFloorDir } from './helpers/floor-env.mjs';
+import { scratchFloorDir, floorEnv } from './helpers/floor-env.mjs';
 import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { withFloorLock } from '../pipeline/lib/model-floor.mjs';
 import { arbiterFailures, roundOutcome } from '../pipeline/lib/triage.mjs';
@@ -58,7 +58,7 @@ const FRESH = { running: '2.1.322', installed: '2.1.322' };
 
 // fable: the only changed path is one the config sends to Fable every round (a Fable round with the given Codex findings); else a plain dispute round.
 function world(t, { fable = true, findings = NO_FINDINGS } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   repo.write('.claude/pipeline.yml', fable ? SENSITIVE_YML : pipelineYml());
   repo.write('.gitignore', '.review/\n');
@@ -76,7 +76,7 @@ function world(t, { fable = true, findings = NO_FINDINGS } = {}) {
     env(extra = {}) {
       const env = {
         ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: join(scratch, 'locks'),
-        PIPELINE_MODEL_FLOOR_DIR: w.floor, PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID,
+        ...floorEnv(w.floor), PIPELINE_MACHINE_ID: process.env.PIPELINE_MACHINE_ID,
       };
       for (const k of SCRUBBED) delete env[k];
       return { ...env, ...extra };

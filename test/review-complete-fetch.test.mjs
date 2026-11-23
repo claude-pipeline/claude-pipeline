@@ -13,6 +13,7 @@ import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { floorEnv } from './helpers/floor-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -41,7 +42,7 @@ const GH = [
 // A PR repo whose "origin" is a bare repository, on feat/x (one 60-line file off the light lane, a change in src/a.js), with
 // round 1 already recorded. `withOrigin: false` is a repo that never had a remote.
 function world(t, { withOrigin = true, accept = false } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
   const scratch = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-rcfetch-')));
   t.after(() => rmSync(scratch, { recursive: true, force: true }));
@@ -60,6 +61,9 @@ function world(t, { withOrigin = true, accept = false } = {}) {
     repo.git(['remote', 'add', 'origin', originDir]);
     repo.git(['push', '-q', 'origin', 'main']);
     repo.git(['fetch', '-q', 'origin']);
+    // A real clone has refs/remotes/origin/HEAD (git clone sets it; git >= 2.48 also creates it on fetch, older git does not): set it so every git version anchors the default branch
+    // on something a PR cannot edit, and the offline tests below keep exercising the cached-ref paths rather than the untrusted-anchor refusal (#456).
+    repo.git(['remote', 'set-head', 'origin', 'main']);
   }
   repo.branch('feat/x');
   repo.write('src/a.js', aFile(true));
@@ -74,7 +78,7 @@ function world(t, { withOrigin = true, accept = false } = {}) {
     cli(args, env = {}) {
       const r = spawnSync(process.execPath, [bin, ...args], {
         cwd: repo.dir, encoding: 'utf8',
-        env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...env },
+        env: { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env }, // floorEnv: an empty Codex home, so the weekly-quota governor never reads the real one (#429)
       });
       let json = null;
       try { json = r.stdout ? JSON.parse(r.stdout) : null; } catch { /* the assertion on json will say so */ }
@@ -190,10 +194,23 @@ test('origin is unreachable: review-complete still answers from the cached ref, 
   assert.ok(!w.item().implemented);
 });
 
-test('origin is unreachable and the content has no covering round: review-complete says origin/main could not be refreshed; with a covering round it passes', (t) => {
+test('origin is unreachable and the content has no covering round: review-complete says origin/main could not be refreshed; with a covering round it passes; with no origin/HEAD anchor it refuses untrusted-anchor', (t) => {
   const w = world(t);
   w.repo.git(['remote', 'set-url', 'origin', join(w.scratch, 'does-not-exist.git')]);
   w.prHead(w.head);
+  // A fixture clone made by hand has no refs/remotes/origin/HEAD, so with the remote unreachable nothing anchors the default branch except the working tree's own config, which a PR can edit (#377, S1):
+  // review-complete refuses BEFORE hashing (exit 1, error untrusted-anchor, #456), since a marker would vouch for content measured from a branch the PR chose. That is intended, not a regression of the cached-ref behaviour.
+  // git >= 2.48 creates origin/HEAD on fetch (remote.origin.followRemoteHEAD); older git does not. Set it either way, then delete the symref
+  // itself (--no-deref: a plain `update-ref -d` follows it and deletes origin/main instead), so every git version reaches the unanchored state.
+  w.repo.git(['remote', 'set-head', 'origin', 'main']);
+  w.repo.git(['update-ref', '--no-deref', '-d', 'refs/remotes/origin/HEAD']);
+  assert.notEqual(w.repo.git(['rev-parse', '--verify', '-q', 'refs/remotes/origin/main']).trim(), '', 'origin/main must survive');
+  const unanchored = w.cli(['review-complete', '--pr', '7']);
+  assertExit(unanchored, 1, unanchored.stderr + unanchored.stdout);
+  assert.equal(unanchored.json.error, 'untrusted-anchor');
+  assert.match(unanchored.json.reason, /could not be anchored on the remote/);
+  // A real clone has origin/HEAD (git clone sets it): that cached anchor is a source a PR cannot edit, so the cached-ref behaviour below holds offline.
+  w.repo.git(['remote', 'set-head', 'origin', 'main']);
   const ok = w.cli(['review-complete', '--pr', '7']);
   assertExit(ok, 0, ok.stderr + ok.stdout);
 

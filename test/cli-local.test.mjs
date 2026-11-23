@@ -437,6 +437,7 @@ test('job: start then wait reports done with exit code 0 and the output tail', (
   assert.equal(started.json.ok, true);
   assert.equal(started.json.name, 'ok');
   assert.equal(started.json.jobDir, join(jobsDir(repo), 'ok'));
+  assert.equal(started.json.cwd, repo.dir, 'start says where the command runs: the top level of the repository that --repo (else the current directory) is in');
   assert.equal(typeof started.json.pid, 'number');
   const waited = cli(repo.dir, ['job', 'wait', 'ok', '--timeout', '30']);
   assertExit(waited, 0, waited.stdout);
@@ -502,14 +503,20 @@ test('job: a failing command is done with its exit code and CLI exit 1', (t) => 
 
 test('job: a job that is still running is exit 0 state running, then done', async (t) => {
   const repo = project();
-  // The job holds until the test drops a release file (or 60 s pass), not for a fixed time: under machine load each CLI
-  // call can take seconds, and a timed job could finish before the "still running" checks below.
+  // The job holds until the test drops a release file (or its folder is gone, or 5 minutes pass), not for a fixed time: under machine load
+  // (load 60-100) each CLI call can take 10 s or more, and a 60 s job could finish before the "still running" checks below. The folder check
+  // ends it once the test's cleanup removed the release file with the folder, so it is never left polling.
   const release = join(repo.dir, 'release-slow');
   t.after(() => { writeFileSync(release, ''); repo.cleanup(); });
-  const hold = "const fs = require('fs'); const end = Date.now() + 60000; "
-    // (no `>` in the program: `job start` also judges the unquoted reading of the command, where a `>` is a redirect and the file guard refuses a redirect it cannot place)
-    + 'const t = setInterval(function () { if (fs.existsSync(process.argv[1]) || end < Date.now()) clearInterval(t); }, 50);';
-  assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', '-e', hold, release]), 0);
+  const hold = "const fs = require('fs'); const end = Date.now() + 300000; "
+    // (argv[2]: a script file's argv[1] is the file itself; no `>` in the program: `job start` also judges the unquoted reading of the command, where a `>` is a redirect and the file guard refuses a redirect it cannot place)
+    + "const t = setInterval(function () { if (fs.existsSync(process.argv[2]) || !fs.existsSync(require('path').dirname(process.argv[2])) || end < Date.now()) clearInterval(t); }, 50);";
+  // The program is a file, not a `node -e <program>` argument: `job start` judges the quoted line and the unquoted one, and the unquoted one splits a program into one
+  // word per token, each probed on disk as a possible script (about 160 ms here for this program against 2 ms for the short line, many times that on a slow Windows runner),
+  // so a long program ran into the guard's 5 s check deadline and was refused (#614).
+  const holdFile = join(repo.dir, 'hold.cjs');
+  writeFileSync(holdFile, hold);
+  assertExit(cli(repo.dir, ['job', 'start', 'slow', '--', 'node', holdFile, release]), 0);
   const early = cli(repo.dir, ['job', 'read', 'slow']);
   assertExit(early, 0);
   assert.equal(early.json.state, 'running');

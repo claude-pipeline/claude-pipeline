@@ -7,6 +7,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { cpuTime } from './helpers/timing.mjs';
 
 const HOME = '/home/u';
 const BASE = { home: HOME, env: {}, platform: 'linux', cwd: HOME, realpath: (p) => p, existsSync: () => false, readText: () => null };
@@ -99,13 +100,13 @@ describe('R19-F1: a relative cd in a loop / function narrows unless it climbs (`
   ]);
 });
 
-describe('R19-F2: a double-quoted argument never vanishes', () => {
+describe('R19-F2: a double-quoted argument never vanishes (but "$@" does, #383)', () => {
   allows('F2', [
     ['"$PYTHON" "$SCRIPT"; rm -f out.tmp', '"$PYTHON" "$SCRIPT"; rm -f out.tmp'],
     ['$RUNNER "$f"; rm -f out.tmp', '$RUNNER "$f"; rm -f out.tmp'],
-    ['$RUNNER "$@"; rm -f out.tmp', '$RUNNER "$@"; rm -f out.tmp'],
   ]);
   denies('F2', [
+    ['$RUNNER "$@" (a quoted "$@" expands to no word with no parameters, #383)', '$RUNNER "$@"; rm -f out.tmp'],
     ['$D $EMPTY (unquoted)', '$D $EMPTY; rm -f settings.json'],
     ['"$D" $EMPTY (the argument is unquoted)', '"$D" $EMPTY; rm -f settings.json'],
     ['$D *.nomatch (a glob)', '$D *.nomatch; rm -f settings.json'],
@@ -154,7 +155,6 @@ describe('R21: ~/.zshenv sees a CDPATH learned from a sourced file', () => {
 
 // ---- CI (Windows H2): a command word longer than any directory name is not read as an AUTO_CD directory (that made the line be judged again in every assumed directory) ----
 describe('#288 CI H2: a very long lone command word is not an AUTO_CD directory', () => {
-  const cpu = () => { const u = process.cpuUsage(); return (u.user + u.system) / 1000; };
   const LIMIT = 200_000;
   const fill = (u) => u.repeat(Math.ceil(LIMIT / u.length)).slice(0, LIMIT);
   test('a lone run-time word over PATH_MAX does not make the directory unknown; a short one still does', () => {
@@ -167,10 +167,8 @@ describe('#288 CI H2: a very long lone command word is not an AUTO_CD directory'
   });
   for (const [name, unit] of [['backslashes', '\\'], ['backticks', '`'], ['dollar-brace', '${'], ['nested name-subscripts', 'a[']]) {
     test(`a 200 kB line of ${name} costs about one pass, not one per assumed directory`, () => {
-      const t0 = cpu();
-      run(fill(unit), PROJ);
-      const ms = cpu() - t0;
-      assert.ok(ms < 1500, `${Math.round(ms)} ms of CPU`); // (main: ~0.2-0.6 s locally; one pass per assumed directory took 2-3.5 s)
+      const ms = cpuTime(() => run(fill(unit), PROJ));
+      assert.ok(ms < 2500, `${Math.round(ms)} ms of CPU`); // (main: ~0.2-0.6 s locally, ~4x on a Windows runner: the 2500 ms of test/guard-t8b.test.mjs; one pass per assumed directory took 2-3.5 s locally, #393)
     });
   }
 });

@@ -3,6 +3,7 @@
 // so argv building, output validation, failure classification and finding ids are pure and unit-tested.
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
+import { CODEX_MODEL_MAX, CODEX_MODEL_RE, isCodexModelId } from './codex-model-id.mjs';
 
 export const FINDINGS_SCHEMA_PATH = fileURLToPath(new URL('../schemas/codex-findings.schema.json', import.meta.url));
 
@@ -12,8 +13,34 @@ export const CATEGORIES = [
   'performance', 'maintainability', 'testing', 'design', 'docs', 'other',
 ];
 
+// Spelling variants of ONE canonical category (#475): an alias only ever names the same category in another spelling (never a different one, and never a move out of the
+// security class). Case, spaces and underscores are folded first (`Data Integrity` is `data-integrity`, `data loss` is `data-loss`); the keys here are the folded forms.
+export const CATEGORY_ALIASES = Object.freeze({
+  test: 'testing', tests: 'testing', doc: 'docs', documentation: 'docs', perf: 'performance', 'broken-behavior': 'broken-behaviour',
+});
+const foldCategory = (c) => c.trim().toLowerCase().replace(/[\s_]+/g, '-');
+// -> { json: a copy whose findings carry canonical categories, mapped: [{where, from, to}] }. An unknown category stays as written (validateFindings refuses it with the list); a non-object is returned as is.
+// `keys`: the lists that hold findings (the review answer's three buckets, or the arbiter's `findings`).
+export function normalizeFindingCategories(json, keys = ['blocking', 'suggestions', 'worth_considering']) {
+  if (!isObject(json)) return { json, mapped: [] };
+  const copy = structuredClone(json);
+  const mapped = [];
+  for (const key of keys) {
+    if (!Array.isArray(copy[key])) continue;
+    copy[key].forEach((f, i) => {
+      if (!isObject(f) || typeof f.category !== 'string') return;
+      const folded = foldCategory(f.category);
+      const to = CATEGORIES.includes(folded) ? folded : Object.hasOwn(CATEGORY_ALIASES, folded) ? CATEGORY_ALIASES[folded] : undefined;
+      if (to === undefined || to === f.category) return;
+      mapped.push({ where: `${key}[${i}]`, from: f.category, to });
+      f.category = to;
+    });
+  }
+  return { json: copy, mapped };
+}
+export const categoryNotes = (mapped) => mapped.map((m) => `${m.where}: category ${JSON.stringify(m.from)} read as ${JSON.stringify(m.to)}`);
+
 const EFFORTS = ['low', 'medium', 'high', 'xhigh'];
-const MODEL_RE = /^[A-Za-z0-9._-]+$/;
 const BODY_LIMIT = 2000;
 const RULING_LIMIT = 40;
 const SENSITIVE_LIMIT = 30;
@@ -39,12 +66,13 @@ const clip = (s, n) => (s.length > n ? `${s.slice(0, n - 1)}…` : s);
 // model and effort are spliced into TOML values (-c key="value"), so reject anything that could escape the quotes.
 export function buildCodexArgs({ cwd, model, effort, schemaPath, outPath }) {
   if (!EFFORTS.includes(effort)) throw new Error(`invalid effort ${JSON.stringify(effort)}: expected one of ${EFFORTS.join('|')}`);
-  if (typeof model !== 'string' || !MODEL_RE.test(model)) throw new Error(`invalid model ${JSON.stringify(model)}: expected ${MODEL_RE}`);
+  if (!isCodexModelId(model)) throw new Error(`invalid model ${JSON.stringify(model)}: expected ${CODEX_MODEL_RE}, at most ${CODEX_MODEL_MAX} characters`);
   for (const [name, value] of [['cwd', cwd], ['schemaPath', schemaPath], ['outPath', outPath]]) {
     if (!nonEmptyString(value)) throw new Error(`${name} is required`);
   }
   return [
     'exec', '--sandbox', 'read-only', '--color', 'never', '--skip-git-repo-check',
+    '--json', // stdout becomes JSONL events: the only thing classifyCodexFailure reads
     '-C', cwd, '-o', outPath, '--output-schema', schemaPath,
     '-c', `model="${model}"`, '-c', `model_reasoning_effort="${effort}"`,
     '-', // prompt arrives on stdin
@@ -130,6 +158,22 @@ export function resolutionBaseNote(resolution) {
   ];
 }
 
+// review.regression_only_paths of the TRUSTED default-branch config, for a Fable-lane round and the files it touches (owner-committed, so plain text). `regressionOnly` = { globs, forkPoint } or
+// null/empty: then nothing is added, so an ordinary prompt is byte-identical. The reviewer KEEPS the bucket and category it would give and only SAYS, in its reasoning, whether the problem is the same
+// on the merge base or a regression: the arbiter alone applies the bar (a reviewer that downgraded a finding here would hide it from the Rulings block and the filing gate).
+export function regressionOnlyLines(regressionOnly) {
+  const globs = (Array.isArray(regressionOnly?.globs) ? regressionOnly.globs : []).map(oneLine).filter(Boolean);
+  if (globs.length === 0) return [];
+  assertRev('regressionOnly.forkPoint', regressionOnly.forkPoint);
+  return [
+    '',
+    '## Regression-only bar',
+    `The repository owner reviews the paths below by whether this PR makes things WORSE than the merge base (\`${regressionOnly.forkPoint}\`). For each finding on a file matching them, read that file at the merge base (\`git show ${regressionOnly.forkPoint}:<path>\`) and say in your reasoning either "same on base" (the same weakness is already there, unchanged) or "regression" (this PR adds or worsens it). A file this PR adds or renames has no merge-base version: say "regression".`,
+    'Do NOT change the bucket or category because a finding is the same on base: report it as you otherwise would. A later reviewer decides what to do with it. Every other file is reviewed as above.',
+    `Paths: ${globs.join(', ')}`,
+  ];
+}
+
 // rulesRef: where the project rules are read from. Defaults to base, but the caller should pass the PR's merge base: a
 // later round's base already contains the PR's own edits.
 // baseKind 'synthetic': base is a tree id (the last reviewed head plus the base branch merged in), so the range excludes the base
@@ -143,7 +187,7 @@ export function resolutionBaseNote(resolution) {
 // brief naming them (at most SENSITIVE_LIMIT, as data in a fence: a file name is chosen by the change author).
 // confirmFixed: [{ id, title, file, detail }] of accepted items marked implemented through other files (state.mjs addRound documents
 // round.confirmFixed); the prompt asks whether each is really fixed ("## Confirm fixed", data in fences). Nothing is added when empty.
-export function buildReviewPrompt({ pr, title, body, base, head, risk, round, lightLane, priorRulings = [], rulesRef = base, largeBinaries = [], baseKind, sensitivePaths = [], resolution, confirmFixed = [] }) {
+export function buildReviewPrompt({ pr, title, body, base, head, risk, round, lightLane, priorRulings = [], rulesRef = base, largeBinaries = [], baseKind, sensitivePaths = [], resolution, confirmFixed = [], threatModels = [], regressionOnly = null }) {
   assertRev('base', base);
   assertRev('rulesRef', rulesRef);
   assertRev('head', head);
@@ -187,6 +231,17 @@ export function buildReviewPrompt({ pr, title, body, base, head, risk, round, li
       ...fenced('sensitive paths', [...shown, ...(sensitive.length > shown.length ? [`(+${sensitive.length - shown.length} more)`] : [])].join('\n')),
     );
   }
+  // review.threat_models of the TRUSTED default-branch config for the paths this round touches (owner-committed, so plain text): absent when there are none, so an ordinary prompt is byte-identical.
+  const models = (Array.isArray(threatModels) ? threatModels : []).filter((m) => typeof m?.name === 'string' && Array.isArray(m.paths) && typeof m.text === 'string');
+  if (models.length > 0) {
+    lines.push(
+      '',
+      '## Threat model',
+      "The repository owner's threat model for the paths below. For a file matching a model's paths, attack only within that model: a security construction outside it is at most a SUGGESTION, never BLOCKING. Bugs, broken behaviour, data loss, data integrity, auth and permissions stay BLOCKING whatever the model says, and every other file is reviewed as above. A file matching several models: judge it against the union.",
+    );
+    for (const m of models) lines.push('', `Model ${oneLine(m.name)} (paths: ${m.paths.map(oneLine).join(', ')}):`, String(m.text).trim());
+  }
+  lines.push(...regressionOnlyLines(regressionOnly));
   if (resolving) lines.push(...resolutionSection(resolution, { base, head }));
   lines.push(
     '',
@@ -200,7 +255,7 @@ export function buildReviewPrompt({ pr, title, body, base, head, risk, round, li
     '- SUGGESTIONS: clear improvements',
     '- WORTH CONSIDERING: ideas, trade-offs, future work',
     '',
-    'Every finding needs: file (repository-relative path), line (0 if not line-specific), category, detail (what is wrong, concretely), reasoning (why it matters and how you know), and testable (true if a unit or integration test could prove or disprove it).',
+    'Every finding needs: file (repository-relative path), line (0 if not line-specific), category, detail (what is wrong, concretely), reasoning (why it matters and how you know), and testable (true if a unit or integration test could prove or disprove it). A finding in the testing category must name the concrete failure that no existing test would catch.',
     'Do not pad. Empty buckets are fine, and so is an empty review when you find nothing.',
     'Answer with JSON only, matching the provided output schema (summary, blocking, suggestions, worth_considering).',
   );
@@ -246,7 +301,8 @@ export const SECOND_REVIEW_SCHEMA_PATH = fileURLToPath(new URL('../schemas/secon
 // The packet for `pipeline triage second-review`: BLIND by construction. It carries the original finding and the evidence the CLI itself recorded
 // (a test it ran), nothing a judge, the arbiter or Claude concluded about it: the caller passes only those fields, and the item's `final`, `judge`,
 // `arbiter` and `secondReview` never reach this function. Every text the finding or the PR author wrote is fenced as untrusted data.
-export function buildSecondReviewPrompt({ pr, title, risk, head, items }) {
+// regressionOnly: { globs, forkPoint } for a Fable-lane round with a finding on a matched file (see regressionOnlyLines), else null: the packet is then byte-identical.
+export function buildSecondReviewPrompt({ pr, title, risk, head, items, regressionOnly = null }) {
   assertRev('head', head);
   if (!isPositiveInt(pr)) throw new Error(`invalid pr ${JSON.stringify(pr)}: expected a positive integer`);
   if (!Array.isArray(items) || items.length === 0) throw new Error('items: expected at least one finding');
@@ -286,6 +342,7 @@ export function buildSecondReviewPrompt({ pr, title, risk, head, items }) {
     }
   }
   lines.push(
+    ...regressionOnlyLines(regressionOnly),
     '',
     '## How to answer',
     'For EACH finding above, exactly once, give:',
@@ -360,15 +417,176 @@ const AUTH_RE = /not logged in|unauthori[sz]ed|codex login|authentication failed
 const NETWORK_RE = /could not resolve host|network error|network is unreachable|econnreset|etimedout|service unavailable|\b502 bad gateway\b|\b(?:status|http|code|error)\W{0,4}(?:502|503)\b/;
 const MISSING_COMMAND_RE = /command not found|is not recognized as an internal or external command/;
 
-// Every non-success outcome maps to one of four failure kinds; none of them can be mistaken for "no findings".
+// A Codex thread id / session id as it appears in a rollout file name; checked before it is used in a path.
+export const THREAD_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+// `codex exec --json` prints one JSON event per stdout line. Only a whole line that parses to an object with a string `type` is an
+// event: a half line (output cut off), plain text, or JSON text sitting inside some event's string (an item's command output) is not.
+export function parseCodexEvents(stdout) {
+  const events = [];
+  for (const line of String(stdout ?? '').split('\n')) {
+    const text = line.trim();
+    if (!text.startsWith('{')) continue;
+    try {
+      const e = JSON.parse(text);
+      if (e && typeof e === 'object' && !Array.isArray(e) && typeof e.type === 'string') events.push(e);
+    } catch { /* not a whole JSON line */ }
+  }
+  return events;
+}
+
+const messageOf = (v) => (typeof v === 'string' && v.trim() !== '' ? v : null);
+
+// What Codex itself said about a failed run, from its own events: the LAST `turn.failed` message (the verdict), every top-level `error`
+// event message (transient "Reconnecting... n/5" lines included), and the thread id. item.* events are what the model and its tools
+// printed, so they are never read here.
+export function readCodexVerdict(stdout) {
+  let turnFailed = null;
+  let threadId = null;
+  const errors = [];
+  for (const e of parseCodexEvents(stdout)) {
+    if (e.type === 'thread.started' && threadId === null && typeof e.thread_id === 'string' && THREAD_ID_RE.test(e.thread_id)) threadId = e.thread_id;
+    else if (e.type === 'turn.failed') turnFailed = messageOf(e.error?.message) ?? '';
+    else if (e.type === 'error') {
+      const m = messageOf(e.message);
+      if (m) errors.push(m);
+    }
+  }
+  return { turnFailed, errors, threadId };
+}
+
+// A refused model: Codex/OpenAI answered 400 (or 404) with a typed `model_not_found` error. The turn.failed message is that error's JSON, sometimes behind a prefix
+// ("unexpected status 404 Not Found: {...}"): the text from the first "{" is parsed, and only the structured `error.code` (or a top-level `code`) counts, never words. A status,
+// when the body carries one, must be 400 or 404. -> { code: 'model_not_found', status: number|null, model: the quoted name the error text gives or null, text } or null.
+// `model` is for BINDING only (does the refusal name the model this run asked for?): it comes from the provider's message, so it is never shown or recorded as a fact (R3-9).
+export function parseModelNotFound(message) {
+  if (typeof message !== 'string') return null;
+  const raw = message.trim();
+  const from = raw.startsWith('{') ? 0 : raw.indexOf('{');
+  if (from < 0) return null;
+  let body;
+  try { body = JSON.parse(raw.slice(from)); } catch { return null; }
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return null;
+  const inner = body.error && typeof body.error === 'object' && !Array.isArray(body.error) ? body.error : null;
+  if ((inner?.code ?? body.code) !== 'model_not_found') return null;
+  const status = body.status ?? inner?.status;
+  if (status !== undefined && status !== null && status !== 400 && status !== 404) return null;
+  const text = typeof (inner?.message ?? body.message) === 'string' ? (inner?.message ?? body.message) : '';
+  const named = /'([A-Za-z0-9._-]{1,100})'/.exec(text);
+  return { code: 'model_not_found', status: typeof status === 'number' ? status : null, model: named ? named[1] : null, text: clip(oneLine(text), 300) };
+}
+
+// Every non-success outcome maps to one of five failure kinds; none of them can be mistaken for "no findings".
 // Order matters: a 429 body often also mentions auth or the network, and quota must win.
-export function classifyCodexFailure({ code, stderr = '', stdout = '', timedOut = false, spawnError } = {}) {
-  const text = `${stderr}\n${stdout}\n${spawnError?.message ?? ''}`.toLowerCase();
-  if (spawnError?.code === 'ENOENT' || code === 127 || MISSING_COMMAND_RE.test(text) || timedOut) return 'unavailable';
-  if (QUOTA_RE.test(text)) return 'quota';
-  if (AUTH_RE.test(text)) return 'auth';
-  if (NETWORK_RE.test(text)) return 'unavailable';
-  return 'error';
+// `quota` needs ALL of: a non-zero exit, no timeout, no kill by a signal, and a LAST `turn.failed` event whose message is Codex's usage-limit
+// wording. stderr (Codex's tracing, or a shell's complaint) is read only for a missing binary; the other kinds read the same structured
+// `model` needs the same (non-zero exit, no timeout, no signal) and a LAST `turn.failed` that parseModelNotFound reads as a refused model; quota still wins first.
+// messages. -> {reason, message (the turn.failed message or null), threadId}.
+export function analyzeCodexFailure({ code, signal = null, stderr = '', stdout = '', timedOut = false, spawnError } = {}) {
+  const { turnFailed, errors, threadId } = readCodexVerdict(stdout);
+  const out = (reason) => ({ reason, message: turnFailed || null, threadId });
+  const shellText = `${stderr}\n${spawnError?.message ?? ''}`.toLowerCase();
+  if (spawnError?.code === 'ENOENT' || code === 127 || MISSING_COMMAND_RE.test(shellText) || timedOut) return out('unavailable');
+  if (typeof code === 'number' && code !== 0 && !signal && turnFailed && QUOTA_RE.test(turnFailed.toLowerCase())) return out('quota');
+  if (typeof code === 'number' && code !== 0 && !signal && turnFailed && parseModelNotFound(turnFailed) !== null) return out('model');
+  const text = [turnFailed ?? '', ...errors].join('\n').toLowerCase();
+  if (AUTH_RE.test(text)) return out('auth');
+  if (NETWORK_RE.test(text)) return out('unavailable');
+  return out('error');
+}
+
+// Codex says the model is overloaded: a non-zero exit, no timeout, no kill by a signal, and a LAST `turn.failed` event whose message is Codex's own
+// capacity wording ("Selected model is at capacity...", or its typed `server_overloaded`). Never stderr, never item.* or top-level error events (the model
+// and its tools can print that text). Such a failure is worth one retry; it keeps its ordinary classification (analyzeCodexFailure) if the retry fails too.
+const CAPACITY_RE = /selected model is at capacity|server[_ ]overloaded/i;
+export function isCapacityFailure({ code, signal = null, stdout = '', timedOut = false } = {}) {
+  if (typeof code !== 'number' || code === 0 || signal || timedOut) return false;
+  const { turnFailed } = readCodexVerdict(stdout);
+  return turnFailed !== null && CAPACITY_RE.test(turnFailed);
+}
+
+// -> 'quota' | 'model' | 'auth' | 'unavailable' | 'error' (analyzeCodexFailure also returns the turn.failed message and the thread id).
+export function classifyCodexFailure(input = {}) {
+  return analyzeCodexFailure(input).reason;
+}
+
+// ---------- quota reset time ----------
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+const dtfCache = new Map();
+function wallParts(ms, timeZone) {
+  const key = timeZone ?? '';
+  let dtf = dtfCache.get(key);
+  if (!dtf) {
+    dtf = new Intl.DateTimeFormat('en-US', { timeZone, hourCycle: 'h23', year: 'numeric', month: 'numeric', day: 'numeric', hour: 'numeric', minute: 'numeric', second: 'numeric' });
+    dtfCache.set(key, dtf);
+  }
+  const p = {};
+  for (const { type, value } of dtf.formatToParts(new Date(ms))) if (type !== 'literal') p[type] = Number(value);
+  return p;
+}
+// The zone's UTC offset at an instant: its wall clock read as if it were UTC, minus the instant.
+const offsetAt = (ms, timeZone) => {
+  const whole = ms - (((ms % 1000) + 1000) % 1000);
+  const w = wallParts(whole, timeZone);
+  return Date.UTC(w.year, w.month - 1, w.day, w.hour, w.minute, w.second) - whole;
+};
+
+// The instants (0, 1 or 2) at which the wall clock in `timeZone` reads y-m-d h:min. None = a time a spring-forward skipped; two = a time a
+// fall-back repeats.
+function instantsOf(y, mo, d, h, min, timeZone) {
+  const asUtc = Date.UTC(y, mo - 1, d, h, min, 0);
+  const found = new Set();
+  for (const guessOffset of [offsetAt(asUtc - DAY_MS, timeZone), offsetAt(asUtc + DAY_MS, timeZone)]) {
+    const t = asUtc - guessOffset;
+    const w = wallParts(t, timeZone);
+    if (w.year === y && w.month === mo && w.day === d && w.hour === h && w.minute === min) found.add(t);
+  }
+  return [...found].sort((a, b) => a - b);
+}
+
+// Codex's usage-limit message says when to come back. Forms: "try again at 4:21 PM", "at 16:21", "in 37 minutes", "in 2 hours",
+// "after 2026-11-11T08:21:00Z". A clock time is the next time it comes round within 24 h in `timeZone` (default: this machine's); one that
+// a daylight-saving change skips or repeats is ambiguous, so it gives no resetAt. -> {resetAt: ISO | null, resetText: matched words | null}.
+export function parseQuotaReset(message, { now = Date.now(), timeZone } = {}) {
+  const text = String(message ?? '');
+  const nowMs = now instanceof Date ? now.getTime() : Number(now);
+  const none = { resetAt: null, resetText: null };
+  if (!Number.isFinite(nowMs)) return none;
+
+  const iso = /\bafter (\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:Z|[+-]\d{2}:?\d{2}))/i.exec(text);
+  if (iso) {
+    const ms = Date.parse(iso[1]);
+    return { resetAt: Number.isFinite(ms) ? new Date(ms).toISOString() : null, resetText: iso[0] };
+  }
+
+  const rel = /\bin (?=\d)(?:(\d{1,3}) hours?)?(?:\s*(?:and\s+)?(\d{1,4}) minutes?)?(?!\w)/i.exec(text);
+  if (rel && (rel[1] !== undefined || rel[2] !== undefined)) {
+    const ms = nowMs + (Number(rel[1] ?? 0) * 60 + Number(rel[2] ?? 0)) * 60 * 1000;
+    return { resetAt: new Date(ms).toISOString(), resetText: rel[0].trim() };
+  }
+
+  const clock = /\bat (\d{1,2}):(\d{2})(?:\s*([ap])(?:\.m\.|m))?(?![\w:])/i.exec(text);
+  if (!clock) return none;
+  const resetText = clock[0];
+  let hour = Number(clock[1]);
+  const minute = Number(clock[2]);
+  const meridiem = clock[3]?.toLowerCase();
+  if (minute > 59 || (meridiem ? hour < 1 || hour > 12 : hour > 23)) return { resetAt: null, resetText };
+  if (meridiem) hour = (hour % 12) + (meridiem === 'p' ? 12 : 0);
+
+  let tz;
+  let today;
+  try {
+    tz = timeZone ?? new Intl.DateTimeFormat().resolvedOptions().timeZone;
+    today = wallParts(nowMs, tz);
+  } catch { return { resetAt: null, resetText }; }
+  // Today's occurrence if that wall time is still ahead, otherwise tomorrow's.
+  const tomorrow = hour * 60 + minute <= today.hour * 60 + today.minute;
+  const day = new Date(Date.UTC(today.year, today.month - 1, today.day + (tomorrow ? 1 : 0)));
+  const at = instantsOf(day.getUTCFullYear(), day.getUTCMonth() + 1, day.getUTCDate(), hour, minute, tz);
+  if (at.length !== 1 || at[0] <= nowMs || at[0] - nowMs > DAY_MS) return { resetAt: null, resetText };
+  return { resetAt: new Date(at[0]).toISOString(), resetText };
 }
 
 // ---------- ids and fingerprints ----------

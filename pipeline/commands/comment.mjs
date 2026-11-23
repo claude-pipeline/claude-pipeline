@@ -9,7 +9,8 @@ import { loadConfig, DEFAULTS } from '../lib/config.mjs';
 import { loadState } from '../lib/state.mjs';
 import { MARKERS, summarySections, needsHumanComment, blockedComment, blockedReasonComment, awaitingReviewComment } from '../lib/render.mjs';
 import { recordForOutcome } from '../lib/run-record.mjs';
-import { readSummaryComment, writeSummaryComment } from '../lib/summary-comment.mjs';
+import { writeRunRecord } from '../lib/run-progress.mjs';
+import { readSummaryComment } from '../lib/summary-comment.mjs';
 import { createGitHub, commandCwd, guardGh, requireRepoRoot } from '../lib/github.mjs';
 import { parkStatusLines } from '../lib/round-status.mjs';
 import { allItems, readModelProofs, withReviewLock } from '../lib/review-context.mjs';
@@ -21,7 +22,7 @@ export const meta = {
     'pipeline comment --pr N --kind triage|summary|needs-human|blocked|awaiting-review [--outcome O] [--built TEXT] [--reason TEXT] [--hits-file F] [--repo DIR]',
     '  --kind triage publishes the review state under the review lock as a compare-and-swap on its content (lib/review-publish.mjs): it is refused',
     '  (exit 1 {ok:false, error:\'stale-publication\', reason}) when the PR holds a state this copy neither published nor restored: run `pipeline state show --pr N`',
-    '  and redo the decision; {action:\'unchanged\'} when the PR already holds exactly this state. The other kinds take no lock.',
+    '  and redo the decision; and (exit 1 {ok:false, error:\'newer-format\', reason}, before any write) when the PR\'s triage comment holds a state of a NEWER version than this install reads: run `pipeline update` first; {action:\'unchanged\'} when the PR already holds exactly this state. The other kinds take no lock.',
     '  --kind blocked renders the verify report\'s failure; with --reason TEXT it renders a "the review stopped: TEXT" comment instead (no report needed), e.g. the advice of a stop that waits for a terminal restart.',
     '  --kind needs-human adds, when a review state with at least one round exists for this PR, a short status block under the paragraph: rounds, booked cost (with the last round\'s share),',
     '  open items with their severity and why the review is not clean (the extra-round ask\'s text without its recommendation). Display only: a part that cannot be read becomes a "not available" line; the comment is always written.',
@@ -76,8 +77,9 @@ function summaryKind(gh, pr, sections, outcome) {
     repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
     outcome, host: hostname(), now: Date.now(),
   });
-  const r = writeSummaryComment(gh, pr, { record, sections, existing });
-  return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: record.step, warnings } };
+  const r = writeRunRecord(gh, pr, { record, sections, firstRead: existing, retry: true });
+  for (const w of r.warnings) if (!warnings.includes(w)) warnings.push(w);
+  return { exitCode: EXIT.OK, output: { ok: true, kind: 'summary', pr, action: r.action, url: r.url, id: r.id, step: r.record.step, warnings } };
 }
 
 // true only when GitHub says the PR is a ready (non-draft) PR; a failed read, or any other answer, is false.
@@ -169,7 +171,7 @@ export const run = guarded(async (argv, ctx) => {
   }
   return guardGh(() => {
     if (kind === 'summary') return summaryKind(gh, pr, body, values.outcome);
-    const r = gh.upsertComment(pr, MARKER_OF[kind], body);
+    const r = gh.upsertComment(pr, MARKER_OF[kind], body, { retry: true });
     return { exitCode: EXIT.OK, output: { ok: true, kind, pr, action: r.action, url: r.url, id: r.id } };
   });
 });

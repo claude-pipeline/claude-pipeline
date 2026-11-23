@@ -12,6 +12,10 @@ test('isClaudeCodeProcess: the claude binary by any path, or a JS runtime runnin
   assert.equal(isClaudeCodeProcess({ comm: 'node', args: 'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js --resume' }), true);
   assert.equal(isClaudeCodeProcess({ comm: '/usr/local/bin/node', args: '/usr/local/bin/node /home/u/.claude/local/claude' }), true);
   assert.equal(isClaudeCodeProcess({ comm: 'bun', args: 'bun /x/claude-code/cli.js' }), true);
+  // Node 24 on Linux: ps comm is MainThread, so a Claude Code parent was missed (CI Node 24 failure).
+  assert.equal(isClaudeCodeProcess({ comm: 'MainThread', args: 'node /usr/lib/node_modules/@anthropic-ai/claude-code/cli.js' }), true);
+  assert.equal(isClaudeCodeProcess({ comm: 'MainThread', args: 'node scripts/test.mjs' }), false);
+  assert.equal(isClaudeCodeProcess({ comm: 'MainThread' }), false);
   // A background job's processes rename themselves (`claude bg-spare`, `claude bg-pty-host`).
   for (const comm of ['claude bg-spare', 'claude bg-pty-host', '/Users/u/.local/bin/claude bg-spare']) assert.equal(isClaudeCodeProcess({ comm }), true, comm);
   for (const info of [{ comm: 'Claude' }, { comm: 'claude-helper' }, { comm: 'claude bg' }, { comm: 'claude bg-' }, { comm: 'claude bg-spare x' }, { comm: 'claude foo' }, { comm: 'Claude bg-spare' }, { comm: 'node', args: 'node scripts/test.mjs' }, { comm: 'zsh' }, { comm: 'node' }, null, {}]) {
@@ -344,7 +348,8 @@ test('win32: an injected lookup wins over table (the table is never queried); no
 });
 
 test('processTable on a real Windows host lists this process with its parent and creation time', { skip: process.platform !== 'win32' }, () => {
-  const t = processTable();
+  // #348: on a busy shared runner the one PowerShell query can hit its 12 s timeout (read as null, which production answers with the per-hop fallback). Retry once; a table that IS read is asserted in full.
+  const t = processTable() ?? processTable();
   assert.ok(t instanceof Map, 'the table could be read');
   const me = t.get(process.pid);
   assert.ok(me, 'this process is in the table');
@@ -359,7 +364,8 @@ test('processTable and realLookup on a real Windows host return a CJK command-li
   const child = spawnChild(process.execPath, ['-e', 'setTimeout(()=>{},30000)', cjk], { windowsHide: true, stdio: 'ignore' });
   t.after(() => { child.kill(); });
   assert.ok(Number.isInteger(child.pid), 'the child started');
-  const row = processTable()?.get(child.pid);
+  // #348: same one retry as the test above (a busy runner can time the one PowerShell query out).
+  const row = (processTable() ?? processTable())?.get(child.pid);
   assert.ok(row, 'the child is in the process table');
   assert.ok(row.args.includes(cjk), `processTable args=${JSON.stringify(row.args)}`);
   const one = realLookup(child.pid);

@@ -31,11 +31,14 @@ export const low = (over = {}) => ({
 export const findingsOf = (blocking = [], suggestions = [], worth = []) => ({ summary: 'Reviewed.', blocking, suggestions, worth_considering: worth });
 export const uniqueSlug = () => `acme/widgets-${randomUUID()}`;
 
+// Every effort the config can pick is `high`, so the helpers' `--effort high` is always the configured one (the effort rule: test/cli-codex-review-effort.test.mjs);
+// a review block that sets `effort:` itself replaces it.
+const EFFORT_HIGH = '  effort: {low: high, medium: high, high: high, followup: high, small_fix: high}\n';
 // opts.review: extra lines for the `review:` block of pipeline.yml (after max_rounds); opts.yml: extra top-level lines; opts.comments: PR comments the fake holds at the start.
 export function roundWorld(t, { max = 1, review = '', yml = '', comments = [], slug = uniqueSlug(), mode = 'chat' } = {}) {
-  const repo = createTmpRepo();
+  const repo = createTmpRepo({ highEffort: true });
   t.after(() => repo.cleanup());
-  const ymlOf = (more = {}) => `${pipelineYml()}review:\n  max_rounds: ${max}\n${more.review ?? review}${more.yml ?? yml}${mode === 'chat' ? 'owner_approval: chat\n' : ''}`;
+  const ymlOf = (more = {}) => `${pipelineYml()}review:\n  max_rounds: ${max}\n${(more.review ?? review).includes('  effort:') ? '' : EFFORT_HIGH}${more.review ?? review}${more.yml ?? yml}${mode === 'chat' ? 'owner_approval: chat\n' : ''}`;
   repo.write('.claude/pipeline.yml', ymlOf());
   repo.write('.gitignore', '.review/\n');
   repo.write('src/a.js', aFile(false));
@@ -61,7 +64,8 @@ export function roundWorld(t, { max = 1, review = '', yml = '', comments = [], s
   const w = {
     repo, base, head, scratch, slug, fake, issueUrl,
     cli(args, env = {}) {
-      const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, ...floorEnv(), ...env };
+      // A private usage ledger per world: a run without the test runner's mark (`node test/x.test.mjs`) never reaches the account's real one.
+      const merged = { ...process.env, ...fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: lockDir, PIPELINE_CODEX_USAGE_FILE: join(scratch, 'codex-usage.jsonl'), ...floorEnv(), ...env };
       for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_TEST_MODE', 'FAKE_CODEX_OUTPUT']) if (!(k in env)) delete merged[k];
       const r = spawnSync(process.execPath, [bin, ...args], { cwd: repo.dir, env: merged, encoding: 'utf8' });
       let json = null;

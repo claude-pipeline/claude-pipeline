@@ -17,11 +17,11 @@ Into `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 | Piece | What it does |
 |---|---|
 | skills `review`, `verify`, `pipeline-setup` | the process: review builds the change and runs the cross-model review, then asks you to merge; verify runs the quick check; pipeline-setup onboards a repo |
-| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
+| agents `implementer`, `verifier` (Sonnet), `judge` (Opus), `substitute-opus` / `substitute-fable` (read-only stand-ins for Codex on a round it could not review: `pipeline substitute`), `arbiter` and `arbiter-fix` (Fable; `arbiter-fix` is the lower-effort variant `arbiter needed` picks for a fix round) | the judgment; models are pinned in the agent files and proven from transcripts |
 | `pipeline/bin/pipeline.mjs` | one zero-dependency Node CLI that makes every deterministic decision (hard-stops, final gate, merge) |
 | hook `guard-git` (matcher `Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks pushes/force-pushes to `main`, admin merges, protection edits, approval-label changes, whether typed in a shell, a `Monitor` command, a script file or an MCP tool call |
 | hook `guard-files` (matcher `Edit\|Write\|MultiEdit\|NotebookEdit\|Bash\|PowerShell\|Monitor\|mcp__.*`) | blocks agents editing the pipeline's own files and settings — **installed last**, after the proofs |
-| hook `owner-go` (UserPromptSubmit) | records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
+| hook `owner-go` (UserPromptSubmit; PostToolUse on `AskUserQuestion`) | records your click on a merge / extra-round / ruling dialog the pipeline issued (`--ask`; only a human click Claude Code stamps as yours counts, see docs/cli.md `owner-go`), and records your chat "merge" (a prompt that starts with "merge"), your typed ruling when you override one (a ruling request) and your `extra round` (a prompt that starts with `extra round` or `grant round`: one more review round past `review.max_rounds`) against the PR, head and owner items the reply before it showed, so `P merge` and the guards can tell your approval from the agent's word (`owner_approval: chat`, resumed runs); never blocks or changes a prompt |
 | hook `stack-register` (PreToolUse on `Bash` and the write tools `Edit\|Write\|MultiEdit\|NotebookEdit`, 30 s) | records which private Supabase stack a session is about to use, before the tool runs; **fail-closed** like the guards (an unloadable file blocks with exit 2) |
 | hook `stack-dev-bind` (PostToolUse on `Bash`, 10 s) | notes which stack a dev server you started is bound to; non-blocking |
 | hook `update-notice` (SessionStart, 5 s) | prints one line at the start of a session when the automatic update has something to say (see Automatic updates); it only reads a small status file, never touches the network, and never blocks a session; non-blocking |
@@ -53,7 +53,7 @@ ancestry: an agent must not be able to rewrite its own rules). Run it **in your 
 Claude with `PIPELINE_ADMIN=1 claude`.
 
 ```sh
-git clone https://github.com/ianjamila/claude-pipeline ~/Claude/claude-pipeline
+git clone https://github.com/claude-pipeline/claude-pipeline ~/Claude/claude-pipeline
 cd ~/Claude/claude-pipeline
 ./install.sh --skip-file-guard     # macOS / Linux   (Windows: .\install.ps1 --skip-file-guard)
 ./install.sh --check               # drift report only; exit 1 if anything differs; never writes
@@ -354,7 +354,8 @@ head you did not review (the receipt names the head the event carried).
   The stack-stop seams `PIPELINE_DOCKER`, `PIPELINE_PS`, `PIPELINE_LSOF`, `PIPELINE_SUPABASE`, `PIPELINE_STACKS_DEADLINE_MS` and `PIPELINE_INSTALL_WORKER_WAIT_MS` follow a stricter rule: an installed copy ignores them always; in the repo checkout they count only when `PIPELINE_STACKS_HOME` points somewhere other than the default `~/.claude/pipeline-state/stacks` **and** `PIPELINE_STACKS_ONLY` names the projects that isolated run may touch.
 - **What blocks a change to a guard.** A guard change is held back only for (a) allowing on the branch what `main` denies, (b) missing a command an agent would plausibly write unprompted,
   (c) denying an everyday command, or (d) failing open on a timeout for plausible input. A deliberately evasive construction (non-default shell options, a crafted sourced file) is not a merge blocker: it goes
-  to a follow-up issue (#373).
+  to a follow-up issue (#373). A repo can state this as `review.threat_models` (see "Review threat models and the late fix-verify lane"): the arbiter and
+  Codex then judge security findings on the matching paths within that model, and a security finding outside it becomes a follow-up issue, never a merge block.
 - **Your chat "merge" is checked locally.** The owner-go hook records only prompts you type (Claude Code never runs it for
   the model or a subagent), and `P merge` and guard-git trust only those records. But the agent runs as your OS user and with
   your GitHub token: a program the guards cannot see into (a script that builds the record path at run time, a test that
@@ -372,7 +373,7 @@ head you did not review (the receipt names the head the event carried).
   `extra round` alike; no guard names the `claude` CLI yet (see #132 / PR #133).
 - **Branch protection needs GitHub Pro** for private repos. Without it a repo runs in `gate`
   mode (skills and CLI only) and preflight says so.
-- **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area; CI runs the full verify, the
+- **Quick check locally, CI is the full proof.** The agent runs only `verify.quick` on the changed area (in this repo: six fixed test files plus the tests related to the branch's changes, within a time budget, `CP_QUICK_RELATED_BUDGET_MS`); CI runs the full verify, the
   repo's existing checks and the cheap guard jobs (E2E only for high-risk PRs). The owner merges, never the agent.
 - **Verify slots are per machine.** `verify.max_parallel_full` limits full verifies on one computer, not across your machines, and the
   `verify.max_load` check is skipped on Windows (with a warning).
@@ -382,11 +383,13 @@ head you did not review (the receipt names the head the event carried).
 
 ## Project settings and environment
 
+**Substitute review (Codex quota spent).** When Codex stops on its usage limit, or a small fix-check meets the PR's `review.codex_round_budget` (default 6) or the weekly `review.codex_budget.hard` (default 90 %), a read-only Claude agent reviews that round instead: `substitute-opus`, `substitute-fable` once the PR was ever high risk (`review.substitute.mode` auto|off, `min_wait_minutes`, `max_packet_mb`; `review.effort.small_fix`, `small_fix_lines`). Only your typed "merge" accepts such a PR (the `substitute` area; never the gated route, never label mode). A review state that holds one is version 4: run `pipeline update` on every machine before the first substitute round, and finish or park those PRs before rolling the pipeline back (an older CLI cannot read them). `pipeline codex-status` shows the weekly use and the PRs waiting for Codex (`--usage`: where the tokens went); a new session says "Codex is back" once the outage is over.
+
 `.claude/pipeline.yml` is documented in its template (`pipeline/templates/pipeline.yml`). Three keys deserve a
 mention: `owner_approval` (`label` by default; `chat` drops the approval labels: blocking hard-stops and test-integrity
 violations no longer fail CI, the review skill stops before the merge, lists them in a PR comment and merges when you say
 "merge" in chat; the PR ends as `awaiting-owner-merge`), `ci.guard_checks` (default `true`: the `Test integrity` and `Hard-stop scan` statuses are always
-required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.review_check`
+required on top of `ci.required_checks`; `false` only for a repo that does not run `pipeline-guards.yml`), `ci.merge_checks` (optional list: checks your own merge command also requires although branch protection does not; `pipeline ci-wait` waits for them when they report, like required checks, and reports one that never reports as `notOwed`; `protect` ignores them), `ci.review_check`
 (default `false`; `true` makes the guards also post `Cross-model review`, green only when the newest review-complete comment
 names the head's content hash, and every required-check list includes it; turn it on together with branch protection), `ci.draft_while_iterating` (default `false`; `true` makes `pipeline redraft` turn a ready PR back to draft before a fix push, so
 the heavy CI runs once when it is marked ready again; set it only when every heavy required workflow skips drafts, lists
@@ -396,6 +399,30 @@ and `ci.approvers` (logins whose approval labels count; required for org-owned r
 fail closed with `org-repo-needs-ci.approvers`). `pipeline config` prints `warnings` for config that is valid
 but suspicious. Documentation and test files are exempt from the content rules (sensitive terms, SQL, auth) but keep
 one: a real-looking secret key literal (not marked fake inside the key itself) is still a `needs-human` hit there.
+
+### Review threat models and the late fix-verify lane (opt-in)
+
+Six `review` keys. The first three are inert until you set them; `review.post_max_suggestions` defaults to off, while the trip-wire pair is ON by default in chat mode (see below):
+
+| Key | Default | What it does |
+|---|---|---|
+| `review.regression_only_paths` | `[]` | Up to 20 globs (off when empty), each also listed in `risk.high_risk_paths` or `review.arbiter_always_paths` of the same config (a config error otherwise: the Fable lane would never review it). A glob with a wildcard or brace must be listed there verbatim (only a literal path is matched against their globs), a `!` exclusion entry in this list is a config error (list only the paths the bar covers), and an entry a LATER `!` exclusion in its sensitive list fully cancels (the same glob, `**`, or `P/**` above it) is a config error too (it covers no file; a partial exclusion is fine, and each sensitive list is judged on its own). For a PR touching a listed path, the Fable arbiter judges a finding on that file by "is it worse than the merge base?": the same weakness already on the base is ruled FOLLOW-UP with `scope: "same-on-base"` (even a BLOCKING security finding, and only for a file the PR plainly modifies: an added or renamed file, a binary, symlink or submodule entry, one matching two diff entries, or a ruling that cites a line the PR itself adds or no line at all, waits for a human); a regression stays merge-blocking. Codex, the substitute and the second review see the section too but keep the bucket and only say "same on base" or "regression" in their reasoning. The arbiter has no shell, so `arbiter needed` writes the PR's changes to each listed file against the merge base to `regression-base.md` in the round directory (its digest is in the digest-bound input). Every arbiter FOLLOW-UP or REJECT on a listed file is a row of the merge block ("arbiter (same as merge-base)" when the ruling carried the scope, else "arbiter (regression-only path)") and an owner item the owner's "merge" is bound to, and each FOLLOW-UP needs its filed issue before the review completes. Read from the trusted default-branch config; set it only after `pipeline vendor --check` shows the runner knows the key. |
+| `review.threat_models` | `[]` | Up to 10 `{name, paths, text}` (name `/^[a-z0-9-]{1,40}$/`, unique; `paths` non-empty globs; `text` up to 4000 characters). For a PR that touches a matching path, the Fable arbiter's input carries the model, and so does the Codex (or substitute) prompt on a Fable-lane round only (on a judge or light round nothing would route a downgraded finding to an issue or a human). A security finding (category `security`) on a matching file that lies outside the model is ruled FOLLOW-UP with `scope: "out-of-model"`: an issue is filed (the review is not complete until it is) and the merge block lists it ("arbiter (outside threat model NAME)"). It is never a REJECT, and bugs, broken behaviour, data loss, auth and permission problems keep their usual route. |
+| `review.fix_verify_after_round` | `null` (off) | `1..10`: counted rounds past this ordinal may get the narrow `arbiter-fix` brief even on `risk.high_risk_paths` / `review.arbiter_always_paths` files (never past a hard-stop hit other than a P-path, a size driver or a flagged fix scope). |
+| `review.fix_round_max_lines` | `150` | Non-test added lines a late fix round may have, and a new non-test source file, before the round falls back to the full brief. Computed live from the round diff. `pipeline state fix-scope --round R` measures a fix round with the same limit before the push; the review skill asks the owner when it is flagged (own PR / plan first / push as is). |
+| `review.post_max_suggestions` | `review` (off) | `follow-up` or `review`. With `follow-up`, past `review.max_rounds` (counted round > max + 1: the first round past the limit, the automatic extra round or the owner's first grant when there was none, is exempt; later owner-granted rounds are affected) a low-severity SUGGESTION / WORTH CONSIDERING (category performance, maintainability, testing, design, docs or other) that the judge or arbiter ruled ACCEPT becomes a FOLLOW-UP: an issue is filed (the review is not complete until it is), the merge block lists it ("accepted by X in round k past limit m; NOT fixed in this merge; issue #N"), and Claude may tighten it back to ACCEPT with `claude-ruling` (never loosen it). Never a BLOCKING, security or bug item, nor one that fails the `defer-fixes` severity test (a location outside the reviewed diff, a file that also holds an accepted, still-undecided, human-owed or judge-dismissed-but-still-settle-testable BLOCKING or security item (as of the conversion: one accepted in a later round is not caught), a sensitive path in either the working-tree or the trusted config, an unreadable diff), and never the owner's, Claude's or a cached ruling. `review` in any of the working-tree, fork-point or trusted default-branch config (or an unreadable one) keeps it off. |
+| `review.trip_wire_extra_rounds` | `3` | `1..10`: once a PR has reviewed `review.max_rounds` + this many counted rounds, `triage round-request` stops with `trip-wire` and a process review (status, new accepts per round, past-limit share) instead of printing another round line. |
+| `review.trip_wire_not_falling` | `2` | `1..5`: past-limit rounds whose new-ACCEPT count did not fall below the round before (and was above zero) that trip the same stop. The smaller value of the two configs applies. |
+
+Every ask for one more round also carries display-only text: a `nextRound` prediction (what the round would be: base-only, resolution-only or a counted whole-PR round, why the free resolution round was refused, and the no-round alternative of reverting own commits after a clean review), a worded `Recommended: follow up | one more round | stop and park or split` line, and from counted round 6 a `longReview` (the last three rounds' findings and a blocking-loop flag). `codex-review --plan` and `round codex` show `reviewKind` and `resolutionIneligible`; `stats rounds` totals them by kind and by reason; `pipeline summary` adds a soft "Tests added" line. None of it decides anything.
+
+The trip-wire is a prompt, not a gate: it is ON by default in chat mode (every installation gets it on update), the owner answers it, and `triage round-request --after-process-review` prints the usual round line afterwards (still returning `tripWire`); the owner still has to type "extra round". Past-limit rounds have always needed that word, so the wire only adds a look at the whole process first. It uses the existing run-record outcome `blocked` with `detail: process-review`, no new outcome. `review.post_max_suggestions` and a state that carries a post-limit FOLLOW-UP raise the state format to version 6: an older CLI refuses such a state ("update the pipeline") instead of treating the unfiled follow-up as complete. Rollback: finish or re-run review of affected PRs on the new CLI (or `pipeline state discard-round` the rounds) before downgrading, then remove the keys.
+
+Threat models, the regression-only bar and the late lane are read from the TRUSTED config (the default branch's, at the fork point `risk.mjs#trustedBase` pins on the round), and the late lane also needs the working-tree and fork-point configs to agree (strictest wins): a PR cannot loosen its own review by editing `pipeline.yml`. If the trusted config is unavailable, no model applies and the full brief runs, as before. The fix-verify choice (late lane or not) also reads the trusted config on every round, and when that config is unavailable (a stacked PR's parent branch can cause that by moving `default_branch` in its `pipeline.yml`) the round gets the full brief, never the narrow one; and any hard stop, sensitive path or risk it finds forces the full brief: for a PR to the default branch that is the same commit as the fork-point config, so nothing changes there, but for a stacked PR it stops a parent branch's relaxed `pipeline.yml` from admitting the medium-effort brief.
+
+**Install order.** An installed pipeline or vendored `config.mjs` older than this release rejects a `pipeline.yml` with these keys. (1) Merge and install this release (`pipeline update`); (2) `pipeline vendor --check`, and `pipeline vendor` on drift; (3) only then set the keys, in a later PR (the settings take effect from the next PR on, since the fork-point config is read).
+
+**Roll back.** Remove the three keys from `.claude/pipeline.yml` first (the review then behaves as before). An arbiter ruling that carries `outOfModel` lifts that PR's review state to version 5, which an older CLI refuses to read: finish or re-run the review of such a PR on the new CLI (or `pipeline state discard-round` the affected round) before you downgrade. To revert this release alone, `git revert` its commits after that; states without an out-of-model ruling stay at their old version and read fine.
 
 ### Merge hold (opt-in)
 
@@ -429,6 +456,18 @@ It is a firewall hint, not app authentication: the smoke stays a cookie-less, GE
 origin is exactly in `smoke_bypass_origins` (never a preview URL, another host or localhost; redirects are not followed), and the value is never printed. The smoke's JSON gains
 `bypassHeader: true|false` (whether it was sent); a configured name with no environment value is `false`, not an error.
 Re-vendor (`pipeline vendor`) so the project's `scripts/pipeline/smoke.mjs` and `lib/config.mjs` know the key.
+
+### Outbound text scan (machine-local, opt-in)
+
+For a repository that is public, text the pipeline posts there (comments, issue and PR titles and bodies, labels, GraphQL mutations, the agent-log branch) can be run through a
+scanner on your machine first. The list lives in `~/.claude/pipeline-local/outbound-scan.json` (the account's home, never a repo, so a branch cannot drop it):
+`{ "owner/name": { "command": ["/absolute/path/to/scanner", "arg"] } }`. Each outbound text goes to the scanner on stdin (never argv); exit 0 lets the write through,
+anything else (a non-zero exit, a crash, a timeout after 60 s) blocks it with exit 1 and `error: outbound-scan-blocked`, naming the field kinds scanned and how the scanner ended, never the text or anything the scanner printed. A repo that is not listed behaves exactly as before; no file means nothing is listed. It fails closed: a file that cannot be read or parsed blocks every write, and a
+listed repo whose scanner path is missing or not executable blocks that repo's writes. Screenshots (`pipeline artifacts push`) cannot be scanned and are refused for a listed repo;
+a blocked `agent-log publish` leaves its lines queued (the error names the queue file, `.git/claude-pipeline/agent-log-queue.jsonl`: delete a flagged line there), and for a listed repo
+the log commit is made under the fixed `claude-pipeline` noreply identity, not your git name and email. A repo counts as listed when either its `gh` name or the owner/name of `git push origin`'s URL is listed.
+Keys must be exactly `owner/name` (no URL, no `.git`, no spaces); any other key blocks every write. A renamed or transferred repository must be re-listed under its new name, or it stops being scanned.
+Writes that carry only ids, a sha or the name of an existing label (enqueue, dequeue, convert to draft, update-branch, add / remove / delete a label) are not scanned, so a scanner fault can never keep a PR in the merge queue.
 
 ### Faster verify (opt-in)
 
@@ -487,7 +526,7 @@ Rollout: the config rejects unknown keys, so set these in a repo only after ever
 | Variable | Meaning |
 |---|---|
 | `PIPELINE_OFF=1` | review and verify stand down for the session |
-| `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session |
+| `PIPELINE_ADMIN=1` | allows the installer and `protect --apply` from a Claude session, and bypasses the live-database guard (Supabase MCP writes, `supabase` CLI lines incl. `db query` (a real `--read-only` passes) and Management API lines; see `docs/cli.md` "Live database guard") |
 | `PIPELINE_MACHINE_ID` | stable id for this machine in the lock files (default: one generated once) |
 | `PIPELINE_SMOKE_BYPASS_KEY` | secret value of the `smoke_bypass_header` header (see "Smoke firewall bypass header"); read only by `scripts/pipeline/smoke.mjs`, never printed |
 | `PIPELINE_SMOKE_PORT` | the e2e smoke server's port; printed by `supabase-local env`, read by `playwright.smoke.config.ts` |
@@ -508,7 +547,7 @@ executable.
   `model_not_found`; it never silently falls back).
   With `owner_approval: chat` Claude now decides those items itself and records why (`pipeline triage claude-ruling`): a dismissal of a BLOCKING or security item, or any REJECT, needs a Codex
   second review that also dismisses it at high confidence, and every such dismissal is shown to you in a Rulings block above the merge request, so your "merge" covers it. You are not asked to type a ruling.
-  If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (`pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
+  If you want to dismiss something Claude or Codex would not, say so: the typed path stays as the override (an arbiter's accepted fix that is not built yet can be deferred to an issue the same way, follow-up only; `pipeline triage owner-ruling`; it asks with a `⚖️ Owner ruling needed` line, your whole answer
   is recorded on this machine and must be only the decisions, `R1-B1: accept` / `follow-up` / `reject` per item, reasons in another message; it is published in the triage comment). Then remove `needs-human`.
 - **Installer refuses** "inside a Claude Code session": run it from your own terminal.
 - **Repo moved / transferred?** Your earlier "merge", ruling and `extra round` records name the old repository, so `P review-complete` / `P merge` can say an owner grant "cannot be verified". In your own terminal (not in Claude Code) record the move once; GitHub must confirm it, and only records made before the move then count for the new name:
@@ -528,9 +567,10 @@ node pipeline/bin/pipeline.mjs --help
 
 CI (`.github/workflows/ci.yml`) runs the suite on Ubuntu (Node 20 and 24) and Windows (Node 24),
 plus an installer round trip into a throwaway Claude home with a space in its path. Its job names
-`test (ubuntu)` and `test (windows)` are this repo's required checks. The Windows suite runs as three
-parallel shards (`node scripts/test.mjs --shard I/3`, named `test (windows 1/3)` to `3/3`); `test (windows)`
-is the aggregate that is green only when all three succeeded.
+`test (ubuntu)` and `test (windows)` are this repo's required checks, and both are aggregates. The Ubuntu suite runs once
+per Node version in parallel (`test (ubuntu node 20)` and `test (ubuntu node 24)`); `test (ubuntu)` is green only when both
+succeeded. The Windows suite runs as three parallel shards (`node scripts/test.mjs --shard I/3`, named `test (windows 1/3)`
+to `3/3`); `test (windows)` is the aggregate that is green only when all three succeeded.
 
 The repo is onboarded to itself (`.claude/pipeline.yml`) with **every path a hard-stop**, so a
 change to the pipeline never auto-merges: the review skill builds, checks and reviews it, then hands you a
