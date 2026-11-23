@@ -1930,6 +1930,11 @@ test('#662: `echo x | git switch B && P` is proven by the &&; every other shape 
     `echo ref > .git/HEAD | git switch agent/y && ${P}`,
     `echo x | cd /other && ${P}`,
     `echo x | git switch agent/y & ${P}`,
+    // R1-F1: the closer of a loop / if / case as the stage before the switch: its body ran concurrently with it and is no "earlier work" the proof may skip (allow on 49ca2b80, deny now)
+    `while read l; do :; done | git switch agent/y && ${P}`,
+    `for i in 1; do gh pr checkout 5; done | git switch agent/y && ${P}`,
+    `if true; then :; fi | git switch agent/y && ${P}`,
+    `case x in x) :;; esac | git switch agent/y && ${P}`,
     `echo x | git switch agent/y &>/dev/null && ${P}`,
     `echo x | { git switch agent/y; } && ${P}`,
     `true && echo x | git switch agent/y && ${P}`,

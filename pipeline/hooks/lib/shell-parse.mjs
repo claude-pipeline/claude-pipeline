@@ -3073,6 +3073,7 @@ class Parser {
         endSeg(this.i);
         if (nx !== '|') this.markClosedOut(closed);
         if (closed !== undefined) { this.pipeStart = Math.min(this.lastClosePS, this.pipeStart); if (nx !== '|') { this.pipeHead = Math.min(this.lastClosePH, this.pipeHead); this.pipeLead = this.lastClosePL; } }
+        if (nx !== '|' && closed !== undefined && pl) pl.bad = true; // (R1-F1: a stage that is the closer of a loop / if / case (`done |`): its body came out before the stage record began, so `from` would leave it out of the pipeline)
         if (nx !== '|') { if (pl && pl.segs.length && pl.segs[pl.segs.length - 1] === closedSeg && pl.ops.length === pl.segs.length - 1 && !pl.closed) pl.ops.push(nx === '&' ? '|&' : '|'); else if (pl) pl.bad = true; } // (#662)
         if (nx !== '|') this.markPipe(this.pipeHead); // (#352 R11-F1: the stage before a `|` ran in a subshell, whatever stage comes after it)
         if (nx === '|') { lastSep = '||'; this.i += 2; }
