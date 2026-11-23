@@ -41,7 +41,7 @@ no pipeline; I can't certify it end-to-end. Want me to run pipeline-setup?"
    A step with status `skipped` did not run: say so and quote its `skipReason`; it is not a pass, and the
    final gate accepts it only when the owner listed it in `verify.skippable_steps`.
    A step that printed a node:test or vitest summary also has `counts {passed, failed, skipped}`; a `pass` with
-   `counts.passed` 0 is a step that ran nothing (no `counts` = the step printed no summary).
+   `counts.passed` 0 is a step where no test passed (read `failed` and `skipped` beside it; no `counts` = the step printed no summary).
 3. Fix the first failing step (it fails fast), rerun. Repeat until `ok: true`.
 4. Never make it green by weakening checks: no skipping, deleting, or loosening tests, no
    lowering coverage thresholds, no editing verify scripts or CI config to dodge a failure.
