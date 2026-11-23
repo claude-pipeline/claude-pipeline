@@ -468,3 +468,11 @@ test('R2-F1 / R2-B1 / R2-B2: a length expansion is one number for printf, an unq
   const ev = "i=1; eval 'i=other'; : $((i))"; // (the guards' own eval handling refuses the line whole, so the proof is asserted directly)
   assert.equal(arithAssignedNames(ev, simpleCommands(ev, {})).dynamic, true, 'literal eval text that rebinds i makes the read of i unproven');
 });
+test('R3-B1 / R3-B2 / R3-F1: an unquoted bare $name printf argument moves only the words after it onto a number conversion; a text label, an environment number and a counter set late stay allowed', () => {
+  allow('ref=HEAD; label=files; printf \'%s %d\\n\' $label 3; git show $ref');
+  allow('ref=HEAD; total=$((2+3)); printf \'%d\' $total; git show $ref');
+  allow('ref=HEAD; echo start; count=0; printf \'%d\' $count; git show $ref');
+  const r = git('ref=HEAD; printf \'%d\\n\' $BUILD_NUMBER; git show $ref', fakeFs(GIT_ROOT, SPEC), { env: { BUILD_NUMBER: '42' } });
+  assert.equal(r.decision, 'allow', r.reason);
+  deny(P("label=''; value='count+1'; printf '%s %d\\n' $label 10 value"));
+});
