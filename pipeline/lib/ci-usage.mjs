@@ -259,14 +259,16 @@ export function headPushes({ pr, timeline, commits = [], runs }) {
 }
 
 // A head pushed while the PR was ready is named only when it can be proven: the PR's commit list holds it (a head a force push dropped, or one past GitHub's 250-commit cap, has no record, and an
-// update-branch merge there would look like a push), and, when `fromMs` is given (the runs before it were not read), its commit is dated no earlier than that (an older commit may have had its first run before it).
+// update-branch merge there would look like a push), and, when `fromMs` is given (the runs before it were not read), its commit is dated at least COMMIT_CLOCK_SKEW_MS after that (an older commit may have had its first run before it).
 // Both callers (`pipeline summary`, `pipeline ci-usage`) leave a head that fails this out and say so.
+// A committer clock can run fast: a commit dated less than this after `fromMs` may still have had its first run before it.
+export const COMMIT_CLOCK_SKEW_MS = 3_600_000;
 export function headProvable(sha, commits, fromMs = null) {
   const c = (commits ?? []).find((k) => normalizeCommit(k).sha === sha);
   if (c === undefined) return false;
   if (fromMs === null) return true;
   const d = commitDate(c);
-  return d !== null && d >= fromMs;
+  return d !== null && d >= fromMs + COMMIT_CLOCK_SKEW_MS;
 }
 
 // Heads pushed while the PR was READY: the missed redrafts (when the repository iterates in draft). Excluded: the opening head, catch-ups, heads whose first run was the
@@ -319,7 +321,9 @@ const commitDate = (c) => ms(c?.commit?.committer?.date ?? c?.commit?.author?.da
 // `isPrivate`: a public repository is free, so its PR rows are 0 too.
 export function analysePrUsage({ number, pr, timeline, commits = [], runs, evidenceRuns = runs, jobsByRun = new Map(), rates = DEFAULT_RATES, viewer = null, sinceMs = null, evidenceFromMs = null, isPrivate = true, ambiguousHeads = [] }) {
   const classified = classifyRuns({ pr, timeline, commits, runs, evidenceRuns, jobsByRun, rates });
-  const pushes = headPushes({ pr, timeline, commits, runs: evidenceRuns });
+  // evidenceRuns only decide which run came first: a head none of the kept runs belongs to (a push that ran another workflow only) is not this report's
+  const keptHeads = new Set(runs.map((r) => r.head_sha));
+  const pushes = headPushes({ pr, timeline, commits, runs: evidenceRuns }).filter((h) => keptHeads.has(h.sha));
   const ambiguous = new Set(ambiguousHeads);
   const readyPushes = pushes.filter((h) => h.kind === 'push' && h.phase === 'ready');
   const pushedReady = readyPushes.filter((h) => !ambiguous.has(h.sha) && headProvable(h.sha, commits, evidenceFromMs));

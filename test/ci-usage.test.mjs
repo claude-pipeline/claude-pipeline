@@ -376,3 +376,20 @@ test('PR #823 round 1 B9: when the viewer lookup fails, wasted redrafts are not 
   assert.deepEqual([repo.totals.wastedRedrafts, repo.prs.find((x) => x.pr === 7).wastedRedrafts], [null, null]);
   assert.match(r.json.warnings.join('\n'), /the viewer login could not be read/);
 });
+
+test('PR #823 round 2 B3: an unlinked run from before the PR was created does not hide a push while ready in the report (as in the summary)', () => {
+  // failure caught: an old PR's unlinked run on the same SHA, found repository-wide, left the head out of the count
+  const before = run(1401, { pull_requests: [], created_at: T('08:30'), run_started_at: T('08:30'), updated_at: plus(T('08:30'), 3) }); // head sha('3'); PR 7 was created at 09:00
+  const r = usage(world({ runs: [...RUNS, before] }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const p = r.json.repos[0].prs.find((x) => x.pr === 7);
+  assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [1, [sha('3').slice(0, 12)], 0]);
+});
+
+test('PR #823 round 2 B5: a failed viewer lookup makes the total wasted redrafts null even when no PR row was read', () => {
+  // failure caught: with every PR read skipped (low rate limit) the total stayed 0 while the warning said it was unknown
+  const r = usage(world({ remaining: 500, extra: [{ match: '^api user', code: 1, stderr: 'gh: HTTP 401' }] }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  assert.deepEqual([repo.prs.length, repo.totals.wastedRedrafts], [0, null]);
+});

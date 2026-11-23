@@ -161,13 +161,14 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const prRows = [];
   const classified = [];
   // a head that also has a pull_request run GitHub did not link to any PR: which run came first on it cannot be proven, so it is not judged (see analysePrUsage)
-  const unlinkedHeads = new Set(listed.filter((r) => r.event === 'pull_request' && (r.pull_requests ?? []).length === 0 && r.head_sha).map((r) => r.head_sha));
+  const unlinkedPrRuns = listed.filter((r) => r.event === 'pull_request' && (r.pull_requests ?? []).length === 0 && r.head_sha);
   // the runs before the oldest one kept were not read when the run list was cut: a head whose commit is older may have had its first run there
   const oldest = Math.min(...listed.map((r) => Date.parse(r.created_at)).filter(Number.isFinite));
   const evidenceFromMs = runsCut && Number.isFinite(oldest) ? Math.max(sinceMs, oldest) : sinceMs;
   for (const [n, { incomplete, ...data }] of readPr) {
     const { runs: prRuns, all } = prGroups.get(n);
-    const ambiguousHeads = incomplete ? all.map((r) => r.head_sha) : [...unlinkedHeads];
+    // like the summary: only an unlinked run created since this PR was created can have been the first run of one of its heads
+    const ambiguousHeads = incomplete ? all.map((r) => r.head_sha) : unlinkedPrRuns.filter((r) => !(Date.parse(r.created_at) < Date.parse(data.pr.createdAt))).map((r) => r.head_sha);
     const row = analysePrUsage({ number: n, ...data, runs: prRuns, evidenceRuns: all, jobsByRun, rates, viewer, sinceMs, evidenceFromMs, isPrivate, ambiguousHeads });
     if (viewer === null) row.wastedRedrafts = null; // whose redraft it was cannot be told
     classified.push(...row.classified);
@@ -177,6 +178,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const unread = runs.filter((r) => !(r.event === 'pull_request' && readPr.has(prOfRun.get(r.id))));
   classified.push(...classifyRuns({ runs: unread, jobsByRun, rates, unlinked: true }));
   const agg = aggregateUsage({ classified, prRows, isPrivate, rates, draftWhileIterating });
+  if (viewer === null) agg.totals.wastedRedrafts = null; // also with no PR row: whose redraft it was cannot be told
 
   const partial = budget.reason !== null || skipped.prs > 0 || skipped.jobs > 0 || truncated;
   if (budget.reason === 'rate-limit') warn(`the rate limit is low (${budget.rate?.remaining} calls left, stopping below ${MIN_REMAINING}): the report is partial`);

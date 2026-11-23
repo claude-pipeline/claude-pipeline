@@ -369,7 +369,8 @@ test('PR #823 round 1 B3/F3/B5: a ready-phase head with no commit record, or who
   const dated = (d) => commit('3', { commit: { message: 'work', committer: { date: d } } });
   assert.deepEqual([row([commit('3')]).pushesWhileReady, row([commit('3')]).uncheckedHeads], [1, 0]);
   assert.deepEqual([row([]).pushesWhileReady, row([]).uncheckedHeads], [0, 1], 'no commit record');
-  assert.deepEqual([row([dated(T('10:25'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('10:25'))], Date.parse(T('10:00'))).uncheckedHeads], [1, 0]);
+  assert.deepEqual([row([dated(T('11:30'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('11:30'))], Date.parse(T('10:00'))).uncheckedHeads], [1, 0]);
+  assert.deepEqual([row([dated(T('10:30'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('10:30'))], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'a commit dated within an hour after the start: its clock may be fast (PR #823 round 2 B1)');
   assert.deepEqual([row([dated(T('08:00'))], Date.parse(T('10:00'))).pushesWhileReady, row([dated(T('08:00'))], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'older than the evidence window');
   assert.deepEqual([row([commit('3')], Date.parse(T('10:00'))).pushesWhileReady, row([commit('3')], Date.parse(T('10:00'))).uncheckedHeads], [0, 1], 'no commit date: not provable');
 });
@@ -402,4 +403,12 @@ test('PR #823 round 1 B9: a PR row with an unknown wasted-redraft count makes th
   const { classified, ...row } = p;
   const text = renderUsageTable({ since: '2026-11-06', repos: [{ slug: 'acme/widgets', private: true, classifierVersion, partial: false, draftWhileIterating: true, prs: [{ ...row, wastedRedrafts: null }], calls: 1, rateLimit: null, skipped: {}, unexcludable: [], ...agg }] });
   assert.match(text, /wasted redrafts unknown/);
+});
+
+test('PR #823 round 2 B2: with a workflow filter, a head none of the kept runs belongs to is not counted (pushed, draft or unchecked)', () => {
+  // failure caught: a push that only ran another workflow named in pushedHeads / pushesWhileReady for which the report holds no run
+  const kept = longRun(sha('3'), T('10:30'), 10, { name: 'ci' });
+  const other = run(sha('4'), T('10:40'), { name: 'docs' });
+  const p = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits: [commit('3'), commit('4')], runs: [kept], evidenceRuns: [kept, other] });
+  assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads, p.pushesWhileDraft], [1, [sha('3').slice(0, 12)], 0, 0]);
 });
