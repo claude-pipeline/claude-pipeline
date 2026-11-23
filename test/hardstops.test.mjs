@@ -769,3 +769,196 @@ test('knownEnvNames: a no-match exit 1 skips the batch, but an overBuffer / sign
     assert.throws(() => knownEnvNames('main', new Set(['FOO']), res(patch)), GitError, label);
   }
 });
+
+// ---- R4 "pgTAP test deleted/renamed": the base copy decides (#643) ---------------------------------------------------
+
+const PGTAP_BASE = "begin;\nselect plan(1);\nselect ok(true);\nselect * from finish();\nrollback;\n";
+const HELPER_BASE = "-- worklist helper, not a test\nselect id from patients where consent is null;\n";
+const moveCollect = async (files, move) => {
+  const repo = createTmpRepo();
+  for (const [p, t] of Object.entries(files)) repo.write(p, t);
+  repo.commit('base');
+  repo.branch('feat');
+  move(repo);
+  return collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
+};
+
+// Catches: a harmless helper moved out of supabase/tests sending the PR down the high-risk path (DRMed #437).
+test('IO: deleting or moving a marker-free helper .sql out of supabase/tests is no hard stop at all', async () => {
+  const moved = await moveCollect({ 'supabase/tests/0150_worklist.sql': HELPER_BASE }, (repo) => {
+    repo.write('docs/worklist.txt', HELPER_BASE);
+    repo.rm('supabase/tests/0150_worklist.sql');
+    repo.commit('move helper');
+  });
+  assert.deepEqual(moved, [], JSON.stringify(moved));
+  const deleted = await moveCollect({ 'supabase/tests/0150_worklist.sql': HELPER_BASE }, (repo) => {
+    repo.rm('supabase/tests/0150_worklist.sql');
+    repo.commit('delete helper');
+  });
+  assert.deepEqual(deleted, [], JSON.stringify(deleted));
+});
+
+// Catches: the exemption swallowing a real pgTAP test that was renamed or deleted.
+test('IO: a real pgTAP file renamed or deleted under supabase/tests still trips R4', async () => {
+  const renamed = await moveCollect({ 'supabase/tests/rls.sql': PGTAP_BASE }, (repo) => {
+    repo.write('scripts/rls.sql', PGTAP_BASE);
+    repo.rm('supabase/tests/rls.sql');
+    repo.commit('move test');
+  });
+  assert.ok(renamed.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(renamed));
+  const deleted = await moveCollect({ 'supabase/tests/rls.sql': PGTAP_BASE }, (repo) => {
+    repo.rm('supabase/tests/rls.sql');
+    repo.commit('delete test');
+  });
+  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
+});
+
+// Catches: a suite split over files (a driver runs runtests(), another file holds the assertions or test functions, a third only
+// \ir-includes them) losing R4 when the file without plan()/finish() is deleted.
+test('IO: deleting a shared-runner pgTAP file (assertions, test function, or include only) still trips R4', async () => {
+  const bodies = {
+    assertions: "select is(1, 1, 'one');\nselect throws_ok('select 1/0', '22012');\n",
+    testFunction: "create or replace function tests.setup_rls() returns void as $ begin insert into patients (id) values (1); end $ language plpgsql;\n",
+    include: "\\ir 0150_rls_cases.sql\n",
+    includeLong: "\\include 0150_rls_cases.sql\n",
+    includeRelative: "\\include_relative 0150_rls_cases.sql\n",
+    setHas: "select set_has('select id from visible_rows', 'values (1)', 'expected row is visible');\n",
+    quotedOk: "select \"ok\"(false, 'x');\n",
+    quotedSetHas: "select \"set_has\"('select 1', 'values (1)');\n",
+    isntEmpty: "select isnt_empty('select id from patients', 'rls leaves rows');\n",
+  };
+  for (const [label, body] of Object.entries(bodies)) {
+    const hits = await moveCollect({ 'supabase/tests/0150_cases.sql': body }, (repo) => {
+      repo.rm('supabase/tests/0150_cases.sql');
+      repo.commit('delete shared file');
+    });
+    assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), `${label}: ${JSON.stringify(hits)}`);
+  }
+});
+
+// Catches: reading the blob from inside the PR, so commit 1 strips the markers and commit 2 moves the "helper" away.
+test('IO: markers stripped in one PR commit and the file moved in the next still trips R4 (base blob decides)', async () => {
+  const hits = await moveCollect({ 'supabase/tests/rls.sql': PGTAP_BASE }, (repo) => {
+    repo.write('supabase/tests/rls.sql', HELPER_BASE);
+    repo.commit('strip markers');
+    repo.write('scripts/rls.sql', HELPER_BASE);
+    repo.rm('supabase/tests/rls.sql');
+    repo.commit('move');
+  });
+  assert.ok(hits.some((h) => h.rule === 'R4-pipeline'), JSON.stringify(hits));
+});
+
+// Catches: a marker-free non-SQL test (a shell or TS end-to-end proof under supabase/tests) read as a "helper" and losing R4 when deleted or moved.
+test('IO: deleting or moving a marker-free non-SQL file under supabase/tests still trips R4', async () => {
+  const E2E = "#!/bin/sh\ncurl -sf \"$API_URL/rpc/guarded\" | grep -q denied\n";
+  const deleted = await moveCollect({ 'supabase/tests/0207_guard_e2e.sh': E2E }, (repo) => {
+    repo.rm('supabase/tests/0207_guard_e2e.sh');
+    repo.commit('delete e2e');
+  });
+  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
+  const moved = await moveCollect({ 'supabase/tests/0207_guard_e2e.ts': E2E }, (repo) => {
+    repo.write('scripts/0207_guard_e2e.ts', E2E);
+    repo.rm('supabase/tests/0207_guard_e2e.ts');
+    repo.commit('move e2e');
+  });
+  assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
+});
+
+// Catches: a test entry point named *.test.sql whose body only delegates to a routine (no marker in its own text) losing R4 when deleted.
+test('IO: deleting or moving a marker-free *.test.sql entry point still trips R4', async () => {
+  const entry = "select * from tests.check_tenant_visibility();\n";
+  const deleted = await moveCollect({ 'supabase/tests/tenant_visibility.test.sql': entry }, (repo) => {
+    repo.rm('supabase/tests/tenant_visibility.test.sql');
+    repo.commit('delete entry point');
+  });
+  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
+  const moved = await moveCollect({ 'supabase/tests/tenant_visibility.test.sql': entry }, (repo) => {
+    repo.write('scripts/tenant_visibility.test.sql', entry);
+    repo.rm('supabase/tests/tenant_visibility.test.sql');
+    repo.commit('move entry point');
+  });
+  assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
+});
+
+// Catches: a delegating entry point under an ordinary .sql name (the suite globs supabase/tests/*.sql) losing R4 when deleted (R2-B1).
+test('IO: deleting or moving a marker-free delegating entry point with an ordinary .sql name still trips R4', async () => {
+  const bodies = {
+    selectFrom: "select * from tests.check_tenant_visibility();\n",
+    selectFromBare: "select * from check_tenant_visibility();\n",
+    selectCall: "select tests.check_tenant_visibility();\n",
+    selectCallBare: "select check_tenant_visibility();\n",
+  };
+  for (const [label, entry] of Object.entries(bodies)) {
+    const deleted = await moveCollect({ 'supabase/tests/tenant_visibility.sql': entry }, (repo) => {
+      repo.rm('supabase/tests/tenant_visibility.sql');
+      repo.commit('delete entry point');
+    });
+    assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), `${label} deleted: ${JSON.stringify(deleted)}`);
+    const moved = await moveCollect({ 'supabase/tests/tenant_visibility.sql': entry }, (repo) => {
+      repo.write('scripts/tenant_visibility.sql', entry);
+      repo.rm('supabase/tests/tenant_visibility.sql');
+      repo.commit('move entry point');
+    });
+    assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), `${label} moved: ${JSON.stringify(moved)}`);
+  }
+});
+
+// Catches: a UTF-8 byte-order mark in front of an include-only suite file hiding the psql include, so deleting it loses R4 (R2-B2).
+test('IO: deleting a BOM-prefixed include-only file still trips R4', async () => {
+  const hits = await moveCollect({ 'supabase/tests/0150_cases.sql': "\uFEFF\\ir tenant_cases.sql\n" }, (repo) => {
+    repo.rm('supabase/tests/0150_cases.sql');
+    repo.commit('delete bom include');
+  });
+  assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(hits));
+});
+
+// Catches: PostgreSQL built-ins (has_table_privilege, set_config) read as pgTAP assertions, so a plain data-check helper still trips R4 (R2-F1).
+test('IO: a helper using has_table_privilege() and set_config() is exempt when deleted or moved; wrapped in ok() it still trips R4', async () => {
+  const helper = "select count(*) from pg_class;\nselect set_config('request.jwt.claims', '{}', true);\nselect c.relname, has_table_privilege('anon', c.oid, 'SELECT') as anon_select from pg_class c;\n";
+  const deleted = await moveCollect({ 'supabase/tests/0150_verify.sql': helper }, (repo) => {
+    repo.rm('supabase/tests/0150_verify.sql');
+    repo.commit('delete helper');
+  });
+  assert.deepEqual(deleted, [], JSON.stringify(deleted));
+  const moved = await moveCollect({ 'supabase/tests/0150_verify.sql': helper }, (repo) => {
+    repo.write('docs/0150_verify.txt', helper);
+    repo.rm('supabase/tests/0150_verify.sql');
+    repo.commit('move helper');
+  });
+  assert.deepEqual(moved, [], JSON.stringify(moved));
+  const asserted = "select ok(has_table_privilege('anon', 'patients', 'SELECT') = false, 'anon cannot read');\n";
+  const hits = await moveCollect({ 'supabase/tests/0150_priv.sql': asserted }, (repo) => {
+    repo.rm('supabase/tests/0150_priv.sql');
+    repo.commit('delete assertion');
+  });
+  assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(hits));
+});
+
+// Catches: a plain-SQL privilege test (DO block + RAISE EXCEPTION, or a level-less RAISE that defaults to EXCEPTION, no pgTAP call) losing R4 once set_config/has_*_privilege stopped counting as markers (R3-F1, R4-B1).
+test('IO: deleting or moving a DO-block privilege test with an ordinary .sql name still trips R4', async () => {
+  const bodies = [
+    "select set_config('role', 'anon', true);\ndo $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise exception 'anon can read patients'; end if; end $$;\n",
+    "select set_config('role', 'anon', true);\ndo $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise 'anon can read patients'; end if; end $$;\n",
+    "do $$ begin if has_table_privilege('anon', 'public.patients', 'SELECT') then raise using message = 'anon can read patients'; end if; end $$;\n",
+  ];
+  for (const body of bodies) {
+    const deleted = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
+      repo.rm('supabase/tests/anon_grants.sql');
+      repo.commit('delete do-block test');
+    });
+    assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), body + JSON.stringify(deleted));
+    const moved = await moveCollect({ 'supabase/tests/anon_grants.sql': body }, (repo) => {
+      repo.write('scripts/anon_grants.sql', body);
+      repo.rm('supabase/tests/anon_grants.sql');
+      repo.commit('move do-block test');
+    });
+    assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), body + JSON.stringify(moved));
+  }
+  // A notice-level RAISE does not fail the run: a helper that only logs stays exempt.
+  const logger = "do $$ begin raise notice 'seeding'; end $$;\n";
+  const exempt = await moveCollect({ 'supabase/tests/seed_log.sql': logger }, (repo) => {
+    repo.rm('supabase/tests/seed_log.sql');
+    repo.commit('delete logger');
+  });
+  assert.deepEqual(exempt, [], JSON.stringify(exempt));
+});
