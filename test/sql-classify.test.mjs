@@ -67,6 +67,29 @@ test('describeSql: #655 only the own WHERE of a statement counts, not one in a s
   assert.deepEqual(flags('with s as (select 1 as id) update t set a = 1 where id in (select id from s)'), []);
   // scope that cannot be determined (unbalanced parentheses) warns rather than stays silent
   assert.deepEqual(flags('update t set a = (select 1 where true'), ['UPDATE-NO-WHERE']);
+  // WHERE as an output label (after AS) or a qualified column name (after a dot) is not a filter; nor is anything after RETURNING
+  assert.deepEqual(flags('delete from t returning 1 as where'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('update t set x = t.where'), ['UPDATE-NO-WHERE']);
+  assert.deepEqual(flags('update t set a = 1 returning 1 as where'), ['UPDATE-NO-WHERE']);
+  // an empty condition is no condition
+  assert.deepEqual(flags('delete from t where'), ['DELETE-NO-WHERE']);
+  // matched outer parentheses around an always-true condition do not hide it
+  assert.deepEqual(flags('update t set a = 1 where (1 = 1)'), ['UPDATE-WHERE-TRUE']);
+  assert.deepEqual(flags('update t set a = 1 where ((true))'), ['UPDATE-WHERE-TRUE']);
+  assert.deepEqual(flags('delete from t where (1 = 1)'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('delete from t where ((true))'), ['DELETE-NO-WHERE']);
+  // parentheses that do not wrap the whole condition are still an ordinary condition
+  assert.deepEqual(flags('update t set a = 1 where (id = 1) or (true)'), []);
+});
+
+test('describeSql: #655 a change that runs behind EXPLAIN, COPY or a leading parenthesis is scanned like WITH', () => {
+  assert.deepEqual(flags('explain analyze delete from t'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('explain (analyze) update t set a = 1'), ['UPDATE-NO-WHERE']);
+  assert.deepEqual(flags('copy (delete from t returning *) to stdout'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('(with d as (delete from t returning *) select * from d)'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('explain analyze delete from t where id = 1'), []);
+  // a locking clause behind EXPLAIN is not a change
+  assert.deepEqual(flags('explain select 1 from t for update'), []);
 });
 
 test('describeSql: #655 inside WITH every UPDATE/DELETE word warns unless the whole run proves it is something else', () => {
