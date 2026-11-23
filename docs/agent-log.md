@@ -304,3 +304,4 @@ full record.
 - 2026-11-20 · #749 · Guard: fewer false refusals of quoted text, xargs-in-quotes gap closed, registry writer protected (#683 #610 #624 #617 #618 #620 #609 #605 #600) · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 693 runs (190 high)
 - 2026-11-20 · #761 · Shell guard: coproc, one exit rule, cd behind time/command/builtin, short for-loop bodies (PR C1) · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 693 runs (190 high)
 - 2026-11-23 · #688 · Live-database guard, part 2: supabase CLI / Management API rule (#262) · risk high · rounds 9 · arbiter 9 (fix-verify 5) · blocked · Codex 7d: 584 runs (161 high)
+- 2026-11-23 · #749 · Guard: fewer false refusals of quoted text, xargs-in-quotes gap closed, registry writer protected (#683 #610 #624 #617 #618 #620 #609 #605 #600) · risk high · rounds 5 · arbiter 5 · merged · Codex 7d: 592 runs (163 high)
