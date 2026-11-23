@@ -2696,6 +2696,7 @@ class Parser {
     let subTail = null;
     let tailUndo = null; // (#352 R13-F1: what the segment that took subTail would have had without it, to give it back when that segment turns out to hold a word: only a redirect list continues the subshell's command)
     let lastNeg = false; // (the stage before a `|` was negated: `! a | b` negates the pipeline, so b's commands too)
+    let pl = null; // (#662: the pipeline being read at this level: { from, segs, ops, bad, closed }, see plDone)
     let lastAfterClose = false; // (the `&&` just read follows the closer of a construct that may have skipped its body: the next segment takes it, see emit)
     // the operator before the command being read (a substitution in its words runs under it, see inGroup)
     this.lexOp = () => (seg ? { sep: seg.sep, afterClose: seg.afterClose, lead: seg.lead } : { sep: lastSep, afterClose: lastSep === '&&' && lastAfterClose, lead: lastSep === '|' ? this.pipeLead : null });
@@ -2721,6 +2722,9 @@ class Parser {
         if (!tail && lastSep !== '|' && lastSep !== '&&' && lastSep !== '||') this.pipeStart = ctx.out.length; // (a & ends the whole and-or list: `a && b &`)
         if (!tail && lastSep !== '|') { this.pipeHead = ctx.out.length; this.pipeLead = lastSep; }
         lastAfterClose = false;
+        // (#662: the pipeline record. A stage continues the pipeline of the segment before it only when a plain `|` / `|&` joined them; anything else begins a new one. A stage that is a subshell tail, or read while a heredoc waits, makes the record untrustworthy)
+        if (lastSep === '|' && pl && !pl.closed) { seg.pl = pl; if (tail || this.queue.length) pl.bad = true; } else { if (pl) { pl.closed = true; this.plDone(pl); } pl = { from: ctx.out.length, segs: [], ops: [], bad: !!tail || this.queue.length > 0, closed: false, attached: false }; seg.pl = pl; }
+        pl.segs.push(seg);
       }
     };
     const mark = () => { if (qa < 0) qa = cur.length; inWord = true; };
@@ -2755,6 +2759,7 @@ class Parser {
         // >&2 / 2>&1 duplicate a descriptor: the target is recorded as &2 / &1 so it is not mistaken for a file name
         const dup = (rop === '>&' || rop === '<&') && /^(?:[0-9]+|-)$/.test(text);
         seg.redirects.push({ op: rop, target: dup ? '&' + text : text, fd: rfd });
+        if (rop === '&>' || rop === '&>>') seg.ampDone = true; // (#529: the words after the target of a `&>` are read differently by the shells, see below)
         if (subs.length && text.startsWith('>(')) seg.outSubs.push(subs); // `cat f > >(bash)`: the substitution's commands read what this command writes
         // Why: `exec 3< f.sh; bash <&3`: a descriptor opened from a file earlier on the line (or a `{fd}<` named one) is read by the shell that gets it as stdin
         if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && seg.words[seg.words.length - 1]?.fdRedir === true))) {
@@ -2892,6 +2897,8 @@ class Parser {
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
+      // (#529: a word (an assignment word too) after the target of a `&>` / `&>>`: dash reads `cmd &>f word` as `cmd &` and then `>f word`, a command of its own that runs HERE, bash as one command `cmd word` with a redirect. The commands differ: refused)
+      if (seg.ampDone === true) ctx.truncated = true;
       seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: fdw }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
     };
     const endSeg = (idx) => {
@@ -2904,8 +2911,11 @@ class Parser {
       this.lastStage = seg.groupStage ?? [seg];
       this.lastStageParen = false;
       lastNeg = segNeg(seg);
+      // (#529: a `&>` / `&>>` in this segment: dash may read it as a `&` that backgrounds the whole and-or list up to here, see markMaybeBg. Taken before the segment is finished: a group closer's list starts where the group began)
+      const ampFrom = seg.amp === true ? (seg.closesFrom !== undefined ? Math.min(this.lastClosePS, this.pipeStart) : this.pipeStart) : -1;
       seg = null;
       this.drain(false);
+      if (ampFrom >= 0) this.markMaybeBg(ampFrom);
     };
 
     while (this.i < n && !ctx.stopped) {
@@ -3051,6 +3061,7 @@ class Parser {
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
+          seg.amp = true; // (#529: see markMaybeBg)
           if (s[this.i + 2] === '>') { rop = '&>>'; this.i += 3; } else { rop = '&>'; this.i += 2; }
         }
       } else if (c === '|') {
@@ -3058,9 +3069,12 @@ class Parser {
         flushWord(); // (`}|cat`: the closing word first)
         if (depth === 0) ctx.notPlain = true; // (| |& ||)
         const closed = seg?.closesFrom;
+        const closedSeg = seg; // (#662: the stage this `|` ends)
         endSeg(this.i);
         if (nx !== '|') this.markClosedOut(closed);
         if (closed !== undefined) { this.pipeStart = Math.min(this.lastClosePS, this.pipeStart); if (nx !== '|') { this.pipeHead = Math.min(this.lastClosePH, this.pipeHead); this.pipeLead = this.lastClosePL; } }
+        if (nx !== '|' && closed !== undefined && pl) pl.bad = true; // (R1-F1: a stage that is the closer of a loop / if / case (`done |`): its body came out before the stage record began, so `from` would leave it out of the pipeline)
+        if (nx !== '|') { if (pl && pl.segs.length && pl.segs[pl.segs.length - 1] === closedSeg && pl.ops.length === pl.segs.length - 1 && !pl.closed) pl.ops.push(nx === '&' ? '|&' : '|'); else if (pl) pl.bad = true; } // (#662)
         if (nx !== '|') this.markPipe(this.pipeHead); // (#352 R11-F1: the stage before a `|` ran in a subshell, whatever stage comes after it)
         if (nx === '|') { lastSep = '||'; this.i += 2; }
         else if (nx === '&') { lastSep = '|'; this.i += 2; }
@@ -3183,7 +3197,22 @@ class Parser {
     }
     if (lit > 0 && litGlob) { this.ctx.dynamic = true; this.qualifierCode(s.slice(gRaw), cur.slice(gCur), depth, false); } // never closed: cannot be delimited
     endSeg(n);
+    if (pl) { pl.closed = true; this.plDone(pl); }
     return false;
+  }
+
+  // (#662: the pipeline record, on the command of the LAST stage: pipeRec = { from: the ctx.out index where the pipeline began (its first stage's substitutions are inside), stages: the commands each stage emitted, ops: the operators as written
+  // (`|` or `|&`), wrapped: a stage had a wrapper stripped (command / env / nohup / exec / time ...), pending: false }. Attached once the pipeline has closed and every stage is finished. None when the parser cannot tell: a stage waiting for
+  // a heredoc, a group / subshell stage, a last stage that emitted anything but one command. Not enumerable.)
+  plDone(pl) {
+    if (pl.attached || !pl.closed || pl.bad || pl.segs.length < 2 || pl.ops.length !== pl.segs.length - 1) return;
+    if (!pl.segs.every((x) => x.span !== undefined && x.pending === 0 && !x.pipeOut && !x.words.some((w) => w.qa < 0 && (w.text === '{' || w.text === '}' || w.text === '(' || w.text === ')')))) return;
+    const last = pl.segs[pl.segs.length - 1];
+    if (last.span[1] - last.span[0] !== 1) return;
+    const out = this.ctx.out;
+    pl.attached = true;
+    const stages = pl.segs.map((x) => out.slice(x.span[0], x.span[1]));
+    Object.defineProperty(out[last.span[0]], 'pipeRec', { value: { from: pl.from, stages, ops: pl.ops, wrapped: out.slice(pl.from, last.span[1]).some((c) => c.wrapped === true), pending: false }, enumerable: false });
   }
 
   // The code a glob group runs (see qualifierCodes): each string is parsed as commands one level deeper, like a `-c` string.
@@ -3356,6 +3385,7 @@ class Parser {
       this.finalizeSeg(seg);
       // (#352 R10: every command of a pipeline (the stages, and what they hold) is marked: a change in one is its subshell's. A stage is marked when the stage after it is finished)
       seg.span = [out0, this.ctx.out.length];
+      if (seg.pl) this.plDone(seg.pl); // (#662)
       for (const s of seg.sep === '|' ? [seg, ...(seg.pipedFrom ?? []).filter((p) => !seg.pipeSkip?.includes(p))] : []) if (s.span) for (const c of this.ctx.out.slice(...s.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true });
       if (seg.pipeOut) for (const c of this.ctx.out.slice(...seg.span)) Object.defineProperty(c, 'pipe', { value: true, enumerable: false, configurable: true }); // (#352 R11-F1: a | was read while it waited for its heredoc body: see markPipe)
       if (seg.afterClose && this.ctx.out.length === out0) this.ctx.owedClose = { grp: seg.grp, depth: seg.depth }; // (it emitted nothing: the mark waits for the next command of ITS level, see emit)
@@ -3453,6 +3483,22 @@ class Parser {
   markBackground(from) {
     if (this.queue.length) this.ctx.ctlBroken = true;
     for (const c of this.ctx.out.slice(from)) Object.defineProperty(c, 'bg', { value: true, enumerable: false, configurable: true });
+  }
+
+  // (#529: dash / Debian sh / ash read `A && B &>f` as `A && B &` (a background job: the whole and-or list up to here) and then `>f` (a command that only opens f); bash, zsh, ksh and macOS sh read a redirect of B. So every
+  // command of the and-or list from `from` UP TO AND INCLUDING the command that carries the `&>` may have run in a child: maybeBg, never `bg` (the shells disagree, the readers must not pick one). maybeBgEnds: the ctx.out index
+  // of the command that carries it, one entry per `&>` that covers the command (`A &>f && B &>g`: A has two): a reader tells "inside the span" from "after it" with it (C in `A && B &>f && C` is not in the span). Not enumerable.
+  // Commands still waiting for a heredoc are not out yet: the marks are not to be trusted.)
+  markMaybeBg(from) {
+    if (this.queue.length) this.ctx.ctlBroken = true;
+    const end = this.ctx.out.length - 1;
+    for (let k = from; k <= end; k++) {
+      const c = this.ctx.out[k];
+      if (!c) continue;
+      if (!c.maybeBgEnds) Object.defineProperty(c, 'maybeBgEnds', { value: [], enumerable: false, configurable: true });
+      if (!c.maybeBgEnds.includes(end)) c.maybeBgEnds.push(end);
+      Object.defineProperty(c, 'maybeBg', { value: true, enumerable: false, configurable: true });
+    }
   }
 
   // (#352 R11-F1: every command from `from` on is a stage of a pipeline: a change in one is its subshell's. Commands still waiting for a heredoc are not out yet: the marks are not to be trusted)

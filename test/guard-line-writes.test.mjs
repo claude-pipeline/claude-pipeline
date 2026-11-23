@@ -2112,3 +2112,17 @@ test('time: applySed refuses (null) a program whose regex work on the text could
   const file = Array.from({ length: 2000 }, (_, i) => `const v${i} = foo(${i}); // ${'x'.repeat(40)} bar`).join('\n') + '\n';
   for (const prog of ['s/foo.*bar/x/', 's/foo/x/g', '/v1[0-9]*/d', 's/^const //']) assert.notEqual(applySed({ args: ['-i', prog, 'f'], word: 'f' }, file), null, prog);
 });
+
+// #529: dash reads `A &>f` as `A &` (a background job) then `>f`. Failure caught: `sh f &>/dev/null; echo bad > f` judged only with the file as it is before the write, when dash runs the script
+// while (or after) the write lands. Each row: BASE -> CANDIDATE. The span is the parser's `maybeBg` (a quoted `&>` in data makes nothing opaque).
+test('#529: a command with `&>` may run in the background: the writes after it may land first; the foreground twin keeps today\'s reading', () => {
+  const spec = { ...SPEC, 'sp1.sh': 'bash n.sh &>/dev/null', 'fg3.sh': 'bash n.sh >/dev/null 2>&1' };
+  denyBoth('bash n.sh &>/dev/null; cp f.sh n.sh', spec); // BASE allow -> CANDIDATE deny
+  denyBoth('bash n.sh &>>/tmp/l; cp f.sh n.sh', spec); // BASE allow -> CANDIDATE deny
+  denyBoth('true && bash n.sh &>/dev/null; cp f.sh n.sh', spec); // BASE allow -> CANDIDATE deny (the span starts at the list start)
+  denyBoth('bash sp1.sh; cp f.sh n.sh', spec); // nested frame holding a span: BASE allow -> CANDIDATE deny (the frame's job outlives it)
+  denyBoth('cp f.sh n.sh; bash n.sh &>/dev/null', spec); // control, BASE deny -> CANDIDATE deny (the write is first and certain)
+  allowBoth('bash n.sh >/dev/null 2>&1; cp f.sh n.sh', spec); // twin: BASE allow -> CANDIDATE allow
+  allowBoth('bash fg3.sh; cp f.sh n.sh', spec); // nested twin: BASE allow -> CANDIDATE allow
+  allowBoth("echo '&>' ; bash fg3.sh; cp f.sh n.sh", spec); // quoted data: BASE allow -> CANDIDATE allow (no frame becomes opaque from text)
+});

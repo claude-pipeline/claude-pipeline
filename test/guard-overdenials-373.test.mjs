@@ -42,8 +42,14 @@ describe('#373 task 1: || | & between simple commands', () => {
     ['a join earlier on its own line', `true || false\n${P} && find . -delete`],
     ['a pipe earlier on its own line', `echo x | cat\n${P} && find . -delete`],
     ['a job earlier on its own line', `sleep 1 &\n${P} && find . -delete`],
+    ['#529 twin: the same chain without a `&>` (BASE allow, CANDIDATE allow)', `${P} && find . -delete`],
+    ['#529: a `&>` after the write: the cd and the write are one span, dash runs both in the child (BASE allow, CANDIDATE allow)', `${P} && find . -delete &>/dev/null`],
   ]);
   denies('joins', [
+    // #529: dash reads `cd D &>f && W` as `cd D &` (a child) then `>f && W`: W runs in the OLD directory, which the narrowing must not forget. Failure caught: `find . -delete` judged only in /home/u/proj while dash deletes from /home/u.
+    ['#529: a cd inside a `&>` span starts no chain past it (BASE allow, CANDIDATE deny)', `${P} &>/dev/null && find . -delete`],
+    ['#529: the same with `|| exit 1` (BASE allow, CANDIDATE deny)', `${P} &>/dev/null || exit 1; find . -delete`],
+    ['#529: the cd is in the span through its list (BASE allow, CANDIDATE deny)', `${P} && true &>>/tmp/l && find . -delete`],
     ['a cd after | (it may run in a subshell)', `a | ${P} && find . -delete`],
     ['a cd after || (it may be skipped)', `a || ${P} && find . -delete`],
     ['the cd is a stage of a pipeline', `${P} | true && find . -delete`],
@@ -288,4 +294,40 @@ describe('#373: a long line of each new shape stays linear', () => {
   timed('many unclosed openers', '( '.repeat(5000) + 'a');
   timed('many closers', ') '.repeat(5000));
   timed('many then words', 'if a; then '.repeat(2000));
+});
+
+// #529 (files guard): dash reads `A &>f` as `A &` then `>f`. A name a span assigns holds the assigned value INSIDE the span in every shell; after it dash may have kept the old value (a child ran the assignment), so a
+// later write through it is only known at run time. The target of the `&>` (and the redirects after it) is opened from the directory BEFORE the span in dash: the redirect rule already reads every directory of the line.
+describe('#529 files: a `&>` span', () => {
+  const PROT = ['.claude', 'settings.json'].join('/'); // (a protected file: the settings file of the user's claude folder)
+  denies('variable', [
+    ['assigned in the span, used after it (BASE allow, CANDIDATE deny)', 'D=/tmp/ok &>/dev/null; touch $D/f'],
+    ['assigned in the span, used after its end through && (BASE allow, CANDIDATE deny)', 'D=/tmp/ok && true &>/dev/null && touch $D/f'],
+    ['written inside the span and again after it (R1-B5 control: the write past the span stays refused)', 'D=/tmp/ok && touch "$D/f" &>/dev/null; cat "$D/x"; touch "$D/g"'],
+    ['a name built from the span name, written past the span end (R2-B1 control: refused from where its source is)', 'D=/tmp/ok && F="$D/r" && true &>/dev/null; echo "$D"; touch "$F"'],
+    ['a binder after the span end still reaches the write inside it (R2-F1: allowed on ab3e4d96, deny on main)', 'D=/tmp/ok && touch $D/f &>/dev/null; echo $D; read D'],
+    ['the same in a loop: the binder reaches the write above it (R2-F1)', 'for i in 1 2; do touch $D/f; D=/tmp/ok && true &>/dev/null; echo $D; read D; done'],
+    ['a binder after a plain reassignment past the span end still reaches the write inside it (R3-B1: allowed on 9babc0e4, deny on main)', 'D=/tmp/ok && touch $D/f &>/dev/null; echo $D; D=/tmp/ok; read D'],
+    ['a name built after the span from a span name, written past the span end (R3-F1: the closure hands it the source\'s index)', 'D=/tmp/ok &>/dev/null; F=$D/x; touch $F'],
+    ['a plain reassignment past the span end does not make the protected write inside it safe (R4-F1: allowed on 6ae30671, deny on main)', `F=settings.json && cp x ~/${PROT.split('/')[0]}/$F &>/dev/null; F=safe; echo $F`],
+    ['the same, the reassignment last (R4-F1)', `F=settings.json && cp x ~/${PROT.split('/')[0]}/$F &>/dev/null; echo $F; F=safe`],
+    ['a protected round directory by a span name (BASE deny, CANDIDATE deny: control, the reason changes)', `F=22 &>/dev/null; echo '{}' > ${['.review', 'round-'].join('/')}$F/x.json`],
+  ]);
+  allows('variable', [
+    ['the same assignment without a `&>` (BASE allow, CANDIDATE allow)', 'D=/tmp/ok; touch $D/f'],
+    ['used inside the span (BASE allow, CANDIDATE allow)', 'D=/tmp/ok && touch $D/f &>/dev/null'],
+    ['a safe write inside the span, the name reassigned and read past it (R4-F1 control: allow on main and now)', 'F=notes.txt && cp x /tmp/$F &>/dev/null; F=safe; echo $F'],
+    ['used inside the span, read again after it (R1-B5: allow; deny on 49ca2b80, where a later read made the name unknown for the whole line)', 'D=/tmp/ok && touch "$D/f" &>/dev/null; echo "$D"'],
+    ['a name built from the span name, used inside the span, the source read again after it (R2-B1: allow; deny on ab3e4d96, where the derived name was unknown for the whole line)', 'D=/tmp/ok && F="$D/result" && touch "$F" &>/dev/null; echo "$D"'],
+  ]);
+  denies('target', [ // (controls: BASE deny, CANDIDATE deny; the redirect rule reads every directory of the line, which covers both readings of where the `&>` target is opened)
+    ['bash opens child/FILE, dash ./FILE: cwd is the protected folder', `cd child && : &>${PROT.split('/')[1]}`, { cwd: '/home/u/.claude' }],
+    ['the redirect after the `&>` target', `cd child && : &>/dev/null >${PROT.split('/')[1]}`, { cwd: '/home/u/.claude' }],
+    ['the protected file is in the directory the cd leads to', `cd /home/u/.claude && : &>${PROT.split('/')[1]}`],
+    ['a spelled protected path', `: &>~/${PROT}`],
+  ]);
+  allows('target', [
+    ['only /dev/null (BASE allow, CANDIDATE allow)', 'cd child && : &>/dev/null'],
+    ['a relative target away from the protected folder (BASE allow, CANDIDATE allow)', 'cd /tmp/c && : &>report'],
+  ]);
 });

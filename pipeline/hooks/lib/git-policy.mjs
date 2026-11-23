@@ -2145,7 +2145,7 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
   };
   // (the command surely runs in this shell whenever the body reaches it: after `;` (first of its list), at the loop's own loop depth (a loop inside the body may run zero times), not in a branch, a function or
   // trap body, not negated, not a pipeline stage or in the background, no redirection that can fail on it, and every level between the loop and it entered by `;` (not behind && / || / &: `false && eval 'cd d'`))
-  const surelyHere = (x, k) => x.sep === ';' && !x.ctl?.cond && !x.ctl?.fn && !x.ctl?.trap && x.negated !== true && x.bg !== true && x.pipe !== true
+  const surelyHere = (x, k) => x.sep === ';' && !x.ctl?.cond && !x.ctl?.fn && !x.ctl?.trap && x.negated !== true && x.bg !== true && x.maybeBg !== true && x.pipe !== true
     && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&' && redirectsFirm(x.redirects) && (x.loops?.length ?? 0) <= ownLoops
     && (x.up ?? []).slice(ownUp.length).every((u) => u.sep === ';' && u.kind !== 'sub' && !u.proc && entered(u, k));
   // (`continue N` goes on with the loop N levels out, counted from the command's own; a count that is not a plain number may reach any)
@@ -2170,7 +2170,7 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
     // not started by a wrapper or in a process of its own, not chdir (no builtin in bash), no redirection that may fail it, not a pipeline stage or in the background, in the first's own level; and neither is
     // negated (`! cd a && cd b`: b runs only when a failed). Else the general rule keeps a as a place the body may end in.)
     const surely = (x, k) => !elsewhere(x) && baseName(x.argv[0]) !== 'chdir' && redirectsFirm(x.redirects) && !x.ctl?.cond
-      && x.negated !== true && x.bg !== true && x.pipe !== true && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&'
+      && x.negated !== true && x.bg !== true && x.maybeBg !== true && x.pipe !== true && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&'
       && (x.loops?.length ?? 0) === (c.loops?.length ?? 0) && (x.up?.length ?? 0) === (c.up?.length ?? 0) && (x.up ?? []).every((u, m) => c.up[m] === u);
     if (sure && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && surely(next, j + 1)) {
       const after = moved.map((d) => (next.extCd === true ? null : nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {})));
@@ -3386,7 +3386,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       const op = own.sep === '|' ? ((deeper ? own.lead : own.pipeLead) ?? ';') : own.sep; // (a level's entry holds it as `lead`, a command as `pipeLead`: see emit)
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
-      if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
+      if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !c.maybeBg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
         if (!deeper) return exits(x);
         // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
         // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
@@ -3403,12 +3403,44 @@ function evalString(str, startDir, ctx, level, child = false) {
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
   };
+  // (#529: the spans a `&>` / `&>>` may have made a background job (dash reads `A && B &>f` as `A && B &` then `>f`: shell-parse's maybeBg / maybeBgEnds). Each open span is { end: the index of the command that carries the `&>`, changed: a command
+  // of it may have changed what the walk holds (the directory, a branch, an alias, a variable) }. Inside it the walk goes on as before (`cd d && P &>/dev/null`: P sees the cd in every shell). At the first command past its end, what the span
+  // changed is "ran here" in one shell and "ran in a child" in the other: UNKNOWN (settleSpan), never reverted, never certain. Kept apart from the trackers: an unconditional tracker is dropped at the next `;` without forgetting
+  // anything, and the list is no part of snap / restore, so a level that closes does not drop it.)
+  const spans = [];
+  const settleSpan = (sp) => {
+    if (sp.changed) {
+      if (sp.moved) dir = null; // (R1-B4: only a span that moved the directory loses it: one that switched a branch or assigned a name keeps it)
+      forgetNames(sp.every); // (the branches: every one when a git command may have moved it, else the names recorded)
+      aliasesUnsure(sp.al);
+    }
+    for (const k of sp.names) { delete ctx.vars[k]; ctx.unsureVars.add(k); }
+  };
+  // (the spans that end before command i are settled; the spans command c is in are opened. A walk that ends settles the rest: its caller shares the state)
+  const settleSpans = (i) => {
+    let names = false;
+    for (let k = 0; k < spans.length;) {
+      if (spans[k].end >= i) { k++; continue; }
+      const sp = spans.splice(k, 1)[0];
+      if (sp.changed || sp.names.size > 0) { settleSpan(sp); names ||= sp.names.size > 0; }
+    }
+    return names;
+  };
+  const openSpans = (c, i) => {
+    if (c.maybeBgEnds === undefined) return;
+    for (const end of c.maybeBgEnds) if (end >= i && !spans.some((sp) => sp.end === end)) spans.push({ end, dir, changed: false, moved: false, every: false, names: new Set(), al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
+  };
+  const noteSpans = (c, i, { changed, moved = false, every = false, names = [] }) => {
+    if (!changed && names.length === 0) return;
+    for (const sp of spans) if (sp.end >= i && c.maybeBgEnds?.includes(sp.end)) { if (changed) { sp.changed = true; sp.moved ||= moved; sp.every ||= every; } for (const k of names) sp.names.add(k); }
+  };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
   // (#609 R1: one mark for the whole evaluation: a walked text defines / aliases / disables `exit` or exports a function (a child shell inherits it), so a written `exit` may not end the shell and no forget is deferred)
   if (hazard || cmds.some((c) => c.argv.length > 1 && baseName(c.argv[0]) === 'export' && c.argv.slice(1).some((a) => /^-[a-zA-Z]*f/.test(a)))) ctx.budget.exitMayBeRedefined = true; // (on the shared budget: a startup file is judged on a copy of ctx, and its mark must reach the script)
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
   const dirAt = new Map();
+  const altDirs = new Map(); // (#529: command index -> the directories its `&>` / `&>>` target and the redirects after it may ALSO be opened from: dash opens them in the directory before the span, see openSpans)
   const cdDirs = cdTargets(cmds, startDir, ctx);
   const frame = newWriteFrame(cmds, {
     text: str,
@@ -3422,12 +3454,13 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (path.isAbsolute(e)) return [path.resolve(e)];
       if (!dirAt.has(idx)) return [...cdDirs.map((d) => path.resolve(d, e)), e];
       const d = dirAt.get(idx);
-      return d ? [path.resolve(d, e)] : [e];
+      const alt = (altDirs.get(idx) ?? []).map((a) => (a ? path.resolve(a, e) : e));
+      return [...(d ? [path.resolve(d, e)] : [e]), ...alt];
     },
     isAbs: path.isAbsolute, p: path, ci: process.platform === 'win32' || process.platform === 'darwin',
     real: (q) => realLocation(ctx.realpath, q),
     readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
-    stamp: (idx) => (dirAt.has(idx) ? `S${dirAt.get(idx)}` : ''), // (locate() answers differently once the command's directory is known)
+    stamp: (idx) => (dirAt.has(idx) ? `S${dirAt.get(idx)}${(altDirs.get(idx) ?? []).map((a) => `|${a}`).join('')}` : ''), // (locate() answers differently once the command's directory is known)
     tick: () => checkDeadline(ctx.budget),
   });
   ctx.writeFrames.push(frame);
@@ -3521,6 +3554,12 @@ function evalString(str, startDir, ctx, level, child = false) {
     const c = cmds[i];
     if (chdirBase !== undefined) { dir = chdirBase; chdirBase = undefined; }
     const argv = c.argv;
+    // (#529: the spans that ended before this command are settled, the ones it is in opened. A variable a span assigned is unsure from here on: a command that reads it is refused, as for one a sourced file may have set)
+    if (spans.length > 0 && settleSpans(i)) {
+      const unsure = unsureVarReachingCommand(cmds.slice(i), ctx);
+      if (unsure !== null) return deny(`$${unsure} was assigned by a command that dash may run in a background child (\`&>\` is read as \`&\` then \`>\`), so its value at run time cannot be verified. Use it inside that command, or write the value out.`);
+    }
+    openSpans(c, i);
     // Why: a cd inside a subshell ($( ), ( ), backticks, <( ), a text a new process runs: bash -c, a shell fed on stdin) moves that process only: when it ends, the line goes on in the directory it had when it started,
     // whatever the commands are named (superpowers' task-brief finds its helper with `$(cd "$(dirname "$0")" && pwd)` and then goes on where it was). A branch switched in it is the repository's, so it stays switched,
     // or unknown when the switch may not have run. A change in this shell's own level (eval, source, a { } group the line may not enter) is unknown after it: the level itself may not have run; a { } group the
@@ -3575,13 +3614,16 @@ function evalString(str, startDir, ctx, level, child = false) {
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
     if (c.chdir !== undefined) { chdirBase = dir; dir = c.chdir === null || dir === null ? null : joinDir(dir, c.chdir, ctx); }
+    const dirBefore = dir; // (#529: a span command that moves the walk's own directory changed something, see spans)
+    const varsBefore = c.maybeBg === true && argv.length > 0 ? { vars: { ...ctx.vars }, unsure: new Set(ctx.unsureVars) } : null;
     frame.i = i;
     dirAt.set(i, dir);
+    if (c.maybeBgEnds !== undefined && (c.redirects ?? []).some((r) => r.op === '&>' || r.op === '&>>')) { const alts = spans.filter((sp) => sp.end === i && sp.dir !== dir).map((sp) => sp.dir); if (alts.length) altDirs.set(i, alts); } // (#529: the span moved the directory: dash opens the target from where it was before)
     // (#352 R35-F2: the closer of a { } group is listed as a command of no words in it, after its last one: a redirection on it that can fail (`{ cd d; } < /missing`) fails the group before it runs, so what
     // the group changed is not handed on as certain when it ends (see the brace rule above))
     if (isCloser(c) && levels?.length && c.up.length && !redirectsFirm(c.redirects)) levels[levels.length - 1].doubt = true;
     if (writesUnderGit(frame, i)) forgetBranches(ctx); // (#506: a write below a .git directory may move HEAD: the branch of every repository is unknown from here on)
-    if (!argv.length) { recordAssigned(c, ctx, level); continue; } // a bare `NAME=value`
+    if (!argv.length) { recordAssigned(c, ctx, level); if (c.maybeBg === true) noteSpans(c, i, { names: Object.keys(c.env ?? {}) }); continue; } // a bare `NAME=value`
     const name = baseName(argv[0]);
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
@@ -3692,9 +3734,16 @@ function evalString(str, startDir, ctx, level, child = false) {
     }
     if (verdict && verdict.decision === 'deny') return verdict;
     const changedState = argv.length > 0 && stateChanged(ctx, before);
+    if (varsBefore) {
+      const names = [];
+      for (const k of new Set([...Object.keys(varsBefore.vars), ...Object.keys(ctx.vars)])) if (varsBefore.vars[k] !== ctx.vars[k]) names.push(k);
+      for (const k of ctx.unsureVars) if (!varsBefore.unsure.has(k)) names.push(k);
+      noteSpans(c, i, { changed: changesStateWords || changedState || dir !== dirBefore, moved: dir !== dirBefore || (DIR_CHANGERS.includes(name) && !childCd), every: changedState || (changesStateWords && name === 'git'), names });
+    }
     if (argv.length > 0 && (changesStateWords || changedState)) {
-      const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd));
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir', redir: how === 'redir', and: c.sep === '&&', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
+      const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
@@ -3727,6 +3776,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     else forgetBranches(ctx);
   }
   if (pendingForget) forgetBranches(ctx);
+  for (const sp of spans.splice(0)) if (sp.changed || sp.names.size > 0) settleSpan(sp); // (#529: the text ends inside a span: its caller shares the state)
   // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop (#615: a body can leave early: break / continue / return / exit) made may not either; when the text ends nothing
   // after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text ends in: as if a command after `;` followed, it is forgotten
   // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). (#615: none is kept)
@@ -3761,6 +3811,43 @@ function certainChange(cmds, c, trusted, moves = true) {
   // and is not settled by a `;`. Redirected in a body keeps today's reading: unknown at once)
   if (moves && !redirectsFirm(c.redirects)) return inBody ? null : 'redir';
   return inBody ? 'chain' : 'certain';
+}
+
+// #662: `echo x | git switch agent/y && P`. A branch switch changes the repository, not the shell, so that the last stage of a pipeline is a subshell does not matter: what matters is that it SUCCEEDED (the `&&` after the
+// pipeline runs P only then, with or without pipefail: the status of a pipeline is its last stage's) and that nothing else of the pipeline or before it can still move HEAD. Everything not listed is today's answer: unknown.
+// The pipeline is the parser's record (pipeRec, on the last stage). ALL must hold: only `|` (no `|&`: a ksh coprocess / bash both-streams), no wrapper stripped, led by `;` or the start of the text, nothing negated, in the
+// background, in a subshell, a group, a level or a loop / branch / function body from the pipeline's start to the switch; the switch is exactly `git switch B`, the command word plain `git` (R1-B2: no path, no `./`) and no branch is created (R1-B1: `-c` / `-b` stay unknown, as on main; a one-operand
+// `git checkout NAME` can restore a deleted tracked file and leave HEAD: #789); every other command of the pipeline (substitutions inside the stages included) is a plain reader of data (PIPE_INERT) with no redirect but fd
+// dups and /dev/null and no process substitution; and, in the TOP-LEVEL text only, no earlier command of the text can have left work running (a background job, a coprocess, a launcher, a script / shell / interpreter run,
+// a function call, source, eval: #762 is the same race for an unpiped switch).
+const PIPE_INERT = new Set(['echo', 'printf', 'cat', 'true', 'yes', 'seq']);
+const PIPE_RUNNERS = new Set(['bash', 'sh', 'zsh', 'dash', 'ksh', 'fish', 'source', '.', 'eval', 'exec', 'nohup', 'setsid', 'disown', 'timeout', 'screen', 'tmux', 'at', 'batch', 'xargs', 'parallel', 'env', 'coproc', 'node', 'python', 'python3', 'ruby', 'perl', 'php', 'deno', 'bun', 'npx', 'npm', 'pnpm', 'yarn', 'make', 'sudo', 'nice', 'ionice', 'stdbuf', 'watch', 'command', 'builtin', 'time']);
+const dupOrNull = (r) => typeof r.target === 'string' && (r.target === '/dev/null' || /^&(?:\d+|-)$/.test(r.target)) && r.op !== '&>' && r.op !== '&>>';
+function pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) {
+  const rec = c.pipeRec;
+  if (!rec || !trusted || level !== 0 || child === true || cmds.truncated || cmds.ctlBroken || rec.pending || rec.wrapped || !rec.ops.every((o) => o === '|')) return false;
+  if (nextSep(cmds, i) !== '&&' || c.depth > 0 || (c.pipeLead ?? ';') !== ';') return false;
+  if (c.argv.length !== 3 || c.argv[0] !== 'git' || Object.keys(c.env ?? {}).length > 0 || (c.redirects ?? []).length > 0) return false;
+  const [, sub, a] = c.argv;
+  const name = sub === 'switch' ? a : null;
+  if (name === null || !/^[A-Za-z0-9_][\w./@+-]*$/.test(name)) return false;
+  const seg = cmds.slice(rec.from, i + 1);
+  if (seg[seg.length - 1] !== c) return false;
+  for (const x of seg) {
+    if (x.bg || x.maybeBg || x.paren || x.spawn || x.wrapped || x.negated || (x.up ?? []).length > 0 || Object.values(x.ctl ?? {}).some(Boolean)) return false;
+    if (x === c) continue;
+    const n = x.argv.length ? baseName(x.argv[0]) : '';
+    const words = [...x.argv, ...(x.redirects ?? []).map((r) => r.target ?? '')];
+    if (!PIPE_INERT.has(n) || Object.keys(x.env ?? {}).length > 0 || words.some((w) => /[<>]\(/.test(String(w))) || !(x.redirects ?? []).every(dupOrNull)) return false;
+    if (n === 'printf' && x.argv.slice(1).some((w) => /^-v/.test(w))) return false;
+    if (n === 'cat' && x.argv.slice(1).some((w) => !w.startsWith('-'))) return false;
+  }
+  for (const x of cmds.slice(0, rec.from)) { // (the earlier work, any depth)
+    const n = x.argv.length ? baseName(x.argv[0]) : '';
+    if (x.bg || x.maybeBg || x.spawn || x.wrapped || x.fan || PIPE_RUNNERS.has(n) || cmds.fns?.has(n) || (x.argv.length && x.argv[0].includes('/')) || scriptFileOf(x.argv, x.raw, str)) return false;
+    if ([...x.argv, ...(x.redirects ?? []).map((r) => r.target ?? '')].some((w) => /[<>]\(/.test(String(w)))) return false;
+  }
+  return true;
 }
 
 // Why (#84): text too long to parse inside the time budget is refused whatever it says. Judging it by the guarded words it

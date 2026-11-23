@@ -1352,3 +1352,28 @@ test('T4: a brace body after for / select / repeat / foreach (no do) is not trus
     assert.ok(!simpleCommands(line).ctlBroken, `${JSON.stringify(line)}: marks refused`);
   }
 });
+
+// #529: dash / Debian sh / ash read `A && B &>f` as `A && B &` then `>f`. maybeBg marks every command of the and-or list up to AND INCLUDING the one that carries the `&>` (never `bg`: bash reads a redirect); maybeBgEnds says where
+// the span ends, so a reader tells "inside" from "after" (C in `A && B &>f && C` is not in it). Failure caught: a reader that treats the cd of `cd d &>/dev/null && P` as certain for P, or marks the commands after the span.
+// A word after the target (an assignment word too) is a different command in the two readings: the parse is cut short (truncated).
+test('#529: `&>` / `&>>` mark the and-or list up to the command that carries it as maybeBg, with the end of the span; a word after the target is refused', () => {
+  const marks = (s) => simpleCommands(s).map((c) => [c.argv.join(' '), c.maybeBg === true, c.maybeBgEnds ?? null, c.bg === true]);
+  assert.deepEqual(marks('cd X && P &>/dev/null && C'), [['cd X', true, [1], false], ['P', true, [1], false], ['C', false, null, false]]);
+  assert.deepEqual(marks('cd X; P &>>/tmp/l'), [['cd X', false, null, false], ['P', true, [1], false]]);
+  assert.deepEqual(marks('a &>f && b &>g; c'), [['a', true, [0, 1], false], ['b', true, [1], false], ['c', false, null, false]]); // two spans: each settles at its own end
+  assert.deepEqual(marks('{ cd X; } &>/dev/null; P'), [['cd X', true, [1], false], ['', true, [1], false], ['P', false, null, false]]); // a group closed by the redirect is the whole span
+  assert.deepEqual(marks('cd X & P'), [['cd X', false, null, true], ['P', false, null, false]]); // a real `&` is bg, not maybeBg
+  assert.equal(simpleCommands('cd X &>/dev/null').truncated, false);
+  for (const line of ['cd X &>/dev/null foo', 'x=1 &>/dev/null F=22', 'cd X &>>f g']) assert.equal(simpleCommands(line).truncated, true, line);
+});
+
+// #662: the pipeline record on the command of the LAST stage. Failure caught: a switch judged "proven" in a pipeline whose stages the parser could not tell apart (a `|&`, a wrapper, a stage that is a group, a heredoc that waits).
+test('#662: pipeRec names the stages, the operators and wrappers of a pipeline; none when the parser cannot tell', () => {
+  const rec = (s) => { const out = simpleCommands(s); const c = out.find((x) => x.pipeRec); return c ? { last: c.argv.join(' '), from: c.pipeRec.from, ops: c.pipeRec.ops, wrapped: c.pipeRec.wrapped, stages: c.pipeRec.stages.map((st) => st.map((y) => y.argv.join(' '))) } : null; };
+  assert.deepEqual(rec('a; echo x | cat | git switch b && P'), { last: 'git switch b', from: 1, ops: ['|', '|'], wrapped: false, stages: [['echo x'], ['cat'], ['git switch b']] });
+  assert.deepEqual(rec('echo x |& git switch b').ops, ['|&']);
+  assert.equal(rec('command echo x | git switch b').wrapped, true);
+  assert.equal(rec('echo "$(git checkout main)" | git switch b').from, 0); // the commands of a first-stage substitution come out BEFORE the stage: they are inside [from, last]
+  assert.equal(simpleCommands('echo "$(git checkout main)" | git switch b')[0].argv.join(' '), 'git checkout main');
+  for (const line of ['echo x | { git switch b; } && P', 'cat <<EOF | git switch b && P\nbody\nEOF', 'echo x', '(echo x) | git switch b']) assert.equal(rec(line), null, line);
+});

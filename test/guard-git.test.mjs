@@ -1845,6 +1845,114 @@ test('directory / branch / variable state from a command that may not have run i
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });
 
+// #529: dash / Debian sh / ash read `A && B &>f` as `A && B &` (a background job) and then `>f`; bash / zsh / ksh read a redirect. What a command of such a span changed (the directory, a branch, a variable) is
+// "ran here" in one shell and "ran in a child" in the other: unknown after the span, never certain. Failure caught: a push judged on the branch of a directory the dash reading never moved to (a push of main from the
+// main checkout after `cd /work/repo &>/dev/null && git push`). Each row: BASE verdict (610b504c) -> CANDIDATE verdict.
+test('#529: what a `&>` / `&>>` span changed is unknown after the span, certain inside it', () => {
+  const o = { byDir: { '/work/main': 'main', '/work/repo': 'agent/x', '/work/repo2': 'agent/x' }, cwd: '/work/main', labels: [] };
+  const P = 'git push';
+  const newDeny = [ // allow -> deny
+    `cd /work/repo &>/dev/null && ${P}`,
+    `cd /work/repo &>>/tmp/l && ${P}`,
+    `cd /work/repo &>/dev/null || exit 1; ${P}`, // the `|| exit` proves nothing for a cd that may have run in a child
+    `dash -c 'cd /work/repo &>/dev/null && ${P}'`,
+    `sh -c 'cd /work/repo &>/dev/null && ${P}'`,
+    `cd /work/repo &>/dev/null && git status && ${P}`,
+    `git switch agent/y && : &>/dev/null; ${P}`, // a branch switch in the span
+  ];
+  for (const c of newDeny) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const controlDeny = [ // deny -> deny (the buggy reading is already refused on base: they guard the new rule against an overbroad allowance)
+    `cd /work/repo &>/dev/null; ${P}`,
+    `cd /work/main && cd /work/repo &>/dev/null; ${P}`,
+    `{ cd /work/repo; } &>/dev/null; ${P}`,
+    `{ cd /work/repo; :; } &>/dev/null; ${P}`,
+    `cd /work/repo &>/dev/null && : ; cd /work/repo2 &>/dev/null; ${P}`,
+    `cd /work/repo &>/dev/null foo; ${P}`, // a word after the target: deny on base for the unknown directory, now because the parser gives up (truncated)
+    `x=1 &>/dev/null F=22; ${P}`,
+  ];
+  for (const c of controlDeny) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const allow = [ // allow -> allow
+    'git push origin agent/x &>/dev/null',
+    `cd /work/repo && ${P} &>/dev/null`, // inside the span the cd reaches the push in every shell
+    `git switch agent/y && ${P} &>/dev/null`,
+    `sleep 1 &>/dev/null; cd /work/repo && ${P}`, // the span changed nothing
+    "bash -c 'make &>/dev/null; echo done'",
+    `cd /work/repo &>/dev/null; git status`,
+  ];
+  for (const c of allow) assert.equal(evaluate(c, o).decision, 'allow', c);
+  // R1-B4: a span that only assigned a name keeps the directory (a push from a feature branch with a safe destination). allow after the fix, deny on 49ca2b80 (the span forgot the directory)
+  const feature = { branch: 'agent/x', pushDest: 'origin/agent/x', labels: [] };
+  for (const c of ['MSG=done && echo "$MSG" &>build.log; ' + P, 'export X=1 && make &>/dev/null; ' + P]) assert.equal(evaluate(c, feature).decision, 'allow', c);
+  // a variable: the shell takes the value inherited (B=main) in dash, the assigned one in bash. allow -> deny after the span; inside the span both read the assignment (allow -> allow)
+  const env = { ...process.env, B: 'main' };
+  const withEnv = (c) => evaluateGitCommand(c, { cwd: '/work/repo', home: '/home/u', env, currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false });
+  assert.equal(withEnv('B=agent/x &>/dev/null; git push origin HEAD:$B').decision, 'deny');
+  assert.equal(withEnv('B=agent/x && git push origin HEAD:$B &>/dev/null').decision, 'allow');
+});
+
+// #662: a branch switch in the LAST stage of a pipeline, proven by the `&&` after the pipeline (the status of a pipeline is its last stage's, with or without pipefail). Failure caught: a push judged on the branch of
+// a switch that did not happen, or that something else of the line moved on (an earlier background job, a one-operand `git checkout NAME` that restored a file). Each row: BASE -> CANDIDATE.
+test('#662: `echo x | git switch B && P` is proven by the &&; every other shape of a switch in a pipeline stays unknown', () => {
+  const files = { '/work/main/s.sh': 'echo x | git switch agent/y && git push\n', '/work/main/helper.sh': 'git checkout main &\n' };
+  const abs = Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
+  const o = { byDir: { '/work/main': 'main', '/work/repo': 'agent/x' }, cwd: '/work/main', labels: [], readText: (p) => abs[resolve(p)] ?? null, pathExists: (p) => resolve(p) in abs };
+  const P = 'git push';
+  const newAllow = [ // BASE deny -> CANDIDATE allow
+    `echo x | git switch agent/y && ${P}`,
+    `set -o pipefail; echo x | git switch agent/y && ${P}`, // both readings give the same answer: no pipefail tracking
+    `echo x | git switch agent/y && echo ok && ${P}`,
+  ];
+  for (const c of newAllow) assert.equal(evaluate(c, o).decision, 'allow', c);
+  const controls = [ // BASE deny -> CANDIDATE deny: they guard the new allowance
+    `echo x | git checkout agent/y && ${P}`, // one operand: may restore a file and leave HEAD (#789)
+    `git checkout main & sleep 1; echo x | git switch agent/y && ${P}`, // an earlier background writer
+    `git checkout main &>/dev/null; echo x | git switch agent/y && ${P}`,
+    `sleep 1 & echo x | git switch agent/y && ${P}`, // any earlier job withholds the proof (an accepted over-refusal)
+    `echo x |& git switch agent/y && ${P}`,
+    `command echo x | git switch agent/y && ${P}`, // a wrapper
+    `echo "$(git checkout main)" | git switch agent/y && ${P}`, // a substitution in the first stage
+    `cat <<EOF | git switch agent/y && ${P}\nbody\nEOF`, // a heredoc waits: no record
+    `bash helper.sh; echo x | git switch agent/y && ${P}`, // a returned helper that left a job
+    `cat <(git checkout main); echo x | git switch agent/y && ${P}`,
+    `nohup git checkout main; echo x | git switch agent/y && ${P}`,
+    'bash s.sh', // no proof inside a nested text
+    `echo x | git switch agent/y; ${P}`,
+    `set -o pipefail; echo x | git switch agent/y; ${P}`,
+    `echo x | git switch agent/y && echo ok; ${P}`,
+    `echo x | git switch agent/y || exit 1; ${P}`,
+    `git switch agent/y | cat && ${P}`,
+    `git checkout main | git switch agent/y && ${P}`,
+    `bash s.sh | git switch agent/y && ${P}`,
+    `echo $(git checkout main) | git switch agent/y && ${P}`,
+    `echo x > >(git checkout main) | git switch agent/y && ${P}`,
+    `echo ref > .git/HEAD | git switch agent/y && ${P}`,
+    `echo x | cd /other && ${P}`,
+    `echo x | git switch agent/y & ${P}`,
+    // R1-B1 / R1-B2: a branch-creating switch and a command word that is not plain `git` get no proof (allow on 49ca2b80, deny now)
+    `echo x | git switch -c agent/z && ${P}`,
+    `echo x | cat | git switch -c agent/z && ${P}`,
+    `echo x | git checkout -b agent/z && ${P}`,
+    `echo x | ./tools/git switch agent/y && ${P}`,
+    // R1-F1: the closer of a loop / if / case as the stage before the switch: its body ran concurrently with it and is no "earlier work" the proof may skip (allow on 49ca2b80, deny now)
+    `while read l; do :; done | git switch agent/y && ${P}`,
+    `for i in 1; do gh pr checkout 5; done | git switch agent/y && ${P}`,
+    `if true; then :; fi | git switch agent/y && ${P}`,
+    `case x in x) :;; esac | git switch agent/y && ${P}`,
+    `echo x | git switch agent/y &>/dev/null && ${P}`,
+    `echo x | { git switch agent/y; } && ${P}`,
+    `true && echo x | git switch agent/y && ${P}`,
+    `! echo x | git switch agent/y && ${P}`,
+    `echo x | git switch -- f && ${P}`,
+    `echo x | git switch agent/y -- f && ${P}`,
+    `echo x | git symbolic-ref HEAD refs/heads/agent/y && ${P}`,
+    `echo x | git -C /work/repo switch agent/y && ${P}`,
+    `echo x | env git switch agent/y && ${P}`,
+    `echo x | git switch main && ${P}`, // the proven switch reaches main: refused for the protected branch, which only a proven switch can say
+  ];
+  for (const c of controls) assert.equal(evaluate(c, o).decision, 'deny', c);
+  assert.match(evaluate(`echo x | git switch main && ${P}`, o).reason, /main/);
+});
+
 // Background-scan finding on 4789b20 (state tracking): constructs that change where a later command runs, or what a
 // variable holds, without anything the walk follows. Each deny below pushes from the `main` checkout in a real shell.
 test('namerefs, function / alias / trap definitions, shell options and sourced files make the state unknown', () => {

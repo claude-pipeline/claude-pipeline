@@ -300,6 +300,8 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['straight line: switch with 2>/dev/null (R35 allow flipped)', `cd /work/other; git switch agent/x 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null; ${PB} origin HEAD`],
     ['straight line: cd back with >&2 (R35 allow flipped)', `cd /work/other; cd ${GIT_ROOT} >&2; ${PB} origin HEAD`],
+    // (#529: was an allow above. dash reads `cd D &>/dev/null && P` as `cd D &` then `>/dev/null && P`: the cd ran in a child, the push runs from the old directory)
+    ['straight line: cd back with &>/dev/null && push (#529: dash reads the cd as a background job)', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
     ['straight line: cd back with 2>/dev/null, then another command, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && true; ${PB} origin HEAD`],
   ]) {
     denies(what, line, {}, DIRS);
@@ -311,7 +313,6 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['cd back with 2>/dev/null || exit 1, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || exit 1; ${PB} origin HEAD`],
     ['cd back with 2>/dev/null && push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
     ['cd back with >&2 && push', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
-    ['cd back with &>/dev/null && push', `cd /work/other && cd ${GIT_ROOT} &>/dev/null && ${PB} origin HEAD`],
     ['failing redirection on the cd back, then && push', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
     ['failing redirection on the checkout, then && push', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
     ['cd back with 2>/dev/null || { exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { exit 1; }; ${PB} origin HEAD`],
