@@ -191,10 +191,10 @@ test('review round 1 B4: the ready window ends at the next converted_to_draft: a
   const pushed = [run(sha('d'), T('10:00', 40))];
   assert.deepEqual(classifyRuns({ pr, timeline: tl, commits: [], runs: pushed }).map((x) => x.class), ['push-while-draft']);
   assert.deepEqual(headPushes({ pr, timeline: tl, commits: [], runs: pushed }).map((h) => [h.kind, h.phase]), [['push', 'draft']]);
-  // ready run on sha 1 at 10:00:05; the redraft's own run on the same head at 10:00:40 is not part of the ready suite
+  // ready run on sha 1 at 10:00:05; the redraft's own run on the same head at 10:00:40 is not part of the ready suite, and no push (the head did not change): other
   const redraft = [run(sha('1'), T('10:00', 5)), run(sha('1'), T('10:00', 40), { conclusion: 'skipped' })];
   const classes = classifyRuns({ pr, timeline: tl, commits: [], runs: redraft }).map((x) => x.class);
-  assert.deepEqual(classes, ['ready-for-review', 'push-while-draft']);
+  assert.deepEqual(classes, ['ready-for-review', 'other']);
 });
 
 test('review round 1 B5: two heads first seen in the same second: the opening head is the lower run id whatever the input order', () => {

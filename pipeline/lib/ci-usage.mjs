@@ -171,8 +171,8 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
     else if (run.conclusion === 'cancelled' && updated !== null && events.some((e) => e.to === 'draft' && updated - e.t >= 0 && updated - e.t <= WINDOW_MS)) cls = 'converted-cancel';
     else if (Number(run.run_attempt) > 1) cls = 'rerun';
     else if (isReadyRun(events, readyBy, created, run.head_sha)) cls = 'ready-for-review';
-    // a run created well after its head's first run is no push (a reopened PR, a converted_to_draft run on the old head), and no opening or catch-up suite either
-    else if (created !== null && created - (firstOf.get(run.head_sha)?.t ?? created) > WINDOW_MS) cls = 'other';
+    // a run created well after its head's first run, or after a converted_to_draft that followed it, is no push (a reopened PR, the run of a redraft on the old head), and no opening or catch-up suite either
+    else if (created !== null && staleHead(events, firstOf.get(run.head_sha)?.t ?? created, created)) cls = 'other';
     else if (openingHeads.has(run.head_sha)) cls = 'opening';
     else if (catchups.has(run.head_sha)) cls = 'catch-up';
     else cls = prPhaseAt(timeline, pr, created) === 'ready' ? 'push-while-ready' : 'push-while-draft';
@@ -189,6 +189,9 @@ export function classifyRuns({ pr = null, timeline = null, commits = [], runs, j
     };
   });
 }
+
+// a run created at `t` on a head first seen at `first` did not come with a push of that head: 120 s have passed, or the PR was sent back to draft in between
+const staleHead = (events, first, t) => t - first > WINDOW_MS || events.some((e) => e.to === 'draft' && e.t > first && e.t <= t);
 
 // Per ready_for_review (by its time): the head of the earliest pull_request run created within 120 s after it, i.e. the head that event started. One ready event
 // exempts one head; a second head first seen in the same window is a push.
