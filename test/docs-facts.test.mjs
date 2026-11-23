@@ -233,7 +233,8 @@ test('extra-round discipline: the ask shows rounds, cost and severity; "follow u
   assert.match(merge, /With `recommend: extra-round` never offer the follow-up path/);
   assert.match(build, /ONE `implementer` dispatch builds the whole change/);
   assert.match(build, /continue THE SAME agent/);
-  assert.match(ref('cost-booking'), /booked ONCE, after its last leg/);
+  assert.match(ref('cost-booking'), /booked after EACH leg like any call/);
+  assert.ok(!/booked ONCE, after its last leg/.test(ref('cost-booking')));
   assert.ok(!/Split the work into small tasks/.test(build + skillMd()));
   const implementer = read('agents/implementer.md');
   assert.match(implementer, /the whole change of a PR \(or one part of a big one\)/);
