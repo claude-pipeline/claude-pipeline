@@ -196,3 +196,10 @@ test('review round 1 B4: the ready window ends at the next converted_to_draft: a
   const classes = classifyRuns({ pr, timeline: tl, commits: [], runs: redraft }).map((x) => x.class);
   assert.deepEqual(classes, ['ready-for-review', 'push-while-draft']);
 });
+
+test('review round 1 B5: two heads first seen in the same second: the opening head is the lower run id whatever the input order', () => {
+  const pr = { createdAt: T('09:00'), draft: false };
+  const a = run(sha('a'), T('09:00', 10)); // the opening head (lower id)
+  const b = run(sha('b'), T('09:00', 10)); // a fix pushed in the same second
+  for (const runs of [[a, b], [b, a]]) assert.deepEqual(pushedWhileReady({ pr, timeline: [], commits: [], runs }).heads.map((h) => h.sha), [sha('b')]);
+});

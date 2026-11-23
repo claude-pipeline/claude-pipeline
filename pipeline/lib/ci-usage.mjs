@@ -236,7 +236,7 @@ export function headPushes({ pr, timeline, commits = [], runs }) {
   const catchups = catchUpShas(commits, pr?.baseRef, pr?.baseRepo);
   const first = firstRuns(runs);
   const readyBy = readyHeads(events, runs);
-  const rows = [...first.entries()].sort((a, b) => a[1].t - b[1].t);
+  const rows = [...first.entries()].sort((a, b) => a[1].t - b[1].t || Number(a[1].run.id) - Number(b[1].run.id));
   const opened = ms(pr?.createdAt);
   return rows.map(([sha, { t }], i) => {
     let kind = 'push';
