@@ -310,3 +310,4 @@ full record.
 - 2026-11-23 · #748 · Finish an untriaged round before the next one after head-moved-since-round; show Fable the reviewed code (#551) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 606 runs (169 high)
 - 2026-11-23 · #781 · Live-DB approval block: "changes every row" warning, fail-closed (#655) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 630 runs (178 high)
 - 2026-11-23 · #785 · Cost booking: book a continued implementer per leg; vendor source tests skip only when shallow (#628, #599) · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge · Codex 7d: 640 runs (181 high)
+- 2026-11-23 · #787 · Follow-ups: pgTAP move content check, ci-wait predatesReady, verify test counts, clean-status retry (#643 #642 #644 #672) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 660 runs (192 high)
