@@ -599,6 +599,8 @@ const DESCRIBE_BASE = ['d', 'da', 'dA', 'dAc', 'dAf', 'dAo', 'dAp', 'db', 'dc', 
 const META_OK = new Set(['', '.', 'set', 'unset', 'echo', 'qecho', 'warn', 'pset', 'timing', 'x', 'a', 't', 'f', 'H', 'C', 'q', 'quit', 'if', 'elif', 'else', 'endif', 'conninfo', 'errverbose', 'gdesc', 'l', 'l+', 'list', 'list+', 'g', 'gx',
   ...DESCRIBE_BASE.flatMap((n) => [n, `${n}+`, `${n}S`, `${n}S+`, `${n}+S`])]);
 const SET_LINE = /^[ \t]*\\set[ \t]+[a-z][a-z0-9_]*(?:[ \t]+(?:[A-Za-z0-9_.-]+|'[A-Za-z0-9_ .,@/-]*'))?[ \t]*$/;
+// (the one upper-case name allowed, as `-v ON_ERROR_STOP` is: exactly this line and nothing else)
+const SET_ON_ERROR_STOP = /^[ \t]*\\set[ \t]+ON_ERROR_STOP[ \t]+(?:on|off|1|0|true|false)[ \t]*$/;
 const SQL_WORDS = ['program', 'dblink', 'fdw', 'plpython', 'plperlu', 'pltclu', 'plsh'];
 const isMetaSpace = (ch) => ch === ' ' || ch === '\t' || ch === '\f' || ch === '\v';
 const isAlpha = (ch) => (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z');
@@ -630,7 +632,7 @@ export function psqlTextRefusal(text, { host = false } = {}) {
       if (!META_OK.has(name)) return `the meta-command \`\\${name}\` on line ${n + 1} is not on the allow-list`;
       if ((name === 'g' || name === 'gx') && line.slice(j).trim() !== '') return `\`\\${name}\` with text after it on line ${n + 1}`;
       if (name === 'pset' && line.slice(j).trimStart().toLowerCase().startsWith('p')) return `\`\\pset\` of a pager setting on line ${n + 1}`;
-      if (name === 'set' && !SET_LINE.test(line)) return `a \`\\set\` on line ${n + 1} that is not \`\\set <name> [<plain value>]\``;
+      if (name === 'set' && !SET_LINE.test(line) && !SET_ON_ERROR_STOP.test(line)) return `a \`\\set\` on line ${n + 1} that is not \`\\set <name> [<plain value>]\``;
       bs = line.indexOf('\\', j);
     }
   }

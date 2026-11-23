@@ -144,7 +144,7 @@ test('docker psql: a SQL file with any meta-command outside the allow-list, raw 
   dockerConfig(null);
   const bad = [
     '\\c other\n', '\\connect other\n', '\\i x.sql\n', '\\ir x.sql\n', '\\! id\n', '\\o out.txt\n', '\\copy t from x\n', '\\gset\n', '\\setenv X 1\n', '\\encoding SJIS\n',
-    "\\set x '\\\\c y'\n", "\\set x ':y'\n", "\\set X 1\n", '\\echo `id`\n', 'select :uid;\n', 'select :LAST_ERROR_MESSAGE;\n', 'select 1;\rselect 2;\n', 'select 1;\0\n',
+    "\\set x '\\\\c y'\n", "\\set x ':y'\n", "\\set X 1\n", '\\set ON_ERROR_STOP :foo\n', "\\set ON_ERROR_STOP 'x y'\n", '\\set ON_ERROR_STOP on now\n', '\\set ON_ERROR_STOP ON\n', '\\echo `id`\n', 'select :uid;\n', 'select :LAST_ERROR_MESSAGE;\n', 'select 1;\rselect 2;\n', 'select 1;\0\n',
     '\\pset pager on\n', '\\g out.txt\n', "copy t from program 'x';\n", 'create extension dblink;\n', '/* a\n-- */ \\c x\n', '$$ a\n-- $$ \\c x\n',
     'select 1:::uid;\n', "\\set x 'a' b\n", 'select 1; \\if \\c x\n',
     Buffer.from([0x73, 0xff, 0x0a]), Buffer.concat([Buffer.from([0xef, 0xbb, 0xbf]), Buffer.from('select 1;\n')]),
@@ -159,6 +159,7 @@ test('docker psql: a SQL file with any meta-command outside the allow-list, raw 
   mustAllow(DOCKER_FILE);
   sql('select 1::int;\n');
   mustAllow(DOCKER_FILE);
+  for (const v of ['on', 'off', '1', '0', 'true', 'false']) { sql(`\\set ON_ERROR_STOP ${v}\nselect 1;\n`); mustAllow(DOCKER_FILE); }
   // the same checks apply to -c
   mustRefuse("docker exec supabase_db_x psql -X -c '\\c other'");
   mustRefuse("docker exec supabase_db_x psql -X -c 'select :uid'");
