@@ -2755,6 +2755,7 @@ class Parser {
         // >&2 / 2>&1 duplicate a descriptor: the target is recorded as &2 / &1 so it is not mistaken for a file name
         const dup = (rop === '>&' || rop === '<&') && /^(?:[0-9]+|-)$/.test(text);
         seg.redirects.push({ op: rop, target: dup ? '&' + text : text, fd: rfd });
+        if (rop === '&>' || rop === '&>>') seg.ampDone = true; // (#529: the words after the target of a `&>` are read differently by the shells, see below)
         if (subs.length && text.startsWith('>(')) seg.outSubs.push(subs); // `cat f > >(bash)`: the substitution's commands read what this command writes
         // Why: `exec 3< f.sh; bash <&3`: a descriptor opened from a file earlier on the line (or a `{fd}<` named one) is read by the shell that gets it as stdin
         if ((rop === '<' || rop === '<>') && ((rfd !== null && rfd !== 0) || (rfd === null && seg.words[seg.words.length - 1]?.fdRedir === true))) {
@@ -2892,6 +2893,8 @@ class Parser {
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
+      // (#529: a word (an assignment word too) after the target of a `&>` / `&>>`: dash reads `cmd &>f word` as `cmd &` and then `>f word`, a command of its own that runs HERE, bash as one command `cmd word` with a redirect. The commands differ: refused)
+      if (seg.ampDone === true) ctx.truncated = true;
       seg.words.push({ text, qa: q, bm: marks, dyn, subs, win, pat, one, fdRedir: fdw }); // (fdRedir: a `{fd}>file` redirect prefix, no command word: see finalizeGroup, R19-F2)
     };
     const endSeg = (idx) => {
@@ -2904,8 +2907,11 @@ class Parser {
       this.lastStage = seg.groupStage ?? [seg];
       this.lastStageParen = false;
       lastNeg = segNeg(seg);
+      // (#529: a `&>` / `&>>` in this segment: dash may read it as a `&` that backgrounds the whole and-or list up to here, see markMaybeBg. Taken before the segment is finished: a group closer's list starts where the group began)
+      const ampFrom = seg.amp === true ? (seg.closesFrom !== undefined ? Math.min(this.lastClosePS, this.pipeStart) : this.pipeStart) : -1;
       seg = null;
       this.drain(false);
+      if (ampFrom >= 0) this.markMaybeBg(ampFrom);
     };
 
     while (this.i < n && !ctx.stopped) {
@@ -3051,6 +3057,7 @@ class Parser {
         else if (nx === '>' && !noRedir) {
           flushWord(); startSeg();
           redir = 'file'; rfd = null;
+          seg.amp = true; // (#529: see markMaybeBg)
           if (s[this.i + 2] === '>') { rop = '&>>'; this.i += 3; } else { rop = '&>'; this.i += 2; }
         }
       } else if (c === '|') {
@@ -3453,6 +3460,22 @@ class Parser {
   markBackground(from) {
     if (this.queue.length) this.ctx.ctlBroken = true;
     for (const c of this.ctx.out.slice(from)) Object.defineProperty(c, 'bg', { value: true, enumerable: false, configurable: true });
+  }
+
+  // (#529: dash / Debian sh / ash read `A && B &>f` as `A && B &` (a background job: the whole and-or list up to here) and then `>f` (a command that only opens f); bash, zsh, ksh and macOS sh read a redirect of B. So every
+  // command of the and-or list from `from` UP TO AND INCLUDING the command that carries the `&>` may have run in a child: maybeBg, never `bg` (the shells disagree, the readers must not pick one). maybeBgEnds: the ctx.out index
+  // of the command that carries it, one entry per `&>` that covers the command (`A &>f && B &>g`: A has two): a reader tells "inside the span" from "after it" with it (C in `A && B &>f && C` is not in the span). Not enumerable.
+  // Commands still waiting for a heredoc are not out yet: the marks are not to be trusted.)
+  markMaybeBg(from) {
+    if (this.queue.length) this.ctx.ctlBroken = true;
+    const end = this.ctx.out.length - 1;
+    for (let k = from; k <= end; k++) {
+      const c = this.ctx.out[k];
+      if (!c) continue;
+      if (!c.maybeBgEnds) Object.defineProperty(c, 'maybeBgEnds', { value: [], enumerable: false, configurable: true });
+      if (!c.maybeBgEnds.includes(end)) c.maybeBgEnds.push(end);
+      Object.defineProperty(c, 'maybeBg', { value: true, enumerable: false, configurable: true });
+    }
   }
 
   // (#352 R11-F1: every command from `from` on is a stage of a pipeline: a change in one is its subshell's. Commands still waiting for a heredoc are not out yet: the marks are not to be trusted)

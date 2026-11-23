@@ -1845,6 +1845,48 @@ test('directory / branch / variable state from a command that may not have run i
   for (const c of allowCmds) assert.equal(evaluate(c, o).decision, 'allow', c);
 });
 
+// #529: dash / Debian sh / ash read `A && B &>f` as `A && B &` (a background job) and then `>f`; bash / zsh / ksh read a redirect. What a command of such a span changed (the directory, a branch, a variable) is
+// "ran here" in one shell and "ran in a child" in the other: unknown after the span, never certain. Failure caught: a push judged on the branch of a directory the dash reading never moved to (a push of main from the
+// main checkout after `cd /work/repo &>/dev/null && git push`). Each row: BASE verdict (610b504c) -> CANDIDATE verdict.
+test('#529: what a `&>` / `&>>` span changed is unknown after the span, certain inside it', () => {
+  const o = { byDir: { '/work/main': 'main', '/work/repo': 'agent/x', '/work/repo2': 'agent/x' }, cwd: '/work/main', labels: [] };
+  const P = 'git push';
+  const newDeny = [ // allow -> deny
+    `cd /work/repo &>/dev/null && ${P}`,
+    `cd /work/repo &>>/tmp/l && ${P}`,
+    `cd /work/repo &>/dev/null || exit 1; ${P}`, // the `|| exit` proves nothing for a cd that may have run in a child
+    `dash -c 'cd /work/repo &>/dev/null && ${P}'`,
+    `sh -c 'cd /work/repo &>/dev/null && ${P}'`,
+    `cd /work/repo &>/dev/null && git status && ${P}`,
+    `git switch agent/y && : &>/dev/null; ${P}`, // a branch switch in the span
+  ];
+  for (const c of newDeny) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const controlDeny = [ // deny -> deny (the buggy reading is already refused on base: they guard the new rule against an overbroad allowance)
+    `cd /work/repo &>/dev/null; ${P}`,
+    `cd /work/main && cd /work/repo &>/dev/null; ${P}`,
+    `{ cd /work/repo; } &>/dev/null; ${P}`,
+    `{ cd /work/repo; :; } &>/dev/null; ${P}`,
+    `cd /work/repo &>/dev/null && : ; cd /work/repo2 &>/dev/null; ${P}`,
+    `cd /work/repo &>/dev/null foo; ${P}`, // a word after the target: deny on base for the unknown directory, now because the parser gives up (truncated)
+    `x=1 &>/dev/null F=22; ${P}`,
+  ];
+  for (const c of controlDeny) assert.equal(evaluate(c, o).decision, 'deny', c);
+  const allow = [ // allow -> allow
+    'git push origin agent/x &>/dev/null',
+    `cd /work/repo && ${P} &>/dev/null`, // inside the span the cd reaches the push in every shell
+    `git switch agent/y && ${P} &>/dev/null`,
+    `sleep 1 &>/dev/null; cd /work/repo && ${P}`, // the span changed nothing
+    "bash -c 'make &>/dev/null; echo done'",
+    `cd /work/repo &>/dev/null; git status`,
+  ];
+  for (const c of allow) assert.equal(evaluate(c, o).decision, 'allow', c);
+  // a variable: the shell takes the value inherited (B=main) in dash, the assigned one in bash. allow -> deny after the span; inside the span both read the assignment (allow -> allow)
+  const env = { ...process.env, B: 'main' };
+  const withEnv = (c) => evaluateGitCommand(c, { cwd: '/work/repo', home: '/home/u', env, currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false });
+  assert.equal(withEnv('B=agent/x &>/dev/null; git push origin HEAD:$B').decision, 'deny');
+  assert.equal(withEnv('B=agent/x && git push origin HEAD:$B &>/dev/null').decision, 'allow');
+});
+
 // Background-scan finding on 4789b20 (state tracking): constructs that change where a later command runs, or what a
 // variable holds, without anything the walk follows. Each deny below pushes from the `main` checkout in a real shell.
 test('namerefs, function / alias / trap definitions, shell options and sourced files make the state unknown', () => {
