@@ -461,3 +461,10 @@ test('R1-F3: the text of a trap or eval written out is read with the caller\'s b
   allow('OUT=dist; trap \'echo failed\' ERR; count=0; for f in src/*; do count=$((count+1)); done; echo "$count" > "$OUT/count.txt"');
   denyEach([P("i='n=7'; trap ': $((i))' DEBUG"), P("i='n=7'; eval ': $((i))'"), P('i=3; eval "$code"; : $((i))')]);
 });
+test('R2-F1 / R2-B1 / R2-B2: a length expansion is one number for printf, an unquoted $name that may be empty shifts the arguments, literal eval text that rebinds a number loses the proof', () => {
+  allow('ref=HEAD; files=(a b c); printf \'%d files\' ${#files[@]}; git show $ref');
+  allow('ref=HEAD; files=(a b c); printf \'%d files\' "${#files[@]}"; git show $ref');
+  deny(P("label=''; value='count+1'; printf '%s %d\\n' $label 10 value"));
+  const ev = "i=1; eval 'i=other'; : $((i))"; // (the guards' own eval handling refuses the line whole, so the proof is asserted directly)
+  assert.equal(arithAssignedNames(ev, simpleCommands(ev, {})).dynamic, true, 'literal eval text that rebinds i makes the read of i unproven');
+});

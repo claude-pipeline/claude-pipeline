@@ -2107,7 +2107,7 @@ function withoutRedirects(ws) {
   }
   return out;
 }
-function printfBodies(c, add) {
+function printfBodies(c, add, bare) {
   // (the words the arguments are read from are the parser's own, brace lists expanded: `printf '%s %d' {a,total}` has two; the written words only tell how each was quoted)
   const ws = withoutRedirects(writtenWords(c.raw ?? ''));
   const k = ws.findIndex((w) => !ASSIGN_WORD.test(w)); // (the command word)
@@ -2140,9 +2140,11 @@ function printfBodies(c, add) {
   const anyNum = convs.some((x) => NUM_CONV.includes(x));
   if (!anyNum && !numbered) return null;
   if (numbered || star) return 'a printf format with numbered or * conversions';
-  const isInt = (w) => wholeArith(w) !== null || /^"?\$[?#$!]"?$/.test(w); // (one `$(( ))` / `$#` word is digits: no split, no glob, nothing to evaluate)
+  const isInt = (w) => wholeArith(w) !== null || /^"?\$[?#$!]"?$/.test(w) || /^"?\$\{#[A-Za-z_]\w*(?:\[[@*]\])?\}"?$/.test(w); // (one `$(( ))` / `$#` word is digits: no split, no glob, nothing to evaluate)
   const plainWord = (w) => isInt(w) || /^\$(?:\{[A-Za-z_]\w*\}|[A-Za-z_]\w*)$/.test(w) || (!/\$[@*]|\$\{[^}]*\[[@*]\]|`/.test(w) && !/^[^'"]*\$/.test(w.replace(/"[^"]*"|'[^']*'/g, '')) && !/[*?[]/.test(w.replace(/"[^"]*"|'[^']*'/g, '')));
   if (args.some((w) => !plainWord(w))) return 'a printf argument list that may split or glob';
+  // (an UNQUOTED bare `$name` may be empty and vanish, which shifts every later argument to the next conversion: arithAssignedNames asks the proof that the name is a number, and so not empty)
+  for (const w of args) { const m = /^\$(?:\{([A-Za-z_]\w*)\}|([A-Za-z_]\w*))$/.exec(w); if (m) bare(m[1] ?? m[2]); }
   argvArgs.forEach((w, j) => {
     if (!NUM_CONV.includes(convs[j % convs.length]) || isInt(w)) return;
     add(w);
@@ -2237,8 +2239,8 @@ function readUnproven(k, r, f, outer, depth = 0) {
 }
 const ARITH_CACHE = new WeakMap();
 function arithFrame(text, cmds, depth) {
-  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bodyWhy: 0, badBody: -1, spans: [], s: '', subs: [], copies: [], bodyTexts: [], g: '', modReads: new Map() };
-  if (!/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s|\bprintf\b|\bprint\b|\beval\b|\btrap\b|\b(?:declare|typeset|local)\s+[-+][A-Za-z]*n/.test(text)) return f;
+  const f = { names: new Set(), dynamic: false, why: null, reads: new Map(), bodyTargets: new Set(), certainScalar: new Set(), certainArray: new Set(), runner: false, nameref: false, nested: [], events: null, other: null, bare: [], bodyWhy: 0, badBody: -1, spans: [], s: '', subs: [], copies: [], bodyTexts: [], g: '', modReads: new Map() };
+  if (depth === 0 && !/\(\(|\$\[|\[|\+=|\$\{\w+:|(?<![\w.$/-])let\s|\bprintf\b|\bprint\b|\beval\b|\btrap\b|\b(?:declare|typeset|local)\s+[-+][A-Za-z]*n/.test(text)) return f;
   const s = quotedBodiesBlank(text, cmds);
   const g = expansionText(s, cmds);
   const bodies = arithBodies(s, g, cmds);
@@ -2248,7 +2250,7 @@ function arithFrame(text, cmds, depth) {
   for (const b of bodies.mod) bodyReads(b, f.modReads);
   if (bodies.capped || bodies.incomplete) { f.dynamic = true; f.why ??= bodies.capped ? 'too many subscripts to read' : 'a subscript or offset longer than the guard reads'; } // (the fail-closed reading, see the cap in arithBodies)
   const add = (b) => { bodies.push(b); bodies.src.push(null); bodies.span.push(null); };
-  if (cmds) for (const c of cmds) { const why = /(?:^|\/)(?:printf|print)$/.test(c.argv?.[0] ?? '') ? printfBodies(c, add) : null; if (why) { f.dynamic = true; f.why ??= why; } }
+  if (cmds) for (const c of cmds) { const why = /(?:^|\/)(?:printf|print)$/.test(c.argv?.[0] ?? '') ? printfBodies(c, add, (k) => f.bare.push(k)) : null; if (why) { f.dynamic = true; f.why ??= why; } }
   bodies.forEach((body, i) => {
     for (const m of body.matchAll(ARITH_ASSIGNED)) { const k = m[1] ?? m[2] ?? m[3] ?? m[4]; f.names.add(k); if (m[4] === undefined) f.bodyTargets.add(k); }
     if (ARITH_ASSIGNED_DYN.test(body)) f.dynamic = true;
@@ -2286,6 +2288,11 @@ export function arithAssignedNames(raw, cmds = null, outer = null) {
     if (f.runner) proof = 'a command that runs code in this shell (eval, trap, source)';
     else if (f.nameref) proof = 'a nameref';
     else for (const [k, r] of f.reads) if (readUnproven(k, r, f, outer)) { proof = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
+  }
+  // (a bare `$name` printf argument that is not provably a non-empty number: it may vanish and shift the arguments)
+  if (proof === null) for (const k of f.bare) {
+    const known = !f.other.has(k) && (f.certainScalar.has(k) || SHELL_SUPPLIED_NUMBERS.has(k) || (outer?.vars && Object.hasOwn(outer.vars, k) && INT_LITERAL.test(outer.vars[k])));
+    if (!known || readUnproven(k, { plain: true, sub: false }, f, outer)) { proof = `a printf argument \`$${k}\` that may be empty or text shifts which argument a number conversion takes`; break; }
   }
   if (proof === null) for (const [k, r] of f.modReads) if (readUnproven(k, r, f, outer)) { proof = `an arithmetic reads \`${k}\`, whose value is not a plain number here`; break; }
   // (the text an eval / trap runs reads names under the caller's bindings and its own)
