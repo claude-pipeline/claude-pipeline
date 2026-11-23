@@ -739,3 +739,73 @@ test('local skips carry skipKind local; a run that is not skipped (or a skipIf r
   assert.equal(both.exitCode, 0);
   assert.deepEqual([reportOf(repo).steps[0].skipKind, reportOf(repo).steps[0].skipReason], ['ci', 'deferred to CI (.github/workflows/ci.yml#SQL arms)']);
 });
+
+// ---- test counts per step (#644) ------------------------------------------------------------------------------------
+
+// Catches: a "pass" that ran no tests being indistinguishable from a full run: report.json had only pass/fail per step.
+test('a step that prints a node:test or vitest summary gets counts in report.json; a step with no summary has none (never zeros)', async () => {
+  const repo = await setup();
+  // No backslashes in the snippet (see the ANSI test above): one console.log per line, strings in single quotes.
+  const say = (lines) => nodeCmd(lines.map((l) => `console.log('${l}')`).join(';'));
+  const steps = [
+    { name: 'node', cmd: say(['# tests 8', '# pass 4', '# fail 1', '# cancelled 1', '# skipped 1', '# todo 1', '# duration_ms 3.5']), quick: false },
+    { name: 'vitest', cmd: say([' Test Files  2 passed (2)', '      Tests  12 passed | 2 failed | 1 skipped (15)']), quick: false },
+    { name: 'empty', cmd: say(['# tests 0', '# pass 0', '# fail 0', '# duration_ms 1']), quick: false },
+    pass('plain'),
+  ];
+  await verify(repo, [], steps);
+  const rep = reportOf(repo);
+  assert.deepEqual(rep.steps[0].counts, { passed: 4, failed: 2, skipped: 2 }, 'a cancelled test counts as failed');
+  assert.deepEqual(rep.steps[1].counts, { passed: 12, failed: 2, skipped: 1 });
+  assert.deepEqual(rep.steps[2].counts, { passed: 0, failed: 0, skipped: 0 }, 'a pass that ran nothing is visible as counts.passed 0');
+  assert.equal('counts' in rep.steps[3], false);
+});
+
+// Catches: a test that prints "pass 3" (node:test echoes it as a "# pass 3" diagnostic) being added to the reported passes.
+test('only the runner\'s own summary block is counted: a stray "# pass N" diagnostic before or after it is not', async () => {
+  const repo = await setup();
+  const say = (lines) => nodeCmd(lines.map((l) => `console.log('${l}')`).join(';'));
+  await verify(repo, [], [{ name: 'node', cmd: say(['# pass 3', '# tests 1', '# suites 0', '# pass 1', '# fail 0', '# cancelled 0', '# skipped 0', '# todo 0', '# duration_ms 12.5', '# pass 9']), quick: false }]);
+  assert.deepEqual(reportOf(repo).steps[0].counts, { passed: 1, failed: 0, skipped: 0 });
+});
+
+// Catches: a test that prints "tests 3" / "pass 3" (node:test echoes them as "# ..." diagnostics) and then ordinary output adding
+// three passes to a run whose real summary says one; and a summary block cut off before its duration_ms adding anything.
+test('a node:test block is counted only when its duration_ms closes it', async () => {
+  const repo = await setup();
+  const say = (lines) => nodeCmd(lines.map((l) => `console.log('${l}')`).join(';'));
+  await verify(repo, [], [
+    { name: 'stray', cmd: say(['# tests 3', '# pass 3', 'ok 1 - x', '# tests 1', '# pass 1', '# fail 0', '# duration_ms 4']), quick: false },
+    { name: 'cut', cmd: say(['# tests 3', '# pass 3', '# fail 0']), quick: false },
+    // Catches: a block with no pass/fail line at all closing at duration_ms and reporting a measured zero.
+    { name: 'no-outcomes', cmd: say(['# tests 3', '# duration_ms 4']), quick: false },
+    // Catches: pass/fail lines that do not add up to the declared total reporting a measured zero for tests that were never accounted for.
+    { name: 'short-sum', cmd: say(['# tests 3', '# pass 0', '# fail 0', '# duration_ms 4']), quick: false },
+  ]);
+  const rep = reportOf(repo);
+  assert.deepEqual(rep.steps[0].counts, { passed: 1, failed: 0, skipped: 0 });
+  assert.equal('counts' in rep.steps[1], false);
+  assert.equal('counts' in rep.steps[2], false, 'a block with no pass/fail line is not a measured zero');
+  assert.equal('counts' in rep.steps[3], false, 'outcomes that do not sum to the declared total are dropped, not reported');
+});
+
+// Catches: a test printing "Tests  3 passed (3)" being added to vitest's real total; and vitest's "Tests  no tests" (a green step that
+// ran nothing) leaving the step without counts instead of explicit zeros.
+test('a vitest Tests row counts only right after its Test Files row; "no tests" is three zeros', async () => {
+  const repo = await setup();
+  const say = (lines) => nodeCmd(lines.map((l) => `console.log('${l}')`).join(';'));
+  await verify(repo, [], [
+    { name: 'stray', cmd: say(['      Tests  3 passed (3)', ' Test Files  1 passed (1)', '      Tests  1 passed (1)']), quick: false },
+    { name: 'only-stray', cmd: say(['      Tests  3 passed (3)']), quick: false },
+    { name: 'none', cmd: say([' Test Files  no test files', '      Tests  no tests']), quick: false },
+    // Catches: a node:test summary line between the two rows leaving the Test Files header active (mixed runner output).
+    { name: 'interrupted', cmd: say([' Test Files  1 passed (1)', '# pass 1', '      Tests  3 passed (3)']), quick: false },
+    { name: 'blank-between', cmd: say([' Test Files  1 passed (1)', '', '      Tests  3 passed (3)']), quick: false },
+  ]);
+  const rep = reportOf(repo);
+  assert.deepEqual(rep.steps[0].counts, { passed: 1, failed: 0, skipped: 0 });
+  assert.equal('counts' in rep.steps[1], false);
+  assert.deepEqual(rep.steps[2].counts, { passed: 0, failed: 0, skipped: 0 });
+  assert.equal('counts' in rep.steps[3], false, 'a node:test line between the rows ends the vitest header');
+  assert.deepEqual(rep.steps[4].counts, { passed: 3, failed: 0, skipped: 0 }, 'a blank line between the rows keeps the header');
+});
