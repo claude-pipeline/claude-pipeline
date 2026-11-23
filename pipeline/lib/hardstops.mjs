@@ -195,7 +195,7 @@ const PGTAP_MARKER = new RegExp(
     '\\b(?:is|isnt|set|bag|throws|performs|lives|has|hasnt|col|fk|results|function|enum|index|policy|policies|trigger|rule|language|domain|can|cannot)_[a-z0-9_]*"?\\s*\\(',
     '\\b[a-z0-9_]+_(?:ok|eq|ne|are|is|isnt|like|unlike|has|hasnt|empty|returns|within|ilike|matching|imatching)"?\\s*\\(',
     '\\bcreate\\s+(?:or\\s+replace\\s+)?function\\s+(?:"?[a-z0-9_]+"?\\.)?"?(?:test|startup|setup|teardown|shutdown)[a-z0-9_]*"?\\s*\\(',
-    '^\\s*\\\\(?:i|ir|include|include_relative)\\s+\\S',
+    '^[ \\t]*\\\\(?:i|ir|include|include_relative)[ \\t]+\\S',
   ].join('|'),
   'im',
 );
