@@ -35,6 +35,7 @@ const ctlMarks = (c) => ({ loop: c.loop > 0, fn: c.fn > 0, trap: c.trap > 0, con
 const LOOP_WORDS = new Set(['while', 'until', 'for', 'select', 'repeat', 'foreach']);
 // (#352 R14-F1: the reserved words that can stand right after a subshell's `)`, giving its redirect tail back)
 const AFTER_PAREN_RESERVED = new Set(['then', 'else', 'elif', 'fi', 'do', 'done', 'esac', '}']);
+const SHORT_BODY_HEADS = new Set(['for', 'select', 'repeat', 'foreach']); // (loops whose body a `{` can open without `do` in zsh)
 const KEYWORDS = new Set(['if', 'then', 'else', 'elif', 'fi', 'do', 'done', 'while', 'until', '!', 'esac', 'coproc']);
 // plainSeq (see simpleCommands): the words that, at the start of a command, are shell syntax and no plain simple command (a compound command, a keyword, a group, a coprocess, a function, `[[`)
 // shape (see simpleCommands): the words that may open or continue a whitelisted construct at the start of a segment (the rest of the segment is read as an ordinary plain command)
@@ -240,8 +241,10 @@ const ENV_LONG = ['ignore-environment', 'null', 'unset', 'chdir', 'split-string'
 const envLong = (name) => (ENV_LONG.includes(name) ? name : (ENV_LONG.filter((o) => o.startsWith(name)).length === 1 ? ENV_LONG.find((o) => o.startsWith(name)) : null));
 // Does this command surely LEAVE the shell when it runs (so what follows a `cd DIR || <it>` ran after a cd that worked)? Only a plain `exit`, alone or with ONE literal number (#425 R1, #427): `return` at top level is an error
 // and the shell goes on; a redirection on the exit may fail before it runs (the caller reads a redirection on a group's closer); `exit 1 2` is refused ("too many arguments") and a run-time word may split into two.
-// One rule for the files guard (cd narrowing) and the git guard (orExits).
-export const plainExit = (c) => c.argv[0] === 'exit' && (c.redirects ?? []).length === 0 && (c.argv.length === 1 || (c.argv.length === 2 && /^\d+$/.test(c.argv[1])));
+// F2: the number is at most 3 digits (bash 5.3: `exit 99999999999999999999` is "numeric argument required" and the shell goes on). A wrapper (`command exit 1`: zsh may find no such command; `nohup`, `env`,
+// `coproc exit 1`: a child; `time`, `builtin`, `noglob`) may leave no shell either: `wrapped` / `spawn` are no current-shell exit. A `coproc { exit 1; }` group is judged by its level (git-policy settle: `co`).
+// One rule for the files guard (cd narrowing) and the git guard (settle, orExits, the group proof exitFollows, the snapshot restore).
+export const plainExit = (c) => c.argv[0] === 'exit' && c.wrapped !== true && c.spawn !== true && (c.redirects ?? []).length === 0 && (c.argv.length === 1 || (c.argv.length === 2 && /^\d{1,3}$/.test(c.argv[1])));
 // The shape events of a command list (see simpleCommands), by `at`: Map at -> [event].
 export function shapeAt(shape) {
   const evAt = new Map();
@@ -2205,7 +2208,7 @@ function emit(ctx, argv, env, raw, depth, redirects = [], sep = ';', afterClose 
   // sep: the operator before it (; & && || |), for callers that care whether it surely runs; not enumerable, like `truncated`
   Object.defineProperty(cmd, 'sep', { value: sep, enumerable: false });
   // pipeLead (#352 R11-F2): of a later stage of a pipeline, the operator before the pipeline's FIRST stage (a later stage may come out before the first: a heredoc waiting, an empty group). Not enumerable.
-  // (Not `lead`: that is #373's keyword the segment starts with (shapeSeg, files-policy cdTarget); one name for both made `x | { …; }` and `x | if …` throw, and the line was given up on)
+  // (Not `kwLead`: that is #373's keyword the segment starts with (shapeSeg, files-policy cdTarget); one name for both made `x | { …; }` and `x | if …` throw, and the line was given up on)
   if (ctx.lead) Object.defineProperty(cmd, 'pipeLead', { value: ctx.lead, enumerable: false });
   // afterClose (#352 R7-F2): its `&&` follows the closer of a construct whose body may not have run (`fi &&`, `done &&`, `esac &&`, a group that may skip): it is chained to the construct, not to the body's last command. Not enumerable
   Object.defineProperty(cmd, 'afterClose', { value: afterClose, enumerable: false });
@@ -2287,6 +2290,7 @@ class Parser {
     this.ctlStack = []; // loops / function bodies / { groups open (see ctlOpen), for every nesting level of this text
     this.ctlBase = 0; // where the current level's entries start
     this.dblOpen = false; // a `[[` was read as a command and its `]]` has not come yet: a && / || inside it splits the segment, so the `]]` is read in a later one (#352 R17-F1)
+    this.ctlHead = []; // for each open construct: the word a loop was opened by (while / for / repeat ...), else null (T4: a `{` that opens the body of a for / select / repeat / foreach before its `do`)
     this.ctlCond = []; // for each open construct: an if / loop whose condition is still open (no `then` / `do` yet), see the R16 rule in flushWord
     this.ctlNeg = []; // for each open construct: it was opened under a `!` (its commands are negated, see ctx.neg)
     this.ctlPS = []; // and the start of the pipeline it was opened in (an index of ctx.out), for a `&` after its closer
@@ -2859,8 +2863,8 @@ class Parser {
       else if (seg.fnActive && text !== '{') { fnName = true; ctx.fns.add(text); seg.fnHasName = true; }
       const fnKw = text === '{' && seg.fnActive === true && seg.fnHasName === true;
       if (q < 0 && cmdPos && (text === 'then' || text === 'do' || text === 'elif')) this.ctlSetCond(text === 'do' ? 'loop' : 'if', text === 'elif');
-      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg), seg); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
-      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg), seg); seg.ctl = { ...seg.ctl, cond: true }; }
+      if (q < 0 && cmdPos && LOOP_WORDS.has(text)) { this.ctlOpen('loop', segNeg(seg), seg, text); this.coChild(seg); seg.ctl = { ...seg.ctl, loop: true }; seg.loops = this.ctx.loops; }
+      else if (q < 0 && cmdPos && text === 'if') { this.ctlOpen('if', segNeg(seg), seg); this.coChild(seg); seg.ctl = { ...seg.ctl, cond: true }; }
       else if (q < 0 && cmdPos && text === 'fi') seg.closesFrom = this.ctlClose(['if']);
       else if (q < 0 && cmdPos && text === 'done') seg.closesFrom = this.ctlClose(['loop']);
       else if (q < 0 && cmdPos && text === '}') {
@@ -2876,11 +2880,15 @@ class Parser {
       else if (q < 0 && (cmdPos || fnKw) && text === '{') {
         // (a plain group after && / || runs only when that holds, and one that is a pipeline stage runs in a subshell: its commands may not run here -- review of #50)
         const kind = fnPending || fnKw ? 'fn' : ['&&', '||', '|'].includes(seg.sep) ? 'cbrace' : 'brace';
+        // (T4: `for x in; { cd R; } && P`, `for ((;;)); { … }`, `repeat 0; { … }`: bash and zsh run the brace as the loop's body (zsh short form) or as a group after a header that ran no body (bash: a `{` where `do` is due ends the loop only by a syntax error or by
+        // `break`); the loop level never closes here, so a cd in the brace would be believed. The R16 rule above reads the `{` that shares the segment with the head; this one the `{` after a `;` / newline. while / until / if take a `{` in their condition.)
+        if (kind !== 'fn' && this.condOpenTop() && SHORT_BODY_HEADS.has(this.ctlHead[this.ctlStack.length - 1])) ctx.ctlBroken = true;
         this.ctlOpen(kind, kind !== 'fn' && segNeg(seg), seg);
         if (kind === 'fn') seg.ctl = { ...seg.ctl, fn: true }; // (the body's first command is in this segment: `{ echo x > f; }`)
         if (kind === 'cbrace') seg.ctl = { ...seg.ctl, cond: true };
-        // (`coproc { exit 1; }`: the group runs in a background subshell, so an exit in it leaves no shell: its level carries `co` for git-policy's settle, as the `coproc exit 1` word group does with `wrapped`)
-        if (kind !== 'fn' && seg.words.some((w) => w.text === 'coproc' && w.qa < 0)) this.ctx.up[this.ctx.up.length - 1].co = true;
+        // (`coproc { exit 1; }`: the group runs in a background subshell, so an exit in it leaves no shell: its level carries `co` for git-policy's settle, as the `coproc exit 1` word group does with `wrapped`. R1-B2: only the `{` right
+        // after `coproc` (or its NAME) is that boundary; a group nested in it is a plain one)
+        if (kind !== 'fn') this.coChild(seg);
       }
       if (text === '{' || text === '(') seg.fnActive = false;
       fnPending = fnName && seg.fnActive === true; // (a name of `function NAME` ending the line: its body may open on the next)
@@ -3322,8 +3330,8 @@ class Parser {
     if (!plain) { ctx.notWide = true; return; }
     if (kw) {
       this.shapeEvent(kw, seg.sep, n0);
-      // (the keyword is no part of the command: its raw text starts with it, see `lead`)
-      for (let k = outFrom; k < ctx.out.length; k++) if (ctx.out[k].depth === 0) Object.defineProperty(ctx.out[k], 'lead', { value: kw, enumerable: false });
+      // (the keyword is no part of the command: its raw text starts with it, see `kwLead`)
+      for (let k = outFrom; k < ctx.out.length; k++) if (ctx.out[k].depth === 0) Object.defineProperty(ctx.out[k], 'kwLead', { value: kw, enumerable: false });
     }
   }
 
@@ -3359,12 +3367,21 @@ class Parser {
     } finally { this.ctx.grp = grp; this.ctx.ctl = ctl; this.ctx.loops = loops; this.ctx.up = up; this.ctx.upHold = upHold; this.ctx.lead = lead; }
   }
 
+  // R1-B2 / R1-B3: the construct just opened (a `{` group, an if, a loop) is the child a `coproc` right before it starts (`coproc CONSTRUCT`; a `coproc NAME {` never opens a group here, and a word after `coproc` that opens a construct is that construct, never a name): its level carries `co`, so what it does is judged inside it and the parent goes on
+  // where it was, as after a subshell. Not one the words before it only contain (`coproc { { cd d; }; }`: the inner group).
+  coChild(seg) {
+    const w = seg.words;
+    const co = (x) => x?.text === 'coproc' && x.qa < 0;
+    if (co(w[w.length - 1])) this.ctx.up[this.ctx.up.length - 1].co = true;
+  }
+
   // A loop / function body / plain `{` group opens at this nesting level (closed by ctlClose, or when the level ends: see parseList).
-  ctlOpen(kind, neg = false, seg = null) {
+  ctlOpen(kind, neg = false, seg = null, head = null) {
     // (each level copies the list of enclosing levels below: past MAX_NEST levels the line is given up on, as nested $( ) is, so 50 000 `{ ` cannot take gigabytes)
     if (this.ctx.up.length >= MAX_NEST) { this.ctx.stopped = true; this.ctx.truncated = true; this.i = this.src.length; }
     this.ctlStack.push(kind);
     this.ctlCond.push(kind === 'if' || kind === 'loop');
+    this.ctlHead.push(kind === 'loop' ? head : null);
     // (#352 R10: every construct is a level of its own (up): its commands run under the operator of the construct, whatever `;` they are separated by inside it)
     this.ctlUp.push(this.ctx.up);
     this.ctx.up = [...this.ctx.up, { sep: seg ? seg.sep : this.lexOp().sep, lead: seg ? seg.lead : this.lexOp().lead, kind: kind === 'brace' ? 'brace' : 'blk' }];
@@ -3398,6 +3415,7 @@ class Parser {
   popCtl() {
     const kind = this.ctlStack.pop();
     this.ctlCond.pop();
+    this.ctlHead.pop();
     this.ctx.up = this.ctlUp.pop();
     this.ctlFrom.pop();
     this.ctlPS.pop();
@@ -3590,8 +3608,13 @@ class Parser {
       }
     }
     const cmd = this.process(argv, env, seg, false);
-    // (a leading `coproc` was stripped above: its command runs in a background subshell, so it is wrapped for git-policy's bareExit just as `command` / `noglob` are)
-    if (cmd && words.slice(0, i).some((w) => w.text === 'coproc' && w.qa < 0)) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
+    // (a leading `coproc` was stripped above: its command runs in a background child process, like env / nohup: it is `spawn`ed (its cd moves that child, nothing it does is certain) and wrapped (no plainExit). R1-B3: not when a
+    // compound follows it (`coproc if cd D && P; then …`): the whole compound is the child, its level carries `co` (coChild), and the commands in it are judged as the group's are, so only `wrapped`)
+    const coAt = words.slice(0, i).findIndex((w) => w.text === 'coproc' && w.qa < 0);
+    if (cmd && coAt >= 0) {
+      Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
+      if (!words.slice(coAt + 1, i).some((w) => ['if', 'while', 'until'].includes(w.text) && w.qa < 0)) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
+    }
     return cmd;
   }
 
@@ -3610,12 +3633,16 @@ class Parser {
     let fan = null; // the xargs / parallel that built this command from stdin text
     const runnerDirs = [];
     let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
-    let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see git-policy's bareExit)
+    let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see plainExit. A leading `coproc` is also `spawn`, below)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
+    // extCd (T2): a `time`, `command` or `builtin` stood in front. Whether it ran the command as the shell's own builtin or as an external program differs by shell and spelling (dash has no `time` keyword, zsh's `command cd` runs /usr/bin/cd,
+    // bash's `time` after an assignment is a program), so a `cd` behind it may or may not have moved THIS shell: git-policy leaves the directory unknown. Not `spawn` (bash really moves), not truncated (`\time make` is everyday).
+    let extCd = false;
     for (let guard = 0; guard < 32 && a.length; guard++) {
       const un = unwrap(a);
       if (!un) break;
       wrapped = true;
+      if (base(a[0]) === 'time' || base(a[0]) === 'command' || base(a[0]) === 'builtin') extCd = true; // (`builtin`: dash has none, "not found": the cd never runs and the line goes on in the old directory)
       if (PACKAGE_RUNNERS.has(base(a[0]))) {
         viaRunner = true;
         // (R1-B6: `npx --prefix sub tool`, `npm exec --prefix sub tool`: the bin is looked up from that directory too; every directory option among the words counts, a tool's own --prefix included: more places, never fewer)
@@ -3657,6 +3684,7 @@ class Parser {
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
     if (cmd && wrapped) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
+    if (cmd && extCd) Object.defineProperty(cmd, 'extCd', { value: true, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
     if (cmd && (seg.negated || segNeg(seg))) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
@@ -4063,7 +4091,7 @@ export function simpleCommands(str, opts) {
   // shape: null unless the text is a WIDER whitelist than plainSeq: simple commands joined by && ; a newline || | |& or &, and at the top level only (not inside one another) a subshell `( … )`, a brace group
   // `{ …; }` or `if CMD; then … [else …] fi`, each holding such a sequence; nothing else (no `!`, coproc, always, function, loop, case, `elif`, `[[`, `time`, command-less segment, cut-short parse, heredoc the parser and
   // the shell may read differently). Then an array of the constructs' events, see shapeEvent. The cd narrowing of the files policy reads it: from the commands in order, each one's own join (`sep`) and these events it
-  // works out what a command surely ran after. A command that opens a segment with `if` / `then` / `else` / `{` has `lead` = that word (its `raw` starts with it). plainSeq is the narrower, older flag.
+  // works out what a command surely ran after. A command that opens a segment with `if` / `then` / `else` / `{` has `kwLead` = that word (its `raw` starts with it). plainSeq is the narrower, older flag.
   Object.defineProperty(ctx.out, 'shape', { value: !ctx.notWide && !ctx.hdOdd && !ctx.truncated && !ctx.ctlBroken && !ctx.hdForeign && ctx.shapeStack.length === 0 ? ctx.shapeEvents : null, enumerable: false });
   // heredocSpans: [start, end, quoted] of every heredoc body in the text (quoted: its delimiter was quoted, so nothing in it expands), or null when one cannot be located (read out of other text, no terminator, a parse that gave up)
   Object.defineProperty(ctx.out, 'heredocSpans', { value: ctx.hdForeign || ctx.truncated ? null : ctx.hdSpans, enumerable: false });

@@ -5757,8 +5757,8 @@ function evaluateBashForFilesFrame(command, opts) {
     return u.length > 32 ? null : u;
   };
   const cdTarget = (c) => { // the plain target of a `cd` whose destination is known now, else null
-    // (#373: the segment of `if cd X` / `then cd X` / `{ cd X` starts with the keyword the parser read, `c.lead`; its text is no part of the command)
-    const raw = c.lead === undefined ? c.raw : c.raw.startsWith(c.lead) ? c.raw.slice(c.lead.length) : null;
+    // (#373: the segment of `if cd X` / `then cd X` / `{ cd X` starts with the keyword the parser read, `c.kwLead`; its text is no part of the command)
+    const raw = c.kwLead === undefined ? c.raw : c.raw.startsWith(c.kwLead) ? c.raw.slice(c.kwLead.length) : null;
     if (cdNameOf(c.argv[0]) !== 'cd' || raw === null || raw.includes('\\') || !PLAIN_CD.test(raw)) return null; // (R5-F1: `env cd`, `sudo cd`, `time cd` run no builtin in this shell)
     const rest = c.argv.slice(1).filter((a) => a !== '--' && !/^-[LPe@]+$/.test(a));
     if (rest.length > 1) return null;

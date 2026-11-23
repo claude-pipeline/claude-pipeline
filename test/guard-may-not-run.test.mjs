@@ -246,7 +246,10 @@ test('#403 (R10-F6): a cd run through a wrapper that starts a process is that pr
   denies('xargs cd', `echo /work/other2 | xargs cd && ${SHIP}`);
   denies('find -exec cd', `find . -exec cd /work/other2 ';' && ${SHIP}`);
   denies('a wrapped switch', `nohup ${RESET} && ${SHIP}`);
-  allows('twin: command / builtin / exec stay transparent', `command cd /work/other2 && builtin cd /work/other2 && ${SHIP}`);
+  // (#449, PR C1: a cd behind command / builtin leaves the directory unknown: zsh's `command cd` runs the external /usr/bin/cd, dash has no `builtin`)
+  denies('command cd / builtin cd: the directory is unknown', `command cd /work/other2 && builtin cd /work/other2 && ${SHIP}`);
+  allows('twin: command / builtin stay transparent for the push itself', `cd /work/other2 && command ${SHIP}`);
+  allows('twin: a plain absolute cd after it makes the directory known again', `builtin cd /work/main; cd /work/other2 && ${SHIP}`);
 });
 
 // (#352 R11: a level that ends gives its alias changes back as unsure; a stage before a `|` is marked when the `|` is read; the operator before a pipeline reaches every later stage; a text lexed while an earlier
