@@ -307,6 +307,7 @@ test('repo config: every file the risk rating imports (transitively) is covered 
 // block a Bash/Edit tool call. What each hook does with the result is stated per file; none of them decides a review gate, proof, trust or install.
 const STACKS_EXEMPT_WHY = 'owner-decided exception to the rule above (2026-11-13, #392)';
 const DEPTH1_EXEMPT = new Map([
+  ['pipeline/lib/ci-usage-pr.mjs', 'display only: summary.mjs imports only pushedWhileReadyOf, which reads the PR\'s timeline, commits and runs (only under ci.draft_while_iterating: true) and returns {warnings, field?, note?}; summary puts note in the comment text, the warnings in its warnings list and field in its printed JSON; it catches every error, writes nothing, and the run record, outcome, cost, gates and proofs do not read it'],
   ['pipeline/lib/codex-usage-kinds.mjs', 'display only: codex-status.mjs imports only summariseUsage, which reads the Codex session logs and sums tokens per session kind for the printed report; it writes nothing and no gate, proof or route reads its result'],
   ['pipeline/lib/round-ask.mjs', 'display only: the text of the extra-round ask and the park comment (round-status.mjs hands costFrom, roundsFrom, openItems, notCleanReasons and statusLines to the owner-facing display, triage.mjs hands askSummary and processReviewSummary (the process-review text of the trip-wire prompt: pure string building from values triage.mjs computed) to the ask, and uses longReviewOf (the last counted rounds\' findings and the blocking-loop flag, shown in the ask) and recommendedWords (the recommendation in words) for display fields only); admission, the trip-wire itself (roundTripWire) and defer eligibility are decided in triage.mjs (listed) and defer-fixes re-checks'],
   ['pipeline/lib/worktree-prune/inspect.mjs', 'live-sessions.mjs imports only unFirm (strips the macOS /System/Volumes/Data firmlink prefix from a path), which only liveSessionsIn calls (the worktree-prune session match); review-lease.mjs uses claudeConfigDirs and psStarts, never liveSessionsIn, so no gate, proof, trust or install branches on it'],
@@ -321,6 +322,7 @@ const DEPTH1_EXEMPT = new Map([
 // importing anything else from the file (a namespace, a default, a new name, a side-effect import) fails until someone re-reads it. '*' = a namespace
 // or an unreadable clause; '(side effect)' = a bare `import './x.mjs'`. Checked against every root's import clause, static and dynamic.
 const DEPTH1_NAMES = new Map([
+  ['pipeline/lib/ci-usage-pr.mjs', ['pushedWhileReadyOf']],
   ['pipeline/lib/codex-usage-kinds.mjs', ['summariseUsage']],
   ['pipeline/lib/round-ask.mjs', ['askSummary', 'costFrom', 'issuedRoundVariant', 'longReviewOf', 'notCleanReasons', 'openItems', 'processReviewSummary', 'recommendedWords', 'roundsFrom', 'statusLines']],
   ['pipeline/lib/worktree-prune/inspect.mjs', ['unFirm']],
@@ -394,6 +396,7 @@ test('repo config: the import-clause reader names default, namespace, side-effec
 // issue #392). A command that books into the run record (cost.mjs) is listed. A new or unaudited command fails the test below until it is
 // listed in risk.high_risk_paths or classified here. Before adding an entry, read what the command does (not its header).
 const COMMANDS_EXEMPT = new Map([
+  ['ci-usage.mjs', 'read-only display of CI cost per PR and class of run (reads workflow runs, jobs, PR timelines and commits; prints a table or JSON); writes nothing and no gate reads it; the pushedWhileReady line of summary.mjs (listed) uses lib/ci-usage.mjs, not this command'],
   ['config.mjs', 'read-only display: prints the validated config; the validation and defaults are lib/config.mjs (listed) through requireConfig in lib/cmd-common.mjs (listed)'],
   ['guard-log.mjs', 'read-only: counts the guard deny log per day and reason code; writes nothing and no decision reads it'],
   ['labels.mjs', 'creates or realigns the label names, colours and descriptions on GitHub (idempotent); it applies and removes no label on any PR and grants nothing, and no gate reads a label\'s colour or description; it writes GitHub labels but no review state or run record'],
