@@ -215,3 +215,15 @@ test('review round 2 B1: a reopen on the opening head or a catch-up head, long a
   assert.deepEqual(classifyRuns({ pr, timeline: [], commits: [merge], runs: catchup }).map((x) => x.class), ['opening', 'catch-up', 'other']);
 });
 
+
+test('review round 2 B3: a converted_to_draft in the same second as ready_for_review (listed after it) closes the ready window; a draft-then-ready pair does not', () => {
+  const pr = { createdAt: T('09:00'), draft: false };
+  const runs = [run(sha('d'), T('10:00', 10))];
+  // ready, then draft, one second: the PR is a draft when the head is first seen
+  const readyThenDraft = [ev('ready_for_review', T('10:00')), ev('converted_to_draft', T('10:00'))];
+  assert.deepEqual(classifyRuns({ pr, timeline: readyThenDraft, commits: [], runs }).map((x) => x.class), ['push-while-draft']);
+  assert.deepEqual(headPushes({ pr, timeline: readyThenDraft, commits: [], runs }).map((h) => [h.kind, h.phase]), [['push', 'draft']]);
+  // draft, then ready, one second: the PR is ready, the head is the ready-for-review suite
+  const draftThenReady = [ev('converted_to_draft', T('10:00')), ev('ready_for_review', T('10:00'))];
+  assert.deepEqual(classifyRuns({ pr, timeline: draftThenReady, commits: [], runs }).map((x) => x.class), ['ready-for-review']);
+});

@@ -210,8 +210,8 @@ function readyHeads(events, runs) {
   }
   return heads;
 }
-// time `t` is within 120 s after the ready event `e` and before the next converted_to_draft (a PR sent back to draft ends what the ready event started)
-const inReadyWindow = (events, e, t) => t - e.t >= 0 && t - e.t <= WINDOW_MS && !events.some((d) => d.to === 'draft' && d.t > e.t && d.t <= t);
+// time `t` is within 120 s after the ready event `e` and before the next converted_to_draft (a PR sent back to draft ends what the ready event started); "next" is by position in the sorted events, so a draft listed after `e` in the same second counts and one listed before it does not
+const inReadyWindow = (events, e, t) => t - e.t >= 0 && t - e.t <= WINDOW_MS && !events.some((d, i) => d.to === 'draft' && i > events.indexOf(e) && d.t <= t);
 const isReadyRun = (events, readyBy, t, headSha) => t !== null && events.some((e) => e.to === 'ready' && inReadyWindow(events, e, t) && readyBy.get(e.t) === headSha);
 
 // ---- the pushes (heads) of one PR -----------------------------------------------------------------------------------
