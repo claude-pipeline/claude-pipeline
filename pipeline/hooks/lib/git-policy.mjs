@@ -1650,7 +1650,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   if (!sf.sourced && path.isAbsolute(abs)) ctx.selfScript = abs;
   let v;
   try {
-    v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced);
+    v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced && !sf.inline); // (#609 R1: an eval-fed text runs in the caller's shell, not a child's)
   } finally {
     ctx.selfScript = outerSelf;
   }
@@ -3396,6 +3396,8 @@ function evalString(str, startDir, ctx, level, child = false) {
   };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
+  // (#609 R1: one mark for the whole evaluation: a walked text defines / aliases / disables `exit` or exports a function (a child shell inherits it), so a written `exit` may not end the shell and no forget is deferred)
+  if (hazard || cmds.some((c) => c.argv.length > 1 && baseName(c.argv[0]) === 'export' && c.argv.slice(1).some((a) => /^-[a-zA-Z]*f/.test(a)))) ctx.budget.exitMayBeRedefined = true; // (on the shared budget: a startup file is judged on a copy of ctx, and its mark must reach the script)
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
   const dirAt = new Map();
   const cdDirs = cdTargets(cmds, startDir, ctx);
@@ -3426,6 +3428,8 @@ function evalString(str, startDir, ctx, level, child = false) {
   // directory on the old branch, so they are walked with the state unknown. `to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`:
   // the change was not certain (certainChange: it may not have run, or only for a chain), then the state stays unknown (R2-F1). A branch entry first made in the group is unknown after it (R2-B1).
   let failGroup = null;
+  // #609: a non-inert group in a CHILD-run text (`bash s.sh`: a child shell does not inherit the caller's functions, so the written `exit` ends the child) whose exit is a verified literal exit of the shell that runs the text: the forget is deferred to the END of the text (the commands after the group run only when the group did not)
+  let pendingForget = false;
   // #352 R6: the loops being walked, outermost first, each a frame: its range, the state at its entry, its carry (what its body may leave for the next iteration), the places its body can start in and
   // the carry each was judged with, and the walk state to start a pass from. A frame is finished when no start is left that was not judged with the carry as it is now.
   const restoreAfterGroup = () => {
@@ -3526,8 +3530,13 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (failGroup && i > failGroup.to) {
       // (#554: in a nested text the group's exit ends only that text, so the group may have run when the caller goes on: unless the group is inert (the end-of-text test below) the branches stay unknown)
       const inert = level === 0 || cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx));
+      const groupExit = cmds[failGroup.to];
       restoreAfterGroup();
-      if (!inert) forgetBranches(ctx);
+      // (#609: deferred only for a bare, unwrapped `exit` (plainExit, no child-launch flag, and the WRITTEN first word is `exit`: wrapper classification uses the basename, so an external `/usr/bin/time exit 1` reads as the shell's own `time` and cannot end the shell); everything else forgets at once, as before)
+      if (!inert) {
+        if (level > 0 && child === true && !ctx.budget.exitMayBeRedefined && groupExit && plainExit(groupExit) && groupExit.spawn !== true && /^\s*exit(?:[\s;}]|$)/.test(groupExit.raw ?? '')) pendingForget = true;
+        else forgetBranches(ctx);
+      }
     }
     settle(c, i); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
     if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, mover: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
@@ -3708,6 +3717,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();
     else forgetBranches(ctx);
   }
+  if (pendingForget) forgetBranches(ctx);
   // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop (#615: a body can leave early: break / continue / return / exit) made may not either; when the text ends nothing
   // after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text ends in: as if a command after `;` followed, it is forgotten
   // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). (#615: none is kept)

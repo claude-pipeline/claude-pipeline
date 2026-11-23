@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { OWNER_ENTRY, linesOf, runHook } from './helpers/owner-go.mjs';
 import { run } from '../pipeline/commands/live-db.mjs';
-import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
+import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
 import { buildBlock, canonicalDataSql, checkedTopLevel, summaryProblem, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
@@ -34,8 +34,7 @@ function world(t, { sql = SQL, file = FILE } = {}) {
   return { home, repo, head, ownerCtx, session: `test-${randomUUID()}` };
 }
 const setup = async (w) => {
-  await runDbRefs(['set', '--ref', REF, '--name', 'EagleWatch prod', '--repo', 'acme/widgets'], w.ownerCtx);
-  await runDbRefs(['set', '--ref', DEV, '--name', 'Scratch', '--repo', 'acme/widgets', '--dev'], w.ownerCtx);
+  seedRegistry(w.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live' }, { ref: DEV, name: 'Scratch', repo: 'acme/widgets', kind: 'dev' }] });
 };
 const migBlock = (w, over = {}) => buildBlock({ op: 'migration', ref: REF, label: 'EagleWatch prod', name: NAME, file: FILE, head: w.head, repo: 'acme/widgets', dir: w.repo.dir, sql: SQL, summary: 'adds column c', ...over });
 const dataSql = "update t set a = 1 where id = 7";

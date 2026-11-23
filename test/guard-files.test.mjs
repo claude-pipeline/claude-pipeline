@@ -283,6 +283,26 @@ const BASH_ALLOW = [
   // #563, second case: the word `parallel` / `xargs` inside a quoted prose argument (a PR title in `summary --built`, `agent-log publish --line`) is data, not a fan-out command
   ['summary text that says parallel', 'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 561 --outcome awaiting-owner-merge --built "Load-proof guard timing tests and parallel ubuntu Node 20 and 24 CI jobs"'],
   ['agent-log line that says parallel', "node ~/.claude/pipeline/bin/pipeline.mjs agent-log publish --line 'Load-proof guard timing tests and parallel ubuntu Node jobs (#477, #243)'"],
+  // #610 #617 #620 #624: quoted prose that says parallel / xargs is data when it is a named operand of a command that cannot run it (a pattern, the pipeline's prose flags, a git log message filter)
+  ['env + assignment then rg with a quoted pattern (#610)', "env LC_ALL=C rg ' xargs ' ~/.claude/pipeline"],
+  ['env + assignment then grep -n with a quoted pattern (#610)', "env LC_ALL=C grep -n ' parallel ' ~/.claude/pipeline/VERSION"],
+  ['rg -e patterns, one of them the word exec (#610)', "rg -e ' xargs ' -e exec ~/.claude/pipeline"],
+  ['summary --built after a $(...) assignment (#617-1)', 'GH_TOKEN="$(gh auth token)" node ~/.claude/pipeline/bin/pipeline.mjs summary --built "x parallel y"'],
+  ['summary --built behind a leading if (#617-2)', 'if node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 561 --built "x parallel y"; then echo ok; fi'],
+  ['quoted head run of the trusted tool with --built prose (#617-4)', '"~/.claude/pipeline/bin/pipeline.mjs" summary --built "x parallel y"'],
+  ['--built prose ending in an interpreter-looking R1/R2 (#620)', 'node ~/.claude/pipeline/bin/pipeline.mjs summary --pr 606 --outcome awaiting-owner-merge --built "Guard tests run in parallel jobs; fixes R1/R2"'],
+  ['git log --grep= with a fan-out word (#624)', 'git -C ~/.claude/pipeline log --grep="use parallel workers"'],
+  ['git log --grep with a fan-out word and --oneline (#624)', 'git -C ~/.claude/pipeline log --grep "use parallel workers" --oneline'],
+  // (green before this change: every prose flag of the trusted command keeps main's blanking)
+  ['summary --built with an apostrophe', `node ~/.claude/pipeline/bin/pipeline.mjs summary --built "don't run jobs in parallel"`],
+  ['comment --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs comment --pr 5 --reason 'a parallel b'"],
+  ['triage --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs triage --pr 5 --reason 'a parallel b'"],
+  ['triage --owner-quote prose', "node ~/.claude/pipeline/bin/pipeline.mjs triage --pr 5 --owner-quote 'a parallel b'"],
+  ['checkpoint --next prose', "node ~/.claude/pipeline/bin/pipeline.mjs checkpoint --next 'a parallel b'"],
+  ['checkpoint --detail prose', "node ~/.claude/pipeline/bin/pipeline.mjs checkpoint --detail 'a parallel b'"],
+  ['redraft --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs redraft --pr 5 --reason 'a parallel b'"],
+  ['merge-hold --reason prose', "node ~/.claude/pipeline/bin/pipeline.mjs merge-hold --pr 5 --reason 'a parallel b'"],
+  ['live-db --summary prose', "node ~/.claude/pipeline/bin/pipeline.mjs live-db present --summary 'a parallel b'"],
   ['a different repo .claude dir', 'cat /repo/.claude/settings.json > /dev/null'],
   ['empty command', ''],
 ];
@@ -293,6 +313,41 @@ for (const [name, cmd] of BASH_ALLOW) {
     assert.equal(r.decision, 'allow', `${cmd} -> ${r.reason}`);
   });
 }
+
+// #618 #610 #617 #624: the fan-out gate. Each row is refused BY that gate ("hands work to xargs or a shell"): the protected path is only on the producer side of the pipe (or a data operand
+// sits next to something that runs), and the quoted text is a command line a wrapper, pager, preprocessor, git config or file program hands to a shell. Catches: a quote hiding 'xargs rm' from the gate.
+const FAN_OUT_DENY = [
+  ["env -S 'xargs rm' (a quote before the word)", "find ~/.claude/pipeline -type f | env -S 'xargs rm'"],
+  ['gtimeout sh -c with a quoted fan-out', "find ~/.claude/pipeline -type f | gtimeout 5 sh -c 'xargs rm'"],
+  ['/usr/bin/time -f with a quoted fan-out (wrapper option with a side effect)', "find ~/.claude/pipeline -type f | /usr/bin/time -o out.txt -f 'xargs rm' cat x"],
+  ['rg --pre behind env', "find ~/.claude/pipeline -type f | env LESS=x rg --pre 'xargs rm' x"],
+  ['rg --pre', "find ~/.claude/pipeline -type f | rg --pre 'xargs rm' x"],
+  ['bat --pager', "find ~/.claude/pipeline -type f | bat --pager 'xargs rm' x"],
+  ['git -c core.pager after a producer', "find ~/.claude/pipeline -type f | git -c core.pager='xargs rm' log"],
+  ['git -c core.pager after a read of the tree', "cat ~/.claude/pipeline/VERSION | git -c core.pager='xargs rm' log"],
+  ['a non-trusted file program given a compound argument', "find ~/.claude/pipeline -type f | node /tmp/x.mjs 'ls; xargs rm'"],
+  ['triage settle --test-cmd is run by a shell', "find ~/.claude/pipeline -type f | node ~/.claude/pipeline/bin/pipeline.mjs triage settle --id 1 --result bug-confirmed --test-cmd 'xargs rm x' --test-file x"],
+  ['LESSOPEN pipe', "find ~/.claude/pipeline -type f | LESSOPEN='|xargs rm %s' less x"],
+  // (the same operands as the ALLOW rows, next to something that runs)
+  ['git log --grep piped to xargs', 'git -C ~/.claude/pipeline log --grep="a parallel b" | xargs rm'],
+  ['a second quoted word on an rg line is scanned', "env LC_ALL=C rg -e ' xargs ' ~/.claude/pipeline 'q; xargs rm'"],
+  ['a wrapper other than env + assignments keeps the text', "wsl grep -e 'x; xargs rm' ~/.claude/pipeline/VERSION"],
+  ['an assignment-only line stays refused (a value may be run later)', 'TITLE="a parallel b"; ls ~/.claude/pipeline'],
+];
+for (const [name, cmd] of FAN_OUT_DENY) {
+  test(`bash DENY (fan-out gate): ${name}`, () => {
+    const r = evaluateBashForFiles(cmd, { ...LINUX, cwd: '/repo' });
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /hands work to xargs or a shell/, cmd);
+  });
+}
+
+test('bash DENY: a git -c core.pager config before -C ... log --grep stays refused (not a read-only command)', () => {
+  assert.equal(bash(`git -c core.pager='xargs rm' -C ~/.claude/pipeline log --grep="use workers"`), 'deny');
+});
+test('bash DENY: git log --grep piped to a shell stays refused', () => {
+  assert.equal(bash(`git -C ~/.claude/pipeline log --grep="a parallel b" --format='%s' | sh`), 'deny');
+});
 
 test('bash: PIPELINE_ADMIN=1 in the process env allows everything', () => {
   const env = { PIPELINE_ADMIN: '1' };
