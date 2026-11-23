@@ -78,7 +78,7 @@ risk:
     "**/.githooks/**", "**/.husky/**",
     "pipeline/lib/glob.mjs", "pipeline/lib/git.mjs", "pipeline/lib/diff.mjs", "pipeline/lib/doc-paths.mjs", "pipeline/lib/docs-exempt.mjs",
     "pipeline/lib/yaml.mjs", "pipeline/vendor/**", "pipeline/lib/proc.mjs", "pipeline/lib/paths.mjs", "pipeline/lib/resolution.mjs",
-    "pipeline/lib/seams.mjs", "pipeline/lib/shell-words.mjs",
+    "pipeline/lib/seams.mjs", "pipeline/lib/shell-words.mjs", "pipeline/lib/conflict-sides.mjs",
     "pipeline/lib/transcript.mjs", "pipeline/lib/ci-proof.mjs", "pipeline/lib/integrity.mjs", "pipeline/lib/guard-provenance.mjs",
     "pipeline/lib/state.mjs", "pipeline/lib/review-publish.mjs", "pipeline/lib/review-context.mjs", "pipeline/lib/locks.mjs",
     "pipeline/lib/round-status.mjs", "pipeline/commands/final-gate.mjs", "pipeline/commands/triage.mjs", "pipeline/commands/model-proof.mjs",

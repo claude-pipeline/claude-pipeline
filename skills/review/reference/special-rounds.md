@@ -18,7 +18,7 @@ The old, still valid way to run a round one command at a time (what `P round cod
    An interrupted round (no triage comment yet): `P state discard-round --round R --pr N` before rerunning it.
    `baseOnly: true` (only main merged in): Codex did not run, no items, not counted; it carries the last reviewed result forward.
    `resolutionOnly: true` (a main conflict resolved by choosing lines): a real review of just the resolution, triaged as usual
-   (an ACCEPT still needs its fix round) but not counted; `resolutionIneligible: "<reason>"` ⇒ a normal counted round.
+   (an ACCEPT still needs its fix round) but not counted; `resolutionIneligible: "<reason>"` ⇒ a counted round: `reviewBaseKind: conflict` when the PR's own changes since the last review plus the conflict resolutions can be shown (typed lines or own commits after a conflicting main merge; the diff leaves main's commits out, and the prompt carries the conflict records), else the whole PR. Read the records: a file main deleted or moved that the head keeps is judged there, not in the patch.
 
 ## Conflict with the base (merge commit alone, a pre-push hook that refuses it)
 
@@ -29,7 +29,7 @@ In a repo whose base branch has a merge queue, main is merged into a PR branch o
 1. Make the merge commit alone, locally; do not add the fix yet. `P redraft --pr N` (Rule 8) before anything is pushed.
 2. The session NEVER bypasses a hook; the bypass is the owner's. Ask the owner (AskUserQuestion, one click), first option: the owner pushes the lone merge commit with the hook's documented bypass (`git push` with its no-verify flag), so the round stays free; second option: push the merge and the migration rename together and accept a counted whole-PR round. The question names the PR, the clash and what each costs (correctness before the free round).
 3. First answer: the owner pushes the merge commit from the PR's worktree with the bypass. Run the resolution round on that head (`resolutionOnly`, free). Then commit the rename and push it normally (the hook passes: the clash is gone); the next round is an ordinary fix check of just that commit (its base is the merge head, which already contains main, so `reviewBaseKind` is `previous`). The PR stays a draft until the rename is pushed, so no ready-era CI runs on the clashing head.
-4. Second answer: one push of both commits, a normal whole-PR round, nothing special.
+4. Second answer: one push of both commits, a normal counted round (a `conflict` round when the merge conflicted and the evidence is complete, else the whole PR), nothing special.
 
 ## Old 2.5 and 2.6 (publish, fix, outcome)
 

@@ -90,6 +90,7 @@ test('protectedKindsFor: round 1, post-rise (recorded or this round\'s own), con
   assert.deepEqual(protectedKindsFor({ state: { rounds: [codexRound(1, 'low'), codexRound(2, 'high')] }, round: 3 }), ['post-rise']);
   assert.deepEqual(protectedKindsFor({ state: calm, round: 2, confirmCount: 2 }), ['confirm-fixed']);
   assert.deepEqual(protectedKindsFor({ state: calm, round: 2, resolutionOnly: true }), ['resolution-only']);
+  assert.deepEqual(protectedKindsFor({ state: calm, round: 2, conflictRound: true }), ['conflict-merge']); // keeps a conflict round off the small-fix substitute lane
   const owed = { rounds: [opusRound(1, 'medium'), fableRound(2, 'high'), codexRound(3, 'high')] };
   assert.deepEqual(protectedKindsFor({ state: owed, round: 4 }), ['whole-pr']);
 });

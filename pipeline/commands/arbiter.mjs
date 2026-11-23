@@ -12,7 +12,8 @@
 import path from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { Fail, guarded, resolveRepo } from '../lib/cmd-common.mjs';
-import { CATEGORIES, categoryNotes, fingerprint, largeBinaryNote, normalizeFindingCategories, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
+import { CATEGORIES, categoryNotes, conflictBaseNote, conflictSection, fingerprint, largeBinaryNote, normalizeFindingCategories, resolutionBaseNote, resolutionSection } from '../lib/codex.mjs';
+import { renderConflictSides } from '../lib/conflict-sides.mjs';
 import { GitError, ReviewBaseUnavailable, diffFiles, ensureReviewBase, headSha, reviewPatch, revParse, showFile } from '../lib/git.mjs';
 import { baseConfigAt, loadConfig } from '../lib/config.mjs';
 import { collectHardStops } from '../lib/hardstops.mjs';
@@ -55,7 +56,7 @@ export const meta = {
     '  briefReason (mode review): why that brief, e.g. `fix round: round 1 accepted 1 item(s) ...`, `synthetic review base ...`, `the round\'s own range is medium risk ...`, `the trusted default-branch config is unavailable`, or the message of an error caught while assessing the range',
     '  --full: force the full brief (`full` / `high` / `arbiter`, briefReason `forced by --full`) on a Fable review round `needed` would class as fix-verify; the stored brief and the digest change with it. For when `arbiter-fix` cannot be started or the owner wants a full review. It changes the brief, not the scope: the diff a pass reviews stays `round` after an earlier proven pass (a whole-pr review needs a Fable refresh round: `state fable-refresh`). It sticks: the round stores arbiter.forcedFull, also when a stale terminal stops the call, so a later plain `needed` (the retry after a restart, or after an unproven or malformed pass) keeps the full brief, briefReason still `forced by --full`, until a pass is proven. The stop drops the stored input (fix-verify brief, digest, tag), so an earlier arbiter-fix pass cannot prove the round and the retry writes a fresh full input; `apply` also refuses (exit 1 forced-full-pending) a round that stores forcedFull beside a fix-verify brief',
     '  mode review (a Fable round: medium/high risk or a sensitive path): always needed, even with zero items, until a proven pass is applied',
-    '    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that)',
+    '    (then {needed:false, done:true}); the input carries the diff to review (scope whole-pr the first time, round after that); after a conflicting merge with the default branch (a conflict round) the round slice also carries the conflict note, the paths and records, and conflict-sides.md (both sides of every conflict by oid, each line framed by side and line number, sha256 pinned in the input and rebuilt from the round at apply; over 200 KB or unreadable: the pass reads the whole PR)',
     '  mode review in a terminal whose Claude Code build is older than the installed one (stale): exit 1 {ok:false, error: stale-terminal, restartRequired: true,',
     '    claudeCode: {running, installed, stale}, advice} BEFORE any input is written (no Fable spend); restart the terminal, then run needed again; unknown versions (stale null) do not stop it;',
     '    the stop is saved as round.arbiter.failure {cause, advice, at}',
@@ -184,6 +185,7 @@ const floorAdviceFor = (judged) => judged.advice ?? null;
 const isFableRound = (round) => round.fableRequired === true && round.baseOnly !== true;
 const FABLE_DIFF = 'fable-diff.patch';
 const REGRESSION_BASE = 'regression-base.md';
+const CONFLICT_SIDES = 'conflict-sides.md';
 
 // The merge-base view of the regression-only files for a read-only agent: for each changed file matching a glob (old or new path), the lines the PR adds and removes against the FORK POINT, whatever the
 // scope of the Fable diff (a round-scope diff hides what an earlier round of the same PR added). Written next to the input; its digest goes into the input text, so the input digest binds it.
@@ -207,6 +209,18 @@ function writeRegressionBase(round, root, { globs, forkPoint }) {
   return { basePath, baseDigest: sha256(text) };
 }
 
+// The both-sides view of a 'conflict' round for a read-only agent (lib/conflict-sides.mjs#renderConflictSides: every stage blob by oid, every line framed by side and line number, 200 KB cap), written next to the
+// input; its digest goes into the input text. -> { sidesPath, sidesDigest } | null (a blob git cannot give, or over the cap: the caller reads the whole PR instead).
+const conflictSidesOf = (round) => ({ n: round.n, from: round.fromHead, forkPoint: round.forkPoint, conflicted: round.conflicted, records: round.records });
+function writeConflictSides(round, root) {
+  if (typeof round.fromHead !== 'string' || typeof round.forkPoint !== 'string') return null;
+  const made = renderConflictSides(conflictSidesOf(round), { cwd: root });
+  if (made.text === undefined) return null;
+  const sidesPath = path.join(ensureRoundDir(root, round.n), CONFLICT_SIDES);
+  writeFileAtomic(sidesPath, made.text);
+  return { sidesPath, sidesDigest: sha256(made.text) };
+}
+
 // The diff a Fable pass reviews, written next to its input and pinned by digest. The first proven Fable pass of a PR sees
 // the WHOLE PR (fork point..this round's head): a PR that only became medium in a later round must not have its first
 // rounds go unreviewed by Fable. After that, each round's own slice (what Codex saw), like Codex. A pass proven below the re-review threshold (MIN_FABLE, or
@@ -217,7 +231,10 @@ function writeFableDiff(state, round, root, gate) {
   const earlierProven = state.rounds.some((r) => r.n < round.n && isFableRound(r) && provenNotStale(r, gate));
   // Any stale round no whole-PR pass has replaced yet: this pass must read everything, or it could never replace it (staleFableRounds).
   const replacesStale = staleFableRounds(state, gate).length > 0;
-  const scope = earlierProven && round.fableRefresh !== true && !replacesStale ? 'round' : 'whole-pr';
+  let scope = earlierProven && round.fableRefresh !== true && !replacesStale ? 'round' : 'whole-pr';
+  // A 'conflict' round per round needs both sides of every conflict written for Fable (it has no shell); when that cannot be done, this pass reads the whole PR.
+  const sides = scope === 'round' && round.reviewBaseKind === 'conflict' ? writeConflictSides(round, root) : null;
+  if (scope === 'round' && round.reviewBaseKind === 'conflict' && sides === null) scope = 'whole-pr';
   // A synthetic / resolution round's base is a tree that exists only where it was made: rebuilt here when this clone lacks it,
   // and never replaced by another range (a different review) when it cannot be.
   let from;
@@ -235,7 +252,9 @@ function writeFableDiff(state, round, root, gate) {
   const text = note.length === 0 ? patch : `${patch}\nLarge binary files (content not shown):\n${note.join('\n')}\n`;
   const diffPath = path.join(ensureRoundDir(root, round.n), FABLE_DIFF);
   writeFileAtomic(diffPath, text);
-  return { diffPath, diffDigest: sha256(text), scope, from };
+  // The files the threat models and the regression bar are read from: a 'conflict' round's base is a tree, so they come from the whole PR (fork point..head), as a whole-PR round's do.
+  const tmFrom = sides !== null ? round.forkPoint : from;
+  return { diffPath, diffDigest: sha256(text), scope, from, tmFrom, ...(sides === null ? {} : sides) };
 }
 
 // The instructions part of a Fable review input. Everything a model wrote earlier (titles, reasons) is flattened to one line.
@@ -255,6 +274,7 @@ function reviewSection(state, round, diff, fix = null) {
     `Diff to review (${diff.scope === 'whole-pr' ? 'the whole pull request' : `only what changed in round ${round.n}`}): ${diff.diffPath}`,
     `Diff sha256: ${diff.diffDigest}`,
     `Range: ${diff.from}..${round.toHead}`,
+    ...(diff.sidesPath ? [`Conflict sides (Read it): ${diff.sidesPath}`, `Conflict sides sha256: ${diff.sidesDigest}`] : []),
     `Each finding's \`category\` must be exactly one of: ${CATEGORIES.join(', ')}.`,
   ];
   // A FIX ROUND (chooseBrief): the narrow brief. Same mode, same diff, same JSON contract: only what to spend the effort on changes.
@@ -289,6 +309,10 @@ function reviewSection(state, round, diff, fix = null) {
   if (round.resolutionOnly === true && diff.scope === 'round') {
     const resolution = { ...round, from: round.fromHead };
     out.push('', ...resolutionBaseNote(resolution), ...resolutionSection(resolution, { base: diff.from, head: round.toHead }));
+  }
+  // A 'conflict' round per round: the same slice Codex reads (the PR's own changes plus how each conflict was resolved) and the same paths and records; the note points at conflict-sides.md instead of `git show`.
+  if (round.reviewBaseKind === 'conflict' && diff.scope === 'round') {
+    out.push('', ...conflictBaseNote({ from: round.fromHead, forkPoint: round.forkPoint }, { fable: true }), ...conflictSection(round));
   }
   if (fix) {
     const fixes = fix.accepted.slice(0, 40).flatMap((i) => [
@@ -519,7 +543,7 @@ async function neededLocked(values, n, root, ctx) {
   // The files the Fable diff covers (shared by the threat-model lookup and chooseBrief); null when git cannot list them (no model is shown then, chooseBrief says why).
   let diffFileList = null;
   if (review) {
-    try { diffFileList = diffFiles(diff.from, round.toHead, { cwd: root }); } catch { /* chooseBrief reports it */ }
+    try { diffFileList = diffFiles(diff.tmFrom, round.toHead, { cwd: root }); } catch { /* chooseBrief reports it */ }
   }
   const forkPoint = round.forkPoint ?? state.rounds.findLast((r) => typeof r.forkPoint === 'string')?.forkPoint ?? null;
   const tm = review ? await threatModelContext(round, diffFileList, items, root, forkPoint) : null;
@@ -545,7 +569,7 @@ async function neededLocked(values, n, root, ctx) {
   const ids = items.map((i) => i.id);
   const kept = round.arbiter?.failure;
   // The brief rides with a Fable review round only: a dispute round (and any round stored before this existed) has none, which `apply` reads as full.
-  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}), ...(tm?.names.length > 0 ? { threatModels: tm.names, diffFrom: diff.from } : {}), ...(regression ? { regressionOnly: regression } : {}) };
+  const stored = { inputDigest: digest, items: ids, tag, mode, ...(review ? { brief: expectation.brief, briefReason, effort: expectation.effort, agent: expectation.agent } : {}), ...(forcedFull ? { forcedFull: true } : {}), ...(kept ? { failure: kept } : {}), ...(diff ? { diffPath: diff.diffPath, diffDigest: diff.diffDigest, scope: diff.scope } : {}), ...(diff?.sidesPath ? { conflictSides: { path: diff.sidesPath, digest: diff.sidesDigest } } : {}), ...(tm?.names.length > 0 ? { threatModels: tm.names, diffFrom: diff.tmFrom } : {}), ...(regression ? { regressionOnly: regression } : {}) };
   saveState(root, patchRound(state, n, { arbiter: stored, ...(tm?.pin ? { trustedConfigSha: tm.sha } : {}) }));
   const promptHeader = `ROUND: ${n}\nINPUT-DIGEST: ${digest}`;
   return {
@@ -587,6 +611,25 @@ function checkRegressionBase(regressionOnly) {
     throw err;
   }
   return sha256(text) === regressionOnly.baseDigest ? [] : [`${REGRESSION_BASE} no longer matches the digest the arbiter was given (edited since \`arbiter needed\`)`];
+}
+
+// The both-sides file a 'conflict' round's input names must still be exactly what was given, and must be what git gives now for the round's recorded commits and oids (a file rebuilt from the round, not only the
+// digest of what is on disk). A per-round pass of a conflict round whose state lost the file's pin is refused.
+function checkConflictSides(stored, round, root) {
+  if (round.reviewBaseKind !== 'conflict' || stored.scope !== 'round') return [];
+  const pin = stored.conflictSides;
+  if (typeof pin?.path !== 'string' || typeof pin.digest !== 'string') return [`the conflict round's input names no ${CONFLICT_SIDES}: run \`arbiter needed\` again`];
+  let text;
+  try {
+    text = readFileOrFail(pin.path, 'conflict sides');
+  } catch (err) {
+    if (err instanceof Fail) return [`${CONFLICT_SIDES} is missing or unreadable: ${err.output.message}`];
+    throw err;
+  }
+  if (sha256(text) !== pin.digest) return [`${CONFLICT_SIDES} no longer matches the digest the arbiter was given (edited since \`arbiter needed\`)`];
+  const again = renderConflictSides(conflictSidesOf(round), { cwd: root });
+  if (again.text === undefined) return [`${CONFLICT_SIDES} cannot be rebuilt from the round's commits (${again.unavailable})`];
+  return sha256(again.text) === pin.digest ? [] : [`${CONFLICT_SIDES} is not what git gives for this round's commits and recorded blobs: run \`arbiter needed\` again`];
 }
 
 function checkDiffFile(stored) {
@@ -713,6 +756,7 @@ async function applyLocked({ n, agentId, givenTag, expectModelPrefix, askedEffor
   // A review mode input names the diff Fable read by its digest; the file must still be exactly that diff.
   if (review) errors.push(...checkDiffFile(stored));
   if (review && stored.regressionOnly) errors.push(...checkRegressionBase(stored.regressionOnly));
+  if (review) errors.push(...checkConflictSides(stored, round, root));
 
   let rulings = null;
   let categoryWarnings = [];

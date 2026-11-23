@@ -11,7 +11,7 @@ import { createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } from './helpers/fak
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { Fail } from '../pipeline/lib/cmd-common.mjs';
 import { EXIT } from '../pipeline/lib/cli.mjs';
-import { admitRound, planRange, recordRound, requiredBase, roundPrompt } from '../pipeline/lib/review-round.mjs';
+import { admitRound, classifyReview, planRange, recordRound, requiredBase, roundPrompt } from '../pipeline/lib/review-round.mjs';
 
 const GH = [
   { match: '^pr view 7', stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main' } },
@@ -129,4 +129,34 @@ test('planRange: base is the base a round must use (the previous round\'s toHead
   const synthetic = planRange({ state: { rounds: [round('r1head')] }, forkPoint: 'fork0', review: { base: 'treeid', kind: 'synthetic' } });
   assert.equal(synthetic.base, 'r1head');
   assert.equal(synthetic.reviewBase, 'treeid');
+});
+
+// ---- classifyReview: where the counted 'conflict' kind may and may not appear (#423) ------------------------------------------------------------------------------
+
+// Failure caught: the conflict base replacing a range the caller owes whole (an owed whole-PR round starts at the merge base; an escalated judge-to-Fable round reads the whole PR), which would
+// hand Fable or the owed round only the slice since the last review.
+test('classifyReview: a conflicting merge gives the conflict kind, except where a whole PR is owed (merge-base, nothing tried) or the reviewer escalated (whole-pr, conflict cleared)', async (t) => {
+  const w = await world(t);
+  w.repo.checkout('main');
+  w.repo.write('src/a.js', file(2)); // main edits the line the PR changed: the trial merge of head with main conflicts
+  const main = w.repo.commit('main edits line 12');
+  const o = { cwd: w.root };
+  const tried = [];
+  const common = {
+    state: { rounds: [{ toHead: w.head, items: [] }] }, base: w.head, forkPoint: main, trusted: true,
+    tryResolution: () => { tried.push('resolution'); return { ineligible: 'history-nonmerge' }; },
+    tryConflict: () => { tried.push('conflict'); return { base: 'tree0', conflicted: ['src/a.js'], conflictedCount: 1, records: [] }; },
+  };
+  const counted = classifyReview(common, o);
+  assert.deepEqual([counted.review, counted.conflict, counted.resolutionIneligible], [{ base: 'tree0', kind: 'conflict' }, { conflicted: ['src/a.js'], conflictedCount: 1, records: [] }, 'history-nonmerge']);
+
+  tried.length = 0;
+  const owed = classifyReview({ ...common, wholePr: true }, o);
+  assert.deepEqual([owed.review, owed.conflict, tried], [{ base: main, kind: 'merge-base' }, null, []]);
+
+  const escalated = classifyReview({ ...common, escalated: true }, o);
+  assert.deepEqual([escalated.review, escalated.conflict, escalated.resolution], [{ base: main, kind: 'whole-pr' }, null, null]);
+
+  const refused = classifyReview({ ...common, tryConflict: () => ({ unavailable: 'evidence: x' }) }, o);
+  assert.deepEqual([refused.review, refused.conflict], [{ base: main, kind: 'whole-pr' }, null]);
 });

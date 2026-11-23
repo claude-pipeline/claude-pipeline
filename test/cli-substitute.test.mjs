@@ -671,6 +671,36 @@ test('a resolution-only round: the packet exports sides/ours and sides/base for 
   assert.deepEqual([round.firstReviewer, round.resolutionOnly, round.reviewBaseKind], ['substitute', true, 'resolution']);
 });
 
+test('a conflict round (an own commit after the conflicting merge): the packet exports every stage blob by oid under sides/<ancestor|ours|theirs> and conflict-records.md; prepare and apply agree; the round is recorded as a conflict round', (t) => {
+  // Failure caught: a substitute reviewer given a tree-based range with no way to read the sides or the records of a conflict it must judge.
+  const w = world(t);
+  assertExit(w.codex(1, findingsOf()), 0);
+  const ours = readFileSync(join(w.repo.dir, 'src/a.js'), 'utf8');
+  w.repo.checkout('main');
+  w.repo.write('src/a.js', ours.replace('compute(x.y)', '1200'));
+  w.repo.commit('main edits the line');
+  w.repo.checkout('feat/x');
+  try { w.repo.git(['merge', '--no-ff', '-m', 'Merge main into feat/x', 'main']); } catch { /* the conflict: resolved below */ }
+  w.repo.write('src/a.js', ours);
+  w.repo.git(['add', '-A']);
+  w.repo.git(['commit', '-q', '--no-edit']);
+  w.repo.write('src/c.js', 'export const c = 1;\n');
+  const merged = w.repo.commit('own commit after the merge');
+  w.prHead(merged);
+  assertExit(w.run(2, w.quota(), { from: w.head, to: merged }), 3);
+  const p = w.prepare(2);
+  assertExit(p, 0, p.stdout + p.stderr);
+  for (const f of ['sides/ancestor/src/a.js', 'sides/ours/src/a.js', 'sides/theirs/src/a.js', 'conflict-records.md']) assert.ok(p.json.files.includes(f), `${f} exported: ${p.json.files.join(', ')}`);
+  const sub = join(w.dir(2), 'substitute');
+  assert.equal(readFileSync(join(sub, 'sides', 'ours', 'src/a.js'), 'utf8'), ours);
+  assert.ok(readFileSync(join(sub, 'sides', 'theirs', 'src/a.js'), 'utf8').includes('1200'));
+  assert.ok(readFileSync(p.json.inputPath, 'utf8').includes(join(sub, 'conflict-records.md')));
+  const r = w.cli(['substitute', 'apply', '--pr', '7', '--round', '2', '--projects-dir', install(w, p.json)]);
+  assertExit(r, 0, r.stdout + r.stderr);
+  const round = w.state().rounds[1];
+  assert.deepEqual([round.firstReviewer, round.resolutionOnly, round.reviewBaseKind], ['substitute', undefined, 'conflict']);
+});
+
 test('risk rises after an Opus substitute round: the next substitute is substitute-fable and the whole-PR round (merge base) is owed, exported and recorded', (t) => {
   const w = world(t);
   const opus = w.ready();

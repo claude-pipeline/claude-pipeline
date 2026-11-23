@@ -20,7 +20,7 @@ import { EXIT } from './cli.mjs';
 import { assignIds, buildReviewPrompt, largeBinaryNote, renderFindingsMarkdown } from './codex.mjs';
 import { Fail } from './cmd-common.mjs';
 import {
-  GitError, NETWORK_TIMEOUT_MS, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, showFile,
+  GitError, NETWORK_TIMEOUT_MS, conflictReviewBase, diffFiles, effectiveReviewBase, git, headSha, mergeBase, resolutionReviewBase, reviewPatch, showFile,
 } from './git.mjs';
 import { createGitHub } from './github.mjs';
 import { assertPublishedHistory } from './review-publish.mjs';
@@ -207,12 +207,14 @@ export function defaultRoundRange({ root, config, ctx, pr, state }) {
 
 // Which review base and kind a round would get (the classification admitRound makes; the cap and the written artifacts are not part of it, so the display paths
 // - `codex-review --plan`'s siblings and `triage round-request`'s prediction - call it too). `trusted`: the PR targets the trusted default branch (only then are the base
-// branch's commits left out); `escalated`: a judge PR that now needs Fable (reviews the whole PR); `tryResolution`: the resolution-only proof, run only when the
-// trial merge fell back to whole-PR. Reads git; writes at most the trial merge's objects, no ref and no state.
-// -> { review: {base, kind}, resolution (the proven resolution | null), resolutionIneligible (the proof's refusal, when it was tried and refused) }
-export function classifyReview({ state, wholePr, base, forkPoint, trusted, escalated = false, tryResolution }, o) {
+// branch's commits are left out); `escalated`: a judge PR that now needs Fable (reviews the whole PR); `tryResolution`: the resolution-only proof, run only when the
+// trial merge fell back to whole-PR; `tryConflict`: after that proof refused, the counted 'conflict' round (git.mjs#conflictReviewBase: the PR's own changes plus the evidence of each
+// conflict's resolution), whose refusal leaves the whole-PR range. Reads git; writes at most the trial merge's objects, no ref and no state.
+// -> { review: {base, kind}, resolution (the proven resolution | null), conflict ({ conflicted, conflictedCount, records } | null), resolutionIneligible (the proof's refusal, when it was tried and refused) }
+export function classifyReview({ state, wholePr, base, forkPoint, trusted, escalated = false, tryResolution, tryConflict }, o) {
   let review = { base: forkPoint, kind: 'merge-base' };
   let resolution = null;
+  let conflict = null;
   let resolutionIneligible;
   if (state?.rounds.length > 0 && !wholePr) {
     review = trusted ? effectiveReviewBase({ from: base, forkPoint }, o) : { base, kind: 'previous' };
@@ -223,19 +225,25 @@ export function classifyReview({ state, wholePr, base, forkPoint, trusted, escal
         review = { base: found.base, kind: 'resolution' };
       } else {
         resolutionIneligible = found.ineligible;
+        const proven = tryConflict ? tryConflict() : { unavailable: 'not tried' };
+        if (proven.unavailable === undefined) {
+          conflict = { conflicted: proven.conflicted, conflictedCount: proven.conflictedCount, records: proven.records };
+          review = { base: proven.base, kind: 'conflict' };
+        }
       }
     }
   }
   if (escalated) {
     review = { base: forkPoint, kind: 'whole-pr' };
     resolution = null;
+    conflict = null;
   }
-  return { review, resolution, resolutionIneligible };
+  return { review, resolution, conflict, resolutionIneligible };
 }
 
 // Phase one. `base` and `head` are full SHAs (head is the checked-out HEAD). Returns the admitted round (opaque to the caller except
 // for these fields): { state, view, slug, ghRepo, forkPoint, level, rated, lane, fable, lightLane, review: {base, kind}, resolution,
-// resolutionOnly, resolutionView, resolutionIneligible, escalated, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
+// resolutionOnly, resolutionView, conflict ({ conflicted, conflictedCount, records } of a 'conflict' round | null), resolutionIneligible, escalated, baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems,
 // hashAtHead, dir } plus the inputs it was given.
 export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   const o = { cwd: root };
@@ -285,11 +293,14 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   // two sides had, the range is the resolution alone and the round is free of the cap (resolutionReviewBase has every rule).
   const baseBranchRef = reviewBaseRef(root, config, prBase);
   c.tryResolution = () => resolutionReviewBase({ from: base, forkPoint, head, baseRef: baseBranchRef }, o);
+  // The conflict case when the resolution proof refused (typed text, an own commit after the merge, a conflict that is not plain text): a COUNTED round on the PR's own changes plus
+  // the evidence of how each conflict was resolved, where conflictReviewBase can show it all; anywhere else the whole-PR range stays.
+  c.tryConflict = () => conflictReviewBase({ from: base, forkPoint, head, baseRef: baseBranchRef }, o);
   // A PR the judge has been reviewing that now needs Fable (it gained a hit or a sensitive path, or grew past risk.high_lines): this round reviews the
   // WHOLE PR, so the Fable pass sees everything the judge-only rounds covered (never a resolution-only round: that is a slice by definition).
   const escalated = state?.rounds.length > 0 && state.reviewer === 'judge' && lane.reviewer === 'fable';
-  const { review, resolution, resolutionIneligible } = classifyReview({
-    state, wholePr, base, forkPoint, trusted: prBase === rated.defaultBranch && rated.untrusted === null, escalated, tryResolution: c.tryResolution,
+  const { review, resolution, conflict, resolutionIneligible } = classifyReview({
+    state, wholePr, base, forkPoint, trusted: prBase === rated.defaultBranch && rated.untrusted === null, escalated, tryResolution: c.tryResolution, tryConflict: c.tryConflict,
   }, o);
   c.resolutionIneligible = resolutionIneligible;
   const resolutionOnly = resolution !== null;
@@ -347,7 +358,8 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
     const trustedRead = baseConfigAt(trustedConfigSha, root);
     try {
       if (trustedRead.ok) {
-        const files = diffFiles(review.base, head, o);
+        // A 'conflict' round's base is a tree: the files the models and the regression bar are read from are the whole PR's (fork point..head), as a whole-PR round's.
+        const files = diffFiles(review.kind === 'conflict' ? c.forkPoint : review.base, head, o);
         threatModels = threatModelsFor(files, trustedRead.config);
         const globs = regressionOnlyFor(files, trustedRead.config);
         if (globs.length > 0) regressionOnly = { globs, forkPoint: c.forkPoint };
@@ -356,7 +368,7 @@ export async function admitRound({ root, config, ctx, pr, round, base, head }) {
   }
 
   return {
-    ...c, state, view, slug, level, rated, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView,
+    ...c, state, view, slug, level, rated, lane, fable, lightLane, review, resolution, resolutionOnly, resolutionView, conflict,
     baseOnly, patch, largeBinaries, preAdmission, priorRulings, confirmItems, trustedConfigSha, threatModels, regressionOnly, hashAtHead: currentContentHash(root, config), escalated,
   };
 }
@@ -369,6 +381,7 @@ export const roundPrompt = (adm) => buildReviewPrompt({
   ...(adm.regressionOnly ? { regressionOnly: adm.regressionOnly } : {}),
   ...(adm.confirmItems.length > 0 ? { confirmFixed: adm.confirmItems.map((i) => ({ id: i.id, title: i.title, file: i.file, detail: i.detail })) } : {}),
   ...(adm.resolutionOnly ? { resolution: { from: adm.base, forkPoint: adm.forkPoint, ...adm.resolutionView } } : {}),
+  ...(adm.conflict ? { conflict: { from: adm.base, forkPoint: adm.forkPoint, ...adm.conflict } } : {}),
 });
 
 // The facts of the reviewed range that decide "a small fix-check" (review-route.mjs): changed lines (binary = unbounded), whether it adds a file, whether it
@@ -400,7 +413,7 @@ export function rangeFacts(from, to, config, o) {
 export function protectedKindsOf(adm) {
   const { state, round } = adm;
   const risen = state ? higherRisk(maxRiskOf(state), adm.level) !== maxRiskOf(state) : false;
-  return protectedKindsFor({ state, round, resolutionOnly: adm.resolutionOnly, confirmCount: adm.confirmItems.length, risen });
+  return protectedKindsFor({ state, round, resolutionOnly: adm.resolutionOnly, conflictRound: adm.review.kind === 'conflict', confirmCount: adm.confirmItems.length, risen });
 }
 
 // The routing knobs planRound reads, as the STRICTER of the working-tree config and the trusted base config (the one committed at the PR's fork point): a PR
@@ -598,6 +611,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
       ...(adm.wholePr ? { wholePr: true } : {}),
       ...(adm.escalated ? { escalated: true } : {}),
       ...(adm.resolutionOnly ? { resolutionOnly: true, ...adm.resolutionView } : {}),
+      ...(adm.conflict ? { conflicted: adm.conflict.conflicted, conflictedCount: adm.conflict.conflictedCount, records: adm.conflict.records } : {}),
       ...(reviewer === 'fable' && !adm.baseOnly ? { fableRequired: true, fableReasons: reasons, sensitivePaths: adm.lane.sensitivePaths.slice(0, 50) } : {}),
     });
     writeJson(path.join(dir, 'codex.json'), { findings, items: ruled });

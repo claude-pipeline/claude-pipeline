@@ -11,7 +11,8 @@
 // previous round (git.mjs#effectiveReviewBase): those commits were reviewed in their own PRs. A round that is nothing but
 // such a merge is recorded as `baseOnly` without running Codex. When that merge conflicted and the resolver only chose lines
 // the two sides already had (git.mjs#resolutionReviewBase proves it), the round is shown just the resolution and is recorded as
-// `resolutionOnly`: a real review that does not count toward the round cap. The state is
+// `resolutionOnly`: a real review that does not count toward the round cap. When it cannot be proven but every conflict's resolution can be shown
+// (git.mjs#conflictReviewBase), the round is a counted `conflict` round on the PR's own changes. The state is
 // read-modified-written under the per-PR lock, but the lock is NOT held while Codex runs (up to 30 minutes): the
 // state is read again under the lock once Codex has answered, and a round recorded in the meantime wins.
 // The admission before Codex runs and the final locked write are the shared module pipeline/lib/review-round.mjs (admitRound / recordRound),
@@ -49,7 +50,7 @@ export const meta = {
     '    a round with confirmFixed items, a resolution-only round, a whole-PR round that is owed. The round records effort; a round the governor lowered also records governor:{usedPct, threshold, observedAt} (state version 4)',
     '  --plan prints what the round would do and runs nothing, writes no route.json and no round: {ok, plan:{route: codex|substitute, evidence: none|budget|governor, effort, why, round, base (the base to pass as --base: the previous round toHead, else the fork point), reviewBase + reviewBaseKind (the range the round reviews), wholePrOwed, protected, small, lowered?, budget:{used, budget},',
     '    governor:{usedPct, soft, hard, observedAt}|null, facts:{changedLines, newFile, sensitive}, reviewKind, resolutionOnly?, resolutionIneligible?}, expectedEffort}; the skill passes expectedEffort as --effort (--effort is optional with --plan)',
-    '    reviewKind (display only) = what the round would review: merge-base (round 1 / a whole PR owed) | previous | synthetic (the default branch merged in cleanly) | resolution (resolutionOnly: true) | whole-pr; resolutionIneligible = the short code (and detail) of why the free resolution-only round was refused, when it was tried',
+    '    reviewKind (display only) = what the round would review: merge-base (round 1 / a whole PR owed) | previous | synthetic (the default branch merged in cleanly) | resolution (resolutionOnly: true) | conflict (a conflicting default-branch merge, counted: the changes of the PR itself plus the conflict resolutions) | whole-pr; resolutionIneligible = the short code (and detail) of why the free resolution-only round was refused, when it was tried',
     '  a small fix-check (not protected, see above) goes to the substitute instead of Codex when the PR has used review.codex_round_budget Codex runs (recorded Codex rounds and recorded Codex second reviews in the state; a killed or retried run',
     '    does not count) or the weekly Codex quota used is at least review.codex_budget.hard (P codex-status; an unreadable figure turns the governor off). Codex is not run: exit 3 {ok:false, unavailable:true, reason:withheld, message,',
     '    substitute:{eligible:true, why: budget-spent|governor-hard, evidence: budget|governor, agent, resetAt:null}, plan}; route.json holds {evidence: budget, budget:{used, budget}} or {evidence: governor, governor:{usedPct, threshold, observedAt}}',
@@ -61,7 +62,7 @@ export const meta = {
     '    review.codex_model is the base config\'s (an unreadable base or an untrusted anchor: the built-in default), never the working tree\'s, and --model must name it, else exit 2 {error:model-mismatch, expected}; it is read at the fork point admission fetched (origin/<default branch>, refreshed best effort even when the PR\'s base is another branch, a stack), so this check follows admission',
     '  when GitHub names no base branch and the default branch cannot be anchored on the remote (an origin remote that answered neither origin/HEAD nor ls-remote: the working tree\'s default_branch is the PR\'s to edit), exit 3 {reason:github, error:unanchored-base}; with such an untrusted anchor the commits merged in from the base branch are never left out of a later round (the range is the previous round\'s head, kind previous)',
     '  a whole-PR round is owed (state outcome wholePrOwed) when an Opus substitute round came before the PR\'s risk rose to high and no whole-PR round has run since: that round must use the PR\'s merge base as --base (else exit 2 base-mismatch),',
-    '    reviews the whole PR (reviewBaseKind merge-base, never base-only or resolution-only, counts toward the cap) and records wholePr:true and patchSha256. An all-Codex history owes none',
+    '    reviews the whole PR (reviewBaseKind merge-base, never base-only, resolution-only or conflict, counts toward the cap) and records wholePr:true and patchSha256. An all-Codex history owes none',
     '  --base must be the PR\'s merge base for round 1 and the previous round\'s toHead after that, else exit 2 {error:base-mismatch}',
     '  exit 2 {error:empty-range} when earlier rounds accepted items and the branch content is unchanged since the last round (base == head, an empty commit,',
     '    an amend); the message names the accepted items still waiting for a fix, or says the content is what round N reviewed. Never for a round that only merged',
@@ -87,8 +88,10 @@ export const meta = {
     '  commits merged in from the PR\'s base branch since the previous round are left out of the reviewed diff; a round that only merged them in',
     '    is recorded without running Codex: {ok:true, baseOnly:true, counts all 0}',
     '  when that merge conflicted and the resolution only chose lines the two sides already had, Codex reviews just the resolution:',
-    '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise',
-    '    the whole PR is reviewed as before (a counted round) and {resolutionIneligible:"<reason>"} says why the resolution was not; every round output also carries reviewKind',
+    '    {resolutionOnly:true, conflicted, conflictedCount}; the round is a real review but does not count toward the cap. Otherwise, when the history is the PR\'s own plus merges of the default branch and every conflict\'s resolution can be shown',
+    '    (git.mjs#conflictReviewBase), the round is a COUNTED conflict round (reviewKind conflict; the round records conflicted, conflictedCount and records of the conflicts that are not plain text): the diff is the PR\'s own changes since the last review plus',
+    '    how each text conflict was resolved, with the default branch\'s own commits left out; where that evidence cannot be complete (attributes, a foreign or octopus merge, a rewrite, markers left in, more than 50 conflicts) the whole PR is reviewed as before',
+    '    (a counted round). Either way {resolutionIneligible:"<reason>"} says why the free resolution was not; every round output also carries reviewKind',
     '    taken alone',
     '  exit 3 {ok:false, unavailable:true, reason: quota|model|auth|unavailable|error|malformed|github} when Codex or GitHub could not deliver. A Codex failure also carries',
     '    substitute:{eligible, why, agent, resetAt, waitUntil?}: eligible only for a real quota stop (Codex\'s own turn.failed event, confirmed by its session log when found) or a proven refused model (below) with',
