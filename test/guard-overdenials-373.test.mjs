@@ -304,12 +304,16 @@ describe('#529 files: a `&>` span', () => {
     ['assigned in the span, used after it (BASE allow, CANDIDATE deny)', 'D=/tmp/ok &>/dev/null; touch $D/f'],
     ['assigned in the span, used after its end through && (BASE allow, CANDIDATE deny)', 'D=/tmp/ok && true &>/dev/null && touch $D/f'],
     ['written inside the span and again after it (R1-B5 control: the write past the span stays refused)', 'D=/tmp/ok && touch "$D/f" &>/dev/null; cat "$D/x"; touch "$D/g"'],
+    ['a name built from the span name, written past the span end (R2-B1 control: refused from where its source is)', 'D=/tmp/ok && F="$D/r" && true &>/dev/null; echo "$D"; touch "$F"'],
+    ['a binder after the span end still reaches the write inside it (R2-F1: allowed on ab3e4d96, deny on main)', 'D=/tmp/ok && touch $D/f &>/dev/null; echo $D; read D'],
+    ['the same in a loop: the binder reaches the write above it (R2-F1)', 'for i in 1 2; do touch $D/f; D=/tmp/ok && true &>/dev/null; echo $D; read D; done'],
     ['a protected round directory by a span name (BASE deny, CANDIDATE deny: control, the reason changes)', `F=22 &>/dev/null; echo '{}' > ${['.review', 'round-'].join('/')}$F/x.json`],
   ]);
   allows('variable', [
     ['the same assignment without a `&>` (BASE allow, CANDIDATE allow)', 'D=/tmp/ok; touch $D/f'],
     ['used inside the span (BASE allow, CANDIDATE allow)', 'D=/tmp/ok && touch $D/f &>/dev/null'],
     ['used inside the span, read again after it (R1-B5: allow; deny on 49ca2b80, where a later read made the name unknown for the whole line)', 'D=/tmp/ok && touch "$D/f" &>/dev/null; echo "$D"'],
+    ['a name built from the span name, used inside the span, the source read again after it (R2-B1: allow; deny on ab3e4d96, where the derived name was unknown for the whole line)', 'D=/tmp/ok && F="$D/result" && touch "$F" &>/dev/null; echo "$D"'],
   ]);
   denies('target', [ // (controls: BASE deny, CANDIDATE deny; the redirect rule reads every directory of the line, which covers both readings of where the `&>` target is opened)
     ['bash opens child/FILE, dash ./FILE: cwd is the protected folder', `cd child && : &>${PROT.split('/')[1]}`, { cwd: '/home/u/.claude' }],

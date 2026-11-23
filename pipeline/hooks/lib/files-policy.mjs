@@ -3789,7 +3789,14 @@ function collectVars(cmds, ctx) {
   if (ctx.arith?.dynamic) for (const k of [...given.keys(), ...Object.keys(ctx.inheritedVars ?? {})]) unknown.add(k);
   for (let changed = true; changed;) {
     changed = false;
-    for (const [k, g] of given) if (!unknown.has(k) && [...g.v.matchAll(/\$\{?(\w+)/g)].some((m) => unknown.has(m[1]) || spanFrom.has(m[1]))) { unknown.add(k); changed = true; }
+    for (const [k, g] of given) {
+      if (unknown.has(k)) continue;
+      const srcs = [...g.v.matchAll(/\$\{?(\w+)/g)].map((m) => m[1]);
+      if (srcs.some((n) => unknown.has(n))) { unknown.add(k); changed = true; continue; }
+      // (R2-B1: a name built from a span name is unknown from where its source is, not for the whole line: the writes inside the span use both)
+      const from = Math.min(...srcs.map((n) => spanFrom.get(n) ?? Infinity));
+      if (from < (spanFrom.get(k) ?? Infinity)) { spanFrom.set(k, from); changed = true; }
+    }
   }
   ctx.keptVars = kept;
   ctx.unknownVars = unknown;
@@ -5462,7 +5469,10 @@ function evaluateBashForFilesFrame(command, opts) {
       if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && c.maybeBg !== true && !inFlow(flowStart(cmds), idx)) { // (#529: a span assignment may have run in a child: it clears nothing)
         for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k]) && !ctx.declared?.unknown.has(k)) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = applyTransform(expandRefs(c.env[k], ctx), ctx.declared?.transform.get(k) ?? null); }
       }
+      // (R2-F1: a name a binder on this command marks stays unknown to the end state, which a loop binder reaches the commands above it by: only a name no binder marked is dropped at the end)
+      const held = [...spanAdded].filter((k) => ctx.unknownVars.delete(k));
       markBound(c);
+      for (const k of held) { if (ctx.unknownVars.has(k)) spanAdded.delete(k); else ctx.unknownVars.add(k); }
       if (splicesOptions(c.argv)) { const v = judgeSplices(c, sdirsNow(), ctx, withLineVars(opts, c)); if (v) return v; }
       const sf0 = scriptFileOf(c.argv, c.raw, raw);
       // Why: superpowers' task-brief runs `"${BASH:-bash}" "$(cd "$(dirname "$0")" && pwd)/sdd-workspace"`, and is run as `S=…/scripts; bash $S/task-brief`. The operand right
