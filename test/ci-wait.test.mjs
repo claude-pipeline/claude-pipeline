@@ -1694,3 +1694,35 @@ test('#642 R1-B2: a fresh skip under the same name does not hide a draft-era pas
   assert.equal(r.output.checks[0].state, 'fresh-skip');
   assert.equal(r.output.checks[0].predatesReady, true, JSON.stringify(r.output));
 });
+
+// Catches (R1-B1): a draft-era guards run that finishes evaluating before ready but posts its success AFTER ready: the status is
+// dated after ready, so only the Actions run it links to shows the verdict is old. Without the run read it passes unflagged.
+test('#642 R1-B1: a passing status created after ready by an Actions run that started before ready is flagged predatesReady; the run is read only when needed', async () => {
+  const world = (over) => ({
+    classic: present('late', 'fresh', 'norun'),
+    timeline: readyTimeline,
+    statuses: [
+      st('late', 'success', 'github-actions[bot]', { created_at: '2026-01-01T12:01:00Z', target_url: RUN_URL(77, '/job/3') }),
+      st('fresh', 'success', 'github-actions[bot]', { created_at: '2026-01-01T12:01:00Z', target_url: RUN_URL(78) }),
+      st('norun', 'success', 'github-actions[bot]', { created_at: '2026-01-01T12:01:00Z' }),
+    ],
+    workflowRun: (t, id) => ({ id, run_started_at: id === '77' ? '2026-01-01T11:59:00Z' : '2026-01-01T12:00:30Z' }),
+    ...over,
+  });
+  const s = sim(world());
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(r.exitCode, 0);
+  const flag = Object.fromEntries(r.output.checks.map((c) => [c.name, c.predatesReady]));
+  assert.deepEqual(flag, { late: true, fresh: undefined, norun: undefined });
+  assert.deepEqual([...new Set(s.reads.runs)].sort(), ['77', '78'], 'a status without an Actions run url reads nothing');
+  // an unreadable run falls back to the status time alone: no flag, same verdict
+  for (const workflowRun of [() => { throw new Error('HTTP 404'); }, { id: 77 }, null]) {
+    const u = await sim(world({ workflowRun })).run();
+    assert.equal(u.output.verdict, 'passed', String(workflowRun));
+    assert.equal(u.output.checks.some((c) => c.predatesReady), false, String(workflowRun));
+  }
+  // no run reader: the same fallback; and a failure never reads a run on this path
+  const none = await sim(world({ workflowRun: undefined })).run();
+  assert.equal(none.output.checks.some((c) => c.predatesReady), false);
+});

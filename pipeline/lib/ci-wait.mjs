@@ -64,7 +64,8 @@
 // keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge. Requiring a
 // ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
 // The residual is REPORTED instead: a `checks[]` entry that passed on a run (or status) dated before `readyAt` carries
-// `predatesReady: true` (absent otherwise; an unreadable time never sets it). The verdict is unchanged.
+// `predatesReady: true` (absent otherwise; an unreadable time never sets it). A passing status dated after ready also counts when the
+// Actions run it links to started before ready (read lazily, only on the pass path). The verdict is unchanged.
 import { EXIT } from './cli.mjs';
 import { requiredFromRules } from './protection.mjs';
 import { REVIEW_CONTEXT, parseReviewRecord } from './review-marker.mjs';
@@ -315,6 +316,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   // run with its own start), noted here per check and judged in result() against the same readyAt the report prints, so one failed
   // timeline read cannot leave a pass dated before readyAt unflagged.
   const passStarts = new WeakMap(); // evaluate() result -> ms each passing producer started (NaN when unreadable)
+  const passStatuses = new WeakMap(); // evaluate() result -> its passing commit statuses (their Actions run is read lazily, see markStatusRuns)
   const statusBasis = new WeakMap(); // evaluate() result -> the commit status it rests on (for the status re-read and its evidence)
   const evaluate = async (identity, obs, pr) => {
     const producers = [];
@@ -336,8 +338,25 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
     const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url, ...(identity.source ? { source: identity.source } : {}) };
     if (worst.status) statusBasis.set(out, worst.status);
-    if (isGood(out.state)) passStarts.set(out, producers.filter((p) => p.state === 'pass').map((p) => p.at));
+    if (isGood(out.state)) {
+      passStarts.set(out, producers.filter((p) => p.state === 'pass').map((p) => p.at));
+      passStatuses.set(out, producers.filter((p) => p.state === 'pass' && p.status).map((p) => p.status));
+    }
     return out;
+  };
+
+  // A guards run can evaluate before ready and post its success after it (see statusPredatesReady), so a passing status dated at or after
+  // ready is also dated by the Actions run it links to: one that started before ready is a draft-era pass. Read only on the pass path,
+  // and only for a status not already dated before ready; an unreadable run adds nothing (the status time alone stands).
+  const markStatusRuns = async (states, readyMs) => {
+    if (!Number.isFinite(readyMs)) return;
+    for (const s of states) {
+      for (const status of passStatuses.get(s) ?? []) {
+        if (Date.parse(status.created_at) < readyMs) continue;
+        const started = await getRunStartedAt(status.target_url);
+        if (started !== null) passStarts.get(s)?.push(started);
+      }
+    }
   };
 
   // The run (check run or workflow run of the head, not finished) that keeps an absent required check waiting past
@@ -636,7 +655,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const owedNote = notOwed.length > 0 ? { notOwed } : {};
     // --wait-others: the required checks are green but a non-required check of the run-e2e suite is still running: keep waiting for it (a red or finished one ends the wait as `passed` with `others`, as before).
     if (waitOthers && others !== null && others.some((o) => RUNNING_OTHER.has(o.status)) && elapsed() < timeoutMs) return null;
-    await getReadyAt(pr); // a failed timeline read throws into the poll loop and is retried (like the label read below): the pass is dated against ready, never reported without readyAt / predatesReady
+    await markStatusRuns(states, Date.parse(await getReadyAt(pr))); // a failed timeline read throws into the poll loop and is retried (like the label read below): the pass is dated against ready, never reported without readyAt / predatesReady
     if (others !== null && others.length > 0) {
       return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
     }
