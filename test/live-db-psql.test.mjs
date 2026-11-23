@@ -273,6 +273,8 @@ test('the other family programs and psql behind launchers or variables are refus
     'dropdb x', 'createdb x', 'vacuumdb x', 'reindexdb x', 'clusterdb x', 'pgbench x', 'pg_basebackup -D x', 'pg_receivewal -D x',
     'createuser x', 'dropuser x', 'pg_amcheck x', 'pg_isready', 'vacuumlo x', 'oid2name', 'pg_upgrade --version',
     "kubectl exec db -- psql -c 'select 1'",
+    'kubectl exec db -- pg_repack -h prod',
+    'kubectl exec db -- pg_repack --version',
     "doppler run --command 'psql -c 1'",
     "$PSQL -c 'select 1'",
     'DB=(docker exec -i "$C" psql); "${DB[@]}" -c \'select 1\'',
@@ -341,6 +343,11 @@ test('lines that run no client pass even when they name psql and PG* variables; 
   const P = `psql -X ${URI} -c 'select 1'`;
   for (const line of [
     "rg -n 'psql|PGHOST' docs",
+    "rg -l 'psql|PGHOST' docs | sort",
+    "cd docs && rg -n 'psql|PGHOST' .",
+    "rg -n 'psql|PGHOST' docs | cut -c1-80",
+    "rg -l 'psql|DATABASE_URL' docs | sort | uniq",
+    'git add supabase/migrations/pg_cron.sql',
     'grep -rn \'psql "$DATABASE_URL"\' scripts',
     'gh pr create --title t --body "Runs psql against the local stack; DATABASE_URL is no longer read"',
     'git -C /repo commit -m "psql guard: refuse PGHOST lines"',
@@ -354,6 +361,7 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     `: "\${PGHOST:=x}"; ${P}`,
     `PG''HOST=x ${P}`,
     `export PGHOST=x; rg -n psql docs`,
+    "rg -l 'psql|PGHOST' docs | sort -o out.sh",
     `rg -n psql docs; ${P}`,
     `gh pr create --title t --body "$(PGHOST=db.x.supabase.co psql -c 'select 1')"`,
     `gh pr create --title t --body "$(export PGHOST=x; ${P})"`,

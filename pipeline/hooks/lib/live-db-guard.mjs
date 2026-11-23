@@ -636,7 +636,7 @@ export function psqlTextRefusal(text, { host = false } = {}) {
       bs = line.indexOf('\\', j);
     }
   }
-  // interpolation: only the quoted forms; a run of three or more colons, or any other colon followed by a name, a quote, `{` or a non-ASCII byte, is refused (unquoted `:name` inserts raw text and psql's own variables carry server text)
+  // interpolation: only the quoted forms (the `:<digit>` pass below rests on the guard's own name rule and allow-list, not on a psql rule); a run of three or more colons, or any other colon followed by a name, a quote, `{` or a non-ASCII byte, is refused (unquoted `:name` inserts raw text and psql's own variables carry server text)
   for (let i = 0; i < t.length;) {
     if (t[i] !== ':') { i += 1; continue; }
     let j = i;
@@ -644,7 +644,7 @@ export function psqlTextRefusal(text, { host = false } = {}) {
     const run = j - i;
     if (run >= 3) return 'a run of three or more colons';
     const ch = t[j];
-    // (a single colon and a digit is no psql variable: names start with a letter, `\set` and `-v` take only `[a-z]…`; `08:30`, `"a":5`, `a[1:3]` pass)
+    // (a single colon and a digit passes: psql itself would read `:1` as a variable, but the guard lets none be set, since `\set` and `-v` take only `[a-z]…` names and `\gset`, `\getenv` and `\prompt` are off the allow-list; `08:30`, `"a":5`, `a[1:3]` pass. Loosen either and this pass must go)
     if (ch !== undefined && ((isNameChar(ch) && !(run === 1 && ch >= '0' && ch <= '9')) || ch === "'" || ch === '"' || ch === '{' || ch.charCodeAt(0) >= 0x80)) {
       const ok = (run === 1 && (ch === "'" || ch === '"') && quotedVariable(t, j)) || (run === 2 && isAlpha(ch));
       if (!ok) return `a \`:${ch}\` interpolation or colon form the guard does not read`;
@@ -888,7 +888,8 @@ function dockerPsqlRefusal(c, x, p) {
 }
 
 // data-only commands (a small positive list): a family word after them is an operand, never a program. A bare word 0, nothing that runs a program, writes a file, reads stdin as the command line or sets env; git only with no global option
-const PG_DATA = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'which', 'type', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls']);
+// (the same read-only helpers NO_REQUEST lists: `cd docs && rg …`, `rg … | sort | uniq`; runsProgram, which pgDataOnly applies, already refuses `sort -o` and its program options)
+const PG_DATA = new Set(['rg', 'grep', 'egrep', 'fgrep', 'ag', 'ack', 'which', 'type', 'echo', 'printf', 'cat', 'head', 'tail', 'wc', 'ls', 'cd', 'pwd', 'cut', 'tr', 'sort', 'uniq']);
 const PG_DATA_GIT = new Set(['commit', 'grep', 'log', 'show', 'diff', 'status', 'blame', 'ls-files']);
 const pgDataOnly = (c, plain) => {
   if (!plain || runsProgram(c) || writesFile(c) || stdinFed(c) || Object.keys(c.env ?? {}).length) return false;
@@ -903,7 +904,8 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
   // a name split by empty quotes (`p''sql`) is not in the raw text but is in the words, so both the raw text and every reading's words are judged
   const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n')])].join('\n');
   // the text test misses a family program the parser unwrapped (a `pg_*` name that is not in the list, `timeout 30 pg_prove`): the command names are judged too
-  const token = PG_TOKEN.test(seen) || reading.some((c) => pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? ''));
+  // (a later word of a command that is not data-only is judged too, as a bare program name: `kubectl exec db -- pg_repack -h x`; a path or a file with an extension, `supabase/migrations/pg_cron.sql`, is no program name)
+  const token = PG_TOKEN.test(seen) || reading.some((c) => pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '') || (!pgDataOnly(c, true) && [...c.argv, ...typedWords(c)].some((w) => /^pg_[a-z0-9_]+$/i.test(w) && pgWord(w))));
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
   const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
