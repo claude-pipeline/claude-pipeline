@@ -5,7 +5,7 @@
 //   project `k/.mcp.json` for k = P and each ancestor of P
 // P = `$CLAUDE_PROJECT_DIR` of the hook's environment. Unset (or not absolute) => the local and project layers are UNKNOWN. A file that exists but cannot be read, parsed, is not a regular file (no symlink follow) or is
 // over 8 MB makes its layer UNKNOWN; so does a legacy `.config.json` next to the account file (its content is never read). Server names are compared normalised: every character outside [A-Za-z0-9_-] becomes `_`.
-import { lstatSync, readFileSync } from 'node:fs';
+import { closeSync, constants, fstatSync, lstatSync, openSync, readSync } from 'node:fs';
 import path from 'node:path';
 
 const MAX_BYTES = 8 * 1024 * 1024;
@@ -15,18 +15,30 @@ const normalise = (name) => String(name).replace(/[^A-Za-z0-9_-]/g, '_');
 const isObject = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
 
 // -> { state: 'absent' } | { state: 'ok', value } | { state: 'unknown' }
+// One open, then every check on that descriptor (no lstat/read gap): no symlink follow, a FIFO cannot block, only a regular file of at most MAX_BYTES is read.
 function readJsonFile(file) {
-  let st;
+  let fd;
   try {
-    st = lstatSync(file);
+    fd = openSync(file, constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0));
   } catch (err) {
     return { state: err?.code === 'ENOENT' || err?.code === 'ENOTDIR' ? 'absent' : 'unknown' };
   }
-  if (!st.isFile() || st.size > MAX_BYTES) return { state: 'unknown' };
   try {
-    return { state: 'ok', value: JSON.parse(readFileSync(file, 'utf8')) };
+    const st = fstatSync(fd);
+    if (!st.isFile() || st.size > MAX_BYTES) return { state: 'unknown' };
+    const buf = Buffer.alloc(st.size + 1); // one byte more than the size: a file that grew since fstat is seen as over the limit
+    let n = 0;
+    while (n < buf.length) {
+      const r = readSync(fd, buf, n, buf.length - n, null);
+      if (r === 0) break;
+      n += r;
+    }
+    if (n > st.size) return { state: 'unknown' };
+    return { state: 'ok', value: JSON.parse(buf.toString('utf8', 0, n)) };
   } catch {
     return { state: 'unknown' };
+  } finally {
+    closeSync(fd);
   }
 }
 
