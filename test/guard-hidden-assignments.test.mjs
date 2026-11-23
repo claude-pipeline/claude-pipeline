@@ -16,6 +16,8 @@ import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { execFileSync } from 'node:child_process';
+import { arithAssignedNames, simpleCommands, SHELL_SUPPLIED_TEXT, SHELL_SUPPLIED_NUMBERS } from '../pipeline/hooks/lib/shell-parse.mjs';
 import { EVAL_DEADLINE_MS } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 function fakeFs(root, files, dirs = []) {
@@ -291,4 +293,195 @@ test('program text in quotes (node -e, awk, sed) is no assignment: += and a[i]= 
     `n=2; node <<'EOF'\nlet s=''; s+='x'; a[n=7]=1\nEOF\nbash s$n.sh`,
     `n=2; sed -e 's/a[b]=c/x+=y/' f; bash s$n.sh`,
   ]) allow(c);
+});
+
+// ---- a name READ in an arithmetic body (#473, C2b) --------------------------------------------------------------------------------------------------------------------------------
+// Why: bash and zsh evaluate a bare name's VALUE as an expression inside arithmetic, so `n=2; i='n=7'; : $((i))` assigns n = 7 while both guards read n = 2 and judged s2.sh (s7.sh ran). A name READ in
+// an arithmetic body is trusted only when every value it can hold is a proven plain integer; otherwise the guards' fail-closed `dynamic` reading applies (every name unsure). Each DENY row below ran
+// s7.sh on a real shell while both guards allowed it on main (d248f474); each ALLOW row is everyday arithmetic that must not become a refusal.
+const P = (pre, use = 'bash s$n.sh') => `n=2; ${pre}; ${use}`;
+test('a name read in arithmetic whose value is text (a plain assignment, a command output, a quoted word) can assign any name', () => {
+  denyEach([
+    P("i='n=7'; : $((i))"), P("i='n=7'; : $(( i + 0 ))"), P("i='n=7'; (( i ))"), P("i='n=7'; let i"), P("i='n=7'; [[ i -eq 0 ]]"), P("i='n=7'; a[i]=x"), P("i='n=7'; : $[i]"),
+    P("i='n=7'; : $(( $i ))"), P("i='n=7'; while (( i )); do break; done"), P('i=$(echo n=7); : $((i))'), P('echo hi; : $(( $(cat f) ))'),
+  ]);
+});
+test('printf / print -f evaluate an argument as arithmetic for %d: a text argument (or a format the guard cannot map) can assign any name', () => {
+  denyEach([
+    P("printf '%d' 'n=7'"), P("i='n=7'; printf '%d' \"$i\""), P("print -f '%d' 'n=7'"), P("printf \"$fmt\" 'n=7'"), P("printf '%2$d %1$s' x 'n=7'"), P("printf '\\045d' 'n=7'"),
+    P("printf '%d' \"$@\""), P("printf '%*d' 3 'n=7'"),
+  ]);
+  for (const c of ["printf '%d\\n' 5", "printf '%s: %d\\n' \"$name\" 5", "printf '%s\\n' 'n=7'", 'printf "%d items\\n" 3']) allow(P(c));
+});
+test('names the shell supplies as text (_ REPLY BASH_REMATCH), an array element and a ${i:=v} default hold text an arithmetic can evaluate', () => {
+  denyEach([
+    P("true; : 'n=7'; : $((_))"), P("read <<< 'n=7'; : $((REPLY))"), P("[[ 'n=7' =~ (.*) ]]; : $((BASH_REMATCH))"), P("true; : ${i:='n=7'}; : $((i))"), P("a=(0 'n=7'); : $(( a[1] ))"),
+    P("a[1]='n=7'; : $(( a[1] ))"), P("status='n=7'; : $((status))"), P("_=5; : $((_))"), P("REPLY=5; read <<< 'n=7'; : $((REPLY))"), P("b[1]=5 c[2]='n=7'; : $(( c[2] ))"),
+  ]);
+  deny('bash run.sh', { 'run.sh': 'n=2; : $((BASH_SOURCE)); bash s$n.sh\n', ...SPEC });
+});
+test('one command assigning a name twice, a nameref and a value the evidence rule does not take as a number', () => {
+  denyEach([
+    P("i='n=7' j=$((i)) i=5; : $((i))"), P("i=3; declare -n r=i; r='n=7'; : $((i))"), P("i='$((1))'; : $((i))"), P('i="\\$((1))"; : $((i))'), P('i=x$((1)); : $((i))'),
+    'n=2; declare -n r=n; r=7; bash s$n.sh', // (also live on main in the git guard)
+  ]);
+  for (const c of [P('i=$((1)); : $((i))'), P('i=3; : $((i))'), P('true; rc=$?; [[ $rc -eq 0 ]] && echo y'), P('i=${#n}; : $((i))')]) allow(c);
+});
+test('a quote, backtick or backslash inside a $[ ], subscript or offset body is read as written, not as the blanked text', () => {
+  denyEach([P(': $[ "n=7" ]'), P('a["n=7"]=x'), P("i='n=7'; : $[ \"i\" ]"), P("i='n=7'; a[\"i\"]=x"), P("i='n=7'; : $[ i\\\nj ]")]);
+});
+test('a read in a frame that evals, traps or sources code may name text another command set: every read is unproven', () => {
+  denyEach([P("eval '(( n += 5 ))'"), P("i='n=7'; eval ': $((i))'"), P(`eval "i='n=7'"; : $((i))`)]);
+  const r = files(P("trap '(( n += 5 ))' DEBUG; true"), fakeFs(PROJ, SPEC));
+  assert.equal(r.decision, 'deny', 'files allowed a trap whose text assigns the name');
+  deny(P('source env.sh; : $((i))'), { 'env.sh': "i='n=7'\n", ...SPEC });
+  allow(P(': $((i))'));
+  deny('export n=2; source calc.sh; bash s$n.sh', { 'calc.sh': "n=2; i='n=7'; : $((i))\n", ...SPEC });
+  deny('export n=2; source outer.sh; bash s$n.sh', { 'outer.sh': '. calc.sh\n', 'calc.sh': "i='n=7'; : $((i))\n", ...SPEC });
+  deny("export n=2; i='n=7'; source calc.sh; bash s$n.sh", { 'calc.sh': ': $((i))\n', ...SPEC });
+  deny("export n=2; a=(0 'n=7'); source calc.sh; bash s$n.sh", { 'calc.sh': 'a=5; : $(( a[1] ))\n', ...SPEC });
+  allow("export n=2; i='n=7'; bash calc.sh; bash s$n.sh", { 'calc.sh': ': $((i))\n', ...SPEC }); // (a child shell cannot change the caller)
+  // (a `dynamic` arithmetic in the caller reaches a judged use in a SECOND sourced file: git denies `source …; $n` for another reason, so the use sits in the file)
+  deny("export n=2; i='n=7'; : $((i)); source run.sh", { 'run.sh': 'bash s$n.sh\n', ...SPEC });
+  deny("export n=2; i='n=7'; : $((i)); bash run.sh", { 'run.sh': 'bash s$n.sh\n', ...SPEC });
+});
+test('a read in a nested script sees the value the caller gave the name (or lost): a certain assignment in the leading run replaces it, nothing else does', () => {
+  const run = (body) => ({ 'run.sh': body, ...SPEC });
+  deny("export n=2 i='n=7'; bash run.sh", run('[ -f x ] && i=3; : $((i)); bash s$n.sh\n'));
+  deny("export n=2 i='n=7'; bash run.sh", run('i=3 true; : $((i)); bash s$n.sh\n'));
+  deny("export n=2 i='n=7'; bash run.sh", run('i[2]=3; : $((i)); bash s$n.sh\n'));
+  deny("export n=2 i='n=7'; bash run.sh", run(': $((i)); i=3; bash s$n.sh\n'));
+  deny("export n=2; read i <<< 'n=7'; bash run.sh", run(': $((i)); bash s$n.sh\n'));
+  allow("export n=2 i='n=7'; bash run.sh", run('i=3; : $((i)); bash s$n.sh\n'));
+  allow('export n=2 i=4; bash run.sh', run(': $((i)); bash s$n.sh\n'));
+  const r = files('bash run.sh', fakeFs(PROJ, run(': $((i)); bash s$n.sh\n')), { env: { i: 'n=7', n: '2' } });
+  assert.equal(r.decision, 'deny', 'files allowed an arithmetic that reads a name the environment gave text');
+});
+test('a subscript or offset longer than the guard reads is refused, one it reads in full is not (199 / 200 / 201 characters)', () => {
+  const sub = (len, i) => `n=2; ${i}; echo \${a[${'0'.repeat(len - 2)}+i]}; bash s$n.sh`;
+  const off = (len, i) => `n=2; ${i}; x=abc; echo \${x:${'0'.repeat(len - 2)}+i}; bash s$n.sh`;
+  for (const make of [sub, off]) {
+    deny(make(199, "i='n=7'"));
+    deny(make(200, "i='n=7'")); // (the read at the end is reached)
+    deny(make(201, 'i=3')); // (cut: not read in full, whatever i holds)
+    allow(make(200, 'i=3'));
+  }
+});
+test('a substring subscript past 64 characters is refused (63 / 64 allowed), as is an expansion that joins an identifier', () => {
+  const ix = (len) => '1+'.repeat((len - 1) / 2) + '1';
+  deny(`n=2; echo \${a[${ix(65)}]:1}; bash s$n.sh`);
+  allow(`n=2; echo \${a[${ix(63)}]:1}; bash s$n.sh`);
+  allow(`n=2; echo \${a[${ix(61)}]:1}; bash s$n.sh`);
+  deny(P('s=abc; : $(( a${#s} ))'));
+  allow(P('s=abc; : $(( ${#s} + 1 ))'));
+});
+test('everyday arithmetic: counters, loops, RANDOM, SECONDS, an array index, a [[ -gt ]] operand and printf of a number stay allowed, and the proof says dynamic === false', () => {
+  for (const c of [
+    'for ((i=0;i<3;i++)); do echo $i; done; n=2; bash s$n.sh', 'n=0; n=$((n+1)); m=2; bash s$m.sh', 'sleep $((RANDOM%3)); n=2; bash s$n.sh', 'n=2; a=(1 2 3); i=1; echo ${a[i]}; bash s$n.sh',
+    'n=3; [[ n -gt 2 ]] && echo big; bash s2.sh', 'n=2; let n=3; bash s2.sh', 'x=$((16#ff)); n=2; bash s$n.sh', 'n=2; echo $(( $# + 1 )); bash s$n.sh', 'n=2; i=${#n}; : $((i)); bash s$n.sh',
+    't0=$SECONDS; n=2; echo $((SECONDS - t0)); bash s$n.sh',
+  ]) {
+    allow(c);
+    assert.equal(arithAssignedNames(c, simpleCommands(c, {})).dynamic, false, c);
+  }
+  allow('n=3; echo $((n+1)); bash s2.sh');
+  assert.equal(git('n=3; echo $((n+1)); git checkout -b feat/x$n', fakeFs(GIT_ROOT, SPEC)).decision, 'allow');
+});
+test('the proof depends on the frame it runs in: one parsed line, two outer frames, two answers', () => {
+  const t = ': $((i))';
+  const cmds = simpleCommands(t, {});
+  assert.equal(arithAssignedNames(t, cmds, { vars: { i: '5' }, unknown: new Set(), env: {} }).dynamic, false);
+  assert.equal(arithAssignedNames(t, cmds, { vars: { i: 'n=7' }, unknown: new Set(), env: {} }).dynamic, true);
+  assert.equal(arithAssignedNames(t, cmds, { vars: {}, unknown: new Set(['i']), env: {} }).dynamic, true);
+  assert.equal(arithAssignedNames(t, cmds, null).dynamic, false);
+});
+test('the names a clean bash or zsh defines at start are all listed as text or as integers (a name missing from both would read as an unset number: 0), and a refusal names the arithmetic read', () => {
+  // (compared with the live shells when they exist; the lists were taken from these dumps plus bash(1) "Shell Variables" and zshparam(1) "Parameters set by the shell")
+  for (const [bin, args] of [['/bin/bash', ['--norc', '--noprofile', '-c', 'compgen -v']], ['/bin/zsh', ['-f', '-c', 'print -rl -- ${(k)parameters}']]]) {
+    let out;
+    try { out = execFileSync(bin, args, { env: {}, encoding: 'utf8' }); } catch { continue; } // (no such shell on this machine)
+    for (const k of out.split('\n').filter((x) => /^[A-Za-z_]\w*$/.test(x))) {
+      assert.ok(SHELL_SUPPLIED_TEXT.has(k) || SHELL_SUPPLIED_NUMBERS.has(k) || /^(?:BASH|ZSH_|COMP_|READLINE_|PROMPT)/.test(k), `${bin} defines ${k}: add it to SHELL_SUPPLIED_TEXT or SHELL_SUPPLIED_NUMBERS`);
+    }
+  }
+  const r = git(P("i='n=7'; : $((i))"), fakeFs(GIT_ROOT, SPEC));
+  assert.match(r.reason, /an arithmetic reads `i`, whose value is not a plain number here/, r.reason);
+});
+test('a dynamic body does not make unsure a name only that body expands, but the poison still reaches a later use; a status the environment gave as text is read as text; a certain array literal replaces an array of text', () => {
+  // (the shell expands `$pid` inside the body before it evaluates the body: `echo "$(( $(ps -o rss= -p $pid)/1024 ))"` alone stays allowed, as on main)
+  allow('echo "$(( $(ps -o rss= -p $pid)/1024 ))MB"');
+  deny('n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; bash s$n.sh'); // (what main does for a `$(cat f)` body: the text evaluated can assign n)
+  deny('n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; echo $pid > out/$pid.txt');
+  const r = files('n=2; : $((status)); bash s$n.sh', fakeFs(PROJ, SPEC), { env: { status: 'n=7' } });
+  assert.equal(r.decision, 'deny', 'files allowed an arithmetic that reads a status the environment gave as text');
+  const cmds = simpleCommands('a=(0 1); a=5; : $(( a[1] ))', {});
+  const bad = { vars: { a: "(0 n=7)" }, unknown: new Set(), env: {} };
+  assert.equal(arithAssignedNames('a=(0 1); a=5; : $(( a[1] ))', cmds, bad).dynamic, false, 'a certain array literal in the leading run replaced the incoming array');
+  const cmds2 = simpleCommands('a=5; : $(( a[1] ))', {});
+  assert.equal(arithAssignedNames('a=5; : $(( a[1] ))', cmds2, bad).dynamic, true, 'a certain scalar replaces element 0 only');
+});
+
+// ---- review round 1 (#817): over-refusals and bypasses of the first build ---------------------------------------------------------------------------------------------------------
+const SPEC2 = { ...SPEC, 'list.sh': 'ok' };
+test('R1-B1: an array of numbers ending in a text word is read in linear time (the integer-array test backtracked exponentially)', () => {
+  const t = 'ids=(1700000001 1700000002 1700000003 1700000004 latest); echo ${ids[@]}';
+  const t0 = Date.now();
+  arithAssignedNames(t, simpleCommands(t, {}));
+  assert.ok(Date.now() - t0 < 1000, `${Date.now() - t0} ms`);
+});
+test('R1-B2 / R1-F1 / R1-F2: a name used outside the one unproven body (quoted, or with another body or binder on the line) stays unknown', () => {
+  denyEach([
+    'n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; bash s"$pid".sh', // (R1-B2: a later double-quoted use)
+    'n=2; echo "$(( $(ps -o rss= -p $pid)/1024 ))"; echo ${a[d]}; echo $pid > out/$pid.txt', // (R1-F2: a one-letter body elsewhere cut `pid` to `pi`)
+    'read "$K" < cfg; echo "$(( $(wc -c < "$S") / 1024 ))"; bash "$S"', // (R1-F1: a run-time-named binder is a cause of its own)
+  ]);
+});
+test('R1-B3: a child script whose arithmetic is dynamic does not make the caller\'s names unknown', () => {
+  const r = git('ref=HEAD; read -r answer; bash calc.sh; git show "$ref"', fakeFs(GIT_ROOT, { 'calc.sh': ': $(( $(wc -l < data) + 1 ))\n', ...SPEC }));
+  assert.equal(r.decision, 'allow', r.reason);
+});
+test('R1-B4 / R1-B6: printf of a number to a redirect, a proven $name argument, and a brace list that shifts the arguments', () => {
+  allow('out=out.txt; printf \'%d\\n\' 42 > "$out"; bash s2.sh', SPEC2);
+  allow('count=3; out=list.sh; printf \'%d\' $count; bash "$out"', SPEC2);
+  deny(P("total=queued; printf '%s %d\\n' {prefix,total}"));
+  deny(P("total=queued; printf '%d' $total"));
+});
+test('R1-B5: a copy of a shell-supplied number holds the text the line bound that name to', () => {
+  deny(P('status=queued; i=$status; : $((i))'));
+  allow(P('t0=$SECONDS; : $((SECONDS - t0))'));
+});
+test('R1-B7 / R1-B8 / R1-B9 / R1-F4: program text in quotes, a nested $(( )), a hex literal and a `.` operand are no assignment, text or runner', () => {
+  allow(P("i=1; python3 -c 'i=0; i+=1'; echo \"$((i))\" > out.txt"));
+  allow('out=s2.sh; : $(( 1 + $((2 + 3)) )); bash "$out"', SPEC2);
+  allow(P('i=1; a=(1 2 3); echo ${a[$((i+1))]}'));
+  allow(P('mask=0xff; echo "$((mask & 15))" > out.txt'));
+  allow(P('i=1; command grep -r foo . ; echo $((i+1))'));
+});
+test('R1-F3: the text of a trap or eval written out is read with the caller\'s bindings; a source, or text built at run time, keeps every read unproven', () => {
+  allow('OUT=dist; trap \'echo failed\' ERR; count=0; for f in src/*; do count=$((count+1)); done; echo "$count" > "$OUT/count.txt"');
+  denyEach([P("i='n=7'; trap ': $((i))' DEBUG"), P("i='n=7'; eval ': $((i))'"), P('i=3; eval "$code"; : $((i))')]);
+});
+test('R2-F1 / R2-B1 / R2-B2: a length expansion is one number for printf, an unquoted $name that may be empty shifts the arguments, literal eval text that rebinds a number loses the proof', () => {
+  allow('ref=HEAD; files=(a b c); printf \'%d files\' ${#files[@]}; git show $ref');
+  allow('ref=HEAD; files=(a b c); printf \'%d files\' "${#files[@]}"; git show $ref');
+  deny(P("label=''; value='count+1'; printf '%s %d\\n' $label 10 value"));
+  const ev = "i=1; eval 'i=other'; : $((i))"; // (the guards' own eval handling refuses the line whole, so the proof is asserted directly)
+  assert.equal(arithAssignedNames(ev, simpleCommands(ev, {})).dynamic, true, 'literal eval text that rebinds i makes the read of i unproven');
+});
+test('R3-B1 / R3-B2 / R3-F1: an unquoted bare $name printf argument moves only the words after it onto a number conversion; a text label, an environment number and a counter set late stay allowed', () => {
+  allow('ref=HEAD; label=files; printf \'%s %d\\n\' $label 3; git show $ref');
+  allow('ref=HEAD; total=$((2+3)); printf \'%d\' $total; git show $ref');
+  allow('ref=HEAD; echo start; count=0; printf \'%d\' $count; git show $ref');
+  const r = git('ref=HEAD; printf \'%d\\n\' $BUILD_NUMBER; git show $ref', fakeFs(GIT_ROOT, SPEC), { env: { BUILD_NUMBER: '42' } });
+  assert.equal(r.decision, 'allow', r.reason);
+  deny(P("label=''; value='count+1'; printf '%s %d\\n' $label 10 value"));
+  // R4-B1: a bare name that is a proven number supplies exactly one field, so a text word after it stays text
+  allow('ref=HEAD; count=3; printf \'%d %s\\n\' $count "$ref"; git show $ref');
+  allow('ref=HEAD; count=3; printf \'%d %s\\n\' $count status=ok; git show $ref');
+  // R5-B1: what matters is that the name supplies exactly ONE field, not that it is a number: a text label does; an unset name, an empty value and a changed IFS do not
+  allow('label=files; ref=HEAD; printf \'%s %s %d\\n\' $label "$ref" 3; git show "$ref"');
+  deny(P("printf '%d %s\\n' $zz 'n=7'"));
+  deny(P("count=''; printf '%d %s\\n' $count 'n=7'"));
+  deny(P("IFS=3; count=3; printf '%d %s\\n' $count 'n=7'"));
+  deny(P("label=a; label=; printf '%s %d %s\\n' $label 1 'n=7'"));
 });

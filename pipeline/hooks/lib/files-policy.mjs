@@ -3157,7 +3157,7 @@ function globOptionRisky(name, args, raw, orig = args, lit = undefined) {
 // A sed / awk program keeps its exemption: `$1` and `$NF` of a quoted program are no shell variables, so only a substitution, `${`, `$@`, `$*` or a name the line touches counts.
 function judgedWords(name, args, ctx) {
   if (!args.some((a) => RUNTIME_PART.test(a))) return { args, unknown: false };
-  const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || ctx.unknownAll === true;
+  const touched = (n) => Object.hasOwn(ctx.vars ?? {}, n) || ctx.unknownVars?.has(n) || ctx.pickUnknown?.has(n) || ctx.srcChanged?.has(n) || ctx.srcTouched?.has(n) || (ctx.unknownAll === true && !ctx.unknownAllExcept?.has(n));
   // #298: `python -m json.tool IN [OUT]` writes its second operand, so how many operands the words make is what judges it: it is read like an option tool (no run-time word, the split reading of an expanded word)
   // (R1-B1: the module word is read as expanded: `M=json.tool; python3 -m "$M" $(…)` is the same call as the literal one; #463: so is the flag: `F=-m; python3 $F json.tool $(…)`)
   const optionLike = OPTION_TOOLS.has(name) || (/^python3?$/.test(name) && args.length > 1 && (RUNTIME_PART.test(args[0]) ? expandRefs(args[0], ctx) : args[0]) === '-m' && (RUNTIME_PART.test(args[1]) ? expandRefs(args[1], ctx) : args[1]) === 'json.tool');
@@ -4681,7 +4681,7 @@ function judgeCandidateScripts(sf, dirs, ctx, opts, scanRaw) {
   if (c.over) return deny('too many words, a glob matching too many files, or glob syntax that cannot be resolved could be the script this command runs, so it cannot be checked; name the script file');
   // a variable the line set to a run-time value (`NVM_DIR=$(cmd)`) picks the script: which one is unknown
   // (the unknown line a SQL client may run is not a variable: it is dynamic, refused by the rule below when protected text is around)
-  if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => m[1] !== SQL_UNKNOWN_VAR && (ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1])))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
+  if (sf.words?.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((m) => m[1] !== SQL_UNKNOWN_VAR && (ctx.unknownVars.has(m[1]) || ctx.pickUnknown.has(m[1]) || (ctx.unknownAll && !Object.hasOwn(ctx.vars, m[1]) && !ctx.unknownAllExcept?.has(m[1])))))) return deny('the script is picked by a variable whose value is known only at run time (set to a run-time value, with a width or integer attribute, or by a sourced file that cannot be followed), so it cannot be checked; name the script file');
   if (c.dynamic && makeMatchers(ctx).rawHit(scanRaw, dirs)) return deny('which word is the script this command runs is only known at run time ($VAR / $(...) / a glob) and the line refers to a protected pipeline file; name the file and write the options literally');
   // Why: `bash $S/review-package ...` with S set on the line runs its first operand: a word made only of names the line set, with no run-time part, glob or space, not an option
   const first = sf.firstOperandRuns && sf.words?.length ? sf.ownPath ?? lineVarWord(sf.words[0], ctx) : null;
@@ -4880,8 +4880,8 @@ function setPositionals(argv) {
   }
   return null;
 }
-function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false) { // (rep: the file is sourced from a frame that can run it again, R18)
-  const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
+function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false, inherited = null) { // (rep: the file is sourced from a frame that can run it again, R18)
+  const out = { vars: new Map(), cds: [], all: false, dyn: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
   const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => budgetExpired(ctx.budget) });
   // (#352 R23-F2: a script line whose shape the parser cannot follow (ctlBroken: a bare { or } argument that splits the word groups, `echo { F=x }`, a zsh condition-then-body form, a {fd} word) may or may
@@ -4889,6 +4889,10 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
   if (cmds.truncated || cmds.dynamic || cmds.ctlBroken) out.all = true;
   if (cmds.ctlBroken) out.unknownCd = true; // (`echo { cd d }`: the cd may not run either)
   if (cmds.some((_, i) => dirLikeWord(cmds, i, ctx, [ctx.cwd], true))) out.unknownCd = true; // (R17: AUTO_CD: a command word that could be a directory runs a cd)
+  // (#473: the file's own arithmetic, judged in the caller's frame -- the line's names, and what a file that sourced this one gave -- like a line: one that reads a name it cannot prove makes every name unknown, and the
+  // values the file set BEFORE that arithmetic must not be believed afterwards (`n=2; i='n=7'; : $((i))`): absorbSourced does not merge them back)
+  const ar = arithAssignedNames(text, cmds, { vars: { ...ctx.vars, ...(inherited ?? {}) }, unknown: new Set([...ctx.unknownVars, ...ctx.pickUnknown, ...ctx.srcChanged]), env: ctx.env, unknownAll: ctx.unknownAll === true });
+  if (ar.dynamic) { out.all = true; out.dyn = true; }
   const from = flowStart(cmds);
   const seen = new Map();
   const local = Object.create(null);
@@ -4901,6 +4905,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
     const val = sure && n === 1 && typeof v === 'string' ? substVars(v, local, ctx.budget) : null;
     if (val === null || /[$`]/.test(val)) { out.vars.set(k, null); delete local[k]; } else { out.vars.set(k, val); local[k] = val; }
   };
+  for (const k of ar.names) set(k, null, false);
   for (const [i, c] of cmds.entries()) {
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || c.maybeBg === true || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&'); // (#529: maybeBg: dash may have run it in a child)
     if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); for (const k of implicitBindsOf(c)) set(k, null, false); continue; } // (#352 R21-F1: a lone `{k}>f` binds k)
@@ -4950,7 +4955,8 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
       const t = abs && !seenFiles.has(abs) && !writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: false }) ? ctx.readText(abs) : null;
       if (typeof t !== 'string') out.all = true;
       else {
-        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again, cdpNow());
+        const sub = sourcedEffects(t, ctx, depth + 1, new Set([...seenFiles, abs]), again, cdpNow(), { ...(inherited ?? {}), ...local });
+        if (sub.dyn) out.dyn = true;
         for (const [k, val] of sub.vars) set(k, val, sure && val !== null);
         out.cds.push(...sub.cds);
         if (sub.all) out.all = true;
@@ -5026,7 +5032,7 @@ function absorbSourced(rec, dirs, ctx, rep = false) { // (rep: the command that 
   const { texts, unknown } = sourcedTexts(rec, dirs, ctx);
   // (a file that can set any name: every name the line has set so far may have been changed, and any other may be set; a script they pick is refused. The values
   // stay for the paths a writer builds, which is what they were before the file ran)
-  const poison = () => { ctx.unknownAll = true; ctx.sourcedCdUnknown = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
+  const poison = () => { ctx.unknownAll = true; ctx.unknownAllExcept = null; ctx.sourcedCdUnknown = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.srcChanged.add(k); } };
   if (unknown) poison();
   const merged = new Map();
   const effs = [];
@@ -5050,6 +5056,7 @@ function absorbSourced(rec, dirs, ctx, rep = false) { // (rep: the command that 
   }
   // Why: one of several files runs (a glob, a written file and the one on disk): a name that not every one sets keeps its old value in the others, so it is not definite
   if (effs.length > 1) for (const k of merged.keys()) if (!effs.every((e) => e.vars.has(k))) merged.set(k, null);
+  if (effs.some((e) => e.dyn)) return; // (#473: a file whose arithmetic reads a name it cannot prove: the poison above wins over the literals it set before that)
   for (const [k, v] of merged) {
     ctx.srcTouched.add(k);
     if (v === null || ctx.zshModified?.has(k)) { delete ctx.vars[k]; delete ctx.keptVars?.[k]; ctx.pickUnknown.add(k); ctx.srcChanged.add(k); continue; } // (#74: a sourced name this line reads as `$N:r` is only known at run time)
@@ -5264,12 +5271,14 @@ function evaluateBashForFilesFrame(command, opts) {
   modelZshSelfDirs(cmds, raw, ctx);
   ctx.inheritedVars = opts._vars ?? {}; // (#74: collectVars also marks a name the line only reads with a zsh modifier, when an outer line gave it its value)
   ctx.zshModified = zshModifiedNames(cmds.flatMap((c) => [...(c.argv ?? []), ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')])); // (the names this line reads as `$N:r` / `$N[1]`)
-  ctx.arith = arithAssignedNames(raw, cmds);
+  // (#473: the frame the arithmetic reads names in: the values the outer lines and the environment gave them, before this line's own assignments)
+  ctx.arith = arithAssignedNames(raw, cmds, { vars: opts._vars ?? {}, unknown: new Set([...(opts._unknown ?? []), ...(opts._unknownW ?? []), ...(opts._srcChanged ?? [])]), env: ctx.env, unknownAll: opts._unknownAll === true });
   ctx.vars = collectVars(cmds, ctx);
   if (opts._vars) { ctx.vars = { ...opts._vars, ...ctx.vars }; ctx.keptVars = { ...(opts._keptVars ?? {}), ...ctx.keptVars }; } // variables the line set before the shell that runs this file started
   for (const k of opts._unknownW ?? []) ctx.unknownVars.add(k);
   ctx.pickUnknown = new Set(opts._unknown ?? []); // (a name the line gave a run-time value: only a script it picks is refused; the writer rule is for the names above)
   ctx.srcTouched = new Set(); // names a sourced file set on this line (a later plain assignment of one is the value again)
+  ctx.unknownAllExcept = opts._unknownAll !== true && ctx.arith.dynamic && ctx.arith.bodyOnly.size ? ctx.arith.bodyOnly : null; // (#473: names only the one dynamic body expands: the shell expands them before it evaluates the body)
   ctx.unknownAll = opts._unknownAll === true || ctx.arith.dynamic; // (an arithmetic that assigns through a name may set any name, also one the line never gave. Defence in depth for the names the line gave: collectVars marks every one when arith.dynamic)
   ctx.srcChanged = new Set(opts._srcChanged ?? []); // names an unfollowable sourced file may have changed (a write target that uses one is refused)
   // a name held in a variable (N=PIPELINE_ADMIN; env $N=1 claude)
@@ -5334,7 +5343,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // (every name of the line is seeded, exported or not, and wherever it was set: stricter than the shell, which only passes exported ones on; kept on purpose,
   // a missed name would hide the script a variable picks. The replay found no false block from it.)
   // (a name the line never set, after a source nothing could follow: it may have come from that file)
-  const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n);
+  const newName = (n) => ctx.unknownAll && !Object.hasOwn(ctx.vars, n) && !ctx.unknownAllExcept?.has(n);
   const snaps = []; // per command: the names a sourced file may have changed / set at run time as that command runs (the checks after the loop would otherwise see the end state)
   const psCdHidden = ctx.shell === 'powershell' && !psUnparsed(raw) && psCdUnreadable([raw]); // (R14-F3: a plain PowerShell line holding a directory change the parse did not read as one; a not-plain line is refused below)
   // Is the directory the line works in only known at run time? (a `cd` into an unset / substituted / maybe-changed name, `cd -`, `popd`; or the frame was started in one)
@@ -5435,7 +5444,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const lineIndirect = typeof raw === 'string' && indirectExpansionOnLine(raw, cmds); // (only the text the shell expands: see indirectExpansionOnLine)
   const markBound = (c) => {
     // (#56, Codex review of 8b86e2b; on main too: zsh `${(P)N::=~/.claude/settings.json}` / a bash `${!N…}` may set any name, like `export $N=…`)
-    if (lineIndirect) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
+    if (lineIndirect) { ctx.unknownAll = true; ctx.unknownAllExcept = null; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     // (#352 R21-F1: a lone `{k}>f` redirect has no argv and still binds k)
     if (!c.argv.length) { for (const k of implicitBindsOf(c)) { ctx.pickUnknown.add(k); if (Object.hasOwn(ctx.vars, k)) ctx.unknownVars.add(k); } return; }
     const cn = baseOf(c.argv[0]);
@@ -5446,7 +5455,7 @@ function evaluateBashForFilesFrame(command, opts) {
     const anyName = (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-[A-Za-z]*v/.test(a))) && bindsOf(cn, c.argv).weird)
       || (['export', 'declare', 'typeset', 'local', 'readonly', 'unset', 'let'].includes(cn) && c.argv.slice(1).some((a) => /[$`]/.test(a.includes('=') ? a.slice(0, a.indexOf('=')) : a)))
       || ZSH_NAME_BINDERS.has(cn) || (cn === 'print' && c.argv.some((a) => /^-[A-Za-z]*v/.test(a))); // (#56, Codex recheck of d925d42: zsh binders whose operands are not read)
-    if (anyName) { ctx.unknownAll = true; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
+    if (anyName) { ctx.unknownAll = true; ctx.unknownAllExcept = null; for (const k of Object.keys(ctx.vars)) { ctx.pickUnknown.add(k); ctx.unknownVars.add(k); ctx.srcChanged.add(k); } }
     if (LINE_BINDERS.has(cn) && (cn !== 'printf' || c.argv.some((a) => /^-v/.test(a)))) names.push(...bindsOf(cn, c.argv).names);
     names.push(...implicitBindsOf(c)); // (`[[ x =~ y ]]` sets MATCH, a (#m) pattern flag too: see implicitBindsOf)
     // (#269 R10-F2) What a match or a `select` binds holds a word of the line (`[[ FILE =~ .+ ]] && cp x $MATCH`): only known at run time, so a writer that uses it is refused (unknownVars)
