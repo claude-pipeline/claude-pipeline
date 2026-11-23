@@ -37,6 +37,8 @@ const base = (over = []) => [
   { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: { required_status_checks: { contexts: ['ci', 'lint'], checks: [{ context: 'ci', app_id: 15368 }, { context: 'lint', app_id: -1 }] } } },
   { match: '^api repos/acme/widgets/rules/branches/main', stdout: '[]\n' },
   ...over,
+  // the readyAt timeline read of the passed verdict: no ready event (a PR created ready) dates ready by createdAt; a test's own /timeline entry in `over` wins (first match)
+  { match: '/timeline', stdout: '[]\n' },
 ];
 
 test('meta: a one-line usage naming every flag', () => {
