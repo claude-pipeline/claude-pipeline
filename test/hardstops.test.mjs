@@ -784,13 +784,18 @@ const moveCollect = async (files, move) => {
 };
 
 // Catches: a harmless helper moved out of supabase/tests sending the PR down the high-risk path (DRMed #437).
-test('IO: moving a marker-free helper .sql out of supabase/tests is not R4', async () => {
-  const hits = await moveCollect({ 'supabase/tests/0150_worklist.sql': HELPER_BASE }, (repo) => {
-    repo.write('scripts/worklist.sql', HELPER_BASE);
+test('IO: deleting or moving a marker-free helper .sql out of supabase/tests is no hard stop at all', async () => {
+  const moved = await moveCollect({ 'supabase/tests/0150_worklist.sql': HELPER_BASE }, (repo) => {
+    repo.write('docs/worklist.txt', HELPER_BASE);
     repo.rm('supabase/tests/0150_worklist.sql');
     repo.commit('move helper');
   });
-  assert.ok(!hits.some((h) => h.rule === 'R4-pipeline'), JSON.stringify(hits));
+  assert.deepEqual(moved, [], JSON.stringify(moved));
+  const deleted = await moveCollect({ 'supabase/tests/0150_worklist.sql': HELPER_BASE }, (repo) => {
+    repo.rm('supabase/tests/0150_worklist.sql');
+    repo.commit('delete helper');
+  });
+  assert.deepEqual(deleted, [], JSON.stringify(deleted));
 });
 
 // Catches: the exemption swallowing a real pgTAP test that was renamed or deleted.
