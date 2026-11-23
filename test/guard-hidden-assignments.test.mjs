@@ -16,7 +16,8 @@ import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
-import { arithAssignedNames, simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { execFileSync } from 'node:child_process';
+import { arithAssignedNames, simpleCommands, SHELL_SUPPLIED_TEXT, SHELL_SUPPLIED_NUMBERS } from '../pipeline/hooks/lib/shell-parse.mjs';
 import { EVAL_DEADLINE_MS } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 function fakeFs(root, files, dirs = []) {
@@ -393,4 +394,16 @@ test('the proof depends on the frame it runs in: one parsed line, two outer fram
   assert.equal(arithAssignedNames(t, cmds, { vars: { i: 'n=7' }, unknown: new Set(), env: {} }).dynamic, true);
   assert.equal(arithAssignedNames(t, cmds, { vars: {}, unknown: new Set(['i']), env: {} }).dynamic, true);
   assert.equal(arithAssignedNames(t, cmds, null).dynamic, false);
+});
+test('the names a clean bash or zsh defines at start are all listed as text or as integers (a name missing from both would read as an unset number: 0), and a refusal names the arithmetic read', () => {
+  // (compared with the live shells when they exist; the lists were taken from these dumps plus bash(1) "Shell Variables" and zshparam(1) "Parameters set by the shell")
+  for (const [bin, args] of [['/bin/bash', ['--norc', '--noprofile', '-c', 'compgen -v']], ['/bin/zsh', ['-f', '-c', 'print -rl -- ${(k)parameters}']]]) {
+    let out;
+    try { out = execFileSync(bin, args, { env: {}, encoding: 'utf8' }); } catch { continue; } // (no such shell on this machine)
+    for (const k of out.split('\n').filter((x) => /^[A-Za-z_]\w*$/.test(x))) {
+      assert.ok(SHELL_SUPPLIED_TEXT.has(k) || SHELL_SUPPLIED_NUMBERS.has(k) || /^(?:BASH|ZSH_|COMP_|READLINE_|PROMPT)/.test(k), `${bin} defines ${k}: add it to SHELL_SUPPLIED_TEXT or SHELL_SUPPLIED_NUMBERS`);
+    }
+  }
+  const r = git(P("i='n=7'; : $((i))"), fakeFs(GIT_ROOT, SPEC));
+  assert.match(r.reason, /an arithmetic reads `i`, whose value is not a plain number here/, r.reason);
 });

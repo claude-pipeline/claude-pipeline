@@ -2641,8 +2641,10 @@ function collectAssignments(cmds, ctx, topLevelLocal = false, level = 0, text = 
   // (#56, Codex review of 8b86e2b: zsh `${(P)N::=main}` assigns the variable N names, a bash `${!N…}` reads or sets through it: the same, on main too)
   // (#473: `dynamic` marks every name from here on, not only the names the line gave: a name an outer frame, the environment or a sourced file gives later reads as unsure, see unsureVar)
   if (ar?.dynamic) ctx.unknownAll = true;
+  if (ar?.dynamicRead) ctx.arithReadWhy ??= ar.dynamicRead; // (the cause the refusal names, see arithReadReason)
   if (ar?.dynamic || cmds.some(bindsRunTimeName) || cmds.some((c) => indirectExpansion(c, cmds)) || (cmds.heredocSpans ?? []).some?.((s) => !s[2]) && (typeof text !== "string" || indirectExpansionOnLine(text, cmds))) for (const k of [...Object.keys(ctx.vars), ...namesReadOn(cmds), ...(ar?.dynamic ? counts.keys() : [])]) { delete ctx.vars[k]; ctx.unsureVars.add(k); } // (#473: a dynamic arithmetic also makes unsure the names the line gives, wherever it gives them: an exported `n=2` a later script reads)
 }
+const arithReadReason = (n, why) => `$${n} is unsure because ${why}: evaluating a value that is not a plain number can assign any variable. Give the name a number first (\`i=3\`) or write the number out.`;
 const zshModifiedReason = (n) => `$${n} is followed by \`:\` and a letter or by \`[\` (\`$${n}:r\`, \`$${n}[1,6]\`): zsh reads that as a modifier or a subscript and applies it to the value, so the word it makes is only known at run time. Write the word out, or brace the name (\`\${${n}}:r\`) when the text after it is meant literally.`;
 // A zsh parameter expansion with flags (`${(P)N::=x}` assigns the variable N names) or a bash indirect one (`${!N}`), anywhere in a command's words.
 // (#56 replay of 96848c2: judged on the command's own text, single-quoted parts blanked — a `node -e '…${(x)}…'` program is no expansion; its words, quotes
@@ -3349,6 +3351,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       const read = saved && judgeReadings(str, startDir, ctx, level, onceAssignedNames(cmds, ctx, str), saved);
       if (read) return read;
       if (ctx.zshNames?.has(unsure)) return deny(zshModifiedReason(unsure));
+      if (ctx.arithReadWhy) return deny(arithReadReason(unsure, ctx.arithReadWhy));
       return deny(`$${unsure} is assigned more than once (or where it may not run) on this line, so its value at run time cannot be verified. Rewrite: assign it once, as the first command of the line (\`${unsure}=value; …\`), or write the value out where it is used.`);
     }
   }

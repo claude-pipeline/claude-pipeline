@@ -1969,7 +1969,8 @@ export const SHELL_SUPPLIED_TEXT = new Set(['_', 'argv', 'BASH', 'BASH_ARGC', 'B
   'READNULLCMD', 'SPROMPT', 'TIMEFMT', 'TMPPREFIX', 'TTY', 'USERNAME', 'VENDOR', 'WATCH', 'WORDCHARS', 'ZSH_ARGZERO', 'ZSH_EVAL_CONTEXT', 'ZSH_EXECUTION_STRING', 'ZSH_NAME', 'ZSH_PATCHLEVEL', 'ZSH_VERSION', 'aliases', 'builtins', 'cdpath',
   'commands', 'dirstack', 'dis_aliases', 'dis_builtins', 'dis_functions', 'dis_functions_source', 'dis_galiases', 'dis_patchars', 'dis_reswords', 'dis_saliases', 'fignore', 'fpath', 'funcfiletrace', 'funcsourcetrace', 'funcstack', 'functions',
   'functions_source', 'functrace', 'galiases', 'histchars', 'history', 'historywords', 'jobdirs', 'jobstates', 'jobtexts', 'keymaps', 'mailpath', 'manpath', 'module_path', 'modules', 'nameddirs', 'options', 'parameters', 'patchars', 'path', 'prompt',
-  'psvar', 'reply', 'reswords', 'saliases', 'signals', 'termcap', 'terminfo', 'userdirs', 'usergroups', 'widgets', 'zsh_eval_context', 'zsh_scheduled_events', 'MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend']);
+  'psvar', 'reply', 'reswords', 'saliases', 'signals', 'termcap', 'terminfo', 'userdirs', 'usergroups', 'widgets', 'zsh_eval_context', 'zsh_scheduled_events', 'MATCH', 'match', 'MBEGIN', 'MEND', 'mbegin', 'mend',
+  'watch']);
 const SHELL_TEXT_PREFIX = /^(?:BASH|ZSH_|COMP_|READLINE_|PROMPT)/;
 const INT_LITERAL = /^-?\d+$/;
 const INT_ARRAY = /^\(\s*(?:(?:\[[^\]]*\]=)?-?\d+\s*)*\)$/;
@@ -2106,14 +2107,16 @@ function printfBodies(c, add) {
   const anyNum = convs.some((x) => NUM_CONV.includes(x));
   if (!anyNum && !numbered) return null;
   if (numbered || star) return 'a printf format with numbered or * conversions';
-  const plainWord = (w) => !/\$[@*]|\$\{[^}]*\[[@*]\]|`/.test(w) && !/^[^'"]*\$/.test(w.replace(/"[^"]*"|'[^']*'/g, '')) && !/[*?[]/.test(w.replace(/"[^"]*"|'[^']*'/g, ''));
+  const isInt = (w) => wholeArith(w) !== null || /^"?\$[?#$!]"?$/.test(w); // (one `$(( ))` / `$#` word is digits: no split, no glob, nothing to evaluate)
+  const plainWord = (w) => isInt(w) || (!/\$[@*]|\$\{[^}]*\[[@*]\]|`/.test(w) && !/^[^'"]*\$/.test(w.replace(/"[^"]*"|'[^']*'/g, '')) && !/[*?[]/.test(w.replace(/"[^"]*"|'[^']*'/g, '')));
   if ((c.redirects ?? []).length || args.some((w) => !plainWord(w))) return 'a printf argument list that may split or glob';
   args.forEach((w, j) => {
-    if (!NUM_CONV.includes(convs[j % convs.length])) return;
+    if (!NUM_CONV.includes(convs[j % convs.length]) || isInt(w)) return;
     add(/^'[^']*'$/.test(w) ? w.slice(1, -1) : /^"[^"\\`]*"$/.test(w) ? w.slice(1, -1) : w);
   });
   return null;
 }
+const LEAD_KEYWORDS = new Set(['do', 'then', 'else', 'elif', 'if', 'while', 'until', '{', '!', 'time']);
 const RUNNERS = new Set(['eval', 'trap', 'source', '.']);
 const DECL_CMDS = new Set(['declare', 'typeset', 'local', 'readonly', 'export', 'integer', 'float', 'private']);
 const NAME_OPERAND_CMDS = new Set(['read', 'mapfile', 'readarray', 'getopts', 'select', 'vared', 'coproc', 'unset']);
@@ -2128,6 +2131,7 @@ function bindingIndex(text, cmds, f) {
   for (const c of cmds) {
     const argv = c.argv ?? [];
     const ws = writtenWords(c.raw ?? '');
+    while (ws.length && LEAD_KEYWORDS.has(ws[0])) ws.shift(); // (`do i=$((i+1))`: the keyword before the command is part of its text)
     let L = 0;
     const lead = [];
     while (L < ws.length && ASSIGN_WORD.test(ws[L])) { lead.push(ASSIGN_WORD.exec(ws[L])); L++; }
@@ -2207,7 +2211,7 @@ function arithFrame(text, cmds, depth) {
   });
   for (const m of g.matchAll(ARITH_APPENDED)) f.names.add(m[1]);
   if (cmds) bindingIndex(text, cmds, f);
-  else { f.events = new Set(); f.other = new Set(); if (f.reads.size) f.why ??= 'a body read without the parsed commands'; }
+  else { f.events = new Set(); f.other = new Set(); } // (without the parsed commands no binding is known: only the outer frame decides)
   if (cmds && depth < 3) {
     for (const t of f.nested) { // (the text eval / trap runs: the names it assigns are unsure here, and any name it reads is unproven)
       let sub = null;
