@@ -98,19 +98,23 @@ export function testCounts(text) {
   const clean = String(text).replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
   const counts = { passed: 0, failed: 0, skipped: 0 };
   let found = false;
-  let block = null; // node:test counters held until duration_ms closes the block
+  let block = null; // node:test counters held until duration_ms closes the block (only when it saw a pass and a fail line)
   let afterFiles = false; // the previous non-blank line was vitest's `Test Files` row
   for (const line of clean.split('\n')) {
     const summary = /^\s*(?:#|ℹ)\s+(tests|suites|pass|fail|cancelled|skipped|skip|todo|duration_ms)\s+(\d+(?:\.\d+)?)\s*$/.exec(line);
-    if (summary?.[1] === 'tests') block = { passed: 0, failed: 0, skipped: 0 };
+    if (summary?.[1] === 'tests') block = { passed: 0, failed: 0, skipped: 0, sawPass: false, sawFail: false };
     else if (summary?.[1] === 'duration_ms') {
-      if (block) {
+      if (block?.sawPass && block.sawFail) {
         for (const k of Object.keys(counts)) counts[k] += block[k];
         found = true;
       }
       block = null;
     } else if (!summary && line.trim() !== '') block = null;
-    else if (block && summary && summary[1] !== 'suites') block[{ pass: 'passed', fail: 'failed', cancelled: 'failed' }[summary[1]] ?? 'skipped'] += Number(summary[2]);
+    else if (block && summary && summary[1] !== 'suites') {
+      if (summary[1] === 'pass') block.sawPass = true;
+      if (summary[1] === 'fail') block.sawFail = true;
+      block[{ pass: 'passed', fail: 'failed', cancelled: 'failed' }[summary[1]] ?? 'skipped'] += Number(summary[2]);
+    }
     if (summary) continue;
     if (line.trim() === '') continue;
     const vitest = afterFiles && /^\s*Tests\s+(\d+ (?:passed|failed|skipped|todo)(?: \| \d+ (?:passed|failed|skipped|todo))*|no tests)(?:\s+\(\d+\))?\s*$/.exec(line);

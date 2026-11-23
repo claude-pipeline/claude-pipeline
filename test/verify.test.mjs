@@ -777,10 +777,13 @@ test('a node:test block is counted only when its duration_ms closes it', async (
   await verify(repo, [], [
     { name: 'stray', cmd: say(['# tests 3', '# pass 3', 'ok 1 - x', '# tests 1', '# pass 1', '# fail 0', '# duration_ms 4']), quick: false },
     { name: 'cut', cmd: say(['# tests 3', '# pass 3', '# fail 0']), quick: false },
+    // Catches: a block with no pass/fail line at all closing at duration_ms and reporting a measured zero.
+    { name: 'no-outcomes', cmd: say(['# tests 3', '# duration_ms 4']), quick: false },
   ]);
   const rep = reportOf(repo);
   assert.deepEqual(rep.steps[0].counts, { passed: 1, failed: 0, skipped: 0 });
   assert.equal('counts' in rep.steps[1], false);
+  assert.equal('counts' in rep.steps[2], false, 'a block with no pass/fail line is not a measured zero');
 });
 
 // Catches: a test printing "Tests  3 passed (3)" being added to vitest's real total; and vitest's "Tests  no tests" (a green step that
