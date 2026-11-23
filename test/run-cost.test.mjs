@@ -260,8 +260,8 @@ test('P cost --from-transcript: the empty-transcript replay advice is absent aft
   const withUsd = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl', '--usd', '5']);
   assertExit(withUsd, 0);
   const usdText = withUsd.json.warnings.join('\n');
-  assert.match(usdText, /no replay is needed/);
-  assert.doesNotMatch(usdText, /--usd 0|running again|only --from-transcript/);
+  assert.match(usdText, /running again with the same --phase, --role and --round, --from-transcript and --usd 0/);
+  assert.doesNotMatch(usdText, /no replay is needed/);
   s.fake.setScript(ghEntries({ prHead: s.head, comments: [existing(written(s))], extra: [{ match: '-X PATCH repos/acme/widgets/issues/comments/77', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }));
   const failed = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl', '--output', '5', '--retry']);
   assertExit(failed, 1);
@@ -283,6 +283,30 @@ test('P cost --from-transcript: an empty-transcript booking with --retry and han
   const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/late.jsonl']);
   assertExit(second, 0);
   assert.deepEqual([second.json.cost.total.input, second.json.cost.total.output, second.json.cost.retries], [10, 25, 1]);
+});
+
+// Failure caught (R4-B1): an empty transcript booked with --usd skipped the transcript ledger, so the tokens flushed later were never booked (the record stayed at $5 and zero tokens), and the next normal booking then counted them in full.
+test('P cost --from-transcript: an empty transcript booked with --usd, replayed with --usd 0 once flushed, books the tokens at $0; a later normal booking counts each token once', () => {
+  const s = scenario();
+  const msg = (id, n) => `${JSON.stringify({ message: { id, model: 'claude-sonnet-4-5', usage: { input_tokens: n } } })}\n`;
+  const args = ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/late.jsonl'];
+  s.repo.write('.review/late.jsonl', '');
+  assertExit(costCli(s, [...args, '--usd', '5']), 0);
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/late.jsonl', msg('m1', 100));
+  const replay = costCli(s, [...args, '--usd', '0']);
+  assertExit(replay, 0);
+  assert.deepEqual([replay.json.cost.total.input, replay.json.cost.total.usd], [100, 5], 'the flushed tokens are booked, no USD added on top of the override');
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/late.jsonl', msg('m1', 100) + msg('m2', 50));
+  const normal = costCli(s, args);
+  assertExit(normal, 0);
+  const sc = scenario();
+  sc.repo.write('.review/p.jsonl', msg('m2', 50));
+  const listPrice = costCli(sc, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/p.jsonl']).json.cost.total.usd;
+  assert.ok(listPrice > 0);
+  assert.equal(normal.json.cost.total.input, 150, 'each token once, not 250');
+  assert.equal(normal.json.cost.total.usd, Math.round((5 + listPrice) * 1e6) / 1e6, '$5 plus the list price of the 50 new tokens only');
 });
 
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).

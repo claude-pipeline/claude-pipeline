@@ -91,7 +91,7 @@ export function addCostEntry(cost, entry) {
   return next;
 }
 
-// A transcript already booked for this PR (an agent continued by SendMessage is booked after each leg): only what it gained since the last booking is new. `booking` = { key, usage }, usage the
+// A transcript already booked for this PR (an agent continued by SendMessage is booked after each leg): only what it gained since the last booking is new. `booking` = { key, usage, usdOverride? }, usage the
 // transcript's WHOLE totals ({input, output, cacheRead, cacheWrite, usd, byPrice}); the ledger cost.transcripts[key] keeps what was booked. Returns { cost, entry } with the entry's amounts reduced by the
 // booked ones (never below 0; hand amounts the caller added on top stay) and the ledger set to the whole totals. The ledger keeps the last MAX_TRANSCRIPTS keys.
 const MAX_TRANSCRIPTS = 200;
@@ -106,7 +106,8 @@ export function deductBookedTranscript(cost, entry, booking) {
   const out = { ...entry };
   if (before) {
     for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = sub(entry[k], before[k]);
-    out.usd = Math.round(sub(entry.usd, before.usd) * 1e6) / 1e6;
+    // A --usd override (booking.usdOverride) is a hand figure: no list USD is taken off it, and the ledger still moves on so a later booking deducts these tokens.
+    if (!booking.usdOverride) out.usd = Math.round(sub(entry.usd, before.usd) * 1e6) / 1e6;
     if (isPlainObject(entry.byPrice)) {
       out.byPrice = {};
       for (const [price, b] of Object.entries(entry.byPrice)) {

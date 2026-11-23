@@ -81,7 +81,7 @@ export const run = guarded(async (argv, ctx) => {
   const patch = { cost: {} };
   const notes = [];
   // A file that appears before its lines are flushed reads as empty or partial: still booked, but the caller is told it may be low.
-  // The replay advice (what to repeat, what not to) is added after the write and only when it succeeded: after a failed write it may or may not have landed, so the caller is told to check the run record first; after a --usd booking no replay is advised.
+  // The replay advice (what to repeat, what not to) is added after the write and only when it succeeded: after a failed write it may or may not have landed, so the caller is told to check the run record first; after a --usd booking the advice adds --usd 0 (the amount already holds the cost; the replay books only the tokens).
   const emptyTranscript = Boolean(values['from-transcript']) && fromFile.messages === 0;
   let bucketed = false;
   if (spent) {
@@ -116,10 +116,11 @@ export const run = guarded(async (argv, ctx) => {
     bucketed = complete && Object.keys(byPrice).length > 0;
     // A transcript booked before for this PR (an agent continued by SendMessage) books only what it gained since: the run record keeps what was booked per transcript. The key is a sanitised, clipped
     // file name plus a short hash of the resolved path (two different files of one name stay apart; never the raw path, which would put the home folder into the PR comment) and always passes run-cost's shape check.
-    if (values['from-transcript'] && values.usd === undefined) {
+    // A --usd booking records the ledger too (tokens, so a later booking of the same transcript deducts them), but its USD stays the override: deductBookedTranscript never takes list USD off it.
+    if (values['from-transcript']) {
       const file = resolve(root, values['from-transcript']);
       const hash = createHash('sha256').update(file).digest('hex').slice(0, 12);
-      patch.cost.transcript = { key: `${basename(file).replace(/[^\w.-]/g, '_').slice(0, 100)}-${hash}`, usage: fromFile };
+      patch.cost.transcript = { key: `${basename(file).replace(/[^\w.-]/g, '_').slice(0, 100)}-${hash}`, usage: fromFile, ...(values.usd !== undefined ? { usdOverride: true } : {}) };
     }
   }
   if (values.retry) patch.cost.retries = 1;
@@ -133,7 +134,7 @@ export const run = guarded(async (argv, ctx) => {
     if (emptyTranscript) {
       notes.push('the transcript held no messages (it may not be flushed yet): the booking may be low');
       if (!ok) notes.push('the booking write failed or its answer was lost, so it may or may not have landed: check the PR\'s run record before booking it again (a repeat can count it twice)');
-      else if (values.usd !== undefined) notes.push('the --usd amount already holds this booking\'s cost: no replay is needed (a replay would price the transcript on top of it)');
+      else if (values.usd !== undefined) notes.push(`later book the transcript's tokens by running again with the same --phase, --role and --round${values.model ? ', the same --model' : ''}, --from-transcript and --usd 0 (the --usd amount already holds the cost, so this adds $0): leave out --retry and hand token amounts (already booked, they would count twice)`);
       else notes.push(`later book the rest by running again with the same --phase, --role and --round${values.model ? ', the same --model' : ''} and only --from-transcript: leave out --retry and hand token amounts (already booked, they would count twice)`);
     }
     return {
