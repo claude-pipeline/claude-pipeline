@@ -910,3 +910,25 @@ test('IO: deleting a BOM-prefixed include-only file still trips R4', async () =>
   });
   assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(hits));
 });
+
+// Catches: PostgreSQL built-ins (has_table_privilege, set_config) read as pgTAP assertions, so a plain data-check helper still trips R4 (R2-F1).
+test('IO: a helper using has_table_privilege() and set_config() is exempt when deleted or moved; wrapped in ok() it still trips R4', async () => {
+  const helper = "select set_config('request.jwt.claims', '{}', true);\nselect c.relname, has_table_privilege('anon', c.oid, 'SELECT') as anon_select from pg_class c;\n";
+  const deleted = await moveCollect({ 'supabase/tests/0150_verify.sql': helper }, (repo) => {
+    repo.rm('supabase/tests/0150_verify.sql');
+    repo.commit('delete helper');
+  });
+  assert.deepEqual(deleted, [], JSON.stringify(deleted));
+  const moved = await moveCollect({ 'supabase/tests/0150_verify.sql': helper }, (repo) => {
+    repo.write('docs/0150_verify.txt', helper);
+    repo.rm('supabase/tests/0150_verify.sql');
+    repo.commit('move helper');
+  });
+  assert.deepEqual(moved, [], JSON.stringify(moved));
+  const asserted = "select ok(has_table_privilege('anon', 'patients', 'SELECT') = false, 'anon cannot read');\n";
+  const hits = await moveCollect({ 'supabase/tests/0150_priv.sql': asserted }, (repo) => {
+    repo.rm('supabase/tests/0150_priv.sql');
+    repo.commit('delete assertion');
+  });
+  assert.ok(hits.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(hits));
+});

@@ -191,8 +191,9 @@ const PGTAP_MARKER = new RegExp(
   [
     '\\b(?:plan|no_plan|done_testing|finish|runtests)"?\\s*\\(',
     '\\b(?:ok|is|isnt|like|unlike|matches|doesnt_match|imatches|doesnt_imatch|alike|unalike|ialike|unialike|cmp_ok|pass|fail|isa_ok|can|diag|diag_test_name|skip|todo|todo_start|todo_end|in_todo|check_test|collect_tap|tap_funky|findfuncs|num_failed)"?\\s*\\(',
+    // (set_config and has_*_privilege are PostgreSQL built-ins, not pgTAP: a helper calls them, so they are excluded; an assertion wraps them in ok()/is().)
     // Whole pgTAP families by prefix (is_*, isnt_*, set_*, bag_*, throws_*, performs_*, lives_*, has_*, hasnt_*, col_*, fk_*, results_*, function_*, enum_*, index_*, policy_*, policies_*, trigger_*, rule_*, language_*, domain_*, can_*) and by suffix (*_ok, *_eq, *_ne, *_are, *_is, *_isnt, *_like, *_unlike, *_has, *_hasnt, *_empty, *_returns, *_within, *_ilike, *_matching, *_imatching).
-    '\\b(?:is|isnt|set|bag|throws|performs|lives|has|hasnt|col|fk|results|function|enum|index|policy|policies|trigger|rule|language|domain|can|cannot)_[a-z0-9_]*"?\\s*\\(',
+    '\\b(?!set_config\\b|has_[a-z0-9_]*_privilege\\b)(?:is|isnt|set|bag|throws|performs|lives|has|hasnt|col|fk|results|function|enum|index|policy|policies|trigger|rule|language|domain|can|cannot)_[a-z0-9_]*"?\\s*\\(',
     '\\b[a-z0-9_]+_(?:ok|eq|ne|are|is|isnt|like|unlike|has|hasnt|empty|returns|within|ilike|matching|imatching)"?\\s*\\(',
     '\\bcreate\\s+(?:or\\s+replace\\s+)?function\\s+(?:"?[a-z0-9_]+"?\\.)?"?(?:test|startup|setup|teardown|shutdown)[a-z0-9_]*"?\\s*\\(',
     '^\\uFEFF?[ \\t]*\\\\(?:i|ir|include|include_relative)[ \\t]+\\S',
