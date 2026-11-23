@@ -58,9 +58,9 @@ const S = resolve('/work/repo/s.sh');
 const MAIN = { [resolve('/work/repo')]: 'main' }; // the repository really is on main when the line starts
 describe('#492: doubt carried out of a nested text', () => {
   const SHAPES = [
-    ['(1) a plain exit after a checkout that may fail', 'git checkout agent/missing || exit 1\n'],
-    ['(2) a failure group that exits, then another line', 'git checkout agent/missing || { echo no; exit 1; }\nmake\n'],
-    ['(3) a checkout that may not run on the last line', '[ -n "$CI" ] && git checkout agent/y\n'],
+    ['(1) a plain exit after a checkout that may fail', 'git switch agent/missing || exit 1\n'],
+    ['(2) a failure group that exits, then another line', 'git switch agent/missing || { echo no; exit 1; }\nmake\n'],
+    ['(3) a checkout that may not run on the last line', '[ -n "$CI" ] && git switch agent/y\n'],
   ];
   for (const [why, body] of SHAPES) {
     test(`${why}: the caller's push is denied (the real branch is main), bash s.sh`, () => expect('deny', 'bash s.sh; git push', { [S]: body }, MAIN));
@@ -68,34 +68,34 @@ describe('#492: doubt carried out of a nested text', () => {
   }
   // the top level (level 0) keeps today's verdicts: an exit there ends the whole line, a conditional checkout is judged by the next command
   test('level 0: (1) and (2) narrowed by the exit stay allowed, (3) stays denied', () => {
-    expect('allow', 'git checkout agent/missing || exit 1\ngit push', {}, MAIN);
-    expect('allow', 'git checkout agent/missing || { echo no; exit 1; }\nmake\ngit push', {}, MAIN);
-    expect('deny', '[ -n "$CI" ] && git checkout agent/y\ngit push', {}, MAIN);
+    expect('allow', 'git switch agent/missing || exit 1\ngit push', {}, MAIN);
+    expect('allow', 'git switch agent/missing || { echo no; exit 1; }\nmake\ngit push', {}, MAIN);
+    expect('deny', '[ -n "$CI" ] && git switch agent/y\ngit push', {}, MAIN);
   });
   test('inside the child itself the exit narrowing still holds (the script pushes the branch it switched to: allowed)', () => {
-    expect('allow', 'bash s.sh', { [S]: 'git checkout agent/y || exit 1\ngit push\n' }, MAIN);
+    expect('allow', 'bash s.sh', { [S]: 'git switch agent/y || exit 1\ngit push\n' }, MAIN);
   });
   // (PR #362, the owner's rule "a script's state change never carries over to its caller": what the child switched is unknown to the caller, even a switch that is certain inside it; main allowed it)
   test('a child that switches with certainty does not hand the caller the branch it switched to (denied: never carry over)', () => {
-    expect('deny', 'bash s.sh; git push', { [S]: 'git checkout agent/y\nmake\n' }, MAIN);
+    expect('deny', 'bash s.sh; git push', { [S]: 'git switch agent/y\nmake\n' }, MAIN);
   });
 });
 
 // ---- #505 ----
 const CLEAN = resolve('/work/repo/cleanup.sh');
 describe('#505: every branch is unknown, also the ones no entry was made for', () => {
-  const FILES = { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' };
+  const FILES = { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git switch main\n' };
   test('the issue example: the caller is on agent/x (no checkout earlier on the line), the failure group runs a script that switches to main: denied', () => {
     expect('deny', 'bash build.sh; git push', FILES);
   });
   test('the same with a source in the group', () => {
     expect('deny', 'bash build.sh; git push', { ...FILES, [BUILD]: 'make\ncd dist || { source /work/repo/cleanup.sh; exit 1; }\n' });
   });
-  test('a git checkout in an unknown directory (after a source) marks every branch unknown, even a directory entered later', () => {
-    expect('deny', 'source env.sh; git checkout agent/y; cd /other; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
+  test('a git switch in an unknown directory (after a source) marks every branch unknown, even a directory entered later', () => {
+    expect('deny', 'source env.sh; git switch agent/y; cd /other; git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('a branch recorded after the mark is known again (a checkout of the directory the push runs in)', () => {
-    expect('allow', 'source env.sh; cd /work/repo; git checkout agent/y && git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
+    expect('allow', 'source env.sh; cd /work/repo; git switch agent/y && git push', { [resolve('/work/repo/env.sh')]: 'X=1\n' });
   });
   test('reference: a build script whose failure group is a plain echo keeps the caller branch (allowed)', () => {
     expect('allow', 'bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
@@ -106,7 +106,7 @@ describe('#554: a mark set inside a failure group survives when the nested text 
   // production failure: `bash build.sh; git push` on agent/x was allowed although the group's script switched the repository to main (the next line of the text restored the mark to false)
   // (a plain trailing line: the issue's `npm run build` is denied for a package-script reason of its own)
   const GROUP = 'cd dist || { bash /work/repo/cleanup.sh; exit 1; }\n';
-  const FILES = { [CLEAN]: 'git checkout main\n' };
+  const FILES = { [CLEAN]: 'git switch main\n' };
   test('a line after the group in the script (the #505 fixture plus a trailing line): denied', () => {
     expect('deny', 'bash build.sh; git push', { ...FILES, [BUILD]: `make\n${GROUP}echo built\n` });
   });
@@ -124,7 +124,7 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
   const GROUP = (exit) => `cd /work/repo || { echo missing >> err.log; ${exit}; }\n`;
   const V1 = `${GROUP('exit 1')}git push\n`;
   const V2 = `cd /work/repo || { bash /work/repo/fix.sh; exit 1; }\ngit push\n`;
-  const FIX = { '/work/repo/fix.sh': 'git checkout main\n' };
+  const FIX = { '/work/repo/fix.sh': 'git switch main\n' };
   // gitRun looks a fake file up by resolve(path), which on Windows is D:\work\repo\s.sh: key the fixtures the same way
   const at = (files = {}) => Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
   const verdict = (command, files) => gitRun(command, at(files));
@@ -163,7 +163,7 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
     ['eval-fed text with a caller function exit', 'exit() { :; }; eval "$(cat /work/repo/s.sh)"', REDEF],
     ['an exported function exit into the child shell', 'exit() { :; }; export -f exit; bash /work/repo/s.sh', REDEF],
     ['BASH_ENV startup file that defines exit', 'BASH_ENV=/work/repo/rc.sh bash /work/repo/s.sh', { ...REDEF, '/work/repo/rc.sh': 'exit() { :; }\n' }],
-    ['a sourced helper inside the group that defines exit', 'bash /work/repo/s.sh', { '/work/repo/s.sh': 'cd /work/repo/sub || { source /work/repo/h.sh; exit 1; }\ngit push\n', '/work/repo/h.sh': 'exit() { :; }\ngit checkout main\n' }],
+    ['a sourced helper inside the group that defines exit', 'bash /work/repo/s.sh', { '/work/repo/s.sh': 'cd /work/repo/sub || { source /work/repo/h.sh; exit 1; }\ngit push\n', '/work/repo/h.sh': 'exit() { :; }\ngit switch main\n' }],
     // R2-F1: an implicit home startup file (zsh reads ~/.zshenv, bash -l ~/.bash_profile) is judged on a copy of the state; the mark that exit may be redefined must still reach the script
     ['a home .zshenv that defines exit (zsh reads it implicitly)', 'zsh /work/repo/s.sh', { ...SUB, [HOME + '/.zshenv']: 'exit() { :; }\n' }],
     ['a home .zshenv that aliases exit', 'zsh /work/repo/s.sh', { ...SUB, [HOME + '/.zshenv']: 'alias exit=true\n' }],
@@ -181,7 +181,7 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
   });
   // #607 does not reproduce (no failure group is recorded inside a subshell): pinned so a later change cannot open it
   test('#607 pin: a failure group in a subshell whose helper switches branch keeps the caller push denied', () => {
-    const v = verdict('(cd dist || { bash /work/repo/cleanup.sh; exit 1; }; make); git push', { '/work/repo/cleanup.sh': 'git checkout main\n' });
+    const v = verdict('(cd dist || { bash /work/repo/cleanup.sh; exit 1; }; make); git push', { '/work/repo/cleanup.sh': 'git switch main\n' });
     assert.equal(v.decision, 'deny', v.reason);
     assert.match(v.reason, /cannot determine the current branch/);
   });
@@ -190,7 +190,7 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
     expectAt('deny', 'PATH="$(tooldir):$PATH" source env.sh; git -C /work/repo push', {});
   });
   test('#608 pin: a literal PATH prefix whose env.sh switches branch is walked and denied; a harmless one is allowed', () => {
-    const v = verdict('PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'git checkout main\n' });
+    const v = verdict('PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'git switch main\n' });
     assert.equal(v.decision, 'deny', v.reason);
     assert.match(v.reason, /cannot determine the current branch/);
     expectAt('allow', 'PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'echo hi\n' });
@@ -203,7 +203,7 @@ describe('#609: a literal, unwrapped exit of a failure group ends the text, so t
 // ---- #506 ----
 describe('#506: a write that may land under a repository\'s .git makes its branch unknown', () => {
   const GIT_HEAD = '/work/repo/.git/HEAD';
-  const FIRST = 'git checkout agent/y && '; // (an entry for the directory, as in the R2 rows)
+  const FIRST = 'git switch agent/y && '; // (an entry for the directory, as in the R2 rows)
   test('(1) exec 3>.git/HEAD on an earlier line, a group that writes through descriptor 3', () => {
     expect('deny', `${FIRST}bash build.sh; git push`, { [BUILD]: `exec 3>${GIT_HEAD}\ncd dist || { echo 'ref: refs/heads/main' >&3; exit 1; }\n` });
   });
@@ -283,7 +283,7 @@ describe('R1-B2: a state hazard in a child script or sourced file leaves the cal
   for (const [why, body] of [['a trap', 'trap \'rm -f x\' EXIT\nmake\n'], ['an alias', 'alias ll=\'ls -l\'\nmake\n'], ['a shopt', 'shopt -s nullglob\nmake\n']]) {
     test(`a build script with ${why}, then the push`, () => expect('allow', 'bash build.sh; git push', { [BUILD]: body }));
   }
-  test('control: a function that switches the branch still denies', () => expect('deny', 'bash build.sh; git push', { [BUILD]: 'build() { git checkout main; }\nbuild\n' }));
+  test('control: a function that switches the branch still denies', () => expect('deny', 'bash build.sh; git push', { [BUILD]: 'build() { git switch main; }\nbuild\n' }));
 });
 
 // R1-F1: a git READ (symbolic-ref --short, config --get, branch -r, worktree list) raises no branch doubt, in the line or in a child script; only a command that can move a branch does
@@ -303,25 +303,25 @@ describe('R1-F1: a git read leaves the on-disk branch known (cwd on agent/x, no 
   ]) test(`allowed: bash build.sh holding ${JSON.stringify(body)}`, () => expect('allow', 'bash build.sh; git push', { [BUILD]: body }));
   // the moves still count
   for (const line of [
-    'N=$(git checkout main); git push',
+    'N=$(git switch main); git push',
     'echo "$(git symbolic-ref HEAD refs/heads/main)"; git push',
     'X=$(git branch -m main); git push',
     'X=$(git worktree add ../w main); cd ../w; git push',
   ]) test(`denied: ${line}`, () => expect('deny', line));
-  test('denied: a child script that switches the branch in a substitution', () => expect('deny', 'bash build.sh; git push', { [BUILD]: 'V=$(git checkout main)\nmake\n' }));
+  test('denied: a child script that switches the branch in a substitution', () => expect('deny', 'bash build.sh; git push', { [BUILD]: 'V=$(git switch main)\nmake\n' }));
 });
 
 // ---- #508 ----
 describe('#508: a PATH set before the failure group makes even an echo not inert', () => {
   // (the clause `assignedNames(ctx)` of inertInFailGroup: the PATH is set BEFORE the group, so the group's own words (`echo`, `exit`) are all plain data commands)
   test('the script sets PATH on an earlier line, then a group that only echoes and exits', () => {
-    expect('deny', 'git checkout agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'export PATH=/work/repo/bin:$PATH\ncd dist || { echo no; exit 1; }\n' });
+    expect('deny', 'git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'export PATH=/work/repo/bin:$PATH\ncd dist || { echo no; exit 1; }\n' });
   });
   test('the caller sets PATH on its own line', () => {
-    expect('deny', 'export PATH=/work/repo/bin:$PATH; git checkout agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
+    expect('deny', 'export PATH=/work/repo/bin:$PATH; git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
   });
   test('control: no PATH set anywhere, the same group is inert (allowed)', () => {
-    expect('allow', 'git checkout agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
+    expect('allow', 'git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
   });
 });
 
@@ -373,7 +373,7 @@ describe('#505 over-denial check: a readable sourced file with no git / .git wri
   }
   OK('bash build.sh; git push');
   test('but a sourced file that does switch the branch still denies', () => {
-    expect('deny', 'source env.sh; git push', { [resolve('/work/repo/env.sh')]: 'git checkout main\n' });
+    expect('deny', 'source env.sh; git push', { [resolve('/work/repo/env.sh')]: 'git switch main\n' });
   });
 });
 

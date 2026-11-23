@@ -76,7 +76,7 @@ test('#352 R5-F2: a loop with no variable that reaches a command is judged for i
 
 test('#352 R5-F2: a state change made directly late in the body reaches the early commands of the next iteration', () => {
   denies('switch', `for i in 1 2; do ${PB} origin HEAD; git switch ${MAIN}; done`, {}, BRANCH);
-  denies('checkout', `while true; do ${PB} origin HEAD; git checkout ${MAIN}; done`, {}, BRANCH);
+  denies('checkout', `while true; do ${PB} origin HEAD; git switch ${MAIN}; done`, {}, BRANCH);
   denies('alias', `for i in 1 2; do git ship; ${SHIP}; done`, {}, ALIAS);
   denies('alias, in a script', RUN_SH, script('echo', `while true; do git ship; ${SHIP}; done`), ALIAS);
   denies('push.default', `for i in 1 2; do ${PB}; git config push.default upstream; done`, {}, CONFIG);
@@ -314,7 +314,7 @@ test('#352 R36-B1/F2: no redirection on a cd or state change is trusted (the R35
     ['cd back with 2>/dev/null && push', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null && ${PB} origin HEAD`],
     ['cd back with >&2 && push', `cd /work/other; cd ${GIT_ROOT} >&2 && ${PB} origin HEAD`],
     ['failing redirection on the cd back, then && push', `cd /work/other && cd ${GIT_ROOT} > /missing/f && ${PB} origin HEAD`],
-    ['failing redirection on the checkout, then && push', `cd /work/other && git checkout agent/x > /missing/f && ${PB} origin HEAD`],
+    ['failing redirection on the checkout, then && push', `cd /work/other && git switch agent/x > /missing/f && ${PB} origin HEAD`],
     ['cd back with 2>/dev/null || { exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { exit 1; }; ${PB} origin HEAD`],
     ['cd back with 2>/dev/null || { echo; exit 1; }, then ;', `cd /work/other; cd ${GIT_ROOT} 2>/dev/null || { echo no >&2; exit 1; }; ${PB} origin HEAD`],
     ['quiet pushd && push', `pushd ${GIT_ROOT} >/dev/null && ${PB} origin HEAD`],
@@ -642,7 +642,7 @@ test('C: a branch switch in a directory the walk cannot name makes the tracked b
   denies('the same, the push in a script', `git switch agent/x || exit 1; git -C ${TOP} switch ${MAIN}; bash ./p.sh`, { 'p.sh': `${H}\n` }, BRANCH);
   denies('a switch after a cd to a directory not named', `git switch agent/x || exit 1; cd "$(mktemp -d)"; git switch ${MAIN}; cd ${GIT_ROOT}; ${H}`, {}, BRANCH);
   denies('F8: a child script switches in a directory it cannot name', `git switch agent/x || exit 1; bash ./s.sh; ${H}`, { 's.sh': `git -C ${TOP} switch ${MAIN}\n` }, BRANCH);
-  allows('a literal other repository', `git switch agent/x || exit 1; git -C /work/other switch ${MAIN}; ${H}`);
+  allows('a literal other repository', `git switch agent/x || exit 1; git -C /work/other switch ${MAIN} || exit 1; ${H}`);
   allows('an unnamed directory, no branch move', `git switch agent/x || exit 1; git -C ${TOP} status; ${H}`);
 });
 
@@ -821,9 +821,9 @@ test('T1: `coproc cd` and `coproc { cd; }` run in a background child: the parent
 
 test('T1 F8: a branch switched by a `coproc` child may not have happened when the next command runs', () => {
   // (allowed on main: the switch was believed, the push judged on agent/y)
-  refused('coproc git checkout; P', `coproc git checkout agent/y; ${PH}`, BRANCH);
-  refused('coproc { git checkout; }; P', `coproc { git checkout agent/y; }; ${PH}`, BRANCH);
-  refused('coproc { git checkout; } && P', `coproc { git checkout agent/y; } && ${PH}`, BRANCH);
+  refused('coproc git checkout; P', `coproc git switch agent/y; ${PH}`, BRANCH);
+  refused('coproc { git checkout; }; P', `coproc { git switch agent/y; }; ${PH}`, BRANCH);
+  refused('coproc { git checkout; } && P', `coproc { git switch agent/y; } && ${PH}`, BRANCH);
 });
 
 // ---- review round 1 (#761): R1-B1, a cd behind `builtin` / `command` / `time` leaves the directory unknown, and the package scripts / runner bins the line then runs must not be skipped ----
