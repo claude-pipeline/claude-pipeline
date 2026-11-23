@@ -818,7 +818,7 @@ test('IO: a real pgTAP file renamed or deleted under supabase/tests still trips 
 test('IO: deleting a shared-runner pgTAP file (assertions, test function, or include only) still trips R4', async () => {
   const bodies = {
     assertions: "select is(1, 1, 'one');\nselect throws_ok('select 1/0', '22012');\n",
-    testFunction: "create or replace function tests.test_rls() returns setof text as $$ begin return next ok(true); end $$ language plpgsql;\n",
+    testFunction: "create or replace function tests.setup_rls() returns void as $ begin insert into patients (id) values (1); end $ language plpgsql;\n",
     include: "\\ir 0150_rls_cases.sql\n",
     includeLong: "\\include 0150_rls_cases.sql\n",
     includeRelative: "\\include_relative 0150_rls_cases.sql\n",
