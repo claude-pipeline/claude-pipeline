@@ -888,8 +888,10 @@ const F4_VERBS = new Set(['exec', 'cp', 'run', 'create', 'rename', 'commit']);
 
 // -> reason | null
 function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
-  const token = PG_TOKEN.test(lineText);
-  const sdb = SDB_TEXT.test(lineText);
+  // a name split by empty quotes (`p''sql`) is not in the raw text but is in the words, so both the raw text and every reading's words are judged
+  const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n')])].join('\n');
+  const token = PG_TOKEN.test(seen);
+  const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
   const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
   if (token) {

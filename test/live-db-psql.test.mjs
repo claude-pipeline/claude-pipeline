@@ -286,3 +286,14 @@ test('the other family programs and psql behind launchers or variables are refus
   // a data-only mention passes (the command cannot run psql)
   for (const line of ['echo psql', 'grep -rn pg_dump docs', 'git log --grep=psql', 'cat psql.md', 'ls psql']) mustAllow(line);
 });
+
+// Catches: a family name split by empty quotes (`p''sql`) missing from the raw line text but present in the parsed words, so the psql rule (and the supabase_db_ docker rule) was skipped altogether.
+test('a psql family or supabase_db_ name split by empty quotes is refused like the plain name', () => {
+  dockerConfig(null);
+  for (const line of [
+    "p''sql -h prod.example.com -c 'select 1'",
+    'p"s"ql -h prod.example.com -c \'select 1\'',
+    "pg''_dump -h prod.example.com x",
+    "docker exec supa''base_db_x sh -c 'echo hi'",
+  ]) mustRefuse(line);
+});
