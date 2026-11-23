@@ -4,7 +4,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { run as runDbRefs } from '../pipeline/commands/db-refs.mjs';
+import { seedRegistry } from './helpers/db-refs-owner.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { findLiveDbCli, localDbUrl } from '../pipeline/hooks/lib/live-db-guard.mjs';
 
@@ -12,9 +12,7 @@ const DEV = 'zyxwvutsrq9876543210';
 const LIVE = 'abcdefghij0123456789';
 const home = mkdtempSync(join(tmpdir(), 'cp-live-db-cli-'));
 after(() => rmSync(home, { recursive: true, force: true }));
-const own = { home, env: {}, hasClaudeCodeAncestor: () => false };
-await runDbRefs(['set', '--ref', DEV, '--name', 'Scratch', '--repo', 'acme/widgets', '--dev'], own);
-await runDbRefs(['set', '--ref', LIVE, '--name', 'Prod', '--repo', 'acme/widgets'], own);
+seedRegistry(home, { refs: [{ ref: DEV, name: 'Scratch', repo: 'acme/widgets', kind: 'dev' }, { ref: LIVE, name: 'Prod', repo: 'acme/widgets', kind: 'live' }] });
 
 const OPTS = { home, env: {}, platform: 'linux', realpath: (p) => p, existsSync: () => false, cwd: '/repo' };
 const verdict = (line, opts = {}) => evaluateBashForFiles(line, { ...OPTS, ...opts });
