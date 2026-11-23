@@ -863,3 +863,19 @@ test('IO: deleting or moving a marker-free non-SQL file under supabase/tests sti
   });
   assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
 });
+
+// Catches: a test entry point named *.test.sql whose body only delegates to a routine (no marker in its own text) losing R4 when deleted.
+test('IO: deleting or moving a marker-free *.test.sql entry point still trips R4', async () => {
+  const entry = "select * from tests.check_tenant_visibility();\n";
+  const deleted = await moveCollect({ 'supabase/tests/tenant_visibility.test.sql': entry }, (repo) => {
+    repo.rm('supabase/tests/tenant_visibility.test.sql');
+    repo.commit('delete entry point');
+  });
+  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
+  const moved = await moveCollect({ 'supabase/tests/tenant_visibility.test.sql': entry }, (repo) => {
+    repo.write('scripts/tenant_visibility.test.sql', entry);
+    repo.rm('supabase/tests/tenant_visibility.test.sql');
+    repo.commit('move entry point');
+  });
+  assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
+});
