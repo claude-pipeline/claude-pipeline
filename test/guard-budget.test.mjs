@@ -13,7 +13,9 @@ import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
 import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, wallLeftMs, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
 import { HOOK_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
-import { readFileSync } from 'node:fs';
+import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
+import { tmpdir } from 'node:os';
 
 function fakeFs(root, files, dirs = []) {
   const abs = (p) => resolve(root, p);
@@ -236,7 +238,7 @@ test('guard-git: a bare push does not start its second lookup once the wall cap 
     currentBranch: (dir, o) => { seen.branchLeft = o?.leftMs?.(); clock.t = 10_500; return 'agent/x'; },
     pushDestination: () => { seen.destStarted = true; return 'origin/agent/x'; },
   });
-  assert.ok(seen.branchLeft <= 1000, `the branch lookup was told ${seen.branchLeft} ms are left`);
+  assert.equal(seen.branchLeft, 1000, 'the branch lookup is told what the cap has left');
   assert.equal(r.decision, 'deny');
   assert.equal(seen.destStarted, false);
 });
@@ -247,6 +249,25 @@ test('the wiring lookups start nothing when no wall time is left (a throw: unkno
   assert.throws(() => w.currentBranch(process.cwd(), { leftMs: () => 0 }));
   assert.throws(() => w.pushDestination(process.cwd(), { leftMs: () => 0 }));
   assert.throws(() => w.issueLabels(1, [], process.cwd(), { leftMs: () => 0 }));
+});
+
+test('a fractional wall remainder still starts a lookup (spawnSync takes whole milliseconds only); less than one whole millisecond starts none', async () => {
+  // Failure caught: 4000.25 ms left (the hook's origin is a fractional epoch) passed straight to spawnSync, which throws, so an ordinary `git push` was refused with time to spare.
+  const { realGitWiring } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const w = realGitWiring();
+  assert.doesNotThrow(() => w.currentBranch(process.cwd(), { leftMs: () => 4000.25 }));
+  assert.doesNotThrow(() => w.pushDestination(process.cwd(), { leftMs: () => 4000.25 }));
+  assert.throws(() => w.currentBranch(process.cwd(), { leftMs: () => 0.5 }), GuardLimit);
+});
+
+test('a config read cut off by its timeout is a time failure (GuardLimit), not "no config" that lets the owner-approval check pass', async () => {
+  // Failure caught: `git show` killed at its timeout returned null, the chat config was dropped, mode() answered none and a direct `gh pr merge` ran with no owner record.
+  const { ownerGoWiring } = await import('../pipeline/hooks/lib/git-wiring.mjs');
+  const dir = mkdtempSync(join(tmpdir(), 'cfg-cut-'));
+  writeFileSync(join(dir, '.git'), 'gitdir: x\n');
+  const w = ownerGoWiring('sess');
+  assert.throws(() => w.mode(dir, { leftMs: () => 1 }), GuardLimit);
+  assert.throws(() => w.mergeTemplates(dir, { leftMs: () => 1 }), GuardLimit);
 });
 
 for (const hook of ['guard-git.mjs', 'guard-files.mjs']) {

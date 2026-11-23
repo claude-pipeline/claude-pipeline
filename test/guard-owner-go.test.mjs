@@ -9,6 +9,7 @@ import { tmpdir } from 'node:os';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { ownerGoWiring, defaultResolved } from '../pipeline/hooks/lib/git-wiring.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 // /chat is an owner_approval: chat repo whose merge command is `npm run merge -- {pr} --expect-head {sha}`; the owner said "merge" for
 // #7 at head H7 only.
@@ -252,6 +253,9 @@ test('#58 a package-manager wrapper or an unreadable option never hides the merg
   const broken = { ...o, ownerGo: { ...ownerGo, mergeTemplates: () => { throw new Error('bad yml'); } } };
   assert.equal(evaluateGitCommand(`npm run merge -- 8 --expect-head ${H8}`, broken).decision, 'deny');
   assert.equal(evaluateGitCommand('npm run build', broken).decision, 'allow');
+  // a lookup that ran out of time is not an unreadable yml: no guess, the evaluation is refused (a non-npm merge command would otherwise pass unrecorded)
+  const slow = { ...o, ownerGo: { ...ownerGo, mergeTemplates: () => { throw new GuardLimit('the lookup ran out of time'); } } };
+  assert.equal(evaluateGitCommand('node scripts/m.mjs 8', slow).decision, 'deny');
   // directory unknown after a cd the guard cannot follow
   assert.equal(evaluateGitCommand(`false && cd /x; npm run merge -- 8 --expect-head ${H8}`, o).decision, 'deny');
   assert.equal(evaluateGitCommand('false && cd /x; npm run build', o).decision, 'allow');

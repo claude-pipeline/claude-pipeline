@@ -1023,7 +1023,8 @@ function ownerGoMode(dir, ctx) {
   checkDeadline(ctx.budget);
   try {
     return ctx.ownerGo.mode(dir, { leftMs: leftOf(ctx) });
-  } catch {
+  } catch (err) {
+    if (err instanceof GuardLimit) throw err; // (a lookup that ran out of time: the evaluation is refused)
     return 'chat'; // (a pipeline.yml that cannot be read)
   }
 }
@@ -1141,7 +1142,8 @@ function repoMergeCommandVerdict(argv, dir, ctx, cmdEnv = {}) {
   checkDeadline(ctx.budget);
   try {
     templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd, { leftMs: leftOf(ctx) }) ?? [];
-  } catch {
+  } catch (err) {
+    if (err instanceof GuardLimit) throw err; // (no time left, or a read cut off by its timeout: the repo's own merge command is unknown, so the evaluation is refused, not guessed)
     templates = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: null }];
   }
   const raw = argv.map((a) => expandVars(a, ctx));

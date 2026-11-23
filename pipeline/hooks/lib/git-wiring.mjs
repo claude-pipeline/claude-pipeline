@@ -7,18 +7,23 @@ import path from 'node:path';
 import { run, gh } from '../../lib/proc.mjs';
 import { parseYaml } from '../../lib/yaml.mjs';
 import { approvedPr } from './owner-go.mjs';
+import { GuardLimit } from './script-candidates.mjs';
 
 const LOOKUP_TIMEOUT_MS = 5000;
 const PUSH_LOOKUP_TIMEOUT_MS = 3000;
 
-// The timeout of one lookup process: its own, or what is left of the evaluation's wall cap when that is less (`leftMs`, from the policy; absent for a caller with no cap). Nothing left:
-// the lookup does not start and throws, which every caller below turns into "unknown" (a denial), so a slow lookup can never carry a hook past its host timeout (which Claude Code allows).
+// The timeout of one lookup process: its own, or what is left of the evaluation's wall cap when that is less (`leftMs`, from the policy; absent for a caller with no cap). spawnSync takes whole
+// milliseconds only (the cap's origin is a fractional epoch), so the remainder is floored. Under one whole millisecond (a timeout of 0 means none): the lookup does not start and throws a GuardLimit,
+// which the policy turns into a denial (never a guess about the answer), so a slow lookup can never carry a hook past its host timeout (which Claude Code allows).
+const OUT_OF_TIME = 'no time is left to look this up, so it cannot be verified. Try the command again.';
 const boundedTimeout = (own, leftMs) => {
   if (!leftMs) return own;
-  const left = leftMs();
-  if (!(left > 0)) throw new Error('no time is left to look this up');
-  return Math.min(own, left);
+  const left = Math.floor(Math.min(own, leftMs()));
+  if (!(left > 0)) throw new GuardLimit(OUT_OF_TIME);
+  return left;
 };
+// A lookup killed at its timeout (or cut off by the output limit) said nothing: the time cap's failure, not an answer such as "no such ref".
+const cutOff = (r) => r.signal || r.timedOut || r.overBuffer;
 
 export function realGitWiring() {
   // null (unknown) when HEAD is detached, the directory is not a repository, or git is unavailable
@@ -65,8 +70,14 @@ export function realGitWiring() {
 const COMMITTED_REFS = ['HEAD', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/main', 'refs/remotes/origin/master'];
 const defaultGitShow = (root, ref, leftMs) => {
   // a missing remote-tracking ref must read as missing: `git show` would fall through to a branch or tag literally named `refs/remotes/origin/<b>` (#455)
-  if (ref.startsWith('refs/') && run('git', ['-C', root, 'show-ref', '--verify', '--quiet', ref], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) }).code !== 0) return null;
+  // (a read cut off by its timeout is unknown, not "no config": a chat config dropped that way would switch the owner-approval check off)
+  if (ref.startsWith('refs/')) {
+    const s = run('git', ['-C', root, 'show-ref', '--verify', '--quiet', ref], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
+    if (cutOff(s)) throw new GuardLimit(OUT_OF_TIME);
+    if (s.code !== 0) return null;
+  }
   const r = run('git', ['-C', root, 'show', `${ref}:.claude/pipeline.yml`], { timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
+  if (cutOff(r)) throw new GuardLimit(OUT_OF_TIME);
   return r.code === 0 ? r.stdout : null;
 };
 const defaultRemotes = (dir, leftMs) => {
