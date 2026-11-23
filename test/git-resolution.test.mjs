@@ -1461,6 +1461,67 @@ test('conflictReviewBase (R2-B1): an own commit edits a conflicted file before t
   cNo(cdecide(s, head), 'evidence', 'f.txt');
 });
 
+test('conflictReviewBase (R3-B3): a clean merge of an unrelated main commit before the conflicting merge keeps the round narrow', () => {
+  // Prevents: any chain with a clean merge in it being refused as "an own commit changed f.txt" and the whole PR re-reviewed.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'README': T('r') },
+    ours: { 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'README': T('r2') },
+  });
+  s.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main cleanly', 'main']);
+  s.repo.checkout('main');
+  s.repo.write('f.txt', T('top', 't', 'bottom'));
+  s.repo.commit('main edits f.txt');
+  s.repo.checkout('feat');
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  cOk(cdecide(s, head));
+});
+
+test('conflictReviewBase (R3-F1): a conflicting merge resolved to text nobody reviewed, then a later clean merge of main, stays narrow', () => {
+  // Prevents: the common update-branch flow (conflict merge, then a clean merge) being refused because f.txt is no longer the reviewed blob after the first merge.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom'), 'g.txt': T('g') },
+    ours: { 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'f.txt': T('top', 't', 'bottom') },
+  });
+  resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'typed', 't', 'bottom') });
+  s.repo.checkout('main');
+  s.repo.write('g.txt', T('g2'));
+  s.repo.commit('main moves again');
+  s.repo.checkout('feat');
+  s.repo.git(['merge', '--no-ff', '-q', '-m', 'merge main cleanly', 'main']);
+  cOk(cdecide(s, revParse('HEAD', s.o)));
+});
+
+test('conflictReviewBase (R3-B1): the PR deleted a file main modified, an own commit restores it with main\'s text, and the merge has no conflict for it -> evidence', () => {
+  // Prevents: a missing actual conflict counting as equal to a trial conflict with no stage 2, hiding the own commit whose text the resolver then discards.
+  const s = conflictRepo({
+    base: { 'f.txt': T('x'), 'g.txt': T('top', 'x', 'bottom') },
+    ours: { 'f.txt': null, 'g.txt': T('top', 'o', 'bottom') },
+    theirs: { 'f.txt': T('t'), 'g.txt': T('top', 't', 'bottom') },
+  });
+  s.repo.write('f.txt', T('t'));
+  s.repo.commit('own commit restores f.txt');
+  const head = resolveMerge(s.repo, { 'f.txt': null, 'g.txt': T('top', 'o', 'bottom') });
+  cNo(cdecide(s, head), 'evidence', 'f.txt');
+});
+
+test('conflictReviewBase (R3-B2): two merges of the chain both conflict on f.txt and both keep ours -> evidence, the first main commit\'s side is in no record', () => {
+  // Prevents: main-1's version of f.txt (the first merge's theirs) never reaching a reviewer, because the single trial merge only shows the last main commit's side.
+  const s = conflictRepo({
+    base: { 'f.txt': T('top', 'x', 'bottom') },
+    ours: { 'f.txt': T('top', 'o', 'bottom') },
+    theirs: { 'f.txt': T('top', 't1', 'bottom') },
+  });
+  resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  s.repo.checkout('main');
+  s.repo.write('f.txt', T('top', 't2', 'bottom'));
+  s.repo.commit('main edits f.txt again');
+  s.repo.checkout('feat');
+  const head = resolveMerge(s.repo, { 'f.txt': T('top', 'o', 'bottom') });
+  cNo(cdecide(s, head), 'evidence', 'f.txt');
+});
+
 test('renderConflictSides (R1-B4, R1-B7): a recorded conflict that no longer conflicts, or a blob with hundreds of thousands of lines, is unavailable (whole PR), never an incomplete file or a throw', () => {
   // Prevents: a file missing one conflict's sides being pinned as the Fable evidence, and `arbiter needed` crashing on a RangeError (a spread of every line into one call) instead of falling back.
   const s = conflictRepo({

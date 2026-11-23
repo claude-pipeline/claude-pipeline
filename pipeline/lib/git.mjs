@@ -505,14 +505,31 @@ function conflictChecks({ from, forkPoint, head, baseRef }, o) {
   // The trial merge uses the last reviewed head as its first parent, but an own commit may come before the real merge: a file that commit edited
   // can conflict in the real merge and be absent from the trial list, with no evidence and no marker check. Any conflict a merge commit of the
   // chain has outside the trial list is refused (the whole PR is then reviewed).
-  for (const m of merges) {
-    if (m.parents[0] === fromSha && m.parents[1] === forkSha) continue;
+  // Per conflicted path, in chain order (oldest merge first; `merges` is newest first). A merge with a conflict entry for the path must have the
+  // trial's stage 2 (an own commit that edited the file before the merge changes it: a resolver restoring the reviewed blob would hide the edit from
+  // every review), and only ONE merge of the chain may conflict on a path: the trial merge shows only the last main commit's side, so an earlier
+  // merge's conflict would reach no reviewer. A merge with NO entry for the path is fine when an earlier merge already conflicted there with the
+  // trial's stage 2, or when the path's entry in its first parent is unchanged since the last reviewed head; otherwise an own commit changed it.
+  const conflictedIn = new Set();
+  for (const m of [...merges].reverse()) {
+    if (m.parents[0] === fromSha && m.parents[1] === forkSha) { for (const p of conflicted) conflictedIn.add(p); continue; }
     const actual = mergeTreeDetailed(m.parents[0], m.parents[1], o);
     const extra = actual.conflicts.map((c) => c.path).filter((p) => !known.has(p));
     if (extra.length > 0) throw fail('evidence', `the merge ${m.sha} also conflicts in ${shortList(extra)}, which the trial merge of the last reviewed head does not`);
-    // An own commit that edited a conflicted file before the merge changes that file's stage 2 here: a resolver restoring the reviewed blob would hide
-    // the edit from every review.
-    const changed = merged.conflicts.filter((c) => !sameEntry(c.stages[2], actual.conflicts.find((a) => a.path === c.path)?.stages[2])).map((c) => c.path);
+    const noEntry = merged.conflicts.filter((c) => !actual.conflicts.some((a) => a.path === c.path));
+    const parentEntries = noEntry.length > 0 ? treeEntries(m.parents[0], noEntry.map((c) => c.path), o) : new Map();
+    const fromEntries = noEntry.length > 0 ? treeEntries(fromSha, noEntry.map((c) => c.path), o) : new Map();
+    const changed = [];
+    const twice = [];
+    for (const c of merged.conflicts) {
+      const entry = actual.conflicts.find((a) => a.path === c.path);
+      if (entry) {
+        if (conflictedIn.has(c.path)) twice.push(c.path);
+        else if (!sameEntry(c.stages[2], entry.stages[2])) changed.push(c.path);
+        conflictedIn.add(c.path);
+      } else if (!conflictedIn.has(c.path) && !sameEntry(parentEntries.get(c.path), fromEntries.get(c.path))) changed.push(c.path);
+    }
+    if (twice.length > 0) throw fail('evidence', `more than one merge of the chain conflicts in ${shortList(twice)} (at ${m.sha}); the earlier merge's conflict is in no record`);
     if (changed.length > 0) throw fail('evidence', `an own commit before the merge ${m.sha} changed ${shortList(changed)}, which the trial merge of the last reviewed head conflicts in`);
   }
 
