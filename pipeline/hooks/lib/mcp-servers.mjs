@@ -92,9 +92,13 @@ const PACKAGE = '@supabase/mcp-server-supabase';
 const hostOf = (s) => { try { return new URL(s).hostname; } catch { return ''; } };
 // `pkg@1.2.3` -> `pkg` (the leading `@` of a scope is not a version separator)
 const withoutVersion = (s) => { const i = s.lastIndexOf('@'); return i > 0 && !s.slice(i).includes('/') ? s.slice(0, i) : s; };
-const isPackage = (s) => { const p = withoutVersion(s); return p === PACKAGE || p.split(/[\\/]/).includes('mcp-server-supabase'); };
+// a Windows npm shim is `mcp-server-supabase.cmd` (also .exe, .ps1, .bat)
+const isPackage = (s) => { const p = withoutVersion(s); return p === PACKAGE || p.split(/[\\/]/).some((c) => c.replace(/\.(cmd|exe|ps1|bat)$/i, '') === 'mcp-server-supabase'); };
 // `mcp/supabase:tag`, `registry:5000/mcp/supabase@sha256:…`
 const isImage = (s) => { const i = s.replace(/@.*$/, '').replace(/:[^/:]*$/, ''); return i === 'mcp/supabase' || i.endsWith('/mcp/supabase'); };
+
+// a one-string launcher (`bash -lc "npx -y …"`, `cmd /c "…"`) carries the marker inside one word: test each whitespace- or quote-delimited token too
+const tokensOf = (w) => [w, ...w.split(/[\s"'`;&|()]+/).filter(Boolean)];
 
 // -> 'supabase' | 'other' | 'unresolved'
 export function identify(entry) {
@@ -104,8 +108,9 @@ export function identify(entry) {
   const args = entry.args === undefined ? [] : entry.args;
   if ((url !== undefined && typeof url !== 'string') || (command !== undefined && typeof command !== 'string') || !Array.isArray(args) || !args.every((a) => typeof a === 'string')) return 'unresolved';
   const words = [command, ...args].filter((w) => typeof w === 'string');
-  if ([url, ...args].some((u) => typeof u === 'string' && SUPABASE_HOSTS.has(hostOf(u)))
-    || words.some((w) => isPackage(w) || isImage(w))
+  const tokens = words.flatMap(tokensOf);
+  if ([url, ...tokens].some((u) => typeof u === 'string' && SUPABASE_HOSTS.has(hostOf(u)))
+    || tokens.some((w) => isPackage(w) || isImage(w))
     || (isObject(entry.env) && Object.hasOwn(entry.env, 'SUPABASE_ACCESS_TOKEN'))) return 'supabase';
   if (url === undefined && command === undefined) return 'unresolved';
   return [url, ...words].some((w) => typeof w === 'string' && w.includes('$')) ? 'unresolved' : 'other';

@@ -423,6 +423,11 @@ test('#687 identity: bridges, docker, a local build and the access-token env are
     docker: { command: 'docker', args: ['run', '-i', '--rm', 'mcp/supabase:latest'] },
     'local build': { command: 'node', args: ['/x/mcp-server-supabase/dist/transports/stdio.js'] },
     'access token env': { command: 'node', args: ['vendor.js'], env: { SUPABASE_ACCESS_TOKEN: 'synthetic' } },
+    'windows npm shim': { command: 'cmd.exe', args: ['/c', 'C:\\Users\\x\\AppData\\Roaming\\npm\\mcp-server-supabase.cmd', '--read-only'] },
+    'windows exe shim': { command: 'C:\\tools\\mcp-server-supabase.exe' },
+    'bash one-string launcher': { command: 'bash', args: ['-lc', 'npx -y @supabase/mcp-server-supabase --read-only'] },
+    'cmd one-string launcher': { command: 'cmd', args: ['/c', '"npx -y @supabase/mcp-server-supabase@latest"'] },
+    'sh one-string bridge': { command: 'sh', args: ['-c', 'npx -y mcp-remote https://mcp.supabase.com/mcp'] },
   };
   for (const [label, entry] of Object.entries(supa)) {
     const s = mcpScene(t);
@@ -431,6 +436,7 @@ test('#687 identity: bridges, docker, a local build and the access-token env are
   }
   const other = {
     'incidental path': { command: 'node', args: ['/work/supabase-tools/vendor.js'] },
+    'other vendor one-string launcher': { command: 'bash', args: ['-lc', 'npx -y @vendor/mcp-server --read-only'] },
     'own edge function': { type: 'http', url: 'https://myref.supabase.co/functions/v1/my-mcp' },
   };
   for (const [label, entry] of Object.entries(other)) {
