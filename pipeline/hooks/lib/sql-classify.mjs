@@ -114,12 +114,23 @@ const hasRun = (words, ...run) => {
 };
 
 // #655 (the "changes every row" hint). FAIL CLOSED, no precise walk: when in doubt the warning shows. The hint may over-warn; it must never stay
-// silent on an UPDATE/DELETE without a WHERE of its own. In a statement that starts with WITH every UPDATE/DELETE word is a DML start unless the
-// full run around it proves otherwise (dmlKind); statements starting with anything else than UPDATE/DELETE/WITH/MERGE give no hint.
+// silent on an UPDATE/DELETE without a WHERE of its own. In a statement that starts with WITH, EXPLAIN, COPY or a parenthesis (they run or wrap the
+// change) every UPDATE/DELETE word is a DML start unless the full run around it proves otherwise (dmlKind); a statement starting with UPDATE/DELETE
+// is scanned at its first word, MERGE for its actions, and anything else (policies, foreign keys, GRANT) gives no hint.
+
+// true when the first of `toks` (a '(') closes at the last one
+const wraps = (toks) => {
+  let depth = 0;
+  for (let k = 0; k < toks.length; k += 1) {
+    if (toks[k] === '(') depth += 1;
+    else if (toks[k] === ')') { depth -= 1; if (depth === 0 && k < toks.length - 1) return false; }
+  }
+  return depth === 0;
+};
 
 // The WHERE of the UPDATE/DELETE keyword at `from`: only one at the keyword's own parenthesis depth and inside its own group counts (a WHERE in a
 // sub-select, or after the CTE group closed, belongs to another query). Returns 'none' (no own WHERE, or the scope cannot be determined: unbalanced
-// parentheses), 'true' (the condition is always true: `true`, `1 = 1`, up to the end, the group's end or a RETURNING) or 'ok'.
+// parentheses), 'true' (the condition is always true: `true`, `1 = 1`, up to the end, the group's end or a RETURNING; matched outer parentheses are ignored) or 'ok'. A WHERE after RETURNING, AS or a dot is not a filter.
 function ownWhere(stmt, from) {
   let depth = 0;
   let at = -1;
@@ -130,7 +141,13 @@ function ownWhere(stmt, from) {
     else if (t.t === 'punct' && t.v === ')') {
       depth -= 1;
       if (depth < 0) { closed = true; break; }
-    } else if (depth === 0 && t.t === 'word' && t.v.toUpperCase() === 'WHERE') { at = k; break; }
+    } else if (depth === 0 && t.t === 'word') {
+      const w = t.v.toUpperCase();
+      if (w === 'RETURNING') break; // nothing after it is a filter
+      // WHERE as an output label (AS where) or a qualified name (t.where) is not a filter
+      const prev = stmt[k - 1];
+      if (w === 'WHERE' && !(prev.t === 'punct' && prev.v === '.') && !(prev.t === 'word' && prev.v.toUpperCase() === 'AS')) { at = k; break; }
+    }
   }
   if (at < 0) return 'none';
   const rest = [];
@@ -143,8 +160,11 @@ function ownWhere(stmt, from) {
   }
   // a depth left open at the end of the statement (outside a closed group) means the parentheses do not balance: scope unknown
   if (depth > 0 && !closed) return 'none';
+  // matched outer parentheses around the whole condition do not change it: strip them (no evaluation)
+  while (rest.length > 1 && rest[0] === '(' && rest[rest.length - 1] === ')' && wraps(rest)) { rest.shift(); rest.pop(); }
+  if (!rest.length) return 'none';
   const text = rest.join(' ');
-  return text === 'TRUE' || /^(\d+) = \1$/.test(text) || text === '( TRUE )' ? 'true' : 'ok';
+  return text === 'TRUE' || /^(\d+) = \1$/.test(text) ? 'true' : 'ok';
 }
 
 // What the UPDATE/DELETE word at `i` of a WITH or MERGE statement is: 'skip' (a locking clause or an upsert action: proven by the whole run, not
@@ -174,14 +194,15 @@ export function describeSql(sql) {
     if (first === 'TRUNCATE') found.add('TRUNCATE');
     const starts = []; // [index, 'UPDATE' | 'DELETE'] of every UPDATE/DELETE that begins a change
     if (first === 'UPDATE' || first === 'DELETE') starts.push([0, first]);
-    if (first === 'WITH' || first === 'MERGE') {
+    const scanned = first === 'WITH' || first === 'EXPLAIN' || first === 'COPY' || (stmt[0]?.t === 'punct' && stmt[0].v === '(');
+    if (scanned || first === 'MERGE') {
       let depth = 0;
       const depths = stmt.map((t) => { if (t.t === 'punct' && t.v === ')') depth -= 1; const d = depth; if (t.t === 'punct' && t.v === '(') depth += 1; return d; });
       words.forEach((w, i) => {
         if (w !== 'UPDATE' && w !== 'DELETE') return;
         const kind = dmlKind(words, depths, i);
         if (kind === 'merge') found.add(`MERGE-${w}`);
-        else if (kind === 'dml' && first === 'WITH') starts.push([i, w]);
+        else if (kind === 'dml' && scanned) starts.push([i, w]);
       });
     }
     for (const [at, kw] of starts) {
