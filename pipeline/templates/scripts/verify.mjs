@@ -90,29 +90,35 @@ export function excerpt(text, n = EXCERPT_LINES) {
 }
 
 // Test counts from a step's own summary lines, or null when it printed none (counts are never invented). node:test: `# pass N` /
-// `ℹ pass N` (also fail, skipped / skip, todo) inside the runner's summary block, which opens at its `tests N` line (a test's own
-// printed "# pass 3" is not counted); vitest: `Tests  N passed | M failed | K skipped`. todo counts as skipped; several
-// summaries in one step (a command that runs two suites) add up.
+// `ℹ pass N` (also fail, cancelled, skipped / skip, todo) inside the runner's summary block, which opens at its `tests N` line and is
+// added up only when its `duration_ms` line closes it (a test's own printed "# tests 3" / "# pass 3" never completes a block);
+// vitest: `Tests  N passed | M failed | K skipped` (or `no tests`) right after its `Test Files` row (a test's own printed "Tests  3 passed"
+// is not counted). todo counts as skipped, cancelled as failed; several summaries in one step (a command that runs two suites) add up.
 export function testCounts(text) {
   const clean = String(text).replace(/\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g, '').replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '');
   const counts = { passed: 0, failed: 0, skipped: 0 };
   let found = false;
-  let inSummary = false;
+  let block = null; // node:test counters held until duration_ms closes the block
+  let afterFiles = false; // the previous non-blank line was vitest's `Test Files` row
   for (const line of clean.split('\n')) {
     const summary = /^\s*(?:#|ℹ)\s+(tests|suites|pass|fail|cancelled|skipped|skip|todo|duration_ms)\s+(\d+(?:\.\d+)?)\s*$/.exec(line);
-    if (summary?.[1] === 'tests') inSummary = true;
-    else if (summary?.[1] === 'duration_ms' || (!summary && line.trim() !== '')) inSummary = false; // duration_ms closes the block
-    const node = inSummary && summary && /^(?:pass|fail|skipped|skip|todo)$/.test(summary[1]) ? summary : null;
-    if (node) {
-      counts[{ pass: 'passed', fail: 'failed' }[node[1]] ?? 'skipped'] += Number(node[2]);
-      found = true;
-      continue;
-    }
-    const vitest = /^\s*Tests\s+(\d+ (?:passed|failed|skipped|todo)(?: \| \d+ (?:passed|failed|skipped|todo))*)(?:\s+\(\d+\))?\s*$/.exec(line);
+    if (summary?.[1] === 'tests') block = { passed: 0, failed: 0, skipped: 0 };
+    else if (summary?.[1] === 'duration_ms') {
+      if (block) {
+        for (const k of Object.keys(counts)) counts[k] += block[k];
+        found = true;
+      }
+      block = null;
+    } else if (!summary && line.trim() !== '') block = null;
+    else if (block && summary && summary[1] !== 'suites') block[{ pass: 'passed', fail: 'failed', cancelled: 'failed' }[summary[1]] ?? 'skipped'] += Number(summary[2]);
+    if (summary) continue;
+    if (line.trim() === '') continue;
+    const vitest = afterFiles && /^\s*Tests\s+(\d+ (?:passed|failed|skipped|todo)(?: \| \d+ (?:passed|failed|skipped|todo))*|no tests)(?:\s+\(\d+\))?\s*$/.exec(line);
     if (vitest) {
       for (const m of vitest[1].matchAll(/(\d+) (passed|failed|skipped|todo)/g)) counts[m[2] === 'todo' ? 'skipped' : m[2]] += Number(m[1]);
       found = true;
     }
+    afterFiles = /^\s*Test Files\s+\S/.test(line);
   }
   return found ? counts : null;
 }
