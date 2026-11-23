@@ -369,7 +369,7 @@ test('#352 R12-F1b: a $( ) in a heredoc body or in $[ ] takes the operator befor
   denies('cd d || cat <<EOF, a backtick push in the body', `cd /work/other2 || cat <<EOF\n\`${SHIP}\`\nEOF`);
   ANY_DENY('a body read to the end of the text, behind ||', `${RESET} || cat <<EOF\n$(${SHIP})`);
   allows('twin: switch && cat <<EOF, $( push ) in the body', `${RESET} && cat <<EOF\n$(${SHIP})\nEOF`);
-  allows('twin: switch; cat <<EOF, $( push ) in the body', `${RESET} && cat <<EOF\n$(${SHIP})\nEOF`);
+  denies('switch; cat <<EOF, $( push ) in the body (the ; forgets the branch)', `${RESET}; cat <<EOF\n$(${SHIP})\nEOF`);
   allows('twin: switch && echo $[ $( push ) ]', `${RESET} && echo $[ $(${SHIP}) ]`);
 });
 
@@ -413,7 +413,8 @@ test('#352 R14-F1: a zsh anonymous function or short-form body after ) still con
   denies('cd d && if (true) echo hi & push', `cd /work/other2 && if (true) echo hi & ${SHIP}`);
   allows('twin: cd d && () { true; } && push', `cd /work/other2 && () { true; } && ${SHIP}`);
   allows('twin: cd d && () { true; }; push', `cd /work/other2 && () { true; }; ${SHIP}`);
-  allows('twin: switch; () { push; }', `${RESET} && () { ${SHIP}; }`);
+  allows('twin: switch && () { push; }', `${RESET} && () { ${SHIP}; }`);
+  denies('switch; () { push; } (the ; forgets the branch)', `${RESET}; () { ${SHIP}; }`);
   // (R16: an `if (true) echo hi` has no `then`: a zsh short form the parser does not follow, so the line is refused wholesale: was an allow)
   denies('twin: cd d && if (true) echo hi && push (short form, R16)', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
 });
@@ -435,7 +436,7 @@ test('#352 R15-F1: the } of a zsh alternate-form body ends its until / if, so a 
   denies('switch && if (true) { true; } || push', `${RESET} && if (true) { true; } || ${SHIP}`);
   denies('switch && if (true) { true; } else { true; } || push', `${RESET} && if (true) { true; } else { true; } || ${SHIP}`);
   // (R16: a condition-then-body form is not followed, so these two former allows are refusals)
-  denies('twin: switch; until (true) { push; break; } (R16)', `${RESET}; until (true) { ${SHIP}; break; }`);
+  denies('twin: switch; until (true) { push; break; } (R16)', `${RESET} || exit 1; until (true) { ${SHIP}; break; }`);
   denies('twin: switch && until (true) { true; } && push (R16)', `${RESET} && until (true) { true; } && ${SHIP}`);
 });
 
@@ -505,7 +506,7 @@ test('#352 R17-F2/F4: an unquoted { or } word in argument position (a zsh group 
   denies('R17-F2: while C && { true } short body', `while cd /work/other2 && { true } ${SHIP}`);
   denies('R17-F4: case x { y) switch }; push', `case x { y) ${RESET} }; ${SHIP}`);
   denies('R17-F4: case x { y) cd d }; push (from the other worktree)', `case x { y) cd /work/main }; ${SHIP}`, {}, '/work/other2');
-  denies('R17-F4: case x { y) : ;; } ; push after a switch', `${RESET}; case x { y) : }; ${SHIP}`, {}, MAIN_DIR);
+  denies('R17-F4: case x { y) : ;; } ; push after a switch', `${RESET} || exit 1; case x { y) : }; ${SHIP}`, {}, MAIN_DIR);
   // everyday lines that carry a { or } as an argument keep their verdict
   allows('twin: find . -exec rm {} + ; push', `find . -exec rm {} + && ${SHIP}`, {}, '/work/other2');
   allows('twin: find . -exec echo {} \; ; push', `find . -exec echo {} \\; && ${SHIP}`, {}, '/work/other2');

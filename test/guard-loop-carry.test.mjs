@@ -59,8 +59,8 @@ function allows(what, cmd, files) {
 }
 
 test('#352 R5-B1: a branch switched BEFORE the loop does not hide what the loop body leaves for its next iteration', () => {
-  denies('line', `git switch agent/x; for s in setup other; do ${PB} origin HEAD; npm run $s; done`, pkg(SWITCH_MAIN), BRANCH);
-  denies('script', RUN_SH, script(SWITCH_MAIN, `git switch agent/x; for s in setup other; do ${PB} origin HEAD; npm run $s; done`), BRANCH);
+  denies('line', `git switch agent/x || exit 1; for s in setup other; do ${PB} origin HEAD; npm run $s; done`, pkg(SWITCH_MAIN), BRANCH);
+  denies('script', RUN_SH, script(SWITCH_MAIN, `git switch agent/x || exit 1; for s in setup other; do ${PB} origin HEAD; npm run $s; done`), BRANCH);
   denies('prefix alias', `git config alias.st status; for s in setup other; do git ship; npm run $s; done`, pkg(SHIP), ALIAS);
 });
 
@@ -506,7 +506,7 @@ test('#352 R38-F2: a subshell / command substitution never hands a state change 
   const levels = [
     '( exit 0; git switch agent/x ); PUSH', '( [ -f s ] && exit 0; git switch agent/x ) && PUSH', 'x=$(exit 0; git switch agent/x); PUSH', 'echo "$( [ -f s ] && exit 0; git switch agent/x )"; PUSH',
     'echo `exit 0; git switch agent/x`; PUSH', '( git switch agent/x ); PUSH', 'x=$(git switch agent/x); PUSH', '( cd /work/repo && git switch agent/x ); PUSH',
-    'git switch agent/x; ( git switch main; exit 0; git switch agent/x ); PUSH', 'git switch agent/x; x=$(git switch main; exit 0; git switch agent/x); PUSH',
+    'git switch agent/x || exit 1; ( git switch main; exit 0; git switch agent/x ); PUSH', 'git switch agent/x || exit 1; x=$(git switch main; exit 0; git switch agent/x); PUSH',
   ];
   const HEAD = `${PB} origin HEAD`;
   for (const l of levels) {
@@ -598,7 +598,7 @@ test('#570: a `!` git alias / gh shell alias that switches or rewrites an alias 
   const SET_STATUS = 'git config alias.ship status';
   const p = { 'p.sh': `${PB} origin HEAD\n` };
   denies('alias written and put back by a ! git alias', `${SET_STATUS}; git config alias.x '!${SHIP}; exit 0; ${SET_STATUS}'; git x; git ship`, {}, ALIAS);
-  denies('branch switched and put back by a ! git alias', `git switch agent/x; git config alias.x '!git switch ${MAIN}; exit 0; git switch agent/x'; git x; bash ./p.sh`, p, BRANCH);
+  denies('branch switched and put back by a ! git alias', `git switch agent/x || exit 1; git config alias.x '!git switch ${MAIN}; exit 0; git switch agent/x'; git x; bash ./p.sh`, p, BRANCH);
   denies('alias written and put back by a gh shell alias', `${SET_STATUS}; gh alias set x '!${SHIP}; exit 0; ${SET_STATUS}'; gh x; git ship`, {}, ALIAS);
   denies('R38-F2: the same text given as -c alias.x=', `git -c alias.x='!git switch ${MAIN}; exit 0; git switch agent/x' x; ${PB} origin HEAD`, {}, BRANCH);
   allows('a ! git alias that changes nothing', `${SET_STATUS}; git config alias.x '!echo hi'; git x; git ship`);
@@ -613,7 +613,7 @@ test('#571: the expansion of a gh alias definition is judged, but what it would 
   const MAINPUSH = /pushing to main/;
   denies('a definition would rewrite an alias: not believed', `git config alias.ship '${PUSH} origin ${MAIN}'; gh alias set x '!git config alias.ship status'; git ship`, {}, MAINPUSH);
   denies('a definition would switch branch: not believed', `git switch ${MAIN} || exit 1; gh alias set x '!git switch agent/x'; bash ./p.sh`, p, MAINPUSH);
-  denies('the same alias run: the use site is a child text, the branch is unknown', `git switch agent/x; gh alias set x '!git switch ${MAIN}'; gh x; ${PB} origin HEAD`, {}, BRANCH);
+  denies('the same alias run: the use site is a child text, the branch is unknown', `git switch agent/x || exit 1; gh alias set x '!git switch ${MAIN}'; gh x; ${PB} origin HEAD`, {}, BRANCH);
   allows('a definition only (nothing ran): the push is on agent/x', `git switch agent/x || exit 1; gh alias set x '!git switch ${MAIN}'; ${PB} origin HEAD`);
   allows('a definition with a plain expansion', `${SET_STATUS}; gh alias set x 'pr view'; git ship`);
   allows('a definition with a harmless shell expansion', `${SET_STATUS}; gh alias set x '!echo hi'; git ship`);
@@ -638,10 +638,10 @@ test('#572 / #573: a branch switched and put back by an eval\'d text in a subshe
 test('C: a branch switch in a directory the walk cannot name makes the tracked branch unknown', () => {
   const TOP = '"$(git rev-parse --show-toplevel)"';
   const H = `${PB} origin HEAD`;
-  denies('-C with a toplevel substitution, push on the line', `git switch agent/x; git -C ${TOP} switch ${MAIN}; ${H}`, {}, BRANCH);
-  denies('the same, the push in a script', `git switch agent/x; git -C ${TOP} switch ${MAIN}; bash ./p.sh`, { 'p.sh': `${H}\n` }, BRANCH);
-  denies('a switch after a cd to a directory not named', `git switch agent/x; cd "$(mktemp -d)"; git switch ${MAIN}; cd ${GIT_ROOT}; ${H}`, {}, BRANCH);
-  denies('F8: a child script switches in a directory it cannot name', `git switch agent/x; bash ./s.sh; ${H}`, { 's.sh': `git -C ${TOP} switch ${MAIN}\n` }, BRANCH);
+  denies('-C with a toplevel substitution, push on the line', `git switch agent/x || exit 1; git -C ${TOP} switch ${MAIN}; ${H}`, {}, BRANCH);
+  denies('the same, the push in a script', `git switch agent/x || exit 1; git -C ${TOP} switch ${MAIN}; bash ./p.sh`, { 'p.sh': `${H}\n` }, BRANCH);
+  denies('a switch after a cd to a directory not named', `git switch agent/x || exit 1; cd "$(mktemp -d)"; git switch ${MAIN}; cd ${GIT_ROOT}; ${H}`, {}, BRANCH);
+  denies('F8: a child script switches in a directory it cannot name', `git switch agent/x || exit 1; bash ./s.sh; ${H}`, { 's.sh': `git -C ${TOP} switch ${MAIN}\n` }, BRANCH);
   allows('a literal other repository', `git switch agent/x || exit 1; git -C /work/other switch ${MAIN}; ${H}`);
   allows('an unnamed directory, no branch move', `git switch agent/x || exit 1; git -C ${TOP} status; ${H}`);
 });
@@ -705,10 +705,10 @@ test('#569: a switch made by a file eval\'d inside a literal loop in an eval\'d 
 // R39-F3 / F4 (the arbiter's reading: a memo hit replays an end state without the writes of the first judgement): the same text run a second time in the same state is still unknown afterwards
 test('#362 R39-F3 / F4: a startup file or a line-written script judged once in a state is still unknown to its caller the second time', () => {
   const rc = { rc: `git switch ${MAIN}\nexit 0\ngit switch agent/x\n`, 'noop.sh': 'echo hi\n' };
-  denies('F3: BASH_ENV startup file, twice', `git switch agent/x; BASH_ENV=./rc bash ./noop.sh; git switch agent/x; BASH_ENV=./rc bash ./noop.sh; ${PB} origin HEAD`, rc, BRANCH);
+  denies('F3: BASH_ENV startup file, twice', `git switch agent/x || exit 1; BASH_ENV=./rc bash ./noop.sh; git switch agent/x || exit 1; BASH_ENV=./rc bash ./noop.sh; ${PB} origin HEAD`, rc, BRANCH);
   const n = `echo '${SWITCH_MAIN}' > n.sh`;
   denies('F4: a script written on the line, run twice, push on the line', `${n}; git switch agent/x; bash n.sh; git switch agent/x; bash n.sh; ${PB} origin HEAD`, {}, /may have been written by an earlier command on the line/);
-  denies('F4: the same, the push in a named script', `${n}; git switch agent/x; bash n.sh; git switch agent/x; bash n.sh; bash p.sh`, { 'p.sh': `${PB} origin HEAD\n` }, BRANCH);
+  denies('F4: the same, the push in a named script', `${n}; git switch agent/x || exit 1; bash n.sh; git switch agent/x || exit 1; bash n.sh; bash p.sh`, { 'p.sh': `${PB} origin HEAD\n` }, BRANCH);
 });
 
 test('#362 R40-B1: an alias written and put back by an eval\'d text in a subshell (an exit between) is unsure after the subshell', () => {
