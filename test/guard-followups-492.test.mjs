@@ -315,13 +315,13 @@ describe('R1-F1: a git read leaves the on-disk branch known (cwd on agent/x, no 
 describe('#508: a PATH set before the failure group makes even an echo not inert', () => {
   // (the clause `assignedNames(ctx)` of inertInFailGroup: the PATH is set BEFORE the group, so the group's own words (`echo`, `exit`) are all plain data commands)
   test('the script sets PATH on an earlier line, then a group that only echoes and exits', () => {
-    expect('deny', 'git checkout agent/y && bash build.sh; git push', { [BUILD]: 'export PATH=/work/repo/bin:$PATH\ncd dist || { echo no; exit 1; }\n' });
+    expect('deny', 'git checkout agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'export PATH=/work/repo/bin:$PATH\ncd dist || { echo no; exit 1; }\n' });
   });
   test('the caller sets PATH on its own line', () => {
-    expect('deny', 'export PATH=/work/repo/bin:$PATH; git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
+    expect('deny', 'export PATH=/work/repo/bin:$PATH; git checkout agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
   });
   test('control: no PATH set anywhere, the same group is inert (allowed)', () => {
-    expect('allow', 'git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
+    expect('allow', 'git checkout agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' });
   });
 });
 

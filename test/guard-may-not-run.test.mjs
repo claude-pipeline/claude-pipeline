@@ -369,7 +369,7 @@ test('#352 R12-F1b: a $( ) in a heredoc body or in $[ ] takes the operator befor
   denies('cd d || cat <<EOF, a backtick push in the body', `cd /work/other2 || cat <<EOF\n\`${SHIP}\`\nEOF`);
   ANY_DENY('a body read to the end of the text, behind ||', `${RESET} || cat <<EOF\n$(${SHIP})`);
   allows('twin: switch && cat <<EOF, $( push ) in the body', `${RESET} && cat <<EOF\n$(${SHIP})\nEOF`);
-  allows('twin: switch; cat <<EOF, $( push ) in the body', `${RESET}; cat <<EOF\n$(${SHIP})\nEOF`);
+  allows('twin: switch; cat <<EOF, $( push ) in the body', `${RESET} && cat <<EOF\n$(${SHIP})\nEOF`);
   allows('twin: switch && echo $[ $( push ) ]', `${RESET} && echo $[ $(${SHIP}) ]`);
 });
 
@@ -413,7 +413,7 @@ test('#352 R14-F1: a zsh anonymous function or short-form body after ) still con
   denies('cd d && if (true) echo hi & push', `cd /work/other2 && if (true) echo hi & ${SHIP}`);
   allows('twin: cd d && () { true; } && push', `cd /work/other2 && () { true; } && ${SHIP}`);
   allows('twin: cd d && () { true; }; push', `cd /work/other2 && () { true; }; ${SHIP}`);
-  allows('twin: switch; () { push; }', `${RESET}; () { ${SHIP}; }`);
+  allows('twin: switch; () { push; }', `${RESET} && () { ${SHIP}; }`);
   // (R16: an `if (true) echo hi` has no `then`: a zsh short form the parser does not follow, so the line is refused wholesale: was an allow)
   denies('twin: cd d && if (true) echo hi && push (short form, R16)', `cd /work/other2 && if (true) echo hi && ${SHIP}`);
 });

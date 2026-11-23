@@ -1503,7 +1503,9 @@ test('an unresolved expansion is unknown branch state, never a branch name', () 
     'git branch -m "$NEW"; git push',
   ];
   for (const c of denyCmds) assert.equal(evaluate(c, { branch: 'agent/x' }).decision, 'deny', c);
-  assert.equal(evaluate('B=agent/y; git switch -C "$B"; git push origin HEAD', { branch: 'main' }).decision, 'allow');
+  // (#754: a switch followed by ; may have failed, so a push of HEAD after it is unknown; the && twin is the known-variable allow)
+  assert.equal(evaluate('B=agent/y; git switch -C "$B"; git push origin HEAD', { branch: 'main' }).decision, 'deny');
+  assert.equal(evaluate('B=agent/y; git switch -C "$B" && git push origin HEAD', { branch: 'main' }).decision, 'allow');
 });
 
 test('a protected argument built from a variable assigned twice fails closed', () => {

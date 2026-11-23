@@ -118,7 +118,7 @@ test('#352 R6 allow twins: loops that leave nothing for their next iteration are
   allows('nested loops, nothing left', `for i in 1 2; do for j in 1 2; do ${SHIP}; npm run other; done; done`, SCRIPTS);
   allows('readings that leave nothing', `for s in other other2; do ${SHIP}; npm run $s; done`, pkgOf({ other: 'echo a', other2: 'echo b' }));
   allows('continue with nothing left', `for i in 1 2; do ${SHIP}; [ -f flag ] && continue; npm run other; done`, SCRIPTS);
-  allows('a switch before the loop, a push in it', `git switch agent/x; for i in 1 2; do ${SHIP}; npm run other; done`, SCRIPTS);
+  allows('a switch before the loop, a push in it', `git switch agent/x || exit 1; for i in 1 2; do ${SHIP}; npm run other; done`, SCRIPTS);
   allows('a switch after the loop', `for i in 1 2; do ${SHIP}; done; npm run setup`, SCRIPTS);
   allows('a switch before the loop', `npm run setup; for i in 1 2; do git add f; done`, SCRIPTS);
 });
@@ -167,7 +167,7 @@ test('#352 R7-F2: a state change inside an if / loop is not certain for a comman
   denies('R10: a change in a piped group', '{ git switch agent/x; } | cat; ' + SHIP, {}, undefined, MAIN_DIR);
   denies('R10: a change in a negated group', '! { git switch agent/x; }; ' + SHIP, {}, undefined, MAIN_DIR);
   denies('R10: a change in a background group', '{ git switch agent/x; } & ' + SHIP, {}, undefined, MAIN_DIR);
-  allows('twin: a plain group, then ;', '{ git switch agent/x; }; ' + SHIP, {}, MAIN_DIR);
+  denies('#754: a plain group, then ;: the switch in it may have failed, the push runs on the old branch (the && twin below is allowed)', '{ git switch agent/x; }; ' + SHIP, {}, undefined, MAIN_DIR);
   allows('twin: the change outside the group', '[ -f x ] && git switch agent/x && { :; } && ' + SHIP, {}, MAIN_DIR);
   allows('twin: a plain group', '{ git switch agent/x; } && ' + SHIP, {}, MAIN_DIR);
   allows('twin: && after && after a switch', 'true && git switch agent/x && ' + SHIP, {}, MAIN_DIR);
@@ -199,5 +199,5 @@ test('#352 R7 adjacent shapes: groups, case, a pipeline, a loop in a function ke
   allows('a subshell cd in the loop is lost', 'for i in 1 2; do (npm run a; cd sub); done', sub(PUSH_MAIN));
   allows('a subshell cd in the loop word loop is lost', 'for s in a b; do (cd /work/$s; npm run $s); done', { 'package.json': pk({ a: 'echo', b: 'echo' }), '/work/a/package.json': pk({ a: 'echo', b: PUSH_MAIN }) });
   denies('a state change in an until, then ||', 'until true; do git switch agent/x; done || ' + SHIP, {}, /cannot determine the current branch|pushing to main is blocked/, MAIN_DIR);
-  allows('a switch before a loop, a push after done &&', 'git switch agent/x; for i in 1 2; do git status; done && ' + SHIP, {}, MAIN_DIR);
+  allows('a switch before a loop, a push after done &&', 'git switch agent/x || exit 1; for i in 1 2; do git status; done && ' + SHIP, {}, MAIN_DIR);
 });

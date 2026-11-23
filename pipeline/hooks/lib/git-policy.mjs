@@ -3407,8 +3407,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
       if (op === '||' || x.cond) forget(x);
       // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
-      // leaves the branch names unknown. The names recorded, not every branch: the switch recorded its own directory's)
-      else if (x.unproven) forgetNames(false);
+      // leaves the branch names unknown. Only the directories the switch wrote, not every branch)
+      else if (x.unproven) { if (x.unproven === true) forgetNames(false); else for (const d of x.unproven) { const e = ctx.branches.get(d); if (e) e.name = null; } }
       return false;
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
@@ -3621,6 +3621,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const childCd = c.spawn === true && argv.length > 0 && DIR_CHANGERS.includes(baseName(argv[0]));
     const before = argv.length ? stateMark(ctx) : null;
     const switchesBefore = ctx.switches ?? 0;
+    const writesBefore = (ctx.budget.branchLog ??= []).length;
     const changesStateWords = argv.length > 0 && !childCd && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
@@ -3754,7 +3755,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? (ctx.budget.branchLog.length >= writesBefore ? ctx.budget.branchLog.slice(writesBefore) : true) : null, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
