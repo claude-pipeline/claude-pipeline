@@ -322,3 +322,4 @@ full record.
 - 2026-11-23 · #812 · CI usage, part 1: the shared CI-run classifier (split from #413) · risk medium · rounds 3 · arbiter 3 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 768 runs (238 high)
 - 2026-11-23 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 758 runs (239 high)
 - 2026-11-23 · #819 · cost --from-transcript warns when the transcript has no messages (#658) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 755 runs (240 high)
+- 2026-11-23 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 754 runs (240 high)
