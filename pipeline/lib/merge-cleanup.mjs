@@ -53,13 +53,20 @@ export function isCleanStatusRefusal(ran) {
 }
 
 // The fields a NOT-merged failure gets when that refusal is the whole story AND the state is proven clean: auto-merge confirmed disabled (absence of a flag is not proof), the PR state after the disable
-// was read, and the wait itself read the PR. A zero wait (every non-zero exit) that fails its one read ends as a 'timeout', not an 'error', so the proof is the outcome's `readOk` (a 'timeout' without it, or an 'error', is not proof). Then a fresh run of the merge command (every gate, hold and recovery step again) is safe; this never retries anything itself.
+// was read and is still OPEN (a PR closed meanwhile is a real reason, not a retry), and the wait itself read the PR. A zero wait (every non-zero exit) that fails its one read ends as a 'timeout', not an 'error', so the proof is the outcome's `readOk`: ONLY a 'timeout' with `readOk: true` is proof (a 'timeout' without it, an 'error', a 'blocked' or a 'closed' outcome is not: those are real reasons the merge was refused, see waitFailureNote). Then a fresh run of the merge command (every gate, hold and recovery step again) is safe; this never retries anything itself.
 export function cleanStatusRetry(ran, outcome, abandoned) {
-  if (!isCleanStatusRefusal(ran) || outcome?.state === 'error' || (outcome?.state === 'timeout' && outcome.readOk !== true) || abandoned?.autoMergeDisabled !== true || abandoned.readError) return {};
+  if (!isCleanStatusRefusal(ran) || !(outcome?.state === 'timeout' && outcome.readOk === true) || abandoned?.autoMergeDisabled !== true || abandoned.readError || abandoned.state !== 'OPEN') return {};
   return {
     retryable: 'clean-status',
     next: "GitHub refused to arm auto-merge on a PR it already sees as mergeable; run this same merge once more (a fresh run re-checks everything); the owner's approval still applies when the dry run shows the same closing lines",
   };
+}
+
+// What a zero-wait read found when the merge command failed: a 'blocked' outcome's problems or a 'closed' PR, as a sentence for the failure reason (null for any other outcome). `abandoned` is the read after auto-merge was disabled: a PR closed between the two reads (a zero-wait 'timeout' above) is named too.
+export function waitFailureNote(outcome, abandoned) {
+  if (outcome?.state === 'blocked') return `a blocker appeared while waiting: ${(outcome.problems ?? []).join('; ')}`;
+  if (outcome?.state === 'closed' || (outcome?.state === 'timeout' && !abandoned?.readError && abandoned?.state === 'CLOSED')) return 'the PR was closed without merging';
+  return null;
 }
 
 // The fields to add to a MERGED result. Exit 0 adds nothing.

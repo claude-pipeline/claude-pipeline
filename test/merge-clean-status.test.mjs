@@ -90,6 +90,29 @@ for (const [route, go] of Object.entries(ROUTES)) {
     assert.equal(r.json.next, undefined);
   });
 
+  // Failure caught (#672): a zero-wait read that SAW a blocker or a closed PR still said "run this same merge once more" and dropped the blocker's reason, so the caller spent a dry run and a merge job on a merge the gate refuses.
+  test(`${route}: the zero-wait read found a blocker or a closed PR: no retryable, and the reason says why`, (t) => {
+    const blocked = go(t, { STUB_ERR: OBSERVED }, { extra: [{ match: '^pr view 12 --json state,mergeCommit,labels', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [{ name: 'pipeline-blocked' }] } }] });
+    assertExit(blocked.r, 1);
+    assert.equal(blocked.r.json.autoMergeDisabled, true);
+    assert.equal(blocked.r.json.retryable, undefined, 'a blocked outcome is a real refusal');
+    assert.equal(blocked.r.json.next, undefined);
+    assert.match(blocked.r.json.reason, /merge command failed \(exit 1\) and the PR is not merged; a blocker appeared while waiting: .*blocking label\(s\): pipeline-blocked/);
+    const closed = go(t, { STUB_ERR: OBSERVED }, { extra: [{ match: '^pr view 12 --json state,mergeCommit,labels', stdoutJson: { state: 'CLOSED', mergeCommit: null, labels: [] } }] });
+    assertExit(closed.r, 1);
+    assert.equal(closed.r.json.retryable, undefined, 'a closed PR is not retryable');
+    assert.match(closed.r.json.reason, /and the PR is not merged; the PR was closed without merging/);
+  });
+
+  // Failure caught (R1-B2): the PR was open at the zero-wait read and closed before the read after the disable; the retry was withheld but the reason said only "the PR is not merged".
+  test(`${route}: the PR is closed when read after the disable: no retryable, and the reason names the closure`, (t) => {
+    const { r } = go(t, { STUB_ERR: OBSERVED }, { extra: [{ match: '^pr view 12 --json state,mergeCommit$', stdoutJson: { state: 'CLOSED', mergeCommit: null } }] });
+    assertExit(r, 1);
+    assert.equal(r.json.autoMergeDisabled, true);
+    assert.equal(r.json.retryable, undefined, 'a closed PR is not retryable');
+    assert.match(r.json.reason, /and the PR is not merged; the PR was closed without merging/);
+  });
+
   test(`${route}: auto-merge not proven off, or the state unreadable: no retryable (armed; unreadable; disable failed but GitHub confirms nothing is armed = retryable)`, (t) => {
     const armed = go(t, { STUB_ERR: OBSERVED }, { disableAutoCode: 1, autoMergeRequest: { enabledAt: '2026-11-17T00:00:00Z' } });
     assert.equal(armed.r.json.autoMergeDisabled, false);
@@ -142,7 +165,7 @@ test('isCleanStatusRefusal: only the two whole-line forms, at least one, nothing
 });
 
 test('cleanStatusRetry: needs the exact refusal AND a proven clean state (disarmed, no read error, the wait did not fail to read)', () => {
-  const clean = { autoMergeDisabled: true };
+  const clean = { autoMergeDisabled: true, state: 'OPEN' };
   const got = cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, clean);
   assert.equal(got.retryable, 'clean-status');
   assert.match(got.next, /run this same merge once more/);
@@ -150,7 +173,11 @@ test('cleanStatusRetry: needs the exact refusal AND a proven clean state (disarm
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: false }), {}, 'not disarmed');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: undefined }), {}, 'absence of a flag is not proof');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: true, readError: 'HTTP 502' }), {}, 'the state after the disable was not read');
+  // Catches: a PR closed between the wait's read and the post-disable read still being marked retryable.
+  assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: true }, { autoMergeDisabled: true, state: 'CLOSED' }), {}, 'closed after the wait read it open');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'error', error: 'HTTP 502' }, clean), {}, 'the wait could not read the PR');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout', readOk: false }, clean), {}, 'a zero wait whose one read failed ends as a timeout');
   assert.deepEqual(cleanStatusRetry(ran(), { state: 'timeout' }, clean), {}, 'a timeout that does not say the read worked is no proof');
+  assert.deepEqual(cleanStatusRetry(ran(), { state: 'blocked', problems: ['blocking label(s): pipeline-blocked'] }, clean), {}, 'a blocked outcome');
+  assert.deepEqual(cleanStatusRetry(ran(), { state: 'closed' }, clean), {}, 'a closed outcome');
 });

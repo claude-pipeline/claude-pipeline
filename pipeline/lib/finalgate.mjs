@@ -1363,7 +1363,7 @@ export async function abandonMerge({ gh, pr, cwd, env, disable = disableAutoMerg
   if (view?.state === 'MERGED') {
     return { autoMergeDisabled, merged: true, mergeSha: await readMergeSha({ gh, pr, first: view.mergeCommit?.oid, sleep, pollMs }) };
   }
-  return { autoMergeDisabled, merged: false, mergeSha: null, ...(readError ? { readError } : {}) };
+  return { autoMergeDisabled, merged: false, mergeSha: null, state: view?.state ?? null, ...(readError ? { readError } : {}) };
 }
 
 // Test hook: PIPELINE_MERGE_WAIT_MS / PIPELINE_MERGE_POLL_MS. The wait can only be SHORTENED (a shorter wait ends in
