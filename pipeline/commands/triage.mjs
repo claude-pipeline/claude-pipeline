@@ -436,10 +436,15 @@ async function ownerRuling(rest, ctx) {
     // again now (the item, a sensitive path or the severity config may have changed since); a typed answer or an answer on any other dialog said no such thing.
     if (decision === 'FOLLOW-UP' && answers.every((r) => r.ask?.variant === 'ruling-v2-follow-up')) {
       // R2-B1: the dialog's claim covered the WHOLE batch it was asked for, so recheck every sibling still waiting (not just this id): else this id's FOLLOW-UP is saved on a batch claim that no longer holds.
-      const batch = new Set(answers.flatMap((r) => r.ids));
-      const waiting = findRound(state, n).items.filter((i) => i.id === id || (batch.has(i.id) && i.final?.by !== 'owner' && (i.final?.needsHuman === true || isDeferrableAccept(i) || isProtectedFinal(i))));
-      const stale = recommendationRefusal({ root, config, state, items: waiting, recommend: 'follow-up' });
-      if (stale !== null) return refuse(`the owner answered on the dialog that recommended Follow-up all, which said the pipeline rates ${waiting.map((i) => i.id).join(', ')} low severity, but that no longer holds (${stale}), so the answer approves nothing; ask again on the neutral dialog: \`pipeline triage ruling-request --pr ${prNum} --ids ${waiting.map((i) => i.id).join(',')} --ask\` with no --recommend`);
+      // R3-B1/B2: each matching record is its own dialog: resolve its ids across ALL rounds (as the request and the digest do) and recheck it alone; the answer stands when one record's own batch still qualifies.
+      const checks = answers.map((r) => {
+        const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || (i.final?.by !== 'owner' && (i.final?.needsHuman === true || isDeferrableAccept(i) || isProtectedFinal(i))));
+        return { waiting, stale: recommendationRefusal({ root, config, state, items: waiting, recommend: 'follow-up' }) };
+      });
+      if (checks.every((c) => c.stale !== null)) {
+        const { waiting, stale } = checks[0];
+        return refuse(`the owner answered on the dialog that recommended Follow-up all, which said the pipeline rates ${waiting.map((i) => i.id).join(', ')} low severity, but that no longer holds (${stale}), so the answer approves nothing; ask again on the neutral dialog: \`pipeline triage ruling-request --pr ${prNum} --ids ${waiting.map((i) => i.id).join(',')} --ask\` with no --recommend`);
+      }
     }
     seedBaseline({ ctx, root, pr: prNum, state }); // the `comment --kind triage` that publishes this ruling needs the baseline too
     const ruled = applyOwnerRuling(item, { decision, reason, ownerQuote, ruledAt: new Date().toISOString() });

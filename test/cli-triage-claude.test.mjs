@@ -1227,6 +1227,36 @@ test('owner-ruling: a click on "Follow-up all (Recommended)" is checked again ag
   assertExit(driftDenied, 1, driftDenied.stdout);
   assert.match(driftDenied.json.reason, /no longer holds.*R1-S2 is already implemented.*ask again on the neutral dialog.*--ids R1-S1,R1-S2 --ask/);
   assert.equal(drift.stateText(), beforeDrift);
+  // R3-B1: the batch's sibling is in ANOTHER round (the request and the digest resolve ids across rounds); implemented after the ask -> the first id is refused too, naming it, state untouched
+  const moveToRound2 = (w) => w.edit((st) => {
+    const [moved] = st.rounds[0].items.splice(1, 1);
+    moved.id = 'R2-S1';
+    st.rounds.push({ ...structuredClone(st.rounds[0]), n: 2, items: [moved] });
+  });
+  const across = mk([], [second()]);
+  moveToRound2(across);
+  const applyAcross = typedFor(t, across, ['R1-S1', 'R2-S1'], 'R1-S1: follow-up, R2-S1: follow-up', FU);
+  across.edit((st) => { st.rounds[1].items[0].implemented = true; });
+  const beforeAcross = across.stateText();
+  const acrossDenied = applyAcross('R1-S1', 'FOLLOW-UP');
+  assertExit(acrossDenied, 1, acrossDenied.stdout);
+  assert.match(acrossDenied.json.reason, /no longer holds.*R2-S1 is already implemented.*--ids R1-S1,R2-S1 --ask/);
+  assert.equal(across.stateText(), beforeAcross);
+  // R3-B2: an "Other" answer on the two-id dialog ("R1-S1: follow-up") and a later single-id click with the same quote both match R1-S1. allow: the single-id dialog's own batch still qualifies, so the older record's sibling (implemented since) does not refuse it
+  const twoRecords = mk([], [second()]);
+  typedFor(t, twoRecords, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up', FU);
+  twoRecords.edit((st) => { st.rounds[0].items.find((i) => i.id === 'R1-S2').implemented = true; });
+  const applyOwn = typedFor(t, twoRecords, ['R1-S1'], 'R1-S1: follow-up', FU);
+  const ownOk = applyOwn('R1-S1', 'FOLLOW-UP');
+  assertExit(ownOk, 0, ownOk.stdout + ownOk.stderr);
+  assert.equal(twoRecords.item('R1-S1').final.decision, 'FOLLOW-UP');
+  // deny: when no record's own batch qualifies (the lone id's dialog is stale too), it is still refused
+  const noneOk = mk([finding()], [second()]);
+  typedFor(t, noneOk, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up', FU);
+  const applyNone = typedFor(t, noneOk, ['R1-S1'], 'R1-S1: follow-up', FU);
+  const noneDenied = applyNone('R1-S1', 'FOLLOW-UP');
+  assertExit(noneDenied, 1, noneDenied.stdout);
+  assert.match(noneDenied.json.reason, /no longer holds/);
   // the same finding ruled by a typed answer, a click on the neutral dialog, or an ACCEPT click on the recommended one needs no recheck
   for (const [what, variant, decision] of [['typed', undefined, 'FOLLOW-UP'], ['neutral click', 'ruling-v1', 'FOLLOW-UP'], ['accept click on the recommended dialog', 'ruling-v2-follow-up', 'ACCEPT']]) {
     const w = mk([finding()]);
