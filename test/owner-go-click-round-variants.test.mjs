@@ -588,3 +588,27 @@ test('#613 a standalone refusal still answers when its ask file became unreadabl
   assert.deepEqual([s.state, s.askId], ['unverified', w.askId], 'an unreadable ask with a refusal on record');
   assert.equal(readState(w, { now: () => w.answeredAt + 24 * 3600 * 1000 + CAPTURE_SKEW_MS + 60000 }).state, 'none', 'outside the window it no longer matters');
 });
+
+// ---- 9 the ruling dialog's variants (cp #771) ------------------------------------------------------------------------------------------------------
+// Literals captured at origin/main 4bcf5647, BEFORE any ruling-variant code existed: the legacy pins compare against these, never against output of the refactored builders.
+const RULING_IDS = ['R1-B1', 'R1-B2'];
+const RULING_LINE = rulingRequest(58, RULING_IDS, REPO, 'c0ffee000000');
+const RULING_ASK_ID = 'ask-000000000000';
+const LEGACY_RULING_DIALOG_SHA256 = 'e9eaa8e744f7702276a2ce6ceb38b0676380b023fc7b922d1da64734a89bfcd6'; // canonical dialog with the fixed ask id above
+const LEGACY_RULING_ASK_FILE = '{"v":1,"askId":"ask-000000000000","kind":"ruling","repo":"acme/app","prs":[58],"dialog":{"question":"Your ruling on #58? (ask-000000000000)\\n\\nR1-B1 is waiting for your decision.\\n⚖️ Owner ruling needed #58: R1-B1, R1-B2 · content c0ffee000000 · repo acme/app","header":"Ruling","multiSelect":false,"options":[{"label":"Not now","description":"Rule on nothing now. Nothing is recorded."},{"label":"Accept all","description":"Accept every item asked (R1-B1, R1-B2)."},{"label":"Follow-up all","description":"Move every item asked (R1-B1, R1-B2) to a follow-up."},{"label":"Reject all","description":"Reject every item asked (R1-B1, R1-B2)."}]},"dialogSha256":"e9eaa8e744f7702276a2ce6ceb38b0676380b023fc7b922d1da64734a89bfcd6","actions":{"Not now":null,"Accept all":"R1-B1: accept, R1-B2: accept","Follow-up all":"R1-B1: follow-up, R1-B2: follow-up","Reject all":"R1-B1: reject, R1-B2: reject"},"issuedAt":"2023-11-14T22:13:20.000Z","hookLayersSha256":null}\n';
+const rulingParts = (variant) => rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line: RULING_LINE, variant });
+
+test('the legacy ruling dialog is byte-identical to the one shipped before the variants: its canonical dialog hash and the ask file issueAsk writes match literals captured at 4bcf5647', () => {
+  // failure caught: a refactor that drifts a legacy ruling label, description, action or ask-file key (every ruling ask issued before the upgrade would then fail to verify, or a click would map to another ruling)
+  const p = rulingParts(undefined);
+  assert.equal(dialogSha256({ question: `${p.title} (${RULING_ASK_ID})\n\n${p.block}`, header: p.header, options: p.options }), LEGACY_RULING_DIALOG_SHA256);
+  const home = tmpHome();
+  const r = issueAsk({ ...p, home, now: () => 1700000000000 });
+  assert.ok(r.askId, JSON.stringify(r));
+  const raw = readFileSync(join(asksDir(home), `${r.askId}.json`), 'utf8');
+  const file = JSON.parse(raw);
+  assert.equal(file.dialogSha256, dialogSha256(file.dialog), 'the file hash covers its own dialog');
+  // the ask id and the hash that covers it are random per ask: normalise both, everything else is literal
+  const normal = raw.split(r.askId).join(RULING_ASK_ID).replace(file.dialogSha256, LEGACY_RULING_DIALOG_SHA256);
+  assert.equal(normal, LEGACY_RULING_ASK_FILE);
+});
