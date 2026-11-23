@@ -284,7 +284,7 @@ book tokens / USD / retries of one agent call in the run record (shown by `P sum
 pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|verifier|controller|other
               [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]
   -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable
-  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped; a transcript with no messages is still booked, with a warning that the booking may be low);
+  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped);
   explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.
   --round R: the review round the call served (judge or arbiter of round R, and the implementer that fixes round R's accepts); the entry is also added to cost.byRound[R],
   which the extra-round ask uses to name what the last round cost. Build-phase calls pass none.
@@ -294,6 +294,8 @@ pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implem
 ```
 
 Exit: 0 booked · 1 the run record could not be written (`warnings` says why) · 2 usage · 3 GitHub (`gh`) unavailable.
+
+A --from-transcript file that holds no messages (empty, or not flushed yet) is still booked, but `warnings` says the transcript held no messages and the booking may be low: run the booking again later.
 
 Cost attribution (issue #57): the run record gets a `cost` section {total, byPhase, byRole, retries, guardBlocks, sessions}, each of total / phase / role holding {input, output, cacheRead, cacheWrite, usd, calls}. Phases are the record steps; roles are implementer, judge, arbiter, verifier, controller and other (an unknown phase or role is booked as `other`). Records written before this have no `cost` section and everything that reads it treats that as "nothing booked". `P summary` shows the totals and both breakdowns in the status block and as `cost` in its JSON. `--session ID` (on `cost` or `summary`) names a Claude session of the run; `summary` counts the guard denies of those sessions in `<home>/.claude/pipeline-state/guard-log.jsonl` (override with `PIPELINE_GUARD_LOG_FILE`) into `guardBlocks` and keeps each session's own count in `guardBySession` ({sessionId: denies}, at most 20 sessions, `null` while the count is unknown; shown as `(s1 2 · s2 0)` after the status-line count). A missing log leaves the count unknown (shown as a dash), unreadable lines are skipped and reported in `warnings`. The numbers are display only: no command decides anything from them. The amounts are what the caller books (`--from-transcript` sums a transcript's own usage counts; the USD figure is whatever `--usd` says).
 
