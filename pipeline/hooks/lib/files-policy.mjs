@@ -3754,14 +3754,15 @@ function collectVars(cmds, ctx) {
       }
     }
   }
-  // (#529: a name a `&>` span assigns holds the assigned value for the commands INSIDE the span in every shell; after it dash may have run the assignment in a child: the value is only known at run time wherever a later command reads it)
+  // (#529: a name a `&>` span assigns holds the assigned value for the commands INSIDE the span in every shell; after it dash may have run the assignment in a child: the value is only known at run time wherever a later command reads it: from the first command past the span end, R1-B5)
+  const spanFrom = new Map(); // name -> index of the first command past the span (ctx.spanUnknown: made unknown there, see evaluateBashForFilesFrame)
   for (const [i, c] of cmds.entries()) {
     if (c.maybeBgEnds === undefined) continue;
     const end = Math.min(...c.maybeBgEnds);
     const names = [...Object.keys(c.env ?? {}), ...(['export', 'declare', 'typeset', 'local', 'readonly', 'integer', 'float'].includes(baseOf(c.argv[0] ?? '')) ? declAttrs(c.argv).assigns.map(([k]) => k) : [])];
     for (const k of names) {
       const reads = new RegExp(`\\$\\{?${k.replace(/\W/g, '')}(?![A-Za-z0-9_])`);
-      if (cmds.slice(Math.max(end, i) + 1).some((x) => [...x.argv, ...Object.values(x.env ?? {}), ...(x.redirects ?? []).map((r) => r.target ?? '')].some((w) => reads.test(String(w))))) unknown.add(k);
+      if (cmds.slice(Math.max(end, i) + 1).some((x) => [...x.argv, ...Object.values(x.env ?? {}), ...(x.redirects ?? []).map((r) => r.target ?? '')].some((w) => reads.test(String(w))))) spanFrom.set(k, Math.min(spanFrom.get(k) ?? Infinity, Math.max(end, i) + 1));
     }
   }
   // Why (#74): zsh reads `$B:r` / `$B[1,6]` (an unbraced name and a modifier or subscript) as another word than the one substVars gives (`B=settings.json.x; cp x ~/.claude/$B:r`
@@ -3788,10 +3789,11 @@ function collectVars(cmds, ctx) {
   if (ctx.arith?.dynamic) for (const k of [...given.keys(), ...Object.keys(ctx.inheritedVars ?? {})]) unknown.add(k);
   for (let changed = true; changed;) {
     changed = false;
-    for (const [k, g] of given) if (!unknown.has(k) && [...g.v.matchAll(/\$\{?(\w+)/g)].some((m) => unknown.has(m[1]))) { unknown.add(k); changed = true; }
+    for (const [k, g] of given) if (!unknown.has(k) && [...g.v.matchAll(/\$\{?(\w+)/g)].some((m) => unknown.has(m[1]) || spanFrom.has(m[1]))) { unknown.add(k); changed = true; }
   }
   ctx.keptVars = kept;
   ctx.unknownVars = unknown;
+  ctx.spanUnknown = spanFrom;
   ctx.declared = { transform: attrs, unknown: new Set(unknown) }; // (attributes stay with the name: a later plain assignment does not clear them)
   return vars;
 }
@@ -5449,10 +5451,12 @@ function evaluateBashForFilesFrame(command, opts) {
   };
   const cwdsNow = () => (unknownCwd() ? unique([...cwdDirs, ...assumedCwds(ctx)]) : cwdDirs); // (where the shell itself can be: a package manager starts there, not in a git -C directory)
   const sdirsNow = () => (unknownCwd() ? unique([...dirs, ...assumedCwds(ctx)]) : dirs); // (a sourced file may make the directory unknown part-way through the line)
+  const spanAdded = new Set();
   if ((opts._depth ?? 0) < 4) {
     for (const [idx, c] of cmds.entries()) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
       frame.i = idx;
+      for (const [k, from] of ctx.spanUnknown ?? []) if (from === idx && !ctx.unknownVars.has(k)) { ctx.unknownVars.add(k); spanAdded.add(k); } // (R1-B5: a name a `&>` span assigned is unknown from the first command past the span; the per-command snapshots carry it, the end state does not)
       if (ctx.srcChanged.size || ctx.unknownVars.size) snaps[idx] = { changed: new Set(ctx.srcChanged), unknownV: new Set(ctx.unknownVars) }; // (what is true when this command runs: a later plain assignment must not clean it)
       opts._fsChanged = ctx.parentFsChanged || mayChangeListing(cmds, idx, ctx); // (a script or -c text this command runs sees the listing after the earlier commands)
       if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && c.maybeBg !== true && !inFlow(flowStart(cmds), idx)) { // (#529: a span assignment may have run in a child: it clears nothing)
@@ -5649,6 +5653,7 @@ function evaluateBashForFilesFrame(command, opts) {
     }
   }
 
+  for (const k of spanAdded) ctx.unknownVars.delete(k); // (R1-B5: the writer check below reads the end state, which must not reach the commands inside the span: the snapshots hold it for the ones past the span)
   // a path built from a name whose value is only known at run time (typeset -L4 D=...) may be anywhere: a writer or a redirection that uses it is refused
   if (ctx.unknownVars.size || snaps.some((x) => x?.unknownV.size)) {
     for (const [ci, c] of cmds.entries()) {
