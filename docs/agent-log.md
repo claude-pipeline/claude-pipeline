@@ -306,3 +306,4 @@ full record.
 - 2026-11-23 · #688 · Live-database guard, part 2: supabase CLI / Management API rule (#262) · risk high · rounds 9 · arbiter 9 (fix-verify 5) · blocked · Codex 7d: 584 runs (161 high)
 - 2026-11-23 · #749 · Guard: fewer false refusals of quoted text, xargs-in-quotes gap closed, registry writer protected (#683 #610 #624 #617 #618 #620 #609 #605 #600) · risk high · rounds 5 · arbiter 5 · merged · Codex 7d: 592 runs (163 high)
 - 2026-11-23 · #688 · Live-database guard, part 2: supabase CLI / Management API rule (#262) · risk high · rounds 10 · arbiter 10 (fix-verify 5) · substitute 1 · awaiting-owner-merge · Codex 7d: 595 runs (165 high)
+- 2026-11-23 · #763 · Guard: deadline counts CPU time, hard wall cap stays fail-closed (#627) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 598 runs (167 high)
