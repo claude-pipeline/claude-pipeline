@@ -21,7 +21,7 @@ import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmM
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
 // (what proves the shell left on a `|| exit`: shell-parse's plainExit, which also refuses a wrapped / spawned exit)
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -331,10 +331,12 @@ function memoLookup(ctx, key, fn) {
   return e.v;
 }
 
+const leftOf = (ctx) => () => wallLeftMs(ctx.budget); // (what the wall cap has left, asked again by each lookup it bounds)
 function branchOf(dir, gitDir, ctx) {
   if (dir === null) return null;
   let b;
-  try { b = memoLookup(ctx, ['branch', dir, gitDir ?? null], () => ctx.currentBranch(dir, { gitDir })); } catch { return null; }
+  checkDeadline(ctx.budget); // (a lookup is a child process the deadline cannot interrupt: none starts past the cap, and it is bounded by what is left of it)
+  try { b = memoLookup(ctx, ['branch', dir, gitDir ?? null], () => ctx.currentBranch(dir, { gitDir, leftMs: leftOf(ctx) })); } catch { return null; }
   if (typeof b !== 'string') return null;
   b = b.trim().replace(/^refs\/heads\//, '');
   return b === '' || b === 'HEAD' ? null : b;
@@ -369,7 +371,8 @@ function effectiveBranch(dir, gitDir, ctx) {
 function pushDestOf(dir, gitDir, ctx, branch) {
   if (dir === null) return null;
   let d;
-  try { d = memoLookup(ctx, ['push', dir, gitDir ?? null, branch ?? null], () => ctx.pushDestination(dir, branch === undefined ? { gitDir } : { gitDir, branch })); } catch { return null; }
+  checkDeadline(ctx.budget);
+  try { d = memoLookup(ctx, ['push', dir, gitDir ?? null, branch ?? null], () => ctx.pushDestination(dir, branch === undefined ? { gitDir, leftMs: leftOf(ctx) } : { gitDir, branch, leftMs: leftOf(ctx) })); } catch { return null; }
   return typeof d === 'string' && d.trim() ? d.trim() : null;
 }
 
@@ -799,10 +802,11 @@ const repoArgsOf = (flags, env, ctx) => {
 function checkIssueHold(num, repoArgs, dir, ctx, action) {
   if (DYNAMIC.test(num)) return deny(`the issue number "${num}" is built at run time, so whether it carries pipeline-pause or pipeline-rollback cannot be verified. Name the issue number.`);
   let labels;
+  checkDeadline(ctx.budget);
   try {
     // no -R / GH_REPO: the repository is the directory's — unknown after a cd that may not have run
     if (dir === null && !(repoArgs && repoArgs.length)) throw new Error('cannot tell which directory (so which repository) this runs in; name it with -R owner/repo');
-    labels = ctx.issueLabels(num, repoArgs, dir ?? ctx.cwd);
+    labels = ctx.issueLabels(num, repoArgs, dir ?? ctx.cwd, { leftMs: leftOf(ctx) });
     if (!Array.isArray(labels)) throw new Error('unexpected lookup result');
   } catch (err) {
     return deny(`could not verify issue labels for ${num} (${err?.message ?? err}); refusing to ${action} it without knowing whether it carries pipeline-pause or pipeline-rollback.`);
@@ -1014,9 +1018,11 @@ function checkApi(rest, env, dir, ctx) {
 function ownerGoMode(dir, ctx) {
   if (!ctx?.ownerGo) return 'none';
   if (dir === null) return 'chat'; // (which repository is unknown)
+  checkDeadline(ctx.budget);
   try {
-    return ctx.ownerGo.mode(dir);
-  } catch {
+    return ctx.ownerGo.mode(dir, { leftMs: leftOf(ctx) });
+  } catch (err) {
+    if (err instanceof GuardLimit) throw err; // (a lookup that ran out of time: the evaluation is refused)
     return 'chat'; // (a pipeline.yml that cannot be read)
   }
 }
@@ -1088,7 +1094,8 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
   let repo = named;
   if (repo === undefined) {
-    try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir) ?? null; } catch { repo = null; }
+    checkDeadline(ctx.budget);
+    try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir, { leftMs: leftOf(ctx) }) ?? null; } catch { repo = null; }
   }
   if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set, or the line moves gh's config directory: GH_CONFIG_DIR, XDG_CONFIG_HOME, APPDATA, HOME, or its git: GIT_DIR, GIT_CONFIG_*; or changes the remotes or gh's default repository), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
   let ok = false;
@@ -1130,9 +1137,11 @@ function repoMergeCommandVerdict(argv, dir, ctx, cmdEnv = {}) {
   if (!ctx?.ownerGo) return null;
   // (an unknown directory is judged by the session's own; a pipeline.yml that cannot be read leaves `npm run merge` as the guess, as the mode of an unreadable one is chat)
   let templates = [];
+  checkDeadline(ctx.budget);
   try {
-    templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd) ?? [];
-  } catch {
+    templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd, { leftMs: leftOf(ctx) }) ?? [];
+  } catch (err) {
+    if (err instanceof GuardLimit) throw err; // (no time left, or a read cut off by its timeout: the repo's own merge command is unknown, so the evaluation is refused, not guessed)
     templates = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: null }];
   }
   const raw = argv.map((a) => expandVars(a, ctx));
@@ -3306,7 +3315,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
 function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
-  const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => budgetExpired(ctx.budget) }); // a scan that outlasts the deadline gives up: truncated, so denied
   // #452: the group form `cd d || { echo "no d" >&2; exit 1; }; git push`, read by shell-parse's exitFollows, the files guard's rule (a group entered by ||, its last command a plain exit, no redirection on its closer)
   let shapeTop; // (the commands of the text's own level and their shape events, built when first asked)
   // #478 R1-B1: the index in cmds of the group's last command, its `exit` (-1: not this form). The commands after i up to it run only when the cd / checkout FAILED.
@@ -3781,7 +3790,9 @@ function evaluateGitOnce(command, {
   lexists = pathExists === existsSync ? defaultLexists : () => false, // (a caller that fakes pathExists gets no real-disk lstat)
   readDir = defaultReadDir,
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
-  now = Date.now, // injectable clock (tests)
+  now = Date.now, // injectable wall clock (tests)
+  cpu, // injectable CPU clock (tests); with only `now` injected it is the same clock
+  wall0, // the `now` time the hard wall cap counts from (the hooks pass HOOK_CLOCK: process start); undefined: the start of this evaluation
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
   nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration (<nodePrefix>/etc/npmrc); undefined: from process.execPath, null: none (tests)
   ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), repoOf(dir), approvedHead(pr, head, repo) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
@@ -3790,7 +3801,7 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), branchesUnknown: false, cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
