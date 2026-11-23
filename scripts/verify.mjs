@@ -110,7 +110,10 @@ export function testCounts(text) {
       if (summary[1] === 'fail') block.sawFail = true;
       block[{ pass: 'passed', fail: 'failed', cancelled: 'failed' }[summary[1]] ?? 'skipped'] += Number(summary[2]);
     }
-    if (summary) continue;
+    if (summary) {
+      afterFiles = false;
+      continue;
+    }
     if (line.trim() === '') continue;
     const vitest = afterFiles && /^\s*Tests\s+(\d+ (?:passed|failed|skipped|todo)(?: \| \d+ (?:passed|failed|skipped|todo))*|no tests)(?:\s+\(\d+\))?\s*$/.exec(line);
     if (vitest) {

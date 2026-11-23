@@ -795,9 +795,14 @@ test('a vitest Tests row counts only right after its Test Files row; "no tests" 
     { name: 'stray', cmd: say(['      Tests  3 passed (3)', ' Test Files  1 passed (1)', '      Tests  1 passed (1)']), quick: false },
     { name: 'only-stray', cmd: say(['      Tests  3 passed (3)']), quick: false },
     { name: 'none', cmd: say([' Test Files  no test files', '      Tests  no tests']), quick: false },
+    // Catches: a node:test summary line between the two rows leaving the Test Files header active (mixed runner output).
+    { name: 'interrupted', cmd: say([' Test Files  1 passed (1)', '# pass 1', '      Tests  3 passed (3)']), quick: false },
+    { name: 'blank-between', cmd: say([' Test Files  1 passed (1)', '', '      Tests  3 passed (3)']), quick: false },
   ]);
   const rep = reportOf(repo);
   assert.deepEqual(rep.steps[0].counts, { passed: 1, failed: 0, skipped: 0 });
   assert.equal('counts' in rep.steps[1], false);
   assert.deepEqual(rep.steps[2].counts, { passed: 0, failed: 0, skipped: 0 });
+  assert.equal('counts' in rep.steps[3], false, 'a node:test line between the rows ends the vitest header');
+  assert.deepEqual(rep.steps[4].counts, { passed: 3, failed: 0, skipped: 0 }, 'a blank line between the rows keeps the header');
 });
