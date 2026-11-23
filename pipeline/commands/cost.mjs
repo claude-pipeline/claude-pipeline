@@ -133,7 +133,7 @@ export const run = guarded(async (argv, ctx) => {
     if (emptyTranscript) {
       notes.push('the transcript held no messages (it may not be flushed yet): the booking may be low');
       notes.push(ok
-        ? `later book the rest by running again with the same --phase, --role and --round and only --from-transcript: leave out --retry and hand token amounts (already booked, they would count twice)${values.usd !== undefined ? ', and pass --usd 0 (the --usd amount is already booked)' : ''}`
+        ? `later book the rest by running again with the same --phase, --role and --round${values.model ? ', the same --model' : ''} and only --from-transcript: leave out --retry and hand token amounts (already booked, they would count twice)${values.usd !== undefined ? ', and pass --usd 0 (the --usd amount is already booked)' : ''}`
         : 'the booking was not recorded: once the transcript is flushed, run the whole command again');
     }
     return {
