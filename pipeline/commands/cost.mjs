@@ -81,7 +81,7 @@ export const run = guarded(async (argv, ctx) => {
   const patch = { cost: {} };
   const notes = [];
   // A file that appears before its lines are flushed reads as empty or partial: still booked, but the caller is told it may be low.
-  if (values['from-transcript'] && fromFile.messages === 0) notes.push('the transcript held no messages (it may not be flushed yet): the booking may be low; run this again later to book the rest');
+  if (values['from-transcript'] && fromFile.messages === 0) notes.push('the transcript held no messages (it may not be flushed yet): the booking may be low; later book the rest by running only --from-transcript again (no --retry, --usd or hand amounts: those are already booked and would count twice)');
   let bucketed = false;
   if (spent) {
     const own = { input: num('input'), output: num('output'), cacheRead: num('cache-read'), cacheWrite: num('cache-write') };

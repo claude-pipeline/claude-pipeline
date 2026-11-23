@@ -245,10 +245,23 @@ test('P cost --from-transcript: a transcript with no messages is still booked bu
   const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl']);
   assertExit(r, 0);
   assert.equal(r.json.recorded, true);
-  assert.match(r.json.warnings.join('\n'), /held no messages.*may be low.*again later/);
+  assert.match(r.json.warnings.join('\n'), /held no messages.*may be low.*only --from-transcript again/);
   s.repo.write('.review/full.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { output_tokens: 3 } } })}\n`);
   const ok = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/full.jsonl']);
   assert.doesNotMatch(ok.json.warnings.join('\n'), /no messages/);
+});
+
+// Failure caught: following the empty-transcript warning by repeating the whole command (with --retry and hand amounts) booked the retry and the hand tokens twice.
+test('P cost --from-transcript: an empty-transcript booking with --retry and hand amounts, then the transcript alone once flushed, counts each only once', () => {
+  const s = scenario();
+  s.repo.write('.review/late.jsonl', '');
+  const first = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/late.jsonl', '--output', '5', '--retry']);
+  assertExit(first, 0);
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/late.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/late.jsonl']);
+  assertExit(second, 0);
+  assert.deepEqual([second.json.cost.total.input, second.json.cost.total.output, second.json.cost.retries], [10, 25, 1]);
 });
 
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
