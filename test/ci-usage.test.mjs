@@ -395,3 +395,14 @@ test('PR #823 round 2 B5: a failed viewer lookup makes the total wasted redrafts
   const [repo] = r.json.repos;
   assert.deepEqual([repo.prs.length, repo.totals.wastedRedrafts], [0, null]);
 });
+
+test('PR #823 round 4 B1: a PR created in the same second as the oldest run kept from a capped list gets no commit-date proof waived: its later head is unchecked, not a push while ready', () => {
+  // failure caught: a run sharing the cutoff second may lie beyond the cut, so the PR's opening run was not read and its head (here at 10:30, > 120 s after creation) was reported as a missed redraft
+  const capped = { match: '^api repos/acme/widgets/actions/runs\\?created', stdoutJson: { total_count: 1200, workflow_runs: RUNS } }; // oldest run kept: 1006 at 08:00
+  const createdAtCutoff = { match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { ...PR7, created_at: T('08:00') } };
+  const undated = COMMITS7.map((c) => (c.sha === sha('3') ? { ...c, commit: { message: 'work' } } : c));
+  const r = usage(world({ extra: [capped, createdAtCutoff, { match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: undated }] }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const p = r.json.repos[0].prs.find((x) => x.pr === 7);
+  assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
+});

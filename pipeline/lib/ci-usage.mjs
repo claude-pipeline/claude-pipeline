@@ -326,9 +326,10 @@ export function analysePrUsage({ number, pr, timeline, commits = [], runs, evide
   const pushes = headPushes({ pr, timeline, commits, runs: evidenceRuns }).filter((h) => keptHeads.has(h.sha));
   const ambiguous = new Set(ambiguousHeads);
   const readyPushes = pushes.filter((h) => h.kind === 'push' && h.phase === 'ready');
-  // a PR created at or after the evidence start has no run before it: no commit-date proof is needed (pr.createdAt is GitHub's clock, so no skew either)
+  // a PR created after the evidence start has no run before it: no commit-date proof is needed (pr.createdAt is GitHub's clock, so no skew either)
+  // strictly after: when the run list was cut, runs of the start second itself may lie beyond the cut
   const createdMs = ms(pr?.createdAt);
-  const proofFromMs = createdMs !== null && evidenceFromMs !== null && createdMs >= evidenceFromMs ? null : evidenceFromMs;
+  const proofFromMs = createdMs !== null && evidenceFromMs !== null && createdMs > evidenceFromMs ? null : evidenceFromMs;
   const pushedReady = readyPushes.filter((h) => !ambiguous.has(h.sha) && headProvable(h.sha, commits, proofFromMs));
   const jobMinutes = zeroMinutes();
   let usd = 0;
