@@ -238,6 +238,23 @@ test('P cost --from-transcript: the transcript usage is booked, explicit amounts
   assertExit(costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/missing.jsonl']), 2);
 });
 
+// A transcript read while still empty (size 0, no usage lines, or only a half-written line) booked zeros with ok:true and no warning, so nobody noticed the call went unbooked.
+test('P cost --from-transcript: a transcript with no messages with usage warns (with or without --usd); a normal one does not', () => {
+  const warns = (content, extra = []) => {
+    const s = scenario();
+    s.repo.write('.review/t.jsonl', content);
+    const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl', ...extra]);
+    assertExit(r, 0);
+    assert.equal(r.json.ok, true);
+    return r.json.warnings.filter((w) => /no messages with usage found/.test(w));
+  };
+  assert.equal(warns('').length, 1, 'empty file');
+  assert.equal(warns('{"message":{"id":"m","usage":{"input_tok').length, 1, 'only a half-written line');
+  assert.equal(warns(`${JSON.stringify({ type: 'user', message: { content: 'hi' } })}\n`).length, 1, 'lines without usage');
+  assert.equal(warns('', ['--usd', '1']).length, 1, 'still warns with --usd');
+  assert.deepEqual(warns(`${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 1, output_tokens: 1 } } })}\n`), [], 'a normal transcript');
+});
+
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
 test('P cost --from-transcript: booking a continued agent\'s transcript again books only the new usage (total = the whole transcript once)', () => {
   const s = scenario();
