@@ -15,7 +15,7 @@ import { createCommentsGh, createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } f
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { SUPPORTED_STATE_VERSION, decodeFromComment } from '../pipeline/lib/state.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
-import { reviewEligibilityProblems, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
+import { RULING_WHY, reviewEligibilityProblems, rulingRecommendationRefusal, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
 import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
@@ -1129,6 +1129,54 @@ test('owner-ruling: a typed REJECT or ACCEPT of an arbiter ACCEPT is refused (th
   assertExit(c, 1, c.stdout);
   assert.equal(w.stateText(), before);
   assertExit(typed('R1-S1', 'FOLLOW-UP'), 0); // control: the typed one still works
+});
+
+// cp #771: may the ruling dialog SHOW "Claude recommends <decision> all"? Pure rules; each refusal is a recommendation the click could not record, or one nudging the owner to dismiss what the pipeline treats as critical.
+const recItem = (id, over = {}) => ({
+  id, round: 1, bucket: 'SUGGESTION', category: 'docs', title: `t ${id}`, file: 'src/plain.js', line: 3, detail: 'd', codexReasoning: 'c', testable: false, fingerprint: `fp-${id}`,
+  judge: null, test: { status: 'none', evidence: '' }, arbiter: null, implemented: false, followupIssue: null,
+  final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence' }, ...over,
+});
+const settledAccept = (id, over = {}) => recItem(id, { category: 'maintainability', final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'worth fixing' }, ...over });
+const recCtx = (items, over = {}) => ({
+  state: { pr: 7, rounds: [{ n: 1, items }] }, config: { risk: { high_risk_paths: ['src/payroll/**'] }, review: { arbiter_always_paths: [] } },
+  files: [{ oldPath: 'src/plain.js', newPath: 'src/plain.js', path: 'src/plain.js' }, { oldPath: 'src/payroll/pay.js', newPath: 'src/payroll/pay.js', path: 'src/payroll/pay.js' }], baseConfig: null, ...over,
+});
+const refusal = (items, decision, over = {}) => rulingRecommendationRefusal(items, decision, recCtx(items, over));
+
+test('rulingRecommendationRefusal: the recommendation is refused for what the click could not record or what the pipeline treats as a critical dismissal', () => {
+  // failure caught (each): Accept all recommended while the owner-ruling command would refuse it (#559); Follow-up recommended for a finding a second review would be owed
+  const waits = recItem('R1-S1');
+  const deferrable = settledAccept('R1-S2');
+  assert.match(refusal([waits, deferrable], 'ACCEPT'), /R1-S2 does not need a human decision.*may only be deferred/, 'accept with one open deferrable ACCEPT in a mixed batch (second id only)');
+  assert.match(refusal([settledAccept('R1-S3', { implemented: true })], 'FOLLOW-UP'), /already implemented|does not need a human decision/, 'an item that needs no human decision');
+  const risky = [
+    ['a non-blocking data-loss low-confidence item', recItem('R1-S4', { category: 'data-loss' }), /not low severity/],
+    ['a BLOCKING low-confidence item', recItem('R1-B1', { bucket: 'BLOCKING', category: 'docs' }), /BLOCKING/],
+    ['a security-dismissal item', recItem('R1-S5', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'security-dismissal', reason: 'would dismiss a blocking security/data item' } }), /other than low confidence/],
+    ['a non-security model-proof item', recItem('R1-S6', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed' } }), /other than low confidence/],
+    ['an unknown-cause item', recItem('R1-S7', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, reason: 'something else' } }), /other than low confidence/],
+    ['a deferrable bug ACCEPT SUGGESTION', settledAccept('R1-S8', { category: 'bug' }), /not low severity/],
+    ['a deferrable maintainability ACCEPT on a sensitive path', settledAccept('R1-S9', { file: 'src/payroll/pay.js' }), /sensitive path/],
+  ];
+  for (const [what, item, re] of risky) assert.match(refusal([item], 'FOLLOW-UP'), re, `follow-up on ${what}`);
+  assert.match(refusal([recItem('R1-S10')], 'FOLLOW-UP', { files: null }), /reviewed diff is not known/, 'follow-up with an unknown diff');
+  assert.match(refusal([recItem('R1-S12')], 'REJECT'), /critical dismissal/, 'REJECT is never recommended');
+  assert.match(refusal([], 'ACCEPT'), /no item/);
+  // one bad item among good ones refuses the whole batch
+  assert.match(refusal([recItem('R1-S13'), recItem('R1-S14', { category: 'security' })], 'FOLLOW-UP'), /R1-S14/);
+  // a malfunction cause may still be ACCEPTED (accept is never a dismissal)
+  assert.equal(refusal([recItem('R1-S15', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed' } })], 'ACCEPT'), null);
+});
+
+test('rulingRecommendationRefusal: accept on needs-human items, and follow-up on a low-severity open deferrable ACCEPT or a low-confidence docs item, are allowed', () => {
+  // failure caught: a refusal so wide that the recommended dialog is never shown, so the owner is never told which button the controller's research favours
+  assert.equal(refusal([recItem('R1-S1'), recItem('R1-B2', { bucket: 'BLOCKING', category: 'security' })], 'ACCEPT'), null, 'accept on two needs-human items, one of them BLOCKING security');
+  assert.equal(refusal([settledAccept('R1-S3')], 'FOLLOW-UP'), null, 'a settled arbiter ACCEPT with no cause, maintainability, plain file');
+  assert.equal(refusal([recItem('R1-S4')], 'FOLLOW-UP'), null, 'a low-confidence docs item');
+  assert.equal(refusal([recItem('R1-S5'), settledAccept('R1-S6')], 'FOLLOW-UP'), null, 'both kinds in one batch');
+  assert.deepEqual(Object.keys(RULING_WHY), ['accept', 'follow-up']);
+  assert.deepEqual(Object.keys(RULING_WHY['follow-up']), ['minor-later'], 'no reject code, and no code claims more than rule 3 proves');
 });
 
 test('F1: an answer recorded while the item waited for a human cannot defer it after it became an ACCEPT; a multi-id request still applies its second id', (t) => {

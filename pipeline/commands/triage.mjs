@@ -30,7 +30,7 @@ import { clickNotes, followUpClickState, roundAsk, rulingAsk } from '../hooks/li
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRuled, ownerRulingGap, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, ownerRulingRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
@@ -381,21 +381,6 @@ function lightLaneLocked(n, root) {
 
 // What the owner said is recorded as said (trimmed only), with a cap so a pasted wall of text cannot bloat the published state.
 const OWNER_TEXT_MAX = 1000;
-
-// Why this ruling may not be recorded, or null. The command exists for ONE case: the owner confirmed in chat what to do with
-// an item that is waiting for a human. It is not a way to reopen an item somebody already settled.
-function ownerRulingRefusal(item, id, round, decision) {
-  if (item === undefined) return `no item ${id} in round ${round}`;
-  // #559: an unimplemented ACCEPT of the arbiter, the judge or the cache is not waiting for a human; the owner may only DEFER it (FOLLOW-UP: the fix goes to an issue). REJECT and ACCEPT stay refused.
-  if (isDeferrableAccept(item)) {
-    return decision === 'FOLLOW-UP' ? null : `${id} does not need a human decision (an owner ruling cannot reopen a settled item); an arbiter/judge ACCEPT that is not fixed yet may only be deferred (FOLLOW-UP) by an owner ruling, not ${decision === 'ACCEPT' ? 're-accepted' : 'rejected'}`;
-  }
-  // The owner may rule on an item waiting for a human, or (E6) override a Claude or forced final that is not implemented yet.
-  const protectedFinal = isProtectedFinal(item);
-  if (item.final?.needsHuman !== true && !protectedFinal) return `${id} does not need a human decision (an owner ruling cannot reopen a settled item)`;
-  if (item.final?.needsHuman !== true && item.implemented === true) return `${id} is already implemented (an owner ruling cannot reopen it)`;
-  return null;
-}
 
 async function ownerRuling(rest, ctx) {
   const { values } = parseCommandArgs(rest, {
