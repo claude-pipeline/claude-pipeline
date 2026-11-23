@@ -495,7 +495,7 @@ async function neededLocked(values, n, root, ctx) {
       const again = finalizeWithoutArbiter(cleared, { lightLane: state.lightLane, force: values.force === true || forceArbiter(ctx.env) });
       state = updateItems(state, n, again);
       round = findRound(state, n);
-      clearedMalfunction = true; // saved once the reviewed commit is known to be here: a refused retry writes nothing
+      clearedMalfunction = true; // saved with the retry metadata once the input is written (or on the nothing-to-rule-on return): a refused or failed retry writes nothing
     }
   }
 
@@ -515,7 +515,6 @@ async function neededLocked(values, n, root, ctx) {
       throw new Fail(EXIT.USAGE, { ok: false, error: 'head-unavailable', message: `round ${round.n} was reviewed at ${round.toHead.slice(0, 12)}, which this clone does not have: fetch that commit, then run \`arbiter needed\` again` });
     }
   }
-  if (clearedMalfunction) saveState(root, state);
   const diff = review ? writeFableDiff(state, round, root, readReviewGate({ env: ctx.env ?? process.env })) : null;
   // The files the Fable diff covers (shared by the threat-model lookup and chooseBrief); null when git cannot list them (no model is shown then, chooseBrief says why).
   let diffFileList = null;

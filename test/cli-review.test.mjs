@@ -1105,6 +1105,19 @@ test('arbiter needed on a dispute round whose recorded toHead this clone lacks: 
   assertExit(r2, 2, r2.stderr + r2.stdout);
   assert.equal(r2.json.error, 'head-unavailable');
   assert.equal(w2.stateText(), before2, 'the cleared model-proof final is not saved when the retry is refused');
+
+  // The same retry with the commit present but the input file unwritable (a directory sits where it goes): the failed write must not have erased the prior final.
+  const w3 = world(t);
+  assertExit(w3.codex(1, standardFindings()), 0);
+  assertExit(w3.judge(1, { ...STANDARD_JUDGE, 'R1-B1': ['REJECT'] }), 0);
+  const st3 = w3.state();
+  st3.rounds[0].items.find((i) => i.id === 'R1-B1').final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: 'model-proof failed' };
+  writeFileSync(join(w3.repo.dir, '.review', 'state.json'), JSON.stringify(st3));
+  mkdirSync(w3.roundFile(1, 'arbiter-input.md'), { recursive: true });
+  const before3 = w3.stateText();
+  const r3 = w3.cli(['arbiter', 'needed', '--round', '1']);
+  assert.notEqual(r3.status, 0, 'the input write fails: ' + r3.stderr + r3.stdout);
+  assert.equal(w3.stateText(), before3, 'the cleared model-proof final is saved only after the arbiter input is written');
 });
 
 test('arbiter needed: the excerpt is +/-20 lines of the file at the reviewed head, numbered, and cannot break out of its fence', (t) => {
