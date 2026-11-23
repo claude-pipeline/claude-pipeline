@@ -879,3 +879,25 @@ test('IO: deleting or moving a marker-free *.test.sql entry point still trips R4
   });
   assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
 });
+
+// Catches: a delegating entry point under an ordinary .sql name (the suite globs supabase/tests/*.sql) losing R4 when deleted (R2-B1).
+test('IO: deleting or moving a marker-free delegating entry point with an ordinary .sql name still trips R4', async () => {
+  const bodies = {
+    selectFrom: "select * from tests.check_tenant_visibility();\n",
+    selectFromBare: "select * from check_tenant_visibility();\n",
+    selectCall: "select tests.check_tenant_visibility();\n",
+  };
+  for (const [label, entry] of Object.entries(bodies)) {
+    const deleted = await moveCollect({ 'supabase/tests/tenant_visibility.sql': entry }, (repo) => {
+      repo.rm('supabase/tests/tenant_visibility.sql');
+      repo.commit('delete entry point');
+    });
+    assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), `${label} deleted: ${JSON.stringify(deleted)}`);
+    const moved = await moveCollect({ 'supabase/tests/tenant_visibility.sql': entry }, (repo) => {
+      repo.write('scripts/tenant_visibility.sql', entry);
+      repo.rm('supabase/tests/tenant_visibility.sql');
+      repo.commit('move entry point');
+    });
+    assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), `${label} moved: ${JSON.stringify(moved)}`);
+  }
+});

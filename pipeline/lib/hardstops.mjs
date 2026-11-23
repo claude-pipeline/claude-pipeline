@@ -186,7 +186,7 @@ const isR4Config = (p) => isAgentInstructionPath(p) || inc(p, R4_CONFIG_GLOBS) |
 const TEST_DIR_GLOBS = ['**/supabase/tests/**'];
 // A pgTAP test file shows one of these: a harness call (plan/finish/runtests), an assertion call, a test-function definition
 // (test_*, startup_*, setup_*, teardown_*, shutdown_*; a driver's runtests() runs them from another file) or a psql include
-// (\i, \ir, \include or \include_relative pulls a suite in). A helper or fixture under the test dir has none. Over-matching is the safe side: it keeps R4.
+// (\i, \ir, \include or \include_relative pulls a suite in) or a delegating select of a routine. A helper or fixture under the test dir has none. Over-matching is the safe side: it keeps R4.
 const PGTAP_MARKER = new RegExp(
   [
     '\\b(?:plan|no_plan|done_testing|finish|runtests)"?\\s*\\(',
@@ -196,6 +196,9 @@ const PGTAP_MARKER = new RegExp(
     '\\b[a-z0-9_]+_(?:ok|eq|ne|are|is|isnt|like|unlike|has|hasnt|empty|returns|within|ilike|matching|imatching)"?\\s*\\(',
     '\\bcreate\\s+(?:or\\s+replace\\s+)?function\\s+(?:"?[a-z0-9_]+"?\\.)?"?(?:test|startup|setup|teardown|shutdown)[a-z0-9_]*"?\\s*\\(',
     '^[ \\t]*\\\\(?:i|ir|include|include_relative)[ \\t]+\\S',
+    // An entry point that only delegates to a routine (`select * from [schema.]routine(`, `select schema.routine(`), whatever its file name.
+    '\\bselect\\s+\\*\\s+from\\s+(?:"?[a-z0-9_]+"?\\.)?"?[a-z0-9_]+"?\\s*\\(',
+    '\\bselect\\s+"?[a-z0-9_]+"?\\.\\s*"?[a-z0-9_]+"?\\s*\\(',
   ].join('|'),
   'im',
 );
