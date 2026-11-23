@@ -38,7 +38,7 @@ export const meta = {
     '  the Codex run is the job codex-rR tagged <pr>:<R>:<base>:<head>: the same tag running is adopted (no second start), another tag running is exit 1 job-conflict',
     '  the result is read from the job\'s whole stdout; when that is missing (an older runner) or was cut, and the state records round R, the report is built from the state, else {next:"job read"}',
     '  a round already recorded picks up a job codex-rR only when its tag\'s base:head are the recorded round\'s fromHead:toHead (a job left by a discarded round is never used: exit 1 identity-mismatch);',
-    '  a round that is ALREADY recorded in the state is only picked up from its finished or running job (no Codex run in this call): every JSON of that call carries pickedUp:true; the checked-out HEAD must still be the recorded toHead (an explicit --head is compared with the job\'s instead), else exit 1 head-moved-since-round {next:"round codex --pr N --round R+1"}: do not rerun round R, run round R+1',
+    '  a round that is ALREADY recorded in the state is only picked up from its finished or running job (no Codex run in this call): every JSON of that call carries pickedUp:true; the checked-out HEAD must still be the recorded toHead (an explicit --head is compared with the job\'s instead), else exit 1 head-moved-since-round: do not rerun round R; next is `round codex --pr N --round R+1` only when round R is finished, else its finish step (`arbiter needed --pr N --round R` for a Fable round without a proven arbiter pass, or for judged items without a ruling; `triage light-lane --round R` on the light lane, else a judge-step pointer that is not a command, for items the judge has not seen; the arbiter reads the recorded range, not HEAD); a round no longer recorded at the job\'s range is exit 1 identity-mismatch',
     '     a job that ended non-zero while the state already records round R at the job tag base:head (round recorded another way, e.g. substitute apply) reports from the state ({codex:{fromState:true}}), not the failure JSON; a round recorded at another base:head (another writer, during the wait) leaves the job failure JSON as it is: never ok:true, never `arbiter needed`',
     '     a job that exited 0 while the state records round R at another base:head (round discarded and recorded again during the wait) is exit 1 identity-mismatch with next `state show --pr N`: nothing reported, never `arbiter needed`',
     '  the command exits early when the process that started it is gone (the job keeps running; rerun it)',
@@ -213,7 +213,25 @@ async function roundCodexRun(rest, ctx, seen) {
   const checkHeadAtRecorded = () => {
     const recordedTo = existing.tag.split(':')[3];
     if (values.head === undefined && fullSha('HEAD', root) !== recordedTo) {
-      throw new Fail(EXIT.FAILED, { ok: false, error: 'head-moved-since-round', message: `round ${round} was recorded at ${recordedTo} but HEAD is another commit: that result is not a review of HEAD; run round ${round + 1} instead`, next: `round codex --pr ${pr} --round ${round + 1}`, recordedHead: recordedTo, tag: existing.tag, runId: existing.runId });
+      // The state is read again here (the wait may have changed it): the round must still be recorded at this job's range, as finish() requires.
+      const { state } = checkIdentity(root, pr, round, { mayBeRecorded: true });
+      const rec = roundOfJob(existing.tag, state, pr, round);
+      if (rec === undefined) {
+        throw identityMismatch(`round ${round} is no longer recorded in the review state at the range of job ${name} (tag ${existing.tag}): nothing was reported`, { next: `state show --pr ${pr}` });
+      }
+      // An unfinished round is finished first: round R+1 would be admitted with R untriaged. A Fable round is the round's own record (a base-only round has no Fable pass, as fablePendingRounds reads it).
+      const fable = rec.fableRequired === true && rec.baseOnly !== true;
+      const unjudged = rec.items.filter((i) => !i.judge && !i.final);
+      let next = `round codex --pr ${pr} --round ${round + 1}`;
+      if (fable) {
+        if (rec.arbiter?.proofOk !== true || rec.items.some((i) => !i.final)) next = `arbiter needed --pr ${pr} --round ${round}`;
+      } else if (unjudged.length > 0) {
+        // Not a command: the judge's transcript tag carries a digest of the codex.json, so there is nothing to type here (review skill step 3).
+        next = state.lightLane === true && unjudged.every((i) => i.bucket === 'WORTH_CONSIDERING') ? `triage light-lane --round ${round}` : `judge step for round ${round}: review skill step 3, reference/judge-and-settle.md (not a command)`;
+      } else if (rec.items.some((i) => !i.final)) {
+        next = `arbiter needed --pr ${pr} --round ${round}`;
+      }
+      throw new Fail(EXIT.FAILED, { ok: false, error: 'head-moved-since-round', message: `round ${round} was recorded at ${recordedTo} but HEAD is another commit: that result is not a review of HEAD; do not rerun it: finish round ${round} first if its judge/arbiter pass has not run (arbiter needed --round ${round} reads the recorded range), then run round ${round + 1}`, next, recordedHead: recordedTo, tag: existing.tag, runId: existing.runId });
     }
   };
   // A round that was already recorded: no Codex run happened in this call, and the output says so.

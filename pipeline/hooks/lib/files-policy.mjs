@@ -21,20 +21,20 @@ import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
-import { evaluateSupabaseMcp, isSupabaseTool } from './live-db-guard.mjs';
+import { evaluateSupabaseMcp, findLiveDbCli, isSupabaseTool } from './live-db-guard.mjs';
 import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
 
 const posix = path.posix;
 const MAX_SCRIPT_BYTES = 1_000_000;
 const MAX_ALIAS_LOOKUPS = 20_000; // (#111: distinct words x directories the line may be in; above it the text is refused like an over-long one, so the stats stay bounded)
 const MAX_REVIEW_FILE_IDS = 2000; // (#111: files of the review folder and its rounds whose inodes are collected, so a hard link to a protected one is known; past it collection STOPS silently, so a hard link to a file beyond the cap is not seen: a documented residual, not a fail-closed. Which files fall past it depends on listing order. Depth: the protected names directly in .review, and a round folder's entries two levels down)
-const MAX_ALIAS_TEXT = 200_000; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused)
+const MAX_ALIAS_TEXT = MAX_SCRIPT_BYTES; // (#111: a longer text is not scanned for review-folder links word by word: with a review folder it is refused; cp #691: no shorter than the largest program the guard reads, it was 200,000)
 const MAX_LINE_CHARS = 200_000; // a longer command line is not parsed (the hook has a 15 s budget)
 // What an unparsed or truncated line is judged by: any word that names a protected file, a switch or an installer.
 const SENSITIVE_WORDS = /\.claude|\.codex(?:\/*(?![\w.\-\/])|\W+sessions)|PIPELINE_ADMIN|disableAllHooks|CLAUDECODE|install\.|\bprotect\b|\.review\W+(?:state|round-|final-gate|substitute-attempts|prod-before|published-baseline|[\w.-]*smoke)/i;
@@ -436,7 +436,7 @@ function makeCtx(opts) {
     readHead: opts.readHead ?? defaultReadHead, // the first bytes of a file readText refused (over the cap)
     ignoreUnmodelled: opts._ignoreUnmodelled === true, // inside a real-home startup file's judgment: see judgeStartupFile
     frames: opts._frames ?? [], // the files each command list being evaluated writes (see line-writes.mjs), outermost first
-    budget: opts._budget ?? newEvalBudget(opts.now), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
+    budget: opts._budget ?? newEvalBudget(opts.now, opts.cpu, opts.wall0), // script reads, deadline and expansion allowance of this evaluation (shared with nested calls)
     readDir: opts.readDir ?? defaultReadDir,
     nodePrefix: opts.nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration; undefined: from process.execPath, null: none (tests)
     admin: (opts.env ?? process.env).PIPELINE_ADMIN === '1',
@@ -881,7 +881,8 @@ function physicalTargets(target, ctx) {
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 // #472: and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs): run by hand with an injected check they would write a pending click with a made-up capture-time hook result.
 // #262: and the live-database go recorder (lib/live-db-go.mjs): run by hand it would write a "typed go" the owner never typed. ONE alternation feeds both expressions, so the path check and the word / stdin checks cannot drift apart.
-const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go`;
+// #683: and the database registry writer (lib/db-refs.mjs, commands/db-refs.mjs): run by hand it would rewrite which databases count as live. A scratch file that imports it is stopped by the writer itself, not by this text scan.
+const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go|db-refs`;
 const OWNER_GO_RECORDER = new RegExp(String.raw`(?:^|/)hooks/(?:lib/)?(?:${OWNER_GO_LIBS})\.mjs$`, 'i');
 const OWNER_GO_WORD = new RegExp(String.raw`(?:${OWNER_GO_LIBS})\.mjs`, 'i');
 
@@ -1671,11 +1672,13 @@ function makeMatchers(ctx) {
   const ALIAS_WORD_WIDE = /[^\s'"`;|&<>(){}[\]*?$]+/g;
   const aliasInText = (v, dirs) => {
     if (!ctx.hasReviewDir()) return false; // (no review folder: nothing below can match, see hitReviewInode)
-    if (v.length > MAX_ALIAS_TEXT) return true;
+    if (v.length > MAX_ALIAS_TEXT) { ctx.aliasLimit = true; return true; } // (a refusal from a cap says so: ctx.aliasLimit, read by judgeFoundScript)
     const where = dirs?.length ? dirs : [ctx.cwd];
     const words = new Set([...(v.match(ALIAS_WORD) ?? []), ...(v.match(ALIAS_WORD_WIDE) ?? [])]);
-    if (words.size * where.length > MAX_ALIAS_LOOKUPS) return true;
+    if (words.size * where.length > MAX_ALIAS_LOOKUPS) { ctx.aliasLimit = true; return true; }
+    let seen = 0;
     for (const word of words) {
+      if ((++seen & 511) === 0 && ctx.budget) checkDeadline(ctx.budget); // (a long text is scanned up to the evaluation's deadline, then the check fails closed)
       if (!/[A-Za-z0-9]/.test(word)) continue;
       const e = word === '~' || word.startsWith('~/') ? pathsFor().join(ctx.homePosix, word.slice(1)) : word;
       for (const d of isAbs(e) ? [''] : where) {
@@ -2520,9 +2523,93 @@ const LAST_WORD_RE = /\$(?:_|\{_)(?![A-Za-z0-9_])/; // `$_` / `${_}`: the last w
 // R7-F3 (#266): an arithmetic context on a line that names a protected file: `$((`, `((`, `$[`, a `let` word, a numeric test operator word (`-eq`, `-lt` ...), an integer declaration (`typeset -i`, `declare -i`, `local -i`, `integer`) and a lone `_` in ANY spelling (bare, quoted, escaped or assigned:
 // `${x:_}`, `$a[_]`, `printf %d "_"`, `n=_`, `[ "_" -gt 0 ]` read it as arithmetic; any `_` not touching a letter, digit or `_` fails closed; `$_` and `${_}` are expansions of the last word, not a name, and are judged by LAST_WORD_RE). Each alternative is a literal, a lookaround or a one-class run, so the scan is linear.
 const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s;&|(){`])(?:typeset|declare|local)\s+-[A-Za-z]*i|\s-(?:eq|ne|lt|gt|le|ge)(?=\s)|(?<![$\p{L}\p{N}_]|\$\{)_(?![\p{L}\p{N}_])/u;
+// Items 5b/10 (guard false refusals): the line as the arithmetic gate reads it. The JavaScript of `node -e` / `-p` PROGRAM, when PROGRAM is the whole of one word, written at command position with nothing before it
+// that can open a quote, a comment, an expansion or a heredoc (no quote, `#`, `$`, backslash, backtick or `<<`: `node -e …` first on the line, or after `cd /repo && `), is not shell code: in a SINGLE-quoted program `((` and a `let` word are no arithmetic, in a DOUBLE-quoted
+// program with no `$` and no backtick in it (so no expansion can run) a `((` is none. Only those two spellings are rewritten: `$((`, `$[`, a lone `_`, `((` / let in shell code, a program word with an
+// unquoted part and every other match of ARITH_CONTEXT are read as written.
+const INLINE_NODE_WORD = /(?<=^|[;&|(\n]\s*)node(?:js)?\s+(?:-e|-p|--eval|--print)\s+(?:'([^']*)'|"((?:[^"\\$`]|\\[^$`])*)")(?=\s|$|[;&|)])/g;
+function arithView(raw) {
+  return raw.replace(INLINE_NODE_WORD, (all, single, double, at) => {
+    const before = raw.slice(0, at);
+    if (/['"#$\\`]|<</.test(before)) return all; // (R1-B3 / R1-F1: a quote, a comment, an expansion, an escape or a heredoc anywhere before the word: a quote scan cannot tell where the shell is quoted once a comment, an ANSI-C quote, a nested "${…}" or an escape is in play, so the line is read as written)
+    const head = all.slice(0, all.search(/['"]/));
+    if (single !== undefined) return `${head}'${single.replace(/\((?=\()/g, '( ').replace(/(?<!\w)let(?=\s)/g, 'lXt')}'`;
+    if (double.includes('\\')) return all;
+    return `${head}"${double.replace(/\((?=\()/g, '( ')}"`;
+  });
+}
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
-const FAN_OUT_RE = /(?:^|[\s;&|(`])(?:xargs|parallel)(?=\s|$)/;
+// (#618: a quote opens a word too: `env -S 'xargs rm'`, `rg --pre 'xargs rm'`, `git -c core.pager='xargs rm'` hand the quoted text to a shell)
+const FAN_OUT_RE = /(?:^|[\s;&|(`'"])(?:xargs|parallel)(?=\s|$)/;
+
+// #610 #617 #624: the ONLY quoted operands removed from a command's text before FAN_OUT_RE looks at it: values of options that are data, named exactly (a closed list), never a general "data head".
+// A value is removed only when it has no `$`, backtick, backslash or quote character, its quoted needle (`-e 'v'`, `--grep="v"` ...) occurs EXACTLY ONCE in the command text and stands between blanks;
+// anything else removes nothing and the text is scanned whole. The prefix before an rg / grep / git head must be empty, assignments or `env` + assignments (any other wrapper may hand the rest of the line to a shell).
+const ASSIGN_SRC = String.raw`[A-Za-z_]\w*=(?:"[^"]*"|'[^']*'|[^\s'"]*)`;
+const DATA_PREFIX = new RegExp(String.raw`^\s*(?:${ASSIGN_SRC}\s+)*(?:env\s+(?:${ASSIGN_SRC}\s+)*)?`);
+const RG_BOOL_SHORT = /^-[inFwvlLcrRHhsqEPSUIaoxzu]+$/;
+const RG_BOOL_LONG = new Set(['--ignore-case', '--line-number', '--fixed-strings', '--word-regexp', '--invert-match', '--files-with-matches', '--count', '--recursive', '--no-messages', '--quiet', '--hidden', '--no-ignore', '--smart-case', '--no-heading', '--with-filename', '--no-filename', '--only-matching']);
+const plainValue = (v) => typeof v === 'string' && v.length > 0 && !/[$`\\'"]/.test(v);
+function removeNeedles(text, needles) {
+  let out = text;
+  for (const n of needles) {
+    const at = out.indexOf(n);
+    if (at < 0 || out.indexOf(n, at + 1) >= 0) continue;
+    const before = out[at - 1];
+    const after = out[at + n.length];
+    if ((at > 0 && !/\s/.test(before)) || (after !== undefined && !/\s/.test(after))) continue;
+    out = `${out.slice(0, at)} ${out.slice(at + n.length)}`;
+  }
+  return out;
+}
+const quoted = (flag, v, seps) => seps.flatMap((sep) => [`${flag}${sep}'${v}'`, `${flag}${sep}"${v}"`]);
+// the values of `flags` among argv (spaced or `=` form)
+function flagValues(argv, flags) {
+  const out = [];
+  argv.forEach((w, i) => {
+    for (const f of flags) {
+      if (w === f && argv[i + 1] !== undefined) out.push([f, argv[i + 1]]);
+      else if (f.startsWith('--') && w.startsWith(`${f}=`)) out.push([f, w.slice(f.length + 1)]);
+    }
+  });
+  return out;
+}
+// -> the command's raw text without its named data operands (see above); `trusted`: the installed pipeline command (its --built / --line prose)
+export function withoutDataOperands(c, trusted) {
+  const raw = c.raw ?? '';
+  const argv = c.argv ?? [];
+  const needles = [];
+  if (trusted) {
+    const tool = raw.indexOf('pipeline.mjs');
+    if (tool < 0) return raw;
+    for (const [f, v] of flagValues(argv, ['--built', '--line'])) if (plainValue(v)) needles.push(...quoted(f, v, [' ', '=']));
+    return `${raw.slice(0, tool)}${removeNeedles(raw.slice(tool), needles)}`;
+  }
+  const m = DATA_PREFIX.exec(raw);
+  const afterPrefix = raw.slice(m[0].length);
+  const headWord = /^(rg|grep|egrep|fgrep|git)(?=\s|$)/.exec(afterPrefix)?.[1];
+  if (!headWord || baseOf(argv[0] ?? '') !== headWord) return raw;
+  const args = argv.slice(1);
+  const body = afterPrefix.slice(headWord.length);
+  if (headWord === 'git') {
+    let i = 0;
+    while (args[i] === '-C' && args[i + 1] !== undefined) i += 2;
+    if (args[i] !== 'log') return raw;
+    for (const [f, v] of flagValues(args.slice(i + 1), ['--grep', '--author', '--committer'])) if (plainValue(v)) needles.push(...quoted(f, v, [' ', '=']));
+  } else {
+    for (const [f, v] of flagValues(args, ['-e', '--regexp'])) if (plainValue(v)) needles.push(...quoted(f, v, f === '-e' ? [' '] : [' ', '=']));
+    const hasPatternSource = args.some((w) => w === '-e' || w === '--regexp' || w === '-f' || w === '--file' || w.startsWith('--regexp=') || w.startsWith('--file='));
+    if (!hasPatternSource) {
+      for (const w of args) {
+        if (RG_BOOL_SHORT.test(w) || RG_BOOL_LONG.has(w)) continue;
+        if (!w.startsWith('-') && plainValue(w)) needles.push(`'${w}'`, `"${w}"`);
+        break;
+      }
+    }
+  }
+  return `${raw.slice(0, m[0].length)}${headWord}${removeNeedles(body, needles)}`;
+}
 
 const shellQuote = (w) => (/^[\w@%+=:,./~-]+$/.test(w) ? w : `'${w.replace(/'/g, `'\\''`)}'`);
 
@@ -3994,6 +4081,77 @@ const INTERP_PROGRAM = /^(?:node|nodejs|deno|bun|tsx|ts-node|python[\d.]*|ruby|p
 // Program text that names a protected path next to something that writes, moves or deletes.
 const WRITE_WORDS = String.raw`write|append|unlink|\brm\b|rmSync|rmtree|rmdir|rename|copy|\bcp(?:Sync)?\b|\bmv\b|\bln\b|mkdir|truncate|symlink|chmod|extractall|>>?\s*['"\w$~/.]|\btee\b|shutil|os\.remove|move|dump|save|replace|\bsed\b|install`;
 const WRITE_HINT = new RegExp(`${WRITE_WORDS}|open\\s*\\(`, 'i');
+// Item 5: an inline node -e / -p program that can only READ is described by an ALLOWLIST (no write-hint blocklist can name everything node can do): no run-time part, no word that reaches the process or loads code, every call on a short read-only list,
+// `require(` with one literal module. A program that is anything else keeps the rule for any text that names a protected file.
+const INLINE_NODE_WORDS = /[`$]|[)\]]\s*\(|\?\.\s*\(|\b(?:new|import|process|Reflect|globalThis|global|this|vm|binding|eval|Function|child_process)\b/;
+const INLINE_NODE_BARE = new Set(['require', 'readFileSync', 'existsSync', 'readdirSync', 'String', 'Number', 'Boolean', 'if', 'for', 'while', 'switch', 'catch']);
+const INLINE_NODE_QUALIFIED = new Set(['JSON.parse', 'JSON.stringify', 'console.log', 'console.error', 'Object.keys', 'Object.values', 'Object.entries', 'Array.isArray']);
+const INLINE_NODE_METHODS = new Set(['readFileSync', 'existsSync', 'readdirSync', 'map', 'filter', 'find', 'some', 'every', 'forEach', 'reduce', 'sort', 'flat', 'join', 'split', 'slice', 'includes', 'startsWith', 'endsWith', 'trim', 'match', 'test', 'toFixed', 'padStart', 'padEnd']);
+// R1-B1 (#737): readFileSync(PATH) or readFileSync(PATH, 'encoding'): the second argument, when there is one, is a plain string literal. An options object (inline, held in a variable, spread in) can carry `flag: 'w+'`, which truncates the file it
+// reads. `args` is the text after the opening parenthesis; a closing parenthesis that never comes, a spread, or an unquoted `/` (a regex literal the scan could misread) is not read-only.
+function readFileSyncArgsPlain(args) {
+  const parts = [''];
+  let depth = 0;
+  for (let i = 0; i < args.length; i++) {
+    const ch = args[i];
+    if (ch === "'" || ch === '"') {
+      const end = args.indexOf(ch, i + 1);
+      if (end < 0 || args.slice(i, end).includes('\\')) return false;
+      parts[parts.length - 1] += args.slice(i, end + 1);
+      i = end;
+      continue;
+    }
+    if (ch === '/' || (ch === '.' && args.startsWith('...', i))) return false;
+    if (ch === '(' || ch === '[' || ch === '{') depth++;
+    else if (ch === ')' || ch === ']' || ch === '}') {
+      if (depth === 0) return ch === ')' && parts.length <= 2 && (parts.length === 1 || /^\s*(?:'[^']*'|"[^"]*")\s*$/.test(parts[1]));
+      depth--;
+    }
+    if (ch === ',' && depth === 0) parts.push('');
+    else parts[parts.length - 1] += ch;
+  }
+  return false;
+}
+function inlineNodeReadOnly(prog) {
+  if (/\\u/i.test(prog)) return false; // (R2-F1: an identifier escape, `fs` for `fs`, hides a name from every word scan below; `'\n'` and other escapes stay allowed)
+  if (INLINE_NODE_WORDS.test(prog) || WRITE_HINT.test(prog.replace(/[<>=]/g, ' '))) return false; // (a write name is refused even as a callback: .map(fs.unlinkSync))
+  if (/\brequire\b(?!\s*\(\s*(?:'[^'\\]*'|"[^"\\]*")\s*\))/.test(prog)) return false; // (every `require` is a call with one plain string)
+  for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'([^'\\]*)'|"([^"\\]*)")\s*\)/g)) {
+    const mod = r[1] ?? r[2];
+    if (!(['fs', 'node:fs', 'path', 'node:path'].includes(mod) || mod.endsWith('.json'))) return false;
+  }
+  // R1-B2 (#737): the fs module is used only as a direct call to readFileSync / existsSync / readdirSync (`require('fs').readFileSync(`), or held in `const NAME = require('fs')` (nothing else follows it) whose every later use is such a call; the `fs`
+  // node -e predefines is held the same way. A function taken from it and not called (`.map(fs.openSync)`, `const readFileSync = require('fs').openSync`, `const {openSync: x} = require('fs')`, `{m: require('fs').openSync}`) is called later by something the call scan does not see.
+  const fsCall = /^\s*\.\s*(?:readFileSync|existsSync|readdirSync)\s*\(/;
+  const fsOwn = []; // (text ranges that are the require itself or its declaration)
+  const fsNames = new Set(['fs']);
+  for (const r of prog.matchAll(/\brequire\s*\(\s*(?:'(?:node:)?fs'|"(?:node:)?fs")\s*\)/g)) {
+    const end = r.index + r[0].length;
+    fsOwn.push([r.index, end]);
+    if (fsCall.test(prog.slice(end))) continue;
+    const decl = /(?<![\p{L}\p{N}_$.])(?:const|let|var)\s+([\p{L}_][\p{L}\p{N}_]*)\s*=\s*$/u.exec(prog.slice(0, r.index));
+    if (!decl || !/^\s*(?:;|$)/.test(prog.slice(end))) return false;
+    fsNames.add(decl[1]);
+    fsOwn.push([decl.index, r.index]);
+  }
+  for (const name of fsNames) {
+    for (const o of prog.matchAll(new RegExp(`(?<![\\p{L}\\p{N}_$])${name}(?![\\p{L}\\p{N}_$])`, 'gu'))) {
+      if (fsOwn.some(([x, y]) => o.index >= x && o.index < y)) continue;
+      if (!fsCall.test(prog.slice(o.index + name.length))) return false;
+    }
+  }
+  for (const r of prog.matchAll(/([\p{L}_][\p{L}\p{N}_]*(?:\s*\.\s*[\p{L}_][\p{L}\p{N}_]*)*)\s*\(/gu)) {
+    const before = prog.slice(0, r.index).trimEnd();
+    if (/(?:^|\.)readFileSync$/.test(r[1].replace(/\s+/g, '')) && !readFileSyncArgsPlain(prog.slice(r.index + r[0].length))) return false;
+    if (before.endsWith('.')) { // (a method after something: `).readFileSync(`, `/x/.test(`, `?.(` is no allowed shape)
+      if (before.endsWith('?.') || !INLINE_NODE_METHODS.has(r[1].split(/\s*\.\s*/).at(-1))) return false;
+      continue;
+    }
+    const name = r[1].replace(/\s+/g, '');
+    if (name.includes('.') ? !(INLINE_NODE_QUALIFIED.has(name) || /^Math\.[A-Za-z]+$/.test(name) || INLINE_NODE_METHODS.has(name.split('.').at(-1))) : !INLINE_NODE_BARE.has(name)) return false;
+  }
+  return true;
+}
 
 // `bash f.sh`, `source f`, `./f`, `node f.mjs`, `python f.py`: the file is read (up to 1 MB) and judged like the same text
 // typed on the line. A shell script that exists but cannot be read is denied; a missing file runs nothing; a
@@ -4311,8 +4469,10 @@ function judgeScriptText(text, sf, abs, dir, ctx, opts) {
   const dynamicBefore = ctx.dynamic;
   ctx.braceChunks = true; // (#265 g: the text is brace-expanded in pieces, so a brace-split protected path in a long program is seen)
   let hitsProtected;
+  ctx.aliasLimit = false;
   try { hitsProtected = text.length <= MAX_SCRIPT_BYTES && m.rawHit(text, [dir], true); } finally { ctx.braceChunks = false; }
   ctx.dynamic = dynamicBefore;
+  if (hitsProtected && ctx.aliasLimit === true && WRITE_HINT.test(text)) return deny(`the program ${sf.file} is refused for its size / scan limit: it is too long, or holds too many distinct words, to be checked word by word for a link to a repo's review folder (${PROTECTED_MSG}); split it up or keep what writes in a smaller file`);
   if (hitsProtected && WRITE_HINT.test(text)) return deny(`the program ${sf.file} refers to a protected pipeline file and writes (${PROTECTED_MSG})${programHitWhere(text, m, dir, ctx, sf.file)}`);
   return null;
 }
@@ -4330,14 +4490,14 @@ function programHitWhere(text, m, dir, ctx, file) {
   const b = ctx.budget;
   const saved = { grown: b.grown, braceOver: ctx.braceOver, dynamic: ctx.dynamic };
   try {
-    const stopAt = Math.min(b.deadline, b.now() + LOCATE_MS);
+    const stopAt = b.now() + LOCATE_MS;
     // (rawHit reads a home config folder in program text as a hit when the text holds a call anywhere: `(` `)` `[` `]`; a line is judged as the text would be, with that call added)
     const hasCall = /[()[\]]/.test(text);
     const hits = [];
     let cut = false;
     let from = 0;
     for (let n = 1; from <= text.length; n++) {
-      if (n > LOCATE_MAX_LINES || ((n & 63) === 0 && b.now() > stopAt)) { cut = true; break; }
+      if (n > LOCATE_MAX_LINES || ((n & 63) === 0 && (b.now() > stopAt || budgetExpired(b)))) { cut = true; break; }
       let to = text.indexOf('\n', from);
       if (to < 0) to = text.length;
       const line = text.slice(from, text[to - 1] === '\r' ? to - 1 : to);
@@ -4704,7 +4864,7 @@ function setPositionals(argv) {
 function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false, cdpSeed = false) { // (rep: the file is sourced from a frame that can run it again, R18)
   const out = { vars: new Map(), cds: [], all: false, unknownCd: false, bareCd: false, cdpath: cdpSeed || mentionsCdpath(text) }; // (#385: cdpSeed: the file that sources this one already had CDPATH in play)
   const cdpNow = () => ctx.cdpath === true || out.cdpath; // (R20-F1: read at each cd, a nested file may set it after this point; R19: a file that mentions CDPATH may set it: its plain cd names are not followed)
-  const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline });
+  const cmds = simpleCommands(text, { bashState: ctx.bashState, expired: () => budgetExpired(ctx.budget) });
   // (#352 R23-F2: a script line whose shape the parser cannot follow (ctlBroken: a bare { or } argument that splits the word groups, `echo { F=x }`, a zsh condition-then-body form, a {fd} word) may or may
   // not run the commands read from it: what it binds, and the directory it ends in, are unknown)
   if (cmds.truncated || cmds.dynamic || cmds.ctlBroken) out.all = true;
@@ -4914,7 +5074,7 @@ function evaluateSameText(command, opts) {
 function evaluateBashForFilesUnchecked(command, opts = {}) {
   if (!opts._bashState) {
     const state = { bound: false, rewrote: false };
-    const budget = opts._budget ?? newEvalBudget(opts.now);
+    const budget = opts._budget ?? newEvalBudget(opts.now, opts.cpu, opts.wall0);
     const first = evaluateBashForFilesUnchecked(command, { ...opts, _budget: budget, _bashState: state });
     if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
     // (the second pass spends what the first left, so every cap still ends in a denial; only the startup-file memo starts empty)
@@ -4990,7 +5150,7 @@ function loopReadings(command, opts) {
   return out;
 }
 function evaluateBashForFilesFrame(command, opts) {
-  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now) }; // one budget for this evaluation and every script it reads
+  if (!opts._budget) opts = { ...opts, _budget: newEvalBudget(opts.now, opts.cpu, opts.wall0) }; // one budget for this evaluation and every script it reads
   const opts0 = opts; // (R16: the frame as it was called, for the pass that judges it again with a late switch seeded)
   const assumedCwd = opts._assumedCwd === true; // (a rerun of the line with the cwd assumed to be a protected directory; what it runs is judged normally)
   if (assumedCwd) opts = { ...opts, _assumedCwd: false };
@@ -5026,7 +5186,7 @@ function evaluateBashForFilesFrame(command, opts) {
   if (variantsOf(raw).some((t) => setsAdmin(t, ctx.platform) || setsAdmin(t.replace(/['"`]\s*\+\s*['"`]/g, '').replace(/['"`\\]/g, ''), ctx.platform))) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code (naming it, e.g. in grep or prose, is fine)');
   if (hasDisableAll(raw) || hasDisableAll(flat)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
 
-  const cmds = simpleCommands(raw, { env: opts.env ?? process.env, bashState: opts._bashState, expired: () => opts._budget.now() > opts._budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  const cmds = simpleCommands(raw, { env: opts.env ?? process.env, bashState: opts._bashState, expired: () => budgetExpired(opts._budget) }); // a scan that outlasts the deadline gives up: truncated, so denied
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
@@ -5044,7 +5204,7 @@ function evaluateBashForFilesFrame(command, opts) {
   const rawOfCmd = (c) => maskProse(c.raw, prose.get(c).values);
   const wordsOf = (c) => { const d = prose.get(c).drop; return d.size ? c.argv.filter((_, i) => !d.has(i)) : c.argv; };
   for (const c of cmds) {
-    checkDeadline(ctx.budget); // (the one wall-clock deadline of the evaluation, checked at every command: a hook past its timeout is ALLOWED)
+    checkDeadline(ctx.budget); // (the one deadline of the evaluation (CPU limit and hard wall cap), checked at every command: a hook past its timeout is ALLOWED)
     const words = [c.argv.join(' '), ...Object.entries(c.env).map(([k, v]) => `${k}=${v}`)].join(' ');
     if (setsAdmin(words, ctx.platform)) return deny('the command sets PIPELINE_ADMIN; only the owner may set it, when launching Claude Code');
     if (hasDisableAll(words)) return deny('the command mentions disableAllHooks, which would switch the pipeline hooks off');
@@ -5127,6 +5287,12 @@ function evaluateBashForFilesFrame(command, opts) {
   const installer = findInstaller(cmds, raw, dirs, ctx, opts);
   if (installer) return deny(installer);
   if (findDbRefsWrite(cmds, raw)) return deny('pipeline db-refs changes which databases count as live; only the owner may run it, from their own terminal (`pipeline db-refs show` is allowed)');
+  {
+    // (B10: a quoted command string is parsed again with the same env and deadline; its own bashState, `{ bound: true }`: a prose word that binds BASH must not force the whole-evaluation rerun above)
+    const reparse = (text) => simpleCommands(text, { env: opts.env ?? process.env, bashState: { bound: true }, expired: () => opts._budget.now() > opts._budget.deadline });
+    const dbCli = findLiveDbCli(cmds, scanRaw, readDbRefs(opts.home || os.homedir()), wordsOf, reparse); // #262: an agent-run supabase CLI line or Management API call that can reach a non-local database
+    if (dbCli) return deny(dbCli);
+  }
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');
 
   // 6: the job runner executes its inner command on the agent's behalf
@@ -5446,7 +5612,7 @@ function evaluateBashForFilesFrame(command, opts) {
     if (!c.argv.length) continue;
     const runs = RUNTIMES.has(baseOf(c.argv[0])) || OWNER_GO_RECORDER.test(toPosix(c.argv[0]));
     if (runs && c.argv.some((w) => OWNER_GO_WORD.test(toPosix(expandRefs(w, ctx))))) {
-      return deny('the owner-go recorder records the owner\'s chat "merge"; only Claude Code runs it, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
+      return deny('the owner-go recorder records the owner\'s chat "merge" (and the database registry writer rewrites which databases count as live); only Claude Code runs them, on a prompt the owner types; to change its source, edit the source with the Edit tool (a program that runs or rewrites it is refused; PIPELINE_ADMIN=1 for the owner)');
     }
     // #472 (R1-B1, R2): a runtime that reads its program from stdin (`node --input-type=module <<EOF`, `node - <<< …`, `node /dev/stdin`, `echo … | node`) names no file in its words, so the check above cannot see what it imports.
     // Decided from the command's OWN stdin source, not from the shape of its words (`--input-type module` and `- x` are ordinary words that still run stdin): a heredoc, a here-string or a `< <(…)` on it, or the receiving
@@ -5465,10 +5631,10 @@ function evaluateBashForFilesFrame(command, opts) {
       // (R4-F1: the text AS WRITTEN decides: a name the line gave a value and then rebinds at run time (`P=x true; read -r P …`) expands to its stale value and would hide the `$`)
       if (known && !own.some((t) => /[$`]/.test(t)) && !known.some((t) => /[$`]/.test(t))) {
         if (known.some((t) => OWNER_GO_WORD.test(t))) {
-          return deny('a program read from stdin that names the owner-go recorder or its click libraries is refused: they record the owner\'s chat "merge" or click, and only Claude Code runs them, on the owner\'s own prompt or answer');
+          return deny('a program read from stdin that names the owner-go recorder, its click libraries or the database registry writer is refused: they record the owner\'s chat "merge" or click, or rewrite the registry of live databases, and only Claude Code runs them, on the owner\'s own prompt or answer');
         }
       } else if (wholeLineTexts(cmds, raw).some((t) => OWNER_GO_WORD.test(toPosix(expandRefs(t, ctx))))) {
-        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor, a command that can rename another (alias, hash, source, eval, trap), anything else that cannot be followed command by command, or the output of another command may feed it), and it names an owner-go recorder or click library: they record the owner\'s chat "merge" or click, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
+        return deny('this line runs a JavaScript runtime and is not a plain command line (a group, subshell, nested text, a variable, a file, a descriptor, a command that can rename another (alias, hash, source, eval, trap), anything else that cannot be followed command by command, or the output of another command may feed it), and it names an owner-go recorder, click library or the database registry writer: they record the owner\'s chat "merge" or click, or rewrite the registry of live databases, and only Claude Code runs them. Run the runtime on a line of its own, or keep the library name off that line');
       }
     }
   }
@@ -5667,8 +5833,8 @@ function evaluateBashForFilesFrame(command, opts) {
     return u.length > 32 ? null : u;
   };
   const cdTarget = (c) => { // the plain target of a `cd` whose destination is known now, else null
-    // (#373: the segment of `if cd X` / `then cd X` / `{ cd X` starts with the keyword the parser read, `c.lead`; its text is no part of the command)
-    const raw = c.lead === undefined ? c.raw : c.raw.startsWith(c.lead) ? c.raw.slice(c.lead.length) : null;
+    // (#373: the segment of `if cd X` / `then cd X` / `{ cd X` starts with the keyword the parser read, `c.kwLead`; its text is no part of the command)
+    const raw = c.kwLead === undefined ? c.raw : c.raw.startsWith(c.kwLead) ? c.raw.slice(c.kwLead.length) : null;
     if (cdNameOf(c.argv[0]) !== 'cd' || raw === null || raw.includes('\\') || !PLAIN_CD.test(raw)) return null; // (R5-F1: `env cd`, `sudo cd`, `time cd` run no builtin in this shell)
     const rest = c.argv.slice(1).filter((a) => a !== '--' && !/^-[LPe@]+$/.test(a));
     if (rest.length > 1) return null;
@@ -5998,7 +6164,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // R7-F3 (#266): in arithmetic zsh reads a bare name `_` (the last word of the previous command) and evaluates its text again, a subscript with a substitution included. `echo 'path[$(cmd)]'; echo $((_))`
   // plants nothing a rule can refuse, and the reader names no protected file, so it is never judged: on a line that names a protected file an arithmetic context anywhere denies the line. The gate reads the UNMASKED line (post-push review of #288): a path inside a prose value
   // (a quoted echo argument, a commit message) is masked out of protectedInRaw, but the planted text can sit anywhere.
-  if (protectedAnywhere && ARITH_CONTEXT.test(raw)) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator, an integer declaration or a lone _), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
+  if (protectedAnywhere && ARITH_CONTEXT.test(arithView(raw))) return deny(`the command line refers to a protected pipeline file and holds an arithmetic context ($(( )), $[ ], (( )), let, a numeric test operator, an integer declaration or a lone _), which can evaluate text planted by an earlier command; split it so the arithmetic is on its own line (${PROTECTED_MSG})`);
 
   const winAncestor = (c) => c.raw.includes('\\') && m.ancestorRaw(rawOfCmd(c));
   // Why: in a rerun that assumes the directory (after a cd only known at run time) every relative word resolves inside the assumed protected directory (`npm`, `test`), so a word counts only when it can name
@@ -6053,14 +6219,49 @@ function evaluateBashForFilesFrame(command, opts) {
   // (R4-F1: allow-list: quoted text is blanked ONLY for a command known to run none of its arguments: a readable, unwrapped head in NON_RUNNERS, or an INLINE_RUNNERS name on a file program; every other command keeps c.raw, as origin/main does)
   // (R1-B2 / R2-F1: only a plain data command is blanked; quoted text stays when it may run: inline code, a wrapper (WRAPPER_CMDS), find -exec, a shell or another interpreter (INTERPRETERS) named in argv, or a written first word that is not argv[0] (the parser unwrapped it or it cannot be read))
   const rawHead = (c) => baseOf((c.raw ?? '').trim().split(/\s+/).find((w) => !/^[A-Za-z_]\w*=/.test(w)) ?? ''); // (the parser unwraps `env -S 'nice xargs rm'` to argv [rm]: the written first word is the wrapper)
-  const knownNonRunner = (c) => c.argv.length > 0 && rawHead(c) === baseOf(c.argv[0]) && (NON_RUNNERS.has(rawHead(c)) || INLINE_RUNNERS.test(rawHead(c)));
-  const runsText = (c) => !knownNonRunner(c) || runsInlineCode(c, ctx) || WRAPPER_CMDS.has(rawHead(c)) || c.argv.some((w) => WRAPPER_CMDS.has(baseOf(w))) || rawHead(c) !== baseOf(c.argv[0] ?? '') || c.argv.some((w) => SHELL_NAMES.has(baseOf(w))) || c.argv.some((w) => INTERPRETERS.test(baseOf(w)) && !INLINE_RUNNERS.test(baseOf(w))) || (baseOf(c.argv[0] ?? '') === 'find' && c.argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
-  const fansOut = (c) => FAN_OUT_RE.test(runsText(c) ? c.raw : (withoutLiteralText(c.raw, { dqData: true }) ?? c.raw));
+  // (#610 #617 #620 #624) The INLINE_RUNNERS door stays open ONLY for the installed pipeline command (its prose flags are data; `triage settle --test-cmd` is run by a shell, so it keeps its text); any other file program keeps its quoted text.
+  // A pager or preprocessor option is command-valued (`rg --pre 'xargs rm'`, `bat --pager ...`), so such a command is no known non-runner.
+  const trustedCall = (c) => c.argv.length > 0 && (isPipelineTool(c.argv[0], ctx) || (baseOf(c.argv[0]) === 'node' && isPipelineTool(c.argv[1], ctx)));
+  const settlesWithTestCmd = (c) => c.argv.includes('settle') && c.argv.some((w) => w === '--test-cmd' || w.startsWith('--test-cmd='));
+  const pagerish = (c) => ['less', 'more', 'bat', 'man'].includes(rawHead(c)) || c.argv.some((w) => /^--(?:pre|pre-glob|pager|preprocessor)(?:=|$)/.test(w));
+  const knownNonRunner = (c) => c.argv.length > 0 && rawHead(c) === baseOf(c.argv[0]) && !pagerish(c) && (NON_RUNNERS.has(rawHead(c)) || (INLINE_RUNNERS.test(rawHead(c)) && trustedCall(c) && !settlesWithTestCmd(c)));
+  // (#620: for the trusted command a prose value of --built / --line is no command NAME: `fixes R1/R2` ends in an interpreter-looking word)
+  const runWords = (c) => {
+    if (!trustedCall(c)) return c.argv;
+    const skip = new Set();
+    c.argv.forEach((w, i) => { if (w === '--built' || w === '--line') skip.add(i + 1); else if (w.startsWith('--built=') || w.startsWith('--line=')) skip.add(i); });
+    return c.argv.filter((_, i) => !skip.has(i));
+  };
+  const runsText = (c) => !knownNonRunner(c) || runsInlineCode(c, ctx) || WRAPPER_CMDS.has(rawHead(c)) || runWords(c).some((w) => WRAPPER_CMDS.has(baseOf(w))) || rawHead(c) !== baseOf(c.argv[0] ?? '') || runWords(c).some((w) => SHELL_NAMES.has(baseOf(w))) || runWords(c).some((w) => INTERPRETERS.test(baseOf(w)) && !INLINE_RUNNERS.test(baseOf(w))) || (baseOf(c.argv[0] ?? '') === 'find' && c.argv.some((w) => /^-(?:exec|execdir|ok|okdir)$/.test(w)));
+  const fansOut = (c) => FAN_OUT_RE.test(runsText(c) ? withoutDataOperands(c, trustedCall(c)) : (withoutLiteralText(c.raw, { dqData: true }) ?? c.raw));
   if (cmds.some((c) => fansOut(c) || (SHELL_NAMES.has(baseOf(c.argv[0] ?? '')) && !isReadOnly(c, ctx)))) return deny('the command refers to a protected pipeline file and hands work to xargs or a shell, which could modify it');
 
   const pool = unaccounted ? cmds.filter((c) => c.argv.length) : mentioning;
   const harmless = assignmentOnlyHarmless(cmds, ctx, ctx.frames.indexOf(frame) === 0);
-  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c));
+  // Item 5 (guard false refusals): `node -e / -p PROGRAM` that can only read is not judged as a command that may write (an ALLOWLIST, inlineNodeReadOnly). The command is exactly `node -e|-p PROGRAM`: no other option, argument, `--`, env-prefix
+  // assignment, wrapper (env, command, npx ...: the raw text starts with node) or write redirect, no NODE_OPTIONS anywhere on the line. Anything else is judged as before.
+  const readsInlineNode = (c) => /^node$/.test(c.argv[0] ?? '') && /^(?:-e|-p)$/.test(c.argv[1] ?? '') && c.argv.length === 3 && /^node\s/.test(c.raw.trimStart())
+    && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && Object.keys(c.env ?? {}).length === 0 && !/NODE_OPTIONS/.test(raw)
+    && !/\$['"]/.test(c.raw) // (an ANSI-C or locale word is decoded by the shell into text the raw word does not show)
+    && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
+    && inlineNodeReadOnly(c.argv[2]);
+  // Item 7b (guard false refusals): `out=$(node ~/.claude/pipeline/bin/pipeline.mjs job wait …)`: an assignment that gives plain lower-case names (no shell variable the shell reads: PATH, IFS, the zsh `path` family ...) nothing but ONE whole
+  // command substitution is judged as the command inside it, which is a command of the line like any other (judged above and below: `out=$(rm …)` is still refused as rm). A value with any other text, a redirect, and every other name keep the rule above.
+  // (zsh's documented special lower-case parameters, and the families by name: the `*_functions` hook arrays, `zsh*`, `zle*` and `dis_*`)
+  const TIED_NAMES = /^(?:reply|match|mbegin|mend|psvar|signals|watch|fignore|mailpath|histchars|pipestatus|status|argv|dirstack|funcstack|funcfiletrace|funcsourcetrace|functrace|userdirs|nameddirs|widgets|keymaps|historywords|jobdirs|jobstates|jobtexts|modules|parameters|options|commands|aliases|galiases|saliases|builtins|reswords|functions|terminfo|termcap|errnos|sysparams|patchars|region_highlight|prompt|path|fpath|cdpath|manpath|module_path|langinfo|epochtime|usernames|mapfile|compstate|history|.*_functions|zsh.*|zle.*|dis_.*)$/;
+  const wholeSubstitution = (v) => {
+    const s = String(v).replace(/^"([^"]*)"$/, '$1');
+    if (!s.startsWith('$(') || s.startsWith('$((') || !s.endsWith(')') || /`/.test(s)) return false;
+    let depth = 0;
+    for (let i = 1; i < s.length; i++) {
+      if (s[i] === '(') depth++;
+      else if (s[i] === ')' && --depth === 0 && i !== s.length - 1) return false;
+    }
+    return depth === 0;
+  };
+  const assignsSubstitution = (c) => c.argv.length === 0 && !(c.redirects ?? []).length && Object.keys(c.env ?? {}).length > 0
+    && Object.entries(c.env).every(([k, v]) => /^[a-z][a-z0-9_]*$/.test(k) && !TIED_NAMES.test(k) && !Object.hasOwn(ctx.env ?? {}, k) && wholeSubstitution(v)); // (a name the hook's environment holds: main's rule, assignmentOnlyHarmless)
+  const bad = pool.find((c) => !isReadOnly(c, ctx) && !harmless(c) && !readsInlineNode(c) && !assignsSubstitution(c));
   if (bad) {
     const name = bad.argv.length ? baseOf(bad.argv[0]) : '(assignment)';
     // #295: a command that is read-only in itself, refused only because the line's heredoc text holds an expansion that can evaluate (ctx.heredocPlants, R5-F3): say so, not "is not a read-only command"

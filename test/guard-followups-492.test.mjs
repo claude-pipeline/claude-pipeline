@@ -118,6 +118,88 @@ describe('#554: a mark set inside a failure group survives when the nested text 
   });
 });
 
+// ---- #609 (+ pins #607 #608) ----
+describe('#609: a literal, unwrapped exit of a failure group ends the text, so the commands after it are judged with the exact branch', () => {
+  // production failure: `cd /work/repo || { echo missing >> err.log; exit 1; }` then `git push` in the same script was refused ("cannot determine the current branch") although the push is never reached when the group ran
+  const GROUP = (exit) => `cd /work/repo || { echo missing >> err.log; ${exit}; }\n`;
+  const V1 = `${GROUP('exit 1')}git push\n`;
+  const V2 = `cd /work/repo || { bash /work/repo/fix.sh; exit 1; }\ngit push\n`;
+  const FIX = { '/work/repo/fix.sh': 'git checkout main\n' };
+  // gitRun looks a fake file up by resolve(path), which on Windows is D:\work\repo\s.sh: key the fixtures the same way
+  const at = (files = {}) => Object.fromEntries(Object.entries(files).map(([k, v]) => [resolve(k), v]));
+  const verdict = (command, files) => gitRun(command, at(files));
+  const expectAt = (decision, command, files) => expect(decision, command, at(files));
+  for (const [vname, script, extra] of [['V1 (echo in the group)', V1, {}], ['V2 (the group runs a helper that switches branch)', V2, FIX]]) {
+    for (const run of ['bash s.sh', 'source s.sh']) {
+      // (a SOURCED text runs in the caller's shell: a function named exit defined by the caller would make the written exit not leave it, which the walk cannot see, so only a child-run text defers)
+      test(`${vname}: \`${run}\` with the push INSIDE the script after a literal exit is ${run === 'bash s.sh' ? 'allowed' : 'still denied (sourced)'}`, () => {
+        expectAt(run === 'bash s.sh' ? 'allow' : 'deny', run, { ...extra, '/work/repo/s.sh': script });
+      });
+      test(`${vname}: \`${run}; git -C /work/repo push\` stays denied, on the CALLER's push`, () => {
+        const v = verdict(`${run}; git -C /work/repo push`, { ...extra, '/work/repo/s.sh': script });
+        assert.equal(v.decision, 'deny', v.reason);
+        assert.match(v.reason, /cannot determine the current branch/);
+        // (a sourced script is denied inside itself, as before this change: only the child-run one reaches the caller's push)
+        if (run === 'bash s.sh') assert.doesNotMatch(v.reason, /the script s\.sh/);
+      });
+    }
+  }
+  // (an exit that is not verifiably the shell's own keeps today's immediate uncertainty: a wrapper's child-local exit, an external time, a quoted word)
+  for (const exit of ['/usr/bin/time exit 1', 'time exit 1', 'nohup exit 1', 'env exit 1', 'command exit 1']) {
+    test(`\`${exit}\` in the group keeps the push inside the script denied`, () => {
+      const v = verdict('bash s.sh', { '/work/repo/s.sh': `${GROUP(exit)}git push\n` });
+      assert.equal(v.decision, 'deny', v.reason);
+      assert.match(v.reason, /the script s\.sh would run a blocked command/);
+    });
+  }
+  test('a function named exit defined by the caller: sourcing the script is denied (the written exit may not leave the shell; the reason a sourced text does not defer)', () => {
+    expectAt('deny', 'exit() { :; }; source /work/repo/s.sh', { '/work/repo/s.sh': V1 });
+  });
+  // R1-B1 / R1-F1: the written exit may not be the shell's real exit: the caller's function, an exported one, an eval (this shell), a startup file, or a sourced helper redefines it; the cd failing then switches to main and the push runs there
+  const S = V2;
+  const REDEF = { '/work/repo/s.sh': S, ...FIX };
+  const SUB = { '/work/repo/s.sh': 'cd /work/repo/sub || { bash /work/repo/fix.sh; exit 1; }\ngit push\n', ...FIX };
+  for (const [why, line, files] of [
+    ['eval-fed text with a caller function exit', 'exit() { :; }; eval "$(cat /work/repo/s.sh)"', REDEF],
+    ['an exported function exit into the child shell', 'exit() { :; }; export -f exit; bash /work/repo/s.sh', REDEF],
+    ['BASH_ENV startup file that defines exit', 'BASH_ENV=/work/repo/rc.sh bash /work/repo/s.sh', { ...REDEF, '/work/repo/rc.sh': 'exit() { :; }\n' }],
+    ['a sourced helper inside the group that defines exit', 'bash /work/repo/s.sh', { '/work/repo/s.sh': 'cd /work/repo/sub || { source /work/repo/h.sh; exit 1; }\ngit push\n', '/work/repo/h.sh': 'exit() { :; }\ngit checkout main\n' }],
+    // R2-F1: an implicit home startup file (zsh reads ~/.zshenv, bash -l ~/.bash_profile) is judged on a copy of the state; the mark that exit may be redefined must still reach the script
+    ['a home .zshenv that defines exit (zsh reads it implicitly)', 'zsh /work/repo/s.sh', { ...SUB, [HOME + '/.zshenv']: 'exit() { :; }\n' }],
+    ['a home .zshenv that aliases exit', 'zsh /work/repo/s.sh', { ...SUB, [HOME + '/.zshenv']: 'alias exit=true\n' }],
+    ['a home .bash_profile that defines exit (bash -l reads it implicitly)', 'bash -l /work/repo/s.sh', { ...SUB, [HOME + '/.bash_profile']: 'exit() { :; }\n' }],
+    ['a plain eval of the script (this shell, so a function of the caller may stand for exit)', 'eval "$(cat /work/repo/s.sh)"', REDEF],
+  ]) {
+    test(`${why}: denied`, () => {
+      expectAt('deny', line, files);
+    });
+  }
+  test('intended tightening: a git switch after the group no longer re-establishes a known branch for the caller', () => {
+    const v = verdict('bash s.sh; git -C /work/repo push', { '/work/repo/s.sh': `${GROUP('exit 1')}git switch agent/x\n` });
+    assert.equal(v.decision, 'deny', v.reason);
+    assert.match(v.reason, /cannot determine the current branch/);
+  });
+  // #607 does not reproduce (no failure group is recorded inside a subshell): pinned so a later change cannot open it
+  test('#607 pin: a failure group in a subshell whose helper switches branch keeps the caller push denied', () => {
+    const v = verdict('(cd dist || { bash /work/repo/cleanup.sh; exit 1; }; make); git push', { '/work/repo/cleanup.sh': 'git checkout main\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+    assert.match(v.reason, /cannot determine the current branch/);
+  });
+  // #608 does not need a source change (the candidate walk already covers a literal PATH prefix); the three rows fail if PATH-setting lines are excluded or `sourceGone` hides the walked case
+  test('#608 pin: a dynamic PATH prefix on source keeps the push denied', () => {
+    expectAt('deny', 'PATH="$(tooldir):$PATH" source env.sh; git -C /work/repo push', {});
+  });
+  test('#608 pin: a literal PATH prefix whose env.sh switches branch is walked and denied; a harmless one is allowed', () => {
+    const v = verdict('PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'git checkout main\n' });
+    assert.equal(v.decision, 'deny', v.reason);
+    assert.match(v.reason, /cannot determine the current branch/);
+    expectAt('allow', 'PATH="/opt/tools:$PATH" source env.sh; git -C /work/repo push', { '/opt/tools/env.sh': 'echo hi\n' });
+  });
+  test('#608 pin: the everyday `export PATH=...; [ -f .env.local ] && source .env.local; git push` stays allowed', () => {
+    expectAt('allow', 'export PATH="$HOME/bin:$PATH"; [ -f .env.local ] && source .env.local; git -C /work/repo push', {});
+  });
+});
+
 // ---- #506 ----
 describe('#506: a write that may land under a repository\'s .git makes its branch unknown', () => {
   const GIT_HEAD = '/work/repo/.git/HEAD';

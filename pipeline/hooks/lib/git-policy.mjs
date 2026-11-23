@@ -21,11 +21,9 @@ import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmM
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
-// (an exit written bare: no wrapper in front of it (shell-parse's `wrapped`; `spawn` for a find -exec / launcher). Only that one is proof the shell left: `command exit 1` (zsh), `noglob exit 1` (bash) and `/usr/bin/time exit 1` are
-// not found or run a child, and the line goes on. Used where a `|| exit` is trusted to prove a redirected or loop-body move happened)
-const bareExit = (c) => c?.wrapped !== true && c?.spawn !== true;
+// (what proves the shell left on a `|| exit`: shell-parse's plainExit, which also refuses a wrapped / spawned exit)
 const PROTECTED_BRANCHES = ['main', 'master'];
 const APPROVAL_LABELS = ['human-approved', 'test-change-approved'];
 const GUARD_LABELS = ['needs-human', 'pipeline-blocked', 'awaiting-review', 'pipeline-pause', 'pipeline-rollback'];
@@ -333,10 +331,12 @@ function memoLookup(ctx, key, fn) {
   return e.v;
 }
 
+const leftOf = (ctx) => () => wallLeftMs(ctx.budget); // (what the wall cap has left, asked again by each lookup it bounds)
 function branchOf(dir, gitDir, ctx) {
   if (dir === null) return null;
   let b;
-  try { b = memoLookup(ctx, ['branch', dir, gitDir ?? null], () => ctx.currentBranch(dir, { gitDir })); } catch { return null; }
+  checkDeadline(ctx.budget); // (a lookup is a child process the deadline cannot interrupt: none starts past the cap, and it is bounded by what is left of it)
+  try { b = memoLookup(ctx, ['branch', dir, gitDir ?? null], () => ctx.currentBranch(dir, { gitDir, leftMs: leftOf(ctx) })); } catch { return null; }
   if (typeof b !== 'string') return null;
   b = b.trim().replace(/^refs\/heads\//, '');
   return b === '' || b === 'HEAD' ? null : b;
@@ -371,7 +371,8 @@ function effectiveBranch(dir, gitDir, ctx) {
 function pushDestOf(dir, gitDir, ctx, branch) {
   if (dir === null) return null;
   let d;
-  try { d = memoLookup(ctx, ['push', dir, gitDir ?? null, branch ?? null], () => ctx.pushDestination(dir, branch === undefined ? { gitDir } : { gitDir, branch })); } catch { return null; }
+  checkDeadline(ctx.budget);
+  try { d = memoLookup(ctx, ['push', dir, gitDir ?? null, branch ?? null], () => ctx.pushDestination(dir, branch === undefined ? { gitDir, leftMs: leftOf(ctx) } : { gitDir, branch, leftMs: leftOf(ctx) })); } catch { return null; }
   return typeof d === 'string' && d.trim() ? d.trim() : null;
 }
 
@@ -801,10 +802,11 @@ const repoArgsOf = (flags, env, ctx) => {
 function checkIssueHold(num, repoArgs, dir, ctx, action) {
   if (DYNAMIC.test(num)) return deny(`the issue number "${num}" is built at run time, so whether it carries pipeline-pause or pipeline-rollback cannot be verified. Name the issue number.`);
   let labels;
+  checkDeadline(ctx.budget);
   try {
     // no -R / GH_REPO: the repository is the directory's — unknown after a cd that may not have run
     if (dir === null && !(repoArgs && repoArgs.length)) throw new Error('cannot tell which directory (so which repository) this runs in; name it with -R owner/repo');
-    labels = ctx.issueLabels(num, repoArgs, dir ?? ctx.cwd);
+    labels = ctx.issueLabels(num, repoArgs, dir ?? ctx.cwd, { leftMs: leftOf(ctx) });
     if (!Array.isArray(labels)) throw new Error('unexpected lookup result');
   } catch (err) {
     return deny(`could not verify issue labels for ${num} (${err?.message ?? err}); refusing to ${action} it without knowing whether it carries pipeline-pause or pipeline-rollback.`);
@@ -1016,9 +1018,11 @@ function checkApi(rest, env, dir, ctx) {
 function ownerGoMode(dir, ctx) {
   if (!ctx?.ownerGo) return 'none';
   if (dir === null) return 'chat'; // (which repository is unknown)
+  checkDeadline(ctx.budget);
   try {
-    return ctx.ownerGo.mode(dir);
-  } catch {
+    return ctx.ownerGo.mode(dir, { leftMs: leftOf(ctx) });
+  } catch (err) {
+    if (err instanceof GuardLimit) throw err; // (a lookup that ran out of time: the evaluation is refused)
     return 'chat'; // (a pipeline.yml that cannot be read)
   }
 }
@@ -1090,7 +1094,8 @@ function directMergeVerdict(pr, head, dir, ctx, what, elsewhere = false, pinFlag
   if (!/^[0-9a-f]{40}$/.test(String(head ?? ''))) return deny(`${what} #${pr}: ${where} must pin the head the owner said "merge" for: add \`${pinFlag} <full 40-character head>\`. ${via}`);
   let repo = named;
   if (repo === undefined) {
-    try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir) ?? null; } catch { repo = null; }
+    checkDeadline(ctx.budget);
+    try { repo = dir === null ? null : ctx.ownerGo.repoOf(dir, { leftMs: leftOf(ctx) }) ?? null; } catch { repo = null; }
   }
   if (!repo) return deny(`${what} #${pr}: which repository it merges in cannot be told (the checkout's remotes name none, several or one off github.com; -R / a PR URL / GH_REPO is built at run time, disagrees or names a host other than github.com; or GH_HOST is set, or the line moves gh's config directory: GH_CONFIG_DIR, XDG_CONFIG_HOME, APPDATA, HOME, or its git: GIT_DIR, GIT_CONFIG_*; or changes the remotes or gh's default repository), and the owner's "merge" names its repository. Name it with -R owner/name, or ${via[0].toLowerCase()}${via.slice(1)}`);
   let ok = false;
@@ -1132,9 +1137,11 @@ function repoMergeCommandVerdict(argv, dir, ctx, cmdEnv = {}) {
   if (!ctx?.ownerGo) return null;
   // (an unknown directory is judged by the session's own; a pipeline.yml that cannot be read leaves `npm run merge` as the guess, as the mode of an unreadable one is chat)
   let templates = [];
+  checkDeadline(ctx.budget);
   try {
-    templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd) ?? [];
-  } catch {
+    templates = ctx.ownerGo.mergeTemplates(dir ?? ctx.cwd, { leftMs: leftOf(ctx) }) ?? [];
+  } catch (err) {
+    if (err instanceof GuardLimit) throw err; // (no time left, or a read cut off by its timeout: the repo's own merge command is unknown, so the evaluation is refused, not guessed)
     templates = [{ prefix: ['npm', 'run', 'merge', '--'], shaFlag: null }];
   }
   const raw = argv.map((a) => expandVars(a, ctx));
@@ -1652,7 +1659,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
   if (!sf.sourced && path.isAbsolute(abs)) ctx.selfScript = abs;
   let v;
   try {
-    v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced);
+    v = judgeScoped(text, dir, ctx, level, sf, !sf.sourced && !sf.inline); // (#609 R1: an eval-fed text runs in the caller's shell, not a child's)
   } finally {
     ctx.selfScript = outerSelf;
   }
@@ -1738,6 +1745,8 @@ function judgeAlternatives(ctx, items, judge) {
   return v;
 }
 
+// (R1-B1: a cd behind `time` / `command` / `builtin` may or may not have moved this shell, so which package.json or node_modules/.bin a package script or a runner reads is one of two places: refused, as for a cd the guard cannot follow)
+const EXT_CD_MSG = (said) => `package script: an earlier cd behind time / command / builtin may or may not have moved this shell, so which package.json or node_modules/.bin \`${said}\` reads cannot be verified. Run the cd without the wrapper, or use an absolute --prefix.`;
 const MARKERS_MSG =(said, kind) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${kind === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
 function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
@@ -1761,6 +1770,7 @@ function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
     const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => packageScriptVerdict(argv, d, ctx, level, judged));
     if (v) return v;
     // a directory the guard lost track of (after a sourced file or a cd it cannot follow): judged like a script named at run time (`bash $F`) -- refused when the line mentions a guarded operation (t11)
+    if (ctx.extCdUnknown === true) return deny(EXT_CD_MSG(said));
     return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json `' + said + '` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
   }
   const plan = packageScripts(call, pkgEnv(ctx, dir));
@@ -1849,6 +1859,7 @@ function binVerdict(name, dir, ctx, level, quiet = false, lookup = dir) {
 function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
   const name = expandVars(argv[0], ctx);
   if (name.includes('/')) return null;
+  if (dir === null && !quiet && ctx.extCdUnknown === true) return deny(EXT_CD_MSG(argv.slice(0, 4).join(' ')));
   // (#352) a runner (npx, npm exec, pnpm dlx / exec, yarn exec, bunx) run after a cd the guard cannot follow, in a script file: its bin is looked up from the script's own directory and each one above it
   if (dir === null && lookup === null) {
     const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => binVerdict(name, d, ctx, level, quiet, d));
@@ -2116,8 +2127,8 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
   let own = Infinity;
   for (let j = loop.start; j < loop.end; j++) own = Math.min(own, cmds[j].grp?.length ?? 0);
   const { up: ownUp, depth: ownLoops } = loopOwnLevel(cmds, loop);
-  // (a command in a subshell of the body, in a text a new process runs, or one a wrapper started does not move this shell, nor continue its loop: one in a text the loop is itself in does, R10-B1)
-  const elsewhere = (x) => (x.grp?.length ?? 0) > own || x.spawn || x.up?.some((u) => u.proc && !ownUp.includes(u));
+  // (a command in a subshell of the body, in a text a new process runs, in a `coproc { }` group (a background child) or one a wrapper started does not move this shell, nor continue its loop: one in a text the loop is itself in does, R10-B1)
+  const elsewhere = (x) => (x.grp?.length ?? 0) > own || x.spawn || x.up?.some((u) => (u.proc || u.co === true) && !ownUp.includes(u));
   // (a level between the loop and the command is surely entered when the command is: a { } group with no redirection that can fail on its closer (listed as a command of no words in the group, after its
   // last one), an eval text whose eval has none; an if / case branch, a loop or function body is not (the command's ctl / loops say so))
   const entered = (u, k) => {
@@ -2154,7 +2165,7 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
     const orExits = next?.sep === '||' && plainExit(next) && cmds[j + 2]?.sep !== '|' && cmds[j + 2]?.sep !== '&'
       && !(cmds[j + 2] !== undefined && cmds[j + 2].argv.length === 0 && (cmds[j + 2].redirects ?? []).length > 0);
     const sure = surelyHere(c, j) && !(next?.sep === '||' && !orExits);
-    let moved = dirs.map((d) => (nm === 'chdir' ? null : nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}))); // (#425 R1-F2: chdir leaves the directory unknown)
+    let moved = dirs.map((d) => (nm === 'chdir' || c.extCd === true ? null : nextDir(d, nm, c.argv, ctx, cdp, c.env ?? {}))); // (#425 R1-F2: chdir leaves the directory unknown; T2: so does a cd behind `time` / `command`)
     // (`cd a && cd b`: the second runs only when the first did, so the pair either moves twice or not at all. #352 R28-F1: only when the second moves this shell as surely as the first:
     // not started by a wrapper or in a process of its own, not chdir (no builtin in bash), no redirection that may fail it, not a pipeline stage or in the background, in the first's own level; and neither is
     // negated (`! cd a && cd b`: b runs only when a failed). Else the general rule keeps a as a place the body may end in.)
@@ -2162,7 +2173,7 @@ function loopEndDirs(cmds, loop, from, ctx, cdp) {
       && x.negated !== true && x.bg !== true && x.pipe !== true && cmds[k + 1]?.sep !== '|' && cmds[k + 1]?.sep !== '&'
       && (x.loops?.length ?? 0) === (c.loops?.length ?? 0) && (x.up?.length ?? 0) === (c.up?.length ?? 0) && (x.up ?? []).every((u, m) => c.up[m] === u);
     if (sure && next?.sep === '&&' && next.argv.length && DIR_CHANGERS.includes(baseName(next.argv[0])) && surely(next, j + 1)) {
-      const after = moved.map((d) => nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {}));
+      const after = moved.map((d) => (next.extCd === true ? null : nextDir(d, baseName(next.argv[0]), next.argv, ctx, cdp, next.env ?? {})));
       moved = [...dirs, ...after];
       j++;
     }
@@ -3304,7 +3315,7 @@ function judgeReadings(str, startDir, ctx, level, names, saved) {
 function evalString(str, startDir, ctx, level, child = false) {
   checkDeadline(ctx.budget);
   if (level > MAX_NESTING) return deny('pipeline job start / alias is nested too deeply to verify.');
-  const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => ctx.budget.now() > ctx.budget.deadline }); // a scan that outlasts the deadline gives up: truncated, so denied
+  const cmds = simpleCommands(str, { env: ctx.env, bashState: ctx.bashState, expired: () => budgetExpired(ctx.budget) }); // a scan that outlasts the deadline gives up: truncated, so denied
   // #452: the group form `cd d || { echo "no d" >&2; exit 1; }; git push`, read by shell-parse's exitFollows, the files guard's rule (a group entered by ||, its last command a plain exit, no redirection on its closer)
   let shapeTop; // (the commands of the text's own level and their shape events, built when first asked)
   // #478 R1-B1: the index in cmds of the group's last command, its `exit` (-1: not this form). The commands after i up to it run only when the cd / checkout FAILED.
@@ -3375,16 +3386,17 @@ function evalString(str, startDir, ctx, level, child = false) {
       const op = own.sep === '|' ? ((deeper ? own.lead : own.pipeLead) ?? ';') : own.sep; // (a level's entry holds it as `lead`, a command as `pipeLead`: see emit)
       if (op === '&&') return true;
       // (#427: only a plain `exit` leaves (not `return`, not one with a redirection or extra words), and no redirection on the closer of its group right after it)
-      if (op === '||' && plainExit(c) && !((x.redir || x.loopOnly) && !bareExit(c)) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
+      if (op === '||' && plainExit(c) && !c.pipe && !c.bg && !(cmds[i + 1] !== undefined && cmds[i + 1].argv.length === 0 && (cmds[i + 1].redirects ?? []).length > 0)) {
         if (!deeper) return exits(x);
         // (#427 merge of main: `cd X || { exit 1; }`: the exit is the first command the `||` reaches (its own sep is ||) through `{ }` / if / while openings of this shell (no subshell level
         // between), so it runs when the change failed. Not in a function or trap body the change is not in (`cd X || function g { exit 1; }` only defines g), and no redirection on a closer
-        // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above). A redirected / loop-body move is not proven by an exit in a `coproc { }` level: it runs in a background subshell (`co`))
+        // of the levels between (`{ exit 1; } < f`: listed as commands of no words right after it, see above). No move is proven by an exit in a `coproc { }` level BELOW the move's own level: it runs in a background subshell (`co`, like `sub`);
+        // an exit in the same group as the cd (`coproc { cd X || exit 1; P; }`) is that child's own and proves it for the commands of that child)
         const between = c.up.slice(x.up.length);
         let k = i + 1;
         while (cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].up?.length ?? 0) > x.up.length) { if ((cmds[k].redirects ?? []).length > 0) break; k++; }
         const closerRedir = cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].redirects ?? []).length > 0;
-        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.sep === '||' && !((x.redir || x.loopOnly) && e.co === true)) && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
+        if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.co !== true && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
       if (op === '||' || x.cond) forget(x);
       return false;
@@ -3393,6 +3405,8 @@ function evalString(str, startDir, ctx, level, child = false) {
   };
   // sticky: a later `cd /abs` does not make it known again (`alias cd=true; cd /safe`, a DEBUG trap that cds back)
   const hazard = definesFunction(str, cmds) || cmds.some(isStateHazard);
+  // (#609 R1: one mark for the whole evaluation: a walked text defines / aliases / disables `exit` or exports a function (a child shell inherits it), so a written `exit` may not end the shell and no forget is deferred)
+  if (hazard || cmds.some((c) => c.argv.length > 1 && baseName(c.argv[0]) === 'export' && c.argv.slice(1).some((a) => /^-[a-zA-Z]*f/.test(a)))) ctx.budget.exitMayBeRedefined = true; // (on the shared budget: a startup file is judged on a copy of ctx, and its mark must reach the script)
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
   const dirAt = new Map();
   const cdDirs = cdTargets(cmds, startDir, ctx);
@@ -3423,6 +3437,8 @@ function evalString(str, startDir, ctx, level, child = false) {
   // directory on the old branch, so they are walked with the state unknown. `to`: the index of the group's exit; `snap`: the state the cd / checkout left, put back for the commands after the group unless `doubt`:
   // the change was not certain (certainChange: it may not have run, or only for a chain), then the state stays unknown (R2-F1). A branch entry first made in the group is unknown after it (R2-B1).
   let failGroup = null;
+  // #609: a non-inert group in a CHILD-run text (`bash s.sh`: a child shell does not inherit the caller's functions, so the written `exit` ends the child) whose exit is a verified literal exit of the shell that runs the text: the forget is deferred to the END of the text (the commands after the group run only when the group did not)
+  let pendingForget = false;
   // #352 R6: the loops being walked, outermost first, each a frame: its range, the state at its entry, its carry (what its body may leave for the next iteration), the places its body can start in and
   // the carry each was judged with, and the walk state to start a pass from. A frame is finished when no start is left that was not judged with the carry as it is now.
   const restoreAfterGroup = () => {
@@ -3442,9 +3458,10 @@ function evalString(str, startDir, ctx, level, child = false) {
     while (levels.length > k) {
       const l = levels.pop();
       const outer = levels[levels.length - 1];
-      if (l.e.kind === 'sub' || l.e.proc) {
+      if (l.e.kind === 'sub' || l.e.co === true || l.e.proc) {
         // (a directory a text left unknown stays unknown: it did something the walk cannot follow, `bash -c 'cd() { :; }'. A subshell's own snapshot is the directory the line goes on in, whatever a text inside it did: R10-F5)
-        if (l.e.kind === 'sub' || (dir !== null && !hazard)) dir = l.dir;
+        // (`coproc { … }` is a subshell too: it runs in a background child, so the parent goes on where it was, and a branch it switched may not have been yet: unknown)
+        if (l.e.kind === 'sub' || l.e.co === true || (dir !== null && !hazard)) dir = l.dir;
         if (l.state) { forgetNames(l.mover); aliasesUnsure(l.al); } // (#352 R11-B1: an alias it (re)defined is unsure too: the level may not have run, as for a change that is not certain)
       }
       else if (l.e.kind === 'blk') { for (const x of trackers) if (x.scoped && x.up.includes(l.e)) forget(x); } // (a change in a branch / loop / function body: unknown once the body is left)
@@ -3522,8 +3539,13 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (failGroup && i > failGroup.to) {
       // (#554: in a nested text the group's exit ends only that text, so the group may have run when the caller goes on: unless the group is inert (the end-of-text test below) the branches stay unknown)
       const inert = level === 0 || cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx));
+      const groupExit = cmds[failGroup.to];
       restoreAfterGroup();
-      if (!inert) forgetBranches(ctx);
+      // (#609: deferred only for a bare, unwrapped `exit` (plainExit, no child-launch flag, and the WRITTEN first word is `exit`: wrapper classification uses the basename, so an external `/usr/bin/time exit 1` reads as the shell's own `time` and cannot end the shell); everything else forgets at once, as before)
+      if (!inert) {
+        if (level > 0 && child === true && !ctx.budget.exitMayBeRedefined && groupExit && plainExit(groupExit) && groupExit.spawn !== true && /^\s*exit(?:[\s;}]|$)/.test(groupExit.raw ?? '')) pendingForget = true;
+        else forgetBranches(ctx);
+      }
     }
     settle(c, i); // (what a subshell saves is the SETTLED state: the rule is applied for the operator before it first, so a state the subshell's own commands forget cannot be given back as certain)
     if (levels) for (let k = levels.length; k < c.up.length; k++) levels.push({ e: c.up[k], dir, lost: false, state: false, mover: false, al: { git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, log: aliasLogLen(ctx) } });
@@ -3573,7 +3595,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (childCd) { /* the child's own directory */ }
-    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
@@ -3677,7 +3699,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
       // (an exit behind a wrapper (`env exit 1`, `command exit 1`, `/usr/bin/time exit 1`) may leave no shell: it proves nothing about the redirected move)
-      const redirOnly = how === 'redir' && c.sep !== '&&' && bareExit(cmds[exitOfGroup(i)]);
+      const redirOnly = how === 'redir' && c.sep !== '&&';
       if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly), from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);
@@ -3704,6 +3726,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (failGroup.byDir && cmds.slice(failGroup.from + 1, failGroup.to + 1).every((g) => inertInFailGroup(g, ctx))) restoreAfterGroup();
     else forgetBranches(ctx);
   }
+  if (pendingForget) forgetBranches(ctx);
   // (#352 R37-F1: a change that follows && may not have run, and one that only a branch (if / elif / else / case), a function or trap body, or a loop (#615: a body can leave early: break / continue / return / exit) made may not either; when the text ends nothing
   // after it in this text has settled it, while the caller (a script, a package script, an alias) trusts the state a definite text ends in: as if a command after `;` followed, it is forgotten
   // (`false && git switch b`, `if [ -f x ]; then git switch b; fi` as the last command of a script). (#615: none is kept)
@@ -3731,6 +3754,7 @@ function evalString(str, startDir, ctx, level, child = false) {
 // (#352 R35-F2, R36, R37-F1: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it (none is firm, redirectsFirm) means it may not have run at all: its change is unknown at once, NO exception for
 // && (R36 kept it as 'chain' for the command chained to it, but nothing settled it when the text ended, so a script ending in `git switch b > /missing/f` handed b to its caller, which pushed the branch the failed switch left))
 function certainChange(cmds, c, trusted, moves = true) {
+  if (c.extCd === true && DIR_CHANGERS.includes(baseName(c.argv[0]))) return null; // (T2: a cd behind `time` / `command` may have run as an external program in this shell's name: the directory is unknown, whatever follows)
   if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
   const inBody = Object.values(c.ctl).some(Boolean);
   // (#530 / #545: a failed redirection stops the command and gives status 1, so what follows it with && (or after `|| exit`, a plain exit) runs only when the move happened: 'redir', a tracker that is conditional
@@ -3766,7 +3790,9 @@ function evaluateGitOnce(command, {
   lexists = pathExists === existsSync ? defaultLexists : () => false, // (a caller that fakes pathExists gets no real-disk lstat)
   readDir = defaultReadDir,
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
-  now = Date.now, // injectable clock (tests)
+  now = Date.now, // injectable wall clock (tests)
+  cpu, // injectable CPU clock (tests); with only `now` injected it is the same clock
+  wall0, // the `now` time the hard wall cap counts from (the hooks pass HOOK_CLOCK: process start); undefined: the start of this evaluation
   env = {}, // the hook process's environment (BASH_ENV / ENV / ZDOTDIR name startup files the shells run); {} keeps tests hermetic
   nodePrefix, // #89 t3: where this node binary's npm keeps its global configuration (<nodePrefix>/etc/npmrc); undefined: from process.execPath, null: none (tests)
   ownerGo = null, // #58: { mode(dir), mergeTemplates(dir), repoOf(dir), approvedHead(pr, head, repo) } (git-wiring.mjs ownerGoWiring); null = no direct-merge check
@@ -3775,7 +3801,7 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), branchesUnknown: false, cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };

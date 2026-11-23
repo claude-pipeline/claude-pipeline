@@ -7,6 +7,7 @@
 // or project-scoped server could ignore `project_id`).
 import fs from 'node:fs';
 import path from 'node:path';
+import { insideClaudeCode } from '../../lib/owner-only.mjs';
 
 export const DB_REFS_REL = '.claude/pipeline-state/db-refs.json';
 export const REF_RE = /^[a-z0-9]{20}$/;
@@ -61,7 +62,11 @@ export function targetOf(projectId, state, serverSegment) {
 }
 
 // Atomic write: tmp file + rename, 0600. Throws on any failure. Used by the owner's command only.
+// #683: refuses inside Claude Code, on the REAL environment and process tree (owner-only.mjs), so a scratch script that imports this library cannot rewrite the registry (the hook cannot see a file's imports).
+// commands/db-refs.mjs checks first and gives the friendly message; this is the backstop for every other caller.
 export function writeDbRefs(home, state) {
+  const inside = insideClaudeCode(process.env);
+  if (inside) throw new Error(`the database registry is written only from the owner's own terminal (${inside}); run \`pipeline db-refs set|remove|server\` there`);
   const file = dbRefsFile(home);
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const body = `${JSON.stringify({ v: 1, refs: state.refs, servers: state.servers ?? [] }, null, 2)}\n`;
