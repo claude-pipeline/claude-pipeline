@@ -295,3 +295,28 @@ describe('#373: a long line of each new shape stays linear', () => {
   timed('many closers', ') '.repeat(5000));
   timed('many then words', 'if a; then '.repeat(2000));
 });
+
+// #529 (files guard): dash reads `A &>f` as `A &` then `>f`. A name a span assigns holds the assigned value INSIDE the span in every shell; after it dash may have kept the old value (a child ran the assignment), so a
+// later write through it is only known at run time. The target of the `&>` (and the redirects after it) is opened from the directory BEFORE the span in dash: the redirect rule already reads every directory of the line.
+describe('#529 files: a `&>` span', () => {
+  const PROT = ['.claude', 'settings.json'].join('/'); // (a protected file: the settings file of the user's claude folder)
+  denies('variable', [
+    ['assigned in the span, used after it (BASE allow, CANDIDATE deny)', 'D=/tmp/ok &>/dev/null; touch $D/f'],
+    ['assigned in the span, used after its end through && (BASE allow, CANDIDATE deny)', 'D=/tmp/ok && true &>/dev/null && touch $D/f'],
+    ['a protected round directory by a span name (BASE deny, CANDIDATE deny: control, the reason changes)', `F=22 &>/dev/null; echo '{}' > ${['.review', 'round-'].join('/')}$F/x.json`],
+  ]);
+  allows('variable', [
+    ['the same assignment without a `&>` (BASE allow, CANDIDATE allow)', 'D=/tmp/ok; touch $D/f'],
+    ['used inside the span (BASE allow, CANDIDATE allow)', 'D=/tmp/ok && touch $D/f &>/dev/null'],
+  ]);
+  denies('target', [ // (controls: BASE deny, CANDIDATE deny; the redirect rule reads every directory of the line, which covers both readings of where the `&>` target is opened)
+    ['bash opens child/FILE, dash ./FILE: cwd is the protected folder', `cd child && : &>${PROT.split('/')[1]}`, { cwd: '/home/u/.claude' }],
+    ['the redirect after the `&>` target', `cd child && : &>/dev/null >${PROT.split('/')[1]}`, { cwd: '/home/u/.claude' }],
+    ['the protected file is in the directory the cd leads to', `cd /home/u/.claude && : &>${PROT.split('/')[1]}`],
+    ['a spelled protected path', `: &>~/${PROT}`],
+  ]);
+  allows('target', [
+    ['only /dev/null (BASE allow, CANDIDATE allow)', 'cd child && : &>/dev/null'],
+    ['a relative target away from the protected folder (BASE allow, CANDIDATE allow)', 'cd /tmp/c && : &>report'],
+  ]);
+});

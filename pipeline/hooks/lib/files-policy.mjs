@@ -2472,7 +2472,7 @@ function modelZshSelfDirs(cmds, raw, ctx) {
     // (a name that something on the script may rebind keeps its text: HERE="${0:A:h}" is not believed after `read HERE`)
     if (c.env) c.env = Object.fromEntries(Object.entries(c.env).map(([k, v]) => { const f = fix(v); return [k, f !== String(v) && mayRebind(k, cmds, raw) ? v : f]; }));
     if (c.redirects) for (const r of c.redirects) if (typeof r.target === 'string') r.target = fix(r.target);
-    const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
+    const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || c.maybeBg === true || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&'); // (#529: maybeBg: dash may have run it in a child)
     if (!c.argv.length && sure) for (const [k, v] of Object.entries(c.env ?? {})) if (counts.get(k) === 1 && PLAIN_ABS.test(v) && !mayRebind(k, cmds, raw)) known.set(k, v);
   }
 }
@@ -3675,7 +3675,7 @@ function rsyncNamesSure(cmds, idx, ctx) {
     const [site] = sites;
     const c = cmds[site];
     const sure = site < limit && (c.argv.length === 0 || SURE_BINDERS.has(baseOf(c.argv[0]))) && c.depth === 0
-      && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && !['|', '&'].includes(nextTopSep(cmds, site))
+      && c.sep !== '&&' && c.sep !== '||' && c.sep !== '|' && c.sep !== '&' && c.maybeBg !== true && !['|', '&'].includes(nextTopSep(cmds, site))
       && !mayNotRun(cmds, from, site);
     if (!sure) return false;
     // (#478 R2-B2: a value that holds a name is only as sure as that name was before this site: `[ -n "$DRY" ] && N=-n; OPTS="-a --delete $N"`)
@@ -3752,6 +3752,16 @@ function collectVars(cmds, ctx) {
         if (d.unknown) unknown.add(k);
         set(k, v);
       }
+    }
+  }
+  // (#529: a name a `&>` span assigns holds the assigned value for the commands INSIDE the span in every shell; after it dash may have run the assignment in a child: the value is only known at run time wherever a later command reads it)
+  for (const [i, c] of cmds.entries()) {
+    if (c.maybeBgEnds === undefined) continue;
+    const end = Math.min(...c.maybeBgEnds);
+    const names = [...Object.keys(c.env ?? {}), ...(['export', 'declare', 'typeset', 'local', 'readonly', 'integer', 'float'].includes(baseOf(c.argv[0] ?? '')) ? declAttrs(c.argv).assigns.map(([k]) => k) : [])];
+    for (const k of names) {
+      const reads = new RegExp(`\\$\\{?${k.replace(/\W/g, '')}(?![A-Za-z0-9_])`);
+      if (cmds.slice(Math.max(end, i) + 1).some((x) => [...x.argv, ...Object.values(x.env ?? {}), ...(x.redirects ?? []).map((r) => r.target ?? '')].some((w) => reads.test(String(w))))) unknown.add(k);
     }
   }
   // Why (#74): zsh reads `$B:r` / `$B[1,6]` (an unbraced name and a modifier or subscript) as another word than the one substVars gives (`B=settings.json.x; cp x ~/.claude/$B:r`
@@ -4883,7 +4893,7 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
     if (val === null || /[$`]/.test(val)) { out.vars.set(k, null); delete local[k]; } else { out.vars.set(k, val); local[k] = val; }
   };
   for (const [i, c] of cmds.entries()) {
-    const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&');
+    const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || c.maybeBg === true || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&'); // (#529: maybeBg: dash may have run it in a child)
     if (!c.argv.length) { for (const [k, v] of Object.entries(c.env ?? {})) set(k, v, sure); for (const k of implicitBindsOf(c)) set(k, null, false); continue; } // (#352 R21-F1: a lone `{k}>f` binds k)
     const name = baseOf(c.argv[0]);
     const again = rep || repeats(cmds, i); // (R18: this command can run again: from a loop / function / trap of the line, or of the file itself)
@@ -5445,7 +5455,7 @@ function evaluateBashForFilesFrame(command, opts) {
       frame.i = idx;
       if (ctx.srcChanged.size || ctx.unknownVars.size) snaps[idx] = { changed: new Set(ctx.srcChanged), unknownV: new Set(ctx.unknownVars) }; // (what is true when this command runs: a later plain assignment must not clean it)
       opts._fsChanged = ctx.parentFsChanged || mayChangeListing(cmds, idx, ctx); // (a script or -c text this command runs sees the listing after the earlier commands)
-      if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && !inFlow(flowStart(cmds), idx)) {
+      if (!c.argv.length && (ctx.unknownVars.size || ctx.pickUnknown.size || ctx.srcTouched.size) && c.sep !== '&&' && c.sep !== '||' && c.depth === 0 && c.maybeBg !== true && !inFlow(flowStart(cmds), idx)) { // (#529: a span assignment may have run in a child: it clears nothing)
         for (const k of Object.keys(c.env ?? {})) if ((ctx.unknownVars.has(k) || ctx.pickUnknown.has(k) || ctx.srcTouched.has(k)) && !/[$`]/.test(c.env[k]) && !ctx.declared?.unknown.has(k)) { ctx.unknownVars.delete(k); ctx.pickUnknown.delete(k); ctx.srcChanged.delete(k); ctx.vars[k] = applyTransform(expandRefs(c.env[k], ctx), ctx.declared?.transform.get(k) ?? null); }
       }
       markBound(c);
