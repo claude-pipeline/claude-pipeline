@@ -4,7 +4,7 @@
 //
 // Shapes in (GitHub's own, untouched):
 //   timeline  [{ event: 'ready_for_review' | 'converted_to_draft' | 'committed' | 'head_ref_force_pushed' | ..., created_at, actor: { login } }]
-//   pr        { createdAt, draft }  (`draft` is the PR's CURRENT draft flag: with no draft/ready event on the timeline it is also what the PR always was)
+//   pr        { createdAt, draft, baseRef }  (`draft` is the PR's CURRENT draft flag: with no draft/ready event on the timeline it is also what the PR always was; `baseRef` its base branch, which a catch-up must merge)
 //   commits   normalised by normalizeCommit: { sha, parents (count), committer (login), message }
 //   runs      workflow runs: { id, name, path, event, head_sha, run_attempt, conclusion, created_at, run_started_at, updated_at }
 //   jobs      actions/runs/{id}/jobs?filter=all (every attempt): { run_attempt, conclusion, started_at, completed_at, labels }
@@ -66,21 +66,28 @@ export function prPhaseAt(timeline, prCreated, t) {
 // ---- catch-ups (update-branch) --------------------------------------------------------------------------------------
 
 // GitHub's "Update branch" (PUT pulls/{n}/update-branch, which `pipeline update-branch` calls, lib/updatebranch.mjs) makes a merge commit of the base into the
-// PR branch: two parents, committed by GitHub itself (login `web-flow`), message "Merge branch '<base>' into <head-branch>". Either mark counts (a local
-// `git merge main` writes the same message, and is the same base churn).
-const UPDATE_BRANCH_MESSAGE = /^Merge branch '[^'\n]+' into \S+/;
+// PR branch: two parents, committed by GitHub itself (login `web-flow`), message "Merge branch '<base>' into <head-branch>". A local merge writes the same message
+// ("Merge branch '<base>' into ..." or "Merge remote-tracking branch 'origin/<base>' into ..."): the same base churn. With the PR's base known (`baseRef`) the merged
+// branch must BE the base (a merge of a feature branch is a push, whoever committed it); with it unknown any merge of a branch counts, or any web-flow merge.
+const MERGE_MESSAGE = /^Merge (remote-tracking )?branch '([^'\n]+)' into \S+/;
+const mergedBranch = (message) => {
+  const m = MERGE_MESSAGE.exec(String(message).split('\n')[0]);
+  return m === null ? null : (m[1] ? m[2].replace(/^[^/]+\//, '') : m[2]);
+};
 export function normalizeCommit(c) {
   const parents = typeof c?.parents === 'number' ? c.parents : Array.isArray(c?.parents) ? c.parents.length : 0;
   const committer = typeof c?.committer === 'string' ? c.committer : (c?.committer?.login ?? null);
   const message = typeof c?.message === 'string' ? c.message : String(c?.commit?.message ?? '');
   return { sha: String(c?.sha ?? ''), parents, committer, message };
 }
-export function isCatchUpCommit(c) {
+export function isCatchUpCommit(c, baseRef = null) {
   const k = normalizeCommit(c);
   if (k.parents !== 2) return false;
-  return k.committer === 'web-flow' || UPDATE_BRANCH_MESSAGE.test(k.message.split('\n')[0]);
+  const merged = mergedBranch(k.message);
+  if (typeof baseRef === 'string' && baseRef !== '') return merged === baseRef;
+  return k.committer === 'web-flow' || merged !== null;
 }
-const catchUpShas = (commits) => new Set((commits ?? []).filter(isCatchUpCommit).map((c) => normalizeCommit(c).sha));
+const catchUpShas = (commits, baseRef = null) => new Set((commits ?? []).filter((c) => isCatchUpCommit(c, baseRef)).map((c) => normalizeCommit(c).sha));
 
 // ---- cost of one run ------------------------------------------------------------------------------------------------
 
@@ -142,7 +149,7 @@ export function elapsedMs(run) {
 // `jobsByRun`: Map run id -> jobs for the runs whose jobs were read. -> one row per run, same order.
 export function classifyRuns({ pr = null, timeline = null, commits = [], runs, jobsByRun = new Map(), rates = DEFAULT_RATES }) {
   const events = timeline ? toggles(timeline) : [];
-  const catchups = catchUpShas(commits);
+  const catchups = catchUpShas(commits, pr?.baseRef);
   const readyBy = readyHeads(events, runs);
   const openingHeads = pr && timeline ? new Set(headPushes({ pr, timeline, commits, runs }).filter((h) => h.kind === 'opening').map((h) => h.sha)) : new Set();
   return (runs ?? []).map((run) => {
@@ -198,7 +205,7 @@ const isReadyRun = (events, readyBy, t, headSha) => t !== null && events.some((e
 // created. A re-run keeps its original created_at, so a re-run never makes a push look newer; only the first run of a head counts.
 export function headPushes({ pr, timeline, commits = [], runs }) {
   const events = toggles(timeline);
-  const catchups = catchUpShas(commits);
+  const catchups = catchUpShas(commits, pr?.baseRef);
   const first = new Map();
   for (const run of runs ?? []) {
     if (run.event !== 'pull_request' || !run.head_sha) continue;
@@ -253,11 +260,14 @@ export function wastedRedrafts({ pr, timeline, commits = [], runs, viewer = null
 
 // ---- one PR ---------------------------------------------------------------------------------------------------------
 
-// The newest review-complete marker comment's time (ms), or null. Author not checked (as ci-wait does not).
-export function lastReviewMarkerAt(comments) {
+// The newest review-complete marker comment's time (ms), or null. Only the viewer's own (the pipeline posts it as the viewer; `viewer` null = unknown: any author) and never
+// an edited one (an edit is not a path review-complete takes: lib/review-marker.mjs#latestReviewComment), so a copy of a marker by someone else moves nothing.
+export function lastReviewMarkerAt(comments, viewer = null) {
   let at = null;
   for (const c of Array.isArray(comments) ? comments : []) {
     if (parseReviewRecord(c?.body) === null) continue;
+    if (viewer !== null && c?.user?.login !== viewer) continue;
+    if (c?.updated_at !== undefined && ms(c.updated_at) !== ms(c.created_at)) continue;
     const t = ms(c.created_at);
     if (t !== null && (at === null || t > at)) at = t;
   }
@@ -275,7 +285,7 @@ export function analysePrUsage({ number, pr, timeline, commits = [], comments = 
   const classified = classifyRuns({ pr, timeline, commits, runs, jobsByRun, rates });
   const pushes = headPushes({ pr, timeline, commits, runs });
   const pushedReady = pushes.filter((h) => h.kind === 'push' && h.phase === 'ready');
-  const markerAt = comments === null ? null : lastReviewMarkerAt(comments);
+  const markerAt = comments === null ? null : lastReviewMarkerAt(comments, viewer);
   const jobMinutes = zeroMinutes();
   let usd = 0;
   let workflowElapsedMin = 0;
@@ -306,7 +316,7 @@ export function analysePrUsage({ number, pr, timeline, commits = [], comments = 
     pushedHeads: pushedReady.map((h) => sha12(h.sha)),
     pushesWhileDraft: pushes.filter((h) => h.kind === 'push' && h.phase === 'draft').length,
     wastedRedrafts: wastedRedrafts({ pr, timeline, commits, runs, viewer, sinceMs }),
-    catchups: new Set((commits ?? []).filter((c) => isCatchUpCommit(c) && (sinceMs === null || (commitDate(c) ?? sinceMs) >= sinceMs)).map((c) => normalizeCommit(c).sha)).size,
+    catchups: new Set((commits ?? []).filter((c) => isCatchUpCommit(c, pr?.baseRef) && (sinceMs === null || (commitDate(c) ?? sinceMs) >= sinceMs)).map((c) => normalizeCommit(c).sha)).size,
     heavyRuns, workflowElapsedMin: round(workflowElapsedMin), jobMinutes: roundMinutes(jobMinutes), estimatedUsd: isPrivate ? round(usd, 4) : 0,
     churnRuns, churnMinutes: round(churnMinutes), churnUnreadRuns,
     finalCatchupReruns: comments === null ? null : finalCatchupReruns,
@@ -366,7 +376,8 @@ export function aggregateUsage({ classified, prRows, isPrivate, rates = DEFAULT_
     churnRuns: prRows.reduce((s, p) => s + p.churnRuns, 0),
     churnMinutes: round(prRows.reduce((s, p) => s + p.churnMinutes, 0)),
     churnUnreadRuns: prRows.reduce((s, p) => s + p.churnUnreadRuns, 0),
-    finalCatchupReruns: prRows.reduce((s, p) => s + (p.finalCatchupReruns ?? 0), 0),
+    // unknown (null) when a PR that needed its comments (it has churn runs) could not have them read; a PR that never needed them adds 0
+    finalCatchupReruns: prRows.some((p) => p.finalCatchupReruns === null && p.churnRuns > 0) ? null : prRows.reduce((s, p) => s + (p.finalCatchupReruns ?? 0), 0),
     estimatedUsd: isPrivate ? round(usd, 4) : 0,
   };
   return {
@@ -407,7 +418,7 @@ export function renderUsageTable({ since, repos }) {
     out.push('', `PRs ${t.prs} · heavy runs ${t.heavyRuns} · workflow elapsed ${minText(t.workflowElapsedMin)} min (measured) · job minutes ${osText(t.jobMinutes)} · jobs read for ${t.coverage}% of the heavy runs`);
     out.push(r.private ? `Estimated cost ${usdText(t.estimatedUsd)} (an estimate, not a bill: ${cell(r.assumptions.note)})` : 'Public repository: Actions minutes are free (estimated cost $0.00)');
     out.push(`Pushed while ready ${t.pushesWhileReady} · missed redrafts ${t.missedRedrafts === null ? 'unknown (ci.draft_while_iterating could not be read)' : t.missedRedrafts} (draft_while_iterating ${r.draftWhileIterating}) · wasted redrafts ${t.wastedRedrafts}`);
-    out.push(`Base churn: ${t.churnRuns} heavy run(s) on catch-up heads, ${minText(t.churnMinutes)} job min · ${t.catchupsPerPr ?? '-'} catch-ups per PR · ${t.finalCatchupReruns} heavy run(s) on a catch-up head after the last review-complete`);
+    out.push(`Base churn: ${t.churnRuns} heavy run(s) on catch-up heads, ${minText(t.churnMinutes)} job min · ${t.catchupsPerPr ?? '-'} catch-ups per PR · ${t.finalCatchupReruns ?? 'unknown'} heavy run(s) on a catch-up head after the last review-complete`);
     out.push(`Calls ${r.calls}${r.rateLimit ? ` · rate limit remaining ${r.rateLimit.remaining}` : ''}${r.partial ? ` · skipped: ${cell(JSON.stringify(r.skipped))}` : ''}`);
     for (const u of r.unexcludable) out.push(cell(`Note: ${u}`));
     out.push('');

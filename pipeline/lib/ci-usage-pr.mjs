@@ -31,7 +31,7 @@ export async function pushedWhileReadyOf({ root, gh, pr }) {
       // a branch name can have been used by an earlier PR, or by a PR from another fork: only the runs since this one was created, those linked to this PR, and the unlinked ones
       // whose head repository is this PR's (an unlinked run of an unknown or other repository stays unattributed)
       .filter((r) => Date.parse(r.created_at) >= created && ((r.pull_requests ?? []).length === 0 ? sameRepo(r.head_repository?.full_name, pull.head?.repo?.full_name) : r.pull_requests.some((p) => p?.number === pr)));
-    const found = pushedWhileReady({ pr: { createdAt: pull.created_at, draft: pull.draft === true }, timeline, commits, runs });
+    const found = pushedWhileReady({ pr: { createdAt: pull.created_at, draft: pull.draft === true, baseRef: pull.base?.ref }, timeline, commits, runs });
     if (found.count === 0) return { warnings };
     const heads = found.heads.map((h) => h.sha.slice(0, 12));
     const times = found.count === 1 ? 'once' : `${found.count} times`;

@@ -107,6 +107,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   const isCandidate = (r) => elapsedMs(r) >= HEAVY_ELAPSED_MS || Number(r.run_attempt) > 1;
   const candidates = runs.filter(isCandidate);
   let prListFailed = false;
+  let commentsFailed = false;
   const prOfRun = new Map();
   let byBranch = null;
   const needsBranchLookup = candidates.some((r) => r.event === 'pull_request' && !Number.isInteger(r.pull_requests?.[0]?.number));
@@ -149,7 +150,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
       const pr = gh.api('GET', `repos/${slug}/pulls/${n}`);
       const timeline = pages(gh, `repos/${slug}/issues/${n}/timeline`, undefined, cut('timeline events', n), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
       const commits = pages(gh, `repos/${slug}/pulls/${n}/commits`, undefined, cut('commits', n), { onCall: () => budget.tick(maxCalls * PR_SHARE) });
-      readPr.set(n, { pr: { createdAt: pr?.created_at, draft: pr?.draft === true }, timeline, commits, comments: null });
+      readPr.set(n, { pr: { createdAt: pr?.created_at, draft: pr?.draft === true, baseRef: pr?.base?.ref }, timeline, commits, comments: null });
     } catch (err) {
       if (err instanceof budget.stop) { skipped.prs += 1; continue; }
       warn(`#${n}: could not be read (${asciiLine(err?.message, 120)}): its runs stay unclassified`);
@@ -182,7 +183,10 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
     try {
       data.comments = pages(gh, `repos/${slug}/issues/${n}/comments`, undefined, cut('comments', n), { onCall: () => budget.tick() });
     } catch (err) {
-      if (!(err instanceof budget.stop)) warn(`#${n}: the comments could not be read (${asciiLine(err?.message, 100)}): finalCatchupReruns is unknown for it`);
+      if (!(err instanceof budget.stop)) {
+        commentsFailed = true;
+        warn(`#${n}: the comments could not be read (${asciiLine(err?.message, 100)}): finalCatchupReruns is unknown for it`);
+      }
     }
   }
 
@@ -199,7 +203,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   classified.push(...classifyRuns({ runs: unread, jobsByRun, rates }));
   const agg = aggregateUsage({ classified, prRows, isPrivate, rates, draftWhileIterating });
 
-  const partial = budget.reason !== null || skipped.prs > 0 || skipped.jobs > 0 || truncated || prListFailed;
+  const partial = budget.reason !== null || skipped.prs > 0 || skipped.jobs > 0 || truncated || prListFailed || commentsFailed;
   if (budget.reason === 'rate-limit') warn(`the rate limit is low (${budget.rate?.remaining} calls left, stopping below ${MIN_REMAINING}): the report is partial`);
   if (budget.reason === 'max-calls') warn(`--max-calls ${maxCalls} reached: the report is partial`);
   if (skipped.prs > 0) warn(`${skipped.prs} PR(s) with heavy runs were not read: their runs are unclassified`);

@@ -262,6 +262,17 @@ test('R1-B7: a run re-run in under a minute still has its jobs read (the first a
   assert.deepEqual([repo.totals.byClass.rerun.heavyRuns, repo.totals.coverage], [1, 100]);
 });
 
+test('R1-B10: a failed comments read is a warning, a partial report and an unknown (null, not 0) final catch-up total', () => {
+  const down = [{ match: '^api repos/acme/widgets/issues/7/comments', code: 1, stderr: 'gh: HTTP 502' }];
+  const r = usage(world({ extra: down }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const repo = r.json.repos[0];
+  assert.deepEqual([repo.partial, repo.totals.finalCatchupReruns, repo.prs[0].finalCatchupReruns], [true, null, null]);
+  assert.match(r.json.warnings.join('\n'), /#7: the comments could not be read/);
+  const text = usage(world({ extra: down }), ['--since', '2026-11-05']);
+  assert.match(text.stdout, /unknown heavy run\(s\) on a catch-up head after the last review-complete/);
+});
+
 test('ci-usage: without --json it prints a plain-text table with the warnings; GitHub unreachable for the first list is exit 3', () => {
   const r = usage(world({ flag: null }), ['--since', '2026-11-05']);
   assertExit(r, 0, r.stderr);
@@ -283,7 +294,7 @@ test('ci-usage: a bad --repo-slug or --max-calls is a usage error', () => {
 
 test('ci-usage: the review-complete marker is read only for a PR with a heavy catch-up run, and a catch-up suite after it is a final catch-up rerun', () => {
   const marker = `${REVIEW_COMPLETE_MARKER}\nReviewed.\n\`\`\`json\n${JSON.stringify({ contentHash: 'a'.repeat(64), base: 'b'.repeat(40), head: 'd'.repeat(40), rounds: 2, codexModel: 'gpt', modelProofDigest: null })}\n\`\`\``;
-  const withMarker = [{ match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [{ id: 1, body: marker, created_at: T('12:10') }] }];
+  const withMarker = [{ match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [{ id: 1, body: marker, created_at: T('12:10'), user: { login: 'me' } }] }];
   const r = usage(world({ extra: withMarker }), ['--json', '--since', '2026-11-05']);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.repos[0].totals.churnRuns, r.json.repos[0].totals.finalCatchupReruns], [1, 1]);

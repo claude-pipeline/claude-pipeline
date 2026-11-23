@@ -150,7 +150,7 @@ test('base churn: a heavy run on a catch-up head after the last review-complete 
   const caught = sha('c');
   const commits = [{ ...commit('c'), parents: [{}, {}], committer: { login: 'web-flow' } }];
   const marker = `${REVIEW_COMPLETE_MARKER}\nReviewed.\n\`\`\`json\n${JSON.stringify({ contentHash: 'a'.repeat(64), base: 'b'.repeat(40), head: 'd'.repeat(40), rounds: 2, codexModel: 'gpt', modelProofDigest: null })}\n\`\`\``;
-  const comments = [{ body: 'hello', created_at: T('08:00') }, { body: marker, created_at: T('13:00') }];
+  const comments = [{ body: 'hello', created_at: T('08:00') }, { body: marker, created_at: T('13:00'), user: { login: 'me' } }];
   const runs = [
     longRun(caught, T('12:00', 30), 5), // the ready_for_review suite, on a catch-up head: intended
     longRun(caught, T('13:30'), 6, { id: 777 }), // after the marker: a final catch-up rerun
@@ -167,6 +167,46 @@ test('base churn: a heavy run on a catch-up head after the last review-complete 
   assert.equal(analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits, comments: null, runs, jobsByRun }).finalCatchupReruns, null);
   const agg = aggregateUsage({ classified: p.classified, prRows: [p], isPrivate: true });
   assert.deepEqual([agg.totals.churnRuns, agg.totals.churnMinutes, agg.totals.finalCatchupReruns, agg.totals.catchupsPerPr], [2, 9, 1, 1]);
+});
+
+test("R1-B11: only the viewer's unedited marker comment sets the review-complete time (a copy by someone else, or an edited one, does not)", () => {
+  const caught = sha('c');
+  const commits = [{ ...commit('c'), parents: [{}, {}], committer: { login: 'web-flow' } }];
+  const marker = `${REVIEW_COMPLETE_MARKER}\nReviewed.\n\`\`\`json\n${JSON.stringify({ contentHash: 'a'.repeat(64), base: 'b'.repeat(40), head: 'd'.repeat(40), rounds: 2, codexModel: 'gpt', modelProofDigest: null })}\n\`\`\``;
+  const runs = [longRun(caught, T('13:30'), 6, { id: 777 })];
+  const jobsByRun = new Map([[777, [job(T('13:30'), 6)]]]);
+  const copy = { body: marker, created_at: T('14:00'), user: { login: 'someone' } };
+  const edited = { body: marker, created_at: T('14:10'), updated_at: T('14:20'), user: { login: 'me' } };
+  const mine = { body: marker, created_at: T('13:00'), user: { login: 'me' } };
+  const count = (comments) => analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits, comments, runs, jobsByRun, viewer: 'me' }).finalCatchupReruns;
+  assert.equal(count([mine, copy, edited]), 1, "the run is after the pipeline's own marker");
+});
+
+test("R1-B5: a catch-up is a merge of the PR's BASE branch (update-branch, or a local merge of origin/<base>); a merge of another branch is a push", () => {
+  const merge = (message, committer = 'web-flow') => ({ sha: 'a', parents: [{}, {}], committer: { login: committer }, commit: { message } });
+  assert.equal(isCatchUpCommit(merge("Merge branch 'feature-x' into topic"), 'main'), false, 'web-flow does not make a feature merge a catch-up');
+  assert.equal(isCatchUpCommit(merge("Merge branch 'main' into topic"), 'main'), true);
+  assert.equal(isCatchUpCommit(merge("Merge remote-tracking branch 'origin/main' into topic", 'me'), 'main'), true);
+  assert.equal(isCatchUpCommit(merge("Merge remote-tracking branch 'origin/release/1' into topic", 'me'), 'release/1'), true);
+  assert.equal(isCatchUpCommit(merge("Merge remote-tracking branch 'origin/feature-x' into topic", 'me'), 'main'), false);
+  assert.equal(isCatchUpCommit(merge("Merge remote-tracking branch 'origin/main' into topic", 'me')), true, 'no base known: any merge of a branch');
+  // the head of a feature merge pushed while ready is a push, not a catch-up
+  const pr = { ...PR_DRAFT, baseRef: 'main' };
+  const commits = [{ ...commit('c'), parents: [{}, {}], committer: { login: 'web-flow' }, commit: { message: "Merge branch 'feature-x' into topic" } }];
+  assert.equal(pushedWhileReady({ pr, timeline: TIMELINE, commits, runs: [run(sha('c'), T('10:30'))] }).count, 1);
+});
+
+test('R1-B10: a PR whose comments could not be read makes the total unknown; a PR that never needed them still adds 0', () => {
+  const caught = sha('c');
+  const commits = [{ ...commit('c'), parents: [{}, {}], committer: { login: 'web-flow' } }];
+  const runs = [longRun(caught, T('13:30'), 6, { id: 777 })];
+  const jobsByRun = new Map([[777, [job(T('13:30'), 6)]]]);
+  const needed = analysePrUsage({ number: 7, pr: PR_DRAFT, timeline: TIMELINE, commits, comments: null, runs, jobsByRun });
+  const notNeeded = analysePrUsage({ number: 8, pr: PR_DRAFT, timeline: TIMELINE, commits: [], comments: null, runs: [run(sha('2'), T('10:30'))] });
+  assert.deepEqual([needed.finalCatchupReruns, needed.churnRuns, notNeeded.finalCatchupReruns, notNeeded.churnRuns], [null, 1, null, 0]);
+  const total = (rows) => aggregateUsage({ classified: rows.flatMap((p) => p.classified), prRows: rows, isPrivate: true }).totals.finalCatchupReruns;
+  assert.equal(total([needed, notNeeded]), null);
+  assert.equal(total([notNeeded]), 0);
 });
 
 test('costOfJobs: three parallel shards plus one job are summed; an attempt-2 job counts on its own; the OS split puts self-hosted at 0 USD; each job rounds up', () => {
