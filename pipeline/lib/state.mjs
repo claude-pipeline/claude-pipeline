@@ -36,8 +36,9 @@ const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 // and would leave it out of the owner's bound items.
 // Version 10: a final carries `postMax.rule === 'cap-low'` (an unbuilt low-severity ACCEPT deferred at the round cap, the owner-approval route): a pipeline of version 9 reads it as an ordinary post-limit follow-up and would merge it
 // with no owner "merge" and no Rulings block shown.
+// Version 11: a round's `reviewBaseKind` is 'conflict' (#423): its Fable / Codex input depends on the conflict records and the sides file, which a pipeline of version 10 does not write, so an older reader would diff the cached marker tree and certify the round with a kept modify/delete or binary choice unseen.
 // A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
-export const SUPPORTED_STATE_VERSION = 10;
+export const SUPPORTED_STATE_VERSION = 11;
 export const STATE_VERSION_CLAUDE = 2;
 export const STATE_VERSION_DEFERRAL = 3;
 export const STATE_VERSION_SUBSTITUTE = 4;
@@ -46,6 +47,9 @@ export const STATE_VERSION_POST_MAX = 6;
 export const STATE_VERSION_OWNER_DEFERRAL = 7;
 export const STATE_VERSION_SAME_ON_BASE = 9;
 export const STATE_VERSION_CAP_LOW = 10;
+export const STATE_VERSION_CONFLICT = 11;
+// Does any round of the state hold a 'conflict' review base? Then the writer lifts the state to STATE_VERSION_CONFLICT (and only then).
+export const stateNeedsConflictVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => r?.reviewBaseKind === 'conflict');
 // Does any final of the state carry the cap-low rule on its post-max marker (a cached copy too)? Then the writer lifts the state to STATE_VERSION_CAP_LOW (and only then). The rule's name is triage.mjs CAP_LOW_RULE (not imported: that module imports this one).
 export const stateNeedsCapLowVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => (Array.isArray(r?.items) ? r.items : []).some((i) => i?.final?.postMax?.rule === 'cap-low'));
 // Does any final of the state carry the same-on-base mark (a cached copy too)? Then the writer lifts the state to STATE_VERSION_SAME_ON_BASE (and only then).
@@ -71,9 +75,10 @@ export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute
 // Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
 export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
 const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
-// The lowest version that may hold this state, the HIGHEST any feature in it needs: 10 when a final carries the cap-low rule (stateNeedsCapLowVersion), 9 when a final carries the same-on-base mark, 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
+// The lowest version that may hold this state, the HIGHEST any feature in it needs: 11 when a round's review base is 'conflict' (stateNeedsConflictVersion), 10 when a final carries the cap-low rule (stateNeedsCapLowVersion), 9 when a final carries the same-on-base mark, 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
 // 4 when it holds a substitute round / second review or a governor / budget decision, else 1.
 export function requiredStateVersion(state) {
+  if (stateNeedsConflictVersion(state)) return STATE_VERSION_CONFLICT;
   if (stateNeedsCapLowVersion(state)) return STATE_VERSION_CAP_LOW;
   if (stateNeedsSameOnBaseVersion(state)) return STATE_VERSION_SAME_ON_BASE;
   if (stateNeedsClickDialogVersion(state)) return STATE_VERSION_CLICK_DIALOG;

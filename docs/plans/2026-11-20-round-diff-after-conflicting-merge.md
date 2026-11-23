@@ -20,7 +20,7 @@ Second part: round-request's "changed since the last review: N commits, N files,
 - Display lists (conflicted paths, records) are capped at 50 entries. More than 50 conflicted paths means `'whole-pr'`, so the evidence is never truncated.
 - Fable's first proven pass of a PR still reads the whole PR (`writeFableDiff` scope rules unchanged). A `'conflict'` round is never a fix-verify round (`fixRoundCandidate` refuses every kind but `'previous'`; no change).
 - `pipeline/lib/git.mjs` is vendored (`commands/vendor.mjs` LIBS): run the vendor drift test after changing it.
-- Rollback note for the PR body: an older pipeline reading a recorded `'conflict'` round on a fresh clone cannot rebuild its tree. `ensureReviewBase` returns the id as it is, and the diff fails as unavailable, which fails closed.
+- Rollback note for the PR body: an older pipeline reading a recorded `'conflict'` round does NOT fail closed on its own (`ensureReviewBase` returns the cached marker tree id when it exists, and its input carries no records or sides file), so a state holding such a round is written as state version 11 and an older pipeline refuses it.
 
 ## Admission rules for `'conflict'` (Task 1 implements; all must hold)
 

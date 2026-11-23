@@ -19,6 +19,8 @@ import {
   STATE_VERSION_OUT_OF_MODEL,
   STATE_VERSION_CLICK_DIALOG,
   STATE_VERSION_CAP_LOW,
+  STATE_VERSION_CONFLICT,
+  stateNeedsConflictVersion,
   STATE_VERSION_POST_MAX,
   STATE_VERSION_OWNER_DEFERRAL,
   STATE_VERSION_SAME_ON_BASE,
@@ -523,7 +525,7 @@ test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForCom
     assert.equal(loadState(dir).version, 4);
     assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
     saveState(dir, { ...s, version: SUPPORTED_STATE_VERSION + 1 });
-    assert.throws(() => loadState(dir), /version 11.*supports.*10/);
+    assert.throws(() => loadState(dir), /version 12.*supports.*11/);
     assert.equal(decodeFromComment(encodeForComment({ ...s, version: SUPPORTED_STATE_VERSION + 1 })), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -581,7 +583,7 @@ test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOf
   assert.equal(stateNeedsOutOfModelVersion(marked), true);
   const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
   assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
-  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CAP_LOW);
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CONFLICT);
   assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
   assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
   assert.equal(stateNeedsOutOfModelVersion(null), false);
@@ -712,6 +714,20 @@ test('cap-low deferral: version 10 ONLY when a final carries postMax.rule cap-lo
   assert.equal(refusesAt9(capLow), true);
   assert.equal(refusesAt9(plain), false);
   assert.equal(stateNeedsCapLowVersion(null), false);
+});
+
+// Failure caught: a pipeline of version 10 reads a state holding a 'conflict' round, diffs the cached marker tree and certifies the round without the conflict records / sides file, so a kept modify/delete or binary choice is never seen.
+test('conflict round (#423): version 11 ONLY when a round\'s review base is conflict (saved and published); a synthetic or resolution round keeps its version; a CLI supporting 10 refuses it', () => {
+  const base = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low' });
+  const round = (kind) => addRound(base, { n: 1, fromHead: 'a', toHead: 'b', contentHashAtToHead: 'h', items: [], reviewBase: 'c'.repeat(40), reviewBaseKind: kind });
+  const conflict = round('conflict');
+  assert.equal(stateNeedsConflictVersion(conflict), true);
+  assert.equal(requiredStateVersion(conflict), STATE_VERSION_CONFLICT);
+  assert.equal(STATE_VERSION_CONFLICT, 11);
+  for (const kind of ['synthetic', 'resolution']) assert.equal(stateNeedsConflictVersion(round(kind)), false, kind);
+  assert.equal(stateNeedsConflictVersion(null), false);
+  assert.equal(decodeFromComment(encodeForComment({ ...conflict, version: 1 })).version, STATE_VERSION_CONFLICT, 'a writer that rebuilt the state from an old copy is lifted');
+  assert.ok(STATE_VERSION_CONFLICT > STATE_VERSION_CAP_LOW);
 });
 
 test('A2 (regression-only): version 9 ONLY when a final carries sameOnBase (also on a cached copy); version 9 wins over 7; a plain or owner-deferral-only state keeps its version; a CLI supporting 8 refuses 9', () => {
