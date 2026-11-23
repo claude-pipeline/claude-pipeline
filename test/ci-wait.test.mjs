@@ -1638,3 +1638,43 @@ test('e2e label (R1-F4): a failed label read is retried on the next poll like ev
   assert.equal(b.output.verdict, 'github');
   assert.equal(broken.reads.labels, MAX_READ_FAILURES);
 });
+
+// ---- a passing check that ran before the ready event is flagged, never second-guessed (#642) ---------------------------------
+
+// Catches: `ci-wait` passing within seconds of `gh pr ready` on a guard run from the draft era with nothing telling the agent
+// the pass is old (DRMed #436). Report only: the verdict stays `passed`.
+test('a passing check run that started before ready is flagged predatesReady on its checks[] entry; a ready-era pass, a pass with no start time and a status pass are judged alike; verdict unchanged (#642)', async () => {
+  const world = {
+    classic: present('old', 'fresh', 'unknown', 'oldstatus', 'freshstatus'),
+    timeline: readyTimeline,
+    checkRuns: [
+      cr('old', 'success', { started_at: '2026-01-01T11:00:00Z' }),
+      cr('fresh', 'success', { started_at: '2026-01-01T12:01:00Z' }),
+      cr('unknown', 'success'),
+    ],
+    statuses: [st('oldstatus', 'success', 'github-actions[bot]', { created_at: '2026-01-01T11:00:00Z' }), st('freshstatus', 'success', 'github-actions[bot]', { created_at: '2026-01-01T12:05:00Z' })],
+  };
+  const s = sim(world);
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  assert.equal(r.exitCode, 0);
+  const flag = Object.fromEntries(r.output.checks.map((c) => [c.name, c.predatesReady]));
+  assert.deepEqual(flag, { old: true, fresh: undefined, unknown: undefined, oldstatus: true, freshstatus: undefined });
+  assert.equal(s.suiteCalls.length, 0, 'no extra workflow-run reads to date a pass');
+});
+
+// Catches: one failed timeline read turning a draft-era pass into an unflagged one while the report still prints the readyAt a later
+// read found (the skill reads a missing predatesReady as "not a draft-era pass").
+test('a timeline read that fails once does not hide predatesReady: the flag is judged against the readyAt the report prints', async () => {
+  let reads = 0;
+  const s = sim({
+    classic: present('old'),
+    timeline: () => { reads += 1; if (reads === 1) throw new Error('HTTP 502'); return readyTimeline; },
+    checkRuns: [cr('old', 'success', { started_at: '2026-01-01T11:00:00Z' })],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
+  // the one failed read is retried by the poll loop, so the pass still carries readyAt and the draft-era flag
+  assert.notEqual(r.output.readyAt, null, JSON.stringify(r.output));
+  assert.equal(r.output.checks[0].predatesReady, true, JSON.stringify(r.output));
+});

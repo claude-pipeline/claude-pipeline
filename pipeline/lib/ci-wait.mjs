@@ -63,6 +63,8 @@
 // run is not created yet (seconds after `gh pr ready`) counts as pass. The window is narrow: the skipped job of the same workflow
 // keeps the wait open until that workflow's ready run exists, and the live gate re-reads CI before any merge. Requiring a
 // ready-era run for every identity would hang on checks whose workflows do not trigger on `ready_for_review`.
+// The residual is REPORTED instead: a `checks[]` entry that passed on a run (or status) dated before `readyAt` carries
+// `predatesReady: true` (absent otherwise; an unreadable time never sets it). The verdict is unchanged.
 import { EXIT } from './cli.mjs';
 import { requiredFromRules } from './protection.mjs';
 import { REVIEW_CONTEXT, parseReviewRecord } from './review-marker.mjs';
@@ -309,11 +311,16 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     return era === 'stale' ? 'stale-fail' : era === 'superseded' ? 'superseded' : bad;
   };
 
+  // Report only (see RESIDUAL): did a PASSING check start before the ready event? Dated by its own started_at (a re-run is a new check
+  // run with its own start), noted here per check and judged in result() against the same readyAt the report prints, so one failed
+  // timeline read cannot leave a pass dated before readyAt unflagged.
+  const passStarts = new WeakMap(); // evaluate() result -> ms each passing producer started (NaN when unreadable)
   const statusBasis = new WeakMap(); // evaluate() result -> the commit status it rests on (for the status re-read and its evidence)
   const evaluate = async (identity, obs, pr) => {
     const producers = [];
     for (const run of latestRuns(obs.checkRuns, identity.name, identity.appId)) {
-      producers.push({ state: await runState(run, pr), url: run.html_url ?? null });
+      const state = await runState(run, pr);
+      producers.push({ state, url: run.html_url ?? null, ...(state === 'pass' ? { at: Date.parse(run.started_at) } : {}) });
     }
     const status = latestStatus(obs.statuses, identity.name);
     if (status) {
@@ -322,13 +329,14 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       if (counts) {
         let state = statusState(status);
         if (state === 'fail' && (await statusPredatesReady(status, pr))) state = 'stale-fail';
-        producers.push({ state, url: status.target_url ?? null, status });
+        producers.push({ state, url: status.target_url ?? null, status, ...(state === 'pass' ? { at: Date.parse(status.created_at) } : {}) });
       }
     }
     if (producers.length === 0) return { name: identity.name, appId: identity.appId, state: 'missing', url: null, ...(identity.source ? { source: identity.source } : {}) };
     const worst = producers.reduce((a, b) => (RANK[b.state] > RANK[a.state] ? b : a));
     const out = { name: identity.name, appId: identity.appId, state: worst.state, url: worst.url, ...(identity.source ? { source: identity.source } : {}) };
     if (worst.status) statusBasis.set(out, worst.status);
+    if (out.state === 'pass') passStarts.set(out, producers.filter((p) => p.state === 'pass').map((p) => p.at));
     return out;
   };
 
@@ -429,6 +437,13 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (readyAt === null && last.pr) {
       try { readyAt = await getReadyAt(last.pr); } catch { readyAt = null; }
     }
+    const readyMs = readyAt === null ? NaN : Date.parse(readyAt);
+    const checks = last.states.map((s) => {
+      const starts = passStarts.get(s);
+      if (!starts) return s;
+      const { predatesReady: _drop, ...rest } = s;
+      return Number.isFinite(readyMs) && starts.some((at) => Number.isFinite(at) && at < readyMs) ? { ...rest, predatesReady: true } : rest;
+    });
     return {
       exitCode,
       output: {
@@ -437,7 +452,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
         head,
         readyAt,
         requiredSource: { classic: sources.classic?.kind ?? null, rules: sources.rules?.kind ?? null },
-        checks: last.states,
+        checks,
         ...extra,
       },
     };
@@ -621,6 +636,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     const owedNote = notOwed.length > 0 ? { notOwed } : {};
     // --wait-others: the required checks are green but a non-required check of the run-e2e suite is still running: keep waiting for it (a red or finished one ends the wait as `passed` with `others`, as before).
     if (waitOthers && others !== null && others.some((o) => RUNNING_OTHER.has(o.status)) && elapsed() < timeoutMs) return null;
+    await getReadyAt(pr); // a failed timeline read throws into the poll loop and is retried (like the label read below): the pass is dated against ready, never reported without readyAt / predatesReady
     if (others !== null && others.length > 0) {
       return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
     }
