@@ -71,6 +71,8 @@ test('describeSql: #655 only the own WHERE of a statement counts, not one in a s
   assert.deepEqual(flags('delete from t returning 1 as where'), ['DELETE-NO-WHERE']);
   assert.deepEqual(flags('update t set x = t.where'), ['UPDATE-NO-WHERE']);
   assert.deepEqual(flags('update t set a = 1 returning 1 as where'), ['UPDATE-NO-WHERE']);
+  // a qualified column named returning is not the RETURNING clause
+  assert.deepEqual(flags('update t set v = t.returning where id = 1'), []);
   // an empty condition is no condition
   assert.deepEqual(flags('delete from t where'), ['DELETE-NO-WHERE']);
   // matched outer parentheses around an always-true condition do not hide it
@@ -134,6 +136,18 @@ test('describeSql: #655 UPDATE/DELETE words outside UPDATE/DELETE/WITH/MERGE sta
   assert.deepEqual(flags('create policy p on t for update using (true)'), []);
   assert.deepEqual(flags('alter table t add constraint f foreign key (a) references u on delete cascade'), []);
   assert.deepEqual(flags('grant update, delete on t to r'), ['GRANT']);
+  // CREATE TABLE ... AS runs a data-modifying CTE; only the words after its AS count, so a plain CREATE TABLE stays quiet
+  assert.deepEqual(flags('create table archived_events as with moved as (delete from events returning *) select * from moved'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('create temp table a as with m as (update t set a = 1 returning *) select * from m'), ['UPDATE-NO-WHERE']);
+  assert.deepEqual(flags('create table a as with m as (delete from events where id = 1 returning *) select * from m'), []);
+  assert.deepEqual(flags('create table c (id int references u on delete cascade, x int generated always as (id + 1) stored)'), []);
+  assert.deepEqual(flags('create temp table c (id int) on commit delete rows'), []);
+  assert.deepEqual(flags('create temp table c on commit delete rows as select id from u'), []);
+  // PREPARE ... AS runs the statement at EXECUTE
+  assert.deepEqual(flags('prepare p as delete from t; execute p'), ['DELETE-NO-WHERE']);
+  assert.deepEqual(flags('prepare p as update t set a = 1'), ['UPDATE-NO-WHERE']);
+  assert.deepEqual(flags('prepare p (int) as delete from t where id = $1'), []);
+  assert.deepEqual(flags('prepare p as select * from t for update'), []);
 });
 
 test('describeSql: unterminated SQL is unparsed', () => {

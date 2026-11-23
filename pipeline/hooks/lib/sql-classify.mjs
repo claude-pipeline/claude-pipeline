@@ -114,7 +114,7 @@ const hasRun = (words, ...run) => {
 };
 
 // #655 (the "changes every row" hint). FAIL CLOSED, no precise walk: when in doubt the warning shows. The hint may over-warn; it must never stay
-// silent on an UPDATE/DELETE without a WHERE of its own. In a statement that starts with WITH, EXPLAIN, COPY or a parenthesis (they run or wrap the
+// silent on an UPDATE/DELETE without a WHERE of its own. In a statement that starts with WITH, EXPLAIN, COPY, PREPARE or a parenthesis, or that is a CREATE TABLE ... AS (after its AS) (they run or wrap the
 // change) every UPDATE/DELETE word is a DML start unless the full run around it proves otherwise (dmlKind); a statement starting with UPDATE/DELETE
 // is scanned at its first word, MERGE for its actions, and anything else (policies, foreign keys, GRANT) gives no hint.
 
@@ -143,9 +143,10 @@ function ownWhere(stmt, from) {
       if (depth < 0) { closed = true; break; }
     } else if (depth === 0 && t.t === 'word') {
       const w = t.v.toUpperCase();
-      if (w === 'RETURNING') break; // nothing after it is a filter
-      // WHERE as an output label (AS where) or a qualified name (t.where) is not a filter
       const prev = stmt[k - 1];
+      // a qualified column named returning (t.returning) is not the clause
+      if (w === 'RETURNING' && !(prev.t === 'punct' && prev.v === '.')) break; // nothing after it is a filter
+      // WHERE as an output label (AS where) or a qualified name (t.where) is not a filter
       if (w === 'WHERE' && !(prev.t === 'punct' && prev.v === '.') && !(prev.t === 'word' && prev.v.toUpperCase() === 'AS')) { at = k; break; }
     }
   }
@@ -194,12 +195,16 @@ export function describeSql(sql) {
     if (first === 'TRUNCATE') found.add('TRUNCATE');
     const starts = []; // [index, 'UPDATE' | 'DELETE'] of every UPDATE/DELETE that begins a change
     if (first === 'UPDATE' || first === 'DELETE') starts.push([0, first]);
-    const scanned = first === 'WITH' || first === 'EXPLAIN' || first === 'COPY' || (stmt[0]?.t === 'punct' && stmt[0].v === '(');
+    let depth = 0;
+    const depths = stmt.map((t) => { if (t.t === 'punct' && t.v === ')') depth -= 1; const d = depth; if (t.t === 'punct' && t.v === '(') depth += 1; return d; });
+    // CREATE [..] TABLE ... AS runs what follows its AS (a data-modifying CTE): scan only the words after that AS; PREPARE ... AS runs it at EXECUTE
+    const tableAt = words.indexOf('TABLE');
+    const createAs = first === 'CREATE' && tableAt > 0 && tableAt <= 3 ? words.findIndex((w, i) => w === 'AS' && depths[i] === 0) : -1;
+    const scanned = first === 'WITH' || first === 'EXPLAIN' || first === 'COPY' || first === 'PREPARE' || createAs >= 0 || (stmt[0]?.t === 'punct' && stmt[0].v === '(');
     if (scanned || first === 'MERGE') {
-      let depth = 0;
-      const depths = stmt.map((t) => { if (t.t === 'punct' && t.v === ')') depth -= 1; const d = depth; if (t.t === 'punct' && t.v === '(') depth += 1; return d; });
       words.forEach((w, i) => {
         if (w !== 'UPDATE' && w !== 'DELETE') return;
+        if (i < createAs) return;
         const kind = dmlKind(words, depths, i);
         if (kind === 'merge') found.add(`MERGE-${w}`);
         else if (kind === 'dml' && scanned) starts.push([i, w]);
