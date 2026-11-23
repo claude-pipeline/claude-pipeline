@@ -42,8 +42,14 @@ describe('#373 task 1: || | & between simple commands', () => {
     ['a join earlier on its own line', `true || false\n${P} && find . -delete`],
     ['a pipe earlier on its own line', `echo x | cat\n${P} && find . -delete`],
     ['a job earlier on its own line', `sleep 1 &\n${P} && find . -delete`],
+    ['#529 twin: the same chain without a `&>` (BASE allow, CANDIDATE allow)', `${P} && find . -delete`],
+    ['#529: a `&>` after the write: the cd and the write are one span, dash runs both in the child (BASE allow, CANDIDATE allow)', `${P} && find . -delete &>/dev/null`],
   ]);
   denies('joins', [
+    // #529: dash reads `cd D &>f && W` as `cd D &` (a child) then `>f && W`: W runs in the OLD directory, which the narrowing must not forget. Failure caught: `find . -delete` judged only in /home/u/proj while dash deletes from /home/u.
+    ['#529: a cd inside a `&>` span starts no chain past it (BASE allow, CANDIDATE deny)', `${P} &>/dev/null && find . -delete`],
+    ['#529: the same with `|| exit 1` (BASE allow, CANDIDATE deny)', `${P} &>/dev/null || exit 1; find . -delete`],
+    ['#529: the cd is in the span through its list (BASE allow, CANDIDATE deny)', `${P} && true &>>/tmp/l && find . -delete`],
     ['a cd after | (it may run in a subshell)', `a | ${P} && find . -delete`],
     ['a cd after || (it may be skipped)', `a || ${P} && find . -delete`],
     ['the cd is a stage of a pipeline', `${P} | true && find . -delete`],

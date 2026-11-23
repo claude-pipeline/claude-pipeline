@@ -5922,6 +5922,7 @@ function evaluateBashForFilesFrame(command, opts) {
       const entered = (evAt.get(k) ?? []).some((e) => e.kind === '(' || e.kind === '{'); // (the first command of a subshell or group: it runs whenever the construct does, whatever joined the construct to what is before it)
       if (resume !== undefined && resume.at === k && (sep === ';' || sep === '&&')) chain = resume.chain;
       else if (sep !== '&&') chain = sep === ';' && fr !== undefined && fr.live && !fr.touched ? chain : null;
+      if (chain && chain.spanEnd !== undefined && cmds.indexOf(c) > chain.spanEnd) chain = null; // (#529: a chain a cd made inside a `&>` span ends with the span: dash ran the cd in a child, the commands after it are in the old directory)
       if (chain) narrowDirs.set(c, chain);
       if (fr && (cdOf(c) || changesDir(c))) fr.touched = true;
       if (!cdOf(c)) {
@@ -5932,6 +5933,7 @@ function evaluateBashForFilesFrame(command, opts) {
       const reach = t === null ? null : landings(t, chain ?? known);
       if (reach === null) { lost = true; chain = null; continue; }
       const here = withReal(reach);
+      if (c.maybeBgEnds !== undefined) here.spanEnd = Math.min(...c.maybeBgEnds); // (#529: the earliest span the cd is in: the chain lasts only to its end)
       known = unique([...known, ...here]);
       if (known.length > 32 || here.length > 32) { lost = true; chain = null; continue; }
       const ran = (sep !== '||' && sep !== '|') || entered; // (a cd after || or | may not have run, unless it opens the subshell or group that was entered that way)
