@@ -74,11 +74,13 @@ const MERGE_MESSAGE = /^Merge (remote-tracking )?branch '([^'\n]+)'(?: of (\S+))
 const repoOfUrl = (url) => url.replace(/\.git$/, '').split(/[/:]/).filter(Boolean).slice(-2).join('/').toLowerCase();
 // the host of a pulled URL (https://host/o/r, ssh://git@host/o/r, git@host:o/r, host:o/r); GitHub's own repositories are on github.com
 const hostOfUrl = (url) => (/^[a-z][a-z0-9+.-]*:\/\//i.test(url) ? url.replace(/^[^/]*\/\//, '').replace(/^[^@/]*@/, '').split(/[/:]/)[0] : url.replace(/^[^@/]*@/, '').split(/[/:]/)[0]).toLowerCase();
+// github.com, and ssh.github.com (git over ssh port 443)
+const GITHUB_HOSTS = new Set(['github.com', 'ssh.github.com']);
 const mergedBranch = (message, baseRepo = null) => {
   const m = MERGE_MESSAGE.exec(String(message).split('\n')[0]);
   if (m === null) return null;
   const known = typeof baseRepo === 'string' && baseRepo !== '';
-  if (m[3] !== undefined && known && (repoOfUrl(m[3]) !== baseRepo.toLowerCase() || hostOfUrl(m[3]) !== 'github.com')) return null;
+  if (m[3] !== undefined && known && (repoOfUrl(m[3]) !== baseRepo.toLowerCase() || !GITHUB_HOSTS.has(hostOfUrl(m[3])))) return null;
   if (m[1]) return m[2].replace(/^[^/]+\//, '');
   const owner = /^([^:/]+):/.exec(m[2])?.[1];
   if (owner !== undefined && known && owner.toLowerCase() !== baseRepo.split('/')[0].toLowerCase()) return null;

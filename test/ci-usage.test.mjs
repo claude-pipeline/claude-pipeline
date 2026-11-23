@@ -253,7 +253,8 @@ test('R2-B1: two PRs open at once from the same head branch (different bases): a
   assert.equal(r.json.warnings.length, 0, r.json.warnings.join('\n'));
 });
 
-test('R3-B1: a newer PR from the same branch already closed when the run was created does not hide the one PR that was open: the run goes to it', () => {
+test('R3-B1 / R5-B1: a sibling PR on the same branch that had already closed when an unlinked pull_request run was created leaves the run unattributed (it may be that sibling\'s own)', () => {
+  // failure caught: the run list cannot tell sibling PRs apart, so naming the open one by elimination charged a closed PR's run (any time after its close) to it
   const unlinked = RUNS.map((x) => ({ ...x, pull_requests: [] }));
   const pulls = [{ match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [
     { number: 9, created_at: T('09:10'), updated_at: T('13:00'), closed_at: T('09:20'), head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
@@ -261,11 +262,12 @@ test('R3-B1: a newer PR from the same branch already closed when the run was cre
   ] }];
   const r = usage(world({ runs: unlinked, extra: pulls }), ['--json', '--since', '2026-11-05']);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.deepEqual(r.json.repos[0].prs.map((p) => p.pr), [7]);
-  assert.equal(r.json.repos[0].totals.pushesWhileReady, 1);
+  assert.deepEqual(r.json.repos[0].prs.map((p) => p.pr), []);
+  assert.equal(r.json.repos[0].totals.byClass.unclassified.runs, 5, 'the five pull_request runs, hours after the close');
+  assert.equal(r.json.repos[0].totals.pushesWhileReady, 0);
 });
 
-test('R4-B1: a pull_request run created right after a sibling PR closed is not given to the open sibling by elimination; runs well after the close still are (R3-B1)', () => {
+test('R4-B1: a pull_request run created right after a sibling PR closed is not given to the open sibling by elimination', () => {
   // failure caught: closing PR 9 (workflows on `closed`) charged its run to the still-open PR 7 and could name it a missed redraft
   const unlinked = RUNS.map((x) => ({ ...x, pull_requests: [] }));
   const pulls = [{ match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [
@@ -274,8 +276,21 @@ test('R4-B1: a pull_request run created right after a sibling PR closed is not g
   ] }];
   const r = usage(world({ runs: unlinked, extra: pulls }), ['--json', '--since', '2026-11-05']);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.equal(r.json.repos[0].totals.byClass.unclassified.runs, 3, 'the 09:30 run (both PRs open) and the two 10:30 runs (within 120 s of the close) stay unattributed');
+  assert.equal(r.json.repos[0].totals.byClass.unclassified.runs, 5, 'the 09:30 run (both PRs open), the two 10:30 runs (just after the close) and the two later runs (R5-B1: no time bound) stay unattributed');
   assert.equal(r.json.repos[0].totals.pushesWhileReady, 0);
+});
+
+test('R5-B1: an unlinked pull_request run 2 minutes after a sibling PR closed (past any short window) still stays unattributed', () => {
+  // failure caught: a close-time workflow that queued for over 120 s was charged to the open sibling PR 7
+  const late = run(3001, { pull_requests: [], created_at: T('10:02', 1), run_started_at: T('10:02', 1), updated_at: plus(T('10:02', 1), 12) });
+  const pulls = [{ match: '^api repos/acme/widgets/pulls\\?state=all', stdoutJson: [
+    { number: 9, created_at: T('09:10'), updated_at: T('13:00'), closed_at: T('10:00'), head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+    { number: 7, created_at: T('09:00'), updated_at: T('13:00'), closed_at: null, head: { ref: 'agent/x', repo: { full_name: 'acme/widgets' } } },
+  ] }];
+  const r = usage(world({ runs: [late], extra: pulls }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.repos[0].prs.map((p) => p.pr), []);
+  assert.equal(r.json.repos[0].totals.byClass.unclassified.runs, 1);
 });
 
 test('R3-B4: a PR with more commits than GitHub returned (it caps them at 250, with no cut page) makes the report partial and warns', () => {
