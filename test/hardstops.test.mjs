@@ -820,6 +820,10 @@ test('IO: deleting a shared-runner pgTAP file (assertions, test function, or inc
     assertions: "select is(1, 1, 'one');\nselect throws_ok('select 1/0', '22012');\n",
     testFunction: "create or replace function tests.test_rls() returns setof text as $$ begin return next ok(true); end $$ language plpgsql;\n",
     include: "\\ir 0150_rls_cases.sql\n",
+    includeLong: "\\include 0150_rls_cases.sql\n",
+    includeRelative: "\\include_relative 0150_rls_cases.sql\n",
+    setHas: "select set_has('select id from visible_rows', 'values (1)', 'expected row is visible');\n",
+    isntEmpty: "select isnt_empty('select id from patients', 'rls leaves rows');\n",
   };
   for (const [label, body] of Object.entries(bodies)) {
     const hits = await moveCollect({ 'supabase/tests/0150_cases.sql': body }, (repo) => {
