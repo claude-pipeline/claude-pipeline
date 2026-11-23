@@ -253,19 +253,22 @@ test('P cost --from-transcript: a transcript with no messages is still booked bu
   assert.doesNotMatch(ok.json.warnings.join('\n'), /no messages/);
 });
 
-// Failure caught: the replay advice said the retry and hand amounts "are already booked" even when the record write failed (nothing booked), so following it dropped them; and, after a --usd booking, it said to drop --usd, so the replay added the transcript's list price on top of the override.
-test('P cost --from-transcript: the empty-transcript replay advice says --usd 0 after a --usd booking, and after a failed write says to run the whole command again', () => {
+// Failure caught: the replay advice said the retry and hand amounts "are already booked" even when the record write failed (nothing booked), so following it dropped them; and, after a --usd booking it advised a replay (with or without --usd) that either added the transcript's list price on top of the override or, with --usd 0, left the flushed tokens out of the ledger so the next booking counted them twice; after a failed write it said to run the whole command again, which can count a write the server did take twice.
+test('P cost --from-transcript: the empty-transcript replay advice is absent after a --usd booking, and after a failed write says to check the run record before booking again', () => {
   const s = scenario();
   s.repo.write('.review/empty.jsonl', '');
   const withUsd = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl', '--usd', '5']);
   assertExit(withUsd, 0);
-  assert.match(withUsd.json.warnings.join('\n'), /--usd 0/);
+  const usdText = withUsd.json.warnings.join('\n');
+  assert.match(usdText, /no replay is needed/);
+  assert.doesNotMatch(usdText, /--usd 0|running again|only --from-transcript/);
   s.fake.setScript(ghEntries({ prHead: s.head, comments: [existing(written(s))], extra: [{ match: '-X PATCH repos/acme/widgets/issues/comments/77', code: 1, stderr: 'gh: Server Error (HTTP 502)' }, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }));
   const failed = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl', '--output', '5', '--retry']);
   assertExit(failed, 1);
   assert.equal(failed.json.recorded, false);
   const text = failed.json.warnings.join('\n');
-  assert.match(text, /run the whole command again/);
+  assert.match(text, /may or may not have landed: check the PR's run record before booking it again/);
+  assert.doesNotMatch(text, /whole command/);
   assert.doesNotMatch(text, /already booked/);
 });
 

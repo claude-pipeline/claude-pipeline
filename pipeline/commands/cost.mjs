@@ -81,7 +81,7 @@ export const run = guarded(async (argv, ctx) => {
   const patch = { cost: {} };
   const notes = [];
   // A file that appears before its lines are flushed reads as empty or partial: still booked, but the caller is told it may be low.
-  // The replay advice (what to repeat, what not to) is added after the write and only when it succeeded: after a failed write nothing was booked, so the whole command is run again.
+  // The replay advice (what to repeat, what not to) is added after the write and only when it succeeded: after a failed write it may or may not have landed, so the caller is told to check the run record first; after a --usd booking no replay is advised.
   const emptyTranscript = Boolean(values['from-transcript']) && fromFile.messages === 0;
   let bucketed = false;
   if (spent) {
@@ -132,9 +132,9 @@ export const run = guarded(async (argv, ctx) => {
     const ok = record !== null;
     if (emptyTranscript) {
       notes.push('the transcript held no messages (it may not be flushed yet): the booking may be low');
-      notes.push(ok
-        ? `later book the rest by running again with the same --phase, --role and --round${values.model ? ', the same --model' : ''} and only --from-transcript: leave out --retry and hand token amounts (already booked, they would count twice)${values.usd !== undefined ? ', and pass --usd 0 (the --usd amount is already booked)' : ''}`
-        : 'the booking was not recorded: once the transcript is flushed, run the whole command again');
+      if (!ok) notes.push('the booking write failed or its answer was lost, so it may or may not have landed: check the PR\'s run record before booking it again (a repeat can count it twice)');
+      else if (values.usd !== undefined) notes.push('the --usd amount already holds this booking\'s cost: no replay is needed (a replay would price the transcript on top of it)');
+      else notes.push(`later book the rest by running again with the same --phase, --role and --round${values.model ? ', the same --model' : ''} and only --from-transcript: leave out --retry and hand token amounts (already booked, they would count twice)`);
     }
     return {
       exitCode: ok ? EXIT.OK : EXIT.FAILED,
