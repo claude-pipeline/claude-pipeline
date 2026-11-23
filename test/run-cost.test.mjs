@@ -238,6 +238,19 @@ test('P cost --from-transcript: the transcript usage is booked, explicit amounts
   assertExit(costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/missing.jsonl']), 2);
 });
 
+// Failure caught: a transcript read in the moment it is created (empty or half-flushed) was booked as ok with nothing in the output saying it held no messages, so the caller never booked it again (#658).
+test('P cost --from-transcript: a transcript with no messages is still booked but warns that the booking may be low; one with messages does not', () => {
+  const s = scenario();
+  s.repo.write('.review/empty.jsonl', '');
+  const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/empty.jsonl']);
+  assertExit(r, 0);
+  assert.equal(r.json.recorded, true);
+  assert.match(r.json.warnings.join('\n'), /held no messages.*may be low.*again later/);
+  s.repo.write('.review/full.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { output_tokens: 3 } } })}\n`);
+  const ok = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/full.jsonl']);
+  assert.doesNotMatch(ok.json.warnings.join('\n'), /no messages/);
+});
+
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
 test('P cost --from-transcript: booking a continued agent\'s transcript again books only the new usage (total = the whole transcript once)', () => {
   const s = scenario();
