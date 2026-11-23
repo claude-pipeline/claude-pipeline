@@ -184,6 +184,8 @@ const isR4Pipeline = (p) => (inc(p, R4_PIPELINE_GLOBS.filter((g) => !GITHUB_DIR_
 const isR4Config = (p) => isAgentInstructionPath(p) || inc(p, R4_CONFIG_GLOBS) || (inc(p, GITHUB_DIR_GLOBS) && MARKDOWN_FILE.test(p));
 // pgTAP tests are the RLS safety net: deleting or moving one weakens it (editing one is left to the test-integrity check).
 const TEST_DIR_GLOBS = ['**/supabase/tests/**'];
+// A pgTAP test file declares its plan or runs its tests through one of these; a helper or fixture under the test dir has none.
+const PGTAP_MARKER = /\b(?:plan|no_plan|done_testing|finish|runtests)\s*\(/i;
 const WORKFLOW_GLOBS = ['**/.github/workflows/**'];
 
 // `\b` treats `_` as a word character, so `tin_number` would dodge `\btin\b`; use explicit [a-z0-9] boundaries.
@@ -1349,7 +1351,8 @@ function pathRules(d, cx, sink) {
   const r4c = r4 ? undefined : d.paths.find(isR4Config);
   if (r4) sink.add('R4-pipeline', d.file, `pipeline/verify file: ${r4}`);
   else if (r4c) sink.add('R4-config', d.file, `agent-instruction / build-config file: ${r4c}`);
-  if ((d.status === 'D' || d.status === 'R') && d.paths.some((p) => inc(p, TEST_DIR_GLOBS))) {
+  // Exempt only when the wrapper read the OLD path's blob on the merge-base and found no pgTAP marker (absent set = keep R4).
+  if ((d.status === 'D' || d.status === 'R') && d.paths.some((p) => inc(p, TEST_DIR_GLOBS)) && !cx.pgtapFreeMoves.has(d.file)) {
     sink.add('R4-pipeline', d.file, `pgTAP test ${STATUS_WORD[d.status]}`);
   }
 
@@ -1498,11 +1501,12 @@ const needs = (cond, msg) => {
 //   envFiles      Set of changed files that mention process.env / z.object / createEnv (default: judged from the diff lines)
 //   envImportFiles  Set of changed files that import an env object, so `env.NAME` is a read (default: judged from the diff lines)
 //   headFiles     Map file -> whole new content of changed code files (optional): lets the import check read an import split over lines
+//   pgtapFreeMoves  Set of deleted/renamed files whose old path under the test dirs held no pgTAP marker on the merge-base (default: none, so R4 stays)
 //   guardLosses   [{file, kind:'code'|'sql', detail}] guards that vanished from the whole file without a removed line (commented out)
 // Throws TypeError when the diff touches SQL or package.json and sqlStatements / pkgPairs (or basePkg+headPkg) are missing.
 // Returns hits `{ rule, file, line?, excerpt?, detail, advisory? }`; `advisory: true` = report-only (see blockingHits).
-export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [], headFiles }) {
-  const cx = { ...settings(config), headFiles: new Map(headFiles instanceof Map ? headFiles : Object.entries(headFiles ?? {})) };
+export function classifyHardStops({ files, config, baseEnvNames = new Set(), basePkg, headPkg, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses = [], headFiles, pgtapFreeMoves = [] }) {
+  const cx = { ...settings(config), headFiles: new Map(headFiles instanceof Map ? headFiles : Object.entries(headFiles ?? {})), pgtapFreeMoves: new Set(pgtapFreeMoves) };
   const sink = makeSink();
   const known = new Set(baseEnvNames);
   const env = { known, envFiles: envFiles === undefined ? null : new Set(envFiles), importFiles: envImportFiles === undefined ? null : new Set(envImportFiles) };
@@ -1968,6 +1972,16 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
     if (text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
     else tooBig.push({ rule: 'R0-unscannable', file: d.file, detail: `file is larger than ${MAX_HEAD_TEXT} characters; its imports cannot be checked` });
   }
-  const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles });
+  // A delete/rename under the test dirs is exempt from R4 only when the base copy (never a blob from inside the PR) has no pgTAP
+  // marker. Any read error leaves the file out of the set, so R4 stays.
+  const pgtapFreeMoves = [];
+  for (const d of ds) {
+    if ((d.status !== 'D' && d.status !== 'R') || !d.oldPath || !inc(d.oldPath, TEST_DIR_GLOBS)) continue;
+    try {
+      const before = showFile(mb, d.oldPath, o);
+      if (before !== null && !PGTAP_MARKER.test(before)) pgtapFreeMoves.push(d.file);
+    } catch { /* unreadable base blob: fail closed */ }
+  }
+  const hits = classifyHardStops({ files, config, baseEnvNames, pkgPairs, sqlStatements, envFiles, envImportFiles, guardLosses, headFiles, pgtapFreeMoves });
   return settleHits([...hits, ...tooBig, ...reverseImportHits(ds, head, o, cx, maxImporterHits)], cx);
 }

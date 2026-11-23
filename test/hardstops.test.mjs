@@ -769,3 +769,53 @@ test('knownEnvNames: a no-match exit 1 skips the batch, but an overBuffer / sign
     assert.throws(() => knownEnvNames('main', new Set(['FOO']), res(patch)), GitError, label);
   }
 });
+
+// ---- R4 "pgTAP test deleted/renamed": the base copy decides (#643) ---------------------------------------------------
+
+const PGTAP_BASE = "begin;\nselect plan(1);\nselect ok(true);\nselect * from finish();\nrollback;\n";
+const HELPER_BASE = "-- worklist helper, not a test\nselect id from patients where consent is null;\n";
+const moveCollect = async (files, move) => {
+  const repo = createTmpRepo();
+  for (const [p, t] of Object.entries(files)) repo.write(p, t);
+  repo.commit('base');
+  repo.branch('feat');
+  move(repo);
+  return collectHardStops({ base: 'main', head: 'feat', cwd: repo.dir, config: cfg() });
+};
+
+// Catches: a harmless helper moved out of supabase/tests sending the PR down the high-risk path (DRMed #437).
+test('IO: moving a marker-free helper .sql out of supabase/tests is not R4', async () => {
+  const hits = await moveCollect({ 'supabase/tests/0150_worklist.sql': HELPER_BASE }, (repo) => {
+    repo.write('scripts/worklist.sql', HELPER_BASE);
+    repo.rm('supabase/tests/0150_worklist.sql');
+    repo.commit('move helper');
+  });
+  assert.ok(!hits.some((h) => h.rule === 'R4-pipeline'), JSON.stringify(hits));
+});
+
+// Catches: the exemption swallowing a real pgTAP test that was renamed or deleted.
+test('IO: a real pgTAP file renamed or deleted under supabase/tests still trips R4', async () => {
+  const renamed = await moveCollect({ 'supabase/tests/rls.sql': PGTAP_BASE }, (repo) => {
+    repo.write('scripts/rls.sql', PGTAP_BASE);
+    repo.rm('supabase/tests/rls.sql');
+    repo.commit('move test');
+  });
+  assert.ok(renamed.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(renamed));
+  const deleted = await moveCollect({ 'supabase/tests/rls.sql': PGTAP_BASE }, (repo) => {
+    repo.rm('supabase/tests/rls.sql');
+    repo.commit('delete test');
+  });
+  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
+});
+
+// Catches: reading the blob from inside the PR, so commit 1 strips the markers and commit 2 moves the "helper" away.
+test('IO: markers stripped in one PR commit and the file moved in the next still trips R4 (base blob decides)', async () => {
+  const hits = await moveCollect({ 'supabase/tests/rls.sql': PGTAP_BASE }, (repo) => {
+    repo.write('supabase/tests/rls.sql', HELPER_BASE);
+    repo.commit('strip markers');
+    repo.write('scripts/rls.sql', HELPER_BASE);
+    repo.rm('supabase/tests/rls.sql');
+    repo.commit('move');
+  });
+  assert.ok(hits.some((h) => h.rule === 'R4-pipeline'), JSON.stringify(hits));
+});
