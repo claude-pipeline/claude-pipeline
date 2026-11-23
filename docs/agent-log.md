@@ -315,3 +315,4 @@ full record.
 - 2026-11-23 · #782 · Conflict round: after a conflicting main merge, review the PR's own changes, not the whole PR (#423) · risk high · rounds 7 · arbiter 7 (fix-verify 3) · awaiting-owner-merge · Codex 7d: 672 runs (200 high)
 - 2026-11-23 · #802 · clean-status retry only on a proven-open timeout (#672) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 710 runs (214 high)
 - 2026-11-23 · #791 · Guard: &> spans are unknown after them; a last-stage branch switch proven by && (#529, #662) · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 715 runs (217 high)
+- 2026-11-23 · #413 · CI usage report: cost per run class, pushes while ready, base churn; summary warns on a push to a ready PR · risk high · rounds 5 · arbiter 5 (fix-verify 3) · needs-human · Codex 7d: 724 runs (222 high)
