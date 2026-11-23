@@ -847,3 +847,19 @@ test('IO: markers stripped in one PR commit and the file moved in the next still
   });
   assert.ok(hits.some((h) => h.rule === 'R4-pipeline'), JSON.stringify(hits));
 });
+
+// Catches: a marker-free non-SQL test (a shell or TS end-to-end proof under supabase/tests) read as a "helper" and losing R4 when deleted or moved.
+test('IO: deleting or moving a marker-free non-SQL file under supabase/tests still trips R4', async () => {
+  const E2E = "#!/bin/sh\ncurl -sf \"$API_URL/rpc/guarded\" | grep -q denied\n";
+  const deleted = await moveCollect({ 'supabase/tests/0207_guard_e2e.sh': E2E }, (repo) => {
+    repo.rm('supabase/tests/0207_guard_e2e.sh');
+    repo.commit('delete e2e');
+  });
+  assert.ok(deleted.some((h) => h.rule === 'R4-pipeline' && /deleted/.test(h.detail)), JSON.stringify(deleted));
+  const moved = await moveCollect({ 'supabase/tests/0207_guard_e2e.ts': E2E }, (repo) => {
+    repo.write('scripts/0207_guard_e2e.ts', E2E);
+    repo.rm('supabase/tests/0207_guard_e2e.ts');
+    repo.commit('move e2e');
+  });
+  assert.ok(moved.some((h) => h.rule === 'R4-pipeline' && /renamed/.test(h.detail)), JSON.stringify(moved));
+});

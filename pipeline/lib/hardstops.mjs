@@ -1985,11 +1985,11 @@ export async function collectHardStops({ base, head, cwd, config, maxImporterHit
     if (text.length <= MAX_HEAD_TEXT) headFiles.set(d.file, text);
     else tooBig.push({ rule: 'R0-unscannable', file: d.file, detail: `file is larger than ${MAX_HEAD_TEXT} characters; its imports cannot be checked` });
   }
-  // A delete/rename under the test dirs is exempt from R4 only when the base copy (never a blob from inside the PR) has no pgTAP
-  // marker. Any read error leaves the file out of the set, so R4 stays.
+  // A delete/rename under the test dirs is exempt from R4 only for a .sql/.pg file (the marker describes pgTAP SQL, not a shell or TS
+  // test) whose base copy (never a blob from inside the PR) has no pgTAP marker. Any read error leaves the file out of the set, so R4 stays.
   const pgtapFreeMoves = [];
   for (const d of ds) {
-    if ((d.status !== 'D' && d.status !== 'R') || !d.oldPath || !inc(d.oldPath, TEST_DIR_GLOBS)) continue;
+    if ((d.status !== 'D' && d.status !== 'R') || !d.oldPath || !inc(d.oldPath, TEST_DIR_GLOBS) || !/\.(?:sql|pg)$/i.test(d.oldPath)) continue;
     try {
       const before = showFile(mb, d.oldPath, o);
       if (before !== null && !PGTAP_MARKER.test(before)) pgtapFreeMoves.push(d.file);
