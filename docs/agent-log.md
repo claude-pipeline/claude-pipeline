@@ -313,3 +313,4 @@ full record.
 - 2026-11-23 · #787 · Follow-ups: pgTAP move content check, ci-wait predatesReady, verify test counts, clean-status retry (#643 #642 #644 #672) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 660 runs (192 high)
 - 2026-11-23 · #787 · Follow-ups: pgTAP move content check, ci-wait predatesReady, verify test counts, clean-status retry (#643 #642 #644 #672) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 668 runs (199 high)
 - 2026-11-23 · #782 · Conflict round: after a conflicting main merge, review the PR's own changes, not the whole PR (#423) · risk high · rounds 7 · arbiter 7 (fix-verify 3) · awaiting-owner-merge · Codex 7d: 672 runs (200 high)
+- 2026-11-23 · #802 · clean-status retry only on a proven-open timeout (#672) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 710 runs (214 high)
