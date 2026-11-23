@@ -275,6 +275,7 @@ test('the other family programs and psql behind launchers or variables are refus
     "kubectl exec db -- psql -c 'select 1'",
     'kubectl exec db -- pg_repack -h prod',
     'kubectl exec db -- pg_repack --version',
+    'pgloader x.load', 'pgbadger log', 'pgcopydb clone', 'pgbackrest backup', 'pgcenter top', 'kubectl exec db -- pgloader x.load', // listed clients without a pg_ prefix
     "doppler run --command 'psql -c 1'",
     "$PSQL -c 'select 1'",
     'DB=(docker exec -i "$C" psql); "${DB[@]}" -c \'select 1\'',
@@ -350,7 +351,6 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     "rg -l 'psql|DATABASE_URL' docs | sort | uniq",
     "rg -l 'psql|PGHOST' docs | uniq --skip-fields 1 -",
     'git add supabase/migrations/pg_cron.sql',
-    'git switch pg_repack',
     'git add db/pg_partman',
     'git checkout -b pg_cron_fix',
     'mkdir pg_dumps',
@@ -372,6 +372,7 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     "rg -l 'psql|PGHOST' docs | uniq - out.sh",
     "rg -l 'psql|PGHOST' docs | uniq -- - -report",
     "rg -l 'psql|PGHOST' docs | uniq - -report",
+    'git switch pg_repack', // a listed client name as an operand of a non-data git subcommand fails closed, as `git switch psql` does
     'rg --pre pg_repack x docs',
     'sort --compress-program pg_repack f',
     'ack --pager pg_repack x',
