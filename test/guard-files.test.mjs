@@ -855,6 +855,8 @@ test('hook: an evaluator that throws, or returns no decision, is denied for a co
   fs.mkdirSync(path.join(dir, 'lib'));
   const copy = path.join(dir, 'guard-files.mjs');
   fs.copyFileSync(HOOK, copy);
+  // (the hook also loads the wall-cap clock from script-candidates.mjs, which needs the two modules it imports; only files-policy.mjs is stubbed)
+  for (const m of ['script-candidates.mjs', 'shell-parse.mjs', 'sql-clients.mjs']) fs.copyFileSync(path.join(path.dirname(HOOK), 'lib', m), path.join(dir, 'lib', m));
   const stub = (body) => fs.writeFileSync(path.join(dir, 'lib', 'files-policy.mjs'), body);
   const calls = [
     { tool_name: 'Bash', tool_input: { command: 'ls -la' } },
