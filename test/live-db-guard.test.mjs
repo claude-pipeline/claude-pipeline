@@ -3,7 +3,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
@@ -308,4 +308,192 @@ test('coexistence: the previous owner-go.mjs still reads a home that holds live-
   prior.readRecords({ home: s.home, now: () => NOW, problems, settle: false });
   assert.deepEqual(problems, [], 'the old reader finds nothing unreadable');
   assert.equal(prior.roundCoverage(grant(), { home: s.home, repo: 'acme/widgets', moves: [] }), 'absent', 'the round-grant coverage reader still answers ok (not indeterminate)');
+});
+
+// ---- #687: a Supabase MCP server added under another name ----------------------------------------------------------------------------------
+// Failure caught: the real Supabase MCP server configured under an innocent name (`mine`) lets merge_branch / reset_branch / pause_project / run_notebook / create_project through as ordinary tools (they are
+// judged only on a server named supabase or one the owner registered), so migrations merge into production or the live app pauses with no owner go. No registered server anywhere in these fixtures.
+const ACCOUNT_FILE = ['', 'claude.json'].join('.'); // the session's account file name
+const SUPA_HTTP = { type: 'http', url: 'https://mcp.supabase.com/mcp?project_ref=x' };
+const SUPA_STDIO = { command: 'npx', args: ['-y', '@supabase/mcp-server-supabase@0.19.0', '--project-ref=x'] };
+const VENDOR = { command: 'node', args: ['vendor-mcp.js'] };
+const CONFIG_HINT = /recognised as Supabase from this session's MCP configuration of server mine/;
+const SHAPE_HINT = /recognised as Supabase by its input only/;
+const GENERIC_CALLS = {
+  create_branch: [{ project_id: REF }, { project_id: REF, name: 'x', confirm_cost_id: 'c' }],
+  delete_branch: [{ branch_id: 'b' }],
+  merge_branch: [{ branch_id: 'b' }],
+  rebase_branch: [{ branch_id: 'b' }],
+  reset_branch: [{ branch_id: 'b' }, { branch_id: 'b', migration_version: '1' }],
+  create_project: [{ name: 'n', region: 'us-east-1', organization_id: 'o' }, { name: 'n', region: 'us-east-1', organization_id: 'o', confirm_cost_id: 'c' }],
+  pause_project: [{ project_id: REF }],
+  restore_project: [{ project_id: REF }],
+  run_notebook: [{ project_id: REF, notebook_id: 'n', expected_updated_at: 'x' }, { project_id: REF, notebook_id: 'n', expected_updated_at: 'x', cells: ['select 1'] }],
+  create_notebook: [{ project_id: REF, name: 'n', content: 'c' }, { project_id: REF, name: 'n', content: 'c', description: 'd' }],
+  delete_notebook: [{ project_id: REF, notebook_id: 'n' }],
+};
+
+function mcpScene(t) {
+  const root = mkdtempSync(join(tmpdir(), 'cp-mcp-alias-'));
+  t.after(() => rmSync(root, { recursive: true, force: true }));
+  const home = join(root, 'home');
+  const parent = join(root, 'repo');
+  const proj = join(parent, 'pkg');
+  const cwd = join(root, 'cwd'); // the hook's cwd is NOT the session's project dir
+  const acct = join(root, 'acct');
+  for (const d of [home, proj, cwd, acct]) mkdirSync(d, { recursive: true });
+  const put = (file, value) => { mkdirSync(dirname(file), { recursive: true }); writeFileSync(file, typeof value === 'string' ? value : JSON.stringify(value)); };
+  const env = (extra = {}) => ({ CLAUDE_PROJECT_DIR: proj, ...extra });
+  const run = (tool, input, e = env()) => evaluateFileTool({ tool_name: tool, tool_input: input, cwd, session_id: 's-mcp', transcript_path: join(root, 't.jsonl') }, { home, env: e, platform: process.platform, now: () => NOW });
+  const user = (servers) => put(join(home, ACCOUNT_FILE), { mcpServers: servers });
+  return { root, home, parent, proj, cwd, acct, put, env, run, user };
+}
+const denied = (r, hint, label) => {
+  assert.equal(r.decision, 'deny', label);
+  assert.match(r.reason, hint, label);
+};
+
+test('#687 config, user layer: every generic write on a server the session\'s configuration points at Supabase is refused, by the config route and not by input shape', async (t) => {
+  const s = mcpScene(t);
+  s.user({ mine: SUPA_HTTP });
+  for (const [name, inputs] of Object.entries(GENERIC_CALLS)) {
+    for (const input of inputs) {
+      const r = s.run(`mcp__mine__${name}`, input);
+      denied(r, CONFIG_HINT, `${name} ${JSON.stringify(input)}`);
+      assert.match(r.reason, 'project_id' in input ? /db-refs server add mine/ : /target is unknown/, name);
+    }
+  }
+  // an extra benign key is a call input shape would decline: only the configuration can still recognise it
+  denied(s.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }), CONFIG_HINT, 'merge_branch + extra key');
+});
+
+test('#687 config, local and project layers (the project and its parent directory), and CLAUDE_CONFIG_DIR picks the account file', async (t) => {
+  const projectScoped = [['create_branch', {}], ['create_branch', { name: 'x' }], ['run_notebook', { notebook_id: 'n', expected_updated_at: 'x' }], ['delete_notebook', { notebook_id: 'n' }], ['create_notebook', { name: 'n', content: 'c' }], ['merge_branch', { branch_id: 'b', note: 'x' }]];
+  const layers = {
+    'local, project dir': (s) => s.put(join(s.home, ACCOUNT_FILE), { projects: { [s.proj]: { mcpServers: { mine: SUPA_STDIO } } } }),
+    'local, parent dir (git-root keying)': (s) => s.put(join(s.home, ACCOUNT_FILE), { projects: { [s.parent]: { mcpServers: { mine: SUPA_STDIO } } } }),
+    'project .mcp.json': (s) => s.put(join(s.proj, '.mcp.json'), { mcpServers: { mine: SUPA_STDIO } }),
+    'parent .mcp.json': (s) => s.put(join(s.parent, '.mcp.json'), { mcpServers: { mine: SUPA_STDIO } }),
+  };
+  for (const [layer, setup] of Object.entries(layers)) {
+    const s = mcpScene(t);
+    setup(s);
+    for (const [name, input] of projectScoped) denied(s.run(`mcp__mine__${name}`, input), CONFIG_HINT, `${layer}: ${name} ${JSON.stringify(input)}`);
+  }
+  // a config key with a dot is the tool segment with an underscore
+  const dotted = mcpScene(t);
+  dotted.user({ 'db.prod': SUPA_HTTP });
+  denied(dotted.run('mcp__db_prod__merge_branch', { branch_id: 'b', note: 'x' }), /server db_prod/, 'db.prod -> db_prod');
+  // CLAUDE_CONFIG_DIR: the account dir's file is the session's, the home file is not
+  const a = mcpScene(t);
+  a.user({ mine: VENDOR });
+  a.put(join(a.acct, ACCOUNT_FILE), { mcpServers: { mine: SUPA_HTTP } });
+  denied(a.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }, a.env({ CLAUDE_CONFIG_DIR: a.acct })), CONFIG_HINT, 'account dir Supabase, home vendor');
+  const b = mcpScene(t);
+  b.user({ mine: SUPA_HTTP });
+  b.put(join(b.acct, ACCOUNT_FILE), { mcpServers: { mine: VENDOR } });
+  assert.equal(b.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }, b.env({ CLAUDE_CONFIG_DIR: b.acct })).decision, 'allow', 'account dir vendor, home Supabase');
+});
+
+test('#687 collisions: another project\'s or account\'s same-named server is not this session\'s; a positive match wins; an unset project dir is unknown, not absent', async (t) => {
+  // (a) an unrelated directory's Supabase `db` does not turn the session's vendor `db` into Supabase
+  const a = mcpScene(t);
+  a.put(join(a.home, ACCOUNT_FILE), { mcpServers: { db: VENDOR }, projects: { [join(a.root, 'unrelated')]: { mcpServers: { db: SUPA_STDIO } } } });
+  assert.equal(a.run('mcp__db__delete_branch', { branch_id: 'b', strategy: 'x' }).decision, 'allow', 'vendor db, collision elsewhere: a foreign key is not Supabase-shaped');
+  denied(a.run('mcp__db__delete_branch', { branch_id: 'b' }), SHAPE_HINT, 'vendor db, collision elsewhere: the unrelated Supabase entry is not this session\'s, so shape decides');
+  // (b) another account dir's Supabase `db`; the session has none: the shape fallback decides
+  const b = mcpScene(t);
+  b.put(join(b.acct, ACCOUNT_FILE), { mcpServers: { db: SUPA_HTTP } });
+  denied(b.run('mcp__db__delete_branch', { branch_id: 'b' }), SHAPE_HINT, 'unlocated, Supabase-shaped');
+  assert.equal(b.run('mcp__db__delete_branch', { branch_id: 'b', strategy: 'x' }).decision, 'allow', 'unlocated, foreign key');
+  // (c) a project vendor `db` beside a user-layer Supabase `db`: the Supabase entry wins
+  const c = mcpScene(t);
+  c.user({ db: SUPA_HTTP });
+  c.put(join(c.proj, '.mcp.json'), { mcpServers: { db: VENDOR } });
+  denied(c.run('mcp__db__delete_branch', { branch_id: 'b', note: 'x' }), /configuration of server db/, 'positive match wins');
+  // (d) no CLAUDE_PROJECT_DIR: the local and project layers are unknown, so a user-layer vendor does not clear the call
+  const d = mcpScene(t);
+  d.user({ db: VENDOR });
+  denied(d.run('mcp__db__delete_branch', { branch_id: 'b' }, {}), SHAPE_HINT, 'project dir unset');
+  denied(d.run('mcp__db__delete_branch', { branch_id: 'b' }), SHAPE_HINT, 'same config, project dir set: a configured vendor still gets the shape check');
+});
+
+test('#687 identity: bridges, docker, a local build and the access-token env are Supabase; an incidental path and the owner\'s own function URL are not; an expanded URL or a legacy config file leaves the server unidentified', async (t) => {
+  const supa = {
+    'mcp-remote bridge': { command: 'npx', args: ['-y', 'mcp-remote', 'https://mcp.supabase.com/mcp'] },
+    docker: { command: 'docker', args: ['run', '-i', '--rm', 'mcp/supabase:latest'] },
+    'local build': { command: 'node', args: ['/x/mcp-server-supabase/dist/transports/stdio.js'] },
+    'access token env': { command: 'node', args: ['vendor.js'], env: { SUPABASE_ACCESS_TOKEN: 'synthetic' } },
+    'windows npm shim': { command: 'cmd.exe', args: ['/c', 'C:\\Users\\x\\AppData\\Roaming\\npm\\mcp-server-supabase.cmd', '--read-only'] },
+    'windows exe shim': { command: 'C:\\tools\\mcp-server-supabase.exe' },
+    'bash one-string launcher': { command: 'bash', args: ['-lc', 'npx -y @supabase/mcp-server-supabase --read-only'] },
+    'cmd one-string launcher': { command: 'cmd', args: ['/c', '"npx -y @supabase/mcp-server-supabase@latest"'] },
+    'sh one-string bridge': { command: 'sh', args: ['-c', 'npx -y mcp-remote https://mcp.supabase.com/mcp'] },
+  };
+  for (const [label, entry] of Object.entries(supa)) {
+    const s = mcpScene(t);
+    s.user({ mine: entry });
+    denied(s.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }), CONFIG_HINT, label);
+  }
+  const other = {
+    'incidental path': { command: 'node', args: ['/work/supabase-tools/vendor.js'] },
+    'other vendor one-string launcher': { command: 'bash', args: ['-lc', 'npx -y @vendor/mcp-server --read-only'] },
+    'own edge function': { type: 'http', url: 'https://myref.supabase.co/functions/v1/my-mcp' },
+  };
+  for (const [label, entry] of Object.entries(other)) {
+    const s = mcpScene(t);
+    s.user({ mine: entry });
+    assert.equal(s.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }).decision, 'allow', label);
+    denied(s.run('mcp__mine__merge_branch', { branch_id: 'b' }), SHAPE_HINT, `${label}: a configured vendor does not vouch for the server (launch-time bindings are invisible): judged by shape`);
+  }
+  // a launch-time server (--mcp-config / managed file) can reuse a configured vendor's name: the config never switches the shape check off
+  const acme = mcpScene(t);
+  acme.user({ mine: { command: 'npx', args: ['-y', '@acme/mcp'] } });
+  denied(acme.run('mcp__mine__pause_project', { project_id: 'p' }), SHAPE_HINT, 'configured acme, pause_project');
+  denied(acme.run('mcp__mine__merge_branch', { branch_id: 'b' }), SHAPE_HINT, 'configured acme, merge_branch');
+  for (const [tool, input] of [['mcp__mine__create_branch', { owner: 'o', repo: 'r', branch: 'b' }], ['mcp__mine__create_branch', { project_id: '1', branch: 'b', ref: 'main' }], ['mcp__mine__delete_branch', { projectId: 'p', branchId: 'b' }]]) {
+    assert.equal(acme.run(tool, input).decision, 'allow', `configured acme: ${tool} ${JSON.stringify(input)}`);
+  }
+  const expanded = mcpScene(t);
+  expanded.user({ mine: { type: 'http', url: '${MCP_URL}' } });
+  assert.equal(expanded.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }).decision, 'allow');
+  denied(expanded.run('mcp__mine__merge_branch', { branch_id: 'b' }), SHAPE_HINT, 'unresolved URL falls to the shape check');
+  const legacy = mcpScene(t);
+  legacy.put(join(legacy.acct, ACCOUNT_FILE), { mcpServers: { mine: VENDOR } });
+  legacy.put(join(legacy.acct, '.config.json'), {});
+  denied(legacy.run('mcp__mine__merge_branch', { branch_id: 'b' }, legacy.env({ CLAUDE_CONFIG_DIR: legacy.acct })), SHAPE_HINT, 'legacy config file: the vendor entry is not trusted');
+});
+
+test('#687 shape fallback: an unlocated server with a Supabase-identical input is refused, other vendors\' inputs and Sentry\'s create_project are not; an unreadable file never lets a call through', async (t) => {
+  const s = mcpScene(t);
+  denied(s.run('mcp__plugin_x_db__merge_branch', { branch_id: 'b' }), SHAPE_HINT, 'plugin server');
+  for (const [tool, input] of [['mcp__github__create_branch', { owner: 'o', repo: 'r', branch: 'b' }], ['mcp__neon__delete_branch', { projectId: 'p', branchId: 'b' }], ['mcp__gitlab__create_branch', { project_id: '1', branch: 'b', ref: 'main' }], ['mcp__sentry__create_project', { name: 'x' }], ['mcp__github__create_branch', { branch: 'x' }]]) {
+    assert.equal(s.run(tool, input).decision, 'allow', tool);
+  }
+  const corrupt = mcpScene(t);
+  corrupt.put(join(corrupt.home, ACCOUNT_FILE), '{not json');
+  denied(corrupt.run('mcp__vendor__delete_branch', { branch_id: 'b' }), SHAPE_HINT, 'corrupt account file');
+  const badProject = mcpScene(t);
+  badProject.user({ mine: SUPA_HTTP });
+  badProject.put(join(badProject.proj, '.mcp.json'), '{not json');
+  denied(badProject.run('mcp__mine__merge_branch', { branch_id: 'b', note: 'x' }), CONFIG_HINT, 'corrupt project file, Supabase user entry');
+});
+
+test('#687 units: no ctx keeps today\'s answers; a non-object input is never Supabase-shaped; a symlinked or 9 MB account file is an unknown layer', async (t) => {
+  const { supabaseMatch } = await import('../pipeline/hooks/lib/live-db-guard.mjs');
+  const { activeBinding } = await import('../pipeline/hooks/lib/mcp-servers.mjs');
+  assert.equal(isSupabaseTool('mcp__mine__merge_branch', { ok: true, servers: [] }), false, 'no ctx: rule 5 skipped');
+  assert.equal(isSupabaseTool('mcp__mine__merge_branch', undefined), false);
+  const s = mcpScene(t);
+  const ctx = { home: s.home, env: s.env() };
+  for (const ti of [null, undefined, [], 'branch_id', 7]) assert.equal(supabaseMatch('mcp__plugin_x_db__merge_branch', { ok: true, servers: [] }, ti, ctx), null, JSON.stringify(ti));
+  assert.equal(supabaseMatch('mcp__plugin_x_db__merge_branch', { ok: true, servers: [] }, { branch_id: 'b' }, ctx), 'shape');
+  assert.equal(supabaseMatch('mcp__mine__merge_branch', { ok: true, servers: ['mine'] }, {}, ctx), 'registry');
+  const stateOf = (binding, layer) => binding.layers.find((l) => l.layer === layer)?.state;
+  s.put(join(s.home, ACCOUNT_FILE), ' '.repeat(9 * 1024 * 1024) + '{}');
+  assert.equal(stateOf(activeBinding('mine', ctx), 'user'), 'unknown', '9 MB');
+  rmSync(join(s.home, ACCOUNT_FILE));
+  s.put(join(s.root, 'real.json'), { mcpServers: { mine: SUPA_HTTP } });
+  symlinkSync(join(s.root, 'real.json'), join(s.home, ACCOUNT_FILE));
+  assert.equal(stateOf(activeBinding('mine', ctx), 'user'), 'unknown', 'symlink');
 });

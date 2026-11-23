@@ -12,6 +12,7 @@ import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.
 import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
+import { activeBinding, identify } from './mcp-servers.mjs';
 import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock } from './live-db-go.mjs';
 
 export const LIVE_DB_CONSUMED_REL = '.claude/pipeline-state/owner-go/live-db-consumed';
@@ -25,10 +26,56 @@ export const SUPABASE_READ_NAMES = ['list_tables', 'list_extensions', 'list_migr
 const parts = (tool) => String(tool).split('__');
 export const lastSegment = (tool) => parts(tool).pop();
 export const serverSegment = (tool) => parts(tool)[1] ?? '';
-// the write names only a Supabase server has: any server's tool with one of them is judged (a renamed server in an unprotected .mcp.json: Fable F2). The generic names (create_branch, create_project, run_notebook …) are judged only on a server whose name has `supabase` in it, so another vendor's tool of that name is untouched.
+// Which calls are judged as Supabase (#687 widened this). The first rule that matches wins; `supabaseMatch` says which one, `isSupabaseTool` is its boolean:
+//  1. the server segment has `supabase` in it ('name');
+//  2. the tool name is one only a Supabase server has (SUPABASE_ONLY_NAMES): judged on any server, a renamed server in an unprotected .mcp.json (Fable F2) ('only-name');
+//  3. the server is in the owner's registry (`state.servers`) ('registry');
+//  4. an unreadable or invalid registry (`ok` false) hides that list, so every write name is judged on any server ('registry-broken': evaluateSupabaseMcp then denies with the registry error); a missing registry file is `ok` with an empty list;
+//  5. only for the other eleven write names (GENERIC_SIGNATURES: create_branch, run_notebook, create_project …), and only when the caller passes `ctx` (without it rules 1-4 alone answer): these are also other vendors' tool names, so they cannot be judged on any server (GitHub / GitLab / Neon / Sentry /
+//     Linear tools stay untouched). The real Supabase MCP server configured under another name is found from the ACTIVE session's MCP configuration first (mcp-servers.mjs: this session's account file, local and
+//     project layers; an entry that points at Supabase's endpoint or package) ('config'). The configuration only adds recognition, it never vouches a server as non-Supabase: the hook cannot see servers bound at launch (`--mcp-config`, managed files), so
+//     in every other case (an entry for another vendor, an unreadable layer, an expanded launcher, a plugin or claude.ai connector, an unset CLAUDE_PROJECT_DIR) the call is judged by its INPUT: it has only the fields Supabase's
+//     schema has for that tool, and all those a mode of it requires ('shape'). The guard's standing rule is that what it cannot identify is refused: a wrong allow can merge migrations into production or pause the live app.
+// Limits: a deliberately disguised server (a wrapper script with no Supabase marker, renamed parameters) is out of the threat model; the shape check is evidence, not proof (the schemas strip unknown keys); a vendor tool with a
+// Supabase-identical input on a server the configuration does not show to be Supabase is over-denied (the hint says how the call was recognised); a registered alias with a broken registry and tools outside the write list is #584; a server from `--mcp-config` / `--strict-mcp-config` or a managed MCP file is judged by its input only when no scanned entry of that name is Supabase (otherwise by that entry), and a same-named Supabase entry in any scanned layer makes a vendor server of that name be judged as Supabase (rename one entry).
 const SUPABASE_ONLY_NAMES = ['apply_migration', 'execute_sql', 'deploy_edge_function', 'create_edge_function_secret'];
-// `state` (the owner's db-refs registry): a server the owner listed there is a Supabase server for every tool name. A registry that cannot be read or is invalid (`ok` false) hides that list, so every write name is judged on any server (evaluateSupabaseMcp then denies with the registry error); a missing file is `ok` with an empty list.
-export const isSupabaseTool = (tool, state) => typeof tool === 'string' && tool.startsWith('mcp__') && (/supabase/i.test(serverSegment(tool)) || SUPABASE_ONLY_NAMES.includes(lastSegment(tool)) || (state?.servers ?? []).includes(serverSegment(tool)) || (state?.ok === false && SUPABASE_WRITE_NAMES.includes(lastSegment(tool))));
+// Rule 5d: the input keys of each generic write tool. `keys` = every key the tool's schema has; `modes` = the required keys of the account-scoped call and of the project-scoped one (`--project-ref`: project_id removed;
+// null = the tool is not exposed project-scoped). Source: supabase-community/supabase-mcp (now supabase/mcp) main at 03afe8e7a021 (2026-11-23), npm @supabase/mcp-server-supabase 0.19.0, packages/mcp-server-supabase/src/
+// tools/{branching,account,notebook}-tools.ts. RE-CHECK these tables against the source when that package is bumped (a new optional key makes a real call fail the key-set test on an unidentified server).
+const GENERIC_SIGNATURES = {
+  create_branch: { keys: ['project_id', 'name', 'confirm_cost_id'], modes: [['project_id'], []] },
+  delete_branch: { keys: ['branch_id'], modes: [['branch_id']] },
+  merge_branch: { keys: ['branch_id'], modes: [['branch_id']] },
+  rebase_branch: { keys: ['branch_id'], modes: [['branch_id']] },
+  reset_branch: { keys: ['branch_id', 'migration_version'], modes: [['branch_id']] },
+  create_project: { keys: ['name', 'region', 'organization_id', 'confirm_cost_id'], modes: [['name', 'region', 'organization_id']] },
+  pause_project: { keys: ['project_id'], modes: [['project_id']] },
+  restore_project: { keys: ['project_id'], modes: [['project_id']] },
+  run_notebook: { keys: ['project_id', 'notebook_id', 'cells', 'expected_updated_at'], modes: [['project_id', 'notebook_id', 'expected_updated_at'], ['notebook_id', 'expected_updated_at']] },
+  create_notebook: { keys: ['project_id', 'name', 'content', 'description'], modes: [['project_id', 'name', 'content'], ['name', 'content']] },
+  delete_notebook: { keys: ['project_id', 'notebook_id'], modes: [['project_id', 'notebook_id'], ['notebook_id']] },
+};
+const shapeMatches = (name, ti) => {
+  const sig = Object.hasOwn(GENERIC_SIGNATURES, name) ? GENERIC_SIGNATURES[name] : null;
+  if (!sig || ti === null || typeof ti !== 'object' || Array.isArray(ti)) return false;
+  const own = Object.keys(ti);
+  return own.every((k) => sig.keys.includes(k)) && sig.modes.some((req) => req.every((k) => own.includes(k)));
+};
+// -> 'name' | 'only-name' | 'registry' | 'registry-broken' | 'config' | 'shape' | null. `state`: the owner's db-refs registry; `ctx` ({ home, env }) enables rule 5 (nothing is read without it, or before rules 1-3 have declined).
+export function supabaseMatch(tool, state, ti, ctx) {
+  if (typeof tool !== 'string' || !tool.startsWith('mcp__')) return null;
+  const seg = serverSegment(tool);
+  const name = lastSegment(tool);
+  if (/supabase/i.test(seg)) return 'name';
+  if (SUPABASE_ONLY_NAMES.includes(name)) return 'only-name';
+  if ((state?.servers ?? []).includes(seg)) return 'registry';
+  if (state?.ok === false && SUPABASE_WRITE_NAMES.includes(name)) return 'registry-broken';
+  if (!ctx || !Object.hasOwn(GENERIC_SIGNATURES, name)) return null;
+  const found = activeBinding(seg, ctx).layers;
+  if (found.some((l) => l.state === 'found' && identify(l.entry) === 'supabase')) return 'config';
+  return shapeMatches(name, ti) ? 'shape' : null;
+}
+export const isSupabaseTool = (tool, state, ti, ctx) => !!supabaseMatch(tool, state, ti, ctx);
 
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });

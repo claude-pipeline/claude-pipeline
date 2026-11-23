@@ -21,7 +21,7 @@ import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
 import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
-import { evaluateSupabaseMcp, findLiveDbCli, isSupabaseTool } from './live-db-guard.mjs';
+import { evaluateSupabaseMcp, findLiveDbCli, serverSegment, supabaseMatch } from './live-db-guard.mjs';
 import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
@@ -931,12 +931,21 @@ function evaluateMcp(tool, ti, input, opts) {
   const generic = evaluateMcpGeneric(tool, ti, input, opts);
   if (generic.decision === 'deny' || !tool.startsWith('mcp__')) return generic;
   const home = opts.home || os.homedir();
-  if (!isSupabaseTool(tool, readDbRefs(home))) return generic;
-  if ((opts.env ?? process.env).PIPELINE_ADMIN === '1') return allow();
-  return evaluateSupabaseMcp(tool, ti, {
+  const env = opts.env ?? process.env;
+  const match = supabaseMatch(tool, readDbRefs(home), ti, { home, env });
+  if (!match) return generic;
+  if (env.PIPELINE_ADMIN === '1') return allow();
+  const verdict = evaluateSupabaseMcp(tool, ti, {
     home, sessionId: input?.session_id, transcriptPath: input?.transcript_path, now: opts.now, io: opts.liveDbIo,
   });
+  return verdict.decision === 'deny' && SUPABASE_MATCH_HINT[match] ? { ...verdict, reason: `${verdict.reason} ${SUPABASE_MATCH_HINT[match](serverSegment(tool))}` } : verdict;
 }
+
+// #687: a server not named supabase is refused as Supabase on evidence the owner can check, so a deny says how the call was recognised (the admin switch is named in words: a written literal assignment of it is refused).
+const SUPABASE_MATCH_HINT = {
+  config: (seg) => `(recognised as Supabase from this session's MCP configuration of server ${seg})`,
+  shape: (seg) => `(recognised as Supabase by its input only, because this session's MCP configuration does not show server ${seg} to be Supabase and cannot rule it out (a server bound at launch is invisible to the guard); if it is not a Supabase server, the owner runs this call in a session started with the admin switch, which skips this check)`,
+};
 
 function evaluateMcpGeneric(tool, ti, input, opts) {
   const last = tool.split('__').pop();
