@@ -8,7 +8,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { seedRegistry } from './helpers/db-refs-owner.mjs';
-import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
+import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
 
 const home = mkdtempSync(join(tmpdir(), 'cp-live-db-psql-home-'));
 const work = mkdtempSync(join(tmpdir(), 'cp-live-db-psql-work-'));
@@ -367,4 +367,18 @@ test('docker psql: a colon followed by a digit passes; a colon followed by a nam
   sql("select '2026-11-23 08:00:00+08'::timestamptz, '08:30', 'http://localhost:54321', '{\"count\":5}'::jsonb, (a)[1:3];\n");
   mustAllow(DOCKER_FILE);
   for (const text of ['select :a1;\n', 'select :_x;\n', 'select :{?x};\n', '\\pset   \t PAGER on\n', 'select 1;\n\\pset x\n\\pset  pager\n']) { sql(text); mustRefuse(DOCKER_FILE); }
+});
+
+// Catches (round 1, R1-B3): an MCP tool that runs a shell line on ANOTHER host (ssh, a remote shell) getting the local approval of the docker psql shapes, proven from THIS machine's Docker config and SQL file.
+test('a shell line handed to an MCP command tool is a psql family line the local proofs cannot clear; the same line through Bash still passes', () => {
+  dockerConfig(null);
+  sql(GOOD_FILE);
+  const mcp = (command) => evaluateFileTool({ tool_name: 'mcp__ssh__exec', tool_input: { command }, cwd: work }, { ...OPTS });
+  for (const line of ["docker exec supabase_db_x psql -X -c 'select 1'", DOCKER_FILE, `psql -X "${URI}" -c 'select 1'`]) {
+    mustAllow(line);
+    const v = mcp(line);
+    assert.equal(v.decision, 'deny', `${line}: allowed through MCP`);
+    assert.match(v.reason ?? '', /live database:/, line);
+  }
+  assert.equal(mcp('docker ps').decision, 'allow');
 });

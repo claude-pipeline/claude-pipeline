@@ -931,6 +931,8 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
     if (token && (nonLiteralHead(argv) || nonLiteralHead(typed))) return 'the command is run through a variable on a line that names a psql family program';
     const p = { aligned, cut, typed };
     const name = commandName(argv[0]);
+    // a shell line an MCP tool runs may run on another host: this machine's Docker config, SQL file and localhost prove nothing there
+    if (io.remote === true && (name === 'psql' || (name === 'docker' && own.some(pgWord)))) return 'the line is handed to an MCP tool that may run it on another host, where the local proofs of the two allowed psql shapes do not hold';
     if (name === 'psql') {
       const why = hostPsqlRefusal(c, x, p);
       if (why) return why;
