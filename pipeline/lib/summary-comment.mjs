@@ -64,5 +64,15 @@ export function writeSummaryComment(gh, pr, { record, sections, existing, retry 
   // Sections that are a function of the comment (the closed-PR summary) must be rendered from what is on the PR when they are SENT: a wait out of a rate limit
   // can let another summary post a line, which the body rendered before the wait would erase. So the retry is of the whole step (re-read, re-render, write), not of the PATCH alone.
   const step = typeof gh.retrying === 'function' ? gh.retrying : retrying; // the gh's own retrier carries the env cap, the rate-limit probe and the shared budget
-  return step((attempt) => once(attempt === 1 && existing ? existing : readSummaryComment(gh, pr), false, attempt));
+  // The record is the caller's, built before the wait: if another command changed the stored one meanwhile (`pipeline cost` added an entry), writing it would erase that change, so the write is refused.
+  const recordKey = (c) => (c.status === 'ok' ? encodeRecord(c.record) : c.status);
+  let baseline = null;
+  return step((attempt) => {
+    const current = attempt === 1 && existing ? existing : readSummaryComment(gh, pr);
+    if (attempt === 1) baseline = recordKey(current);
+    else if (current.status !== 'unsupported' && recordKey(current) !== baseline) { // an unsupported read is refused with its own error in once()
+      throw new Error("the summary comment's run record changed while waiting out a rate limit: run the command again");
+    }
+    return once(current, false, attempt);
+  });
 }

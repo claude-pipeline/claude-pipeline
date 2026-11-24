@@ -408,3 +408,29 @@ test('writeRunRecord: function sections go through the gh\'s own retrier when it
   assert.equal(writes, 1);
   assert.equal(reads, 1, 'one read');
 });
+
+test('writeRunRecord: a run record another command changed during a rate-limit wait is not overwritten by the retry', () => {
+  // failure caught: the retry wrote the record built before the wait over the fresh one, erasing a cost entry `pipeline cost` recorded meanwhile
+  const gh = memoryGh();
+  seed(gh, plain());
+  const real = gh.upsertComment;
+  const entry = { phase: 'build', role: 'implementer', input: 10, output: 5, cacheRead: 0, cacheWrite: 0, usd: 1.25 };
+  const withCost = applyCheckpoint(plain(), { cost: { entry } }, { host: 'pc-1', now: NOW });
+  let attempts = 0;
+  const limited = (pr, marker, body, opts) => {
+    attempts += 1;
+    if (attempts === 1) {
+      gh.upsertComment = real;
+      writeSummaryComment(gh, PR, { record: withCost }); // `pipeline cost` lands during the wait
+      gh.upsertComment = limited;
+      throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' });
+    }
+    return real(pr, marker, body, opts);
+  };
+  gh.upsertComment = limited;
+  const before = mineBody(gh);
+  assert.throws(() => writeRunRecord(gh, PR, { record: plain(), retry: true, sections: () => '### Outcome' }), /run record changed while waiting out a rate limit/);
+  assert.equal(attempts, 1, 'no second write');
+  assert.notEqual(mineBody(gh), before);
+  assert.ok(mineBody(gh).includes(encodeRecord(withCost)), 'the cost entry is still on the comment');
+});
