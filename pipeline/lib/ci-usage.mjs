@@ -18,7 +18,7 @@ export const WINDOW_MS = 120_000;
 export const HEAVY_JOB_MINUTES = 1;
 export const HEAVY_ELAPSED_MS = 60_000;
 export const OS_KEYS = Object.freeze(['linux', 'windows', 'macos', 'self-hosted']);
-// USD per minute of a GitHub-hosted runner (the standard rates of 2026-01-01; larger runners cost more, so they are underestimated). Overridable with `--rate os=usd`. Self-hosted runners cost nothing here.
+// USD per minute of a GitHub-hosted runner (the standard rates of 2026-01-01; larger runners cost more, so they are underestimated). Overridable with `--rate os=usd`. Provider / self-hosted runners cost nothing here unless `--rate self-hosted=usd` or a per-label `--rate <label>=usd` (e.g. ubicloud-standard-2) prices them.
 export const DEFAULT_RATES = Object.freeze({ linux: 0.006, windows: 0.010, macos: 0.062 });
 export const CLASSES = Object.freeze(['ready-for-review', 'opening', 'push-while-ready', 'push-while-draft', 'converted-cancel', 'catch-up', 'rerun', 'other', 'unclassified']);
 
@@ -113,10 +113,21 @@ export function runnerOs(labels) {
   return 'self-hosted';
 }
 
+const labelNames = (labels) => (Array.isArray(labels) ? labels : []).map((l) => String(l?.name ?? l).toLowerCase());
+// The USD per minute of one job: a label rate (rates.labels, the job's labels in their order, first match wins) beats everything; else the self-hosted bucket uses rates['self-hosted'] (default 0); else the OS rate.
+function jobRate(os, labels, rates) {
+  const byLabel = rates?.labels;
+  if (byLabel && typeof byLabel === 'object') {
+    for (const l of labelNames(labels)) if (Object.hasOwn(byLabel, l)) return byLabel[l];
+  }
+  if (os === 'self-hosted') return rates?.['self-hosted'] ?? 0;
+  return rates?.[os] ?? DEFAULT_RATES[os];
+}
+
 const zeroMinutes = () => Object.fromEntries(OS_KEYS.map((k) => [k, 0]));
 
 // -> { minutes: { linux, windows, macos, 'self-hosted' } (the sum of the job durations, every attempt), rerunMinutes (the part from attempts after the first),
-//      usd (each job rounded UP to a whole minute x the rate of its OS; self-hosted 0), jobs (counted) }. Jobs that never ran (no start or end time, skipped) add nothing.
+//      usd (each job rounded UP to a whole minute x its rate: a label rate, else rates['self-hosted'] (default 0) for the self-hosted bucket, else the rate of its OS), jobs (counted) }. Jobs that never ran (no start or end time, skipped) add nothing.
 export function costOfJobs(jobs, rates = DEFAULT_RATES) {
   const minutes = zeroMinutes();
   let rerunMinutes = 0;
@@ -130,7 +141,7 @@ export function costOfJobs(jobs, rates = DEFAULT_RATES) {
     const os = runnerOs(j.labels);
     minutes[os] += min;
     if (Number(j.run_attempt) > 1) rerunMinutes += min;
-    if (os !== 'self-hosted') usd += Math.ceil(min) * (rates[os] ?? DEFAULT_RATES[os]);
+    usd += Math.ceil(min) * jobRate(os, j.labels, rates);
     counted += 1;
   }
   return { minutes, rerunMinutes, usd, jobs: counted };
@@ -439,9 +450,9 @@ export function aggregateUsage({ classified, prRows, isPrivate, rates = DEFAULT_
     billing: isPrivate ? 'estimate-private' : 'free-public',
     assumptions: {
       estimate: true,
-      rates: { ...DEFAULT_RATES, ...rates, 'self-hosted': 0 },
+      rates: { ...DEFAULT_RATES, ...rates, 'self-hosted': rates['self-hosted'] ?? 0, ...(rates.labels && Object.keys(rates.labels).length > 0 ? { labels: { ...rates.labels } } : {}) },
       note: isPrivate
-        ? 'each job is rounded up to a whole minute and priced at its runner OS rate; larger runners, free included minutes and discounts are not modelled; jobs not read are not priced (see coverage)'
+        ? 'each job is rounded up to a whole minute and priced at its label rate (--rate <label>=usd) if it has one, else its runner OS rate; provider / self-hosted runners (ubicloud, blacksmith, ...) are priced only when a rate is given with --rate (self-hosted=usd or a label); free included minutes and discounts are not modelled; jobs not read are not priced (see coverage)'
         : 'a public repository does not pay for Actions minutes: estimatedUsd is 0',
     },
   };

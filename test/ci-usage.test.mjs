@@ -45,7 +45,7 @@ const JOBS = {
   1003: [job(T('10:30'), 6), job(T('10:30'), 3.5, ['macos-latest'])],
   1004: [job(T('10:30', 2), 2, ['windows-latest'])],
   1005: [job(T('12:30'), 6)],
-  1006: [job(T('08:00'), 2, ['self-hosted'])],
+  1006: [job(T('08:00'), 2, ['self-hosted', 'ubicloud-standard-2'])],
   1101: [job(T('10:30', 5), 5)],
   1201: [job(T('09:45'), 3)],
 };
@@ -129,8 +129,25 @@ test('ci-usage: --rate overrides the estimate; a bad rate or os is a usage error
   assert.equal(doubled.assumptions.rates.linux, 0.012);
   assert.ok(doubled.totals.estimatedUsd > base.totals.estimatedUsd);
   assert.equal(doubled.assumptions.rates['self-hosted'], 0);
-  for (const bad of ['linux', 'linux=abc', 'solaris=1', 'linux=-1']) assertExit(usage(world(), ['--json', '--rate', bad]), 2, bad);
+  for (const bad of ['linux', 'linux=abc', 'ubicloud=abc', '=0.1', 'linux=-1', 'bad label=1', '-x=1']) assertExit(usage(world(), ['--json', '--rate', bad]), 2, bad);
   assert.deepEqual(parseRates(['macos=0.1']), { linux: 0.006, windows: 0.010, macos: 0.1 });
+});
+
+test('ci-usage --rate: a runner label or self-hosted key prices provider jobs (#795: ubicloud cost 0 with no way to give a rate)', () => {
+  assert.deepEqual(parseRates(['Ubicloud-Standard-2=0.0008', 'self-hosted=0.001', 'linux=0.01']), { linux: 0.01, windows: 0.010, macos: 0.062, 'self-hosted': 0.001, labels: { 'ubicloud-standard-2': 0.0008 } });
+  assert.deepEqual(parseRates(['ubuntu-latest-4-cores=0.016', 'x.y_z=1']).labels, { 'ubuntu-latest-4-cores': 0.016, 'x.y_z': 1 });
+  const base = usage(world(), ['--json', '--since', '2026-11-05']).json.repos[0];
+  assert.equal(base.assumptions.rates['self-hosted'], 0);
+  assert.equal(base.assumptions.rates.labels, undefined);
+  assert.match(base.assumptions.note, /only when a rate is given with --rate/);
+  const priced = usage(world(), ['--json', '--since', '2026-11-05', '--rate', 'self-hosted=0.01']).json.repos[0];
+  assert.equal(priced.assumptions.rates['self-hosted'], 0.01);
+  assert.ok(priced.totals.estimatedUsd > base.totals.estimatedUsd, 'the 2-minute self-hosted job is priced');
+  const byLabel = usage(world(), ['--json', '--since', '2026-11-05', '--rate', 'ubicloud-standard-2=0.0008']).json.repos[0];
+  assert.deepEqual(byLabel.assumptions.rates.labels, { 'ubicloud-standard-2': 0.0008 });
+  assert.equal(byLabel.totals.estimatedUsd, round4(base.totals.estimatedUsd + 2 * 0.0008), 'the 2-minute job carrying the label is priced by it (ceil 2 min x rate)');
+  const other = usage(world(), ['--json', '--since', '2026-11-05', '--rate', 'ubicloud-standard-4=0.5']).json.repos[0];
+  assert.equal(other.totals.estimatedUsd, base.totals.estimatedUsd, 'a label no job carries changes nothing');
 });
 
 test('ci-usage --since: YYYY-MM-DD, Nd and invalid values (exit 2)', () => {

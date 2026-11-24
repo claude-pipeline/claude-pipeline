@@ -11,16 +11,16 @@ import { asciiLine } from '../lib/triage.mjs';
 export const meta = {
   summary: 'CI cost per PR and class of run, and pushes to a ready PR that skipped `pipeline redraft`',
   usage: [
-    'pipeline ci-usage [--repo-slug owner/name]... [--since YYYY-MM-DD|Nd] [--workflow NAME]... [--max-calls 400] [--rate os=usd]... [--json] [--repo DIR]',
+    'pipeline ci-usage [--repo-slug owner/name]... [--since YYYY-MM-DD|Nd] [--workflow NAME]... [--max-calls 400] [--rate key=usd]... [--json] [--repo DIR]',
     '  -> {ok, classifierVersion, since, repos: [{slug, private, billing (free-public | estimate-private), draftWhileIterating (true | false | "unknown"), since, partial, calls, rateLimit, skipped {prs, jobs}, totals, assumptions, prs, unexcludable}], warnings}:',
     '     the workflow runs created since the date (default 7d: `Nd` = now minus N x 24 h, or a UTC midnight YYYY-MM-DD; anything else exits 2) in each --repo-slug (default: the repository gh resolves from the current directory),',
     '     optionally only the --workflow NAME(s) (a name, a path or a file name). Every PR with a run of a minute or more has its timeline and commits read, and every such run its jobs (`actions/runs/{id}/jobs?filter=all`, every attempt).',
     '     totals {prs, heavyRuns (jobs add up to >= 1 min; with the jobs unread, the run lasted >= 1 min or was re-run), workflowElapsedMin (measured: run updated_at - run_started_at), jobMinutes {linux, windows, macos, self-hosted} (the sum of the job durations),',
-    '     estimatedUsd (ESTIMATE: each job rounded up to a whole minute x the rate of its OS, self-hosted 0; a public repository is free-public and 0), coverage (% of the heavy runs whose jobs were read), byClass, byEvent, pushesWhileReady,',
+    '     estimatedUsd (ESTIMATE: each job rounded up to a whole minute x the rate of its OS, provider / self-hosted runners 0 unless a --rate prices them; a public repository is free-public and 0), coverage (% of the heavy runs whose jobs were read), byClass, byEvent, pushesWhileReady,',
     '     missedRedrafts (= pushesWhileReady when the repository\'s .claude/pipeline.yml has ci.draft_while_iterating: true, 0 when false, null when it could not be read), wastedRedrafts (null when the viewer login could not be read: whose redraft it was cannot be told), catchupsPerPr, churnRuns, churnMinutes, uncheckedHeads (heads pushed while ready that were left out: the head also has an unlinked run, is not in the PR\'s commit list, or its commit may predate the period), attribution {unlinkedRuns, linkedHeavyRuns, linkedHeavyElapsedMin, unlinkedHeavyRuns, unlinkedHeavyElapsedMin}};',
     '     class of a run: ready-for-review | opening (the head the PR was opened with) | push-while-ready | push-while-draft | converted-cancel | catch-up | rerun | other (not a pull_request run, by event in byEvent; or a pull_request run GitHub did not link to a PR (a PR from a fork, or a PR merged or closed: GitHub unlinks the runs of a PR that is no longer open, so the per-PR rows and the pushed-while-ready and missed-redraft counts cover the PRs still open when the command runs), counted once under event pull_request and in attribution.unlinkedRuns) | unclassified (its PR was not read);',
     '     prs [{pr, readyCycles, pushesWhileReady, pushedHeads, pushesWhileDraft, wastedRedrafts, catchups, heavyRuns, workflowElapsedMin, jobMinutes, estimatedUsd, churnRuns, churnMinutes, uncheckedHeads}];',
-    '     unexcludable: what the numbers cannot tell apart. Rates (USD per minute, default linux 0.006, windows 0.010, macos 0.062) are overridden with --rate os=usd (os: linux | windows | macos).',
+    '     unexcludable: what the numbers cannot tell apart. Rates (USD per minute, default linux 0.006, windows 0.010, macos 0.062) are overridden with --rate key=usd, key: linux | windows | macos (the OS rate), self-hosted (every provider / self-hosted job no label rate prices; default 0) or a runner label (e.g. --rate ubicloud-standard-2=0.0008; a label rate beats the other two and also prices a GitHub larger runner such as ubuntu-latest-4-cores).',
     '     Budget: --max-calls GitHub calls (one per page; the PRs\' reads stop at 60% of it so the biggest runs get their jobs read) and a stop when fewer than 1000 rate-limit calls are left (checked at the start and every 50 calls): `partial: true`',
     '     with `skipped` counts and a warning (also `partial`: a list GitHub cut or capped); coverage then says how much of the cost is measured. Without --json the same numbers print as a plain-text table. Read-only; no billing endpoint, nothing is cached.',
   ].join('\n'),
@@ -29,6 +29,7 @@ export const meta = {
 const SLUG_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const DAY_MS = 86_400_000;
 const RATE_OS = ['linux', 'windows', 'macos'];
+const RATE_LABEL = /^[a-z0-9][a-z0-9._-]*$/;
 
 // `YYYY-MM-DD` (UTC midnight) | `Nd` (now - N x 24 h) -> ms. Anything else is a usage error.
 export function parseSince(raw, now) {
@@ -43,14 +44,19 @@ export function parseSince(raw, now) {
   throw new UsageError(`--since must be YYYY-MM-DD or Nd (N days back, e.g. 7d), not ${asciiLine(text, 40)}`);
 }
 
+// --rate key=usd, key: linux | windows | macos (OS rate), self-hosted (the rate of every provider / self-hosted job no label rate prices), or a runner label (lowercased). -> DEFAULT_RATES with the
+// OS keys overridden, plus 'self-hosted' and `labels` { label: usd } only when given.
 export function parseRates(list) {
   const rates = {};
+  const labels = {};
   for (const item of list ?? []) {
-    const m = /^([a-z]+)=(\d+(?:\.\d+)?)$/.exec(item);
-    if (!m || !RATE_OS.includes(m[1])) throw new UsageError(`--rate ${asciiLine(item, 40)}: expected os=usd with os one of ${RATE_OS.join(', ')} (e.g. linux=0.006)`);
-    rates[m[1]] = Number(m[2]);
+    const m = /^([A-Za-z0-9._-]+)=(\d+(?:\.\d+)?)$/.exec(item);
+    const key = m?.[1].toLowerCase();
+    if (!m || !RATE_LABEL.test(key)) throw new UsageError(`--rate ${asciiLine(item, 40)}: expected key=usd with key one of ${RATE_OS.join(', ')}, self-hosted, or a runner label of letters, digits, - _ . (e.g. linux=0.006, ubicloud-standard-2=0.0008)`);
+    if (RATE_OS.includes(key) || key === 'self-hosted') rates[key] = Number(m[2]);
+    else labels[key] = Number(m[2]);
   }
-  return { ...DEFAULT_RATES, ...rates };
+  return { ...DEFAULT_RATES, ...rates, ...(Object.keys(labels).length > 0 ? { labels } : {}) };
 }
 
 export const run = guarded(async (argv, ctx) => {
