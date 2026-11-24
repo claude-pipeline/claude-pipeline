@@ -32,7 +32,7 @@ import { hashBranch } from '../lib/risk.mjs';
 
 // The default branch the gate resolved for its run (finalgate.mjs#evaluateGate's trustedBranch), recorded in the gate file; absent (an older gate file) -> undefined, so the hash helper works it out.
 const trustedBranchOf = (gate) => (typeof gate?.trustedBranch === 'string' && gate.trustedBranch !== '' ? gate.trustedBranch : undefined);
-import { QueueUnreadable, clearSessionHold, endRecord, holdOnSignal, predatesQueueMessage, queueCatchUpState, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
+import { QueueUnreadable, clearSessionHold, endRecord, guardLinks, guardRerunGraceMs, holdOnSignal, predatesQueueMessage, queueCatchUpState, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
 import { approvalGapSince, createQueueRoute, queueTiming, isDefaultMergeCommand, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
@@ -593,18 +593,24 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
     return { exitCode: EXIT.FAILED, output: { ok: false, reason: `${base} — ${tail}`, ...failure } };
   };
 
-  // Queue mode: the enqueue replaces the merge command; the lift / restore wrapper below is unchanged (the hold builder's seam: lib/queue-route.mjs onBeforeAttempt / onTerminal).
-  // Lifting needs-human fires `unlabeled`, so the guards re-post `pending` on the head: wait for them to settle green first (F7), else the poster would read `pending`
-  // and spend the one re-queue. Refused as today when they do not (withHoldLifted then puts the hold back). No wait on a restart re-queue: nothing was lifted just now.
-  const queueStep = async () => {
-    if (hold !== null) {
-      const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
-      const problems = await settleGuardStatuses({ gh, pr, head, waitMs, pollMs });
-      if (problems.length > 0) return refuse('pre-merge', problems, { head });
-    }
-    return route.enqueueAndWatch({ requeue: pre.requeue === true });
+  // Both modes: lifting needs-human fires `unlabeled`, so the guards re-post `pending` on the head. Merging (direct: GitHub refuses "2 of 3 required status checks are
+  // pending" and the owner's word is spent) or enqueueing (the poster would read `pending` and spend the one re-queue) before they have settled races them. So after the
+  // lift (F7) wait for the re-run to show (the guard links read BEFORE the lift tell old rows from new ones) and settle green; refused as today when it does not
+  // (withHoldLifted then puts the hold back). No wait, no snapshot when nothing was lifted just now (hold === null, incl. a restart re-queue).
+  let guardsBefore = null;
+  if (hold !== null) {
+    try { guardsBefore = guardLinks(gh.checks(pr)); } catch { guardsBefore = null; } // (unreadable: no re-run detection, the wait then judges the first read as before)
+  }
+  const settleGuards = async () => {
+    if (hold === null) return null;
+    const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
+    const problems = await settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before: guardsBefore, graceMs: guardRerunGraceMs(waitMs, ctx.env ?? process.env) });
+    return problems.length > 0 ? refuse('pre-merge', problems, { head }) : null;
   };
-  const mergeStep = queue.on ? queueStep : mergeAndWait;
+  // Queue mode: the enqueue replaces the merge command; the lift / restore wrapper below is unchanged (the hold builder's seam: lib/queue-route.mjs onBeforeAttempt / onTerminal).
+  const queueStep = async () => (await settleGuards()) ?? route.enqueueAndWatch({ requeue: pre.requeue === true });
+  const directStep = async (running) => (await settleGuards()) ?? mergeAndWait(running);
+  const mergeStep = queue.on ? queueStep : directStep;
   if (hold === null) {
     const result = await mergeStep();
     if (recHold !== null && result.output?.merged === true) result.output.holdLifted = recHold.id;

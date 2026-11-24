@@ -967,10 +967,16 @@ export function guardLinks(rows) {
   for (const r of rows) if (GUARD_CHECKS.includes(r?.name)) links[r.name] = r.link ?? null;
   return links;
 }
+// How long to look for the re-run before judging the old rows: 120 s, never more than the merge wait; the env seam (tests) may only shorten it.
+export function guardRerunGraceMs(waitMs, env = {}) {
+  const set = Number(env.PIPELINE_GUARD_RERUN_GRACE_MS);
+  const grace = Math.min(120_000, waitMs);
+  return Number.isInteger(set) && set >= 0 ? Math.min(set, grace) : grace;
+}
 export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before = null, graceMs = 0, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
   const started = now();
   const deadline = started + waitMs;
-  if (before !== null && typeof before === 'object') {
+  if (before !== null && typeof before === 'object' && Object.keys(before).length > 0) { // (no guard row before the lift: nothing to wait for)
     const graceEnd = started + Math.min(graceMs, waitMs);
     for (;;) {
       let rows = null;
