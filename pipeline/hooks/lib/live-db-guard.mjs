@@ -523,7 +523,7 @@ const isPipelineBin = (argv) => {
   const script = argv.slice(1).find((a) => !a.startsWith('-'));
   return n === 'node' && script !== undefined && PIPELINE_BINS.has(commandName(script));
 };
-// the word that IS the program of an inline interpreter (`node -e|--eval|-p|--print CODE`, `--eval=CODE`, `python|python3|pythonX.Y -c CODE`): JavaScript / Python source, not a shell line, so it is not reparsed (owner 2026-11-20; a shell's `-c` stays read). Its residual is in docs/cli.md
+// the word that IS the program of an inline interpreter (`node -e|--eval|-p|--print CODE`, `--eval=CODE`, `python|python3|pythonX.Y -c CODE`): JavaScript / Python source, not a shell line, so it is not reparsed (owner 2026-11-20; a shell's `-c` stays read). The same residual covers the program text of awk, perl, ruby, php, osascript and `vim -c` (owner 2026-11-24: not guarded). Its residual is in docs/cli.md
 const isInlineProgram = (words, i) => {
   const n = commandName(words[0]);
   if (n === 'node') return ['-e', '--eval', '-p', '--print'].includes(words[i - 1]) || /^--(?:eval|print)=/.test(words[i]);
