@@ -429,6 +429,7 @@ test('sweep bypass classes 1-3 and 6-8: decoded, assembled, globbed, valued and 
     "printf 'pg\\x5frepack' | xargs env", "printf 'ps\\x71l -h prod' | sh", "xargs env <<< $'ps\\x71l'", "echo 'ps\"q\"l' | xargs env", "echo 'p\\sql' | xargs env",
     // 3: a name assembled from pieces under xargs / parallel
     "printf '%s%s' ps ql | xargs env", "echo ps ql | tr -d ' ' | xargs env", 'echo sql | xargs -I{} env p{} -h prod', 'parallel env {1}{2} ::: ps ::: ql',
+    "printf '%s' ps ql | xargs env", "{ printf ps; echo ql -h prod; } | xargs env", '(echo -n ps; echo ql) | xargs env', 'echo sql | xargs -I@ env p@ -h prod', 'echo sql | xargs -J @ env p@ -h prod', 'echo sql | xargs --replace=@ env p@ -h prod',
     'x=ps; y=ql; echo $x$y | xargs env', "printf 'ps\\\\\\\\x71l' | xargs printf | xargs env",
     // 4: a command built from a substitution
     '$(echo ps)ql -h prod', 'eval ps$(echo ql) -h prod', `bash -c "$(printf 'ps\\x71l -h x')"`, "ssh host '$(echo ps)ql -h x'",
@@ -442,8 +443,9 @@ test('sweep bypass classes 1-3 and 6-8: decoded, assembled, globbed, valued and 
   ]) mustRefuse(line);
   for (const line of [
     'git ls-files | xargs npx prettier --check', "printf '%s\\n' a.mjs b.mjs | xargs -n1 node --check", "printf '%s\\0' a.mjs b.mjs | xargs -0 -n1 node --check", "printf '%s\\n' b.mjs a.mjs | sort | xargs -n1 node --check",
-    'echo "$FILES" | xargs npx eslint', "git ls-files | sed 's/a/b/' | xargs node x.mjs", 'parallel gzip {}.log ::: a b', 'cat cmds.txt | parallel',
-    '$(which node) x.js', 'eval "$(brew shellenv)"', "git commit -m \"$(printf 'a\\nb')\"",
+    'echo "$FILES" | xargs npx eslint', 'git ls-files | xargs npx prettier --check; echo "exit $?"', 'rg -l foo src | xargs npx eslint && echo ok', "git diff --name-only | xargs node --check; printf 'done\\n'",
+    'echo "checking v$VERSION"; git ls-files | xargs npx eslint', "git ls-files | sed 's/a/b/' | xargs node x.mjs", 'parallel gzip {}.log ::: a b', 'cat cmds.txt | parallel',
+    "bash -c 'for f in *.md; do n=$(echo \"$f\" | cut -d. -f1); mv \"$f\" \"$n.txt\"; done'", "sh -c 'echo \"count: $(printf %s \"$x\" | wc -c)\"'", '$(which node) x.js', 'eval "$(brew shellenv)"', "git commit -m \"$(printf 'a\\nb')\"",
     'ls /usr/bin/psq?', 'node scripts/*.mjs', 'npx eslint src/*', './scripts/*.sh', 'git add src/pg*',
     'git log --grep=pg_repack', 'node x.js --file=supabase/migrations/pg_cron.sql', 'supabase db query "select * from pg_stat_activity" --local',
     "kubectl exec pod -- sh -c 'ls /tmp; cat /etc/hosts'", 'kubectl logs deploy/pgbouncer', 'echo pgloader | pbcopy',
@@ -461,9 +463,10 @@ test('sweep bypass classes 4-5 and 9-10: expansion-built command names, deferred
     '${:-psql} -h prod', 'x=PGLOADER; ${(L)x} a.load', 'a=(ps ql); ${(j::)a} -h prod', 'f() { $1$2 -h prod; }; f ps ql', // 5
     "echo '* * * * * psql -h prod' | crontab -", "at now <<< 'psql -h prod'", "batch <<< 'pg_dump -h x'", // 9
     "sed -n '1e psql -h prod' f", "sed --expression='e psql -h x' f", // 10
+    "sed 's|marker|psql -h prod|e' f", "sed -e'e psql -h prod' f", "sed '\\%x%e psql -h prod' f", "sed e <<< 'psql -h prod'", "echo 'psql -h prod' | sed e",
   ]) mustRefuse(line);
   for (const line of [
-    'crontab -l | grep psql', 'at -l', "sed -n '/psql/p' f", "sed 's/psql/pg/' f",
+    'crontab -l | grep psql', 'at -l', "sed -n '/psql/p' f", "sed 's/psql/pg/' f", "sed -e 's/psql/x/' f",
     '${HOME}/bin/tool x', '$HOME/bin/tool x', '"$npm_execpath" run x',
   ]) mustAllow(line);
 });

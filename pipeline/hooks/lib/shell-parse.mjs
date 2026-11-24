@@ -647,6 +647,17 @@ function shellScan(argv, zshGlued) {
 // ---- script files -------------------------------------------------------------------------------
 
 const INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php)$/;
+// the replacement strings an xargs / parallel word list defines (`{}` always; `-I X`, `-IX`, `-J X`, `-iX`, `--replace=X`)
+export const replaceTokens = (fan) => {
+  const repl = new Set(['{}']);
+  for (let k = 1; k < fan.length; k++) {
+    const t = fan[k];
+    if ((t === '-I' || t === '-J') && fan[k + 1] !== undefined) repl.add(fan[k + 1]);
+    else if (/^-[IJ]./.test(t) || /^--replace=./.test(t)) repl.add(t.startsWith('--') ? t.slice(10) : t.slice(2));
+    else if (/^-i./.test(t)) repl.add(t.slice(2));
+  }
+  return repl;
+};
 export const SCRIPT_EXT = /\.(?:m?[jt]s|cjs|jsx|tsx|py|rb|pl|php|sh|bash|zsh)$/i;
 const SYSTEM_BIN = /^(?:\/usr)?(?:\/local)?\/(?:s?bin|libexec)\/|^\/opt\/homebrew\/s?bin\//;
 // Flags that make an interpreter run inline code, a module or a test runner instead of a file.
@@ -3751,13 +3762,10 @@ class Parser {
   fanOut(seg, fan, argv, cmd) {
     if (!SHELLS.has(base(argv[0]))) return;
     const r = shellInvocation(argv);
-    const repl = new Set(['{}']);
+    const repl = replaceTokens(fan);
     let argFile = null;
     for (let k = 1; k < fan.length; k++) {
       const t = fan[k];
-      if ((t === '-I' || t === '-J') && fan[k + 1] !== undefined) repl.add(fan[k + 1]);
-      else if (/^-[IJ]./.test(t) || /^--replace=./.test(t)) repl.add(t.startsWith('--') ? t.slice(10) : t.slice(2));
-      else if (/^-i./.test(t)) repl.add(t.slice(2));
       if (t === '-a' || t === '--arg-file') argFile = fan[k + 1] ?? null;
       else if (/^-a./.test(t) && t[1] !== '-') argFile = t.slice(2);
       else if (t.startsWith('--arg-file=')) argFile = t.slice(11);
