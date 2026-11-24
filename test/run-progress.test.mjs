@@ -344,3 +344,29 @@ test('writeRunRecord: sections given as a function are rendered from the comment
   assert.match(seen[0], /Pushed to the ready PR/, 'the function got the re-read comment');
   assert.match(mineBody(gh), /\*\*merged\*\*\n\nPushed to the ready PR without `pipeline redraft` first once/);
 });
+
+test('writeRunRecord: a rate-limited write with function sections is retried from a fresh read and re-render, so a line posted during the wait is not erased', () => {
+  // failure caught: the retry resent the body rendered before the wait, erasing a pushed-while-ready line another summary posted meanwhile (and the warning would be decided on the stale read)
+  const gh = memoryGh();
+  seed(gh, plain());
+  const NOTE = 'Pushed to the ready PR without `pipeline redraft` first once: bbbbbbbbbbbb (a push to a ready PR starts the full CI suite).';
+  const real = gh.upsertComment;
+  let attempts = 0;
+  const limited = (pr, marker, body, opts) => {
+    attempts += 1;
+    if (attempts === 1) {
+      gh.upsertComment = real;
+      writeSummaryComment(gh, PR, { sections: `### Outcome\n\n**awaiting-owner-merge**\n\n${NOTE}` }); // lands during the wait
+      gh.upsertComment = limited;
+      throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' });
+    }
+    return real(pr, marker, body, opts);
+  };
+  gh.upsertComment = limited;
+  const reads = [];
+  writeRunRecord(gh, PR, { record: plain(), retry: true, sections: (fresh) => { reads.push(fresh.sections); return `### Outcome\n\n**merged**\n\n${fresh.sections.split('\n').find((l) => l.startsWith('Pushed to the ready PR')) ?? ''}`; } });
+  assert.equal(attempts, 2);
+  assert.doesNotMatch(reads[0], /Pushed to the ready PR/);
+  assert.match(reads.at(-1), /Pushed to the ready PR/, 'the sections are rendered from the last read');
+  assert.match(mineBody(gh), /\*\*merged\*\*\n\nPushed to the ready PR without `pipeline redraft` first once/);
+});

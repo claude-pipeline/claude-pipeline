@@ -1,6 +1,7 @@
 // The ONE writer of the PR's summary comment: marker + status block + summary sections + record marker.
 // `P summary`, `P comment --kind summary` and `P checkpoint` all go through it, so whichever part the caller does not
 // supply (the run record, or the summary sections) is kept from the comment already on the PR instead of being lost.
+import { retrying } from './gh-retry.mjs';
 import { MARKERS } from './render.mjs';
 import { STATUS_END, STATUS_START, decodeRecord, encodeRecord, renderStatusBlock } from './run-record.mjs';
 
@@ -39,22 +40,27 @@ export function readSummaryComment(gh, pr) {
 // silently: omit `record` and the write is refused.
 // `retry`: wait out a rate limit (the run recorder leaves it off; the comment, summary and checkpoint commands opt in).
 export function writeSummaryComment(gh, pr, { record, sections, existing, retry = false } = {}) {
-  const current = existing ?? readSummaryComment(gh, pr);
-  if (record === undefined && current.status === 'unsupported') {
-    throw new Error('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI before rewriting it');
-  }
-  const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
-  const useSections = typeof sections === 'function' ? sections(current) : (sections !== undefined ? sections : current.sections);
-  const parts = [MARKERS.summary, ''];
-  if (useRecord) parts.push(renderStatusBlock(useRecord), '');
-  if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
-  if (useRecord) parts.push(encodeRecord(useRecord));
-  const body = parts.join('\n').trimEnd();
-  // `current` is a fresh read of the newest own marker comment: edit that id instead of listing every comment again (#396); no comment yet (or a gh without updateComment): the upsert creates it.
-  // `retry` reaches the write only (both are safe to re-run: the PATCH is idempotent, the upsert re-lists before it writes).
-  const opts = retry ? [{ retry: true }] : [];
-  const posted = current.id != null && typeof gh.updateComment === 'function'
-    ? gh.updateComment(current.id, MARKERS.summary, body, ...opts)
-    : gh.upsertComment(pr, MARKERS.summary, body, ...opts);
-  return { ...posted, record: useRecord };
+  const once = (current, retryWrite) => {
+    if (record === undefined && current.status === 'unsupported') {
+      throw new Error('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI before rewriting it');
+    }
+    const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
+    const useSections = typeof sections === 'function' ? sections(current) : (sections !== undefined ? sections : current.sections);
+    const parts = [MARKERS.summary, ''];
+    if (useRecord) parts.push(renderStatusBlock(useRecord), '');
+    if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
+    if (useRecord) parts.push(encodeRecord(useRecord));
+    const body = parts.join('\n').trimEnd();
+    // `current` is a fresh read of the newest own marker comment: edit that id instead of listing every comment again (#396); no comment yet (or a gh without updateComment): the upsert creates it.
+    // `retry` reaches the write only (both are safe to re-run: the PATCH is idempotent, the upsert re-lists before it writes).
+    const opts = retryWrite ? [{ retry: true }] : [];
+    const posted = current.id != null && typeof gh.updateComment === 'function'
+      ? gh.updateComment(current.id, MARKERS.summary, body, ...opts)
+      : gh.upsertComment(pr, MARKERS.summary, body, ...opts);
+    return { ...posted, record: useRecord };
+  };
+  if (!(retry && typeof sections === 'function')) return once(existing ?? readSummaryComment(gh, pr), retry);
+  // Sections that are a function of the comment (the closed-PR summary) must be rendered from what is on the PR when they are SENT: a wait out of a rate limit
+  // can let another summary post a line, which the body rendered before the wait would erase. So the retry is of the whole step (re-read, re-render, write), not of the PATCH alone.
+  return retrying((attempt) => once(attempt === 1 && existing ? existing : readSummaryComment(gh, pr), false));
 }
