@@ -927,21 +927,31 @@ const globPg = (w, min) => {
   if (p.replace(/[*?]/g, '').length < min) return false;
   if (PG_GLOB_NAMES.some((n) => wild(p, n))) return true;
   if (p.includes('.')) return false;
+  if (p[0] === '*' && !tok.includes('/')) return false; // (a leading `*` with no directory, `*2` left by arithmetic, `*(b)`: no `pg_` prefix is proven)
   for (let i = 0; i < 3; i += 1) { if (p[i] === '*') return true; if (p[i] === undefined) return false; if (p[i] !== '?' && p[i] !== 'pg_'[i]) return false; }
   return true;
 };
 // piped commands that only pass text through; any other piped command (tr, sed, awk, head …) may rebuild a name from the producer's text
 const PASS_FILTERS = new Set(['sort', 'uniq', 'tee', 'cat']);
 // a command name, or the text a shell runs, built from echo / printf output inside a substitution (`$(echo ps)ql`, `eval ps$(echo ql)`)
+// (the parser reads `$(( $(echo a) + 1 ))` as a command `$(echo a)` with an arithmetic operator after it: no program)
+const ARITH_OP = /^(?:[+*/%]|<<|>>|==|!=|<=|>=|&&|\|\|)$/;
 const SUBST_LIT = /(?:\$\(|`)\s*(?:echo|printf)\b/;
 const REWRITERS = new Set(['tr', 'sed', 'awk', 'gawk', 'perl', 'python', 'python3', 'ruby', 'cut', 'rev', 'paste', 'fold', 'fmt', 'head', 'tail', 'tac', 'od', 'xxd', 'base64', 'iconv', 'jq', 'grep', 'column', 'expand', 'unexpand', 'nl', 'xargs', 'parallel']);
 const TEXT_RUNNERS = new Set(['eval', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'source', '.']);
-// an expansion in a word that can build or hide a name: two expansions side by side or an expansion glued to name characters (`$1$2`, `$x$y`, `${a}ql`); with braces: a `${…}` that is not a plain name or a plain default (`${:-psql}`, `${(L)x}`, `${x:-pgloader}`). One pass, an unterminated one refuses
+// an expansion in a word that can build or hide a name: two expansions side by side or an expansion glued to name characters (`$1$2`, `$x$y`, `${a}ql`); with braces: a `${…}` that is not a plain name or a plain default (`${:-psql}`, `${(L)x}`, `${x:-pgloader}`). One pass; an unterminated one is a syntax error and ends the scan
 // ${NAME} or ${NAME:-default} with a plain default word (the `"${BASH:-bash}"` idiom) is a plain name; the default must name no family program
-const plainBrace = (c) => {
-  const m = /^\w+(?::?[-=+?]([^$`(){}]*))?$/.exec(c);
+const plainBrace = (c, depth = 0) => {
+  const m = /^#?\w+(?:\[[@*\w]+\])?(?::?[-=+?]([^`()]*))?$/.exec(c);
   if (!m) return false;
-  const d = fedText(m[1] ?? '');
+  let d = m[1] ?? '';
+  // nested plain expansions in the default (a default that is itself a plain braced default) are judged on their own and read as empty here
+  for (let n = 0; /[${}]/.test(d); n += 1) {
+    const inner = /\$\{([^${}`()]*)\}/.exec(d);
+    if (!inner || n > 8 || depth > 8 || !plainBrace(inner[1], depth + 1)) return false;
+    d = d.slice(0, inner.index) + d.slice(inner.index + inner[0].length);
+  }
+  d = fedText(d);
   return !(pgWord(d) || globPg(d, 0) || PG_TOKEN.test(d) || laterPgWord(d));
 };
 const expansionTrick = (s, braces) => {
@@ -952,14 +962,16 @@ const expansionTrick = (s, braces) => {
     let end;
     if (ch === '`') { end = s.indexOf('`', i + 1); if (end < 0) break; if (end === i + 1) { i = end + 1; continue; } end += 1; } // an unterminated backtick is a literal character, an empty pair a no-op
     else if (s[i + 1] === '{') {
-      end = s.indexOf('}', i + 2);
-      if (end < 0) return true;
+      let depth = 1; let j = i + 2;
+      for (; j < s.length && depth > 0; j += 1) { if (s[j] === '{') depth += 1; else if (s[j] === '}') depth -= 1; }
+      if (depth > 0) return false; // unterminated: a syntax error, nothing runs (and no rescan of the rest)
+      end = j - 1;
       if (braces && !plainBrace(s.slice(i + 2, end))) return true;
       end += 1;
     } else if (s[i + 1] === '(') {
       let depth = 0; let j = i + 1;
       for (; j < s.length; j += 1) { if (s[j] === '(') depth += 1; else if (s[j] === ')') { depth -= 1; if (depth === 0) break; } }
-      if (j >= s.length) return true;
+      if (j >= s.length) return false;
       end = j + 1;
     } else if (/\w/.test(s[i + 1] ?? '')) {
       end = i + 2;
@@ -1027,7 +1039,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
   // a command name that only decodes to a family name (`printf 'ps\x71l -h x' | sh`)
   if (reading.some((c) => [c.argv[0], typedWords(c)[0] ?? ''].some((w) => !pgWord(w) && pgWord(fedText(w))))) return 'a psql family name spelled with escapes or quotes in produced text';
   // a command name (or the text eval / a shell runs) built from echo / printf inside a substitution
-  if (reading.some((c) => SUBST_LIT.test(c.argv[0]) || SUBST_LIT.test(typedWords(c)[0] ?? '') || (TEXT_RUNNERS.has(commandName(c.argv[0])) && c.argv.some((w) => SUBST_LIT.test(w))))) return 'a command built from echo / printf text inside a substitution';
+  if (reading.some((c) => ((SUBST_LIT.test(c.argv[0]) || SUBST_LIT.test(typedWords(c)[0] ?? '')) && !ARITH_OP.test(c.argv[1] ?? '')) || (TEXT_RUNNERS.has(commandName(c.argv[0])) && c.argv.some((w, i) => SUBST_LIT.test(w) && (['eval', 'source', '.'].includes(commandName(c.argv[0])) || /^-[A-Za-z]*c[A-Za-z]*$/.test(c.argv[i - 1] ?? '')))))) return 'a command built from echo / printf text inside a substitution';
   // a command name built or hidden by an expansion (`${:-psql}`, `${(L)x}`, `${(j::)a}`, `$1$2`: zsh-only forms and glued expansions the guard cannot resolve), whatever else the line holds
   if (reading.some((c) => [c.argv[0], typedWords(c)[0] ?? ''].some((w) => expansionTrick(String(w), true)))) return 'the command name is built from expansions the guard cannot read (a braced expansion that is not a plain name, or expansions glued together)';
   // a variable that holds a name built from a substitution or glued expansions, then run as the command (`x=$(echo ps)ql; $x -h prod`)
