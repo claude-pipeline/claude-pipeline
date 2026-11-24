@@ -165,6 +165,25 @@ test('costOfJobs: three parallel shards plus one job are summed; an attempt-2 jo
   assert.equal(costOfJobs(jobs, { ...DEFAULT_RATES, linux: 0.01 }).usd > c.usd, true, 'a rate override is used');
 });
 
+test('costOfJobs: a label rate prices a provider job (#795: it cost 0), self-hosted= prices the unpriced rest, a label rate beats the self-hosted and OS rates, no rate keeps provider jobs at 0', () => {
+  const t0 = T('10:00');
+  const ubi = job(t0, 3.2, ['ubicloud-standard-2']); // 4 billed minutes
+  const other = job(t0, 2, ['blacksmith-4vcpu-ubuntu-2204']);
+  assert.equal(costOfJobs([ubi, other], DEFAULT_RATES).usd, 0, 'default: provider jobs stay at 0');
+  assert.equal(costOfJobs([ubi, other], { ...DEFAULT_RATES, labels: {} }).usd, 0);
+  const labelled = { ...DEFAULT_RATES, labels: { 'ubicloud-standard-2': 0.0008 } };
+  assert.equal(Math.round(costOfJobs([ubi], labelled).usd * 1e9) / 1e9, 4 * 0.0008, 'ceil(3.2) x the label rate, not 0');
+  assert.equal(costOfJobs([other], labelled).usd, 0, 'a label rate prices only its own label');
+  const both = { ...DEFAULT_RATES, 'self-hosted': 0.002, labels: { 'ubicloud-standard-2': 0.0008, 'ubuntu-latest': 0.5 } };
+  assert.equal(Math.round(costOfJobs([ubi, other], both).usd * 1e9) / 1e9, Math.round((4 * 0.0008 + 2 * 0.002) * 1e9) / 1e9, 'self-hosted= prices the provider job with no label rate');
+  assert.equal(costOfJobs([job(t0, 1, ['ubicloud-standard-2'])], { ...DEFAULT_RATES, linux: 9, labels: { 'ubicloud-standard-2': 0.0008 } }).usd, 0.0008, 'the label rate beats an OS rate');
+  // a GitHub larger runner is priced by its label; labels match case-insensitively, first of the job's labels wins
+  assert.equal(costOfJobs([job(t0, 2, ['Ubuntu-Latest-4-Cores'])], { ...DEFAULT_RATES, labels: { 'ubuntu-latest-4-cores': 0.016 } }).usd, 2 * 0.016);
+  assert.equal(costOfJobs([job(t0, 1, ['self-hosted', 'ubicloud-standard-2'])], { ...DEFAULT_RATES, labels: { 'self-hosted': 3, 'ubicloud-standard-2': 5 } }).usd, 3);
+  // minutes bucketing is unchanged by a rate
+  assert.equal(costOfJobs([ubi], labelled).minutes['self-hosted'], 3.2);
+});
+
 test('review round 1 B2: an unreadable timeline gives an unknown pushedWhileReady (count null), not the PR current draft flag applied to every historical push', () => {
   // a fix pushed in draft; the PR is ready now; the timeline read failed. Without the timeline the push cannot be called a missed redraft.
   const pr = { createdAt: T('09:00'), draft: false };
