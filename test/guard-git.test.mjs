@@ -1906,6 +1906,10 @@ test('#789: a one-operand git checkout leaves the branch unknown; git switch and
   for (const c of ['git checkout ./README.md && git push origin HEAD', 'git checkout . && git push origin HEAD', 'git checkout ../a.txt && git push origin HEAD', 'git checkout .. && git push origin HEAD']) {
     assert.equal(evaluate(c, { branch: 'agent/topic', labels: [] }).decision, 'allow', c);
   }
+  // (R4-B1: a ref name cannot start with `/`, and the shell turns `~/x` into an absolute path: a file restore, the branch stays)
+  for (const c of ['git checkout /work/repo/README.md && git push origin HEAD', 'git checkout ~/notes.txt && git push origin HEAD']) {
+    assert.equal(evaluate(c, { branch: 'agent/topic', labels: [] }).decision, 'allow', c);
+  }
 });
 
 // #529: dash / Debian sh / ash read `A && B &>f` as `A && B &` (a background job) and then `>f`; bash / zsh / ksh read a redirect. What a command of such a span changed (the directory, a branch, a variable) is

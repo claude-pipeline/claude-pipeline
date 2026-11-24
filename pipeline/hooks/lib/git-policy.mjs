@@ -644,8 +644,8 @@ function trackSwitch(sub, args, d, ctx) {
   if (x === '-' || /^@\{-\d*\}$/.test(x) || DYNAMIC.test(x)) { setBranch(ctx, d, null); return; }
   if (x === 'HEAD' || x === '@') return;
   if (!isSwitch) {
-    // (a path spelling cannot be a ref name: `.`, `..`, `./x`, `../x`, a trailing `/`; --ours / --theirs never switch: a path restore, the branch stays)
-    if (/^\.{1,2}(\/|$)/.test(x) || x.endsWith('/') || flags.some((f) => !f.short && (f.name === 'ours' || f.name === 'theirs'))) return;
+    // (a path spelling cannot be a ref name: `.`, `..`, `./x`, `../x`, a trailing `/`, a leading `/` (absolute) or `~/` (the shell makes it absolute); --ours / --theirs never switch: a path restore, the branch stays)
+    if (/^\.{1,2}(\/|$)/.test(x) || x.endsWith('/') || x.startsWith('/') || x.startsWith('~/') || flags.some((f) => !f.short && (f.name === 'ours' || f.name === 'theirs'))) return;
     // (#789: a one-operand checkout restores a file or switches, and only git knows which: the branch is unknown, with a hint for the push denial)
     ctx.checkoutDoubt = true;
     setBranch(ctx, d, null);
