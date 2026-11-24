@@ -665,7 +665,7 @@ for (const [command, o] of MORE_ALLOW) {
 
 // #586: `cd /work/other; cd /work/repo/missing; git push`: the second cd fails, `;` goes on, and the push runs in /work/other (on main) while the guard judged /work/repo (agent/x)
 const CD_DIRS = ['/work/other', '/work/repo', '/work/repo/sub']; // (the directories that exist; /work/repo/file.txt is a file)
-const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/repo/file.txt': 'agent/x', '/home/u/missing': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
+const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/repo/tdir': 'agent/x', '/work/repo/file.txt': 'agent/x', '/home/u/missing': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
 const CD_DENY = [
   'cd /work/other; cd /work/repo/missing; git push',
   'cd /work/other; pushd /work/repo/missing; git push',
@@ -685,6 +685,8 @@ const CD_DENY = [
   'cd /work/other; install /work/other/f.sh /work/repo/missing; cd /work/repo/missing; git push',
   'cd /work/other; tar -xf /work/repo/missing; cd /work/repo/missing; git push', // (tar names a directory only through -C, unzip only through -d)
   'cd /work/other; unzip /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; tar -xf /work/other/a.tgz -C /work/repo/tdir; cd /work/repo/tdir; git push', // (R2-B3: tar -C needs the folder to exist, it makes none)
+  'cd /work/other; (cd /tmp && ls); cd /work/repo/missing; git push', // (the failed cd is judged again after a subshell that moved elsewhere)
 ];
 const CD_ALLOW = [
   'cd /work/other; cd /work/repo/sub; git push', // the target exists
@@ -697,6 +699,7 @@ const CD_ALLOW = [
   'cd /work/other; git clone https://example.invalid/r.git /work/repo/missing; cd /work/repo/missing; git push',
   'cd /work/repo; git clone https://example.invalid/r.git; cd r; git push',
   'cd /work/repo/sub; cd ..; git push', // an ancestor of where the line stands exists
+  'git clone -- https://example.invalid/r.git r; cd r; bash ./build.sh', // (R2-B4: after git's --, the operands go on)
   'git clone --depth 1 https://example.invalid/r.git; cd r; bash ./build.sh', // (R1-B5: the clone's directory is named after the repository whatever options come before the URL: as on main)
   'git clone -b main https://example.invalid/r.git; cd r; bash ./build.sh',
   'gh repo clone team/tool; cd tool; bash ./build.sh',
@@ -706,16 +709,30 @@ const CD_ALLOW = [
   'cd /work/other; mv /work/repo/sub /work/repo/moved; cd /work/repo/moved; git push',
   'cd /work/other; install -d /work/repo/idir; cd /work/repo/idir; git push',
   'cd /work/other; unzip /work/other/a.zip -d /work/repo/udir; cd /work/repo/udir; git push',
-  'cd /work/other; tar -xf /work/other/a.tgz -C /work/repo/tdir; cd /work/repo/tdir; git push',
 ];
 // (R1-B1: `cd frontend; npm run build` where frontend does not exist runs the ROOT package's build script: the directory the line was in is still judged, as main did by walking up from the presumed subdirectory)
 const cdPkg = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/package.json'), readText: (p) => (resolve(p) === resolve('/work/repo/package.json') ? JSON.stringify({ name: 'x', scripts: { build: ['git', 'push', 'origin', 'main'].join(' '), ok: 'echo hi' } }) : null) };
-for (const c of ['cd frontend; npm run build', 'cd frontend\nnpm run build', 'cd frontend; bash -c "npm run build"']) {
+for (const c of ['cd frontend; npm run build', 'cd frontend\nnpm run build', 'cd frontend; bash -c "npm run build"', 'cd frontend; (cd /tmp && ls); npm run build', 'cd frontend; X=$(cd /tmp && pwd); npm run build', 'cd frontend; bash -c "cd /tmp && ls"; npm run build']) {
   test(`DENY #586 package script ${c.replace(/\n/g, '\\n')}`, () => {
     const v = evaluate(c, cdPkg);
     assert.equal(v.decision, 'deny', `expected deny, got allow for: ${c}`);
   });
 }
+// (R2-B1: `rmdir` of a folder that holds files fails, the cd then succeeds and npm runs the FRONTEND script: both folders are judged)
+test('DENY #586 rmdir frontend; cd frontend; npm run build (the frontend script is the one that pushes)', () => {
+  const mainPush = ['git', 'push', 'origin', 'main'].join(' ');
+  const pkgs = { [resolve('/work/repo/package.json')]: { build: 'echo hi' }, [resolve('/work/repo/frontend/package.json')]: { build: mainPush } };
+  const o = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/frontend') || resolve(p) in pkgs, readDir: (p) => (resolve(p) === resolve('/work/repo/frontend') ? [] : cdWorld.readDir(p)), readText: (p) => (resolve(p) in pkgs ? JSON.stringify({ name: 'x', scripts: pkgs[resolve(p)] }) : null) };
+  const v = evaluate('rmdir frontend; cd frontend; npm run build', o);
+  assert.equal(v.decision, 'deny', 'expected deny, got allow');
+});
+test('ALLOW #586 cd frontend && npm run ok / cd frontend || exit 1 (proven: the target is where it runs)', () => {
+  for (const c of ['cd frontend && npm run ok', 'cd frontend || exit 1; npm run ok']) assert.equal(evaluate(c, cdPkg).decision, 'allow', c);
+});
+test('DENY #586 the reason names the cd and the fix', () => {
+  const v = evaluate('cd /work/other; cd /work/repo/missing; git push', { ...cdWorld, cwd: '/work/repo' });
+  assert.match(v.reason, /^`cd \/work\/repo\/missing` may fail.*Use `cd \/work\/repo\/missing && …` or `cd \/work\/repo\/missing \|\| exit 1`\.$/s);
+});
 test('ALLOW #586 cd frontend; npm run ok (the root script is harmless)', () => {
   const v = evaluate('cd frontend; npm run ok', cdPkg);
   assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
@@ -729,8 +746,9 @@ test('ALLOW #586 cd into a searchable but unlistable directory, then a relative 
     chmodSync(join(d, 'locked'), 0o111);
     const v = evaluateGitCommand(`cd ${join(d, 'locked')}; bash ./build.sh`, { cwd: d, home: d });
     assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
+    writeFileSync(join(d, 'build.sh'), ['git', 'push', 'origin', 'main'].join(' ') + '\n');
     const f = evaluateGitCommand(`cd ${join(d, 'locked', 'build.sh')}; bash ./build.sh`, { cwd: d, home: d });
-    assert.equal(f.decision, 'deny', 'a file target still fails the cd');
+    assert.equal(f.decision, 'deny', 'a file target fails the cd: ./build.sh is the one next to the line');
   } finally {
     chmodSync(join(d, 'locked'), 0o755);
     rmSync(d, { recursive: true, force: true });

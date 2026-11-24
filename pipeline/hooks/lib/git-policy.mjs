@@ -1704,7 +1704,7 @@ function pkgFileWritten(ctx, abs) {
 // The directories a script file may have moved to with a cd the guard cannot follow: its own directory and every one above it, for the path as named and for where it really is (`${0:A:h:h}` resolves links).
 // Each is only a guess at where the script really runs from, so what the guesses do is judged as ALTERNATIVES: see judgeAlternatives.
 function selfDirs(ctx) {
-  const out = [...(ctx.cdWasDirs ?? [])]; // (#586 R1-B1: where the line was before a cd that may have failed)
+  const out = [];
   if (typeof ctx.selfScript !== 'string') return out;
   const real = realLocation(ctx.realpath, ctx.selfScript);
   for (const start of new Set([ctx.selfScript, typeof real === 'string' ? real : ctx.selfScript])) {
@@ -3357,8 +3357,6 @@ function evalString(str, startDir, ctx, level, child = false) {
     }
   }
   let dir = startDir;
-  // (#586 R1-B1: the directories a cd that may have failed can have left the line in: the one it was in before it. While the directory is unknown they are places the package script, merge command and runner bin lookups are ALSO judged in (selfDirs): main judged them from the presumed subdirectory, walking up to the same manifest)
-  let cdWasDirs = startDir === null ? [...(ctx.cdWasDirs ?? [])] : [];
   const cdp = cdpathMaybe(cmds, ctx);
   const trusted = subshellsTrusted(cmds); // (the marks of the parser (up, grp, ctl) say where every level starts and ends: when they are not to be trusted, no change is certain and no level is given back)
   // (#352 R10: ONE rule, an ALLOWLIST, certainChange: a command that changed git state or the directory and is not certain leaves it UNKNOWN for every later command at once (forget). One that is certain stays so for the
@@ -3377,7 +3375,6 @@ function evalString(str, startDir, ctx, level, child = false) {
     for (const [kind, then, now] of [['git', was.git, ctx.gitAliases], ['gh', was.gh, ctx.ghAliases]]) for (const n of new Set([...Object.keys(then), ...Object.keys(now)])) if (then[n] !== now[n]) ctx.aliasUnsure.add(`${kind}:${n.toLowerCase()}`);
   };
   const forget = (x) => {
-    if (x.cdMissing && typeof x.cdWas === 'string' && !cdWasDirs.includes(x.cdWas)) cdWasDirs = [...cdWasDirs, x.cdWas];
     if (x.lost) forgetState(x.mover); else forgetNames(x.mover); // (x.mover: a git command that may move a branch, see movesBranch: only that one can have switched a repository the walk has no entry for)
     aliasesUnsure(x.before);
   };
@@ -3386,6 +3383,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   const settle = (c, i) => {
     // (#530 / #545: after a plain `|| exit` a redirected move (x.redir) is proven to have happened: it goes on as a certain one. The tracker is replaced by a copy, never changed in place: snap() and the loop frames share them)
     const proven = new Map();
+    let stayed = false; // (#586: the first doubtful cd of this settle that stays where it was: a later one, chained to it with &&, never ran)
     // (D: a change made directly in a loop body (x.loopOnly: no other body mark, not after &&) proven by a plain `|| exit` is reached by every later command of that body: kept (soft) through ; and || until the body is
     // left, where the blk rule forgets it (an early break / continue skips the cd and everything after it). The `|| { …; exit 1; }` group form is not read in a text with a loop (no shape events there): still refused)
     // (#754: a branch switch not proven to have succeeded (x.unproven) is proven by the same plain `|| exit`: the copy goes on as before)
@@ -3423,8 +3421,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
       // leaves EVERY branch unknown (R1-B1, the doubtful-git-change rule of #505: a subfolder of the same worktree has no entry of its own and would read the branch the switch may not have left))
       else if (x.unproven) forgetNames(true);
-      // (#586: `cd missing; git push`: the cd may have failed, and the push then runs where the line was before it. Only && and a plain `|| exit` prove it: after any other operator the directory is unknown)
-      else if (x.cdMissing) forget(x);
+      // (#586: `cd missing; git push`: the cd may have failed, and the push then runs where the line was before it. Only && and a plain `|| exit` prove it: after any other operator the walk is in the directory the cd left (reading B, see evaluateGitCommand))
+      else if (x.cdMissing) { if (!stayed) { dir = x.cdWas; stayed = true; ctx.bashState.cdWord ??= x.cdWord; } }
       return false;
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
@@ -3645,8 +3643,6 @@ function evalString(str, startDir, ctx, level, child = false) {
     const varsBefore = c.maybeBg === true && argv.length > 0 ? { vars: { ...ctx.vars }, unsure: new Set(ctx.unsureVars) } : null;
     frame.i = i;
     dirAt.set(i, dir);
-    if (dir !== null) cdWasDirs = [];
-    ctx.cdWasDirs = dir === null ? cdWasDirs : [];
     if (c.maybeBgEnds !== undefined && (c.redirects ?? []).some((r) => r.op === '&>' || r.op === '&>>')) { const alts = spans.filter((sp) => sp.end === i && sp.dir !== dir).map((sp) => sp.dir); if (alts.length) altDirs.set(i, alts); } // (#529: the span moved the directory: dash opens the target from where it was before)
     // (#352 R35-F2: the closer of a { } group is listed as a command of no words in it, after its last one: a redirection on it that can fail (`{ cd d; } < /missing`) fails the group before it runs, so what
     // the group changed is not handed on as certain when it ends (see the brace rule above))
@@ -3657,7 +3653,8 @@ function evalString(str, startDir, ctx, level, child = false) {
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
     let cdMissing = false; // (#586: a cd whose target is not shown to exist: see cdUnproven)
-    let cdWas = null; // (the directory that cd left)
+    let cdWas = null; // (reading B: the directory that cd left, and the word it names)
+    let cdWord = null;
     let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist, not even as a dangling link: nothing runs; #630)
     if (VAR_BUILTINS.includes(name)) {
       const d = declAttrs(argv);
@@ -3668,7 +3665,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (childCd) { /* the child's own directory */ }
-    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; const was = dir; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); cdMissing = dir !== null && cdUnproven(cmds, i, dirAt, ctx, name, argv, dir, was); cdWas = was; } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; const was = dir; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); if (dir !== null && cdUnproven(cmds, i, dirAt, ctx, name, argv, dir, was)) { cdWord = argv.slice(1).find((a) => a !== '--' && !/^-[LP]+$/.test(a)); if (ctx.bashState.cdFails) { cdMissing = true; cdWas = was; } else ctx.bashState.cdDoubt ??= cdWord; } } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
@@ -3690,10 +3687,9 @@ function evalString(str, startDir, ctx, level, child = false) {
         const v = withPrefixEnv(c, ctx, () => evalString(inner, dir, ctx, level + 1));
         if (v.decision === 'deny') { verdict = v; break; }
       }
-      const alsoIn = (judge) => { let v = judge(dir); for (const g of dir === null ? cdWasDirs : []) if (!v) v = judge(g); return v; }; // (R1-B1)
-      if (!verdict) verdict = withPrefixEnv(c, ctx, () => alsoIn((d) => repoMergeCommandVerdict(argv, d, ctx, c.env))); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
+      if (!verdict) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(argv, dir, ctx, c.env)); // (#58; with its prefix: `npm_config_prefix=/chat npm run merge …`)
       // (npm exec NAME / npx NAME: the parser unwraps them to `NAME …`, marked viaRunner. NAME is a bin, never a script, but it is judged as the merge script when it carries that name: `npx npm run NAME`)
-      if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => alsoIn((d) => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], d, ctx, c.env)));
+      if (!verdict && c.viaRunner) verdict = withPrefixEnv(c, ctx, () => repoMergeCommandVerdict(['npx', 'npm', 'run', argv[0]], dir, ctx, c.env));
       if (!verdict && c.viaRunner) {
         verdict = runnerBinVerdict(argv, dir, ctx, level);
         // (R1-B6: `npx --prefix sub tool`: the bin may come from the prefix's node_modules/.bin; it still runs in the working directory)
@@ -3775,7 +3771,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), cdWas, unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, cdMissing, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), cdWas, cdWord, unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, cdMissing, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
@@ -3840,18 +3836,19 @@ function evalString(str, startDir, ctx, level, child = false) {
 // or a path below it; permissive on purpose). No operand and `~` are the home: not asked. A file target fails the cd as a missing one does.)
 // (R1-B5: the directory a `git clone` / `gh repo clone` makes: the operand after the repository when given, else the repository's name. The options that take a value are skipped with it; the words after a bare -- are git's)
 const CLONE_VALUE_OPTS = new Set(['--depth', '-b', '--branch', '-o', '--origin', '-c', '--config', '--reference', '--reference-if-able', '--separate-git-dir', '--template', '-j', '--jobs', '--filter', '-u', '--upload-pack', '--server-option', '--shallow-since', '--shallow-exclude', '--revision', '--bundle-uri', '--ref-format', '--upstream-remote-name']);
-function cloneWords(m) {
+function cloneWords(m, gh = false) {
   const pos = [];
+  let opts = true;
   for (let k = m.indexOf('clone') + 1; k < m.length; k++) {
     const w = m[k];
-    if (w === '--') break;
-    if (w.startsWith('-')) { if (CLONE_VALUE_OPTS.has(w)) k++; continue; }
+    if (w === '--' && opts) { if (gh) break; opts = false; continue; } // (R2-B4: git's -- ends its options and the operands go on; gh's passes the words after it to git)
+    if (opts && w.startsWith('-')) { if (CLONE_VALUE_OPTS.has(w)) k++; continue; }
     pos.push(w);
   }
   if (pos.length === 0) return [];
   return pos.length > 1 ? [pos[1]] : [path.basename(pos[0].replace(/\/+$/, '')).replace(/\.git$/, '')];
 }
-const CD_MAKERS = new Set(['mkdir', 'install', 'cp', 'mv', 'ln', 'tar', 'unzip', 'rsync', 'git', 'gh']);
+const CD_MAKERS = new Set(['mkdir', 'install', 'cp', 'mv', 'ln', 'unzip', 'rsync', 'git', 'gh']);
 const CD_REMOVERS = new Set(['rm', 'rmdir', 'mv']);
 const defaultIsDir = (p) => { try { return statSync(p).isDirectory(); } catch { return false; } };
 function cdUnproven(cmds, i, dirAt, ctx, name, argv, next, was) {
@@ -3883,23 +3880,18 @@ function cdUnproven(cmds, i, dirAt, ctx, name, argv, next, was) {
     if (!CD_MAKERS.has(n)) continue;
     if (n === 'git' && !m.some((w) => w === 'clone' || w === 'init' || w === 'worktree')) continue; // (`git status DIR` names DIR, it does not make it)
     if (n === 'gh' && !m.includes('clone')) continue;
-    // (R1-B3: the words that can be a directory this command made. cp: only recursive; mv, ln, rsync: the destination, when the source is a directory; install: -d; tar: -C DIR; unzip: -d DIR)
+    // (R1-B3: the words that can be a directory this command made. cp: only recursive; mv, ln, rsync: the destination, when the source is a directory; install: -d; unzip: -d DIR; not tar -C, which needs the folder to exist)
     let names = words;
     if (n === 'cp') { if (!flagged(m, /^-[a-zA-Z]*[rRa][a-zA-Z]*$/, '--recursive') && !m.includes('--archive')) continue; }
     else if (n === 'mv' || n === 'ln' || n === 'rsync') { if (words.length < 2 || !words.slice(0, -1).some((w) => { const r = place(w, j); return r !== null && isDir(r); })) continue; names = words.slice(-1); }
     else if (n === 'install') { if (!flagged(m, /^-[a-zA-Z]*d[a-zA-Z]*$/, '--directory')) continue; }
-    else if (n === 'tar' || n === 'unzip') {
-      const flag = n === 'tar' ? ['-C', '--directory'] : ['-d'];
+    else if (n === 'unzip') {
       names = [];
-      m.forEach((w, k) => {
-        if (flag.includes(w)) { if (m[k + 1] !== undefined) names.push(m[k + 1]); }
-        else if (n === 'tar' && w.startsWith('--directory=')) names.push(w.slice(12));
-        else if (w.length > 2 && w.startsWith(flag[0]) && !w.startsWith('--')) names.push(w.slice(2));
-      });
+      m.forEach((w, k) => { if (w === '-d') { if (m[k + 1] !== undefined) names.push(m[k + 1]); } else if (w.startsWith('-d') && w.length > 2 && !w.startsWith('--')) names.push(w.slice(2)); });
     } else if (n === 'git' && m.includes('clone')) {
       // (git clone [options] URL [DIR]: the options that take a value are skipped with it; no DIR names the directory after the repository. R1-B5)
       names = cloneWords(m);
-    } else if (n === 'gh') names = cloneWords(m);
+    } else if (n === 'gh') names = cloneWords(m, true);
     for (const w of names) {
       const r = place(w, j);
       if (r !== null && into(next, r)) made = true;
@@ -3967,11 +3959,22 @@ function judgeLongText(text) {
 
 // Why: "${BASH:-bash}" is rewritten to bash while no text judged so far can bind BASH (see simpleCommands); a text that binds it and is judged after a rewrite makes the verdict stale, so the whole
 // line is judged again with the rewrite off. (A denial stands: the second pass only adds readings.)
+// (#586: TWO READINGS of a cd. Reading A is main's: every cd moves to its target. A cd whose target is not shown to exist (cdUnproven) is recorded on the state (cdDoubt: the word it names). When A allows and recorded one, reading B judges the line
+// again where such a cd does NOT move (the shell stays where it was) unless && or a plain `|| exit` proves it (settle): a denial of B is the verdict, with a sentence that names the cd. Each reading has its own rewrite pass and spends what the one before left.)
 export function evaluateGitCommand(command, opts = {}) {
-  const state = { bound: false, rewrote: false };
-  const first = evaluateGitOnce(command, opts, state);
-  if (first.decision === 'deny' || !(state.bound && state.rewrote)) return first;
-  return evaluateGitOnce(command, opts, { bound: true, rewrote: false, carry: state.budget }); // (the second pass spends what the first left: every cap still ends in a denial; only the startup-file memo starts empty)
+  const reading = (extra) => {
+    const state = { bound: false, rewrote: false, ...extra };
+    const first = evaluateGitOnce(command, opts, state);
+    if (first.decision === 'deny' || !(state.bound && state.rewrote)) return { v: first, state };
+    const again = { ...extra, bound: true, rewrote: false, carry: state.budget }; // (the second pass spends what the first left: every cap still ends in a denial; only the startup-file memo starts empty)
+    return { v: evaluateGitOnce(command, opts, again), state: again };
+  };
+  const a = reading({});
+  if (a.v.decision === 'deny' || a.state.cdDoubt === undefined) return a.v;
+  const b = reading({ cdFails: true, carry: a.state.budget });
+  if (b.v.decision !== 'deny') return a.v;
+  const w = b.state.cdWord ?? a.state.cdDoubt;
+  return { ...b.v, reason: `\`cd ${w}\` may fail (the folder is not shown to exist), and the shell then stays where it was: ${b.v.reason} Use \`cd ${w} && …\` or \`cd ${w} || exit 1\`.` };
 }
 function evaluateGitOnce(command, {
   cwd,
