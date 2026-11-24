@@ -15,10 +15,11 @@ import { createCommentsGh, createFakeGh, NO_COMMENTS, pipelineYml, REPO_VIEW } f
 import { MARKERS, triageComment } from '../pipeline/lib/render.mjs';
 import { SUPPORTED_STATE_VERSION, decodeFromComment } from '../pipeline/lib/state.mjs';
 import { reviewContentHash } from '../pipeline/lib/review-publish.mjs';
-import { reviewEligibilityProblems, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
+import { RULING_WHY, reviewEligibilityProblems, rulingRecommendationRefusal, rulingsDigest, rulingsInventory } from '../pipeline/lib/triage.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { floorEnv } from './helpers/floor-env.mjs';
 import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
+import { ownerGoDir } from '../pipeline/hooks/lib/owner-go.mjs';
 import { applyClaudeRuling, settleSecondReview } from '../pipeline/lib/triage.mjs';
 import { buildSecondReviewPrompt } from '../pipeline/lib/codex.mjs';
 
@@ -1060,9 +1061,14 @@ const arbiterAccepts = (w, id, by = 'arbiter') => w.edit((s) => {
   it.final = { decision: 'ACCEPT', by, needsHuman: false, reason: `${by} accepted it` };
 });
 // The owner's typed answer to a ruling request for `ids` (one prompt that names every id), then the owner-ruling call for `id`.
-function typedFor(t, w, ids, quote) {
+// `variant`: the answer is a click on that dialog (a click's record names its dialog in `ask.variant`). The click's own proof (a tool_result entry) is out of scope here, so the record keeps the typed shape and only gains `ask`.
+function typedFor(t, w, ids, quote, variant = undefined) {
   const asked = w.cli(['triage', 'ruling-request', '--pr', '7', '--ids', ids.join(',')]);
-  ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
+  const record = ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
+  if (variant !== undefined) {
+    const file = join(ownerGoDir(), `${record.session}.jsonl`);
+    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: randomUUID(), toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
+  }
   return (id, decision) => w.cli(['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', 'owner confirmed', '--owner-quote', quote, '--pr', '7']);
 }
 const dWorld = (t) => world(t, { comments: true, slug: `acme/widgets-${randomUUID()}` });
@@ -1129,6 +1135,135 @@ test('owner-ruling: a typed REJECT or ACCEPT of an arbiter ACCEPT is refused (th
   assertExit(c, 1, c.stdout);
   assert.equal(w.stateText(), before);
   assertExit(typed('R1-S1', 'FOLLOW-UP'), 0); // control: the typed one still works
+});
+
+// cp #771: may the ruling dialog SHOW "Claude recommends <decision> all"? Pure rules; each refusal is a recommendation the click could not record, or one nudging the owner to dismiss what the pipeline treats as critical.
+const recItem = (id, over = {}) => ({
+  id, round: 1, bucket: 'SUGGESTION', category: 'docs', title: `t ${id}`, file: 'src/plain.js', line: 3, detail: 'd', codexReasoning: 'c', testable: false, fingerprint: `fp-${id}`,
+  judge: null, test: { status: 'none', evidence: '' }, arbiter: null, implemented: false, followupIssue: null,
+  final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence' }, ...over,
+});
+const settledAccept = (id, over = {}) => recItem(id, { category: 'maintainability', final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'worth fixing' }, ...over });
+const recCtx = (items, over = {}) => ({
+  state: { pr: 7, rounds: [{ n: 1, items }] }, config: { risk: { high_risk_paths: ['src/payroll/**'] }, review: { arbiter_always_paths: [] } },
+  files: [{ oldPath: 'src/plain.js', newPath: 'src/plain.js', path: 'src/plain.js' }, { oldPath: 'src/payroll/pay.js', newPath: 'src/payroll/pay.js', path: 'src/payroll/pay.js' }], baseConfig: null, ...over,
+});
+const refusal = (items, decision, over = {}) => rulingRecommendationRefusal(items, decision, recCtx(items, over));
+
+test('rulingRecommendationRefusal: the recommendation is refused for what the click could not record or what the pipeline treats as a critical dismissal', () => {
+  // failure caught (each): Accept all recommended while the owner-ruling command would refuse it (#559); Follow-up recommended for a finding a second review would be owed
+  const waits = recItem('R1-S1');
+  const deferrable = settledAccept('R1-S2');
+  assert.match(refusal([waits, deferrable], 'ACCEPT'), /R1-S2 does not need a human decision.*may only be deferred/, 'accept with one open deferrable ACCEPT in a mixed batch (second id only)');
+  assert.match(refusal([settledAccept('R1-S3', { implemented: true })], 'FOLLOW-UP'), /already implemented|does not need a human decision/, 'an item that needs no human decision');
+  // R1-B3: a low-confidence ACCEPT still waiting for a human whose fix is already in the PR passes the owner-ruling check, but "fix it later" would be wrong (and drop the built fix from the fix review)
+  assert.match(refusal([recItem('R1-S3b', { implemented: true })], 'FOLLOW-UP'), /R1-S3b is already implemented/, 'a waiting item that is already implemented');
+  assert.equal(refusal([recItem('R1-S3c', { implemented: true })], 'ACCEPT'), null, 'accept stays allowed for it');
+  const risky = [
+    ['a non-blocking data-loss low-confidence item', recItem('R1-S4', { category: 'data-loss' }), /not low severity/],
+    ['a BLOCKING low-confidence item', recItem('R1-B1', { bucket: 'BLOCKING', category: 'docs' }), /BLOCKING/],
+    ['a security-dismissal item', recItem('R1-S5', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'security-dismissal', reason: 'would dismiss a blocking security/data item' } }), /other than low confidence/],
+    ['a non-security model-proof item', recItem('R1-S6', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed' } }), /other than low confidence/],
+    ['an unknown-cause item', recItem('R1-S7', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, reason: 'something else' } }), /other than low confidence/],
+    ['a deferrable bug ACCEPT SUGGESTION', settledAccept('R1-S8', { category: 'bug' }), /not low severity/],
+    ['a deferrable maintainability ACCEPT on a sensitive path', settledAccept('R1-S9', { file: 'src/payroll/pay.js' }), /sensitive path/],
+  ];
+  for (const [what, item, re] of risky) assert.match(refusal([item], 'FOLLOW-UP'), re, `follow-up on ${what}`);
+  assert.match(refusal([recItem('R1-S10')], 'FOLLOW-UP', { files: null }), /reviewed diff is not known/, 'follow-up with an unknown diff');
+  assert.match(refusal([recItem('R1-S12')], 'REJECT'), /critical dismissal/, 'REJECT is never recommended');
+  assert.match(refusal([], 'ACCEPT'), /no item/);
+  // one bad item among good ones refuses the whole batch
+  assert.match(refusal([recItem('R1-S13'), recItem('R1-S14', { category: 'security' })], 'FOLLOW-UP'), /R1-S14/);
+  // a malfunction cause may still be ACCEPTED (accept is never a dismissal)
+  assert.equal(refusal([recItem('R1-S15', { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed' } })], 'ACCEPT'), null);
+});
+
+test('rulingRecommendationRefusal: accept on needs-human items, and follow-up on a low-severity open deferrable ACCEPT or a low-confidence docs item, are allowed', () => {
+  // failure caught: a refusal so wide that the recommended dialog is never shown, so the owner is never told which button the controller's research favours
+  assert.equal(refusal([recItem('R1-S1'), recItem('R1-B2', { bucket: 'BLOCKING', category: 'security' })], 'ACCEPT'), null, 'accept on two needs-human items, one of them BLOCKING security');
+  assert.equal(refusal([settledAccept('R1-S3')], 'FOLLOW-UP'), null, 'a settled arbiter ACCEPT with no cause, maintainability, plain file');
+  assert.equal(refusal([recItem('R1-S4')], 'FOLLOW-UP'), null, 'a low-confidence docs item');
+  assert.equal(refusal([recItem('R1-S5'), settledAccept('R1-S6')], 'FOLLOW-UP'), null, 'both kinds in one batch');
+  assert.deepEqual(Object.keys(RULING_WHY), ['accept', 'follow-up']);
+  assert.deepEqual(Object.keys(RULING_WHY['follow-up']), ['minor-later'], 'no reject code, and no code claims more than rule 3 proves');
+});
+
+test('owner-ruling: a click on "Follow-up all (Recommended)" is checked again against today\'s severity; a typed answer or a click on another dialog is not', (t) => {
+  // failure caught: a click on a recommended dialog that says "the pipeline rates this low" recording a follow-up after the item became serious (a same-file BLOCKING item appeared, or the dialog was forged for a BLOCKING finding), because only the ask was checked
+  const FU = 'ruling-v2-follow-up';
+  const docs = () => sugg({ file: 'src/a.js', category: 'docs' });
+  const mk = (blocking, more = []) => {
+    const w = dWorld(t);
+    assertExit(w.codex(1, findingsOf(blocking, [docs(), ...more])), 0);
+    w.wait('R1-S1');
+    for (const m of more) w.wait(`R1-S${more.indexOf(m) + 2}`);
+    if (blocking.length > 0) w.wait('R1-B1');
+    return w;
+  };
+  // allow: still low severity -> the clicked recommendation is recorded
+  const ok = mk([]);
+  const allowed = typedFor(t, ok, ['R1-S1'], 'R1-S1: follow-up', FU)('R1-S1', 'FOLLOW-UP');
+  assertExit(allowed, 0, allowed.stdout + allowed.stderr);
+  assert.equal(ok.item('R1-S1').final.decision, 'FOLLOW-UP');
+  // deny: a BLOCKING item on the same file waits for a human, so the "low severity" claim is false -> refused, state untouched, re-ask on the neutral dialog
+  const stale = mk([finding()]);
+  const before = stale.stateText();
+  const denied = typedFor(t, stale, ['R1-S1'], 'R1-S1: follow-up', FU)('R1-S1', 'FOLLOW-UP');
+  assertExit(denied, 1, denied.stdout);
+  assert.match(denied.json.reason, /no longer holds.*R1-B1.*ask again on the neutral dialog.*ruling-request --pr 7 --ids R1-S1 --ask/);
+  assert.equal(stale.stateText(), before);
+  // R2-B1: the dialog's claim covered the whole two-id batch. allow: both still qualify -> the first id is recorded
+  const second = () => sugg({ file: 'src/a.js', category: 'docs', title: 'Fix typo', line: 5 });
+  const both = mk([], [second()]);
+  const okBatch = typedFor(t, both, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up, R1-S2: follow-up', FU)('R1-S1', 'FOLLOW-UP');
+  assertExit(okBatch, 0, okBatch.stdout + okBatch.stderr);
+  assert.equal(both.item('R1-S1').final.decision, 'FOLLOW-UP');
+  // deny: the sibling was marked implemented after the ask (the batch digest is unchanged), so the first id is refused too, naming the sibling, state untouched
+  const drift = mk([], [second()]);
+  const applyFirst = typedFor(t, drift, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up, R1-S2: follow-up', FU);
+  drift.edit((st) => { st.rounds[0].items.find((i) => i.id === 'R1-S2').implemented = true; });
+  const beforeDrift = drift.stateText();
+  const driftDenied = applyFirst('R1-S1', 'FOLLOW-UP');
+  assertExit(driftDenied, 1, driftDenied.stdout);
+  assert.match(driftDenied.json.reason, /no longer holds.*R1-S2 is already implemented.*ask again on the neutral dialog.*--ids R1-S1,R1-S2 --ask/);
+  assert.equal(drift.stateText(), beforeDrift);
+  // R3-B1: the batch's sibling is in ANOTHER round (the request and the digest resolve ids across rounds); implemented after the ask -> the first id is refused too, naming it, state untouched
+  const moveToRound2 = (w) => w.edit((st) => {
+    const [moved] = st.rounds[0].items.splice(1, 1);
+    moved.id = 'R2-S1';
+    st.rounds.push({ ...structuredClone(st.rounds[0]), n: 2, items: [moved] });
+  });
+  const across = mk([], [second()]);
+  moveToRound2(across);
+  const applyAcross = typedFor(t, across, ['R1-S1', 'R2-S1'], 'R1-S1: follow-up, R2-S1: follow-up', FU);
+  across.edit((st) => { st.rounds[1].items[0].implemented = true; });
+  const beforeAcross = across.stateText();
+  const acrossDenied = applyAcross('R1-S1', 'FOLLOW-UP');
+  assertExit(acrossDenied, 1, acrossDenied.stdout);
+  assert.match(acrossDenied.json.reason, /no longer holds.*R2-S1 is already implemented.*--ids R1-S1,R2-S1 --ask/);
+  assert.equal(across.stateText(), beforeAcross);
+  // R3-B2: an "Other" answer on the two-id dialog ("R1-S1: follow-up") and a later single-id click with the same quote both match R1-S1. allow: the single-id dialog's own batch still qualifies, so the older record's sibling (implemented since) does not refuse it
+  const twoRecords = mk([], [second()]);
+  typedFor(t, twoRecords, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up', FU);
+  twoRecords.edit((st) => { st.rounds[0].items.find((i) => i.id === 'R1-S2').implemented = true; });
+  const applyOwn = typedFor(t, twoRecords, ['R1-S1'], 'R1-S1: follow-up', FU);
+  const ownOk = applyOwn('R1-S1', 'FOLLOW-UP');
+  assertExit(ownOk, 0, ownOk.stdout + ownOk.stderr);
+  assert.equal(twoRecords.item('R1-S1').final.decision, 'FOLLOW-UP');
+  // deny: when no record's own batch qualifies (the lone id's dialog is stale too), it is still refused
+  const noneOk = mk([finding()], [second()]);
+  typedFor(t, noneOk, ['R1-S1', 'R1-S2'], 'R1-S1: follow-up', FU);
+  const applyNone = typedFor(t, noneOk, ['R1-S1'], 'R1-S1: follow-up', FU);
+  const noneDenied = applyNone('R1-S1', 'FOLLOW-UP');
+  assertExit(noneDenied, 1, noneDenied.stdout);
+  assert.match(noneDenied.json.reason, /no longer holds/);
+  // the same finding ruled by a typed answer, a click on the neutral dialog, or an ACCEPT click on the recommended one needs no recheck
+  for (const [what, variant, decision] of [['typed', undefined, 'FOLLOW-UP'], ['neutral click', 'ruling-v1', 'FOLLOW-UP'], ['accept click on the recommended dialog', 'ruling-v2-follow-up', 'ACCEPT']]) {
+    const w = mk([finding()]);
+    const r = typedFor(t, w, ['R1-S1'], `R1-S1: ${decision.toLowerCase()}`, variant)('R1-S1', decision);
+    assertExit(r, 0, `${what}: ${r.stdout}`);
+    assert.equal(w.item('R1-S1').final.decision, decision, what);
+  }
 });
 
 test('F1: an answer recorded while the item waited for a human cannot defer it after it became an ACCEPT; a multi-id request still applies its second id', (t) => {

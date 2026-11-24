@@ -7,6 +7,10 @@ import { MIN_FABLE, compareVersions, parseModelId } from './model-floor.mjs';
 import { isSensitivePath, regressionOnlyFor, threatModelsFor } from './risk.mjs';
 import { RISK_LEVELS, isSubstituteRound, maxRiskOf, secondReviewerOf } from './state.mjs';
 import { wholePrOwed } from './review-route.mjs';
+import { RULING_WHY } from '../hooks/lib/owner-go-click.mjs';
+
+// The recommendation texts of the ruling dialog (cp #771) are installed code of the click verifier; the command and the tests read them here.
+export { RULING_WHY };
 
 export const SECURITY_CATEGORIES = ['security', 'auth', 'permissions', 'data-integrity', 'data-loss'];
 export const BUCKETS = ['BLOCKING', 'SUGGESTION', 'WORTH_CONSIDERING'];
@@ -693,6 +697,52 @@ const isTestAccept = (final) => final.evidence === 'test' || (final.by === 'cach
 export const isDeferrableAccept = (item) => item?.final?.decision === 'ACCEPT' && item.final.needsHuman !== true && item.implemented !== true
   && DEFERRABLE_ACCEPT_BY.includes(item.final.by) && !isTestAccept(item.final) && !isOwnerRuled(item) && !isProtectedFinal(item) && !isRoundCapDeferral(item);
 export const isOwnerDeferral = (item) => isObject(item?.final?.ownerDeferral);
+
+// Why this ruling may not be recorded, or null. `owner-ruling` exists for ONE case: the owner confirmed in chat what to do with an item that is waiting for a human. It is not a way to reopen an
+// item somebody already settled. Shared by `owner-ruling` and by rulingRecommendationRefusal (a recommendation is shown only for a ruling the click could record).
+export function ownerRulingRefusal(item, id, round, decision) {
+  if (item === undefined) return `no item ${id} in round ${round}`;
+  // #559: an unimplemented ACCEPT of the arbiter, the judge or the cache is not waiting for a human; the owner may only DEFER it (FOLLOW-UP: the fix goes to an issue). REJECT and ACCEPT stay refused.
+  if (isDeferrableAccept(item)) {
+    return decision === 'FOLLOW-UP' ? null : `${id} does not need a human decision (an owner ruling cannot reopen a settled item); an arbiter/judge ACCEPT that is not fixed yet may only be deferred (FOLLOW-UP) by an owner ruling, not ${decision === 'ACCEPT' ? 're-accepted' : 'rejected'}`;
+  }
+  // The owner may rule on an item waiting for a human, or (E6) override a Claude or forced final that is not implemented yet.
+  const protectedFinal = isProtectedFinal(item);
+  if (item.final?.needsHuman !== true && !protectedFinal) return `${id} does not need a human decision (an owner ruling cannot reopen a settled item)`;
+  if (item.final?.needsHuman !== true && item.implemented === true) return `${id} is already implemented (an owner ruling cannot reopen it)`;
+  return null;
+}
+
+// May the ruling dialog show "Claude recommends <decision> all" for these items (cp #771)? The controller researches the items and picks the decision; this decides only whether that recommendation
+// may be SHOWN. -> a reason string (refused) or null. `decision` is 'ACCEPT' | 'FOLLOW-UP' (REJECT is never recommended: every REJECT is a critical dismissal the pipeline accepts only after a second
+// review, which a controller's research is not). `ctx` = the inputs round-request / defer-fixes give itemSeverity (state, config, the reviewed diff's files, the trusted baseConfig).
+//  1. every id passes the SAME check `owner-ruling` applies (so the click could record it);
+//  2. ACCEPT is never a dismissal: rule 1 only;
+//  3. FOLLOW-UP only when EVERY item is low severity (itemSeverity fails closed on BLOCKING, non-allowlisted categories, sensitive paths, same-file serious items, an unknown diff or config) AND is
+//     either an open deferrable ACCEPT or waits for a human with the plain 'low-confidence' cause (never a malfunction, security-dismissal, test-security or unknown one).
+export function rulingRecommendationRefusal(items, decision, ctx = {}) {
+  if (decision !== 'ACCEPT' && decision !== 'FOLLOW-UP') return 'only "accept" and "follow-up" may be recommended: every REJECT is a critical dismissal that needs a second review';
+  if (!Array.isArray(items) || items.length === 0) return 'no item to recommend a ruling for';
+  for (const item of items) {
+    const why = ownerRulingRefusal(item, item?.id, null, decision);
+    if (why !== null) return why;
+  }
+  if (decision === 'ACCEPT') return null;
+  for (const item of items) {
+    // R1-B3: an ACCEPT whose fix is already in the PR (a low-confidence one still waiting for a human) is not "fix it later"; FOLLOW-UP would also drop the built fix from the fix review.
+    if (item.implemented === true) return `${item.id} is already implemented, so a recommendation to follow up (fix it later) would be wrong`;
+    let severity;
+    try {
+      severity = itemSeverity(item, ctx);
+    } catch (err) {
+      return `severity could not be judged (${asciiLine(err?.message, 120)})`;
+    }
+    if (severity.level !== 'low') return `${item.id} is not low severity (${severity.reasons.map((r) => asciiLine(r, 160)).join('; ')})`;
+    if (isDeferrableAccept(item)) continue;
+    if (item.final?.needsHuman !== true || needsHumanCause(item) !== 'low-confidence') return `${item.id} waits for a human for a reason other than low confidence, which a recommendation to follow up must not hide`;
+  }
+  return null;
+}
 
 // ---- cache and light lane -------------------------------------------------------------------
 

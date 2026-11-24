@@ -251,10 +251,10 @@ test('merge-many: a PR whose own worktree has owner_go.click off, or is not in c
 // ---- triage round-request / ruling-request ---------------------------------------------------------------------------------------------------------
 
 // A repo at PR 12 whose review state is at the round cap (max_rounds 1, one reviewed round with open items) and holds two items to rule on.
-function triageWorld(yml = CHAT()) {
+function triageWorld(yml = CHAT(), over = {}) {
   const s = scenario({ yml, report: null, state: null });
   let st = emptyState({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', risk: 'high', maxRounds: 1 });
-  const item = (id, title) => ({ id, source: 'codex', bucket: 'BLOCKING', category: 'security', title, file: 'src/app.js', line: 1, detail: 'detail', codexReasoning: 'why', final: null });
+  const item = (id, title) => ({ id, source: 'codex', bucket: 'BLOCKING', category: 'security', title, file: 'src/app.js', line: 1, detail: 'detail', codexReasoning: 'why', final: null, ...over });
   st = addRound(st, { n: 1, fromHead: 'a', toHead: s.head, contentHashAtToHead: s.hash, items: [item('R1-B1', 'Missing check'), item('R1-S3', 'Another\nmultiline   finding')] });
   saveState(s.repo.dir, st);
   s.fake.setScript([REPO]);
@@ -351,6 +351,70 @@ test('triage ruling-request --ask: item summaries above, then exactly the printe
   const file = readAsk(r.output.ask.askId, { home }).ask;
   assert.equal(file.kind, 'ruling');
   assert.equal(file.actions['Accept all'], 'R1-B1: accept, R1-S3: accept');
+});
+
+const LOW_CONFIDENCE = { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence' };
+
+test('triage ruling-request --ask --recommend: an accepted recommendation puts the option first with the fixed why row before the closing line and issues a v 2 ask; a refused or absent one is the legacy dialog', async () => {
+  // failure caught: a recommended dialog whose row the verifier would refuse (nothing clickable), a recommendation shown for a ruling the owner-ruling command would refuse (the owner clicks and nothing records), or a refusal that retries instead of falling back to the neutral dialog
+  const s = triageWorld(CHAT(), { final: LOW_CONFIDENCE });
+  const home = newHome();
+  const args = ['ruling-request', '--pr', String(PR), '--ids', 'R1-B1,r1-s3', '--ask'];
+  const plain = await triage(s, home, ...args);
+  assert.equal(plain.exitCode, 0, JSON.stringify(plain.output));
+  assert.deepEqual([plain.output.recommend, plain.output.why, plain.output.dialogVariant, 'recommendRefused' in plain.output], [null, null, 'ruling-v1', false]);
+  assert.deepEqual(plain.output.ask.questions[0].options.map((o) => o.label), ['Not now', 'Accept all', 'Follow-up all', 'Reject all'], 'no --recommend keeps the legacy order');
+  assert.equal(JSON.parse(readFileSync(join(asksDir(home), `${plain.output.ask.askId}.json`), 'utf8')).v, 1);
+
+  const r = await triage(s, home, ...args, '--recommend', 'accept', '--why', 'real-problem');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual([r.output.recommend, r.output.why, r.output.dialogVariant, 'recommendRefused' in r.output], ['accept', 'real-problem', 'ruling-v2-accept', false]);
+  const q = r.output.ask.questions[0];
+  assert.deepEqual(q.options.map((o) => o.label), ['Accept all (Recommended)', 'Follow-up all', 'Reject all', 'Not now']);
+  const row = 'Claude recommends Accept all (when asked): Claude checked the code: the finding looks real in this PR, so fixing it now is the safe choice.';
+  assert.equal(q.question, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · BLOCKING · Missing check · src/app.js:1\nR1-S3 · BLOCKING · Another multiline finding · src/app.js:1\n${row}\n${r.output.line}`);
+  assert.deepEqual(presentedRuling(q.question), { pr: PR, repo: 'acme/widgets', ids: ['R1-B1', 'R1-S3'], content: /content ([0-9a-f]{12})/.exec(r.output.line)[1] }, 'the row binds nothing: the closing line still does');
+  const raw = JSON.parse(readFileSync(join(asksDir(home), `${r.output.ask.askId}.json`), 'utf8'));
+  assert.deepEqual([raw.v, raw.variant, raw.actions['Accept all (Recommended)']], [2, 'ruling-v2-accept', 'R1-B1: accept, R1-S3: accept']);
+  assert.equal(readAsk(r.output.ask.askId, { home }).ok, true, 'the installed verifier reads what the command issued');
+
+  // without --ask the fields are still there and nothing is written
+  const home2 = newHome();
+  const bare = await triage(s, home2, 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--recommend', 'accept', '--why', 'unclear-safe');
+  assert.deepEqual([bare.output.recommend, bare.output.why, bare.output.dialogVariant, 'ask' in bare.output], ['accept', 'unclear-safe', 'ruling-v2-accept', false]);
+  assert.deepEqual(asks(home2), []);
+
+  // a REFUSED recommendation (follow-up on a low-confidence BLOCKING security item): exit 0, the legacy dialog, the reason
+  const refused = await triage(s, newHome(), ...args, '--recommend', 'follow-up', '--why', 'minor-later');
+  assert.equal(refused.exitCode, 0, JSON.stringify(refused.output));
+  assert.deepEqual([refused.output.recommend, refused.output.why, refused.output.dialogVariant], [null, null, 'ruling-v1']);
+  assert.match(refused.output.recommendRefused, /not low severity/);
+  assert.deepEqual(refused.output.ask.questions[0].options.map((o) => o.label), ['Not now', 'Accept all', 'Follow-up all', 'Reject all']);
+  assert.equal(refused.output.ask.questions[0].question.includes('Claude recommends'), false);
+  // a follow-up IS shown for low-severity items waiting on low confidence (the severity inputs are the real reviewed diff and trusted base config)
+  const low = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'docs', final: LOW_CONFIDENCE });
+  const fu = await triage(low, newHome(), ...args, '--recommend', 'follow-up', '--why', 'minor-later');
+  assert.equal(fu.exitCode, 0, JSON.stringify(fu.output));
+  assert.deepEqual([fu.output.recommend, fu.output.dialogVariant, 'recommendRefused' in fu.output], ['follow-up', 'ruling-v2-follow-up', false], JSON.stringify(fu.output.recommendRefused));
+  assert.deepEqual(fu.output.ask.questions[0].options.map((o) => o.label), ['Follow-up all (Recommended)', 'Accept all', 'Reject all', 'Not now']);
+  assert.match(fu.output.ask.questions[0].question, /\nClaude recommends Follow-up all \(when asked\): Claude rates these as minor[^\n]*\n⚖️ Owner ruling needed/);
+  // ... and the same for an item the owner-ruling command would refuse (no final: it needs no human decision)
+  const open = triageWorld();
+  const none = await triage(open, newHome(), ...args, '--recommend', 'accept', '--why', 'real-problem');
+  assert.equal(none.exitCode, 0);
+  assert.match(none.output.recommendRefused, /does not need a human decision/);
+  assert.equal(none.output.dialogVariant, 'ruling-v1');
+});
+
+test('triage ruling-request --recommend: the flags go together, only accept|follow-up exist, and a why code of the other decision is a usage error (nothing issued)', async () => {
+  // failure caught: a free-prose why or a code for the opposite decision reaching the dialog, or a REJECT recommendation
+  const s = triageWorld(CHAT(), { final: LOW_CONFIDENCE });
+  const home = newHome();
+  const base = ['ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--ask'];
+  for (const more of [['--recommend', 'accept'], ['--why', 'real-problem'], ['--recommend', 'reject', '--why', 'real-problem'], ['--recommend', 'accept', '--why', 'minor-later'], ['--recommend', 'follow-up', '--why', 'real-problem'], ['--recommend', 'accept', '--why', 'trust me']]) {
+    await assert.rejects(() => triage(s, home, ...base, ...more), /--recommend|--why/, more.join(' '));
+  }
+  assert.deepEqual(asks(home), []);
 });
 
 test('triage ruling-request --ask: label mode -> ask null (the typed line stays); an unknown id still refuses', async () => {

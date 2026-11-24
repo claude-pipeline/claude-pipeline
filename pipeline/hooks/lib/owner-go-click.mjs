@@ -126,17 +126,53 @@ export function roundAsk({ repo, pr, line, variant = ROUND_VARIANT_LEGACY }) {
     ...(variant === ROUND_VARIANT_LEGACY ? {} : { variant }),
   };
 }
-export function rulingAsk({ repo, pr, ids, line }) {
+// The ruling dialog's fixed variant set (cp #771), the same pattern as ROUND_VARIANTS: a frozen table, each id immutable once shipped (a test pins the sha256 of each dialog), the ask file names its
+// variant and the verifier REBUILDS the dialog from this table. Unlike the round dialog the answer texts are built from the asked ids, so the table holds the option ORDER and which one carries
+// "(Recommended)"; the label, description and answer word of each option are fixed below. `ruling-v1` is the legacy dialog byte for byte (no variant key, v 1). The recommended option's answer is the
+// same text its plain label maps to, so a click records the same ruling either way. Reject is never recommended (no ruling-v2-reject).
+const RULING_OPTIONS = Object.freeze({
+  notNow: { label: 'Not now', word: null, description: () => 'Rule on nothing now. Nothing is recorded.' },
+  accept: { label: 'Accept all', word: 'accept', description: (ids) => `Accept every item asked (${ids.join(', ')}).` },
+  followUp: { label: 'Follow-up all', word: 'follow-up', description: (ids) => `Move every item asked (${ids.join(', ')}) to a follow-up.` },
+  reject: { label: 'Reject all', word: 'reject', description: (ids) => `Reject every item asked (${ids.join(', ')}).` },
+});
+const RULING_VARIANTS = Object.freeze({
+  'ruling-v1': { order: ['notNow', 'accept', 'followUp', 'reject'], recommended: null },
+  'ruling-v2-accept': { order: ['accept', 'followUp', 'reject', 'notNow'], recommended: 'accept' },
+  'ruling-v2-follow-up': { order: ['followUp', 'accept', 'reject', 'notNow'], recommended: 'followUp' },
+});
+export const RULING_VARIANT_IDS = Object.freeze(Object.keys(RULING_VARIANTS));
+export const RULING_VARIANT_LEGACY = 'ruling-v1';
+const RULING_V2_IDS = Object.freeze(RULING_VARIANT_IDS.filter((id) => id !== RULING_VARIANT_LEGACY));
+// What the controller may say for a recommendation, worded by installed code (a free prose why could argue for the opposite of the checked button). Each code is valid for ONE decision.
+export const RULING_WHY = Object.freeze({
+  accept: Object.freeze({
+    'real-problem': 'Claude checked the code: the finding looks real in this PR, so fixing it now is the safe choice.',
+    'unclear-safe': 'Claude could not rule it out; accepting means it gets fixed and re-reviewed, the safe choice.',
+  }),
+  'follow-up': Object.freeze({
+    'minor-later': "Claude rates these as minor, and the pipeline's own severity check rates them low: fixing them in their own issue does not hold this PR.",
+  }),
+});
+const RULING_DECISION_WORD = Object.freeze({ accept: 'Accept', 'follow-up': 'Follow-up' });
+const RECOMMENDS = 'Claude recommends ';
+// The recommendation row of the dialog's question (one line, before the binding last line; it binds nothing). Null for a decision / code that is not in the table.
+export function rulingWhyRow(decision, code) {
+  const text = Object.hasOwn(RULING_WHY, decision) && Object.hasOwn(RULING_WHY[decision], code) ? RULING_WHY[decision][code] : null;
+  return text === null ? null : `${RECOMMENDS}${RULING_DECISION_WORD[decision]} all (when asked): ${text}`;
+}
+const rulingVariantDecision = (variant) => (RULING_VARIANTS[variant].recommended === 'accept' ? 'accept' : RULING_VARIANTS[variant].recommended === 'followUp' ? 'follow-up' : null);
+// `variant` omitted = the legacy dialog; an id outside the table (or any non-string) -> null. The parts of a legacy dialog carry no `variant` key, so an ask built from them is byte-identical to today's.
+export function rulingAsk({ repo, pr, ids, line, variant = RULING_VARIANT_LEGACY }) {
+  if (typeof variant !== 'string' || !Object.hasOwn(RULING_VARIANTS, variant)) return null;
+  const v = RULING_VARIANTS[variant];
+  const label = (key) => (v.recommended === key ? `${RULING_OPTIONS[key].label} (Recommended)` : RULING_OPTIONS[key].label);
   const all = (word) => ids.map((id) => `${id}: ${word}`).join(', ');
   return {
     kind: 'ruling', repo, prs: [pr], header: 'Ruling', title: `Your ruling on #${pr}?`, block: line,
-    options: [
-      { label: 'Not now', description: 'Rule on nothing now. Nothing is recorded.' },
-      { label: 'Accept all', description: `Accept every item asked (${ids.join(', ')}).` },
-      { label: 'Follow-up all', description: `Move every item asked (${ids.join(', ')}) to a follow-up.` },
-      { label: 'Reject all', description: `Reject every item asked (${ids.join(', ')}).` },
-    ],
-    actions: { 'Not now': null, 'Accept all': all('accept'), 'Follow-up all': all('follow-up'), 'Reject all': all('reject') },
+    options: v.order.map((key) => ({ label: label(key), description: RULING_OPTIONS[key].description(ids) })),
+    actions: Object.fromEntries(v.order.map((key) => [label(key), RULING_OPTIONS[key].word === null ? null : all(RULING_OPTIONS[key].word)])),
+    ...(variant === RULING_VARIANT_LEGACY ? {} : { variant }),
   };
 }
 // live-db (#262): the owner's go for ONE live Supabase change, the click twin of the typed `go migration <name>` / `go data <sha12>`. `block` is the block `live-db present` printed (verifyBlock rebuilds it
@@ -186,7 +222,16 @@ function installedParts(ask, home) {
   if (ask.kind === 'ruling') {
     const pr = one(/^Your ruling on #(\d{1,6})\?$/);
     const asked = pr === null ? null : rulingBinding('x', q);
-    return asked === null || asked.pr !== pr ? null : rulingAsk({ repo: ask.repo, pr, ids: asked.ids, line: block });
+    if (asked === null || asked.pr !== pr) return null;
+    const variant = ask.variant ?? RULING_VARIANT_LEGACY;
+    if (typeof variant !== 'string' || !Object.hasOwn(RULING_VARIANTS, variant)) return null;
+    // The recommendation row is installed text too (the question body comes from the file): a v2 ask carries exactly one, just before the binding last line, equal to a table row for the variant's
+    // decision; a v1 ask carries none.
+    const lines = block.split('\n');
+    const rows = lines.filter((l) => l.startsWith(RECOMMENDS));
+    const decision = rulingVariantDecision(variant);
+    if (decision === null ? rows.length !== 0 : rows.length !== 1 || lines.at(-2) !== rows[0] || !Object.keys(RULING_WHY[decision]).some((code) => rulingWhyRow(decision, code) === rows[0])) return null;
+    return rulingAsk({ repo: ask.repo, pr, ids: asked.ids, line: block, variant });
   }
   if (ask.kind === 'live-db') {
     const mig = /^Apply migration ([A-Za-z0-9_.-]{1,120}) \(#(\d{1,6})\) to (.+) \(([a-z0-9]{20})\)\?$/.exec(title);
@@ -268,8 +313,9 @@ function readSmallJson(file) {
 }
 const marked = (askId, ext, home) => { const f = askFile(askId, ext, home); try { lstatSync(f); return true; } catch (err) { return err?.code !== 'ENOENT'; } }; // (any error but "absent" counts as present: fail closed)
 
-// An ask file's version rule: `v: 1` with NO `variant` key (the legacy encoding; `variant: null` is invalid), or `v: 2` on a round ask naming one of the round-v2 ids.
-const askVersionOk = (a) => isObj(a) && ((a.v === 1 && !Object.hasOwn(a, 'variant')) || (a.v === 2 && a.kind === 'round' && Object.hasOwn(a, 'variant') && ROUND_V2_IDS.includes(a.variant)));
+// An ask file's version rule: `v: 1` with NO `variant` key (the legacy encoding; `variant: null` is invalid), or `v: 2` naming one of the v2 ids of its own kind (round-v2-* on a round ask, ruling-v2-* on a ruling ask).
+const variantOfKind = (kind, variant) => (kind === 'round' && ROUND_V2_IDS.includes(variant)) || (kind === 'ruling' && RULING_V2_IDS.includes(variant));
+const askVersionOk = (a) => isObj(a) && ((a.v === 1 && !Object.hasOwn(a, 'variant')) || (a.v === 2 && Object.hasOwn(a, 'variant') && variantOfKind(a.kind, a.variant)));
 
 // The issued ask on disk, validated (its dialog and answer map must be the installed builders' own, R1-F4): { ok: true, ask } | { ok: false, reason: 'none' | 'invalid' }.
 export function readAsk(askId, { home = accountHome() } = {}) {
@@ -300,7 +346,7 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
   try {
     const key = repoKey(repo);
     if (!KINDS.includes(kind) || key === null || !Array.isArray(prs) || (prs.length === 0 && kind !== 'live-db') || !prs.every(Number.isInteger) || typeof title !== 'string' || typeof block !== 'string' || !isObj(actions)) return { error: 'invalid' };
-    if (variant !== undefined && (kind !== 'round' || !ROUND_V2_IDS.includes(variant))) return { error: 'invalid' };
+    if (variant !== undefined && !variantOfKind(kind, variant)) return { error: 'invalid' };
     // an action is a decline (null), the answer text a typed parser reads (a string) or a follow-up instruction (round asks only)
     if (!Object.values(actions).every((a) => a === null || typeof a === 'string' || (kind === 'round' && isInstruction(a)))) return { error: 'invalid-actions' };
     const labels = (options ?? []).map((o) => o?.label);
