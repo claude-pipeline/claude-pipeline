@@ -331,3 +331,4 @@ full record.
 - 2026-11-23 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 7 · arbiter 7 (fix-verify 4) · blocked · Codex 7d: 752 runs (245 high)
 - 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 7 · arbiter 7 (fix-verify 4) · needs-human · Codex 7d: 679 runs (234 high)
 - 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 8 · arbiter 8 (fix-verify 5) · blocked · Codex 7d: 683 runs (236 high)
+- 2026-11-24 · #838 · Ruling dialog: recommended option first (#771) · risk high · rounds 5 · arbiter 5 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 697 runs (237 high)
