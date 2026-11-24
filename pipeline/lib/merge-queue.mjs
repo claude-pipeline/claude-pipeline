@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readRepoMoves, sameRepo } from '../hooks/lib/repo-moves.mjs';
-import { PROVENANCE_CHECKS } from './config.mjs';
+import { GUARD_CHECKS, PROVENANCE_CHECKS, REVIEW_CHECK } from './config.mjs';
 import { forgedGuards, labelNames, readMergeSha, validLabels, waitBlockers } from './finalgate.mjs';
 import { HOLD_LABEL, RESTORE_NOTE } from './hold.mjs';
 import { gitCommonDir } from './repo.mjs';
@@ -953,11 +953,47 @@ export async function recoverQueuedLift({ gh, root, pr, orphan, lift, now = Date
 }
 
 // ---- F7: the guards re-run after a hold lift ----------------------------------------------------------------------------------------
-// Removing needs-human fires `pull_request_target: unlabeled`, so pipeline-guards.yml posts the three guard statuses as `pending` again. Enqueueing
-// then would make the queue poster read `pending` and spend the one re-queue. Waits (up to `waitMs`) until none of them is pending, then they must
+// Removing needs-human fires `pull_request_target: unlabeled`, so pipeline-guards.yml posts the guard statuses as `pending` again. Merging or enqueueing
+// then would race them (direct mode: "2 of 3 required status checks are pending", the hold goes back and the owner's word is spent; queue mode: the poster
+// reads `pending` and spends the one re-queue). Both modes call this after the lift. Waits (up to `waitMs`) until none of them is pending, then they must
 // be green with the same provenance as before. -> [] when settled green, else the reasons to refuse (the caller puts the hold back).
-export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
-  const deadline = now() + waitMs;
+// The re-run may not have posted `pending` yet when we first read, and the old green rows would look settled. `before` (guardLinks of a read taken BEFORE the
+// lift) lets us tell: first wait (at most `graceMs`, inside the same `waitMs`) until a guard row is pending or carries a run link not in `before`; if none
+// shows, a repo whose workflow does not re-run on needs-human is judged on its old rows exactly as without `before`.
+// Once a re-run is seen, every status it posts (the guards, and the review status with `reviewCheck` = ci.review_check on) must carry a link not in `before`: the workflow posts them one
+// after another and never sets the review status pending, so two new rows next to the old run's review row are not settled yet (`before` then needs the review link: guardLinks `review`).
+// guardLinks: check rows -> { name: run link } (the guards; with `review` the review status too), null when the read is not a list.
+export function guardLinks(rows, { review = false } = {}) {
+  if (!Array.isArray(rows)) return null;
+  const names = review ? PROVENANCE_CHECKS : GUARD_CHECKS;
+  const links = {};
+  for (const r of rows) if (names.includes(r?.name)) links[r.name] = r.link ?? null;
+  return links;
+}
+// How long to look for the re-run before judging the old rows: 120 s, never more than the merge wait; the env seam (tests) may only shorten it.
+export function guardRerunGraceMs(waitMs, env = {}) {
+  const set = Number(env.PIPELINE_GUARD_RERUN_GRACE_MS);
+  const grace = Math.min(120_000, waitMs);
+  return Number.isInteger(set) && set >= 0 ? Math.min(set, grace) : grace;
+}
+export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before = null, graceMs = 0, reviewCheck = false, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
+  let rerun = false; // (a re-run was seen: the statuses it posts are told from the old run's by their link)
+  const started = now();
+  const deadline = started + waitMs;
+  const watching = before !== null && typeof before === 'object' && Object.keys(before).length > 0; // (no guard row before the lift: nothing to wait for)
+  const seenRerun = (rows) => Array.isArray(rows) && rows.some((r) => GUARD_CHECKS.includes(r?.name) && (r.bucket === 'pending' || (r.link ?? null) !== (before[r.name] ?? null)));
+  if (watching) {
+    const graceEnd = started + Math.min(graceMs, waitMs);
+    for (;;) {
+      let rows = null;
+      try { rows = gh.checks(pr); } catch { rows = null; } // (an unreadable read is reported by the loop below once the grace is over)
+      const seen = seenRerun(rows);
+      const left = graceEnd - now();
+      if (seen) rerun = true;
+      if (seen || left <= 0) break;
+      await sleep(Math.min(pollMs, left));
+    }
+  }
   let why = 'the checks were not read';
   for (;;) {
     let rows = null;
@@ -969,15 +1005,24 @@ export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, now = 
       rows = null;
     }
     if (rows !== null) {
+      if (watching && seenRerun(rows)) rerun = true; // (the grace may have ended on the old rows: the re-run can show itself here)
       const guards = rows.filter((r) => PROVENANCE_CHECKS.includes(r?.name));
       const pending = guards.filter((r) => r.bucket === 'pending');
+      const stale = !rerun ? [] : [...GUARD_CHECKS, ...(reviewCheck ? [REVIEW_CHECK] : [])].filter((name) => { const row = guards.find((r) => r.name === name); return !row || (row.link ?? null) === (before[name] ?? null); });
       if (pending.length === 0) {
-        const bad = guards.filter((r) => r.bucket !== 'pass');
+        const bad = guards.filter((r) => r.bucket !== 'pass' && !stale.includes(r.name));
         if (bad.length > 0) return [`guard check(s) not passing after the hold lift re-ran them: ${bad.map((r) => `${r.name}=${r.bucket ?? r.state}`).join(', ')}`];
-        const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
-        return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
+        // Every status of one run carries that run's link: guards of two runs, or guards beside another run's review row, are not settled.
+        const posted = stale.length > 0 || !rerun ? [] : guards.filter((r) => GUARD_CHECKS.includes(r.name) || (reviewCheck && r.name === REVIEW_CHECK));
+        const mixed = new Set(posted.map((r) => r.link ?? null)).size > 1;
+        if (stale.length === 0 && !mixed) {
+          const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
+          return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
+        }
+        why = mixed ? `the re-run's statuses are not all from one run yet: ${posted.map((r) => `${r.name}=${r.link ?? 'no link'}`).join(', ')}` : `the re-run has not posted yet: ${stale.join(', ')}`;
+      } else {
+        why = `guard check(s) still pending: ${pending.map((r) => r.name).join(', ')}`;
       }
-      why = `guard check(s) still pending: ${pending.map((r) => r.name).join(', ')}`;
     }
     const left = deadline - now();
     if (left <= 0) return [`${why} after ${Math.round(waitMs / 1000)} s: lifting the hold re-runs the guards; run again once they have finished`];
