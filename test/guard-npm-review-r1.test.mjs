@@ -407,3 +407,46 @@ test('with the real file system (no fake) a dangling package.json link still cou
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+// ---- an unknown run directory fails closed: a --prefix / a runner directory only known at run time, or the shell's directory lost (#363, #391) ---------------------------------------
+// Why: `npx --prefix "$X" evil`, `npm exec --prefix "$X" -- evil` and `npm --prefix "$X" run a` were judged only by "does the line mention a guarded word", so a bad bin or script in the package folder the prefix names was ALLOWED. The directory the
+// command runs in and the one the bin / package is looked up from are two things: each pair of places near the line is judged (git guard; the files guard's own rule is a separate change).
+// (a refusal is the unknown-directory class AND names the place: `exec` where the command runs, `lookup` (when it differs) where the bin is found)
+const refusedIn = (cmd, tree, exec, lookup = null) => {
+  const v = G.git.run(cmd, tree(G.git));
+  assert.equal(v.decision, 'deny', `${cmd}: ${v.reason}`);
+  assert.match(v.reason, /the directory this runs in is unknown/, `${cmd}: ${v.reason}`);
+  assert.ok(v.reason.includes(lookup === null ? `in ${GIT_ROOT}${exec}, ` : `in ${GIT_ROOT}${exec}, using the bin in ${GIT_ROOT}${lookup}, `), `${cmd}: names ${exec || '/'} ${lookup ?? ''}: ${v.reason}`);
+};
+const okGit = (cmd, tree) => { const v = G.git.run(cmd, tree(G.git)); assert.equal(v.decision, 'allow', `${cmd}: ${v.reason}`); };
+
+test('#363 a runner prefix only known at run time: the bin in the folder that prefix may name is judged (npx --prefix, npm exec --prefix)', () => {
+  const web = (g) => ({ 'web/node_modules/.bin/evil': sh(g.bad) });
+  refusedIn('npx --prefix "$X" evil', web, '', '/web'); // (the shell is in the working directory, the bin is in the folder the prefix may name)
+  refusedIn('npm exec --prefix "$X" -- evil', web, '', '/web');
+  refusedIn('cd "$Y" && npx --prefix "$X" evil', web, '/web');
+  okGit('npx --prefix "$X" evil', () => ({ 'web/node_modules/.bin/evil': sh('echo hi') }));
+});
+
+test('#363 a runner prefix written out, after a cd that was lost: the bin is looked up at the prefix, run from each place the line may be in (relative or absolute)', () => {
+  // (the bin is two levels down: no folder next to the working directory holds it, only the prefix reaches it)
+  const deep = (g) => ({ 'apps/web/node_modules/.bin/evil': sh(g.bad) });
+  refusedIn('cd "$X" && npx --prefix apps/web evil', deep, '');
+  refusedIn(`cd "$X" && npx --prefix ${GIT_ROOT}/apps/web evil`, deep, '');
+  okGit('cd "$X" && npx --prefix apps/web evil', () => ({ 'apps/web/node_modules/.bin/evil': sh('echo hi') }));
+});
+
+test('#363 a package prefix only known at run time with the shell directory known: the manager call is judged as run in each folder the prefix may name (script, and the bin fallback of yarn / pnpm / bun)', () => {
+  refusedIn('cd sub && npm --prefix "$X" run a', (g) => ({ 'sub/web/package.json': pkg({ a: g.bad }) }), '/sub/web');
+  // a bin-only shorthand: the shell is in sub, the bin only exists under the prefix folder (lookup and execution directories are not the same)
+  refusedIn('cd sub && pnpm --dir "$X" evil', (g) => ({ 'sub/web/package.json': pkg({}), 'sub/web/node_modules/.bin/evil': sh(g.bad) }), '/sub/web');
+  okGit('cd sub && npm --prefix "$X" run a', () => ({ 'sub/web/package.json': pkg({ a: 'echo hi' }) }));
+  okGit('cd sub && pnpm --dir "$X" evil', () => ({ 'sub/web/package.json': pkg({}), 'sub/web/node_modules/.bin/evil': sh('echo hi') }));
+});
+
+// Why (R1): when both the directory the line is in and the prefix are unknown, the directory the bin is FOUND in and the one it RUNS in can differ: a bin that reads a relative helper reads it from the run directory.
+test('#363 both the shell directory and the prefix unknown: the pair (runs in app, found in lib) reaches the helper the bin reads from where it runs', () => {
+  const tree = (g) => ({ 'app/package.json': pkg({}), 'lib/node_modules/.bin/tool': sh('bash run.sh'), 'app/run.sh': sh(g.bad), 'lib/run.sh': sh('echo hi') });
+  refusedIn('cd "$X" && npx --prefix "$Y" tool', tree, '/app');
+  okGit('cd "$X" && npx --prefix "$Y" tool', (g) => ({ ...tree(g), 'app/run.sh': sh('echo hi') }));
+});

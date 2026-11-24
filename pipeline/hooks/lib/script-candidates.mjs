@@ -5,7 +5,7 @@
 // for a glob, the existing files it matches. Each policy then judges the files like any other script.
 // Pure apart from the injected `readDir` (fs.readdirSync-like: names; null when the shell would match nothing there
 // either; any other answer means the directory could not be listed and is refused).
-import { readdirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
+import { readdirSync, opendirSync, statSync, openSync, readSync, closeSync } from 'node:fs';
 import { SCRIPT_EXT, isEqualsWord } from './shell-parse.mjs';
 
 export const MAX_CANDIDATES = 32; // more words than this are refused, not judged
@@ -582,6 +582,44 @@ const EXTENDED_GLOB = /[\^#]|[^=]~(?!\d|$)/;
 // other failure (too many links, I/O, ...): the glob cannot be resolved, so it is refused.
 export const defaultReadDir = (dir) => {
   try { return readdirSync(dir); } catch (e) { return ['ENOENT', 'ENOTDIR', 'EACCES'].includes(e?.code) ? null : false; }
+};
+
+// The SUB-DIRECTORIES of a directory, read with a bound (#363): { dirs: names, overflow } | null (missing, not a directory, no access) | false (any other I/O failure).
+// Only sub-directories count toward `maxDirs` (a folder of a thousand files and three folders is three); the raw entries are bounded too (MAX_LIST_ENTRIES), and `tick` (the deadline) is asked every 256 of them.
+export const MAX_LIST_ENTRIES = 8192;
+export function defaultReadDirBounded(dir, maxDirs, tick = () => {}) {
+  let h;
+  try { h = opendirSync(dir); } catch (e) { return ['ENOENT', 'ENOTDIR', 'EACCES'].includes(e?.code) ? null : false; }
+  try {
+    const dirs = [];
+    let n = 0;
+    for (let ent = h.readSync(); ent !== null; ent = h.readSync()) {
+      if (++n % 256 === 0) tick();
+      if (n > MAX_LIST_ENTRIES) return { dirs, overflow: true };
+      if (!ent.isDirectory() && !ent.isSymbolicLink()) continue; // (a link may lead to a folder: it counts; whether it holds a package is asked later)
+      if (dirs.length >= maxDirs) return { dirs, overflow: true };
+      dirs.push(ent.name);
+    }
+    return { dirs, overflow: false };
+  } catch {
+    return false;
+  } finally {
+    try { h.closeSync(); } catch { /* already closed */ }
+  }
+}
+// The same over an injected `readDir` (the tests' fake file systems): a child is a directory when `readDir(child)` is not null.
+export const boundedFrom = (readDir, joinPath) => (dir, maxDirs, tick = () => {}) => {
+  const names = readDir(dir);
+  if (!Array.isArray(names)) return names === null ? null : false;
+  const dirs = [];
+  for (let k = 0; k < names.length; k++) {
+    if (k % 256 === 255) tick();
+    if (k >= MAX_LIST_ENTRIES) return { dirs, overflow: true };
+    if (readDir(joinPath(dir, names[k])) === null) continue;
+    if (dirs.length >= maxDirs) return { dirs, overflow: true };
+    dirs.push(names[k]);
+  }
+  return { dirs, overflow: false };
 };
 
 // The first bytes of a file the policies refused to read whole (over the 1 MB cap), enough to see a NUL or a shebang. null

@@ -21,7 +21,7 @@ import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmM
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadDirBounded, boundedFrom, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
 
 // (what proves the shell left on a `|| exit`: shell-parse's plainExit, which also refuses a wrapped / spawned exit)
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -1663,7 +1663,7 @@ function judgeScriptText(text, sf, abs, dir, ctx, level) {
     return why ? deny(`the program ${sf.file} contains a guarded command (${why}); it cannot be verified by the guard. Run the operation directly.`) : null;
   }
   if (level >= MAX_NESTING) return deny(`the script ${sf.file} is nested too deeply (scripts running scripts) to verify.`);
-  // (#352: the file being judged -- a cd the guard cannot follow in it, `cd "${0:A:h:h}"`, may have taken the commands after it somewhere near it: see selfDirs)
+  // (#352: the file being judged -- a cd the guard cannot follow in it, `cd "${0:A:h:h}"`, may have taken the commands after it somewhere near it: see reachableDirs)
   const outerSelf = ctx.selfScript;
   if (!sf.sourced && path.isAbsolute(abs)) ctx.selfScript = abs;
   let v;
@@ -1701,33 +1701,137 @@ function pkgFileWritten(ctx, abs) {
   return w.unknown || w.pieces || w.authored || w.programs.length || w.scans.length || w.texts.length || sources.length ? 'maybe' : null;
 }
 
-// The directories a script file may have moved to with a cd the guard cannot follow: its own directory and every one above it, for the path as named and for where it really is (`${0:A:h:h}` resolves links).
-// Each is only a guess at where the script really runs from, so what the guesses do is judged as ALTERNATIVES: see judgeAlternatives.
-function selfDirs(ctx) {
-  const out = [];
-  if (typeof ctx.selfScript !== 'string') return out;
-  const real = realLocation(ctx.realpath, ctx.selfScript);
-  for (const start of new Set([ctx.selfScript, typeof real === 'string' ? real : ctx.selfScript])) {
-    for (let d = path.dirname(start), n = 0; n < 16; n++, d = path.dirname(d)) {
-      if (!out.includes(d)) out.push(d);
-      if (path.dirname(d) === d) break;
+// ---- #363 / #366 / #391: where a command may run when the directory is not known -------------------------------------------------------------------------------------
+// D1, the directories a walk holds: ONE add-only list per walk (newHeld / holdDir): the directories the text cds to, what the caller held, and the literal tails of the cds it cannot follow ("$PWD/apps/web" -> apps/web).
+const MAX_HELD = 16;
+const MAX_CHAIN = 16; // directories above an anchor
+const MAX_CANDIDATE_DIRS = 48; // places judged for one package run
+const MAX_LISTINGS = 24; // folders listed in one evaluation
+const MAX_RELEVANT = 16; // packages / bins found for one package run
+const MAX_SUBDIRS = 256; // sub-directories one listing may hold
+const newHeld = (from) => Object.assign([...(from ?? [])], { tails: [...(from?.tails ?? [])], over: from?.over === true });
+function holdDir(held, d) {
+  if (typeof d !== 'string' || held.includes(d)) return;
+  held.push(d);
+  if (held.length > MAX_HELD) { held.splice(1, 1); held.over = true; } // (the oldest but the start goes: a package run that has to be judged from them is refused for the cap)
+}
+function holdTail(held, t) {
+  if (typeof t !== 'string' || held.tails.includes(t)) return;
+  held.tails.push(t);
+  if (held.tails.length > MAX_HELD) { held.tails.shift(); held.over = true; }
+}
+// The literal part after the last run-time part of a word (`$PWD/apps/web`, `$(git rev-parse --show-toplevel)/apps/web`, `$(dirname "$0")/../web` -> apps/web, ../web), or null.
+function literalTail(w) {
+  if (typeof w !== 'string') return null;
+  let end = -1;
+  for (let i = 0; i < w.length; i++) {
+    if (w[i] === '`') { const j = w.indexOf('`', i + 1); if (j < 0) return null; end = i = j; }
+    else if (w[i] === '$') {
+      const o = w[i + 1];
+      if (o === '(' || o === '{') {
+        let depth = 0;
+        let j = i + 1;
+        for (; j < w.length; j++) { if (w[j] === o) depth++; else if (w[j] === (o === '(' ? ')' : '}') && --depth === 0) break; }
+        if (j >= w.length) return null;
+        end = i = j;
+      } else {
+        const m = /^(?:[A-Za-z_]\w*|[0-9@*#?$!-])/.exec(w.slice(i + 1));
+        if (m) end = i += m[0].length;
+      }
     }
   }
-  return out.slice(0, 32);
+  const tail = end >= 0 && w[end + 1] === '/' ? w.slice(end + 2) : '';
+  return tail !== '' && !/[$`*?[{]/.test(tail) ? tail : null;
+}
+const underDir = (a, base) => { const r = path.relative(base, a); return r === '' || (r !== '..' && !r.startsWith('..' + path.sep) && !path.isAbsolute(r)); };
+
+// D2: the candidates. Anchors (in order): the directory the walk knows, the script's own directory (as named and where it really is: `${0:A:h:h}` resolves links), each directory the walk held (newest first), the working directory.
+// Candidates: each anchor and every directory above it (<= MAX_CHAIN), the literal tails resolved at each of those, and the immediate sub-folders of each directory from an anchor up to its boundary -- the nearest directory with a .git file or
+// directory, else the working directory for an anchor at or below it, else the anchor itself; never the home or a directory above it -- that hold a package.json (`binOnly`: only node_modules/.bin/NAME). Listings are bounded and counted once per evaluation.
+// { dirs, capNear }: capNear is the place a bound was hit (too many folders, an I/O failure, the held list overflowing): the caller refuses.
+function reachableDirs(ctx, { dir = null, bin = null, binOnly = false, tails = [] } = {}) {
+  const held = ctx.held ?? [];
+  const anchors = [];
+  const anchor = (a) => { if (typeof a === 'string' && path.isAbsolute(a) && !anchors.includes(a)) anchors.push(a); };
+  anchor(dir);
+  if (typeof ctx.selfScript === 'string') {
+    anchor(path.dirname(ctx.selfScript));
+    const real = realLocation(ctx.realpath, ctx.selfScript);
+    if (typeof real === 'string') anchor(path.dirname(real));
+  }
+  for (let k = held.length - 1; k >= 0; k--) anchor(held[k]);
+  anchor(ctx.cwd);
+  const cap = (near) => ({ dirs: [], capNear: near });
+  if (held.over === true) return cap(anchors[0] ?? ctx.cwd);
+  const out = [];
+  const add = (d) => { if (!out.includes(d)) out.push(d); };
+  const chain = (a) => { const c = []; for (let d = a, n = 0; n < MAX_CHAIN; n++, d = path.dirname(d)) { c.push(d); if (path.dirname(d) === d) break; } return c; };
+  for (const a of anchors) for (const d of chain(a)) add(d);
+  const above = [...out];
+  for (const t of new Set([...tails, ...(held.tails ?? [])])) for (const d of above) { const r = path.resolve(d, t); if (!out.includes(r) && ctx.pathExists(r)) add(r); }
+  const b = ctx.budget;
+  const lists = (b.dirLists ??= new Map());
+  const listed = new Set();
+  const homeOrAbove = (d) => typeof ctx.home === 'string' && underDir(ctx.home, d);
+  for (const a of anchors) {
+    let top = null;
+    for (const d of chain(a)) if (top === null && ctx.pathExists(path.join(d, '.git'))) top = d;
+    top ??= underDir(a, ctx.cwd) ? ctx.cwd : a;
+    for (const d of chain(a)) {
+      if (!listed.has(d) && !homeOrAbove(d)) {
+        listed.add(d);
+        let r = lists.get(d);
+        if (r === undefined) {
+          if (lists.size >= MAX_LISTINGS) return cap(d);
+          r = ctx.readDirBounded(d, MAX_SUBDIRS, () => checkDeadline(b));
+          lists.set(d, r);
+          checkDeadline(b);
+        }
+        if (r === false || r?.overflow === true) return cap(d);
+        for (const name of [...(r?.dirs ?? [])].sort()) {
+          if (name === 'node_modules' || name === '.git') continue;
+          const child = path.join(d, name);
+          if ((!binOnly && ctx.pathExists(path.join(child, 'package.json'))) || (bin !== null && ctx.pathExists(path.join(child, 'node_modules', '.bin', bin)))) add(child);
+        }
+      }
+      if (d === top) break;
+    }
+  }
+  return out.length > MAX_CANDIDATE_DIRS ? cap(anchors[0] ?? ctx.cwd) : { dirs: out, capNear: null };
+}
+const capMsg = (said, near) => `package script: too many folders/packages near ${near} to verify which package \`${said}\` runs; cd to a literal path or use an absolute --prefix.`;
+const unknownDirMsg = (said, d, inner) => `package script: the directory this runs in is unknown (after a cd, function, alias, trap or sourced file the guard cannot follow, or a --prefix only known at run time); in ${d}, \`${said}\` would run a blocked command: ${String(inner).replace(/[.\s]+$/, '')}. cd to a literal path (chained with &&) or use an absolute --prefix.`;
+// Every place near the line, judged as an alternative: judge(d, spec) -> a refusal or null, and sets spec.relevant when d holds what the command runs (a package that has the script, a bin that resolves). More than MAX_RELEVANT of them is a cap.
+function judgeReachable(ctx, { said, ...where }, judge) {
+  const r = reachableDirs(ctx, where);
+  if (r.capNear !== null) return deny(capMsg(said, r.capNear));
+  let relevant = 0;
+  return judgeAlternatives(ctx, r.dirs, (d) => {
+    const spec = { relevant: false };
+    const v = judge(d, spec);
+    if (v) return deny(unknownDirMsg(said, d, v.reason));
+    return spec.relevant && ++relevant > MAX_RELEVANT ? deny(capMsg(said, d)) : null;
+  });
 }
 
-// Candidate readings of where a command runs (the directories of selfDirs): each is judged from the SAME starting state, and whatever any of them changed (a branch, a git / gh alias) is unknown afterwards,
+// Candidate readings of where a command runs (the directories of reachableDirs): each is judged from the SAME starting state, and whatever any of them changed (a branch, a git / gh alias) is unknown afterwards,
 // never the guess's value nor the old one -- a `git switch` in a package script that may never run is not the branch the later commands act on. (Same rule as judgeScopedIn's candidates and judgeReadings.)
+// D4 (#363): the package marks (an npm pkg set, a marker file), the writes a script exported, a cd behind `command`, a remote change and a redefined `exit` of one candidate are not what the NEXT candidate starts with; afterwards they are all possible.
 // judge(item) returns a verdict (a refusal ends the walk) or null.
 function judgeAlternatives(ctx, items, judge) {
+  const b = ctx.budget;
+  const top = ctx.writeFrames[ctx.writeFrames.length - 1];
   const base = { branches: new Map([...ctx.branches].map(([d, e]) => [d, { ...e }])), git: { ...ctx.gitAliases }, gh: { ...ctx.ghAliases }, unsure: new Set(ctx.aliasUnsure) };
+  const marks = { dirty: b.pkgDirty, bins: b.pkgBinsDirty, mk: b.pkgMarkers?.length ?? 0, mm: b.pkgMarkersMaybe?.length ?? 0, recs: top?.recs.length ?? 0, ext: ctx.extCdUnknown, gh: ctx.ghRepoDirty, exit: b.exitMayBeRedefined };
+  const any = { dirty: false, bins: false, ext: false, gh: false, exit: false };
+  const kept = { mk: [], mm: [], recs: [] };
   const moved = new Set();
   const redefined = new Set();
   const settle = () => {
     for (const d of new Set([...base.branches.keys(), ...ctx.branches.keys()])) {
       const a = base.branches.get(d);
-      const b = ctx.branches.get(d);
-      if (a?.name !== b?.name || a?.trackMain !== b?.trackMain) moved.add(d);
+      const b2 = ctx.branches.get(d);
+      if (a?.name !== b2?.name || a?.trackMain !== b2?.trackMain) moved.add(d);
     }
     for (const [kind, was, now] of [['git', base.git, ctx.gitAliases], ['gh', base.gh, ctx.ghAliases]]) {
       for (const n of new Set([...Object.keys(was), ...Object.keys(now)])) if (was[n] !== now[n]) redefined.add(`${kind}:${n}`);
@@ -1739,6 +1843,15 @@ function judgeAlternatives(ctx, items, judge) {
     for (const n of ctx.aliasUnsure) if (!base.unsure.has(n)) redefined.add(n);
     ctx.aliasUnsure.clear();
     for (const n of base.unsure) ctx.aliasUnsure.add(n);
+    any.dirty ||= b.pkgDirty === true && marks.dirty !== true;
+    any.bins ||= b.pkgBinsDirty === true && marks.bins !== true;
+    any.ext ||= ctx.extCdUnknown === true && marks.ext !== true;
+    any.gh ||= ctx.ghRepoDirty === true && marks.gh !== true;
+    any.exit ||= b.exitMayBeRedefined === true && marks.exit !== true;
+    b.pkgDirty = marks.dirty; b.pkgBinsDirty = marks.bins; ctx.extCdUnknown = marks.ext; ctx.ghRepoDirty = marks.gh; b.exitMayBeRedefined = marks.exit;
+    if (b.pkgMarkers) kept.mk.push(...b.pkgMarkers.splice(marks.mk));
+    if (b.pkgMarkersMaybe) kept.mm.push(...b.pkgMarkersMaybe.splice(marks.mm));
+    if (top) kept.recs.push(...top.recs.splice(marks.recs));
   };
   let v = null;
   for (const item of items) {
@@ -1751,13 +1864,21 @@ function judgeAlternatives(ctx, items, judge) {
   }
   for (const d of moved) ctx.branches.set(d, { name: null, trackMain: false });
   for (const a of redefined) ctx.aliasUnsure.add(a);
+  if (any.dirty) b.pkgDirty = true;
+  if (any.bins) b.pkgBinsDirty = true;
+  if (any.ext) ctx.extCdUnknown = true;
+  if (any.gh) ctx.ghRepoDirty = true;
+  if (any.exit) b.exitMayBeRedefined = true;
+  if (kept.mk.length) (b.pkgMarkers ??= []).push(...kept.mk);
+  if (kept.mm.length) (b.pkgMarkersMaybe ??= []).push(...kept.mm);
+  if (top && kept.recs.length) top.recs.push(...kept.recs);
   return v;
 }
 
 // (R1-B1: a cd behind `time` / `command` / `builtin` may or may not have moved this shell, so which package.json or node_modules/.bin a package script or a runner reads is one of two places: refused, as for a cd the guard cannot follow)
 const EXT_CD_MSG = (said) => `package script: an earlier cd behind time / command / builtin may or may not have moved this shell, so which package.json or node_modules/.bin \`${said}\` reads cannot be verified. Run the cd without the wrapper, or use an absolute --prefix.`;
 const MARKERS_MSG =(said, kind) => `package script: an earlier command on the line (mkdir, touch, rm, mv, cp, ln ...) ${kind === 'known' ? 'creates, removes or renames' : 'may create, remove or rename (a path only known at run time), while the line mentions a guarded operation,'} a package.json, node_modules, server.js, binding.gyp or configuration file that \`${said}\` depends on (in the package's directory or above it), so which script it runs cannot be verified. Run it in a command of its own.`;
-function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
+function packageScriptVerdict(argv, dir, ctx, level) {
   const call = pmCall(argv.map((a) => expandVars(a, ctx)));
   if (!call) return null;
   const said = argv.slice(0, 4).join(' ');
@@ -1767,31 +1888,51 @@ function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
   if (mover) return deny(`package script: ${mover} may point the package manager at another package.json or configuration, so which script \`${said}\` runs cannot be verified. Run it without it (set the directory with --prefix).`);
   // (the manager's own write earlier on the line, or in a script it ran, changed package.json or a configuration file: markPackageState)
   if (pkgOwnWrite(ctx.budget)) return deny(`package script: an earlier command on the line (npm pkg set, npm set-script, npm config set, npm init ...) changes package.json or the package manager's configuration before \`${said}\` reads them, so which script it runs cannot be verified. Run it in a command of its own.`);
-  if (call.dynamic || call.dirDynamic) {
-    return lineMentionsGuarded(ctx)
-      ? deny('package script: the script (or directory) \`' + said + '\` runs is only known at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the script.')
-      : null;
+  const unsure = () => (lineMentionsGuarded(ctx)
+    ? deny('package script: the script (or directory) \`' + said + '\` runs is only known at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the script.')
+    : null);
+  if (call.dynamic) return unsure(); // (a script named at run time)
+  const exe = call.bin ?? (call.execText ? /^[^\s'"]+/.exec(call.execText.trim())?.[0] ?? null : null); // (the bin a manager call may run: folders holding it are candidates too)
+  if (call.dirDynamic) {
+    // (#363: a --prefix only known at run time is one of the places near the line: each is judged as the package the call runs in, with the shell's own directory when it is known)
+    const tail = literalTail(call.dir);
+    const v = judgeReachable(ctx, { said, dir, bin: exe, tails: tail ? [tail] : [] }, (d, spec) => packageRun({ ...call, dir: d, dirDynamic: false }, said, dir ?? d, d, ctx, level, spec));
+    return v ?? unsure();
   }
   if (dir === null) {
-    // (#352) inside a script file, a directory lost to a cd the guard cannot follow is most likely near the script (`cd "$(dirname "$0")/.."`): the package.json is read from the script's directory and each one above it
-    // (the same package.json is reached from several of them: each distinct plan, the ordered runs, is judged once)
-    const judged = new Set();
-    const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => packageScriptVerdict(argv, d, ctx, level, judged));
+    // (#352, #363) a directory lost to a cd the guard cannot follow: an absolute --prefix is judged once, at the prefix; otherwise each place near the line (the folders the line held, the script's own, the working directory, the sub-folders
+    // up to the repository root) that holds what the call runs is judged, and a bad script or bin there refuses
+    const ext = ctx.extCdUnknown === true;
+    const v = typeof call.dir === 'string' && path.isAbsolute(call.dir)
+      ? judgeAlternatives(ctx, [call.dir], (d) => { const w = packageRun(call, said, d, d, ctx, level, null); return w ? deny(unknownDirMsg(said, d, w.reason)) : null; })
+      : judgeReachable(ctx, { said, bin: exe }, (d, spec) => packageRun(call, said, d, d, ctx, level, spec));
     if (v) return v;
     // a directory the guard lost track of (after a sourced file or a cd it cannot follow): judged like a script named at run time (`bash $F`) -- refused when the line mentions a guarded operation (t11)
-    if (ctx.extCdUnknown === true) return deny(EXT_CD_MSG(said));
+    if (ext) return deny(EXT_CD_MSG(said));
     return lineMentionsGuarded(ctx) ? deny('package script: the directory this runs in is unknown (after a cd or a sourced file the guard cannot follow) and the line mentions a guarded operation, so which package.json `' + said + '` reads cannot be verified. Chain the cd with &&, or use an absolute --prefix.') : null;
   }
-  const plan = packageScripts(call, pkgEnv(ctx, dir));
+  return packageRun(call, said, dir, dir, ctx, level, null);
+}
+// The judgement of one manager call run in `exec` (the shell's directory; the candidate itself for a guess), its bin looked up from `lookup`. `spec` (#363): this is one guess among the places near the line: a package that has none of what the call
+// runs is nothing (spec.relevant stays false), a plan or a bin already judged in this evaluation is not judged again.
+function packageRun(call, said, exec, lookup, ctx, level, spec) {
+  const plan = packageScripts(call, pkgEnv(ctx, exec), spec ? { speculative: true } : undefined);
+  if (spec && plan.refuse) spec.relevant = true;
   if (plan.refuse) return deny(plan.refuse);
-  const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [dir], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path });
+  const marked = pkgMarkersFor(ctx.budget, pmStartDirs(call, [exec], ctx.home, path), { pathExists: ctx.pathExists, real: (q) => realLocation(ctx.realpath, q), p: path });
   if (marked === 'known' || (marked === 'maybe' && lineMentionsGuarded(ctx))) return deny(MARKERS_MSG(said, marked));
+  const runs = plan.runs ?? [];
+  const word = call.bin ?? (call.execText ? /^[^\s'"]+/.exec(call.execText.trim())?.[0] ?? null : null);
+  const binAt = spec && word ? [lookup, ...(call.dir ? [path.resolve(lookup, call.dir)] : [])].map((q) => localBin(word, { cwd: q, pathExists: ctx.pathExists, p: path })).find((x) => x) ?? null : null;
   // (a plan already judged for another candidate directory: the whole ORDERED list of runs, as runs of one plan share state -- an alias or a config change of one is there for the next -- and the order can depend on the directory)
   // (the key is not the label: it names the file relative to the directory the manager was started in, which differs)
-  const planKey = (plan.runs ?? []).map((run) => [run.file, run.dir, run.binDir ?? '', run.name ?? run.label, run.text].join('\u0000')).join('\u0001');
+  const seen = spec ? (ctx.budget.specSeen ??= new Set()) : null;
+  const planKey = runs.map((run) => [run.file, run.dir, run.binDir ?? '', run.name ?? run.label, run.text].join('\u0000')).join('\u0001');
   const planSeen = seen !== null && seen.has(planKey);
   if (seen && !planSeen) seen.add(planKey);
-  for (const run of planSeen ? [] : plan.runs ?? []) {
+  if (spec && !planSeen && (runs.some((r) => r.name !== null) || (call.execText && binAt))) spec.relevant = true;
+  for (const run of planSeen ? [] : runs) {
+    if (spec && run.name === null && !binAt) continue; // (a command `npm exec -c TEXT` runs is judged where the bin it names is)
     // (the manager puts every node_modules/.bin from the package's directory upward on the PATH of the script's commands: a bare command name in it may be one of those bins)
     const outerBinDir = ctx.scriptBinDir;
     ctx.scriptBinDir = run.binDir ?? run.dir;
@@ -1803,7 +1944,15 @@ function packageScriptVerdict(argv, dir, ctx, level, seen = null) {
     }
   }
   // (yarn / pnpm / bun NAME with no script of that name run node_modules/.bin/NAME)
-  if (call.bin && !(plan.runs ?? []).some((r) => r.name === call.main)) return binVerdict(call.bin, dir, ctx, level);
+  if (call.bin && !runs.some((r) => r.name === call.main)) {
+    if (spec) {
+      const key = `bin\u0000${binAt}\u0000${exec}`;
+      if (!binAt || seen.has(key)) return null;
+      seen.add(key);
+      spec.relevant = true;
+    }
+    return binVerdict(call.bin, exec, ctx, level, false, lookup);
+  }
   return null;
 }
 
@@ -1869,12 +2018,49 @@ function runnerBinVerdict(argv, dir, ctx, level, quiet = false, lookup = dir) {
   const name = expandVars(argv[0], ctx);
   if (name.includes('/')) return null;
   if (dir === null && !quiet && ctx.extCdUnknown === true) return deny(EXT_CD_MSG(argv.slice(0, 4).join(' ')));
-  // (#352) a runner (npx, npm exec, pnpm dlx / exec, yarn exec, bunx) run after a cd the guard cannot follow, in a script file: its bin is looked up from the script's own directory and each one above it
+  // (#352, #363) a runner (npx, npm exec, pnpm dlx / exec, yarn exec, bunx) run after a cd the guard cannot follow: its bin is looked up from each place near the line (the script's own directory and each one above it, the folders the line held,
+  // the working directory, the sub-folders up to the repository root that hold the bin)
   if (dir === null && lookup === null) {
-    const v = judgeAlternatives(ctx, selfDirs(ctx), (d) => binVerdict(name, d, ctx, level, quiet, d));
+    const v = judgeReachable(ctx, { said: argv.slice(0, 4).join(' '), bin: name, binOnly: true }, (d, spec) => {
+      const found = localBin(name, { cwd: d, pathExists: ctx.pathExists, p: path });
+      if (found) {
+        const seen = (ctx.budget.specSeen ??= new Set());
+        const key = `bin\u0000${found}\u0000${d}`;
+        if (seen.has(key)) return null;
+        seen.add(key);
+        spec.relevant = true;
+      }
+      return binVerdict(name, d, ctx, level, quiet, d);
+    });
     if (v) return v;
   }
   return binVerdict(name, dir, ctx, level, quiet, lookup);
+}
+
+// `npx --prefix W tool` (#363, R1-B6): the bin comes from W's node_modules/.bin, and runs where the line is: two places, kept apart (`exec` / `lookup`) -- a bin that reads a relative helper reads it from where it runs.
+// A prefix known to be inside a known directory is looked up as it always was; one only known at run time, or any prefix after a lost directory, is judged for each PAIR of places near the line (the line's places for `exec`, the places
+// holding the bin for `lookup`; a relative prefix is resolved against each `exec` first, an absolute one is the lookup itself).
+function runnerPrefixVerdict(argv, w, dyn, dir, ctx, level) {
+  const name = expandVars(argv[0], ctx);
+  if (name.includes('/')) return null;
+  const home = w === '~' || w.startsWith('~/') ? path.join(ctx.home ?? '', w.slice(1)) : w;
+  if (!dyn && dir !== null) return runnerBinVerdict(argv, dir, ctx, level, false, path.resolve(dir, home));
+  const said = argv.slice(0, 4).join(' ');
+  const tail = dyn ? literalTail(w) : null;
+  const r = reachableDirs(ctx, { dir, bin: name, tails: tail ? [tail] : [] }); // (the places it may run in: those holding a package or the bin; the bin is looked up in the ones that hold it)
+  if (r.capNear !== null) return deny(capMsg(said, r.capNear));
+  const execs = dir !== null ? [dir] : r.dirs;
+  const found = (d) => localBin(name, { cwd: d, pathExists: ctx.pathExists, p: path });
+  const pairs = new Map();
+  const pair = (e, l) => { const b = found(l); if (b && !pairs.has(`${b}\u0000${e}`)) pairs.set(`${b}\u0000${e}`, [e, l]); };
+  if (dyn) { for (const l of r.dirs) for (const e of execs) pair(e, l); }
+  else if (path.isAbsolute(home)) { for (const e of execs) pair(e, path.resolve(home)); }
+  else for (const e of execs) pair(e, path.resolve(e, home));
+  if (pairs.size > MAX_CANDIDATE_DIRS || new Set([...pairs.keys()].map((k) => k.split('\u0000')[0])).size > MAX_RELEVANT) return deny(capMsg(said, dir ?? ctx.cwd));
+  return judgeAlternatives(ctx, [...pairs.values()], ([e, l]) => {
+    const v = binVerdict(name, e, ctx, level, false, l);
+    return v ? deny(unknownDirMsg(said, e === l ? e : `${e}, using the bin in ${l}`, v.reason)) : null;
+  });
 }
 
 function judgeSqlEscapes(escapes, sf, dir, ctx, level) {
@@ -3484,6 +3670,18 @@ function evalString(str, startDir, ctx, level, child = false) {
     tick: () => checkDeadline(ctx.budget),
   });
   ctx.writeFrames.push(frame);
+  // #363 D1: every directory this walk has held (its start, each cd target of the text, what the caller held): an add-only list, never restored, so what a lost cd, a function body walked before its cd, a hazard that forgets the
+  // directory before every command, or a subshell that gave it back cannot hide is still where an unknown-directory package run may be. A nested text starts with a COPY of the caller's, and what it adds does not flow back.
+  const outerHeld = ctx.held;
+  const held = newHeld(outerHeld);
+  for (const d of cdDirs) holdDir(held, d);
+  for (const c of cmds) {
+    const nm = c.argv.length ? baseName(c.argv[0]) : '';
+    if (nm !== 'cd' && nm !== 'pushd') continue;
+    const t = c.argv.slice(1).find((a) => !a.startsWith('-'));
+    if (t !== undefined) holdTail(held, literalTail(expandVars(t, ctx)));
+  }
+  ctx.held = held;
   const levels = trusted ? [] : null; // (the levels open at the command being walked, outermost first, see emit: up in shell-parse.mjs: { e: the level, dir: where this shell was when it opened, lost / state: a change in it that is certain })
   let chdirBase;
   // #478 R1-B1 (main), carried into the state-mark design: the commands of a failure group `cd X || { …; exit 1; }` (exitOfGroup: also a git checkout / switch) run only when the cd FAILED, in the old
@@ -3634,7 +3832,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const changesStateWords = argv.length > 0 && !childCd && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
-    if (c.chdir !== undefined) { chdirBase = dir; dir = c.chdir === null || dir === null ? null : joinDir(dir, c.chdir, ctx); }
+    if (c.chdir !== undefined) { chdirBase = dir; dir = c.chdir === null ? null : joinDir(dir, c.chdir, ctx); } // (#363: joinDir knows an absolute target whatever the shell's directory)
     const dirBefore = dir; // (#529: a span command that moves the walk's own directory changed something, see spans)
     const varsBefore = c.maybeBg === true && argv.length > 0 ? { vars: { ...ctx.vars }, unsure: new Set(ctx.unsureVars) } : null;
     frame.i = i;
@@ -3689,16 +3887,13 @@ function evalString(str, startDir, ctx, level, child = false) {
         for (const pfx of c.runnerDirs ?? []) {
           if (verdict) break;
           const w = expandVars(pfx, ctx);
-          if (w === '' || /[$`*?[{]/.test(w)) { // (a directory only known at run time: the bin may be in any place, as for `bash $D/tool`)
-            if (lineMentionsGuarded(ctx)) verdict = deny('package script: the script (or directory) `' + argv.slice(0, 4).join(' ') + '` runs is only known at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the script.');
-            continue;
-          }
-          if (dir === null) continue;
-          verdict = runnerBinVerdict(argv, dir, ctx, level, false, path.resolve(dir, w === '~' || w.startsWith('~/') ? path.join(ctx.home ?? '', w.slice(1)) : w));
+          const dyn = w === '' || /[$`*?[{]/.test(w); // (a directory only known at run time: the bin may be in any place, as for `bash $D/tool`)
+          verdict = runnerPrefixVerdict(argv, w, dyn, dir, ctx, level);
+          if (!verdict && dyn && lineMentionsGuarded(ctx)) verdict = deny('package script: the script (or directory) `' + argv.slice(0, 4).join(' ') + '` runs is only known at run time and the line mentions a guarded operation, so what it runs cannot be verified. Name the script.');
         }
       }
-      // (a bare command name in a package script: node_modules/.bin/NAME of the package's directory or above it comes first on the PATH; none there = an ordinary command)
-      if (!verdict && !c.viaRunner && (typeof ctx.scriptBinDir === 'string' || (c.binPath && dir !== null))) verdict = runnerBinVerdict(argv, typeof ctx.scriptBinDir === 'string' ? (dir ?? ctx.scriptBinDir) : dir, ctx, level, true, typeof ctx.scriptBinDir === 'string' ? ctx.scriptBinDir : dir); // (R1-B6: looked up from the package's bin directory, run where the script is)
+      // (a bare command name in a package script: node_modules/.bin/NAME of the package's directory or above it comes first on the PATH; none there = an ordinary command. #363: `npm exec -c evil` after a lost directory too: the places near the line)
+      if (!verdict && !c.viaRunner && (typeof ctx.scriptBinDir === 'string' || c.binPath)) verdict = runnerBinVerdict(argv, typeof ctx.scriptBinDir === 'string' ? (dir ?? ctx.scriptBinDir) : dir, ctx, level, true, typeof ctx.scriptBinDir === 'string' ? ctx.scriptBinDir : dir); // (R1-B6: looked up from the package's bin directory, run where the script is)
       if (!verdict) verdict = withPrefixEnv(c, ctx, () => packageScriptVerdict(argv, dir, ctx, level)); // (#81 t9: `npm run NAME` runs the text package.json holds for NAME)
       if (!verdict) {
         // a string or program text the parser cannot unwrap (node -e, osascript, make CMD=...) that carries a guarded command
@@ -3810,6 +4005,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   for (const x of trackers) if (x.and || x.scoped || x.redir) forget(x); // (#545: a redirected move nothing proved at the end of the text may not have happened)
   return allowed();
   } finally {
+    ctx.held = outerHeld;
     // what the list wrote is still true for the commands after the one that ran it
     const done = ctx.writeFrames.pop();
     const caller = ctx.writeFrames[ctx.writeFrames.length - 1];
@@ -3897,6 +4093,7 @@ function evaluateGitOnce(command, {
   pathExists = existsSync,
   lexists = pathExists === existsSync ? defaultLexists : () => false, // (a caller that fakes pathExists gets no real-disk lstat)
   readDir = defaultReadDir,
+  readDirBounded, // the sub-directories of a directory with a bound (script-candidates.mjs); undefined: over the real disk, or over an injected readDir
   realpath = realpathSync.native, // symlinks followed when a write and a script are compared (tests fake it)
   now = Date.now, // injectable wall clock (tests)
   cpu, // injectable CPU clock (tests); with only `now` injected it is the same clock
@@ -3909,7 +4106,7 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readDirBounded: readDirBounded ?? (readDir === defaultReadDir ? defaultReadDirBounded : boundedFrom(readDir, (a, b) => path.join(a, b))), readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), branchesUnknown: false, cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };

@@ -538,8 +538,10 @@ const GLOBAL_RCS = ['/etc/npmrc', '/usr/local/etc/npmrc', '/opt/homebrew/etc/npm
 
 // Where the scripts are and what they hold, for one evaluation. env: { cwd (null: unknown), home, readText, pathExists, lexists (does a link, even a dangling or looping one, exist; a caller over a fake file system passes one that reads no real disk), readDir, cache (a Map kept for the whole evaluation),
 // written(abs) -> 'known' | 'maybe' | null (does the line write that file before the command?), mentionsGuarded() -> boolean, p (path module), tick() }.
+// `speculative` (#363): the directory is a GUESS (one of the places an unknown directory may be): a package that has none of the scripts the call names (and no direct run) is not what runs, so the configuration files it
+// would be read with are not refused; an unreadable or invalid package.json still is.
 // Returns { refuse: string } | { runs: [{ name, label, text, dir, file }] } | { none: true } (nothing runs: no package.json, no such script). Every give-up is a refusal.
-export function packageScripts(call, env) {
+export function packageScripts(call, env, { speculative = false } = {}) {
   const p = env.p ?? nodePath;
   env.tick?.();
   const cache = env.cache ?? new Map();
@@ -705,6 +707,7 @@ export function packageScripts(call, env) {
     const rec = read(cand.file);
     if (rec.unreadable) return unreadable(cand.file);
     if (rec.invalid) return invalid(cand.file);
+    if (speculative && !direct.length && !call.gate.some((n) => Object.hasOwn(rec.scripts ?? {}, n) && typeof rec.scripts[n] === 'string') && !(call.startDefault && env.pathExists(p.join(cand.dir, 'server.js'))) && !(call.installGroup && env.pathExists(p.join(cand.dir, 'binding.gyp')))) continue; // (#363: not the package that runs)
     // configuration that can change the shell, the prefix or the options a script runs with
     for (const rc of rcFiles(call, cand.dir, env, p)) {
       const bad = rcRefusal(rc, env, cache, exists);
