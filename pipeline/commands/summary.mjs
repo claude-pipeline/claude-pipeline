@@ -20,7 +20,7 @@ import { inlineOptionValues } from '../lib/cmd-io.mjs';
 import { readModelProofs, reviewBaseRef } from '../lib/review-context.mjs';
 import { testsAdded } from '../lib/diff.mjs';
 import { diffFiles, refExists } from '../lib/git.mjs';
-import { pushedWhileReadyOf } from '../lib/ci-usage-pr.mjs';
+import { CLOSED_PR_WARNING, earlierPushedNote, pushedWhileReadyOf } from '../lib/ci-usage-pr.mjs';
 
 export const meta = {
   summary: 'upsert the PR summary comment and print the agent-log line',
@@ -119,20 +119,27 @@ export const run = guarded(async (argv, ctx) => {
     const view = gh.prView(pr, ['title', 'headRefName', 'baseRefName', 'headRefOid']);
     const { title } = view;
     const testsAddedLine = await testsAddedFor(view.baseRefName);
-    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine, ciNote: ciUsage.note });
+    // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
+    const existing = readSummaryComment(gh, pr);
+    if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
+    // A PR that is no longer open cannot be judged again (GitHub unlinks its runs): the line an earlier summary held is carried over; with no earlier summary the check says it could not be made.
+    const ciWarnings = [...ciUsage.warnings];
+    let ciNote = ciUsage.note;
+    if (ciUsage.closed) {
+      if (existing.status === 'absent') ciWarnings.push(CLOSED_PR_WARNING);
+      else ciNote = earlierPushedNote(existing.sections);
+    }
+    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine, ciNote });
     // The weekly Codex spend rides at the end of the line (agent-log close's pending-line match tolerates it).
     const usage = codexUsage({ env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
     const usageText = codexUsageSuffix(usage);
     const agentLogLine = buildAgentLogLine({ state, pr, title, outcome }) + usageText;
-    // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
-    const existing = readSummaryComment(gh, pr);
-    if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
     const guard = guardBlocksFor(existing.status === 'ok' ? existing.record : null, values.session ?? [], ctx);
     const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
       repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
     });
-    warnings.push(...guard.warnings, ...ciUsage.warnings);
+    warnings.push(...guard.warnings, ...ciWarnings);
     const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing, retry: true });
     for (const w of posted.warnings) if (!warnings.includes(w)) warnings.push(w);
     const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), codexUsage: usage, ...(testsAddedLine === undefined ? {} : { testsAdded: testsAddedLine }), warnings };

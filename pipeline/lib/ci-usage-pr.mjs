@@ -6,7 +6,17 @@ import { MAX_PAGES, PAGE, pages } from './gh-pages.mjs';
 import { headProvable, pushedWhileReady } from './ci-usage.mjs';
 import { asciiLine } from './triage.mjs';
 
-// -> { warnings: [], field?: { count, heads: [sha12, ...] }, note?: string }. Nothing is read from GitHub unless the config says true.
+// The start of the summary comment's line about pushes to a ready PR: the note is built with it and an earlier line is found by it, so the two cannot drift.
+export const PUSHED_READY_NOTE = 'Pushed to the ready PR without `pipeline redraft` first';
+// The warning when a PR is no longer open and no earlier summary comment holds the line to carry over.
+export const CLOSED_PR_WARNING = 'pushed-while-ready check: the PR is no longer open (merged or closed), so GitHub no longer links its workflow runs to it: its pushes could not be checked';
+// -> the line of an earlier summary comment's sections that this module wrote, or undefined (a PR that is no longer open cannot be judged again: the caller carries the line over).
+export function earlierPushedNote(sections) {
+  return String(sections ?? '').split('\n').find((l) => l.startsWith(PUSHED_READY_NOTE));
+}
+
+// -> { warnings: [], field?: { count, heads: [sha12, ...] }, note?: string, closed?: true }. Nothing is read from GitHub unless the config says true.
+// `closed: true`: the PR is no longer open, so nothing can be judged (GitHub unlinks its runs): no warning here, the caller carries the earlier line over from the summary comment or warns when there is none.
 export async function pushedWhileReadyOf({ root, gh, pr }) {
   const none = { warnings: [] };
   try {
@@ -22,8 +32,8 @@ export async function pushedWhileReadyOf({ root, gh, pr }) {
     let incomplete = false;
     const cut = (what) => () => { incomplete = true; warnings.push(`pushed-while-ready check: the ${what} were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE}): the PR could not be checked, so no head is named`); };
     const pull = gh.api('GET', `repos/${slug}/pulls/${pr}`);
-    // GitHub fills a run's pull_requests only from the OPEN PRs when it is read: after a merge or a close every run of this PR is unlinked, so nothing can be judged (and nothing is said that would erase an earlier line)
-    if (pull?.state === 'closed') return { warnings: [`pushed-while-ready check: the PR is no longer open (merged or closed), so GitHub no longer links its workflow runs to it: its pushes could not be checked`] };
+    // GitHub fills a run's pull_requests only from the OPEN PRs when it is read: after a merge or a close every run of this PR is unlinked, so nothing can be judged again; the re-rendered comment would drop an earlier line, so the caller carries it over (`closed`)
+    if (pull?.state === 'closed') return { warnings: [], closed: true };
     const branch = pull?.head?.ref;
     if (typeof branch !== 'string' || branch === '' || typeof pull?.created_at !== 'string') throw new Error('the PR has no branch or creation time');
     const created = Date.parse(pull.created_at);
@@ -53,7 +63,7 @@ export async function pushedWhileReadyOf({ root, gh, pr }) {
     const heads = checked.map((h) => h.sha.slice(0, 12));
     const times = count === 1 ? 'once' : `${count} times`;
     warnings.push(`pushed to the ready PR without \`P redraft\` first ${count} time(s): ${heads.join(', ')}; a push to a ready PR starts the full CI suite`);
-    return { warnings, field: { count, heads }, note: `Pushed to the ready PR without \`pipeline redraft\` first ${times}: ${heads.join(', ')} (a push to a ready PR starts the full CI suite).` };
+    return { warnings, field: { count, heads }, note: `${PUSHED_READY_NOTE} ${times}: ${heads.join(', ')} (a push to a ready PR starts the full CI suite).` };
   } catch (err) {
     warnings.push(`pushed-while-ready check skipped: GitHub could not be read (${asciiLine(err?.message, 120)})`);
     return { warnings };
