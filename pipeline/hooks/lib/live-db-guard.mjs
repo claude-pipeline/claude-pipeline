@@ -920,6 +920,7 @@ const globPg = (w, min) => {
   const tok = String(w).trim().split(/\s+/)[0] ?? '';
   const b = tok.slice(tok.lastIndexOf('/') + 1);
   if (!/[*?[]/.test(b)) return false;
+  if (!tok.includes('/') && !/[^*?[\]]/.test(tok)) return false; // a bare wildcard word (`*` left by arithmetic like `(1+2) * 3`) names no program
   let p = b.replace(/\\/g, '').toLowerCase();
   const o = p.indexOf('['); const cl = p.lastIndexOf(']');
   if (o >= 0 && cl > o) p = p.slice(0, o) + '*' + p.slice(cl + 1);
@@ -941,7 +942,7 @@ const expansionTrick = (s, braces) => {
     const ch = s[i];
     if (ch !== '$' && ch !== '`') { i += 1; continue; }
     let end;
-    if (ch === '`') { end = s.indexOf('`', i + 1); if (end < 0) return true; end += 1; }
+    if (ch === '`') { end = s.indexOf('`', i + 1); if (end < 0) break; if (end === i + 1) { i = end + 1; continue; } end += 1; } // an unterminated backtick is a literal character, an empty pair a no-op
     else if (s[i + 1] === '{') {
       end = s.indexOf('}', i + 2);
       if (end < 0) return true;
