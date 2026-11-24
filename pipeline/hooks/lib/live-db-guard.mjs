@@ -934,8 +934,16 @@ const globPg = (w, min) => {
 const PASS_FILTERS = new Set(['sort', 'uniq', 'tee', 'cat']);
 // a command name, or the text a shell runs, built from echo / printf output inside a substitution (`$(echo ps)ql`, `eval ps$(echo ql)`)
 const SUBST_LIT = /(?:\$\(|`)\s*(?:echo|printf)\b/;
+const REWRITERS = new Set(['tr', 'sed', 'awk', 'gawk', 'perl', 'python', 'python3', 'ruby', 'cut', 'rev', 'paste', 'fold', 'fmt', 'head', 'tail', 'tac', 'od', 'xxd', 'base64', 'iconv', 'jq', 'grep', 'column', 'expand', 'unexpand', 'nl', 'xargs', 'parallel']);
 const TEXT_RUNNERS = new Set(['eval', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'source', '.']);
-// an expansion in a word that can build or hide a name: two expansions side by side or an expansion glued to name characters (`$1$2`, `$x$y`, `${a}ql`); with braces: a `${…}` that is not a plain name (`${:-psql}`, `${(L)x}`, `${x:-pgloader}`). One pass, an unterminated one refuses
+// an expansion in a word that can build or hide a name: two expansions side by side or an expansion glued to name characters (`$1$2`, `$x$y`, `${a}ql`); with braces: a `${…}` that is not a plain name or a plain default (`${:-psql}`, `${(L)x}`, `${x:-pgloader}`). One pass, an unterminated one refuses
+// ${NAME} or ${NAME:-default} with a plain default word (the `"${BASH:-bash}"` idiom) is a plain name; the default must name no family program
+const plainBrace = (c) => {
+  const m = /^\w+(?::?[-=+?]([^$`(){}]*))?$/.exec(c);
+  if (!m) return false;
+  const d = fedText(m[1] ?? '');
+  return !(pgWord(d) || globPg(d, 0) || PG_TOKEN.test(d) || laterPgWord(d));
+};
 const expansionTrick = (s, braces) => {
   let i = 0;
   while (i < s.length) {
@@ -946,7 +954,7 @@ const expansionTrick = (s, braces) => {
     else if (s[i + 1] === '{') {
       end = s.indexOf('}', i + 2);
       if (end < 0) return true;
-      if (braces && !/^\w+$/.test(s.slice(i + 2, end))) return true;
+      if (braces && !plainBrace(s.slice(i + 2, end))) return true;
       end += 1;
     } else if (s[i + 1] === '(') {
       let depth = 0; let j = i + 1;
@@ -1007,9 +1015,11 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
     // a printf format with anything but a plain %s / %b / %d / %q can build a name from its pieces (`printf '%s%s' ps ql`)
     const fmt = (c) => commandName(c.argv[0]) === 'printf' && fedText(c.argv.slice(1).find((a) => !a.startsWith('-')) ?? '').replace(/%%/g, '').split(/\s+/).some((p) => p.includes('%') && !/^%[sbdq]$/.test(p));
     // a piped command that rewrites text (tr, sed, head …), or an xargs / parallel that itself builds text (`xargs printf | xargs env`)
-    const filter = (c) => c.pipe === true && !deferred(c) && (stdinFed(c) ? isLit(c) : !isLit(c) && !PASS_FILTERS.has(commandName(c.argv[0])));
-    // a replacement token glued to a name character or another token (`p{}`, `{1}{2}`)
-    const glue = (c) => stdinFed(c) && typedWords(c).some((w) => /[\w}]\{\d*\}|\{\d*\}[\w{]/.test(w));
+    // (when the launcher is a shell, the parser also reads the produced text as commands of their own: only a command that rewrites text counts then)
+    const shellFan = reading.some((c) => stdinFed(c) && TEXT_RUNNERS.has(commandName(c.argv[0])));
+    const filter = (c) => c.pipe === true && !deferred(c) && (stdinFed(c) ? isLit(c) : !isLit(c) && !PASS_FILTERS.has(commandName(c.argv[0])) && (!shellFan || REWRITERS.has(commandName(c.argv[0]))));
+    // a replacement token glued to a name character or another token (`p{}`, `{1}{2}`; the `-I{}` option that defines the token is not one)
+    const glue = (c) => stdinFed(c) && typedWords(c).some((w) => /[\w}]\{\d*\}|\{\d*\}[\w{]/.test(w.replace(/^-[IJi]\{/, '{')));
     // the producer words build a name from variables (`echo $x$y`)
     const built = (c) => (isLit(c) && !stdinFed(c) && c.argv.slice(1).some((w) => expansionTrick(w, false))) || redirText(c).some((w) => expansionTrick(w, false));
     if (literal && reading.some((c) => fmt(c) || filter(c) || glue(c) || built(c))) return 'xargs / parallel builds a command from text the line produces through a printf format, a filter, a glued replacement or glued variables the guard cannot read';
