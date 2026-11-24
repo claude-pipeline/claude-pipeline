@@ -430,6 +430,8 @@ test('sweep bypass classes 1-3 and 6-8: decoded, assembled, globbed, valued and 
     // 3: a name assembled from pieces under xargs / parallel
     "printf '%s%s' ps ql | xargs env", "echo ps ql | tr -d ' ' | xargs env", 'echo sql | xargs -I{} env p{} -h prod', 'parallel env {1}{2} ::: ps ::: ql',
     "printf '%s' ps ql | xargs env", "{ printf ps; echo ql -h prod; } | xargs env", '(echo -n ps; echo ql) | xargs env', 'echo sql | xargs -I@ env p@ -h prod', 'echo sql | xargs -J @ env p@ -h prod', 'echo sql | xargs --replace=@ env p@ -h prod',
+    // a launcher that reads a file or a variable the line built earlier is judged against the whole line
+    "printf 'ps%s' ql > f; xargs env < f", "printf '%s%s' ps ql > /tmp/x; xargs -a /tmp/x env", "v=$(printf %s%s ps ql); xargs env <<< \"$v\"", "v=$(printf '%s%s' ps ql); echo $v | xargs env",
     'x=ps; y=ql; echo $x$y | xargs env', "printf 'ps\\\\\\\\x71l' | xargs printf | xargs env",
     // 4: a command built from a substitution
     '$(echo ps)ql -h prod', 'eval ps$(echo ql) -h prod', `bash -c "$(printf 'ps\\x71l -h x')"`, "ssh host '$(echo ps)ql -h x'",
@@ -464,6 +466,7 @@ test('sweep bypass classes 4-5 and 9-10: expansion-built command names, deferred
     "echo '* * * * * psql -h prod' | crontab -", "at now <<< 'psql -h prod'", "batch <<< 'pg_dump -h x'", // 9
     "sed -n '1e psql -h prod' f", "sed --expression='e psql -h x' f", // 10
     "sed 's|marker|psql -h prod|e' f", "sed -e'e psql -h prod' f", "sed '\\%x%e psql -h prod' f", "sed e <<< 'psql -h prod'", "echo 'psql -h prod' | sed e",
+    "sed -l 5 'e psql -h prod' f", "sed -n -l 5 '1e psql -h prod' f", "sed --expr='e psql -h prod' f", "sed --ex 'e psql -h prod' f", "sed --line-length 5 'e psql -h prod' f",
   ]) mustRefuse(line);
   for (const line of [
     'crontab -l | grep psql', 'at -l', "sed -n '/psql/p' f", "sed 's/psql/pg/' f", "sed -e 's/psql/x/' f",

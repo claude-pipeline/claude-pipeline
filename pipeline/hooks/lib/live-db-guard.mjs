@@ -1008,31 +1008,24 @@ const pgDataOnly = (c, plain) => {
   if (w === 'command' && /^-[pP]*[vV]$/.test(c.argv[1] ?? '')) return true; // a lookup (`command -v psql`), the same shape files-policy reads
   return PG_DATA.has(w) || (w === 'git' && PG_DATA_GIT.has(c.argv[1]));
 };
-// sed runs a program with its `e` command (`1e psql -h x`, `e psql`, `\%x%e psql`) and the `e` flag of `s` (`s|a|psql -h x|e`): the SCRIPT is read (each `-e` / `--expression=` value, attached or separate, else the first operand
-// when no `-f` names a file), never the option words (`-e` itself); over-reads: a stray ` e ` in a pattern
+// sed runs a program with its `e` command (`1e psql -h x`, `e psql`, `\%x%e psql`) and the `e` flag of `s` (`s|a|psql -h x|e`): every word that can be the script is read (see sedScripts), never the option words (`-e` itself); over-reads: a stray ` e ` in a pattern, a file named `e`
 const SED_E_CMD = /(?:^|[^A-Za-z_])e(?:[\s;}]|$)/;
 const SED_S_FLAG_E = /(?:^|[^\w])s([^\s\\\w])(?:\\[\s\S]|(?!\1)[^\\])*\1(?:\\[\s\S]|(?!\1)[^\\])*\1[gpiImM\d]*e/;
 const sedScripts = (argv) => {
-  const a = argv.slice(1);
+  // fail closed: every word that is not an option (the operands, an option's separate value: `-l 5`, `--ex 'e x'`, whatever the abbreviation getopt accepts), the value of any `--opt=value` and the attached value of a short `-e…` (`-ee psql`, `-ne` takes the next word)
   const scripts = [];
-  let operand = null;
-  let fileScript = false;
-  for (let i = 0; i < a.length; i += 1) {
-    const w = a[i];
-    if (w === '--') { operand ??= a[i + 1] ?? null; break; }
-    if (/^--exp[a-z]*=/.test(w)) scripts.push(w.slice(w.indexOf('=') + 1));
-    else if (/^--exp[a-z]*$/.test(w)) { scripts.push(a[i + 1] ?? ''); i += 1; }
-    else if (/^--fi/.test(w)) { fileScript = true; if (!w.includes('=')) i += 1; }
-    else if (/^-[^-]/.test(w)) {
-      // a cluster of short flags: `e` and `f` take the rest of the word, or the next word
+  let operands = false;
+  for (const w of argv.slice(1)) {
+    if (operands || !w.startsWith('-')) scripts.push(w);
+    else if (w === '--') operands = true;
+    else if (w.startsWith('--')) { if (w.includes('=')) scripts.push(w.slice(w.indexOf('=') + 1)); }
+    else {
       for (let k = 1; k < w.length; k += 1) {
-        if (w[k] === 'e') { scripts.push(w.length > k + 1 ? w.slice(k + 1) : (a[i += 1] ?? '')); break; }
-        if (w[k] === 'f') { fileScript = true; if (w.length === k + 1) i += 1; break; }
-        if (w[k] === 'i' || w[k] === 'l') break;
+        if (w[k] === 'e') { if (w.length > k + 1) scripts.push(w.slice(k + 1)); break; }
+        if (w[k] === 'f' || w[k] === 'i' || w[k] === 'l') break;
       }
-    } else if (!w.startsWith('--')) operand ??= w;
+    }
   }
-  if (!scripts.length && !fileScript && operand !== null) scripts.push(operand);
   return scripts;
 };
 const sedRuns = (argv) => sedScripts(argv).some((t) => t.length > 2000 || SED_E_CMD.test(t) || SED_S_FLAG_E.test(t)); // (a script too long to scan cheaply is taken to run)
@@ -1089,9 +1082,14 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
         return convs > 0 && args > convs && !/\s$/.test(f);
       });
     };
+    // a launcher that reads a file or a variable the line built earlier (`< f`, `<<< "$v"`, `-a f`, a launcher that is no pipeline stage) is judged against the whole line; a pipeline's producer with an expansion may hold a variable
+    // a substitution built earlier (`v=$(printf %s%s ps ql); echo $v | xargs env`): every substitution of the line counts too
+    const ownWords = (c) => typedWords(c).slice(0, Math.max(0, typedWords(c).length - c.argv.length));
+    const wholeLine = (c) => (c.redirects ?? []).some((r) => String(r.op).startsWith('<')) || ownWords(c).some((w) => /^-[^-]*a|^--arg-file|^::::$/.test(w)) || !(c.pipe === true || inSub(c));
     const refused = reading.some((c, k) => {
       if (!(deferred(c) || (stdinFed(c) && buildsProgram(c, () => true)))) return false;
-      const w = windowOf(k);
+      let w = wholeLine(c) ? reading : windowOf(k);
+      if (w.some((p) => isLit(p) && [...p.argv, ...redirText(p)].some((a) => /[$`]/.test(a)))) w = reading.filter((p) => w.includes(p) || inSub(p));
       const literal = w.some((p) => isLit(p) || (p.redirects ?? []).some((r) => String(r.op).startsWith('<<')) || (stdinFed(p) && typedWords(p).includes(':::')));
       return literal && (w.some((p) => fmt(p) || filter(p) || built(p)) || glue(c) || joins(w));
     });
