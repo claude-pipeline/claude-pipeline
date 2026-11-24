@@ -479,6 +479,7 @@ test('#794 (no own run left): a PR whose only heavy run predates it gets no row 
   assertExit(r, 0, r.stderr + r.stdout);
   const [repo] = r.json.repos;
   assert.deepEqual([repo.prs.length, repo.totals.prs, repo.totals.wastedRedrafts], [0, 0, 0]);
+  assert.equal(repo.partial, false, 'a PR with no own heavy run is not an unread PR');
   assert.equal(repo.totals.byClass.unclassified.runs, 1);
   assert.equal(repo.totals.workflowElapsedMin, 10);
 });
@@ -510,6 +511,8 @@ test('#794 (unreadable creation time): a PR whose created_at does not parse is n
   assertExit(r, 0, r.stderr + r.stdout);
   const [repo] = r.json.repos;
   assert.equal(repo.prs.length, 0);
+  assert.equal(repo.partial, true, 'an unreadable PR makes the report partial');
+  assert.match(r.json.warnings.join('\n'), /1 PR\(s\) with heavy runs were not read/);
   assert.equal(repo.totals.byClass.unclassified.runs, 1);
   assert.equal(repo.totals.workflowElapsedMin, 10);
   assert.match(r.json.warnings.join('\n'), /#9: its creation time could not be read: its runs are not given to it \(left unclassified\)/);

@@ -172,7 +172,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
     // (as in the summary). It falls into the last pass below, where a linked run of no PR row is unclassified; it stays in the totals.
     const created = Date.parse(data.pr.createdAt);
     // without a usable creation time no run can be proven to be this PR's own: like an unreadable PR, its runs are not given to it (they go to the last pass, unclassified)
-    if (!Number.isFinite(created)) { warn(`#${n}: its creation time could not be read: its runs are not given to it (left unclassified)`); readPr.delete(n); continue; }
+    if (!Number.isFinite(created)) { warn(`#${n}: its creation time could not be read: its runs are not given to it (left unclassified)`); readPr.delete(n); skipped.prs += 1; continue; }
     const own = (r) => Date.parse(r.created_at) >= created;
     const prRuns = group.runs.filter(own);
     const all = group.all.filter(own);
