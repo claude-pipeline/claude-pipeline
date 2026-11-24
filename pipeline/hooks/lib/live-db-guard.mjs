@@ -1059,7 +1059,9 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
       return reading.slice(j, k + 1);
     };
     // a printf format with anything but a plain %s / %b / %d / %q can build a name from its pieces (`printf '%s%s' ps ql`)
-    const fmtOf = (c) => fedText(c.argv.slice(1).find((a) => !a.startsWith('-')) ?? '').replace(/%%/g, '');
+    // a printf's format and arguments, after its options (`-v NAME` takes the next word, `-vNAME` and `--` do not)
+    const printfWords = (c) => { const a = c.argv.slice(1); let i = 0; while (i < a.length && /^-[A-Za-z]/.test(a[i])) i += /^-[A-Za-z]*v$/.test(a[i]) ? 2 : 1; if (a[i] === '--') i += 1; return a.slice(i); };
+    const fmtOf = (c) => fedText(printfWords(c)[0] ?? '').replace(/%%/g, '');
     const fmt = (c) => commandName(c.argv[0]) === 'printf' && fmtOf(c).split(/\s+/).some((p) => p.includes('%') && !/^%[sbdq]$/.test(p));
     // a piped command that rewrites text (tr, sed, head …), or an xargs / parallel that itself builds text (`xargs printf | xargs env`)
     // (when the launcher is a shell, the parser also reads the produced text as commands of their own: only a command that rewrites text counts then)
@@ -1077,14 +1079,15 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
     // (`reach`: on a whole-line reading only an echo / printf whose output can get to the launcher counts: it writes a file, is a pipeline stage or sits in a substitution / subshell; terminal status messages do not.
     // Not on a line with a redirect on a group or loop (`{ …; } > f`), an `exec` redirect or a function: their output goes to a file the producer words do not show)
     const hidesOutput = cmds.some((c) => (c.redirects ?? []).some((r) => String(r.op).includes('>')) && (!c.argv?.length || commandName(c.argv[0]) === 'exec')) || reading.some((c) => c.ctl?.fn);
-    const reaches = (c) => c.pipe === true || inSub(c) || (c.redirects ?? []).some((r) => String(r.op).includes('>'));
+    // (a `printf -v NAME` writes a variable the launcher may read)
+    const reaches = (c) => c.pipe === true || inSub(c) || (commandName(c.argv[0]) === 'printf' && c.argv.slice(1).some((a) => /^-[A-Za-z]*v/.test(a))) || (c.redirects ?? []).some((r) => String(r.op).includes('>'));
     const joins = (w, reach) => {
       const prods = w.filter((c) => isLit(c) && !stdinFed(c) && (!reach || reaches(c)));
       return prods.length > 1 || prods.some((c) => {
         const rest = c.argv.slice(1);
         if (commandName(c.argv[0]) === 'echo') return rest.some((a) => /^-[A-Za-z]*n/.test(a) || /\\c/.test(a));
         const f = fmtOf(c);
-        const args = rest.length - rest.findIndex((a) => !a.startsWith('-')) - 1;
+        const args = printfWords(c).length - 1;
         const convs = (f.match(/%[-+ #0-9.*']*[A-Za-z]/g) ?? []).length;
         return convs > 0 && args > convs && !/\s$/.test(f);
       });
