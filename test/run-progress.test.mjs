@@ -331,3 +331,16 @@ test('writeRunRecord: stamping resumed on an unreadable record returns baseRecor
   assert.equal(baseRecordFor({ status: 'invalid' }, { ...ID, host: 'pc-1', now: NOW }).warnings[0], posted.warnings[0], 'the same wording');
   assert.deepEqual(writeRunRecord(memoryGh(), PR, { record: plain() }).warnings, []);
 });
+
+test('writeRunRecord: sections given as a function are rendered from the comment the writer re-read, so a line posted after the caller\'s first read is not erased', () => {
+  // failure caught: the closed-PR summary rendered its sections from its first read; a pushed-while-ready line an open-PR summary posted before the write was lost by the PATCH
+  const gh = memoryGh();
+  seed(gh, plain());
+  const NOTE = 'Pushed to the ready PR without `pipeline redraft` first once: bbbbbbbbbbbb (a push to a ready PR starts the full CI suite).';
+  const first = readSummaryComment(gh, PR); // the caller's read: no sections yet
+  writeSummaryComment(gh, PR, { sections: `### Outcome\n\n**awaiting-owner-merge**\n\n${NOTE}` }); // a concurrent summary lands
+  const seen = [];
+  writeRunRecord(gh, PR, { record: plain(), firstRead: first, sections: (fresh) => { seen.push(fresh.sections); return `### Outcome\n\n**merged**\n\n${fresh.sections.split('\n').find((l) => l.startsWith('Pushed to the ready PR')) ?? ''}`; } });
+  assert.match(seen[0], /Pushed to the ready PR/, 'the function got the re-read comment');
+  assert.match(mineBody(gh), /\*\*merged\*\*\n\nPushed to the ready PR without `pipeline redraft` first once/);
+});

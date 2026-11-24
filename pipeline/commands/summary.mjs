@@ -122,15 +122,14 @@ export const run = guarded(async (argv, ctx) => {
     // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
     const existing = readSummaryComment(gh, pr);
     if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
-    // A PR that is no longer open cannot be judged again (GitHub unlinks its runs): the line an earlier summary held is carried over; with no earlier summary the check says it could not be made.
+    // A PR that is no longer open cannot be judged again (GitHub unlinks its runs): the line an earlier summary held is carried over; with no earlier rendered summary the check says it could not be made.
+    // The earlier summary is the comment the writer re-reads just before it writes (a summary posted since our first read is not erased), so the sections are rendered from that read.
     const ciWarnings = [...ciUsage.warnings];
-    let ciNote = ciUsage.note;
-    if (ciUsage.closed) {
-      const earlier = earlierPushedNote(existing.sections);
-      if (earlier.rendered) ciNote = earlier.note;
-      else ciWarnings.push(CLOSED_PR_WARNING); // no comment yet, or only a run record (a checkpoint wrote it): no earlier summary to carry from
-    }
-    const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine, ciNote });
+    let closedUnchecked = false;
+    const render = (ciNote) => summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine, ciNote });
+    const sections = ciUsage.closed
+      ? (fresh) => { const earlier = earlierPushedNote(fresh.sections); closedUnchecked = !earlier.rendered; return render(earlier.note); } // no comment yet, or only a run record (a checkpoint wrote it): no earlier summary to carry from
+      : render(ciUsage.note);
     // The weekly Codex spend rides at the end of the line (agent-log close's pending-line match tolerates it).
     const usage = codexUsage({ env: ctx.env, ...(ctx.home ? { home: ctx.home } : {}) });
     const usageText = codexUsageSuffix(usage);
@@ -142,6 +141,7 @@ export const run = guarded(async (argv, ctx) => {
     });
     warnings.push(...guard.warnings, ...ciWarnings);
     const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing, retry: true });
+    if (closedUnchecked) warnings.push(CLOSED_PR_WARNING);
     for (const w of posted.warnings) if (!warnings.includes(w)) warnings.push(w);
     const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), codexUsage: usage, ...(testsAddedLine === undefined ? {} : { testsAdded: testsAddedLine }), warnings };
     if (ciUsage.field) output.pushedWhileReady = ciUsage.field;

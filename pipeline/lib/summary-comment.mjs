@@ -35,7 +35,7 @@ export function readSummaryComment(gh, pr) {
 }
 
 // `record` / `sections` left undefined are kept from the existing comment; pass `existing` (a readSummaryComment result)
-// to avoid reading it twice. An existing record this CLI cannot read (`unsupported`, newer version) is never dropped
+// to avoid reading it twice. `sections` may be a function of that comment (the read this write rests on): it returns the sections to write (the closed-PR summary carries a line from it). An existing record this CLI cannot read (`unsupported`, newer version) is never dropped
 // silently: omit `record` and the write is refused.
 // `retry`: wait out a rate limit (the run recorder leaves it off; the comment, summary and checkpoint commands opt in).
 export function writeSummaryComment(gh, pr, { record, sections, existing, retry = false } = {}) {
@@ -44,7 +44,7 @@ export function writeSummaryComment(gh, pr, { record, sections, existing, retry 
     throw new Error('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI before rewriting it');
   }
   const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
-  const useSections = sections !== undefined ? sections : current.sections;
+  const useSections = typeof sections === 'function' ? sections(current) : (sections !== undefined ? sections : current.sections);
   const parts = [MARKERS.summary, ''];
   if (useRecord) parts.push(renderStatusBlock(useRecord), '');
   if (String(useSections).trim()) parts.push(String(useSections).trim(), '');

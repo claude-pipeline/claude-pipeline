@@ -171,7 +171,9 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
     // GitHub links a run to the PRs that are OPEN now on its branch or head, so a run of an earlier (closed) PR on a reused branch name carries this PR: a run created before the PR existed is not its own
     // (as in the summary). It falls into the last pass below, where a linked run of no PR row is unclassified; it stays in the totals.
     const created = Date.parse(data.pr.createdAt);
-    const own = (r) => !Number.isFinite(created) || Date.parse(r.created_at) >= created;
+    // without a usable creation time no run can be proven to be this PR's own: like an unreadable PR, its runs are not given to it (they go to the last pass, unclassified)
+    if (!Number.isFinite(created)) { warn(`#${n}: its creation time could not be read: its runs are not given to it (left unclassified)`); readPr.delete(n); continue; }
+    const own = (r) => Date.parse(r.created_at) >= created;
     const prRuns = group.runs.filter(own);
     const all = group.all.filter(own);
     for (const r of group.runs) if (!own(r)) { prOfRun.delete(r.id); predating += 1; }

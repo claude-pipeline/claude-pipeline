@@ -496,3 +496,21 @@ test('#793: a head pushed (and the PR readied) before --since, first seen in the
   assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
   assert.deepEqual([repo.totals.pushesWhileReady, repo.totals.missedRedrafts, repo.totals.uncheckedHeads], [0, 0, 1]);
 });
+
+test('#794 (unreadable creation time): a PR whose created_at does not parse is not given any run (it cannot be proven they are its own): unclassified, in the totals, with a warning naming the PR', () => {
+  // failure caught: a null created_at made every linked run pass the ownership check, so an earlier PR's cost was charged to the PR with no warning
+  const earlier = run(2301, { head_sha: sha('5'), pull_requests: [{ number: 9 }], created_at: T('09:30'), run_started_at: T('09:30'), updated_at: plus(T('09:30'), 10) });
+  const extra = [
+    { match: '^api repos/acme/widgets/actions/runs/2301/jobs', stdoutJson: { total_count: 1, jobs: [job(T('09:30'), 10)] } },
+    { match: '^api repos/acme/widgets/pulls/9/commits', stdoutJson: [] },
+    { match: '^api repos/acme/widgets/pulls/9$', stdoutJson: { number: 9, created_at: null, draft: false } },
+    { match: '^api repos/acme/widgets/issues/9/timeline', stdoutJson: [] },
+  ];
+  const r = usage(world({ runs: [earlier], extra }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  assert.equal(repo.prs.length, 0);
+  assert.equal(repo.totals.byClass.unclassified.runs, 1);
+  assert.equal(repo.totals.workflowElapsedMin, 10);
+  assert.match(r.json.warnings.join('\n'), /#9: its creation time could not be read: its runs are not given to it \(left unclassified\)/);
+});
