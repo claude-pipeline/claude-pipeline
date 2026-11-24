@@ -19,7 +19,7 @@ import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { withHoldLifted } from '../pipeline/lib/hold.mjs';
 import {
   beginAttempt, clearSessionHold, confirmAttempt, endRecord, holdOnSignal, liveRecords, noteRemoval, openRecord, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift,
-  settleGuardStatuses, settleRecord, setHold,
+  guardLinks, settleGuardStatuses, settleRecord, setHold,
 } from '../pipeline/lib/merge-queue.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -894,6 +894,43 @@ test('settleGuardStatuses: waits out pending, then green with provenance => []; 
   assert.match(stuck.out[0], /still pending: Test integrity after 25 s/);
   const broken = await run([new Error('HTTP 502')], { waitMs: 15_000 });
   assert.match(broken.out[0], /could not read the checks \(HTTP 502\) after 15 s/);
+});
+
+// #847: the guards' re-run after the lift may not have posted `pending` yet when the first read happens: the OLD green rows then looked settled.
+test('settleGuardStatuses with a before-snapshot: old green rows are not trusted until a guard shows pending or a new link; no sign of a re-run => today\'s verdict; a new-link red => a reason', async () => {
+  const OLD = { 'Test integrity': 'https://x/runs/1', 'Hard-stop scan': 'https://x/runs/1' };
+  const row = (name, bucket, run) => ({ name, bucket, link: `https://x/runs/${run}` });
+  const both = (bucket, run) => [row('Test integrity', bucket, run), row('Hard-stop scan', bucket, run), row('Cross-model review', 'pass', 1)];
+  const run = async (seq, over = {}) => {
+    const c = clock();
+    let i = 0;
+    const gh = { checks: () => { const x = seq[Math.min(i, seq.length - 1)]; i += 1; return x; } };
+    const out = await settleGuardStatuses({ gh, pr: 7, head: HEAD, waitMs: 60_000, pollMs: 10_000, graceMs: 30_000, before: OLD, now: c.now, sleep: c.sleep, provenance: () => [], ...over });
+    return { out, polls: () => i, waited: () => c.t - Date.parse('2026-11-09T09:00:00Z') };
+  };
+  const rerun = await run([both('pass', 1), both('pass', 1), both('pending', 2), both('pass', 2)]);
+  assert.deepEqual(rerun.out, []);
+  assert.equal(rerun.polls(), 4, 'two reads of the old rows, then the pending re-run, then green: it did not return on the old green rows');
+  const fast = await run([both('pass', 2)]);
+  assert.deepEqual(fast.out, [], 'a re-run that already finished (new link, green) is judged at once');
+  assert.equal(fast.polls(), 2, 'one read for the grace, one for the verdict');
+  const none = await run([both('pass', 1)]);
+  assert.deepEqual(none.out, [], 'no re-run seen: judged as today (green + provenance)');
+  assert.equal(none.waited(), 30_000, 'the grace is the most it waits');
+  const capped = await run([both('pass', 1)], { waitMs: 20_000 });
+  assert.deepEqual(capped.out, []);
+  assert.equal(capped.waited(), 20_000, 'the grace is part of the merge wait, not on top of it');
+  const forged = await run([both('pass', 1)], { provenance: ({ names }) => [`${names[0]} (posted by someone)`] });
+  assert.match(forged.out[0], /not posted by the pipeline-guards workflow/, 'the old rows are still held to provenance when no re-run shows');
+  const red = await run([both('pass', 1), both('pending', 2), [row('Test integrity', 'pass', 2), row('Hard-stop scan', 'fail', 2)]]);
+  assert.match(red.out[0], /not passing after the hold lift re-ran them: Hard-stop scan=fail/);
+  const review = await run([[...both('pass', 1).slice(0, 2), row('Cross-model review', 'pass', 9)]]);
+  assert.equal(review.waited(), 30_000, 'a new link on the review check is no sign of a guard re-run');
+  const noSnap = await run([both('pass', 1)], { before: null });
+  assert.equal(noSnap.polls(), 1, 'an unreadable snapshot: today\'s single read');
+  assert.deepEqual(guardLinks(both('pass', 1)), OLD);
+  assert.equal(guardLinks(null), null);
+  assert.equal(guardLinks('nope'), null);
 });
 
 test('R1-B3 a resumed --owner-go watch: the first failed_checks removal is re-queued once under the RECORDED hold binding (no placeholder refusal, no ReferenceError)', (t) => {

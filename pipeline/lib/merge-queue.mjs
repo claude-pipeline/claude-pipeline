@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readRepoMoves, sameRepo } from '../hooks/lib/repo-moves.mjs';
-import { PROVENANCE_CHECKS } from './config.mjs';
+import { GUARD_CHECKS, PROVENANCE_CHECKS } from './config.mjs';
 import { forgedGuards, labelNames, readMergeSha, validLabels, waitBlockers } from './finalgate.mjs';
 import { HOLD_LABEL, RESTORE_NOTE } from './hold.mjs';
 import { gitCommonDir } from './repo.mjs';
@@ -953,11 +953,34 @@ export async function recoverQueuedLift({ gh, root, pr, orphan, lift, now = Date
 }
 
 // ---- F7: the guards re-run after a hold lift ----------------------------------------------------------------------------------------
-// Removing needs-human fires `pull_request_target: unlabeled`, so pipeline-guards.yml posts the three guard statuses as `pending` again. Enqueueing
-// then would make the queue poster read `pending` and spend the one re-queue. Waits (up to `waitMs`) until none of them is pending, then they must
+// Removing needs-human fires `pull_request_target: unlabeled`, so pipeline-guards.yml posts the guard statuses as `pending` again. Merging or enqueueing
+// then would race them (direct mode: "2 of 3 required status checks are pending", the hold goes back and the owner's word is spent; queue mode: the poster
+// reads `pending` and spends the one re-queue). Both modes call this after the lift. Waits (up to `waitMs`) until none of them is pending, then they must
 // be green with the same provenance as before. -> [] when settled green, else the reasons to refuse (the caller puts the hold back).
-export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
-  const deadline = now() + waitMs;
+// The re-run may not have posted `pending` yet when we first read, and the old green rows would look settled. `before` (guardLinks of a read taken BEFORE the
+// lift) lets us tell: first wait (at most `graceMs`, inside the same `waitMs`) until a guard row is pending or carries a run link not in `before`; if none
+// shows, a repo whose workflow does not re-run on needs-human is judged on its old rows exactly as without `before`.
+// guardLinks: check rows -> { guard name: run link }, null when the read is not a list.
+export function guardLinks(rows) {
+  if (!Array.isArray(rows)) return null;
+  const links = {};
+  for (const r of rows) if (GUARD_CHECKS.includes(r?.name)) links[r.name] = r.link ?? null;
+  return links;
+}
+export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before = null, graceMs = 0, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
+  const started = now();
+  const deadline = started + waitMs;
+  if (before !== null && typeof before === 'object') {
+    const graceEnd = started + Math.min(graceMs, waitMs);
+    for (;;) {
+      let rows = null;
+      try { rows = gh.checks(pr); } catch { rows = null; } // (an unreadable read is reported by the loop below once the grace is over)
+      const seen = Array.isArray(rows) && rows.some((r) => GUARD_CHECKS.includes(r?.name) && (r.bucket === 'pending' || (r.link ?? null) !== (before[r.name] ?? null)));
+      const left = graceEnd - now();
+      if (seen || left <= 0) break;
+      await sleep(Math.min(pollMs, left));
+    }
+  }
   let why = 'the checks were not read';
   for (;;) {
     let rows = null;
