@@ -334,3 +334,4 @@ full record.
 - 2026-11-24 · #838 · Ruling dialog: recommended option first (#771) · risk high · rounds 5 · arbiter 5 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 697 runs (237 high)
 - 2026-11-24 · #839 · guard-git: a branch switch followed by ; is not proven, the branch is unknown after it (#754) · risk high · rounds 5 · arbiter 5 · awaiting-owner-merge · Codex 7d: 698 runs (238 high)
 - 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 8 · arbiter 8 (fix-verify 5) · needs-human · Codex 7d: 705 runs (242 high)
+- 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 9 · arbiter 9 (fix-verify 5) · blocked · Codex 7d: 725 runs (248 high)
