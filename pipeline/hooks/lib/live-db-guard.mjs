@@ -935,7 +935,9 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
     if (pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '')) return true;
     const runs = runsProgram(c); // once per command, not per word
     // (a data-only command that feeds a launcher built from stdin, `printf '%s\n' pg_repack | xargs -n1 env`, supplies the name the launcher runs: its words are judged too)
-    return (feeds || (!pgDataOnly(c, true) && (runs || !dataOperands(c.argv)))) && [...c.argv, ...typedWords(c)].some((w) => laterPgOpt(w, runs));
+    // (xargs splits stdin on whitespace, so every piece of a producer word is a candidate program, split on whitespace and the printf / echo escapes `\n` `\t` `\0`)
+    const words = [...c.argv, ...typedWords(c)];
+    return (feeds || (!pgDataOnly(c, true) && (runs || !dataOperands(c.argv)))) && (feeds ? words.flatMap((w) => [w, ...String(w).split(/\s+|\\[nt0]/)]) : words).some((w) => laterPgOpt(w, runs));
   });
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
