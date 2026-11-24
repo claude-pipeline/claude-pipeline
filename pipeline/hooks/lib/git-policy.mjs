@@ -3418,7 +3418,19 @@ function evalString(str, startDir, ctx, level, child = false) {
         if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.co !== true && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
       // (#586 reading B: a doubtful cd the operator before it did not prove stays where it was, whatever the operator: `true && cd d; P`, `cd d || true; P`, `cd a && cd d; P`)
-      if (x.cdMissing) { if (!stayed) { dir = x.cdWas; stayed = true; ctx.bashState.cdWord ??= x.cdWord; } return false; }
+      if (x.cdMissing) {
+        if (!stayed) {
+          dir = x.cdWas; stayed = true; ctx.bashState.cdWord ??= x.cdWord;
+          // (#586 R4-B1: `test -f f && cd a && cd b; P`: when the test fails the whole && chain never ran and P runs where the chain STARTED. The directory there is dirAt of the first command of the chain (walk back over commands of this level joined by &&); not worked out: unknown (null), never a directory that allows more)
+          if (x.andOnly) {
+            let j = x.cdAt;
+            while (j > 0 && cmds[j].sep === '&&' && cmds[j - 1].up.length === x.up.length && x.up.every((e, k) => cmds[j - 1].up[k] === e)) j--;
+            const start = cmds[j].sep === '&&' ? null : (dirAt.get(j) ?? null);
+            if (start !== x.cdWas) { if (ctx.bashState.cdFails === 'chain') dir = start; else ctx.bashState.cdChain ??= true; }
+          }
+        }
+        return false;
+      }
       if (op === '||' || x.cond) forget(x);
       // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
       // leaves EVERY branch unknown (R1-B1, the doubtful-git-change rule of #505: a subfolder of the same worktree has no entry of its own and would read the branch the switch may not have left))
@@ -3653,6 +3665,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
     let cdMissing = false; // (#586: a cd whose target is not shown to exist: see cdUnproven)
+    let cdAt = -1; // (#586 R4-B1: the index of that cd, to find where its && chain started)
     let cdWas = null; // (reading B: the directory that cd left, and the word it names)
     let cdWord = null;
     let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist, not even as a dangling link: nothing runs; #630)
@@ -3665,7 +3678,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (childCd) { /* the child's own directory */ }
-    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; const was = dir; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); if (dir !== null && cdUnproven(cmds, i, dirAt, ctx, name, argv, dir, was)) { cdWord = argv.slice(1).find((a) => a !== '--' && !/^-[LP]+$/.test(a)); if (ctx.bashState.cdFails) { cdMissing = true; cdWas = was; } else ctx.bashState.cdDoubt ??= cdWord; } } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; const was = dir; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); if (dir !== null && cdUnproven(cmds, i, dirAt, ctx, name, argv, dir, was)) { cdWord = argv.slice(1).find((a) => a !== '--' && !/^-[LP]+$/.test(a)); if (ctx.bashState.cdFails) { cdMissing = true; cdWas = was; cdAt = i; } else ctx.bashState.cdDoubt ??= cdWord; } } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
@@ -3771,7 +3784,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), cdWas, cdWord, unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, cdMissing, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), cdWas, cdAt, cdWord, unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, cdMissing, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
@@ -3973,9 +3986,12 @@ export function evaluateGitCommand(command, opts = {}) {
   const a = reading({});
   if (a.v.decision === 'deny' || a.state.cdDoubt === undefined) return a.v;
   const b = reading({ cdFails: true, carry: Object.fromEntries(READING_CAPS.filter((k) => k in a.state.budget).map((k) => [k, a.state.budget[k]])) }); // (B starts with the caps A spent and its pure caches, never A's command-order state or verdict memos)
-  if (b.v.decision !== 'deny') return a.v;
-  const w = b.state.cdWord ?? a.state.cdDoubt;
-  return { ...b.v, reason: `\`cd ${w}\` may fail (the folder is not shown to exist), and the shell then stays where it was: ${b.v.reason} Use \`cd ${w} && …\` or \`cd ${w} || exit 1\`.` };
+  const msg = (r) => ({ ...r.v, reason: `\`cd ${r.state.cdWord ?? a.state.cdDoubt}\` may fail (the folder is not shown to exist), and the shell then stays where it was: ${r.v.reason} Use \`cd ${r.state.cdWord ?? a.state.cdDoubt} && …\` or \`cd ${r.state.cdWord ?? a.state.cdDoubt} || exit 1\`.` });
+  if (b.v.decision === 'deny') return msg(b);
+  if (!b.state.cdChain) return a.v;
+  // (#586 R4-B1: a THIRD reading, only when B met a cd after && whose chain started elsewhere: the chain never ran, and the line goes on where it STARTED)
+  const c3 = reading({ cdFails: 'chain', carry: Object.fromEntries(READING_CAPS.filter((k) => k in b.state.budget).map((k) => [k, b.state.budget[k]])) });
+  return c3.v.decision === 'deny' ? msg(c3) : a.v;
 }
 function evaluateGitOnce(command, {
   cwd,

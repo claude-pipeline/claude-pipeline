@@ -727,6 +727,13 @@ test('DENY #586 rmdir frontend; cd frontend; npm run build (the frontend script 
   const v = evaluate('rmdir frontend; cd frontend; npm run build', o);
   assert.equal(v.decision, 'deny', 'expected deny, got allow');
 });
+// (R4-B1: when `test` fails the shell skips BOTH cds of the && chain and runs the ROOT build, which pushes: the directory the chain started in is judged too)
+test('DENY #586 test -f .frontend-build && cd frontend && cd dist; npm run build (the chain never ran: the root script pushes)', () => {
+  const pkgs = { [resolve('/work/repo/package.json')]: { build: ['git', 'push', 'origin', 'main'].join(' ') }, [resolve('/work/repo/frontend/package.json')]: { build: 'echo hi' } };
+  const o = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => (cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/frontend') || resolve(p) in pkgs) && resolve(p) !== resolve('/work/repo/frontend/dist') && resolve(p) !== resolve('/work/repo/.frontend-build'), readDir: (p) => (resolve(p) === resolve('/work/repo/frontend') ? [] : cdWorld.readDir(p)), readText: (p) => (resolve(p) in pkgs ? JSON.stringify({ name: 'x', scripts: pkgs[resolve(p)] }) : null) };
+  const v = evaluate('test -f .frontend-build && cd frontend && cd dist; npm run build', o);
+  assert.equal(v.decision, 'deny', 'expected deny, got allow');
+});
 // (R3-B4: reading B starts with fresh command-order state: the `npm pkg set` AFTER the lint run must not refuse the lint run)
 test('ALLOW #586 npm run ok; npm pkg set private=true; cd frontend (the write comes after the script)', () => {
   const v = evaluate('npm run ok; npm pkg set private=true; cd frontend', cdPkg);
