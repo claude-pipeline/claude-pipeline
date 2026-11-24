@@ -11,6 +11,8 @@ const HOME = '/home/u';
 const FBASE = { home: HOME, env: {}, platform: 'linux', cwd: `${HOME}/proj`, realpath: (p) => p, existsSync: () => false, readText: () => null };
 const fileRun = (command) => evaluateBashForFiles(command, FBASE);
 
+// (#586: the directories the lines cd to exist: a cd to one not shown to exist leaves the directory unknown after a ;)
+const DIRS = [resolve('/other'), resolve('/work/repo/sub')];
 // `branches` maps a directory to its on-disk branch; the default is a repository on agent/x at /work/repo.
 // `links` is a set of paths that are directory entries without existing (dangling symlinks): lexists sees them, pathExists does not.
 const gitRun = (command, files = {}, branches = {}, links = new Set()) => evaluateGitCommand(command, {
@@ -20,7 +22,8 @@ const gitRun = (command, files = {}, branches = {}, links = new Set()) => evalua
   pushDestination: () => null,
   issueLabels: () => [],
   readText: (p) => files[resolve(p)] ?? null,
-  pathExists: (p) => resolve(p) in files,
+  pathExists: (p) => resolve(p) in files || DIRS.includes(resolve(p)),
+  readDir: (p) => (DIRS.includes(resolve(p)) ? [] : null),
   lexists: (p) => resolve(p) in files || links.has(resolve(p)),
 });
 const expect = (decision, command, files, branches, links) => {
