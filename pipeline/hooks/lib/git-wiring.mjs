@@ -45,15 +45,6 @@ export function realGitWiring() {
     return r.code === 0 && dest ? dest : null;
   };
 
-  // #789: does a LOCAL branch of this name exist in the directory's repository (what a one-operand `git checkout NAME` switches to)? true / false; null when it cannot say (odd name, no repository, cut off by the time cap): never "yes" then
-  const localBranchExists = (dir, name, { gitDir, leftMs } = {}) => {
-    if (typeof name !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9._/-]*$/.test(name)) return null; // never feed odd text to show-ref
-    const args = ['-C', dir, ...(gitDir ? ['--git-dir', gitDir] : []), 'show-ref', '--verify', '--quiet', `refs/heads/${name}`];
-    const r = run('git', args, { timeoutMs: boundedTimeout(PUSH_LOOKUP_TIMEOUT_MS, leftMs) });
-    if (cutOff(r)) return null;
-    return r.code === 0 ? true : r.code === 1 ? false : null; // (1: no such ref; anything else, such as 128 for no repository: unknown)
-  };
-
   // throws when the lookup fails, so the policy denies instead of guessing
   const issueLabels = (n, repoArgs = [], cwd, { leftMs } = {}) => {
     const r = gh(['issue', 'view', String(n), ...repoArgs, '--json', 'labels', '-q', '.labels[].name'], { cwd, timeoutMs: boundedTimeout(LOOKUP_TIMEOUT_MS, leftMs) });
@@ -62,7 +53,7 @@ export function realGitWiring() {
     return r.stdout.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
   };
 
-  return { currentBranch, pushDestination, localBranchExists, issueLabels };
+  return { currentBranch, pushDestination, issueLabels };
 }
 
 // #58: what the git policy asks before a direct merge (`gh pr merge`, the repo's merge command, auto-merge through the API).

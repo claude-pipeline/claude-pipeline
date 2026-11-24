@@ -42,7 +42,6 @@ function evaluate(command, o = {}) {
     },
     readText: o.readText ?? (() => null),
     pathExists: o.pathExists ?? (() => false),
-    localBranchExists: (dir, name, { leftMs, ...extra } = {}) => (Array.isArray(o.branches) ? o.branches.includes(name) : null), // (o.branches: the local branches git would confirm; absent / null: the lookup cannot say)
   });
   return Object.assign(verdict, { calls });
 }
@@ -1893,17 +1892,16 @@ test('#789: a one-operand git checkout leaves the branch unknown; git switch and
   const fileMain = { pathExists: (p) => p.endsWith('/main') };
   assert.equal(evaluate('git checkout README.md && git push origin HEAD', { branch: 'main', labels: [] }).decision, 'deny');
   assert.equal(evaluate('git checkout main && git push origin HEAD', { branch: 'agent/x', labels: [], ...fileMain }).decision, 'deny');
-  assert.equal(evaluate('git checkout agent/y && git push origin HEAD', { branch: 'main', labels: [] }).decision, 'deny');
+  const co = evaluate('git checkout agent/y && git push origin HEAD', { branch: 'main', labels: [] }); // (no lookup: whether agent/y is a branch or a file is not known; the denial says how to be clear)
+  assert.equal(co.decision, 'deny');
+  assert.match(co.reason, /git switch/);
   assert.equal(evaluate('git switch agent/y && git push origin HEAD', { branch: 'main', labels: [] }).decision, 'allow');
   assert.equal(evaluate('git checkout -b agent/y && git push -u origin HEAD', { branch: 'main', labels: [] }).decision, 'allow');
   assert.equal(evaluate('git checkout -B agent/y && git push -u origin HEAD', { branch: 'main', labels: [] }).decision, 'allow');
-  // (R2-F1: a one-operand checkout is a branch switch only when git confirms a LOCAL branch of that name: a deleted tracked file, a file on disk and a branch may share the name, and git then switches. Otherwise unknown, never "yes")
-  const P = 'git checkout agent/y && git push origin HEAD';
-  assert.equal(evaluate(P, { branch: 'main', labels: [], branches: ['agent/y'] }).decision, 'allow');
-  assert.equal(evaluate(P, { branch: 'main', labels: [], branches: [] }).decision, 'deny');
-  assert.equal(evaluate(P, { branch: 'main', labels: [], branches: null }).decision, 'deny');
-  assert.equal(evaluate('git checkout README.md && git push origin HEAD', { branch: 'main', labels: [], branches: ['agent/y'] }).decision, 'deny');
-  assert.equal(evaluate('git checkout main && git push origin HEAD', { branch: 'agent/x', labels: [], branches: ['main'], ...fileMain }).decision, 'deny'); // the branch exists: judged as main
+  // (R3-B4 / R3-F1: a trailing slash cannot end a ref name, and --ours / --theirs never switch: a path restore, the branch stays)
+  for (const c of ['git checkout src/ && git push origin HEAD', 'git checkout --theirs package-lock.json && git add package-lock.json && git commit --no-edit && git push origin HEAD', 'git checkout --ours a.txt && git push origin HEAD']) {
+    assert.equal(evaluate(c, { branch: 'agent/topic', labels: [] }).decision, 'allow', c);
+  }
   // (R2-B1: `.`, `..`, `./x`, `../x` cannot be a ref: a path, the branch stays)
   for (const c of ['git checkout ./README.md && git push origin HEAD', 'git checkout . && git push origin HEAD', 'git checkout ../a.txt && git push origin HEAD', 'git checkout .. && git push origin HEAD']) {
     assert.equal(evaluate(c, { branch: 'agent/topic', labels: [] }).decision, 'allow', c);

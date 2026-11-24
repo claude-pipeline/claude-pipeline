@@ -342,13 +342,6 @@ function branchOf(dir, gitDir, ctx) {
   return b === '' || b === 'HEAD' ? null : b;
 }
 
-// #789: does git confirm a LOCAL branch NAME in this directory? true / false, null when unknown (no lookup, it threw, or it was cut off)
-function localBranchExistsIn(dir, name, ctx) {
-  if (dir === null) return null;
-  checkDeadline(ctx.budget);
-  try { const e = memoLookup(ctx, ['localBranch', dir, name], () => ctx.localBranchExists(dir, name, { leftMs: leftOf(ctx) })); return e === true ? true : e === false ? false : null; } catch { return null; }
-}
-
 // A command earlier on the line may have switched this directory's branch: that, not the real checkout, is what a
 // later bare/HEAD push acts on. `name === null` records "switched to something we cannot name".
 // #505: `ctx.branchesUnknown` is the mark "every branch is unknown": a directory with no entry in ctx.branches is read from disk only while the mark is off. It is set wherever the names are forgotten
@@ -425,13 +418,13 @@ function checkRefspec(spec, dir, gitDir, ctx) {
     // and not protected. Any other run-time text (${B:-main}, $(cat f), m${x}ain, a loop variable) can be main.
     const { branch: b } = effectiveBranch(dir, gitDir, ctx);
     if (!CURRENT_BRANCH_IDIOM.test(dst.replace(/\s+/g, ' ')) || b === null || isProtectedBranch(b)) {
-      return deny(`the destination "${dst}" cannot be resolved here, so it cannot be verified. Write the branch name out: git push -u origin agent/<slug>.`);
+      return deny(`the destination "${dst}" cannot be resolved here, so it cannot be verified. Write the branch name out: git push -u origin agent/<slug>.${b === null ? checkoutHint(ctx) : ''}`);
     }
     return null;
   }
   if (dst === 'HEAD' || dst === '@') {
     const { branch: b } = effectiveBranch(dir, gitDir, ctx);
-    if (b === null) return deny('cannot determine the current branch for `git push … HEAD`, so it cannot be verified. Name the destination branch explicitly.');
+    if (b === null) return deny('cannot determine the current branch for `git push … HEAD`, so it cannot be verified. Name the destination branch explicitly.' + checkoutHint(ctx));
     dst = b;
   }
   if (isProtectedBranch(dst)) return deny(`pushing to ${dst} is blocked. Push an agent/<slug> branch and open a PR; the owner merges.`);
@@ -582,7 +575,7 @@ function pushReading(args, dir, gitDir, ctx, configs) {
     // push.default=upstream (or a branch created from origin/main) can send agent/x to main: ask git where it goes
     const dest = overridden ? (b === null ? null : pushDestOf(dir, gitDir, ctx, b)) : pushDestOf(dir, gitDir, ctx);
     if (dest !== null && isProtectedRef(dest)) return deny(`a bare \`git push\` here would update ${dest} (the branch's push destination). Push explicitly: git push -u origin HEAD:agent/<slug>.`);
-    if (b === null) return deny('cannot determine the current branch (detached HEAD, switched to an unknown ref earlier on the line, or not a repository), so a push with no refspec cannot be verified. Name the branch: `git push -u origin agent/<slug>`.');
+    if (b === null) return deny('cannot determine the current branch (detached HEAD, switched to an unknown ref earlier on the line, or not a repository), so a push with no refspec cannot be verified. Name the branch: `git push -u origin agent/<slug>`.' + checkoutHint(ctx));
     if (isProtectedBranch(b)) return deny(`this checkout is on ${b}; a push with no refspec would push it. Switch to an agent/<slug> branch.`);
     return null;
   }
@@ -651,14 +644,17 @@ function trackSwitch(sub, args, d, ctx) {
   if (x === '-' || /^@\{-\d*\}$/.test(x) || DYNAMIC.test(x)) { setBranch(ctx, d, null); return; }
   if (x === 'HEAD' || x === '@') return;
   if (!isSwitch) {
-    // (R2-B1: `.`, `..`, `./x`, `../x` cannot be a ref name: a path checkout, the branch stays)
-    if (/^\.{1,2}(\/|$)/.test(x)) return;
-    // (#789 / R2-F1: a one-operand checkout restores a file when NAME is one (a tracked file deleted from the worktree: HEAD stays put) and switches when a local branch NAME exists, also when a file shares the name: only git's answer decides, anything else is unknown)
-    setBranch(ctx, d, d !== null && localBranchExistsIn(d, x, ctx) === true ? x : null);
+    // (a path spelling cannot be a ref name: `.`, `..`, `./x`, `../x`, a trailing `/`; --ours / --theirs never switch: a path restore, the branch stays)
+    if (/^\.{1,2}(\/|$)/.test(x) || x.endsWith('/') || flags.some((f) => !f.short && (f.name === 'ours' || f.name === 'theirs'))) return;
+    // (#789: a one-operand checkout restores a file or switches, and only git knows which: the branch is unknown, with a hint for the push denial)
+    ctx.checkoutDoubt = true;
+    setBranch(ctx, d, null);
     return;
   }
   setBranch(ctx, d, x);
 }
+
+const checkoutHint = (ctx) => (ctx.checkoutDoubt === true ? ' A one-word `git checkout NAME` may restore a file instead of switching: use `git switch NAME` (or `git checkout -b NAME`), or name the branch in the push.' : '');
 
 function trackBranch(args, d, gitDir, ctx) {
   const { flags, positionals } = parseOpts(args, { longValue: ['set-upstream-to', 'contains', 'merged', 'no-merged', 'sort', 'format'], shortValue: 'u' });
@@ -3894,7 +3890,6 @@ function evaluateGitOnce(command, {
   cwd,
   home = os.homedir(),
   currentBranch = () => null,
-  localBranchExists = () => null,
   pushDestination = () => null,
   issueLabels = () => { throw new Error('no issue label lookup is available'); },
   readText = defaultReadText,
@@ -3914,7 +3909,7 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, localBranchExists, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), branchesUnknown: false, cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
