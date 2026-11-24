@@ -419,3 +419,35 @@ test('a shell line handed to an MCP command tool is a psql family line the local
   }
   assert.equal(mcp('docker ps').decision, 'allow');
 });
+
+// Catches (Fable sweep of PR #807, 2026-11-24): a psql family program reached through a spelling the guard did not read as a name, so a client ran against a remote database with the line allowed:
+// escapes or quotes in produced text, a name assembled under xargs / parallel, a name built from a substitution, a glob, a NAME=value or env value that runs a program, and a quoted command string of a launcher the parser does not unwrap.
+test('sweep bypass classes 1-3 and 6-8: decoded, assembled, globbed, valued and quoted family names are refused; the harmless neighbours pass', () => {
+  dockerConfig(null);
+  for (const line of [
+    // 1 / 2: escapes and quotes in text a shell or xargs receives
+    "printf 'pg\\x5frepack' | xargs env", "printf 'ps\\x71l -h prod' | sh", "xargs env <<< $'ps\\x71l'", "echo 'ps\"q\"l' | xargs env", "echo 'p\\sql' | xargs env",
+    // 3: a name assembled from pieces under xargs / parallel
+    "printf '%s%s' ps ql | xargs env", "echo ps ql | tr -d ' ' | xargs env", 'echo sql | xargs -I{} env p{} -h prod', 'parallel env {1}{2} ::: ps ::: ql',
+    'x=ps; y=ql; echo $x$y | xargs env', "printf 'ps\\\\\\\\x71l' | xargs printf | xargs env",
+    // 4: a command built from a substitution
+    '$(echo ps)ql -h prod', 'eval ps$(echo ql) -h prod', `bash -c "$(printf 'ps\\x71l -h x')"`, "ssh host '$(echo ps)ql -h x'",
+    // 6: globs in the program position
+    '/usr/bin/psq? -h prod', '/usr/bin/p[s]ql -h prod', '/usr/bin/pg?repack -h prod', '/opt/pg/bin/* -h prod', 'find . -exec /usr/bin/psq? -h x \;',
+    // 7: NAME=value and env values that run a program
+    'alias x=pg_repack\nx -h prod', 'PAGER=pg_repack man ls', "GIT_SSH_COMMAND='pg_repack -h x' git fetch", 'make SHELL=pgloader', 'ssh -oProxyCommand=pgloader host',
+    'tar --use-compress-program=pg_repack -cf x.tar .', 'rsync --rsh=pg_repack a b:', 'docker run --rm --entrypoint=pg_repack img -h x', "ssh -o 'ProxyCommand pg_repack -h x' host", 'nix run nixpkgs#pgloader -- x',
+    // 8: a quoted command string of a launcher the parser does not unwrap
+    "kubectl exec pod -- sh -c 'pg\"\"_repack -h x'", "gh codespace ssh 'cd x && pgloader y'", "gh codespace ssh -c name -- -t 'ps\"\"ql -h prod'",
+  ]) mustRefuse(line);
+  for (const line of [
+    'git ls-files | xargs npx prettier --check', "printf '%s\\n' a.mjs b.mjs | xargs -n1 node --check", "printf '%s\\0' a.mjs b.mjs | xargs -0 -n1 node --check", "printf '%s\\n' b.mjs a.mjs | sort | xargs -n1 node --check",
+    'echo "$FILES" | xargs npx eslint', "git ls-files | sed 's/a/b/' | xargs node x.mjs", 'parallel gzip {}.log ::: a b', 'cat cmds.txt | parallel',
+    '$(which node) x.js', 'eval "$(brew shellenv)"', "git commit -m \"$(printf 'a\\nb')\"",
+    'ls /usr/bin/psq?', 'node scripts/*.mjs', 'npx eslint src/*', './scripts/*.sh', 'git add src/pg*',
+    'git log --grep=pg_repack', 'node x.js --file=supabase/migrations/pg_cron.sql', 'supabase db query "select * from pg_stat_activity" --local',
+    "kubectl exec pod -- sh -c 'ls /tmp; cat /etc/hosts'", 'kubectl logs deploy/pgbouncer', 'echo pgloader | pbcopy',
+    // system schema and catalog names as option or env values are no programs (owner 2026-11-24)
+    'node x.js --schema=pg_catalog', 'supabase gen types --local --schema=pg_catalog', 'SCHEMA=pg_catalog node x.js', 'node x.js --schema=pg_toast', 'SCHEMA=pg_temp_3 node x.js', 'X=pg_stat_activity node x.js', 'node x.js --table=pg_class',
+  ]) mustAllow(line);
+});

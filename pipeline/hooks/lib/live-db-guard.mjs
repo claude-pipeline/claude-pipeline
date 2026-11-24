@@ -906,11 +906,76 @@ const uniqWrites = (args) => {
   }
   return n > 1;
 };
+// what xargs / a shell receives from printf / echo text: escapes decoded (a separator becomes a space), then the quotes and backslashes xargs itself removes (`ps\x71l`, `ps"q"l`, `p\sql`)
+const fedText = (w) => String(w).replace(/\\(?:x([0-9a-fA-F]{1,2})|u([0-9a-fA-F]{1,4})|U([0-9a-fA-F]{1,8})|0?([0-7]{1,3})|([\s\S]))/g, (m, x, u, U, o, ch) => {
+  if (ch !== undefined) return 'ntrfv'.includes(ch) ? ' ' : 'abec'.includes(ch) ? '' : ch;
+  const n = o !== undefined ? parseInt(o, 8) : parseInt(x ?? u ?? U, 16);
+  return n <= 0x20 ? ' ' : String.fromCodePoint(Math.min(n, 0x10ffff));
+}).replace(/['"\\]/g, '');
+// a glob in a program position that can match a family name (`psq?`, `p[s]ql`, `pg?repack`, `/opt/pg/bin/*`); a linear matcher, a bracket region counts as '*' (as globMatchesHead does)
+const PG_GLOB_NAMES = [...PG_NAMES, ...PG_CMD_ONLY];
+const wild = (p, s) => { let i = 0; let j = 0; let star = -1; let mark = 0; while (j < s.length) { if (i < p.length && (p[i] === '?' || p[i] === s[j])) { i += 1; j += 1; } else if (i < p.length && p[i] === '*') { star = i; mark = j; i += 1; } else if (star >= 0) { i = star + 1; mark += 1; j = mark; } else return false; } while (p[i] === '*') i += 1; return i === p.length; };
+// min: how many literal characters the word needs (a later word needs two, so `src/*`, `test/pg*` stay data; word 0 needs none)
+const globPg = (w, min) => {
+  const tok = String(w).trim().split(/\s+/)[0] ?? '';
+  const b = tok.slice(tok.lastIndexOf('/') + 1);
+  if (!/[*?[]/.test(b)) return false;
+  let p = b.replace(/\\/g, '').toLowerCase();
+  const o = p.indexOf('['); const cl = p.lastIndexOf(']');
+  if (o >= 0 && cl > o) p = p.slice(0, o) + '*' + p.slice(cl + 1);
+  if (p.replace(/[*?]/g, '').length < min) return false;
+  if (PG_GLOB_NAMES.some((n) => wild(p, n))) return true;
+  if (p.includes('.')) return false;
+  for (let i = 0; i < 3; i += 1) { if (p[i] === '*') return true; if (p[i] === undefined) return false; if (p[i] !== '?' && p[i] !== 'pg_'[i]) return false; }
+  return true;
+};
+// piped commands that only pass text through; any other piped command (tr, sed, awk, head …) may rebuild a name from the producer's text
+const PASS_FILTERS = new Set(['sort', 'uniq', 'tee', 'cat']);
+// a command name, or the text a shell runs, built from echo / printf output inside a substitution (`$(echo ps)ql`, `eval ps$(echo ql)`)
+const SUBST_LIT = /(?:\$\(|`)\s*(?:echo|printf)\b/;
+const TEXT_RUNNERS = new Set(['eval', 'sh', 'bash', 'zsh', 'dash', 'ksh', 'source', '.']);
+// an expansion in a word that can build or hide a name: two expansions side by side or an expansion glued to name characters (`$1$2`, `$x$y`, `${a}ql`); with braces: a `${…}` that is not a plain name (`${:-psql}`, `${(L)x}`, `${x:-pgloader}`). One pass, an unterminated one refuses
+const expansionTrick = (s, braces) => {
+  let i = 0;
+  while (i < s.length) {
+    const ch = s[i];
+    if (ch !== '$' && ch !== '`') { i += 1; continue; }
+    let end;
+    if (ch === '`') { end = s.indexOf('`', i + 1); if (end < 0) return true; end += 1; }
+    else if (s[i + 1] === '{') {
+      end = s.indexOf('}', i + 2);
+      if (end < 0) return true;
+      if (braces && !/^\w+$/.test(s.slice(i + 2, end))) return true;
+      end += 1;
+    } else if (s[i + 1] === '(') {
+      let depth = 0; let j = i + 1;
+      for (; j < s.length; j += 1) { if (s[j] === '(') depth += 1; else if (s[j] === ')') { depth -= 1; if (depth === 0) break; } }
+      if (j >= s.length) return true;
+      end = j + 1;
+    } else if (/\w/.test(s[i + 1] ?? '')) {
+      end = i + 2;
+      if (!/\d/.test(s[i + 1])) while (end < s.length && /\w/.test(s[end])) end += 1;
+    } else { i += 1; continue; }
+    if ((i > 0 && /\w/.test(s[i - 1])) || (end < s.length && /[\w$`]/.test(s[end]))) return true;
+    i = end;
+  }
+  return false;
+};
 // a later word whose first token is a bare pg_* program name (`/usr/bin/pg_repack`, `pg_repack -h prod` inside `ssh host '…'`): never a name inside a word (`pg_class` in a SQL string) or a file with an extension
-// (the intact word is judged too: a quoted path with a space, `'/opt/Postgres Tools/pg_repack'`, has its program name after the last slash)
-const laterPgWord = (w) => { const s = String(w).trim(); return [s.split(/\s+/)[0] ?? '', s].some((t) => (/^pg_[a-z0-9_]+$/i.test(commandName(t)) || PG_CMD_ONLY.has(commandName(t))) && pgWord(t)); };
-// for a command that runs a program (`rg --pre=pg_repack`, `sort --compress-program=pg_repack`): the value attached to an option word is judged too
-const laterPgOpt = (w, runs) => laterPgWord(w) || (runs && /^[-+]-?[^=\s]+=/.test(String(w)) && laterPgWord(String(w).slice(String(w).indexOf('=') + 1)));
+// (the intact word is judged too: a quoted path with a space, `'/opt/Postgres Tools/pg_repack'`, has its program name after the last slash; the part after a `#` is the name of a runner's package, `nix run nixpkgs#pgloader`;
+// a `ProxyCommand pg_repack -h x` option string (ssh -o) runs its SECOND token)
+const laterPgOne = (t0) => { const t = t0.slice(t0.lastIndexOf('#') + 1); const n = commandName(t); return (/^pg_[a-z0-9_]+$/i.test(n) || PG_CMD_ONLY.has(n)) && pgWord(t); };
+const laterPgWord = (w) => {
+  const s = String(w).trim();
+  const toks = s.split(/\s+/);
+  return [toks[0] ?? '', s].some(laterPgOne) || (toks.length > 1 && /^\w*(?:Command|Program)$/i.test(toks[0]) && laterPgOne(toks[1]));
+};
+// system schema and catalog names (pg_catalog, pg_toast*, pg_temp*, pg_stat_*, pg_class …) are no programs: an option or env VALUE with one passes (owner 2026-11-24, `--schema=pg_catalog`, `SCHEMA=pg_catalog node x.js`)
+const PG_CATALOG = /^pg_(?:catalog|toast\w*|temp\w*|stat_\w+|statio_\w+|class|namespace|attribute|type|proc|index|indexes|roles|user|database|tables|views|settings|extension|constraint|trigger|policies|authid|depend|description|sequence|sequences|statistic|locks|matviews|shadow|am|amop|operator|opclass|collation|language|inherits|enum|range|available_\w+|prepared_\w+|replication_\w+|publication\w*|subscription\w*|foreign_\w+|cursors|timezone_\w+|file_settings|hba_file_rules)$/i;
+const laterPgValue = (v) => { const s = String(v).replace(/^!/, '').trim(); return !PG_CATALOG.test(s) && laterPgWord(s); };
+// the value after any NAME= or --option= of a command that is not data-only (`--rsh=pg_repack`, `-oProxyCommand=pgloader`, `SHELL=pgloader`); a catalog name is no program
+const laterPgOpt = (w) => laterPgWord(w) || globPg(w, 2) || (/^[^=\s]+=/.test(String(w)) && laterPgValue(String(w).slice(String(w).indexOf('=') + 1)));
+const envPg = (c) => Object.values(c.env ?? {}).some(laterPgValue); // PAGER=pg_repack, GIT_SSH_COMMAND='pgloader x'
 // heads whose operands are data (git add / switch, mkdir, rm, gh …), but not find / make, which can run a word
 // (`gh codespace ssh -- pg_repack`, `gh extension exec …` run the words after them: no exemption there)
 const ghRuns = (argv) => commandName(argv[0]) === 'gh' && argv.some((w, i) => (w === 'ssh' && ['codespace', 'cs'].includes(argv[i - 1])) || (w === 'exec' && ['extension', 'ext'].includes(argv[i - 1])));
@@ -925,19 +990,43 @@ const pgDataOnly = (c, plain) => {
 const F4_VERBS = new Set(['exec', 'cp', 'run', 'create', 'rename', 'commit']);
 
 // -> reason | null
-function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
+function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse = null) {
   // a name split by empty quotes (`p''sql`) is not in the raw text but is in the words, so both the raw text and every reading's words are judged
-  const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n')])].join('\n');
+  const feeds = reading.some((c) => stdinFed(c) && buildsProgram(c, () => true));
+  const redirText = (c) => (c.redirects ?? []).map((r) => (typeof r.target === 'string' ? r.target : ''));
+  const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n'), ...(feeds ? [...c.argv, ...redirText(c)].map(fedText) : [])])].join('\n');
+  if (feeds) {
+    // the line itself produces the launcher's input (echo / printf / here-string / :::) but through something the guard does not read exactly: refuse (fail closed)
+    const isLit = (c) => ['echo', 'printf'].includes(commandName(c.argv[0]));
+    const literal = reading.some((c) => isLit(c) || (c.redirects ?? []).some((r) => String(r.op).startsWith('<<')) || (stdinFed(c) && typedWords(c).includes(':::')));
+    // a printf format with anything but a plain %s / %b / %d / %q can build a name from its pieces (`printf '%s%s' ps ql`)
+    const fmt = (c) => commandName(c.argv[0]) === 'printf' && fedText(c.argv.slice(1).find((a) => !a.startsWith('-')) ?? '').replace(/%%/g, '').split(/\s+/).some((p) => p.includes('%') && !/^%[sbdq]$/.test(p));
+    // a piped command that rewrites text (tr, sed, head …), or an xargs / parallel that itself builds text (`xargs printf | xargs env`)
+    const filter = (c) => c.pipe === true && (stdinFed(c) ? isLit(c) : !isLit(c) && !PASS_FILTERS.has(commandName(c.argv[0])));
+    // a replacement token glued to a name character or another token (`p{}`, `{1}{2}`)
+    const glue = (c) => stdinFed(c) && typedWords(c).some((w) => /[\w}]\{\d*\}|\{\d*\}[\w{]/.test(w));
+    // the producer words build a name from variables (`echo $x$y`)
+    const built = (c) => (isLit(c) && !stdinFed(c) && c.argv.slice(1).some((w) => expansionTrick(w, false))) || redirText(c).some((w) => expansionTrick(w, false));
+    if (literal && reading.some((c) => fmt(c) || filter(c) || glue(c) || built(c))) return 'xargs / parallel builds a command from text the line produces through a printf format, a filter, a glued replacement or glued variables the guard cannot read';
+  }
+  // a command name that only decodes to a family name (`printf 'ps\x71l -h x' | sh`)
+  if (reading.some((c) => [c.argv[0], typedWords(c)[0] ?? ''].some((w) => !pgWord(w) && pgWord(fedText(w))))) return 'a psql family name spelled with escapes or quotes in produced text';
+  // a command name (or the text eval / a shell runs) built from echo / printf inside a substitution
+  if (reading.some((c) => SUBST_LIT.test(c.argv[0]) || SUBST_LIT.test(typedWords(c)[0] ?? '') || (TEXT_RUNNERS.has(commandName(c.argv[0])) && c.argv.some((w) => SUBST_LIT.test(w))))) return 'a command built from echo / printf text inside a substitution';
+  // a quoted command string of a launcher the parser does not unwrap (kubectl exec … sh -c, gh codespace ssh), read with the guard's own parser
+  const innerPg = (w) => { const bare = String(w).replace(/['"\\]/g, ''); if (!(PG_TOKEN.test(bare) || /pg/i.test(bare))) return false; const inner = reparse(String(w)); return !inner || inner.truncated || inner.undecidable ? laterPgWord(bare) : inner.some((ic) => ic.argv?.length && [ic.argv[0], typedWords(ic)[0] ?? ''].some((x) => pgWord(x) || globPg(x, 0))); };
+  if (reparse && reading.some((c) => !pgDataOnly(c, true) && (runsProgram(c) || !dataOperands(c.argv)) && commandName(c.argv[0]) !== 'psql' && !isPipelineBin(c.argv) && c.argv.some((w, i) => i > 0 && /[\s'"\;&|]/.test(w) && !isInlineProgram(c.argv, i) && innerPg(w)))) return 'a quoted command string names a psql family program';
   // the text test misses a family program the parser unwrapped (a `pg_*` name that is not in the list, `timeout 30 pg_prove`): the command names are judged too
   // (a later word of a command that is not data-only is judged too, by its first token as a bare program name: `kubectl exec db -- /usr/bin/pg_repack -h x`, `ssh host 'pg_repack -h x'`; a file with an extension, `supabase/migrations/pg_cron.sql`, is no program name; a command whose operands are data, `git switch pg_repack`, `mkdir pg_dumps`, is skipped)
-  const feeds = reading.some((c) => stdinFed(c) && buildsProgram(c, () => true));
+
   const token = PG_TOKEN.test(seen) || reading.some((c) => {
-    if (pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '')) return true;
+    if (pgWord(c.argv[0]) || pgWord(typedWords(c)[0] ?? '') || globPg(c.argv[0], 0) || globPg(typedWords(c)[0] ?? '', 0)) return true;
+    if (envPg(c)) return true;
     const runs = runsProgram(c); // once per command, not per word
     // (a data-only command that feeds a launcher built from stdin, `printf '%s\n' pg_repack | xargs -n1 env`, supplies the name the launcher runs: its words are judged too)
     // (xargs splits stdin on whitespace, so every piece of a producer word is a candidate program, split on whitespace and the printf / echo escapes `\n` `\t` `\0`)
-    const words = [...c.argv, ...typedWords(c)];
-    return (feeds || (!pgDataOnly(c, true) && (runs || !dataOperands(c.argv)))) && (feeds ? words.flatMap((w) => [w, ...String(w).split(/\s+|\\(?:0?[0-7]{1,3}|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[abcefnrtv0])/)]) : words).some((w) => laterPgOpt(w, runs));
+    const words = [...c.argv, ...typedWords(c), ...(feeds ? redirText(c) : [])];
+    return (feeds || (!pgDataOnly(c, true) && (runs || !dataOperands(c.argv)))) && (feeds ? words.flatMap((w) => [w, ...fedText(w).split(/\s+/)]) : words).some((w) => laterPgOpt(w));
   });
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
@@ -963,6 +1052,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
     if (data) continue;
     const argv = c.argv;
     const own = wordsOf(c);
+    if (token && envPg(c)) return 'an environment value names a psql family program';
     if (token && (nonLiteralHead(argv) || nonLiteralHead(typed))) return 'the command is run through a variable on a line that names a psql family program';
     const p = { aligned, cut, typed };
     const name = commandName(argv[0]);
@@ -985,7 +1075,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
     const dataOps = !runs && dataOperands(argv);
     for (const [i, w] of words.entries()) {
       if (i < own.length && isInlineProgram(own, i)) continue;
-      if (PG_TOKEN.test(w) || PG_SET.has(commandName(w)) || (!dataOps && (pgWord(w) || laterPgOpt(w, runs)))) return `\`${w.slice(0, 40)}\` is a psql family program the guard does not know how to read here (a launcher, a quoted command string, or a client other than the two allowed psql shapes)`;
+      if (PG_TOKEN.test(w) || PG_SET.has(commandName(w)) || (i === 0 && globPg(w, 0)) || (!dataOps && (pgWord(w) || laterPgOpt(w)))) return `\`${w.slice(0, 40)}\` is a psql family program the guard does not know how to read here (a launcher, a quoted command string, or a client other than the two allowed psql shapes)`;
     }
   }
   return null;
@@ -998,7 +1088,7 @@ export function findLiveDbCli(cmds, scanRaw, state, wordsOf = (c) => c.argv, rep
   const refuse = (why) => `live database: ${why}; ${OWNER_RUNS}.`;
   const reading = cmds.filter((c) => c.argv?.length);
   const lineText = [scanRaw, ...cmds.map((c) => c.raw)].join('\n');
-  const pg = pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io);
+  const pg = pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse);
   if (pg) return refuse(pg);
   // R10-F1: xargs / parallel append words from stdin that no reading shows; with a supabase token on the line the call cannot be judged
   let lineHead; // sbTokenHead(lineText), computed at most once
