@@ -665,7 +665,7 @@ for (const [command, o] of MORE_ALLOW) {
 
 // #586: `cd /work/other; cd /work/repo/missing; git push`: the second cd fails, `;` goes on, and the push runs in /work/other (on main) while the guard judged /work/repo (agent/x)
 const CD_DIRS = ['/work/other', '/work/repo', '/work/repo/sub']; // (the directories that exist; /work/repo/file.txt is a file)
-const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/repo/tdir': 'agent/x', '/work/repo/file.txt': 'agent/x', '/home/u/missing': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
+const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/other/missing': 'agent/x', '/work/repo/tdir': 'agent/x', '/work/repo/file.txt': 'agent/x', '/home/u/missing': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
 const CD_DENY = [
   'cd /work/other; cd /work/repo/missing; git push',
   'cd /work/other; pushd /work/repo/missing; git push',
@@ -686,6 +686,7 @@ const CD_DENY = [
   'cd /work/other; tar -xf /work/repo/missing; cd /work/repo/missing; git push', // (tar names a directory only through -C, unzip only through -d)
   'cd /work/other; unzip /work/repo/missing; cd /work/repo/missing; git push',
   'cd /work/other; tar -xf /work/other/a.tgz -C /work/repo/tdir; cd /work/repo/tdir; git push', // (R2-B3: tar -C needs the folder to exist, it makes none)
+  'cd /work/repo/missing; cd /work/other; cd /work/other/missing; git push', // (R3-B1: every doubtful cd stays, each where it was)
   'cd /work/other; (cd /tmp && ls); cd /work/repo/missing; git push', // (the failed cd is judged again after a subshell that moved elsewhere)
 ];
 const CD_ALLOW = [
@@ -712,7 +713,7 @@ const CD_ALLOW = [
 ];
 // (R1-B1: `cd frontend; npm run build` where frontend does not exist runs the ROOT package's build script: the directory the line was in is still judged, as main did by walking up from the presumed subdirectory)
 const cdPkg = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/package.json'), readText: (p) => (resolve(p) === resolve('/work/repo/package.json') ? JSON.stringify({ name: 'x', scripts: { build: ['git', 'push', 'origin', 'main'].join(' '), ok: 'echo hi' } }) : null) };
-for (const c of ['cd frontend; npm run build', 'cd frontend\nnpm run build', 'cd frontend; bash -c "npm run build"', 'cd frontend; (cd /tmp && ls); npm run build', 'cd frontend; X=$(cd /tmp && pwd); npm run build', 'cd frontend; bash -c "cd /tmp && ls"; npm run build']) {
+for (const c of ['cd frontend; npm run build', 'cd frontend\nnpm run build', 'cd frontend; bash -c "npm run build"', 'cd frontend; (cd /tmp && ls); npm run build', 'cd frontend; X=$(cd /tmp && pwd); npm run build', 'cd frontend; bash -c "cd /tmp && ls"; npm run build', 'true && cd frontend; npm run build', 'cd frontend || true; npm run build', 'cd a && cd frontend; npm run build']) {
   test(`DENY #586 package script ${c.replace(/\n/g, '\\n')}`, () => {
     const v = evaluate(c, cdPkg);
     assert.equal(v.decision, 'deny', `expected deny, got allow for: ${c}`);
@@ -725,6 +726,11 @@ test('DENY #586 rmdir frontend; cd frontend; npm run build (the frontend script 
   const o = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/frontend') || resolve(p) in pkgs, readDir: (p) => (resolve(p) === resolve('/work/repo/frontend') ? [] : cdWorld.readDir(p)), readText: (p) => (resolve(p) in pkgs ? JSON.stringify({ name: 'x', scripts: pkgs[resolve(p)] }) : null) };
   const v = evaluate('rmdir frontend; cd frontend; npm run build', o);
   assert.equal(v.decision, 'deny', 'expected deny, got allow');
+});
+// (R3-B4: reading B starts with fresh command-order state: the `npm pkg set` AFTER the lint run must not refuse the lint run)
+test('ALLOW #586 npm run ok; npm pkg set private=true; cd frontend (the write comes after the script)', () => {
+  const v = evaluate('npm run ok; npm pkg set private=true; cd frontend', cdPkg);
+  assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
 });
 test('ALLOW #586 cd frontend && npm run ok / cd frontend || exit 1 (proven: the target is where it runs)', () => {
   for (const c of ['cd frontend && npm run ok', 'cd frontend || exit 1; npm run ok']) assert.equal(evaluate(c, cdPkg).decision, 'allow', c);

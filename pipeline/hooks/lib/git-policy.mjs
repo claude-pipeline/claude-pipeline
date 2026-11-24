@@ -3383,7 +3383,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   const settle = (c, i) => {
     // (#530 / #545: after a plain `|| exit` a redirected move (x.redir) is proven to have happened: it goes on as a certain one. The tracker is replaced by a copy, never changed in place: snap() and the loop frames share them)
     const proven = new Map();
-    let stayed = false; // (#586: the first doubtful cd of this settle that stays where it was: a later one, chained to it with &&, never ran)
+    let stayed = false; // (#586: the first doubtful cd of this settle stays where it was; a later one chained to it with && never ran, so it leaves the directory as that one did)
     // (D: a change made directly in a loop body (x.loopOnly: no other body mark, not after &&) proven by a plain `|| exit` is reached by every later command of that body: kept (soft) through ; and || until the body is
     // left, where the blk rule forgets it (an early break / continue skips the cd and everything after it). The `|| { …; exit 1; }` group form is not read in a text with a loop (no shape events there): still refused)
     // (#754: a branch switch not proven to have succeeded (x.unproven) is proven by the same plain `|| exit`: the copy goes on as before)
@@ -3417,12 +3417,12 @@ function evalString(str, startDir, ctx, level, child = false) {
         const closerRedir = cmds[k] !== undefined && cmds[k].argv.length === 0 && (cmds[k].redirects ?? []).length > 0;
         if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.co !== true && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
+      // (#586 reading B: a doubtful cd the operator before it did not prove stays where it was, whatever the operator: `true && cd d; P`, `cd d || true; P`, `cd a && cd d; P`)
+      if (x.cdMissing) { if (!stayed) { dir = x.cdWas; stayed = true; ctx.bashState.cdWord ??= x.cdWord; } return false; }
       if (op === '||' || x.cond) forget(x);
       // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
       // leaves EVERY branch unknown (R1-B1, the doubtful-git-change rule of #505: a subfolder of the same worktree has no entry of its own and would read the branch the switch may not have left))
       else if (x.unproven) forgetNames(true);
-      // (#586: `cd missing; git push`: the cd may have failed, and the push then runs where the line was before it. Only && and a plain `|| exit` prove it: after any other operator the walk is in the directory the cd left (reading B, see evaluateGitCommand))
-      else if (x.cdMissing) { if (!stayed) { dir = x.cdWas; stayed = true; ctx.bashState.cdWord ??= x.cdWord; } }
       return false;
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
@@ -3961,6 +3961,7 @@ function judgeLongText(text) {
 // line is judged again with the rewrite off. (A denial stands: the second pass only adds readings.)
 // (#586: TWO READINGS of a cd. Reading A is main's: every cd moves to its target. A cd whose target is not shown to exist (cdUnproven) is recorded on the state (cdDoubt: the word it names). When A allows and recorded one, reading B judges the line
 // again where such a cd does NOT move (the shell stays where it was) unless && or a plain `|| exit` proves it (settle): a denial of B is the verdict, with a sentence that names the cd. Each reading has its own rewrite pass and spends what the one before left.)
+const READING_CAPS = ['now', 'cpu', 'evalStart', 'wall0', 'cpu0', 'scripts', 'readings', 'grown', 'lookups', 'pkgCache'];
 export function evaluateGitCommand(command, opts = {}) {
   const reading = (extra) => {
     const state = { bound: false, rewrote: false, ...extra };
@@ -3971,7 +3972,7 @@ export function evaluateGitCommand(command, opts = {}) {
   };
   const a = reading({});
   if (a.v.decision === 'deny' || a.state.cdDoubt === undefined) return a.v;
-  const b = reading({ cdFails: true, carry: a.state.budget });
+  const b = reading({ cdFails: true, carry: Object.fromEntries(READING_CAPS.filter((k) => k in a.state.budget).map((k) => [k, a.state.budget[k]])) }); // (B starts with the caps A spent and its pure caches, never A's command-order state or verdict memos)
   if (b.v.decision !== 'deny') return a.v;
   const w = b.state.cdWord ?? a.state.cdDoubt;
   return { ...b.v, reason: `\`cd ${w}\` may fail (the folder is not shown to exist), and the shell then stays where it was: ${b.v.reason} Use \`cd ${w} && …\` or \`cd ${w} || exit 1\`.` };
