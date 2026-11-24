@@ -1067,13 +1067,16 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
     const filter = (c) => c.pipe === true && !deferred(c) && (stdinFed(c) ? isLit(c) : !isLit(c) && !PASS_FILTERS.has(commandName(c.argv[0])) && (!shellFan || REWRITERS.has(commandName(c.argv[0]))));
     // a replacement token glued to a name character or another token (`p{}`, `{1}{2}`, `p@` under `-I@`; the `-I{}` option that defines the token is not one: the launched command's words are read)
     // the launcher's own words (xargs / parallel, its options and the wrapper the parser unwrapped), not the launched program's: `xargs cc -Iinclude` defines no token; words that do not line up with the parsed ones are all read
-    const ownWords = (c) => (typedWords(c).length >= c.argv.length ? typedWords(c).slice(0, typedWords(c).length - c.argv.length) : typedWords(c));
+    // (read from the parser's own xargs words when the launched command is their tail; any other case reads them all, tokens of the launched program included)
+    const ownWords = (c) => { const fw = c.fanWords ?? typedWords(c); const n = fw.length - c.argv.length; return n >= 0 && c.argv.every((w, i) => w === fw[n + i]) ? fw.slice(0, n) : fw; };
     const gluedTo = (w, t) => { for (let i = w.indexOf(t); i >= 0; i = w.indexOf(t, i + 1)) { if ([w[i - 1], w[i + t.length]].some((ch) => ch !== undefined && (/\w/.test(ch) || t.includes(ch)))) return true; } return false; };
     const glue = (c) => stdinFed(c) && (typedWords(c).some((w) => /[\w}]\{\d*\}|\{\d*\}[\w{]/.test(w.replace(/^-[IJi]\{/, '{'))) || [...replaceTokens(ownWords(c))].some((t) => t !== '{}' && c.argv.some((w) => w !== t && gluedTo(w, t))));
     // the producer words build a name from variables (`echo $x$y`)
     const built = (c) => (isLit(c) && !stdinFed(c) && c.argv.slice(1).some((w) => expansionTrick(w, false))) || redirText(c).some((w) => expansionTrick(w, false));
     // pieces of one name from several echo / printf (`{ printf ps; echo ql; } | xargs env`), an echo that leaves out its newline (`-n`, `\c`), or a printf that reuses its format for more arguments than it has conversions without ending in a separator (`printf %s ps ql`)
-    // (`reach`: on a whole-line reading only an echo / printf whose output can get to the launcher counts: it writes a file, is a pipeline stage or sits in a substitution / subshell; terminal status messages do not)
+    // (`reach`: on a whole-line reading only an echo / printf whose output can get to the launcher counts: it writes a file, is a pipeline stage or sits in a substitution / subshell; terminal status messages do not.
+    // Not on a line with a redirect on a group or loop (`{ …; } > f`), an `exec` redirect or a function: their output goes to a file the producer words do not show)
+    const hidesOutput = cmds.some((c) => (c.redirects ?? []).some((r) => String(r.op).includes('>')) && (!c.argv?.length || commandName(c.argv[0]) === 'exec')) || reading.some((c) => c.ctl?.fn);
     const joins = (w, reach) => {
       const prods = w.filter((c) => isLit(c) && !stdinFed(c) && (!reach || c.pipe === true || inSub(c) || (c.redirects ?? []).some((r) => String(r.op).includes('>'))));
       return prods.length > 1 || prods.some((c) => {
@@ -1094,7 +1097,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
       let w = whole ? reading : windowOf(k);
       if (w.some((p) => isLit(p) && [...p.argv, ...redirText(p)].some((a) => /[$`]/.test(a)))) w = reading.filter((p) => w.includes(p) || inSub(p));
       const literal = w.some((p) => isLit(p) || (p.redirects ?? []).some((r) => String(r.op).startsWith('<<')) || (stdinFed(p) && typedWords(p).includes(':::')));
-      return literal && (w.some((p) => fmt(p) || filter(p) || built(p)) || glue(c) || joins(w, whole));
+      return literal && (w.some((p) => fmt(p) || filter(p) || built(p)) || glue(c) || joins(w, whole && !hidesOutput));
     });
     if (refused) return 'xargs / parallel builds a command from text the line produces through a printf format, a filter, a glued replacement, glued variables or several echo / printf pieces the guard cannot read';
   }

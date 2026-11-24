@@ -3702,6 +3702,7 @@ class Parser {
     if (cmd && wrapped) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
     if (cmd && extCd) Object.defineProperty(cmd, 'extCd', { value: true, enumerable: false });
     if (cmd && viaRunner) Object.defineProperty(cmd, 'viaRunner', { value: true, enumerable: false });
+    if (cmd && fan) Object.defineProperty(cmd, 'fanWords', { value: fan, enumerable: false }); // (the exact xargs / parallel words, the launched command's included, as the replace-token reading of fanOut sees them: the live-database guard reads the launcher's own options from them)
     if (cmd && fanRuns) Object.defineProperty(cmd, 'fan', { value: true, enumerable: false }); // (R11-F2: xargs / parallel is the command that runs, not a word among the arguments: the live-database guard)
     if (cmd && (seg.negated || segNeg(seg))) Object.defineProperty(cmd, 'negated', { value: true, enumerable: false }); // (#352 R8: see git-policy's may-not-run rule)
     if (cmd && runnerDirs.length) Object.defineProperty(cmd, 'runnerDirs', { value: runnerDirs, enumerable: false });
