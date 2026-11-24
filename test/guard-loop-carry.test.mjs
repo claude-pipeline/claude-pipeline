@@ -21,7 +21,7 @@ const SHIP = 'git config alias.ship "' + PUSH + ' origin ' + MAIN + '"';
 function fakeFs(root, files) {
   const abs = (p) => resolve(root, p);
   const F = Object.fromEntries(Object.entries(files).map(([k, v]) => [abs(k), v]));
-  const D = new Set([root, '/home/u'].map((p) => resolve(p)));
+  const D = new Set([root, '/home/u', '/work/other', '/work/main'].map((p) => resolve(p)));
   for (const p of Object.keys(F)) for (let d = dirname(p); d !== dirname(d); d = dirname(d)) D.add(d);
   const names = (d) => {
     const out = new Set();
@@ -756,8 +756,9 @@ test('#615: a loop over literal words that exits early before its cd / switch do
 // From /work/main (a repository on main) with /work/repo on agent/x: a push that the guard places in /work/main is "pushing to main is blocked", one it cannot place is "cannot determine the current branch".
 // Why: a wrapped exit (`coproc exit 1`, `nohup exit 1`, zsh's `command exit 1`) or a huge number (bash 5.3: `exit 99999999999999999999` is an error and the shell goes on) leaves no shell, so the cd that FAILED (the
 // push stays in /work/main) was taken as proven; and `coproc cd X` / `coproc { cd X; }` run in a background child, so the parent never moved.
+const CD_DIRS = ['/work/main', '/work/repo', '/other'].map((d) => resolve(d)); // (#586: the directories the lines cd to exist)
 const fromMain = (cmd, cwd = '/work/main') => evaluateGitCommand(cmd, {
-  cwd, home: '/home/u', currentBranch: (d) => ({ '/work/main': MAIN, '/work/repo': 'agent/x' })[unwin(d)] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false,
+  cwd, home: '/home/u', currentBranch: (d) => ({ '/work/main': MAIN, '/work/repo': 'agent/x' })[unwin(d)] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: (p) => CD_DIRS.includes(resolve(p)), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null),
 });
 const IN_MAIN = /pushing to main is blocked/;
 const refused = (what, cmd, reason, cwd) => {
