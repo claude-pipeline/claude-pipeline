@@ -90,7 +90,7 @@ export function mergeAsk({ repo, pr, closing }) {
 // The round dialog's fixed variant set. Each variant is a frozen { options, actions } pair, immutable once shipped: a text change is a NEW id, never an edit (a test pins the sha256 of each). The ask
 // file names its variant, the verifier REBUILDS the dialog from this table (never from the file's own words), and a variant it does not know is an invalid ask. `round-v1` is the legacy
 // dialog, exactly as it always was (no recommendation); the `round-v2-*` ids put the recommended choice first, labelled "(Recommended)". An action is null (a decline), a string (the answer text the typed
-// parsers read) or { instruction: 'follow-up' }: a click that grants and approves nothing (admitClick). Only round-v2-follow-up has a Follow up option (the park variant deliberately has none).
+// parsers read) or { instruction: 'follow-up' }: a click that grants and approves nothing (admitClick). Only round-v2-follow-up has a Follow up option (the park variant deliberately has none). `round-v2-chosen` (#848) is issued only after a trip-wire process review in which the owner already chose one more round: Yes first, labelled "(your choice)", and deliberately NO "(Recommended)" label (the summary may still recommend stopping, and the dialog must not contradict it).
 const NO_ROUND = { label: 'No', description: 'No more rounds now. Nothing is recorded.' };
 const YES_ROUND = { label: 'Yes, one more round', description: 'Grant exactly the one extra counted round shown above, the same as typing "extra round".' };
 const recommended = (o) => ({ label: `${o.label} (Recommended)`, description: o.description });
@@ -110,6 +110,13 @@ const ROUND_VARIANTS = Object.freeze({
       YES_ROUND,
     ],
     actions: { 'No, stop and park (Recommended)': null, 'Yes, one more round': 'extra round' },
+  },
+  'round-v2-chosen': {
+    options: [
+      { label: 'Yes, one more round (your choice)', description: 'You chose one more round at the process review. Grant exactly the one extra counted round shown above, the same as typing "extra round".' },
+      { label: 'No, stop and park', description: 'No more rounds now. Park the PR for a person to decide what stays open. Nothing is recorded.' },
+    ],
+    actions: { 'Yes, one more round (your choice)': 'extra round', 'No, stop and park': null },
   },
 });
 export const ROUND_VARIANT_IDS = Object.freeze(Object.keys(ROUND_VARIANTS));
