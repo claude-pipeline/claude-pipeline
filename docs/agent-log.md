@@ -337,3 +337,4 @@ full record.
 - 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 9 · arbiter 9 (fix-verify 5) · blocked · Codex 7d: 725 runs (248 high)
 - 2026-11-24 · #849 · ci-usage: price provider runners with --rate self-hosted= or a per-label rate (#795) · risk low · rounds 2 · arbiter 1 · awaiting-owner-merge · Codex 7d: 730 runs (253 high)
 - 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 10 · arbiter 10 (fix-verify 6) · blocked · Codex 7d: 737 runs (258 high)
+- 2026-11-24 · #854 · Round dialog after a process review: the owner's chosen round comes first (#848) · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 740 runs (257 high)
