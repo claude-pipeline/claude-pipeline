@@ -597,15 +597,24 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
   // pending" and the owner's word is spent) or enqueueing (the poster would read `pending` and spend the one re-queue) before they have settled races them. So after the
   // lift (F7) wait for the re-run to show (the guard links read BEFORE the lift tell old rows from new ones) and settle green; refused as today when it does not
   // (withHoldLifted then puts the hold back). No wait, no snapshot when nothing was lifted just now (hold === null, incl. a restart re-queue).
+  const reviewCheck = config.ci?.review_check === true && config.ci?.guard_checks !== false;
   let guardsBefore = null;
   if (hold !== null) {
-    try { guardsBefore = guardLinks(gh.checks(pr)); } catch { guardsBefore = null; } // (unreadable: no re-run detection, the wait then judges the first read as before)
+    // An unreadable snapshot (a throw, or not a list) is read once more, then refused here: lifting without it would let the old green rows pass for the re-run. Nothing has been changed yet.
+    for (let attempt = 0; attempt < 2 && guardsBefore === null; attempt += 1) {
+      try { guardsBefore = guardLinks(gh.checks(pr), { review: reviewCheck }); } catch { guardsBefore = null; }
+    }
+    if (guardsBefore === null) return refuse('pre-merge', [`could not read the PR's checks before lifting the hold, so the guards' re-run could not be told from their old results: nothing was changed`], { head });
   }
+  // The plain pre-merge look: withHoldLifted runs it right after the lift, the settle wait below runs it again right before the merge / enqueue (a blocker may appear during the wait).
+  const check = () => preMergeProblems({ gh, pr, head, base: live.baseRefOid, ...(queue.on ? { queueMode: true } : {}) });
   const settleGuards = async () => {
     if (hold === null) return null;
     const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
-    const problems = await settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before: guardsBefore, graceMs: guardRerunGraceMs(waitMs, ctx.env ?? process.env) });
-    return problems.length > 0 ? refuse('pre-merge', problems, { head }) : null;
+    const problems = await settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before: guardsBefore, graceMs: guardRerunGraceMs(waitMs, ctx.env ?? process.env), reviewCheck });
+    if (problems.length > 0) return refuse('pre-merge', problems, { head });
+    const late = await check();
+    return late.length > 0 ? refuse('pre-merge', late, { head }) : null;
   };
   // Queue mode: the enqueue replaces the merge command; the lift / restore wrapper below is unchanged (the hold builder's seam: lib/queue-route.mjs onBeforeAttempt / onTerminal).
   const queueStep = async () => (await settleGuards()) ?? route.enqueueAndWatch({ requeue: pre.requeue === true });
@@ -619,7 +628,7 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
   // The hold is lifted on the owner's word just before the merge command and put back whenever nothing merges (lib/hold.mjs withHoldLifted).
   return withHoldLifted({
     gh, pr, hold, head, items: live.ownerItems, repo, env: ctx.env ?? process.env, refuse,
-    check: () => preMergeProblems({ gh, pr, head, base: live.baseRefOid, ...(queue.on ? { queueMode: true } : {}) }),
+    check,
     merge: mergeStep,
     kill: killTree,
     disableAuto: () => disableAutoMerge({ pr, cwd: root, env: ctx.env }),

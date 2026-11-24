@@ -38,9 +38,9 @@ const docsOnly = (repo) => repo.write('docs/guide.md', '# Guide 2\n');
 const STILL_OPEN = { state: 'OPEN', mergeCommit: null };
 
 // A PR held by needs-human (timeline: the one labeled event), a stateful fake gh, chat mode by default.
-function world({ mode = 'chat', change = bump, state = {}, gh = {}, env = {} } = {}) {
+function world({ mode = 'chat', change = bump, state = {}, gh = {}, env = {}, reviewCheck = false } = {}) {
   const s = scenario({
-    yml: yml(mode), report: null, state: null, change: unique(change),
+    yml: reviewCheck ? yml(mode).replace('guard_checks: false', 'guard_checks: true\n  review_check: true') : yml(mode), report: null, state: null, change: unique(change),
     gh: { mergeStateStatus: 'CLEAN', labels: ['needs-human'], ...gh }, env: { PIPELINE_HOLD_RETRY_MS: '1', ...env },
   });
   const file = join(s.fake.dir, 'hold-state.json');
@@ -344,24 +344,36 @@ test('real run: a stale post-delete read that catches up within the retries stil
 
 // ---- #847: the guards re-run after the lift (unlabeled fires pipeline-guards.yml); the merge command must not run on the pending rows ----------------------
 const GUARD_NAMES = ['Test integrity', 'Hard-stop scan'];
+const REVIEW_NAME = 'Cross-model review';
 const runLink = (n) => `https://github.com/acme/widgets/actions/runs/${n}`;
-const guardRows = (bucket, run) => GUARD_NAMES.map((name) => ({ name, state: { pass: 'SUCCESS', pending: 'PENDING', fail: 'FAILURE' }[bucket], bucket, link: runLink(run) }));
+const rowOf = (name, bucket, run) => ({ name, state: { pass: 'SUCCESS', pending: 'PENDING', fail: 'FAILURE' }[bucket], bucket, link: runLink(run) });
+const guardRows = (bucket, run) => GUARD_NAMES.map((name) => rowOf(name, bucket, run));
 const CI_ROW = { name: 'ci', state: 'SUCCESS', bucket: 'pass' };
-// The guards' provenance (what the final gate reads: latest status of the context, its run 55 and the run's verdict artifact), so the green rows are believed.
-const guardWorld = ({ after, env = {} }) => world({
-  env: { PIPELINE_MERGE_WAIT_MS: '20000', PIPELINE_MERGE_POLL_MS: '1', ...env },
-  gh: {
-    ci: [CI_ROW, ...guardRows('pass', 55)],
-    extra: (o) => [
-      { match: '^api repos/acme/widgets/commits/[0-9a-f]{40}/statuses', stdout: `${JSON.stringify({ state: 'success', by: 'github-actions[bot]', at: '2026-10-01T10:05:00Z', url: runLink(55) })}\n` },
-      { match: '^api repos/acme/widgets/actions/runs/55/artifacts\\?per_page=100 ', stdout: `${verdictArtifactName({ head: o.prHead, integrity: 'success', hardstops: 'success', review: 'success' })}\n` },
-      { match: '^api repos/acme/widgets/actions/runs/55 ', stdout: `${JSON.stringify({ path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: o.prHead, run_attempt: 1, created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:12:00Z', pull_requests: [{ number: 12, head: { sha: o.prHead }, base: { ref: 'main', sha: 'a'.repeat(40) } }] })}\n` },
-      { match: '^api repos/acme/widgets --jq \\.default_branch', stdout: 'main\n' },
-      { match: '^api repos/acme/widgets/compare/[0-9a-f]{40}\\.\\.\\.main --jq \\.status', stdout: 'ahead\n' },
-    ],
-  },
-  state: { checks: { before: [CI_ROW, ...guardRows('pass', 55)], after: [[CI_ROW, ...after[0]], ...after.slice(1).map((rows) => [CI_ROW, ...rows])] } },
-});
+// The guards' provenance (what the final gate reads: the latest status of each context, the run its link names and that run's verdict artifact), so the green rows are believed.
+// Answered per context and per run: a context's latest status is the run its row shows in the LAST `after` read (runs 55 and 56 are both served), as GitHub would at the end of the re-run.
+const guardWorld = ({ after, env = {}, reviewCheck = false, holdAfterRead }) => {
+  const last = after[after.length - 1];
+  const runOf = (name) => Number(/runs\/(\d+)$/.exec(last.find((r) => r.name === name)?.link ?? '')?.[1] ?? 55);
+  const runEntries = (o, n) => [
+    { match: `^api repos/acme/widgets/actions/runs/${n}/artifacts\\?per_page=100 `, stdout: `${verdictArtifactName({ head: o.prHead, integrity: 'success', hardstops: 'success', review: 'success' })}\n` },
+    { match: `^api repos/acme/widgets/actions/runs/${n} `, stdout: `${JSON.stringify({ path: '.github/workflows/pipeline-guards.yml@refs/heads/main', event: 'pull_request_target', head_sha: o.prHead, run_attempt: 1, created_at: '2026-10-01T10:00:00Z', updated_at: '2026-10-01T10:12:00Z', pull_requests: [{ number: 12, head: { sha: o.prHead }, base: { ref: 'main', sha: 'a'.repeat(40) } }] })}\n` },
+  ];
+  const old = [...guardRows('pass', 55), ...(reviewCheck ? [rowOf(REVIEW_NAME, 'pass', 55)] : [])];
+  return world({
+    reviewCheck,
+    env: { PIPELINE_MERGE_WAIT_MS: '20000', PIPELINE_MERGE_POLL_MS: '1', ...env },
+    gh: {
+      ci: [CI_ROW, ...old],
+      extra: (o) => [
+        ...[...GUARD_NAMES, ...(reviewCheck ? [REVIEW_NAME] : [])].map((name) => ({ match: `^api repos/acme/widgets/commits/[0-9a-f]{40}/statuses.*context == "${name}"`, stdout: `${JSON.stringify({ state: 'success', by: 'github-actions[bot]', at: '2026-10-01T10:05:00Z', url: runLink(runOf(name)) })}\n` })),
+        ...runEntries(o, 55), ...runEntries(o, 56),
+        { match: '^api repos/acme/widgets --jq \\.default_branch', stdout: 'main\n' },
+        { match: '^api repos/acme/widgets/compare/[0-9a-f]{40}\\.\\.\\.main --jq \\.status', stdout: 'ahead\n' },
+      ],
+    },
+    state: { checks: { before: [CI_ROW, ...old], after: after.map((rows) => [CI_ROW, ...rows]), ...(holdAfterRead ? { holdAfterRead } : {}) } },
+  });
+};
 
 test('real run, direct mode (#847): the guards re-post pending after the lift => the merge command runs only once they are green again', async (t) => {
   const s = guardWorld({ after: [guardRows('pass', 55), guardRows('pending', 56), guardRows('pending', 56), guardRows('pass', 56)] });
@@ -390,6 +402,38 @@ test('real run, direct mode (#847): the re-run ends red => the merge command nev
   refused(r, 'pre-merge', /not passing after the hold lift re-ran them: Test integrity=fail, Hard-stop scan=fail/);
   assert.deepEqual(s.mergeCalls(), []);
   restored(s, r);
+});
+
+// #847 R1-B1: the guards settle green, but a blocker (here the hold label back on the PR) appeared during the wait: the merge command must not run on the pre-wait look.
+test('real run, direct mode (#847): a blocker that appears while the guards settle => refused at the last look, the merge command never runs', async (t) => {
+  const s = guardWorld({ after: [guardRows('pending', 56), guardRows('pass', 56)], holdAfterRead: 2 });
+  approve(t, s);
+  const r = s.go();
+  refused(r, 'pre-merge', /needs-human/);
+  assert.deepEqual(s.mergeCalls(), []);
+  assert.ok(s.st().labels.includes('needs-human'));
+});
+
+// #847 R1-B2 (ci.review_check on): the workflow posts the two guards, then the review status last and never as pending. Two new rows next to the OLD run's review row are not settled.
+test('real run, direct mode (#847): the guards show the new run but Cross-model review still shows the old one => the merge command waits for the review row of the new run', async (t) => {
+  const withReview = (bucket, run, reviewRun) => [...guardRows(bucket, run), rowOf(REVIEW_NAME, bucket === 'pending' ? 'pass' : bucket, reviewRun)];
+  const s = guardWorld({ reviewCheck: true, after: [withReview('pending', 56, 55), withReview('pass', 56, 55), withReview('pass', 56, 55), withReview('pass', 56, 56)] });
+  approve(t, s);
+  const r = s.go();
+  assertExit(r, 0, `${r.stderr}${r.stdout}`);
+  assert.equal(r.json.merged, true);
+  assert.equal(s.mergeCalls().length, 1);
+  assert.ok(s.atMerge()[0].checksAfterReads >= 4, `the merge command ran only once the review row showed the new run (checks read after the lift: ${s.atMerge()[0].checksAfterReads})`);
+});
+
+// #847 R1-B3: an unreadable before-lift snapshot would skip re-run detection and the old green rows would start the merge: refused BEFORE the lift instead.
+test('real run, direct mode (#847): the checks cannot be read before the lift => refused, nothing changed, the merge command never runs', async (t) => {
+  const s = guardWorld({ after: [guardRows('pass', 56)] });
+  approve(t, s);
+  s.patch((st) => { st.checks.before = 'not a list'; }); // (after the dry run: it reads the checks too)
+  const r = s.go();
+  refused(r, 'pre-merge', /could not read the PR's checks before lifting the hold/);
+  untouched(s);
 });
 
 test('real run: the delete itself fails => refused, the label is (still) on the PR', async (t) => {

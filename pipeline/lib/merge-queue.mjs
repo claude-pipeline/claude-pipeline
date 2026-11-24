@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { readRepoMoves, sameRepo } from '../hooks/lib/repo-moves.mjs';
-import { GUARD_CHECKS, PROVENANCE_CHECKS } from './config.mjs';
+import { GUARD_CHECKS, PROVENANCE_CHECKS, REVIEW_CHECK } from './config.mjs';
 import { forgedGuards, labelNames, readMergeSha, validLabels, waitBlockers } from './finalgate.mjs';
 import { HOLD_LABEL, RESTORE_NOTE } from './hold.mjs';
 import { gitCommonDir } from './repo.mjs';
@@ -960,11 +960,14 @@ export async function recoverQueuedLift({ gh, root, pr, orphan, lift, now = Date
 // The re-run may not have posted `pending` yet when we first read, and the old green rows would look settled. `before` (guardLinks of a read taken BEFORE the
 // lift) lets us tell: first wait (at most `graceMs`, inside the same `waitMs`) until a guard row is pending or carries a run link not in `before`; if none
 // shows, a repo whose workflow does not re-run on needs-human is judged on its old rows exactly as without `before`.
-// guardLinks: check rows -> { guard name: run link }, null when the read is not a list.
-export function guardLinks(rows) {
+// Once a re-run is seen, every status it posts (the guards, and the review status with `reviewCheck` = ci.review_check on) must carry a link not in `before`: the workflow posts them one
+// after another and never sets the review status pending, so two new rows next to the old run's review row are not settled yet (`before` then needs the review link: guardLinks `review`).
+// guardLinks: check rows -> { name: run link } (the guards; with `review` the review status too), null when the read is not a list.
+export function guardLinks(rows, { review = false } = {}) {
   if (!Array.isArray(rows)) return null;
+  const names = review ? PROVENANCE_CHECKS : GUARD_CHECKS;
   const links = {};
-  for (const r of rows) if (GUARD_CHECKS.includes(r?.name)) links[r.name] = r.link ?? null;
+  for (const r of rows) if (names.includes(r?.name)) links[r.name] = r.link ?? null;
   return links;
 }
 // How long to look for the re-run before judging the old rows: 120 s, never more than the merge wait; the env seam (tests) may only shorten it.
@@ -973,7 +976,8 @@ export function guardRerunGraceMs(waitMs, env = {}) {
   const grace = Math.min(120_000, waitMs);
   return Number.isInteger(set) && set >= 0 ? Math.min(set, grace) : grace;
 }
-export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before = null, graceMs = 0, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
+export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before = null, graceMs = 0, reviewCheck = false, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
+  let rerun = false; // (a re-run was seen: the statuses it posts are told from the old run's by their link)
   const started = now();
   const deadline = started + waitMs;
   if (before !== null && typeof before === 'object' && Object.keys(before).length > 0) { // (no guard row before the lift: nothing to wait for)
@@ -983,6 +987,7 @@ export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before
       try { rows = gh.checks(pr); } catch { rows = null; } // (an unreadable read is reported by the loop below once the grace is over)
       const seen = Array.isArray(rows) && rows.some((r) => GUARD_CHECKS.includes(r?.name) && (r.bucket === 'pending' || (r.link ?? null) !== (before[r.name] ?? null)));
       const left = graceEnd - now();
+      if (seen) rerun = true;
       if (seen || left <= 0) break;
       await sleep(Math.min(pollMs, left));
     }
@@ -1000,13 +1005,18 @@ export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before
     if (rows !== null) {
       const guards = rows.filter((r) => PROVENANCE_CHECKS.includes(r?.name));
       const pending = guards.filter((r) => r.bucket === 'pending');
+      const stale = !rerun ? [] : [...GUARD_CHECKS, ...(reviewCheck ? [REVIEW_CHECK] : [])].filter((name) => { const row = guards.find((r) => r.name === name); return !row || (row.link ?? null) === (before[name] ?? null); });
       if (pending.length === 0) {
-        const bad = guards.filter((r) => r.bucket !== 'pass');
+        const bad = guards.filter((r) => r.bucket !== 'pass' && !stale.includes(r.name));
         if (bad.length > 0) return [`guard check(s) not passing after the hold lift re-ran them: ${bad.map((r) => `${r.name}=${r.bucket ?? r.state}`).join(', ')}`];
-        const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
-        return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
+        if (stale.length === 0) {
+          const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
+          return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
+        }
+        why = `the re-run has not posted yet: ${stale.join(', ')}`;
+      } else {
+        why = `guard check(s) still pending: ${pending.map((r) => r.name).join(', ')}`;
       }
-      why = `guard check(s) still pending: ${pending.map((r) => r.name).join(', ')}`;
     }
     const left = deadline - now();
     if (left <= 0) return [`${why} after ${Math.round(waitMs / 1000)} s: lifting the hold re-runs the guards; run again once they have finished`];

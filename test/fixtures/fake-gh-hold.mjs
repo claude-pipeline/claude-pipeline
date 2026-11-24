@@ -7,7 +7,7 @@
 // Routes: `api -X DELETE .../issues/12/labels/needs-human` (removes the label, appends an `unlabeled` event by "me"), `pr edit 12 --add-label X`
 // (adds it, appends a `labeled` event by "me" with a new node id), GET .../issues/12/timeline, GET / POST .../issues/12/comments. With `checks: { before: [rows], after: [rows, ...] }`
 // every `pr checks 12` read that is not `--required` answers `before` while the label is on and the `after` rows in turn (the last one stays) once it is gone;
-// `checksAfterReads` counts those reads. Every
+// `checksAfterReads` counts those reads; `holdAfterRead: n` re-adds the hold label once the nth of them has been answered. Every
 // `pr view` reply whose script entry carries `labels` (or `state`) shows the live labels (prState). Anything else is answered by the script.
 import { readFileSync, writeFileSync, appendFileSync, existsSync } from 'node:fs';
 
@@ -104,7 +104,9 @@ const run = () => {
   if (state.checks && /^pr checks 12 /.test(joined) && !/--required/.test(joined)) {
     if (state.labels.includes('needs-human')) return out(state.checks.before);
     state.checksAfterReads = (state.checksAfterReads ?? 0) + 1;
-    return out(state.checks.after[Math.min(state.checksAfterReads, state.checks.after.length) - 1]);
+    const rows = state.checks.after[Math.min(state.checksAfterReads, state.checks.after.length) - 1];
+    if (state.checks.holdAfterRead === state.checksAfterReads && !state.labels.includes('needs-human')) state.labels.push('needs-human'); // (a blocker that appears while the wait runs)
+    return out(rows);
   }
   const entries = JSON.parse(readFileSync(process.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8'));
   const hit = entries.find((e) => new RegExp(e.match).test(joined));

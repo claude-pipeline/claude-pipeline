@@ -926,9 +926,22 @@ test('settleGuardStatuses with a before-snapshot: old green rows are not trusted
   assert.match(red.out[0], /not passing after the hold lift re-ran them: Hard-stop scan=fail/);
   const review = await run([[...both('pass', 1).slice(0, 2), row('Cross-model review', 'pass', 9)]]);
   assert.equal(review.waited(), 30_000, 'a new link on the review check is no sign of a guard re-run');
+  // #847 R1-B2: with the review status on, a re-run is settled only once its row carries a new link too (it is posted last and never pending).
+  const REVIEW_OLD = { ...OLD, 'Cross-model review': 'https://x/runs/1' };
+  const withReview = (reviewRun, bucket = 'pass') => [row('Test integrity', 'pass', 2), row('Hard-stop scan', 'pass', 2), row('Cross-model review', bucket, reviewRun)];
+  const reviewLate = await run([withReview(1), withReview(1), withReview(2)], { before: REVIEW_OLD, reviewCheck: true });
+  assert.deepEqual(reviewLate.out, []);
+  assert.equal(reviewLate.polls(), 3, 'one read for the grace, one still showing the old review row (not settled), then the new one: it did not return on two new rows beside the old review row');
+  const reviewRed = await run([withReview(2, 'fail')], { before: REVIEW_OLD, reviewCheck: true });
+  assert.match(reviewRed.out[0], /not passing after the hold lift re-ran them: Cross-model review=fail/);
+  const reviewOff = await run([withReview(1)], { before: OLD });
+  assert.deepEqual(reviewOff.out, [], 'ci.review_check off: a review row left from an earlier run is not waited for');
+  const stuck = await run([withReview(1)], { before: REVIEW_OLD, reviewCheck: true, waitMs: 20_000 });
+  assert.match(stuck.out[0], /the re-run has not posted yet: Cross-model review after 20 s/);
   const noSnap = await run([both('pass', 1)], { before: null });
   assert.equal(noSnap.polls(), 1, 'an unreadable snapshot: today\'s single read');
   assert.deepEqual(guardLinks(both('pass', 1)), OLD);
+  assert.deepEqual(guardLinks(both('pass', 1), { review: true }), { ...OLD, 'Cross-model review': 'https://x/runs/1' });
   assert.equal(guardLinks(null), null);
   assert.equal(guardLinks('nope'), null);
 });
