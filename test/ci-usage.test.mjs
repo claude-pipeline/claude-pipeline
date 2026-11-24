@@ -446,3 +446,17 @@ test('#794: runs of an earlier closed PR on a reused branch name, which GitHub n
   assert.equal(repo.totals.workflowElapsedMin, 20, 'both runs stay in the repository totals');
   assert.match(r.json.warnings.join('\n'), /1 pull_request run\(s\) were linked by GitHub to a PR opened after them \(a branch name reused by an earlier PR\): left unclassified, not given to that PR/);
 });
+
+test('#793: a head pushed (and the PR readied) before --since, first seen in the window on a non-push run while the PR is ready, is no push while ready and no missed redraft', () => {
+  // failure caught: a reopened/labeled run on an old head was its first run in the window, so the head was reported as pushed while ready and as a missed redraft
+  const oldPr = { match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { ...PR7, created_at: '2026-11-01T07:00:00Z' } };
+  const timeline = { match: '^api repos/acme/widgets/issues/7/timeline', stdoutJson: [ev('ready_for_review', '2026-11-01T08:00:00Z')] };
+  const commits = { match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: [{ sha: sha('3'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work', committer: { date: '2026-11-01T08:30:00Z' } } }] };
+  const reopened = run(1501, {}); // head sha('3'), in the window, nowhere near a ready event
+  const r = usage(world({ runs: [reopened], extra: [oldPr, timeline, commits] }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  const p = repo.prs.find((x) => x.pr === 7);
+  assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
+  assert.deepEqual([repo.totals.pushesWhileReady, repo.totals.missedRedrafts, repo.totals.uncheckedHeads], [0, 0, 1]);
+});
