@@ -42,9 +42,13 @@ function evaluate(command, o = {}) {
     },
     readText: o.readText ?? (() => null),
     pathExists: o.pathExists ?? (() => false),
+    ...(o.readDir ? { readDir: o.readDir } : {}),
   });
   return Object.assign(verdict, { calls });
 }
+
+// (#586: a cd to a directory that is not shown to exist leaves the directory unknown after a ;: options for a fake disk where these directories exist)
+const dirsExist = (...ds) => { const set = ds.map((d) => resolve(d)); return { pathExists: (p) => set.includes(resolve(p)), readDir: (p) => (set.includes(resolve(p)) ? [] : null) }; };
 
 // [command, options]
 const DENY = [
@@ -659,6 +663,43 @@ for (const [command, o] of MORE_ALLOW) {
   });
 }
 
+// #586: `cd /work/other; cd /work/repo/missing; git push`: the second cd fails, `;` goes on, and the push runs in /work/other (on main) while the guard judged /work/repo (agent/x)
+const CD_DIRS = ['/work/other', '/work/repo', '/work/repo/sub']; // (the directories that exist; /work/repo/file.txt is a file)
+const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/repo/file.txt': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
+const CD_DENY = [
+  'cd /work/other; cd /work/repo/missing; git push',
+  'cd /work/other; pushd /work/repo/missing; git push',
+  'cd /work/other\ncd /work/repo/missing\ngit push',
+  'cd /work/other; cd /work/repo/file.txt; git push', // a file fails the cd as a missing directory does
+  'cd /work/other; mkdir /work/else; cd /work/repo/missing; git push', // (a mkdir of another path proves nothing)
+  'cd /work/other; echo /work/repo/missing; cd /work/repo/missing; git push', // (naming the path is not making it)
+];
+const CD_ALLOW = [
+  'cd /work/other; cd /work/repo/sub; git push', // the target exists
+  'cd /work/other && cd /work/repo/missing && git push', // && proves the move
+  'cd /work/other; cd /work/repo/missing || exit 1; git push',
+  'cd /work/other; cd /work/repo/missing || { echo no; exit 1; }; git push',
+  'cd /work/other; mkdir /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/repo; mkdir -p a/b; cd a/b; git push',
+  'cd /work/repo; mkdir new; cd new; git push',
+  'cd /work/other; git clone https://example.invalid/r.git /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/repo; git clone https://example.invalid/r.git; cd r; git push',
+  'cd /work/repo/sub; cd ..; git push', // an ancestor of where the line stands exists
+];
+for (const c of CD_DENY) {
+  test(`DENY #586 ${c.replace(/\n/g, '\\n')}`, () => {
+    const v = evaluate(c, { ...cdWorld, cwd: '/work/repo' });
+    assert.equal(v.decision, 'deny', `expected deny, got allow for: ${c}`);
+  });
+}
+for (const c of CD_ALLOW) {
+  test(`ALLOW #586 ${c}`, () => {
+    const o = { ...cdWorld, cwd: '/work/repo', byDir: { ...cdWorld.byDir, '/work/repo/a/b': 'agent/x', '/work/repo/new': 'agent/x', '/work/repo/r': 'agent/x' } };
+    const v = evaluate(c, o);
+    assert.equal(v.decision, 'allow', `expected allow, got deny (${v.reason}) for: ${c}`);
+  });
+}
+
 test('what the evaluator asks its collaborators', () => {
   let v = evaluate('git -C /other push', { byDir: { '/other': 'agent/y' } });
   assert.deepEqual(v.calls.branchDirs.map((c) => c.dir), [resolve('/other')]);
@@ -997,9 +1038,9 @@ test('an overridden branch is looked up by name, and only for the directory it c
   assert.deepEqual(v.calls.branchDirs, [], 'the override replaces the real branch lookup');
   v = evaluate('git switch main && git push origin agent/x');
   assert.equal(v.decision, 'allow');
-  v = evaluate('git switch main || exit 1; cd /other; git push', { byDir: { '/other': 'agent/y', '/work/repo': 'agent/x' } });
+  v = evaluate('git switch main || exit 1; cd /other; git push', { ...dirsExist('/other'), byDir: { '/other': 'agent/y', '/work/repo': 'agent/x' } });
   assert.equal(v.decision, 'allow');
-  v = evaluate('git switch main || exit 1; cd /other; git push', { byDir: { '/other': 'main', '/work/repo': 'agent/x' } });
+  v = evaluate('git switch main || exit 1; cd /other; git push', { ...dirsExist('/other'), byDir: { '/other': 'main', '/work/repo': 'agent/x' } });
   assert.equal(v.decision, 'deny');
   v = evaluate('git checkout src/a.ts && git push', { branch: 'main', pathExists: () => true });
   assert.equal(v.decision, 'deny', '#789: a one-operand checkout may restore a file: the branch after it is unknown');
@@ -1810,7 +1851,7 @@ test('a line that passes an unsure variable to something that runs code or picks
 // a pipeline stage, a subshell, a substitution) must not be trusted by the commands after it, and builtins that assign
 // variables without a NAME=value word make the variable unsure.
 test('directory / branch / variable state from a command that may not have run is unknown', () => {
-  const o = { byDir: { '/work/repo': 'main', '/safe': 'agent/x' }, labels: [] };
+  const o = { byDir: { '/work/repo': 'main', '/safe': 'agent/x' }, labels: [], ...dirsExist('/safe') };
   const denyCmds = [
     'false && cd /safe; git push',
     'cd /safe & git push',
@@ -2084,7 +2125,8 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
     labelsByNum: {},
     readText: (p) => abs[resolve(p)] ?? null,
-    pathExists: (p) => resolve(p) in abs,
+    pathExists: (p) => resolve(p) in abs || dirsExist('/other').pathExists(p),
+    readDir: dirsExist('/other').readDir,
   };
   const denyCmds = [
     // a variable known when the line was first checked, unknown after `source`
