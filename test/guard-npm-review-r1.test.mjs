@@ -411,19 +411,19 @@ test('with the real file system (no fake) a dangling package.json link still cou
 // ---- an unknown run directory fails closed: a --prefix / a runner directory only known at run time, or the shell's directory lost (#363, #391) ---------------------------------------
 // Why: `npx --prefix "$X" evil`, `npm exec --prefix "$X" -- evil` and `npm --prefix "$X" run a` were judged only by "does the line mention a guarded word", so a bad bin or script in the package folder the prefix names was ALLOWED. The directory the
 // command runs in and the one the bin / package is looked up from are two things: each pair of places near the line is judged (git guard; the files guard's own rule is a separate change).
-// (a refusal is the unknown-directory class AND names the place; `exec` names where the command runs)
-const refusedIn = (cmd, tree, exec) => {
+// (a refusal is the unknown-directory class AND names the place: `exec` where the command runs, `lookup` (when it differs) where the bin is found)
+const refusedIn = (cmd, tree, exec, lookup = null) => {
   const v = G.git.run(cmd, tree(G.git));
   assert.equal(v.decision, 'deny', `${cmd}: ${v.reason}`);
   assert.match(v.reason, /the directory this runs in is unknown/, `${cmd}: ${v.reason}`);
-  assert.ok(v.reason.includes(`in ${GIT_ROOT}${exec}, `), `${cmd}: names ${exec || '/'}: ${v.reason}`);
+  assert.ok(v.reason.includes(lookup === null ? `in ${GIT_ROOT}${exec}, ` : `in ${GIT_ROOT}${exec}, using the bin in ${GIT_ROOT}${lookup}, `), `${cmd}: names ${exec || '/'} ${lookup ?? ''}: ${v.reason}`);
 };
 const okGit = (cmd, tree) => { const v = G.git.run(cmd, tree(G.git)); assert.equal(v.decision, 'allow', `${cmd}: ${v.reason}`); };
 
 test('#363 a runner prefix only known at run time: the bin in the folder that prefix may name is judged (npx --prefix, npm exec --prefix)', () => {
   const web = (g) => ({ 'web/node_modules/.bin/evil': sh(g.bad) });
-  refusedIn('npx --prefix "$X" evil', web, '/web');
-  refusedIn('npm exec --prefix "$X" -- evil', web, '/web');
+  refusedIn('npx --prefix "$X" evil', web, '', '/web'); // (the shell is in the working directory, the bin is in the folder the prefix may name)
+  refusedIn('npm exec --prefix "$X" -- evil', web, '', '/web');
   refusedIn('cd "$Y" && npx --prefix "$X" evil', web, '/web');
   okGit('npx --prefix "$X" evil', () => ({ 'web/node_modules/.bin/evil': sh('echo hi') }));
 });
