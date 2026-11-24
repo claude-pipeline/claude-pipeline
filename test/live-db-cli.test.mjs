@@ -1,4 +1,4 @@
-// #262 (live-database guard, Task 5 / B1a): agent-run supabase CLI lines and Management API calls that can reach a non-local database. The psql family ships in B1b.
+// #262 (live-database guard, Task 5 / B1a): agent-run supabase CLI lines and Management API calls that can reach a non-local database. The psql family (B1b) is tested in test/live-db-psql.test.mjs.
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
@@ -630,7 +630,7 @@ test('a 190 kB line of star-and-question-mark words is denied fast, not by the h
 // R6-F1: a long word with a \`*\` or \`?\` (a query, a URL) after a bare \`supabase\` name is an operand, not a subcommand head: a pattern that needs more characters than the longest subcommand head cannot be one
 test('a long glob-bearing operand after a supabase name is not read as a subcommand head', () => {
   for (const line of [
-    `docker compose exec supabase psql -c "select * from public.some_long_table_name where created_at > now() - interval '1 day'"`,
+    `docker compose exec supabase sh -c "echo 'select * from public.some_long_table_name where created_at > now() - interval 1 day'"`,
     `ssh supabase 'curl "https://example.com/a/very/long/path/that/goes/on/and/on?x=1&y=2"'`,
     `ssh supabase 'https://example.com/a/very/long/path/that/goes/on/and/on?x=1&y=2'`,
   ]) {

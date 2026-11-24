@@ -926,7 +926,7 @@ test('R14: the [[ / ]] and loop-name text checks judge the line as written: no h
   // still allowed: a [[ after a quote, a wiki link in a heredoc (no blank after the [[)
   for (const cmd of ['echo "[[ a ]] b"', "cat > /tmp/n.md <<'EOF'\nsee [[other-note]] here\nEOF", "cat > /tmp/n.md <<EOF\nsee [[other-note]] here\nEOF"]) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
   // (the LOOP check leaves out a heredoc body, unless an unquoted one runs commands; the ]] check reads every body)
-  for (const cmd of ["psql <<'SQL'\nselect 1;\nSQL", 'psql <<SQL\nselect 1;\nselect 2;\nSQL']) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
+  for (const cmd of ["sqlite3 db <<'SQL'\nselect 1;\nSQL", 'sqlite3 db <<SQL\nselect 1;\nselect 2;\nSQL']) assert.equal(bash(cmd, {}, '/home/u'), 'allow', cmd);
   const loop = 'for 1 in .claude/settings.local.json; do cp /tmp/payload $@; done';
   const loopFailures = [];
   for (const cmd of [

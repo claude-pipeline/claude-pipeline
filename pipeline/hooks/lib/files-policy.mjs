@@ -255,6 +255,16 @@ function defaultReadText(file) {
   }
 }
 
+// the raw bytes of a regular file up to the script cap (the psql guard decodes them strictly): { ok: Buffer } | { absent: true } (ENOENT) | { error: true } (anything else, not a regular file, too big)
+function defaultReadBytes(file) {
+  try {
+    const st = fs.statSync(file);
+    return st.isFile() && st.size <= MAX_SCRIPT_BYTES ? { ok: fs.readFileSync(file) } : { error: true };
+  } catch (err) {
+    return err?.code === 'ENOENT' ? { absent: true } : { error: true };
+  }
+}
+
 function makeCtx(opts) {
   const platform = opts.platform ?? process.platform;
   drivePaths = platform === 'win32';
@@ -433,6 +443,7 @@ function makeCtx(opts) {
     vars: {}, // same-line shell assignments (D=$HOME/.claude), filled in once the line is parsed
     dynamic: false, // set when a scan had to be skipped for size; callers fail closed
     readText: opts.readText ?? defaultReadText,
+    readBytes: opts.readBytes ?? defaultReadBytes,
     readHead: opts.readHead ?? defaultReadHead, // the first bytes of a file readText refused (over the cap)
     ignoreUnmodelled: opts._ignoreUnmodelled === true, // inside a real-home startup file's judgment: see judgeStartupFile
     frames: opts._frames ?? [], // the files each command list being evaluated writes (see line-writes.mjs), outermost first
@@ -991,7 +1002,7 @@ function evaluateMcpGeneric(tool, ti, input, opts) {
   for (const [key, s] of f.values) {
     if (typeof s !== 'string' || !s) continue;
     if (MCP_COMMAND_KEYS.has(key)) {
-      const r = evaluateBashForFiles(s, { ...opts, cwd: input?.cwd });
+      const r = evaluateBashForFiles(s, { ...opts, cwd: input?.cwd, _remote: true }); // (_remote: the line may run on another host; the psql family's local proofs do not apply)
       if (r.decision === 'deny') return deny(`${tool} would run: ${r.reason}`);
       continue; // the Bash rules are the whole verdict for a command (a read of a protected file is fine)
     }
@@ -5318,7 +5329,8 @@ function evaluateBashForFilesFrame(command, opts) {
   {
     // (B10: a quoted command string is parsed again with the same env and deadline; its own bashState, `{ bound: true }`: a prose word that binds BASH must not force the whole-evaluation rerun above)
     const reparse = (text) => simpleCommands(text, { env: opts.env ?? process.env, bashState: { bound: true }, expired: () => opts._budget.now() > opts._budget.deadline });
-    const dbCli = findLiveDbCli(cmds, scanRaw, readDbRefs(opts.home || os.homedir()), wordsOf, reparse); // #262: an agent-run supabase CLI line or Management API call that can reach a non-local database
+    const io = { depth: opts._depth ?? 0, cwd: opts.cwd, env: opts.env ?? process.env, home: opts.home || os.homedir(), readBytes: ctx.readBytes, platform: ctx.platform, remote: opts._remote === true };
+    const dbCli = findLiveDbCli(cmds, scanRaw, readDbRefs(opts.home || os.homedir()), wordsOf, reparse, io); // #262: an agent-run supabase CLI or psql-family line, or a Management API call, that can reach a non-local database
     if (dbCli) return deny(dbCli);
   }
   if (findProtectApply(cmds, raw)) return deny('pipeline protect --apply changes branch protection and the global hooks; only the owner may run it, from a terminal or with PIPELINE_ADMIN=1');

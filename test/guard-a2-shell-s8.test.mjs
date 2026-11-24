@@ -32,11 +32,20 @@ const G = (command, spec = {}) => evaluateGitCommand(command, {
   cwd: GIT_ROOT, home: '/home/u', currentBranch: () => 'agent/x', pushDestination: () => null, issueLabels: () => [], ...fakeFs(GIT_ROOT, spec, ['sub', '/home/u']),
 }).decision;
 const PROJ = '/home/u/proj';
-const F = (command, spec) => {
+const FR = (command, spec) => {
   const fs = fakeFs(PROJ, spec, ['sub', '/home/u', '/home/u/.claude']);
-  return evaluateBashForFiles(command, { home: '/home/u', env: { HOME: '/home/u', ZDOTDIR: '/home/u' }, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists }).decision;
+  return evaluateBashForFiles(command, { home: '/home/u', env: { HOME: '/home/u', ZDOTDIR: '/home/u' }, platform: 'linux', realpath: (p) => p, cwd: PROJ, ...fs, existsSync: fs.pathExists });
 };
-const both = (c, spec, want, why = c) => { assert.equal(G(c, spec), want, `git: ${why}`); assert.equal(F(c, spec), want, `files: ${why}`); };
+const F = (command, spec) => FR(command, spec).decision;
+// (#262 B1b: the files guard refuses a psql line that is not an allowed shape as a live-database line; git keeps its verdict, the SQL scanner both use is proven on the git side)
+const both = (c, spec, want, why = c) => {
+  assert.equal(G(c, spec), want, `git: ${why}`);
+  if (/psql/.test(c)) {
+    const r = FR(c, spec);
+    assert.equal(r.decision, 'deny', `files: ${why}`);
+    if (want === 'allow') assert.match(r.reason ?? '', /live database:/, `files: ${why}`);
+  } else assert.equal(F(c, spec), want, `files: ${why}`);
+};
 
 const SQL = { 'm.sql': 'create table t (a int);\n', 't.sql': 'begin;\nselect 1;\nrollback;\n', 'ok.sh': 'echo ok\n' };
 const DB = 'DB="postgresql://postgres:postgres@127.0.0.1:54322/postgres"; ';
