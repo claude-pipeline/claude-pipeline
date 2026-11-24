@@ -178,6 +178,24 @@ test('#832 (b): a merged PR with no earlier summary comment in a draft_while_ite
   assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
 });
 
+test('#832 (b2): a merged PR whose earlier comment is only a run record (a checkpoint wrote it, no summary yet) still warns it could not check', () => {
+  // failure caught: a checkpoint creates the shared comment before any summary, so the carry branch found nothing and said nothing
+  const fake = gh({ runs: closedRuns, state: 'closed', comments: [{ id: 5, user: { login: 'me' }, body: `${MARKERS.summary}\n\n(no summary yet)` }] });
+  const r = summary(true, fake, 'merged-externally');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(r.json.warnings.join('\n'), /the PR is no longer open \(merged or closed\).*could not be checked/);
+});
+
+test('#832 (d): a line quoted in the earlier --built text is not carried over as the CI finding', () => {
+  // failure caught: the first line starting with the note prefix was taken, so build prose quoting it was published under Outcome
+  const earlier = { id: 5, user: { login: 'me' }, body: `${MARKERS.summary}\n\n### What was built\n\n${EARLIER_LINE}\n\n### Outcome\n\n**awaiting-owner-merge**` };
+  const fake = gh({ runs: closedRuns, state: 'closed', comments: [earlier] });
+  const r = summary(true, fake, 'merged-externally');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.warnings, []);
+  assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
+});
+
 test('#832 (c): a merged PR whose earlier summary had no such line gets no line and no warning (nothing was lost)', () => {
   // failure caught: every merged or closed PR of a draft_while_iterating repository got the "could not be checked" warning on its final summary, pushed or not
   const fake = gh({ runs: closedRuns, state: 'closed', comments: [earlierComment(null)] });

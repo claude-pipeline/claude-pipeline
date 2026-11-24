@@ -27,7 +27,7 @@ const job = (startedAt, minutes, labels = ['ubuntu-latest'], over = {}) => ({
 });
 const commit = (c, over = {}) => ({ sha: sha(c), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' }, ...over });
 
-test('classifierVersion starts at 1', () => assert.equal(classifierVersion, 1));
+test('classifierVersion is 2 (2: a run linked to a PR opened after it is unclassified, not given to that PR)', () => assert.equal(classifierVersion, 2));
 
 test('prPhaseAt: opened as draft, toggled by the timeline; a PR opened ready; a PR with no events follows its flag', () => {
   const draftPr = { createdAt: T('09:00'), draft: false }; // now ready (it was ready at 12:00)
@@ -346,7 +346,7 @@ test('renderUsageTable: prints the PRs, the classes, the cost lines and the unex
   const agg = aggregateUsage({ classified: p.classified, prRows: [p], isPrivate: true, draftWhileIterating: true });
   const { classified, ...row } = p;
   const text = renderUsageTable({ since: '2026-11-06', repos: [{ slug: 'acme/widgets', private: true, classifierVersion, partial: false, draftWhileIterating: true, prs: [row], calls: 5, rateLimit: { remaining: 4000 }, skipped: {}, unexcludable: ['a note'], ...agg }] });
-  assert.match(text, /CI usage since 2026-11-06 in acme\/widgets \(private; classifier v1\)/);
+  assert.match(text, /CI usage since 2026-11-06 in acme\/widgets \(private; classifier v2\)/);
   assert.match(text, /#7 +2 +1 +0 +1 +/);
   assert.match(text, /push-while-ready +1 +1 +10\.0 +linux 6\.0/);
   assert.match(text, /Estimated cost \$0\.04 \(an estimate, not a bill/);

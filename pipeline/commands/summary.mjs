@@ -126,8 +126,9 @@ export const run = guarded(async (argv, ctx) => {
     const ciWarnings = [...ciUsage.warnings];
     let ciNote = ciUsage.note;
     if (ciUsage.closed) {
-      if (existing.status === 'absent') ciWarnings.push(CLOSED_PR_WARNING);
-      else ciNote = earlierPushedNote(existing.sections);
+      const earlier = earlierPushedNote(existing.sections);
+      if (earlier.rendered) ciNote = earlier.note;
+      else ciWarnings.push(CLOSED_PR_WARNING); // no comment yet, or only a run record (a checkpoint wrote it): no earlier summary to carry from
     }
     const sections = summarySections(state, { outcome: detail ? `${outcome} — ${detail}` : outcome, built: values.built, followups: followupsOf(state), modelProofs: readModelProofs(root, state), testsAdded: testsAddedLine, ciNote });
     // The weekly Codex spend rides at the end of the line (agent-log close's pending-line match tolerates it).

@@ -8,11 +8,15 @@ import { asciiLine } from './triage.mjs';
 
 // The start of the summary comment's line about pushes to a ready PR: the note is built with it and an earlier line is found by it, so the two cannot drift.
 export const PUSHED_READY_NOTE = 'Pushed to the ready PR without `pipeline redraft` first';
-// The warning when a PR is no longer open and no earlier summary comment holds the line to carry over.
+// The warning when a PR is no longer open and no earlier summary was rendered to carry the line over from.
 export const CLOSED_PR_WARNING = 'pushed-while-ready check: the PR is no longer open (merged or closed), so GitHub no longer links its workflow runs to it: its pushes could not be checked';
-// -> the line of an earlier summary comment's sections that this module wrote, or undefined (a PR that is no longer open cannot be judged again: the caller carries the line over).
+// -> { rendered, note }: whether an earlier summary comment's sections hold a rendered summary (an Outcome section; a comment a checkpoint wrote holds only the run record), and the line of it that this module wrote (undefined if none).
+// The line is always the last of the Outcome section, so only the text under the LAST `### Outcome` heading is searched (the build text above it is free prose and may quote the line).
 export function earlierPushedNote(sections) {
-  return String(sections ?? '').split('\n').find((l) => l.startsWith(PUSHED_READY_NOTE));
+  const lines = String(sections ?? '').split('\n');
+  const at = lines.lastIndexOf('### Outcome');
+  if (at < 0) return { rendered: false, note: undefined };
+  return { rendered: true, note: lines.slice(at + 1).find((l) => l.startsWith(PUSHED_READY_NOTE)) };
 }
 
 // -> { warnings: [], field?: { count, heads: [sha12, ...] }, note?: string, closed?: true }. Nothing is read from GitHub unless the config says true.

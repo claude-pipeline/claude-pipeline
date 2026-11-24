@@ -10,7 +10,7 @@
 //   jobs      actions/runs/{id}/jobs?filter=all (every attempt): { run_attempt, conclusion, started_at, completed_at, labels }
 import { asciiLine } from './triage.mjs';
 
-export const classifierVersion = 1;
+export const classifierVersion = 2;
 
 // A run created this long after `ready_for_review` is the run that event started; a run cancelled this long after `converted_to_draft` was cancelled by it.
 export const WINDOW_MS = 120_000;

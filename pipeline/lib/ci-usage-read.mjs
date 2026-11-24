@@ -175,6 +175,8 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
     const prRuns = group.runs.filter(own);
     const all = group.all.filter(own);
     for (const r of group.runs) if (!own(r)) { prOfRun.delete(r.id); predating += 1; }
+    // the PR was read for a heavy run that turned out not to be its own: with none left it is no PR of this report (no row), and its remaining runs go to the last pass like those of any PR without a heavy run
+    if (!prRuns.some(isCandidate)) { readPr.delete(n); continue; }
     // like the summary: only an unlinked run created since this PR was created can have been the first run of one of its heads
     const ambiguousHeads = incomplete ? all.map((r) => r.head_sha) : unlinkedPrRuns.filter((r) => !(Date.parse(r.created_at) < Date.parse(data.pr.createdAt))).map((r) => r.head_sha);
     const row = analysePrUsage({ number: n, ...data, runs: prRuns, evidenceRuns: all, jobsByRun, rates, viewer, sinceMs, evidenceFromMs, isPrivate, ambiguousHeads });
