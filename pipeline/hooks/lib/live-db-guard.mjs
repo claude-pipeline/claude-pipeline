@@ -987,12 +987,16 @@ const pgDataOnly = (c, plain) => {
   if (w === 'command' && /^-[pP]*[vV]$/.test(c.argv[1] ?? '')) return true; // a lookup (`command -v psql`), the same shape files-policy reads
   return PG_DATA.has(w) || (w === 'git' && PG_DATA_GIT.has(c.argv[1]));
 };
+// sed runs a program with its `e` command (`1e psql -h x`, `e psql`) and the `e` flag of `s`: sed is read as plain data only while no word can hold either (over-reads: a stray ` e ` in a pattern)
+const sedRuns = (argv) => argv.slice(1).some((a) => /(?:^|[\s;{}!,$=\d/])e(?:[\s;}]|$)|\/[gpiImM\d]*e[gpiImMw\d]*(?:[\s;}]|$)/.test(a));
 const F4_VERBS = new Set(['exec', 'cp', 'run', 'create', 'rename', 'commit']);
 
 // -> reason | null
 function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse = null) {
   // a name split by empty quotes (`p''sql`) is not in the raw text but is in the words, so both the raw text and every reading's words are judged
-  const feeds = reading.some((c) => stdinFed(c) && buildsProgram(c, () => true));
+  // (at / batch / crontab run the text they are given later, like a shell: the stdin they read is judged as an xargs feed; `at -l`, `crontab -l` only read)
+  const deferred = (c) => { const n = commandName(c.argv[0]); return (n === 'at' || n === 'batch') ? !c.argv.slice(1).some((a) => /^-[lrdc]$/.test(a)) : n === 'crontab' && !c.argv.slice(1).some((a) => /^-[A-Za-z]*[lre]/.test(a)); };
+  const feeds = reading.some((c) => deferred(c) || (stdinFed(c) && buildsProgram(c, () => true)));
   const redirText = (c) => (c.redirects ?? []).map((r) => (typeof r.target === 'string' ? r.target : ''));
   const seen = [lineText, ...reading.flatMap((c) => [c.argv.join('\n'), typedWords(c).join('\n'), wordsOf(c).join('\n'), ...(feeds ? [...c.argv, ...redirText(c)].map(fedText) : [])])].join('\n');
   if (feeds) {
@@ -1002,7 +1006,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
     // a printf format with anything but a plain %s / %b / %d / %q can build a name from its pieces (`printf '%s%s' ps ql`)
     const fmt = (c) => commandName(c.argv[0]) === 'printf' && fedText(c.argv.slice(1).find((a) => !a.startsWith('-')) ?? '').replace(/%%/g, '').split(/\s+/).some((p) => p.includes('%') && !/^%[sbdq]$/.test(p));
     // a piped command that rewrites text (tr, sed, head …), or an xargs / parallel that itself builds text (`xargs printf | xargs env`)
-    const filter = (c) => c.pipe === true && (stdinFed(c) ? isLit(c) : !isLit(c) && !PASS_FILTERS.has(commandName(c.argv[0])));
+    const filter = (c) => c.pipe === true && !deferred(c) && (stdinFed(c) ? isLit(c) : !isLit(c) && !PASS_FILTERS.has(commandName(c.argv[0])));
     // a replacement token glued to a name character or another token (`p{}`, `{1}{2}`)
     const glue = (c) => stdinFed(c) && typedWords(c).some((w) => /[\w}]\{\d*\}|\{\d*\}[\w{]/.test(w));
     // the producer words build a name from variables (`echo $x$y`)
@@ -1013,6 +1017,10 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
   if (reading.some((c) => [c.argv[0], typedWords(c)[0] ?? ''].some((w) => !pgWord(w) && pgWord(fedText(w))))) return 'a psql family name spelled with escapes or quotes in produced text';
   // a command name (or the text eval / a shell runs) built from echo / printf inside a substitution
   if (reading.some((c) => SUBST_LIT.test(c.argv[0]) || SUBST_LIT.test(typedWords(c)[0] ?? '') || (TEXT_RUNNERS.has(commandName(c.argv[0])) && c.argv.some((w) => SUBST_LIT.test(w))))) return 'a command built from echo / printf text inside a substitution';
+  // a command name built or hidden by an expansion (`${:-psql}`, `${(L)x}`, `${(j::)a}`, `$1$2`: zsh-only forms and glued expansions the guard cannot resolve), whatever else the line holds
+  if (reading.some((c) => [c.argv[0], typedWords(c)[0] ?? ''].some((w) => expansionTrick(String(w), true)))) return 'the command name is built from expansions the guard cannot read (a braced expansion that is not a plain name, or expansions glued together)';
+  // a variable that holds a name built from a substitution or glued expansions, then run as the command (`x=$(echo ps)ql; $x -h prod`)
+  if (reading.some((c) => nonLiteralHead(c.argv) || nonLiteralHead(typedWords(c))) && cmds.some((c) => Object.values(c.env ?? {}).some((v) => SUBST_LIT.test(String(v)) || expansionTrick(String(v), false)))) return 'a variable built from a substitution or glued expansions is run as the command';
   // a quoted command string of a launcher the parser does not unwrap (kubectl exec … sh -c, gh codespace ssh), read with the guard's own parser
   const innerPg = (w) => { const bare = String(w).replace(/['"\\]/g, ''); if (!(PG_TOKEN.test(bare) || /pg/i.test(bare))) return false; const inner = reparse(String(w)); return !inner || inner.truncated || inner.undecidable ? laterPgWord(bare) : inner.some((ic) => ic.argv?.length && [ic.argv[0], typedWords(ic)[0] ?? ''].some((x) => pgWord(x) || globPg(x, 0))); };
   if (reparse && reading.some((c) => !pgDataOnly(c, true) && (runsProgram(c) || !dataOperands(c.argv)) && commandName(c.argv[0]) !== 'psql' && !isPipelineBin(c.argv) && c.argv.some((w, i) => i > 0 && /[\s'"\;&|]/.test(w) && !isInlineProgram(c.argv, i) && innerPg(w)))) return 'a quoted command string names a psql family program';
@@ -1033,7 +1041,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
   const x = { cmds, scanRaw, io, depth: io.depth ?? 0 };
   if (token) {
     if (cmds.dqTrans === true) return 'the line holds a `$"…"` string the parser reads untranslated, next to a psql family word';
-    if (feeds) return '`xargs` / `parallel` builds a command from stdin and the line names a psql family program';
+    if (feeds) return '`xargs` / `parallel` / `at` / `batch` / `crontab` builds a command from stdin and the line names a psql family program';
   }
   const infos = reading.map((c) => {
     const typed = typedWords(c);
@@ -1069,7 +1077,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
       continue;
     }
     if (sdb && [...argv, ...typed].some((w) => commandName(w) === 'docker') && [...argv, ...typed].some((w) => F4_VERBS.has(w)) && [...argv, ...typed].some((w) => SDB_TEXT.test(w))) return `a docker line that runs, copies into or changes a \`supabase_db_*\` container (${DOCKER_HINT})`;
-    if (!token || name === 'sed' || isPipelineBin(argv)) continue;
+    if (!token || (name === 'sed' && !sedRuns(argv)) || isPipelineBin(argv)) continue;
     const words = [...own, ...(aligned ? typed.slice(0, cut) : typed)];
     const runs = runsProgram(c);
     const dataOps = !runs && dataOperands(argv);

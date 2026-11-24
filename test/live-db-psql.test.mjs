@@ -451,3 +451,19 @@ test('sweep bypass classes 1-3 and 6-8: decoded, assembled, globbed, valued and 
     'node x.js --schema=pg_catalog', 'supabase gen types --local --schema=pg_catalog', 'SCHEMA=pg_catalog node x.js', 'node x.js --schema=pg_toast', 'SCHEMA=pg_temp_3 node x.js', 'X=pg_stat_activity node x.js', 'node x.js --table=pg_class',
   ]) mustAllow(line);
 });
+
+// Catches (Fable sweep of PR #807, 2026-11-24): a psql family program run through a zsh-only or glued expansion in word 0 (`${:-psql}`, `$1$2`), a name built in a variable from a substitution, text given to a deferred runner
+// (`crontab -`, `at`, `batch`), or sed's `e` command, so a client ran against a remote database with the line allowed.
+test('sweep bypass classes 4-5 and 9-10: expansion-built command names, deferred runners and sed `e` are refused; plain reads of them pass', () => {
+  dockerConfig(null);
+  for (const line of [
+    'x=$(echo ps)ql; $x -h prod', 'y=$a$b; $y x', // 4: a variable built from a substitution or glued expansions, then run
+    '${:-psql} -h prod', 'x=PGLOADER; ${(L)x} a.load', 'a=(ps ql); ${(j::)a} -h prod', 'f() { $1$2 -h prod; }; f ps ql', // 5
+    "echo '* * * * * psql -h prod' | crontab -", "at now <<< 'psql -h prod'", "batch <<< 'pg_dump -h x'", // 9
+    "sed -n '1e psql -h prod' f", "sed --expression='e psql -h x' f", // 10
+  ]) mustRefuse(line);
+  for (const line of [
+    'crontab -l | grep psql', 'at -l', "sed -n '/psql/p' f", "sed 's/psql/pg/' f",
+    '${HOME}/bin/tool x', '$HOME/bin/tool x', '"$npm_execpath" run x',
+  ]) mustAllow(line);
+});
