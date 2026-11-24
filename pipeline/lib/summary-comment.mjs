@@ -40,8 +40,9 @@ export function readSummaryComment(gh, pr) {
 // silently: omit `record` and the write is refused.
 // `retry`: wait out a rate limit (the run recorder leaves it off; the comment, summary and checkpoint commands opt in).
 export function writeSummaryComment(gh, pr, { record, sections, existing, retry = false } = {}) {
-  const once = (current, retryWrite) => {
-    if (record === undefined && current.status === 'unsupported') {
+  const once = (current, retryWrite, attempt = 1) => {
+    // a read made after a wait (attempt > 1) is refused whatever `record` is: a newer CLI may have written during it
+    if (current.status === 'unsupported' && (record === undefined || attempt > 1)) {
       throw new Error('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI before rewriting it');
     }
     const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
@@ -62,5 +63,6 @@ export function writeSummaryComment(gh, pr, { record, sections, existing, retry 
   if (!(retry && typeof sections === 'function')) return once(existing ?? readSummaryComment(gh, pr), retry);
   // Sections that are a function of the comment (the closed-PR summary) must be rendered from what is on the PR when they are SENT: a wait out of a rate limit
   // can let another summary post a line, which the body rendered before the wait would erase. So the retry is of the whole step (re-read, re-render, write), not of the PATCH alone.
-  return retrying((attempt) => once(attempt === 1 && existing ? existing : readSummaryComment(gh, pr), false));
+  const step = typeof gh.retrying === 'function' ? gh.retrying : retrying; // the gh's own retrier carries the env cap, the rate-limit probe and the shared budget
+  return step((attempt) => once(attempt === 1 && existing ? existing : readSummaryComment(gh, pr), false, attempt));
 }

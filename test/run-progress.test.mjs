@@ -370,3 +370,41 @@ test('writeRunRecord: a rate-limited write with function sections is retried fro
   assert.match(reads.at(-1), /Pushed to the ready PR/, 'the sections are rendered from the last read');
   assert.match(mineBody(gh), /\*\*merged\*\*\n\nPushed to the ready PR without `pipeline redraft` first once/);
 });
+
+test('writeRunRecord: a newer-CLI record that lands during a rate-limit wait is refused on the retry, not overwritten', () => {
+  // failure caught: the retry's fresh read saw an unsupported (newer) record, but the guard only fired when no record was passed, so the older record was PATCHed over it
+  const gh = memoryGh();
+  seed(gh, plain());
+  const real = gh.upsertComment;
+  const patched = [];
+  let attempts = 0;
+  const limited = (pr, marker, body, opts) => {
+    attempts += 1;
+    if (attempts === 1) {
+      gh.comments.find((c) => c.body.startsWith(MARKERS.summary)).body = NEWER_BODY(); // a newer CLI writes during the wait
+      throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' });
+    }
+    patched.push(body);
+    return real(pr, marker, body, opts);
+  };
+  gh.upsertComment = limited;
+  assert.throws(() => writeRunRecord(gh, PR, { record: plain(), retry: true, sections: () => '### Outcome' }), /newer pipeline version/);
+  assert.equal(attempts, 1, 'no second write');
+  assert.deepEqual(patched, []);
+  assert.equal(mineBody(gh), NEWER_BODY());
+});
+
+test('writeRunRecord: function sections go through the gh\'s own retrier when it has one (a retrier that runs once means one read, one write, and the error propagates)', () => {
+  // failure caught: the retry used the module-level retrier, ignoring the gh's (PIPELINE_GH_RETRY_MS=0, the rate-limit probe, the shared cap)
+  const gh = memoryGh();
+  seed(gh, plain());
+  let reads = 0;
+  const listed = gh.listComments;
+  gh.listComments = () => { reads += 1; return listed(); };
+  let writes = 0;
+  gh.upsertComment = () => { writes += 1; throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' }); };
+  gh.retrying = (fn) => fn(1);
+  assert.throws(() => writeRunRecord(gh, PR, { record: plain(), retry: true, sections: () => '### Outcome' }), /HTTP 429/);
+  assert.equal(writes, 1);
+  assert.equal(reads, 1, 'one read');
+});
