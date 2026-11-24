@@ -342,6 +342,13 @@ function branchOf(dir, gitDir, ctx) {
   return b === '' || b === 'HEAD' ? null : b;
 }
 
+// #789: does git confirm a LOCAL branch NAME in this directory? true / false, null when unknown (no lookup, it threw, or it was cut off)
+function localBranchExistsIn(dir, name, ctx) {
+  if (dir === null) return null;
+  checkDeadline(ctx.budget);
+  try { const e = memoLookup(ctx, ['localBranch', dir, name], () => ctx.localBranchExists(dir, name, { leftMs: leftOf(ctx) })); return e === true ? true : e === false ? false : null; } catch { return null; }
+}
+
 // A command earlier on the line may have switched this directory's branch: that, not the real checkout, is what a
 // later bare/HEAD push acts on. `name === null` records "switched to something we cannot name".
 // #505: `ctx.branchesUnknown` is the mark "every branch is unknown": a directory with no entry in ctx.branches is read from disk only while the mark is off. It is set wherever the names are forgotten
@@ -643,8 +650,13 @@ function trackSwitch(sub, args, d, ctx) {
   const x = expandVars(positionals[0], ctx);
   if (x === '-' || /^@\{-\d*\}$/.test(x) || DYNAMIC.test(x)) { setBranch(ctx, d, null); return; }
   if (x === 'HEAD' || x === '@') return;
-  // (#789: a one-operand checkout restores a file when NAME is one (a tracked file deleted from the worktree: HEAD stays put) and switches when it is a branch, also one that shares its name with a file: unknowable from the text)
-  if (!isSwitch) { setBranch(ctx, d, null); return; }
+  if (!isSwitch) {
+    // (R2-B1: `.`, `..`, `./x`, `../x` cannot be a ref name: a path checkout, the branch stays)
+    if (/^\.{1,2}(\/|$)/.test(x)) return;
+    // (#789 / R2-F1: a one-operand checkout restores a file when NAME is one (a tracked file deleted from the worktree: HEAD stays put) and switches when a local branch NAME exists, also when a file shares the name: only git's answer decides, anything else is unknown)
+    setBranch(ctx, d, d !== null && localBranchExistsIn(d, x, ctx) === true ? x : null);
+    return;
+  }
   setBranch(ctx, d, x);
 }
 
@@ -3623,7 +3635,6 @@ function evalString(str, startDir, ctx, level, child = false) {
     const childCd = c.spawn === true && argv.length > 0 && DIR_CHANGERS.includes(baseName(argv[0]));
     const before = argv.length ? stateMark(ctx) : null;
     const switchesBefore = ctx.switches ?? 0;
-    const writesBefore = (ctx.budget.branchLog ??= []).length;
     const changesStateWords = argv.length > 0 && !childCd && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
@@ -3757,7 +3768,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? (ctx.budget.branchLog.length >= writesBefore ? ctx.budget.branchLog.slice(writesBefore) : true) : null, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
@@ -3883,6 +3894,7 @@ function evaluateGitOnce(command, {
   cwd,
   home = os.homedir(),
   currentBranch = () => null,
+  localBranchExists = () => null,
   pushDestination = () => null,
   issueLabels = () => { throw new Error('no issue label lookup is available'); },
   readText = defaultReadText,
@@ -3902,7 +3914,7 @@ function evaluateGitOnce(command, {
   if (text.length > MAX_LINE_CHARS) return judgeLongText(text);
   const base = cwd || process.cwd();
   const ctx = {
-    cwd: base, home, nodePrefix, currentBranch, pushDestination, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
+    cwd: base, home, nodePrefix, currentBranch, pushDestination, localBranchExists, issueLabels, ownerGo, readText, pathExists, lexists, readDir, readHead, realpath, env, budget: bashState?.carry ? { ...bashState.carry, startupOk: new Set(), startupFx: undefined } : newEvalBudget(now, cpu, wall0), fullText: text, lineText: text,
     vars: Object.create(null), unsureVars: new Set(), tainted: new Set(), aliasUnsure: new Set(), gitAliases: Object.create(null), ghAliases: Object.create(null),
     branches: new Map(), branchesUnknown: false, cfgDirty: false, envCfgDirty: false, writeFrames: [], bashState,
   };
