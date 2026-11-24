@@ -1010,7 +1010,7 @@ const pgDataOnly = (c, plain) => {
 };
 // sed runs a program with its `e` command (`1e psql -h x`, `e psql`, `\%x%e psql`) and the `e` flag of `s` (`s|a|psql -h x|e`): every word that can be the script is read (see sedScripts), never the option words (`-e` itself); over-reads: a stray ` e ` in a pattern, a file named `e`
 const SED_E_CMD = /(?:^|[^A-Za-z_])e(?:[\s;}]|$)/;
-const SED_S_FLAG_E = /(?:^|[^\w])s([^\s\\\w])(?:\\[\s\S]|(?!\1)[^\\])*\1(?:\\[\s\S]|(?!\1)[^\\])*\1[gpiImM\d]*e/;
+const SED_S_FLAG_E = /(?:^|[^A-Za-z_])s([^\s\\\w])(?:\\[\s\S]|(?!\1)[^\\])*\1(?:\\[\s\S]|(?!\1)[^\\])*\1[gpiImM\d]*e/;
 const sedScripts = (argv) => {
   // fail closed: every word that is not an option (the operands, an option's separate value: `-l 5`, `--ex 'e x'`, whatever the abbreviation getopt accepts), the value of any `--opt=value` and the attached value of a short `-e…` (`-ee psql`, `-ne` takes the next word)
   const scripts = [];
@@ -1066,13 +1066,16 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
     const shellFan = reading.some((c) => stdinFed(c) && TEXT_RUNNERS.has(commandName(c.argv[0])));
     const filter = (c) => c.pipe === true && !deferred(c) && (stdinFed(c) ? isLit(c) : !isLit(c) && !PASS_FILTERS.has(commandName(c.argv[0])) && (!shellFan || REWRITERS.has(commandName(c.argv[0]))));
     // a replacement token glued to a name character or another token (`p{}`, `{1}{2}`, `p@` under `-I@`; the `-I{}` option that defines the token is not one: the launched command's words are read)
+    // the launcher's own words (xargs / parallel, its options and the wrapper the parser unwrapped), not the launched program's: `xargs cc -Iinclude` defines no token; words that do not line up with the parsed ones are all read
+    const ownWords = (c) => (typedWords(c).length >= c.argv.length ? typedWords(c).slice(0, typedWords(c).length - c.argv.length) : typedWords(c));
     const gluedTo = (w, t) => { for (let i = w.indexOf(t); i >= 0; i = w.indexOf(t, i + 1)) { if ([w[i - 1], w[i + t.length]].some((ch) => ch !== undefined && (/\w/.test(ch) || t.includes(ch)))) return true; } return false; };
-    const glue = (c) => stdinFed(c) && (typedWords(c).some((w) => /[\w}]\{\d*\}|\{\d*\}[\w{]/.test(w.replace(/^-[IJi]\{/, '{'))) || [...replaceTokens(typedWords(c))].some((t) => t !== '{}' && c.argv.some((w) => w !== t && gluedTo(w, t))));
+    const glue = (c) => stdinFed(c) && (typedWords(c).some((w) => /[\w}]\{\d*\}|\{\d*\}[\w{]/.test(w.replace(/^-[IJi]\{/, '{'))) || [...replaceTokens(ownWords(c))].some((t) => t !== '{}' && c.argv.some((w) => w !== t && gluedTo(w, t))));
     // the producer words build a name from variables (`echo $x$y`)
     const built = (c) => (isLit(c) && !stdinFed(c) && c.argv.slice(1).some((w) => expansionTrick(w, false))) || redirText(c).some((w) => expansionTrick(w, false));
     // pieces of one name from several echo / printf (`{ printf ps; echo ql; } | xargs env`), an echo that leaves out its newline (`-n`, `\c`), or a printf that reuses its format for more arguments than it has conversions without ending in a separator (`printf %s ps ql`)
-    const joins = (w) => {
-      const prods = w.filter((c) => isLit(c) && !stdinFed(c));
+    // (`reach`: on a whole-line reading only an echo / printf whose output can get to the launcher counts: it writes a file, is a pipeline stage or sits in a substitution / subshell; terminal status messages do not)
+    const joins = (w, reach) => {
+      const prods = w.filter((c) => isLit(c) && !stdinFed(c) && (!reach || c.pipe === true || inSub(c) || (c.redirects ?? []).some((r) => String(r.op).includes('>'))));
       return prods.length > 1 || prods.some((c) => {
         const rest = c.argv.slice(1);
         if (commandName(c.argv[0]) === 'echo') return rest.some((a) => /^-[A-Za-z]*n/.test(a) || /\\c/.test(a));
@@ -1084,14 +1087,14 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
     };
     // a launcher that reads a file or a variable the line built earlier (`< f`, `<<< "$v"`, `-a f`, a launcher that is no pipeline stage) is judged against the whole line; a pipeline's producer with an expansion may hold a variable
     // a substitution built earlier (`v=$(printf %s%s ps ql); echo $v | xargs env`): every substitution of the line counts too
-    const ownWords = (c) => typedWords(c).slice(0, Math.max(0, typedWords(c).length - c.argv.length));
     const wholeLine = (c) => (c.redirects ?? []).some((r) => String(r.op).startsWith('<')) || ownWords(c).some((w) => /^-[^-]*a|^--arg-file|^::::$/.test(w)) || !(c.pipe === true || inSub(c));
     const refused = reading.some((c, k) => {
       if (!(deferred(c) || (stdinFed(c) && buildsProgram(c, () => true)))) return false;
-      let w = wholeLine(c) ? reading : windowOf(k);
+      const whole = wholeLine(c);
+      let w = whole ? reading : windowOf(k);
       if (w.some((p) => isLit(p) && [...p.argv, ...redirText(p)].some((a) => /[$`]/.test(a)))) w = reading.filter((p) => w.includes(p) || inSub(p));
       const literal = w.some((p) => isLit(p) || (p.redirects ?? []).some((r) => String(r.op).startsWith('<<')) || (stdinFed(p) && typedWords(p).includes(':::')));
-      return literal && (w.some((p) => fmt(p) || filter(p) || built(p)) || glue(c) || joins(w));
+      return literal && (w.some((p) => fmt(p) || filter(p) || built(p)) || glue(c) || joins(w, whole));
     });
     if (refused) return 'xargs / parallel builds a command from text the line produces through a printf format, a filter, a glued replacement, glued variables or several echo / printf pieces the guard cannot read';
   }

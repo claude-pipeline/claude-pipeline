@@ -446,7 +446,8 @@ test('sweep bypass classes 1-3 and 6-8: decoded, assembled, globbed, valued and 
   for (const line of [
     'git ls-files | xargs npx prettier --check', "printf '%s\\n' a.mjs b.mjs | xargs -n1 node --check", "printf '%s\\0' a.mjs b.mjs | xargs -0 -n1 node --check", "printf '%s\\n' b.mjs a.mjs | sort | xargs -n1 node --check",
     'echo "$FILES" | xargs npx eslint', 'git ls-files | xargs npx prettier --check; echo "exit $?"', 'rg -l foo src | xargs npx eslint && echo ok', "git diff --name-only | xargs node --check; printf 'done\\n'",
-    'echo "checking v$VERSION"; git ls-files | xargs npx eslint', "git ls-files | sed 's/a/b/' | xargs node x.mjs", 'parallel gzip {}.log ::: a b', 'cat cmds.txt | parallel',
+    'echo "checking v$VERSION"; git ls-files | xargs npx eslint', "printf '%s\\n' a.c b.c | xargs cc -Iinclude -fsyntax-only", 'echo checking; xargs -a files.txt -n1 node --check; echo done', 'echo checking; echo -n x; xargs -n1 node --check < f', 'echo a; echo b; xargs -n1 node --check <<< "$FILES"', 'echo a; echo b; parallel echo ::: a b', 'echo "n $X"; xargs -a f x; echo done',
+    "git ls-files | sed 's/a/b/' | xargs node x.mjs", 'parallel gzip {}.log ::: a b', 'cat cmds.txt | parallel',
     "bash -c 'for f in *.md; do n=$(echo \"$f\" | cut -d. -f1); mv \"$f\" \"$n.txt\"; done'", "sh -c 'echo \"count: $(printf %s \"$x\" | wc -c)\"'", '$(which node) x.js', 'eval "$(brew shellenv)"', "git commit -m \"$(printf 'a\\nb')\"",
     'ls /usr/bin/psq?', 'node scripts/*.mjs', 'npx eslint src/*', './scripts/*.sh', 'git add src/pg*',
     'git log --grep=pg_repack', 'node x.js --file=supabase/migrations/pg_cron.sql', 'supabase db query "select * from pg_stat_activity" --local',
@@ -465,7 +466,7 @@ test('sweep bypass classes 4-5 and 9-10: expansion-built command names, deferred
     '${:-psql} -h prod', 'x=PGLOADER; ${(L)x} a.load', 'a=(ps ql); ${(j::)a} -h prod', 'f() { $1$2 -h prod; }; f ps ql', // 5
     "echo '* * * * * psql -h prod' | crontab -", "at now <<< 'psql -h prod'", "batch <<< 'pg_dump -h x'", // 9
     "sed -n '1e psql -h prod' f", "sed --expression='e psql -h x' f", // 10
-    "sed 's|marker|psql -h prod|e' f", "sed -e'e psql -h prod' f", "sed '\\%x%e psql -h prod' f", "sed e <<< 'psql -h prod'", "echo 'psql -h prod' | sed e",
+    "sed 's|marker|psql -h prod|e' f", "sed -e'e psql -h prod' f", "sed '\\%x%e psql -h prod' f", "sed e <<< 'psql -h prod'", "echo 'psql -h prod' | sed e", "sed -n '1s/.*/&/ep' f; echo psql", "echo 'psql --version' | sed -n '1s/.*/&/ep'", "sed '1s/x/psql -h prod/ge' f",
     "sed -l 5 'e psql -h prod' f", "sed -n -l 5 '1e psql -h prod' f", "sed --expr='e psql -h prod' f", "sed --ex 'e psql -h prod' f", "sed --line-length 5 'e psql -h prod' f",
   ]) mustRefuse(line);
   for (const line of [
