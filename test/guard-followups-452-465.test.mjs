@@ -166,12 +166,12 @@ describe('#478 R1-B1: a command inside the failure group is not judged in the di
   DENY('a push in the group after a cd whose input file is missing', 'cd /other < /missing || { git push; exit 1; }; true');
   DENY('a push in the group after an ordinary cd', 'cd /other || { git push; exit 1; }; true');
   DENY('a push in the group, then the push after it', 'cd /other || { git push; exit 1; }; git push');
-  DENY('a push in the group after a git checkout that may fail', 'git checkout agent/y || { git push; exit 1; }; true');
+  DENY('a push in the group after a git switch that may fail', 'git switch agent/y || { git push; exit 1; }; true');
   DENY('a git switch with a push in the group', 'git switch agent/y || { git push; exit 1; }; git status');
   DENY('a push after echo, inside the group', 'cd /other || { echo no >&2; git push; exit 1; }; true');
   // the state after the group is still the moved one
   ALLOW('the push after the group is judged in /other', 'cd /other || { echo no; exit 1; }; git push');
-  ALLOW('a git checkout group, then a push on the new branch', 'git checkout agent/y || { echo no; exit 1; }; git push');
+  ALLOW('a git switch group, then a push on the new branch', 'git switch agent/y || { echo no; exit 1; }; git push');
   ALLOW('a command substitution in the group keeps the later push in /other', 'cd /other || { echo $(date); exit 1; }; git push');
 });
 
@@ -216,12 +216,12 @@ describe('#478 R2-F1 / R2-B1: the state after a failure group is forgotten when 
   });
   const DENY = (name, line) => test(`deny: ${name}`, () => assert.equal(gitRun2(line).decision, 'deny', line));
   const ALLOW = (name, line) => test(`allow: ${name}`, () => assert.equal(gitRun2(line).decision, 'allow', line));
-  DENY('a checkout after a || that may skip it (R2-F1 1)', 'true || git checkout agent/y || { echo no; exit 1; }; git push');
+  DENY('a checkout after a || that may skip it (R2-F1 1)', 'true || git switch agent/y || { echo no; exit 1; }; git push');
   DENY('a second cd after a || (R2-F1 2)', 'cd /other || cd /work/repo || { echo no; exit 1; }; git push');
   DENY('a cd in an if (R2-F1 3)', 'if [ -d /other ]; then cd /other || exit 1; echo in; fi; git push');
   DENY('a branch entry first made in the group (R2-B1)', 'cd /other || { echo no; git -C /protected checkout agent/y; exit 1; }; git -C /protected push');
   ALLOW('the plain group form is still narrowed', 'cd /other || { echo no; exit 1; }; git push');
-  ALLOW('the checkout group is still narrowed', 'git checkout agent/y || { echo no; exit 1; }; git push');
+  ALLOW('the checkout group is still narrowed', 'git switch agent/y || { echo no; exit 1; }; git push');
 });
 
 // R2-B2 / R2-B3 / R2-F2: the --delete dry-run exemption fails closed: a name with a value that no recognised site gave, or a value that holds a name that is not itself sure, is no sure dry-run flag.

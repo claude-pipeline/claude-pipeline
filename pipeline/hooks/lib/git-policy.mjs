@@ -418,13 +418,13 @@ function checkRefspec(spec, dir, gitDir, ctx) {
     // and not protected. Any other run-time text (${B:-main}, $(cat f), m${x}ain, a loop variable) can be main.
     const { branch: b } = effectiveBranch(dir, gitDir, ctx);
     if (!CURRENT_BRANCH_IDIOM.test(dst.replace(/\s+/g, ' ')) || b === null || isProtectedBranch(b)) {
-      return deny(`the destination "${dst}" cannot be resolved here, so it cannot be verified. Write the branch name out: git push -u origin agent/<slug>.`);
+      return deny(`the destination "${dst}" cannot be resolved here, so it cannot be verified. Write the branch name out: git push -u origin agent/<slug>.${b === null ? checkoutHint(ctx) : ''}`);
     }
     return null;
   }
   if (dst === 'HEAD' || dst === '@') {
     const { branch: b } = effectiveBranch(dir, gitDir, ctx);
-    if (b === null) return deny('cannot determine the current branch for `git push … HEAD`, so it cannot be verified. Name the destination branch explicitly.');
+    if (b === null) return deny('cannot determine the current branch for `git push … HEAD`, so it cannot be verified. Name the destination branch explicitly.' + checkoutHint(ctx));
     dst = b;
   }
   if (isProtectedBranch(dst)) return deny(`pushing to ${dst} is blocked. Push an agent/<slug> branch and open a PR; the owner merges.`);
@@ -575,7 +575,7 @@ function pushReading(args, dir, gitDir, ctx, configs) {
     // push.default=upstream (or a branch created from origin/main) can send agent/x to main: ask git where it goes
     const dest = overridden ? (b === null ? null : pushDestOf(dir, gitDir, ctx, b)) : pushDestOf(dir, gitDir, ctx);
     if (dest !== null && isProtectedRef(dest)) return deny(`a bare \`git push\` here would update ${dest} (the branch's push destination). Push explicitly: git push -u origin HEAD:agent/<slug>.`);
-    if (b === null) return deny('cannot determine the current branch (detached HEAD, switched to an unknown ref earlier on the line, or not a repository), so a push with no refspec cannot be verified. Name the branch: `git push -u origin agent/<slug>`.');
+    if (b === null) return deny('cannot determine the current branch (detached HEAD, switched to an unknown ref earlier on the line, or not a repository), so a push with no refspec cannot be verified. Name the branch: `git push -u origin agent/<slug>`.' + checkoutHint(ctx));
     if (isProtectedBranch(b)) return deny(`this checkout is on ${b}; a push with no refspec would push it. Switch to an agent/<slug> branch.`);
     return null;
   }
@@ -643,9 +643,18 @@ function trackSwitch(sub, args, d, ctx) {
   const x = expandVars(positionals[0], ctx);
   if (x === '-' || /^@\{-\d*\}$/.test(x) || DYNAMIC.test(x)) { setBranch(ctx, d, null); return; }
   if (x === 'HEAD' || x === '@') return;
-  if (!isSwitch && d !== null && ctx.pathExists(path.resolve(d, x))) return; // a file on disk: path checkout, or git refuses
+  if (!isSwitch) {
+    // (a path spelling cannot be a ref name: `.`, `..`, `./x`, `../x`, a trailing `/`, a leading `/` (absolute) or `~/` (the shell makes it absolute); --ours / --theirs never switch: a path restore, the branch stays)
+    if (/^\.{1,2}(\/|$)/.test(x) || x.endsWith('/') || x.startsWith('/') || x.startsWith('~/') || flags.some((f) => !f.short && (f.name === 'ours' || f.name === 'theirs'))) return;
+    // (#789: a one-operand checkout restores a file or switches, and only git knows which: the branch is unknown, with a hint for the push denial)
+    ctx.checkoutDoubt = true;
+    setBranch(ctx, d, null);
+    return;
+  }
   setBranch(ctx, d, x);
 }
+
+const checkoutHint = (ctx) => (ctx.checkoutDoubt === true ? ' A one-word `git checkout NAME` may restore a file instead of switching: use `git switch NAME` (or `git checkout -b NAME`), or name the branch in the push.' : '');
 
 function trackBranch(args, d, gitDir, ctx) {
   const { flags, positionals } = parseOpts(args, { longValue: ['set-upstream-to', 'contains', 'merged', 'no-merged', 'sort', 'format'], shortValue: 'u' });
@@ -697,7 +706,7 @@ function trackConfig(args, ctx) {
 
 function trackGit(sub, args, g, ctx) {
   const { d } = g;
-  if (sub === 'checkout' || sub === 'switch') trackSwitch(sub, args, d, ctx);
+  if (sub === 'checkout' || sub === 'switch') { ctx.switches = (ctx.switches ?? 0) + 1; trackSwitch(sub, args, d, ctx); } // (#754: counted, so the walk can tell a command that switched a branch)
   else if (sub === 'branch') trackBranch(args, d, g.gitDir, ctx);
   else if (sub === 'config') return trackConfig(args, ctx);
   else if (sub === 'remote' && args.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true; // (aliases expanded: see directMergeVerdict)
@@ -3376,7 +3385,15 @@ function evalString(str, startDir, ctx, level, child = false) {
     const proven = new Map();
     // (D: a change made directly in a loop body (x.loopOnly: no other body mark, not after &&) proven by a plain `|| exit` is reached by every later command of that body: kept (soft) through ; and || until the body is
     // left, where the blk rule forgets it (an early break / continue skips the cd and everything after it). The `|| { …; exit 1; }` group form is not read in a text with a loop (no shape events there): still refused)
-    const exits = (x) => { if (x.redir) proven.set(x, { ...x, cond: x.and, redir: false }); else if (x.loopOnly) proven.set(x, { ...x, soft: true }); return true; };
+    // (#754: a branch switch not proven to have succeeded (x.unproven) is proven by the same plain `|| exit`: the copy goes on as before)
+    const exits = (x) => {
+      let y = null;
+      if (x.redir) y = { ...x, cond: x.and, redir: false }; else if (x.loopOnly) y = { ...x, soft: true };
+      // (R1-B3: and when the switch came only from an `&&` before it (x.andOnly: not a chain, redirect or pipe), `A && switch || exit` proves A and the switch both ran: cond goes too)
+      if (x.unproven) y = { ...(y ?? x), unproven: false, ...(x.andOnly ? { cond: false } : {}) };
+      if (y) proven.set(x, y);
+      return true;
+    };
     trackers = trackers.filter((x) => {
       if (!x.up.every((e, k) => c.up[k] === e)) return false; // (its level has ended: the rule of that level took over)
       if (x.soft) return true;
@@ -3399,6 +3416,9 @@ function evalString(str, startDir, ctx, level, child = false) {
         if (c.sep === '||' && between.every((e) => e.kind !== 'sub' && e.co !== true && e.sep === '||') && !(c.ctl?.fn === true && !x.fn) && !(c.ctl?.trap === true && !x.trap) && !closerRedir) return exits(x);
       }
       if (op === '||' || x.cond) forget(x);
+      // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
+      // leaves EVERY branch unknown (R1-B1, the doubtful-git-change rule of #505: a subfolder of the same worktree has no entry of its own and would read the branch the switch may not have left))
+      else if (x.unproven) forgetNames(true);
       return false;
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
@@ -3610,6 +3630,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     // (`nohup cd d`, `env cd d`, find -exec cd) is that child's, and leaves this shell where it was.)
     const childCd = c.spawn === true && argv.length > 0 && DIR_CHANGERS.includes(baseName(argv[0]));
     const before = argv.length ? stateMark(ctx) : null;
+    const switchesBefore = ctx.switches ?? 0;
     const changesStateWords = argv.length > 0 && !childCd && (DIR_CHANGERS.includes(baseName(argv[0])) || (baseName(argv[0]) === 'git' && argv.some((w) => STATE_GIT.has(w)) && !argv.some((w) => w === '--show-current' || w === '--list' || w === '-l')));
     // (Phase 3b, Fable attacker pass: `env -C D gh pr merge …` / `sudo -D D …` run the command in D, which the merge check never saw from a
     // cwd outside the repository: it is judged there, or in an unknown directory (null: a chat repo whose repository is unknown) when D cannot be read)
@@ -3743,13 +3764,13 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
       // (an exit behind a wrapper (`env exit 1`, `command exit 1`, `/usr/bin/time exit 1`) may leave no shell: it proves nothing about the redirected move)
       const redirOnly = how === 'redir' && c.sep !== '&&';
-      if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly), from: i, byDir: DIR_CHANGERS.includes(name) };
+      if (changesStateWords && !failGroup && (x.mover || DIR_CHANGERS.includes(name)) && exitsAsGroup(i)) failGroup = { to: exitOfGroup(i), snap: null, doubt: !how || (x.cond && !redirOnly && !(x.andOnly && x.unproven)), from: i, byDir: DIR_CHANGERS.includes(name) };
       if (how) {
         trackers.push(x);
         const top = levels?.[levels.length - 1];

@@ -131,11 +131,11 @@ test('S7 git: ... inside the subshell it counts, a cd outside one (a brace group
     '(cd /work/other; x=$(pwd); git push)',
     '{ cd /work/other; }; git push',
     'cat f | cd /work/other; git push',
-    'x=$(false && git checkout agent/x); git push',
-    '(git checkout main); git push',
+    'x=$(false && git switch agent/x); git push',
+    '(git switch main); git push',
   ]) assert.equal(G(c, {}, { currentBranch: (d) => (resolve(d) === GIT_ROOT ? 'agent/x' : 'main') }), 'deny', c);
   // (the real branch is main: a switch that may not have run does not make the push safe)
-  assert.equal(G('x=$(false && git checkout agent/x); git push', {}, { currentBranch: () => 'main' }), 'deny');
+  assert.equal(G('x=$(false && git switch agent/x); git push', {}, { currentBranch: () => 'main' }), 'deny');
 });
 
 // ---- Codex round 3 (review of 34bacb5) ---------------------------------------------------------------------------------------------------------------------

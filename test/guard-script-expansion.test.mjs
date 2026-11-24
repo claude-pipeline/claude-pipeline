@@ -753,9 +753,9 @@ test('R1: repository and global state a speculative candidate may change is unkn
   const fs2 = (a, b) => gitFs({ 'p1.sh': a, 'p2.sh': b });
   const onMain = { currentBranch: () => 'main' };
   // a candidate switches to a safe branch: if it ran we are on agent/y, if not still on main (and the other way round)
-  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git checkout agent/y'), onMain).decision, 'deny');
-  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git checkout main')).decision, 'deny');
-  assert.match(git('bash p[12].sh && git push', fs2('git status', 'git checkout agent/y'), onMain).reason, /determine the current branch/);
+  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git switch agent/y'), onMain).decision, 'deny');
+  assert.equal(git('bash p[12].sh && git push', fs2('git status', 'git switch main')).decision, 'deny');
+  assert.match(git('bash p[12].sh && git push', fs2('git status', 'git switch agent/y'), onMain).reason, /determine the current branch/);
   // the first candidate creates the very first branch entry of the evaluation
   // #352 R38-F2: a script's change never carries over to its caller (owner decision): a named script that really runs is no longer believed either (it may have ended before the switch); the push that names the branch is the twin
   assert.equal(git('bash p1.sh && git push', gitFs({ 'p1.sh': 'git checkout -b agent/z' }), onMain).decision, 'deny');
@@ -827,8 +827,8 @@ test('merge with #7: a variable a speculative source may have set is unknown to 
   });
   // the repository a command acts on (GIT_DIR) and push configuration from the environment
   assert.equal(git('source p[12].sh; git push origin HEAD:agent/x', g).decision, 'deny');
-  assert.equal(git('source q[12].sh; cd /work/repo; git checkout agent/y && git push', g).decision, 'deny');
-  assert.equal(git('source q1.sh; cd /work/repo; git checkout agent/y && git push', g).decision, 'allow');
+  assert.equal(git('source q[12].sh; cd /work/repo; git switch agent/y && git push', g).decision, 'deny');
+  assert.equal(git('source q1.sh; cd /work/repo; git switch agent/y && git push', g).decision, 'allow');
   // a tainted value reaching a command that runs code, directly or through another variable, here or in a judged script
   assert.equal(git('source p[12].sh; cd /work/repo; X=$F; bash $X', g).decision, 'deny');
   assert.equal(git('source p[12].sh; cd /work/repo; X=$F; bash /work/repo/ok.sh $X', g).decision, 'deny');
@@ -974,14 +974,14 @@ test('guard-files: a program named by a variable or a default word is judged wit
 // ---- recheck 3: speculative readings leave no definite state; the written word stays a candidate; nested / chained assignments refuse ----
 
 test('guard-git: a reading that may not run never sets the branch for later commands', () => {
-  const fx = gitFs({ 's.sh': 'git checkout agent/x', 'p.sh': 'git push' });
+  const fx = gitFs({ 's.sh': 'git switch agent/x', 'p.sh': 'git push' });
   const onMain = { currentBranch: () => 'main' };
   // the hypothetical `bash s.sh` reading switches to agent/x; X=echo means it never ran, so p.sh pushes from the default branch
   for (const c of ['X=echo; ${X:-bash} s.sh; bash p.sh', 'G=bash; $G s.sh; bash p.sh', 'bash ${A:--c ./s.sh}; bash p.sh', 'bash ${A:--c "bash s.sh"}; bash p.sh'])
     assert.equal(git(c, fx, onMain).decision, 'deny', c);
   // a switch that certainly runs: #352 R38-F2: a script's change never carries over to its caller (owner decision), so it is not believed either; a push that names the branch is the twin
   assert.equal(git('bash s.sh; bash p.sh', fx, onMain).decision, 'deny');
-  assert.equal(git('bash s.sh; bash q.sh', gitFs({ 's.sh': 'git checkout agent/x', 'q.sh': 'git push origin agent/x' }), onMain).decision, 'allow');
+  assert.equal(git('bash s.sh; bash q.sh', gitFs({ 's.sh': 'git switch agent/x', 'q.sh': 'git push origin agent/x' }), onMain).decision, 'allow');
   assert.equal(git('bash p.sh', fx, onMain).decision, 'deny');
 });
 

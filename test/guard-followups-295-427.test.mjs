@@ -406,7 +406,7 @@ describe('T2: a cd behind time / command leaves the directory unknown', () => {
     ['a plain cd', `cd /work/repo && ${PUSH_CMD}`],
     ['a cd with a redirect', `cd /work/repo >/dev/null && ${PUSH_CMD}`],
     ['a timed command that is no cd, then a push in the repository', `time make && ${PUSH_CMD}`],
-    ['a time-wrapped switch (the switch is on disk whichever process runs it)', `time git checkout agent/y && ${PUSH_CMD}`],
+    ['a time-wrapped switch (the switch is on disk whichever process runs it)', `time git switch agent/y && ${PUSH_CMD}`],
   ]) {
     test(`allow: ${name}`, () => {
       const v = gitMain(line, name.startsWith('a timed') ? '/work/repo' : '/work/main');

@@ -85,54 +85,54 @@ describe('#481: a substitution in the command after the cd does not hide the || 
 describe('#482: a failure group that ends the text is restored when the text ends', () => {
   const BUILD = resolve('/work/repo/build.sh');
   test('the caller keeps its branch after a script that ends with `cd dist || { ...; exit 1; }`', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
     assert.equal(v.decision, 'allow', v.reason);
   });
   test('the script alone still judges its own text', () => {
     assert.equal(gitRun('bash build.sh', { [BUILD]: 'cd dist || { echo no; exit 1; }\n' }).decision, 'allow');
   });
   test('a group in the middle of the text was already restored (the reference)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\nmake\n' });
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { echo no; exit 1; }\nmake\n' });
     assert.equal(v.decision, 'allow', v.reason);
   });
   // #491 R1: the end-of-text restore only when the group was opened by a directory change and nothing in it changes git state (the caller shares ctx.branches: origin/main left the names forgotten)
   test('R1-B1: a checkout that may fail, then a group that exits: the caller\'s push is not judged on the optimistic branch (denied, as on main)', () => {
-    const v = gitRun('bash build.sh; git push', { [BUILD]: 'git checkout agent/missing || { echo no; exit 1; }\n' });
+    const v = gitRun('bash build.sh; git push', { [BUILD]: 'git switch agent/missing || { echo no; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
-  test('R1-F1: a git checkout inside the group (its directory unknown there) is not hidden by the restore (denied, as on main)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'cd dist || { git checkout main; exit 1; }\n' });
+  test('R1-F1: a git switch inside the group (its directory unknown there) is not hidden by the restore (denied, as on main)', () => {
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'cd dist || { git switch main; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
   // #491 R2: the restore is an allow-list (a directory change opened the group and every command in it is inert), not a deny-list of literal `git <state word>`
   const CLEAN = resolve('/work/repo/cleanup.sh');
   test('R2-F1: a script the group runs that switches the branch (`bash /abs/cleanup.sh`) is not hidden by the restore (denied, as on main)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' });
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git switch main\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
   test('R2-F1: the same with `source /abs/cleanup.sh` (denied, as on main)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { source /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git checkout main\n' });
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || { source /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'git switch main\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
-  test('R2-F1: a nested `cd /work/repo && git checkout main` in a script the group runs (denied, as on main)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'cd /work/repo && git checkout main\n' });
+  test('R2-F1: a nested `cd /work/repo && git switch main` in a script the group runs (denied, as on main)', () => {
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || { bash /work/repo/cleanup.sh; exit 1; }\n', [CLEAN]: 'cd /work/repo && git switch main\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
   test('R2-B1: a `git -C /work/repo checkout agent/y` in the group does not leave the recorded agent/y to the caller (push not allowed)', () => {
-    const v = gitRun('bash build.sh; git push', { [BUILD]: 'git checkout main || { echo no; git -C /work/repo checkout agent/y; exit 1; }\n' });
+    const v = gitRun('bash build.sh; git push', { [BUILD]: 'git switch main || { echo no; git -C /work/repo checkout agent/y; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
   test('the #482 case with a data command in the group (echo, exit) is still restored (allowed)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; exit 1; }\n' });
     assert.equal(v.decision, 'allow', v.reason);
   });
   // (a git command in the group, read-only looking or not, is not inert any more: the push is denied, exactly as on main -- see the R4 rows below)
   test('R4: a `git status` in the group is not inert (denied, as on main)', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || { echo no; git status; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
   // #491 R3: the inert test is an allow-list of the BARE builtin word (or a system-bin path) only: no git command is inert (see the R4 rows)
-  const LAST = (x) => gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: `make\ncd dist || { ${x}; exit 1; }\n` });
+  const LAST = (x) => gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: `make\ncd dist || { ${x}; exit 1; }\n` });
   for (const [why, x] of [
     ['R3-B1: an echo run by an absolute path (any program)', '/work/repo/echo hi'],
     ['R3-F1: a git run by a relative path (any program)', './git status'],
@@ -141,7 +141,7 @@ describe('#482: a failure group that ends the text is restored when the text end
     ['R3-F2: an alias on disk or on the line (`git co main`)', 'git config alias.co "checkout"; git co main'],
     ['R3-F2: git submodule foreach runs a command', "git submodule foreach 'git -C /work/repo checkout main'"],
     ['R3-F2: git bisect moves HEAD', 'git bisect reset'],
-    ['R3-F2: a config handed in through the prefix environment', "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.st GIT_CONFIG_VALUE_0='!git checkout main' git st"],
+    ['R3-F2: a config handed in through the prefix environment', "GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=alias.st GIT_CONFIG_VALUE_0='!git switch main' git st"],
     ['R3: an output redirection of an echo writes a file (.git/HEAD)', 'echo x > /work/repo/.git/HEAD'],
     ['R3: an appended one', 'echo x >> /work/repo/.git/HEAD'],
   ]) {
@@ -151,7 +151,7 @@ describe('#482: a failure group that ends the text is restored when the text end
     });
   }
   test('R3-F2: an alias defined on disk (ctx.gitAliases) is not inert', () => {
-    const v = gitRun('git config alias.st "checkout main" && git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || { git st; exit 1; }\n' });
+    const v = gitRun('git config alias.st "checkout main" && git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || { git st; exit 1; }\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
   // #491 R4: the git half of the allow-list is gone. A read-only-looking git command can still run a program or write HEAD (`git log --output=.git/HEAD`, a PATH change, a
@@ -170,12 +170,12 @@ describe('#482: a failure group that ends the text is restored when the text end
     });
   }
   test('R4-F1: an earlier line of the group that sets PATH, then an echo on a later line, is not inert', () => {
-    const v = gitRun('git checkout agent/y && bash build.sh; git push', { [BUILD]: 'make\ncd dist || {\n  export PATH=/work/repo/bin:$PATH\n  echo hi\n  exit 1\n}\n' });
+    const v = gitRun('git switch agent/y || exit 1; bash build.sh; git push', { [BUILD]: 'make\ncd dist || {\n  export PATH=/work/repo/bin:$PATH\n  echo hi\n  exit 1\n}\n' });
     assert.equal(v.decision, 'deny', v.reason);
   });
   test('R4-F1: an echo in a package script (the manager puts node_modules/.bin on its PATH) is not inert', () => {
     const files = { [resolve('/work/repo/package.json')]: JSON.stringify({ name: 'x', version: '1.0.0', scripts: { build: 'make\ncd dist || { echo no; exit 1; }' } }) };
-    const v = gitRun('git checkout agent/y && npm run build; git push', files);
+    const v = gitRun('git switch agent/y || exit 1; npm run build; git push', files);
     assert.equal(v.decision, 'deny', v.reason);
   });
   for (const x of ['echo no >&2', 'echo no 2>&1', 'echo no >&-', '/bin/echo no', 'true', 'printf x']) {

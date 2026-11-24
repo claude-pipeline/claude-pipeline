@@ -194,7 +194,7 @@ test('F3 twins: what the line exports (or hands to the child) reaches the script
 const PUSH = 'pu' + 'sh'; // (split so a hook that scans this file for a guarded command does not take these lines for one)
 test('t4 state-union: a branch or alias changed by an earlier reading of a script is unknown afterwards, whichever reading comes last', () => {
   // The line is on agent/x (an earlier checkout). The script reads two ways; its LAST reading leaves the branch where it started, the first moves it to main.
-  const first = 'git checkout agent/x; bash scripts/s.sh';
+  const first = 'git switch agent/x || exit 1; bash scripts/s.sh';
   const MOVE = { 'scripts/s.sh': 'for b in main agent/x; do git checkout $b; done\n' };
   for (const tail of [`git ${PUSH} origin HEAD`, `git ${PUSH}`]) assert.equal(git(`${first}; ${tail}`, mk(MOVE, BAD_GIT)).decision, 'deny', tail);
   // (the same with the move in the last reading was refused before: kept so)
