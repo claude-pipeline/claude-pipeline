@@ -17,14 +17,15 @@ const run = (id, head, created, over = {}) => ({
 // PR 12 opened as a draft at 09:00, marked ready at 10:00
 const TIMELINE = [ev('ready_for_review', T('10:00'))];
 const commitOf = (c) => ({ sha: sha(c), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } });
-const gh = ({ runs, timelineFail = false, pullCommits, commits = [commitOf('a'), commitOf('b')], totalRuns, state } = {}) => createFakeGh([
+const gh = ({ runs, timelineFail = false, pullCommits, commits = [commitOf('a'), commitOf('b')], totalRuns, state, comments = [] } = {}) => createFakeGh([
   { match: '^pr view 12 --json title', stdoutJson: { title: 'Add widget', headRefName: 'agent/feat', baseRefName: 'main', headRefOid: sha('b') } },
   ME, REPO,
   { match: '^api repos/acme/widgets/pulls/12/commits', stdoutJson: commits },
   { match: '^api repos/acme/widgets/pulls/12\\b', stdoutJson: { number: PR, created_at: T('09:00'), draft: false, ...(state === undefined ? {} : { state }), ...(pullCommits === undefined ? {} : { commits: pullCommits }), head: { ref: 'agent/feat', repo: { full_name: 'acme/widgets' } } } },
   timelineFail ? { match: '^api repos/acme/widgets/issues/12/timeline', code: 1, stderr: 'gh: HTTP 502' } : { match: '^api repos/acme/widgets/issues/12/timeline', stdoutJson: TIMELINE },
   { match: '^api repos/acme/widgets/actions/runs\\?event=pull_request&branch=agent%2Ffeat', stdoutJson: { total_count: totalRuns ?? runs?.length ?? 0, workflow_runs: runs ?? [] } },
-  { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: [] },
+  { match: '^api repos/acme/widgets/issues/12/comments --paginate', stdoutJson: comments },
+  { match: '^api -X PATCH repos/acme/widgets/issues/comments/', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-5' } },
   { match: '^api -X POST repos/acme/widgets/issues/12/comments', stdoutJson: { id: 5, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-5' } },
 ]);
 function summary(flag, fake, outcome = 'blocked') {
@@ -34,7 +35,7 @@ function summary(flag, fake, outcome = 'blocked') {
   repo.commit('init');
   return cli(['summary', '--pr', String(PR), '--outcome', outcome], { dir: repo.dir, fake });
 }
-const body = (fake) => JSON.parse(fake.calls().find((c) => c.argv.includes('POST')).stdin).body;
+const body = (fake) => JSON.parse(fake.calls().find((c) => c.argv.includes('POST') || c.argv.includes('PATCH')).stdin).body;
 const pushedReady = [run(1, sha('a'), T('09:30')), run(2, sha('b'), T('10:30')), run(3, sha('b'), T('10:30', 3), { name: 'guards' })];
 
 test('summary: flag true and one push while ready => a warning, the JSON field and one line in the comment', () => {
@@ -150,11 +151,56 @@ test('PR #823 round 1 B10: an unlinked run from before this PR existed does not 
   assert.deepEqual(r.json.pushedWhileReady, { count: 1, heads: [sha('b').slice(0, 12)] });
 });
 
-test('PR #823 round 1 F1: the final summary of a merged or closed PR (GitHub unlinks its runs) says it could not check, and names no head', () => {
-  // failure caught: every run of a merged PR is unlinked, so the check found nothing and said nothing: the owner read a summary with no trace of the check
-  const fake = gh({ runs: pushedReady.map((x) => ({ ...x, pull_requests: [] })), state: 'closed' });
+// the summary comment an earlier `summary` run left on the PR (the viewer is `me`); `line` is the pushed-while-ready line it held, or none
+const earlierComment = (line) => ({ id: 5, user: { login: 'me' }, body: `${MARKERS.summary}\n\n### Outcome\n\n**awaiting-owner-merge**${line ? `\n\n${line}` : ''}` });
+const EARLIER_LINE = 'Pushed to the ready PR without `pipeline redraft` first once: bbbbbbbbbbbb (a push to a ready PR starts the full CI suite).';
+const closedRuns = pushedReady.map((x) => ({ ...x, pull_requests: [] }));
+
+test('PR #823 round 1 F1 / #832 (a): the final summary of a merged PR keeps the pushed-while-ready line the earlier summary held, with no warning', () => {
+  // failure caught: GitHub unlinks the runs of a merged PR, so the re-rendered comment lost the line the owner was meant to read after the merge
+  const fake = gh({ runs: closedRuns, state: 'closed', comments: [earlierComment(EARLIER_LINE)] });
+  const r = summary(true, fake, 'merged-externally');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.pushedWhileReady, undefined);
+  assert.deepEqual(r.json.warnings, []);
+  const text = body(fake);
+  assert.match(text, /### Outcome\n\n\*\*merged-externally\*\*\n\nPushed to the ready PR without `pipeline redraft` first once: b{12} \(a push to a ready PR starts the full CI suite\)\./);
+  assert.equal(text.split('Pushed to the ready PR').length, 2, 'the line is there once');
+});
+
+test('#832 (b): a merged PR with no earlier summary comment in a draft_while_iterating repository says it could not check, and names no head', () => {
+  // failure caught: with nothing to carry the line from, the final summary said nothing about a check it could not make
+  const fake = gh({ runs: closedRuns, state: 'closed' });
   const r = summary(true, fake, 'merged-externally');
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.pushedWhileReady, undefined);
   assert.match(r.json.warnings.join('\n'), /the PR is no longer open \(merged or closed\).*could not be checked/);
+  assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
+});
+
+test('#832 (b2): a merged PR whose earlier comment is only a run record (a checkpoint wrote it, no summary yet) still warns it could not check', () => {
+  // failure caught: a checkpoint creates the shared comment before any summary, so the carry branch found nothing and said nothing
+  const fake = gh({ runs: closedRuns, state: 'closed', comments: [{ id: 5, user: { login: 'me' }, body: `${MARKERS.summary}\n\n(no summary yet)` }] });
+  const r = summary(true, fake, 'merged-externally');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.match(r.json.warnings.join('\n'), /the PR is no longer open \(merged or closed\).*could not be checked/);
+});
+
+test('#832 (d): a line quoted in the earlier --built text is not carried over as the CI finding', () => {
+  // failure caught: the first line starting with the note prefix was taken, so build prose quoting it was published under Outcome
+  const earlier = { id: 5, user: { login: 'me' }, body: `${MARKERS.summary}\n\n### What was built\n\n${EARLIER_LINE}\n\n### Outcome\n\n**awaiting-owner-merge**` };
+  const fake = gh({ runs: closedRuns, state: 'closed', comments: [earlier] });
+  const r = summary(true, fake, 'merged-externally');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.warnings, []);
+  assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
+});
+
+test('#832 (c): a merged PR whose earlier summary had no such line gets no line and no warning (nothing was lost)', () => {
+  // failure caught: every merged or closed PR of a draft_while_iterating repository got the "could not be checked" warning on its final summary, pushed or not
+  const fake = gh({ runs: closedRuns, state: 'closed', comments: [earlierComment(null)] });
+  const r = summary(true, fake, 'merged-externally');
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.warnings, []);
+  assert.doesNotMatch(body(fake), /Pushed to the ready PR/);
 });

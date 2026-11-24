@@ -81,7 +81,7 @@ const round4 = (v) => Math.round(v * 1e4) / 1e4;
 test('ci-usage --json: classes, pushes while ready, wasted redrafts, churn and the cost quantities of a private repository', () => {
   const r = usage(world(), ['--json', '--since', '2026-11-05']);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.equal(r.json.classifierVersion, 1);
+  assert.equal(r.json.classifierVersion, 2);
   assert.equal(r.json.since, '2026-11-05T00:00:00Z');
   const [repo] = r.json.repos;
   assert.deepEqual([repo.slug, repo.private, repo.billing, repo.draftWhileIterating, repo.partial], ['acme/widgets', true, 'estimate-private', true, false]);
@@ -328,7 +328,7 @@ test('ci-usage: without --json it prints a plain-text table with the warnings; G
   const r = usage(world({ flag: null }), ['--since', '2026-11-05']);
   assertExit(r, 0, r.stderr);
   assert.equal(r.json, null);
-  assert.match(r.stdout, /CI usage since 2026-11-05T00:00:00Z in acme\/widgets \(private; classifier v1\)/);
+  assert.match(r.stdout, /CI usage since 2026-11-05T00:00:00Z in acme\/widgets \(private; classifier v2\)/);
   assert.match(r.stdout, /#7 +2 +1 +1 +1 +1 +4 /);
   assert.match(r.stdout, /Pushed while ready 1 · missed redrafts unknown/);
   assert.match(r.stdout, /Warnings:\n- acme\/widgets: \.claude\/pipeline\.yml could not be read/);
@@ -422,4 +422,98 @@ test('PR #823 round 4 B1: a PR created in the same second as the oldest run kept
   assertExit(r, 0, r.stderr + r.stdout);
   const p = r.json.repos[0].prs.find((x) => x.pr === 7);
   assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
+});
+
+test('#794: runs of an earlier closed PR on a reused branch name, which GitHub now links to the newer PR, are not charged to it: they stay in the totals as unclassified', () => {
+  // failure caught: PR #5 closed and PR #9 opened on the same branch, #5's runs carry pull_requests [#9]: #9's row showed the cost and pushes of runs older than #9 itself
+  const PR9 = { number: 9, created_at: T('11:00'), draft: true };
+  const earlier = run(2001, { head_sha: sha('5'), pull_requests: [{ number: 9 }], created_at: T('09:30'), run_started_at: T('09:30'), updated_at: plus(T('09:30'), 10) }); // an earlier PR #5's run
+  const own = run(2002, { head_sha: sha('9'), pull_requests: [{ number: 9 }], created_at: T('11:05'), run_started_at: T('11:05'), updated_at: plus(T('11:05'), 10) });
+  const extra = [
+    { match: '^api repos/acme/widgets/actions/runs/2001/jobs', stdoutJson: { total_count: 1, jobs: [job(T('09:30'), 10)] } },
+    { match: '^api repos/acme/widgets/actions/runs/2002/jobs', stdoutJson: { total_count: 1, jobs: [job(T('11:05'), 10)] } },
+    { match: '^api repos/acme/widgets/pulls/9/commits', stdoutJson: [{ sha: sha('5'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }, { sha: sha('9'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }] },
+    { match: '^api repos/acme/widgets/pulls/9$', stdoutJson: PR9 },
+    { match: '^api repos/acme/widgets/issues/9/timeline', stdoutJson: [] },
+  ];
+  const r = usage(world({ runs: [earlier, own], extra }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  const p = repo.prs.find((x) => x.pr === 9);
+  assert.equal(p.heavyRuns, 1, 'only the run created after #9 is its own');
+  assert.equal(repo.totals.byClass.unclassified.runs, 1, 'the earlier PR\'s run is left unclassified');
+  assert.equal(repo.runsListed, 2);
+  assert.equal(repo.totals.workflowElapsedMin, 20, 'both runs stay in the repository totals');
+  assert.match(r.json.warnings.join('\n'), /1 pull_request run\(s\) were linked by GitHub to a PR opened after them \(a branch name reused by an earlier PR\): left unclassified, not given to that PR/);
+});
+
+test('#794 (shared head): the earlier PR\'s run on the same SHA is no evidence for the newer PR: its own run on that head is still the opening suite, not a push', () => {
+  // failure caught: with the earlier PR's run kept in the evidence list it became the head's first run, so the newer PR's own run on that head was classed as a push, not its opening
+  const PR9 = { number: 9, created_at: T('11:00'), draft: true };
+  const earlier = run(2101, { head_sha: sha('9'), pull_requests: [{ number: 9 }], created_at: T('09:30'), run_started_at: T('09:30'), updated_at: plus(T('09:30'), 10) });
+  const own = run(2102, { head_sha: sha('9'), pull_requests: [{ number: 9 }], created_at: T('11:01'), run_started_at: T('11:01'), updated_at: plus(T('11:01'), 10) });
+  const extra = [
+    { match: '^api repos/acme/widgets/actions/runs/2101/jobs', stdoutJson: { total_count: 1, jobs: [job(T('09:30'), 10)] } },
+    { match: '^api repos/acme/widgets/actions/runs/2102/jobs', stdoutJson: { total_count: 1, jobs: [job(T('11:01'), 10)] } },
+    { match: '^api repos/acme/widgets/pulls/9/commits', stdoutJson: [{ sha: sha('9'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }] },
+    { match: '^api repos/acme/widgets/pulls/9$', stdoutJson: PR9 },
+    { match: '^api repos/acme/widgets/issues/9/timeline', stdoutJson: [] },
+  ];
+  const r = usage(world({ runs: [earlier, own], extra }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const byClass = Object.fromEntries(Object.entries(r.json.repos[0].totals.byClass).map(([k, v]) => [k, v.runs]));
+  assert.deepEqual(byClass, { opening: 1, unclassified: 1 });
+});
+
+test('#794 (no own run left): a PR whose only heavy run predates it gets no row and changes no PR total; the run stays unclassified in the totals', () => {
+  // failure caught: the rejected run still chose the PR for analysis, so an empty row was added (totals.prs, catchupsPerPr and wasted redrafts changed by a run that is not the PR's)
+  const PR9 = { number: 9, created_at: T('11:00'), draft: false };
+  const earlier = run(2201, { head_sha: sha('5'), pull_requests: [{ number: 9 }], created_at: T('09:30'), run_started_at: T('09:30'), updated_at: plus(T('09:30'), 10) });
+  const extra = [
+    { match: '^api repos/acme/widgets/actions/runs/2201/jobs', stdoutJson: { total_count: 1, jobs: [job(T('09:30'), 10)] } },
+    { match: '^api repos/acme/widgets/pulls/9/commits', stdoutJson: [] },
+    { match: '^api repos/acme/widgets/pulls/9$', stdoutJson: PR9 },
+    { match: '^api repos/acme/widgets/issues/9/timeline', stdoutJson: [ev('converted_to_draft', T('11:10')), ev('ready_for_review', T('11:20'))] },
+  ];
+  const r = usage(world({ runs: [earlier], extra }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  assert.deepEqual([repo.prs.length, repo.totals.prs, repo.totals.wastedRedrafts], [0, 0, 0]);
+  assert.equal(repo.partial, false, 'a PR with no own heavy run is not an unread PR');
+  assert.equal(repo.totals.byClass.unclassified.runs, 1);
+  assert.equal(repo.totals.workflowElapsedMin, 10);
+});
+
+test('#793: a head pushed (and the PR readied) before --since, first seen in the window on a non-push run while the PR is ready, is no push while ready and no missed redraft', () => {
+  // failure caught: a reopened/labeled run on an old head was its first run in the window, so the head was reported as pushed while ready and as a missed redraft
+  const oldPr = { match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { ...PR7, created_at: '2026-11-01T07:00:00Z' } };
+  const timeline = { match: '^api repos/acme/widgets/issues/7/timeline', stdoutJson: [ev('ready_for_review', '2026-11-01T08:00:00Z')] };
+  const commits = { match: '^api repos/acme/widgets/pulls/7/commits', stdoutJson: [{ sha: sha('3'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work', committer: { date: '2026-11-01T08:30:00Z' } } }] };
+  const reopened = run(1501, {}); // head sha('3'), in the window, nowhere near a ready event
+  const r = usage(world({ runs: [reopened], extra: [oldPr, timeline, commits] }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  const p = repo.prs.find((x) => x.pr === 7);
+  assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
+  assert.deepEqual([repo.totals.pushesWhileReady, repo.totals.missedRedrafts, repo.totals.uncheckedHeads], [0, 0, 1]);
+});
+
+test('#794 (unreadable creation time): a PR whose created_at does not parse is not given any run (it cannot be proven they are its own): unclassified, in the totals, with a warning naming the PR', () => {
+  // failure caught: a null created_at made every linked run pass the ownership check, so an earlier PR's cost was charged to the PR with no warning
+  const earlier = run(2301, { head_sha: sha('5'), pull_requests: [{ number: 9 }], created_at: T('09:30'), run_started_at: T('09:30'), updated_at: plus(T('09:30'), 10) });
+  const extra = [
+    { match: '^api repos/acme/widgets/actions/runs/2301/jobs', stdoutJson: { total_count: 1, jobs: [job(T('09:30'), 10)] } },
+    { match: '^api repos/acme/widgets/pulls/9/commits', stdoutJson: [] },
+    { match: '^api repos/acme/widgets/pulls/9$', stdoutJson: { number: 9, created_at: null, draft: false } },
+    { match: '^api repos/acme/widgets/issues/9/timeline', stdoutJson: [] },
+  ];
+  const r = usage(world({ runs: [earlier], extra }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  assert.equal(repo.prs.length, 0);
+  assert.equal(repo.partial, true, 'an unreadable PR makes the report partial');
+  assert.match(r.json.warnings.join('\n'), /1 PR\(s\) with heavy runs were not read/);
+  assert.equal(repo.totals.byClass.unclassified.runs, 1);
+  assert.equal(repo.totals.workflowElapsedMin, 10);
+  assert.match(r.json.warnings.join('\n'), /#9: its creation time could not be read: its runs are not given to it \(left unclassified\)/);
 });

@@ -331,3 +331,106 @@ test('writeRunRecord: stamping resumed on an unreadable record returns baseRecor
   assert.equal(baseRecordFor({ status: 'invalid' }, { ...ID, host: 'pc-1', now: NOW }).warnings[0], posted.warnings[0], 'the same wording');
   assert.deepEqual(writeRunRecord(memoryGh(), PR, { record: plain() }).warnings, []);
 });
+
+test('writeRunRecord: sections given as a function are rendered from the comment the writer re-read, so a line posted after the caller\'s first read is not erased', () => {
+  // failure caught: the closed-PR summary rendered its sections from its first read; a pushed-while-ready line an open-PR summary posted before the write was lost by the PATCH
+  const gh = memoryGh();
+  seed(gh, plain());
+  const NOTE = 'Pushed to the ready PR without `pipeline redraft` first once: bbbbbbbbbbbb (a push to a ready PR starts the full CI suite).';
+  const first = readSummaryComment(gh, PR); // the caller's read: no sections yet
+  writeSummaryComment(gh, PR, { sections: `### Outcome\n\n**awaiting-owner-merge**\n\n${NOTE}` }); // a concurrent summary lands
+  const seen = [];
+  writeRunRecord(gh, PR, { record: plain(), firstRead: first, sections: (fresh) => { seen.push(fresh.sections); return `### Outcome\n\n**merged**\n\n${fresh.sections.split('\n').find((l) => l.startsWith('Pushed to the ready PR')) ?? ''}`; } });
+  assert.match(seen[0], /Pushed to the ready PR/, 'the function got the re-read comment');
+  assert.match(mineBody(gh), /\*\*merged\*\*\n\nPushed to the ready PR without `pipeline redraft` first once/);
+});
+
+test('writeRunRecord: a rate-limited write with function sections is retried from a fresh read and re-render, so a line posted during the wait is not erased', () => {
+  // failure caught: the retry resent the body rendered before the wait, erasing a pushed-while-ready line another summary posted meanwhile (and the warning would be decided on the stale read)
+  const gh = memoryGh();
+  seed(gh, plain());
+  const NOTE = 'Pushed to the ready PR without `pipeline redraft` first once: bbbbbbbbbbbb (a push to a ready PR starts the full CI suite).';
+  const real = gh.upsertComment;
+  let attempts = 0;
+  const limited = (pr, marker, body, opts) => {
+    attempts += 1;
+    if (attempts === 1) {
+      gh.upsertComment = real;
+      writeSummaryComment(gh, PR, { sections: `### Outcome\n\n**awaiting-owner-merge**\n\n${NOTE}` }); // lands during the wait
+      gh.upsertComment = limited;
+      throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' });
+    }
+    return real(pr, marker, body, opts);
+  };
+  gh.upsertComment = limited;
+  const reads = [];
+  writeRunRecord(gh, PR, { record: plain(), retry: true, sections: (fresh) => { reads.push(fresh.sections); return `### Outcome\n\n**merged**\n\n${fresh.sections.split('\n').find((l) => l.startsWith('Pushed to the ready PR')) ?? ''}`; } });
+  assert.equal(attempts, 2);
+  assert.doesNotMatch(reads[0], /Pushed to the ready PR/);
+  assert.match(reads.at(-1), /Pushed to the ready PR/, 'the sections are rendered from the last read');
+  assert.match(mineBody(gh), /\*\*merged\*\*\n\nPushed to the ready PR without `pipeline redraft` first once/);
+});
+
+test('writeRunRecord: a newer-CLI record that lands during a rate-limit wait is refused on the retry, not overwritten', () => {
+  // failure caught: the retry's fresh read saw an unsupported (newer) record, but the guard only fired when no record was passed, so the older record was PATCHed over it
+  const gh = memoryGh();
+  seed(gh, plain());
+  const real = gh.upsertComment;
+  const patched = [];
+  let attempts = 0;
+  const limited = (pr, marker, body, opts) => {
+    attempts += 1;
+    if (attempts === 1) {
+      gh.comments.find((c) => c.body.startsWith(MARKERS.summary)).body = NEWER_BODY(); // a newer CLI writes during the wait
+      throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' });
+    }
+    patched.push(body);
+    return real(pr, marker, body, opts);
+  };
+  gh.upsertComment = limited;
+  assert.throws(() => writeRunRecord(gh, PR, { record: plain(), retry: true, sections: () => '### Outcome' }), /newer pipeline version/);
+  assert.equal(attempts, 1, 'no second write');
+  assert.deepEqual(patched, []);
+  assert.equal(mineBody(gh), NEWER_BODY());
+});
+
+test('writeRunRecord: function sections go through the gh\'s own retrier when it has one (a retrier that runs once means one read, one write, and the error propagates)', () => {
+  // failure caught: the retry used the module-level retrier, ignoring the gh's (PIPELINE_GH_RETRY_MS=0, the rate-limit probe, the shared cap)
+  const gh = memoryGh();
+  seed(gh, plain());
+  let reads = 0;
+  const listed = gh.listComments;
+  gh.listComments = () => { reads += 1; return listed(); };
+  let writes = 0;
+  gh.upsertComment = () => { writes += 1; throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' }); };
+  gh.retrying = (fn) => fn(1);
+  assert.throws(() => writeRunRecord(gh, PR, { record: plain(), retry: true, sections: () => '### Outcome' }), /HTTP 429/);
+  assert.equal(writes, 1);
+  assert.equal(reads, 1, 'one read');
+});
+
+test('writeRunRecord: a run record another command changed during a rate-limit wait is not overwritten by the retry', () => {
+  // failure caught: the retry wrote the record built before the wait over the fresh one, erasing a cost entry `pipeline cost` recorded meanwhile
+  const gh = memoryGh();
+  seed(gh, plain());
+  const real = gh.upsertComment;
+  const entry = { phase: 'build', role: 'implementer', input: 10, output: 5, cacheRead: 0, cacheWrite: 0, usd: 1.25 };
+  const withCost = applyCheckpoint(plain(), { cost: { entry } }, { host: 'pc-1', now: NOW });
+  let attempts = 0;
+  const limited = (pr, marker, body, opts) => {
+    attempts += 1;
+    if (attempts === 1) {
+      gh.upsertComment = real;
+      writeSummaryComment(gh, PR, { record: withCost }); // `pipeline cost` lands during the wait
+      gh.upsertComment = limited;
+      throw Object.assign(new Error('gh: HTTP 429'), { code: 1, stderr: 'HTTP 429: secondary rate limit\nretry-after: 0', stdout: '' });
+    }
+    return real(pr, marker, body, opts);
+  };
+  gh.upsertComment = limited;
+  const before = mineBody(gh);
+  assert.throws(() => writeRunRecord(gh, PR, { record: plain(), retry: true, sections: () => '### Outcome' }), /run record changed while waiting out a rate limit/);
+  assert.equal(attempts, 1, 'no second write');
+  assert.notEqual(mineBody(gh), before);
+  assert.ok(mineBody(gh).includes(encodeRecord(withCost)), 'the cost entry is still on the comment');
+});

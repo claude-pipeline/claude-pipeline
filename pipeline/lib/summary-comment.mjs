@@ -1,6 +1,7 @@
 // The ONE writer of the PR's summary comment: marker + status block + summary sections + record marker.
 // `P summary`, `P comment --kind summary` and `P checkpoint` all go through it, so whichever part the caller does not
 // supply (the run record, or the summary sections) is kept from the comment already on the PR instead of being lost.
+import { retrying } from './gh-retry.mjs';
 import { MARKERS } from './render.mjs';
 import { STATUS_END, STATUS_START, decodeRecord, encodeRecord, renderStatusBlock } from './run-record.mjs';
 
@@ -35,26 +36,43 @@ export function readSummaryComment(gh, pr) {
 }
 
 // `record` / `sections` left undefined are kept from the existing comment; pass `existing` (a readSummaryComment result)
-// to avoid reading it twice. An existing record this CLI cannot read (`unsupported`, newer version) is never dropped
+// to avoid reading it twice. `sections` may be a function of that comment (the read this write rests on): it returns the sections to write (the closed-PR summary carries a line from it). An existing record this CLI cannot read (`unsupported`, newer version) is never dropped
 // silently: omit `record` and the write is refused.
 // `retry`: wait out a rate limit (the run recorder leaves it off; the comment, summary and checkpoint commands opt in).
 export function writeSummaryComment(gh, pr, { record, sections, existing, retry = false } = {}) {
-  const current = existing ?? readSummaryComment(gh, pr);
-  if (record === undefined && current.status === 'unsupported') {
-    throw new Error('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI before rewriting it');
-  }
-  const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
-  const useSections = sections !== undefined ? sections : current.sections;
-  const parts = [MARKERS.summary, ''];
-  if (useRecord) parts.push(renderStatusBlock(useRecord), '');
-  if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
-  if (useRecord) parts.push(encodeRecord(useRecord));
-  const body = parts.join('\n').trimEnd();
-  // `current` is a fresh read of the newest own marker comment: edit that id instead of listing every comment again (#396); no comment yet (or a gh without updateComment): the upsert creates it.
-  // `retry` reaches the write only (both are safe to re-run: the PATCH is idempotent, the upsert re-lists before it writes).
-  const opts = retry ? [{ retry: true }] : [];
-  const posted = current.id != null && typeof gh.updateComment === 'function'
-    ? gh.updateComment(current.id, MARKERS.summary, body, ...opts)
-    : gh.upsertComment(pr, MARKERS.summary, body, ...opts);
-  return { ...posted, record: useRecord };
+  const once = (current, retryWrite, attempt = 1) => {
+    // a read made after a wait (attempt > 1) is refused whatever `record` is: a newer CLI may have written during it
+    if (current.status === 'unsupported' && (record === undefined || attempt > 1)) {
+      throw new Error('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI before rewriting it');
+    }
+    const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
+    const useSections = typeof sections === 'function' ? sections(current) : (sections !== undefined ? sections : current.sections);
+    const parts = [MARKERS.summary, ''];
+    if (useRecord) parts.push(renderStatusBlock(useRecord), '');
+    if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
+    if (useRecord) parts.push(encodeRecord(useRecord));
+    const body = parts.join('\n').trimEnd();
+    // `current` is a fresh read of the newest own marker comment: edit that id instead of listing every comment again (#396); no comment yet (or a gh without updateComment): the upsert creates it.
+    // `retry` reaches the write only (both are safe to re-run: the PATCH is idempotent, the upsert re-lists before it writes).
+    const opts = retryWrite ? [{ retry: true }] : [];
+    const posted = current.id != null && typeof gh.updateComment === 'function'
+      ? gh.updateComment(current.id, MARKERS.summary, body, ...opts)
+      : gh.upsertComment(pr, MARKERS.summary, body, ...opts);
+    return { ...posted, record: useRecord };
+  };
+  if (!(retry && typeof sections === 'function')) return once(existing ?? readSummaryComment(gh, pr), retry);
+  // Sections that are a function of the comment (the closed-PR summary) must be rendered from what is on the PR when they are SENT: a wait out of a rate limit
+  // can let another summary post a line, which the body rendered before the wait would erase. So the retry is of the whole step (re-read, re-render, write), not of the PATCH alone.
+  const step = typeof gh.retrying === 'function' ? gh.retrying : retrying; // the gh's own retrier carries the env cap, the rate-limit probe and the shared budget
+  // The record is the caller's, built before the wait: if another command changed the stored one meanwhile (`pipeline cost` added an entry), writing it would erase that change, so the write is refused.
+  const recordKey = (c) => (c.status === 'ok' ? encodeRecord(c.record) : c.status);
+  let baseline = null;
+  return step((attempt) => {
+    const current = attempt === 1 && existing ? existing : readSummaryComment(gh, pr);
+    if (attempt === 1) baseline = recordKey(current);
+    else if (current.status !== 'unsupported' && recordKey(current) !== baseline) { // an unsupported read is refused with its own error in once()
+      throw new Error("the summary comment's run record changed while waiting out a rate limit: run the command again");
+    }
+    return once(current, false, attempt);
+  });
 }
