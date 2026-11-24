@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { cpuTimed } from './helpers/timing.mjs';
-import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -675,6 +675,16 @@ const CD_DENY = [
   'cd /work/other; echo /work/repo/missing; cd /work/repo/missing; git push', // (naming the path is not making it)
   'cd /work/other; git status /work/repo/missing; cd /work/repo/missing; git push', // (a git command that does not create a directory proves nothing)
   'cd /work/other; cd ~/missing; git push', // (a path under ~ is asked like any other)
+  'cd /work/other; rm -rf /work/repo/sub; cd /work/repo/sub; git push', // (R1-B2: what an earlier rm / rmdir / mv took away is not there, whatever the disk says now)
+  'cd /work/other; rmdir /work/repo/sub; cd /work/repo/sub; git push',
+  'cd /work/other; mv /work/repo/sub /work/else; cd /work/repo/sub; git push',
+  'cd /work/other; rm -rf /work/repo; cd /work/repo/sub; git push', // (an ancestor of the target)
+  'cd /work/other; cp /work/other/f.txt /work/repo/missing; cd /work/repo/missing; git push', // (R1-B3: copying a file makes no directory)
+  'cd /work/other; mv /work/other/f.txt /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; ln -s /work/other/f.txt /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; install /work/other/f.sh /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; tar -xf /work/repo/missing; cd /work/repo/missing; git push', // (tar names a directory only through -C, unzip only through -d)
+  'cd /work/other; unzip /work/repo/missing; cd /work/repo/missing; git push',
 ];
 const CD_ALLOW = [
   'cd /work/other; cd /work/repo/sub; git push', // the target exists
@@ -687,7 +697,45 @@ const CD_ALLOW = [
   'cd /work/other; git clone https://example.invalid/r.git /work/repo/missing; cd /work/repo/missing; git push',
   'cd /work/repo; git clone https://example.invalid/r.git; cd r; git push',
   'cd /work/repo/sub; cd ..; git push', // an ancestor of where the line stands exists
+  'git clone --depth 1 https://example.invalid/r.git; cd r; bash ./build.sh', // (R1-B5: the clone's directory is named after the repository whatever options come before the URL: as on main)
+  'git clone -b main https://example.invalid/r.git; cd r; bash ./build.sh',
+  'gh repo clone team/tool; cd tool; bash ./build.sh',
+  'gh repo clone team/tool dest; cd dest; bash ./build.sh',
+  'mkdir -p ~/build; cd ~/build; bash ./build.sh', // (R1-B6: mkdir's ~ is the home, as the cd's is)
+  'cp -r /work/repo/sub /work/repo/copy; cd /work/repo/copy; git push', // (R1-B3: what can make a directory still proves the cd)
+  'cd /work/other; mv /work/repo/sub /work/repo/moved; cd /work/repo/moved; git push',
+  'cd /work/other; install -d /work/repo/idir; cd /work/repo/idir; git push',
+  'cd /work/other; unzip /work/other/a.zip -d /work/repo/udir; cd /work/repo/udir; git push',
+  'cd /work/other; tar -xf /work/other/a.tgz -C /work/repo/tdir; cd /work/repo/tdir; git push',
 ];
+// (R1-B1: `cd frontend; npm run build` where frontend does not exist runs the ROOT package's build script: the directory the line was in is still judged, as main did by walking up from the presumed subdirectory)
+const cdPkg = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/package.json'), readText: (p) => (resolve(p) === resolve('/work/repo/package.json') ? JSON.stringify({ name: 'x', scripts: { build: ['git', 'push', 'origin', 'main'].join(' '), ok: 'echo hi' } }) : null) };
+for (const c of ['cd frontend; npm run build', 'cd frontend\nnpm run build', 'cd frontend; bash -c "npm run build"']) {
+  test(`DENY #586 package script ${c.replace(/\n/g, '\\n')}`, () => {
+    const v = evaluate(c, cdPkg);
+    assert.equal(v.decision, 'deny', `expected deny, got allow for: ${c}`);
+  });
+}
+test('ALLOW #586 cd frontend; npm run ok (the root script is harmless)', () => {
+  const v = evaluate('cd frontend; npm run ok', cdPkg);
+  assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
+});
+// (R1-B4: a folder the user may search but not list is a directory the cd enters: the type, not the listing, decides. Real disk; skipped as root, who can list everything)
+test('ALLOW #586 cd into a searchable but unlistable directory, then a relative script', { skip: process.getuid?.() === 0 || process.platform === 'win32' }, () => {
+  const d = realpathSync(mkdtempSync(join(tmpdir(), 'cdlock-')));
+  try {
+    mkdirSync(join(d, 'locked'));
+    writeFileSync(join(d, 'locked', 'build.sh'), 'echo hi\n');
+    chmodSync(join(d, 'locked'), 0o111);
+    const v = evaluateGitCommand(`cd ${join(d, 'locked')}; bash ./build.sh`, { cwd: d, home: d });
+    assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
+    const f = evaluateGitCommand(`cd ${join(d, 'locked', 'build.sh')}; bash ./build.sh`, { cwd: d, home: d });
+    assert.equal(f.decision, 'deny', 'a file target still fails the cd');
+  } finally {
+    chmodSync(join(d, 'locked'), 0o755);
+    rmSync(d, { recursive: true, force: true });
+  }
+});
 for (const c of CD_DENY) {
   test(`DENY #586 ${c.replace(/\n/g, '\\n')}`, () => {
     const v = evaluate(c, { ...cdWorld, cwd: '/work/repo' });
@@ -696,7 +744,7 @@ for (const c of CD_DENY) {
 }
 for (const c of CD_ALLOW) {
   test(`ALLOW #586 ${c}`, () => {
-    const o = { ...cdWorld, cwd: '/work/repo', byDir: { ...cdWorld.byDir, '/work/repo/a/b': 'agent/x', '/work/repo/new': 'agent/x', '/work/repo/r': 'agent/x' } };
+    const o = { ...cdWorld, cwd: '/work/repo', byDir: { ...cdWorld.byDir, '/work/repo/a/b': 'agent/x', '/work/repo/new': 'agent/x', '/work/repo/r': 'agent/x', '/work/repo/copy': 'agent/x', '/work/repo/moved': 'agent/x', '/work/repo/idir': 'agent/x', '/work/repo/udir': 'agent/x', '/work/repo/tdir': 'agent/x' } };
     const v = evaluate(c, o);
     assert.equal(v.decision, 'allow', `expected allow, got deny (${v.reason}) for: ${c}`);
   });
