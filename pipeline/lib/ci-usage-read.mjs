@@ -160,13 +160,21 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   // classify
   const prRows = [];
   const classified = [];
+  let predating = 0; // kept pull_request runs linked to a PR that was opened after them
   // a head that also has a pull_request run GitHub did not link to any PR: which run came first on it cannot be proven, so it is not judged (see analysePrUsage)
   const unlinkedPrRuns = listed.filter((r) => r.event === 'pull_request' && (r.pull_requests ?? []).length === 0 && r.head_sha);
   // the runs before the oldest one kept were not read when the run list was cut: a head whose commit is older may have had its first run there
   const oldest = Math.min(...listed.map((r) => Date.parse(r.created_at)).filter(Number.isFinite));
   const evidenceFromMs = runsCut && Number.isFinite(oldest) ? Math.max(sinceMs, oldest) : sinceMs;
   for (const [n, { incomplete, ...data }] of readPr) {
-    const { runs: prRuns, all } = prGroups.get(n);
+    const group = prGroups.get(n);
+    // GitHub links a run to the PRs that are OPEN now on its branch or head, so a run of an earlier (closed) PR on a reused branch name carries this PR: a run created before the PR existed is not its own
+    // (as in the summary). It falls into the last pass below, where a linked run of no PR row is unclassified; it stays in the totals.
+    const created = Date.parse(data.pr.createdAt);
+    const own = (r) => !Number.isFinite(created) || Date.parse(r.created_at) >= created;
+    const prRuns = group.runs.filter(own);
+    const all = group.all.filter(own);
+    for (const r of group.runs) if (!own(r)) { prOfRun.delete(r.id); predating += 1; }
     // like the summary: only an unlinked run created since this PR was created can have been the first run of one of its heads
     const ambiguousHeads = incomplete ? all.map((r) => r.head_sha) : unlinkedPrRuns.filter((r) => !(Date.parse(r.created_at) < Date.parse(data.pr.createdAt))).map((r) => r.head_sha);
     const row = analysePrUsage({ number: n, ...data, runs: prRuns, evidenceRuns: all, jobsByRun, rates, viewer, sinceMs, evidenceFromMs, isPrivate, ambiguousHeads });
@@ -177,6 +185,7 @@ export function readRepoUsage({ gh, slug, sinceMs, workflows = [], maxCalls, rat
   }
   const unread = runs.filter((r) => !(r.event === 'pull_request' && readPr.has(prOfRun.get(r.id))));
   classified.push(...classifyRuns({ runs: unread, jobsByRun, rates, unlinked: true }));
+  if (predating > 0) warn(`${predating} pull_request run(s) were linked by GitHub to a PR opened after them (a branch name reused by an earlier PR): left unclassified, not given to that PR`);
   const agg = aggregateUsage({ classified, prRows, isPrivate, rates, draftWhileIterating });
   if (viewer === null) agg.totals.wastedRedrafts = null; // also with no PR row: whose redraft it was cannot be told
 

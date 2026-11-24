@@ -423,3 +423,26 @@ test('PR #823 round 4 B1: a PR created in the same second as the oldest run kept
   const p = r.json.repos[0].prs.find((x) => x.pr === 7);
   assert.deepEqual([p.pushesWhileReady, p.pushedHeads, p.uncheckedHeads], [0, [], 1]);
 });
+
+test('#794: runs of an earlier closed PR on a reused branch name, which GitHub now links to the newer PR, are not charged to it: they stay in the totals as unclassified', () => {
+  // failure caught: PR #5 closed and PR #9 opened on the same branch, #5's runs carry pull_requests [#9]: #9's row showed the cost and pushes of runs older than #9 itself
+  const PR9 = { number: 9, created_at: T('11:00'), draft: true };
+  const earlier = run(2001, { head_sha: sha('5'), pull_requests: [{ number: 9 }], created_at: T('09:30'), run_started_at: T('09:30'), updated_at: plus(T('09:30'), 10) }); // an earlier PR #5's run
+  const own = run(2002, { head_sha: sha('9'), pull_requests: [{ number: 9 }], created_at: T('11:05'), run_started_at: T('11:05'), updated_at: plus(T('11:05'), 10) });
+  const extra = [
+    { match: '^api repos/acme/widgets/actions/runs/2001/jobs', stdoutJson: { total_count: 1, jobs: [job(T('09:30'), 10)] } },
+    { match: '^api repos/acme/widgets/actions/runs/2002/jobs', stdoutJson: { total_count: 1, jobs: [job(T('11:05'), 10)] } },
+    { match: '^api repos/acme/widgets/pulls/9/commits', stdoutJson: [{ sha: sha('5'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }, { sha: sha('9'), parents: [{ sha: 'p' }], committer: { login: 'me' }, commit: { message: 'work' } }] },
+    { match: '^api repos/acme/widgets/pulls/9$', stdoutJson: PR9 },
+    { match: '^api repos/acme/widgets/issues/9/timeline', stdoutJson: [] },
+  ];
+  const r = usage(world({ runs: [earlier, own], extra }), ['--json', '--since', '2026-11-05']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  const [repo] = r.json.repos;
+  const p = repo.prs.find((x) => x.pr === 9);
+  assert.equal(p.heavyRuns, 1, 'only the run created after #9 is its own');
+  assert.equal(repo.totals.byClass.unclassified.runs, 1, 'the earlier PR\'s run is left unclassified');
+  assert.equal(repo.runsListed, 2);
+  assert.equal(repo.totals.workflowElapsedMin, 20, 'both runs stay in the repository totals');
+  assert.match(r.json.warnings.join('\n'), /1 pull_request run\(s\) were linked by GitHub to a PR opened after them \(a branch name reused by an earlier PR\): left unclassified, not given to that PR/);
+});
