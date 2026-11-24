@@ -1077,8 +1077,9 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
     // (`reach`: on a whole-line reading only an echo / printf whose output can get to the launcher counts: it writes a file, is a pipeline stage or sits in a substitution / subshell; terminal status messages do not.
     // Not on a line with a redirect on a group or loop (`{ …; } > f`), an `exec` redirect or a function: their output goes to a file the producer words do not show)
     const hidesOutput = cmds.some((c) => (c.redirects ?? []).some((r) => String(r.op).includes('>')) && (!c.argv?.length || commandName(c.argv[0]) === 'exec')) || reading.some((c) => c.ctl?.fn);
+    const reaches = (c) => c.pipe === true || inSub(c) || (c.redirects ?? []).some((r) => String(r.op).includes('>'));
     const joins = (w, reach) => {
-      const prods = w.filter((c) => isLit(c) && !stdinFed(c) && (!reach || c.pipe === true || inSub(c) || (c.redirects ?? []).some((r) => String(r.op).includes('>'))));
+      const prods = w.filter((c) => isLit(c) && !stdinFed(c) && (!reach || reaches(c)));
       return prods.length > 1 || prods.some((c) => {
         const rest = c.argv.slice(1);
         if (commandName(c.argv[0]) === 'echo') return rest.some((a) => /^-[A-Za-z]*n/.test(a) || /\\c/.test(a));
@@ -1097,7 +1098,9 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io, reparse 
       let w = whole ? reading : windowOf(k);
       if (w.some((p) => isLit(p) && [...p.argv, ...redirText(p)].some((a) => /[$`]/.test(a)))) w = reading.filter((p) => w.includes(p) || inSub(p));
       const literal = w.some((p) => isLit(p) || (p.redirects ?? []).some((r) => String(r.op).startsWith('<<')) || (stdinFed(p) && typedWords(p).includes(':::')));
-      return literal && (w.some((p) => fmt(p) || filter(p) || built(p)) || glue(c) || joins(w, whole && !hidesOutput));
+      // (a whole-line reading: an echo / printf whose output cannot reach the launcher is no producer for the format and glued-variable checks either)
+      const reach = whole && !hidesOutput;
+      return literal && (w.some((p) => !(reach && isLit(p) && !stdinFed(p) && !reaches(p)) && (fmt(p) || filter(p) || built(p))) || glue(c) || joins(w, reach));
     });
     if (refused) return 'xargs / parallel builds a command from text the line produces through a printf format, a filter, a glued replacement, glued variables or several echo / printf pieces the guard cannot read';
   }
