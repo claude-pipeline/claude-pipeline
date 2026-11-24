@@ -3391,6 +3391,7 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (x.redir) y = { ...x, cond: x.and, redir: false }; else if (x.loopOnly) y = { ...x, soft: true };
       // (R1-B3: and when the switch came only from an `&&` before it (x.andOnly: not a chain, redirect or pipe), `A && switch || exit` proves A and the switch both ran: cond goes too)
       if (x.unproven) y = { ...(y ?? x), unproven: false, ...(x.andOnly ? { cond: false } : {}) };
+      if (x.cdMissing) y = { ...(y ?? x), cdMissing: false }; // (#586: the same `|| exit` proves a cd to a directory that may not exist)
       if (y) proven.set(x, y);
       return true;
     };
@@ -3419,6 +3420,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       // (#754: `git checkout b; P`: the switch may have failed (no such branch, local changes), and then P runs on the old branch, which can be main. Only && (above) and a plain `|| exit` prove it ran: any other operator
       // leaves EVERY branch unknown (R1-B1, the doubtful-git-change rule of #505: a subfolder of the same worktree has no entry of its own and would read the branch the switch may not have left))
       else if (x.unproven) forgetNames(true);
+      // (#586: `cd missing; git push`: the cd may have failed, and the push then runs where the line was before it. Only && and a plain `|| exit` prove it: after any other operator the directory is unknown)
+      else if (x.cdMissing) forget(x);
       return false;
     });
     if (proven.size) trackers = trackers.map((x) => proven.get(x) ?? x);
@@ -3648,6 +3651,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const name = baseName(argv[0]);
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
+    let cdMissing = false; // (#586: a cd whose target is not shown to exist: see cdUnproven)
     let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist, not even as a dangling link: nothing runs; #630)
     if (VAR_BUILTINS.includes(name)) {
       const d = declAttrs(argv);
@@ -3658,7 +3662,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     } else if (name === 'for' && pinsAt(ctx, level)?.get(argv[1])?.expand) verdict = loopWordAt(argv[1], ctx);
     else if (name === 'for' && computedLoopWord(c) !== null) setVar(ctx, argv[1], computedLoopWord(c), level);
     else if (childCd) { /* the child's own directory */ }
-    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
+    else if (name === 'cd' || name === 'chdir' || name === 'pushd' || name === 'popd') { if (c.extCd === true) ctx.extCdUnknown = true; const was = dir; dir = name === 'chdir' ? null : nextDir(dir, name, argv, ctx, cdp, c.env ?? {}); cdMissing = dir !== null && cdUnproven(cmds, i, dirAt, ctx, name, argv, dir, was); } // (#425 R1-F2: chdir is zsh only, in bash the line goes on in the old directory: the directory after it is unknown, as after popd)
     else if (name === 'git' || name === 'gh') {
       // (Fable attacker pass: a remote or gh's default repository changed on the line: see directMergeVerdict)
       if (name === 'git' && argv.includes('remote') && argv.some((w) => ['add', 'set-url', 'rename', 'remove', 'rm'].includes(w))) ctx.ghRepoDirty = true;
@@ -3764,7 +3768,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (argv.length > 0 && (changesStateWords || changedState)) {
       // (#662: 'pipe': a switch in the last stage of a pipeline that the `&&` after it proves, see pipeSwitchProven. It lives only for that && chain: cond and and, never promoted by an exit)
       const how = certainChange(cmds, c, trusted, changedState || (DIR_CHANGERS.includes(name) && !childCd)) ?? (pipeSwitchProven(cmds, c, i, { trusted, level, child, str }) ? 'pipe' : null);
-      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
+      const x = { up: c.up, cond: c.sep === '&&' || how === 'chain' || how === 'redir' || how === 'pipe', redir: how === 'redir', and: c.sep === '&&' || how === 'pipe', andOnly: c.sep === '&&' && how !== 'chain' && how !== 'redir' && how !== 'pipe', scoped: how === 'chain', loopOnly: how === 'chain' && c.sep === ';' && c.ctl.loop && !c.ctl.fn && !c.ctl.trap && !c.ctl.cond, soft: false, lost: changesStateWords, mover: argv.length > 0 && baseName(argv[0]) === 'git' && movesBranch(argv, ctx), unproven: name === 'git' && changedState && (ctx.switches ?? 0) > switchesBefore ? true : null, cdMissing, before, fn: c.ctl?.fn === true, trap: c.ctl?.trap === true };
       // (#478 R1-B1: `cd X || { …; exit 1; }`, read by exitOfGroup; doubt: not certain, or only for a chain (in a loop / branch / function body: the walk's state after the group would be one pass's)
       // (#557: a git command opens the group only when it can move a branch: a read ending a nested text with an exit would leave every branch unknown for the caller)
       // (#530: a redirected change that is not chained (`cd d 2>/dev/null || { …; exit 1; }`) is certain once the group is left, since the exit is validated by exitOfGroup: its snapshot is sound)
@@ -3824,6 +3828,33 @@ function evalString(str, startDir, ctx, level, child = false) {
 // ('chain': it is in a branch / loop / function body or a trap but otherwise as above: the command chained to it with && sees it (`if x; then cd d && git push; fi`: it runs only when the change did), nothing else does)
 // (#352 R35-F2, R36, R37-F1: `moves`: the command moved the directory or changed the git state the walk holds; then a redirection on it (none is firm, redirectsFirm) means it may not have run at all: its change is unknown at once, NO exception for
 // && (R36 kept it as 'chain' for the command chained to it, but nothing settled it when the text ended, so a script ending in `git switch b > /missing/f` handed b to its caller, which pushed the branch the failed switch left))
+// (#586: `cd /work/other; cd /work/repo/missing; git push`: a cd to a directory that does not exist fails, `;` goes on, and the push runs in the old one. A cd is proven to have moved by what follows it (&&, `|| exit`: settle) or by its
+// target being shown to exist: a directory per ctx.pathExists / ctx.readDir, an ancestor of one the walk stands in, or the work of an earlier command of the line (mkdir, git clone / init / worktree, cp ...: the word names the target
+// or a path below it; permissive on purpose). No operand and `~` are the home: not asked. A file target fails the cd as a missing one does.)
+const CD_MAKERS = new Set(['mkdir', 'install', 'cp', 'mv', 'ln', 'tar', 'unzip', 'rsync', 'git', 'gh']);
+function cdUnproven(cmds, i, dirAt, ctx, name, argv, next, was) {
+  if (name !== 'cd' && name !== 'pushd') return false;
+  const ops = argv.slice(1).filter((a) => a !== '--' && !/^-[LP]+$/.test(a));
+  if (ops.length === 0 || ops.some((a) => a.startsWith('~'))) return false;
+  const isDir = (p) => { try { return ctx.pathExists(p) && ctx.readDir(p) !== null; } catch { return false; } };
+  const into = (a, b) => b === a || b.startsWith(a.endsWith(path.sep) ? a : a + path.sep);
+  if (isDir(next) || [ctx.cwd, was].some((d) => typeof d === 'string' && into(next, path.resolve(d)))) return false;
+  for (let j = 0; j < i; j++) {
+    const m = cmds[j].argv;
+    if (!m.length || !CD_MAKERS.has(baseName(m[0]))) continue;
+    const base = dirAt.get(j);
+    const words = m.slice(1).filter((w) => !w.startsWith('-'));
+    if (baseName(m[0]) === 'git' && m.includes('clone') && words.filter((w) => w !== 'clone').length === 1) words.push(path.basename(words[words.length - 1]).replace(/\.git$/, '')); // (git clone URL names its directory after the repository)
+    for (const w of words) {
+      const e = expandVars(w, ctx);
+      if (DYNAMIC.test(e)) continue;
+      const r = path.isAbsolute(e) ? path.resolve(e) : typeof base === 'string' ? path.resolve(base, e) : null;
+      if (r === null ? next.endsWith(path.sep + e) : into(next, r)) return false;
+    }
+  }
+  return true;
+}
+
 function certainChange(cmds, c, trusted, moves = true) {
   if (c.extCd === true && DIR_CHANGERS.includes(baseName(c.argv[0]))) return null; // (T2: a cd behind `time` / `command` may have run as an external program in this shell's name: the directory is unknown, whatever follows)
   if (!trusted || cmds.ctlBroken || cmds.truncated || c.negated === true || c.bg === true || c.pipe === true || c.spawn === true || !(c.sep === ';' || c.sep === '&&' || c.sep === '&')) return null;
