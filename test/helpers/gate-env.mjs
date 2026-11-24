@@ -59,9 +59,10 @@ export function cli(args, { dir, fake, env = {} }) {
 // ---- scenario: a PR branch with a full evidence trail ---------------------------------------------
 
 const FAKE_MERGE = [
-  "import { appendFileSync, copyFileSync, mkdirSync } from 'node:fs';",
+  "import { appendFileSync, copyFileSync, mkdirSync, readFileSync } from 'node:fs';",
   "mkdirSync('.review', { recursive: true });",
   "appendFileSync('.review/merge-calls.log', `${process.argv.slice(2).join(' ')}\\n`);",
+  "if (process.env.FAKE_MERGE_STATE_FILE) appendFileSync('.review/merge-state.log', `${readFileSync(process.env.FAKE_MERGE_STATE_FILE, 'utf8')}\\n`);",
   "if (process.env.FAKE_MERGE_PATH_FILE) appendFileSync(process.env.FAKE_MERGE_PATH_FILE, `${process.env.PATH}\\n`);",
   "if (process.env.FAKE_MERGE_SWAP) copyFileSync(process.env.FAKE_MERGE_SWAP, process.env.PIPELINE_FAKE_GH_SCRIPT);",
   "if (process.env.FAKE_MERGE_EXIT) { process.stderr.write('merge gate refused: base moved\\n'); process.exit(Number(process.env.FAKE_MERGE_EXIT)); }",
