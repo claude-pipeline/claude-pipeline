@@ -22,9 +22,11 @@ export function roundDialogVariant(recommend, longReview) {
   return ROUND_DIALOG_LEGACY;
 }
 // The lever `PIPELINE_ROUND_DIALOG=legacy` (the exact string; anything else does nothing) can only narrow to the legacy dialog and is read at ISSUE time only: verification never reads it.
+// After a trip-wire process review the owner has already chosen one more round (#848), so no dialog may put stop / park / follow up first: `afterProcessReview` issues round-v2-chosen (Yes first, no recommendation label). The legacy lever still wins.
 export const roundDialogLever = (env) => env?.PIPELINE_ROUND_DIALOG === 'legacy';
-export function issuedRoundVariant({ env, recommend, longReview } = {}) {
+export function issuedRoundVariant({ env, recommend, longReview, afterProcessReview } = {}) {
   if (roundDialogLever(env)) return ROUND_DIALOG_LEGACY;
+  if (afterProcessReview === true) return 'round-v2-chosen';
   return roundDialogVariant(recommend, longReview);
 }
 

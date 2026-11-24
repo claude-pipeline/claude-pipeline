@@ -839,3 +839,25 @@ test('round-request longReview: the trip-wire\'s process review shows the same l
   assert.equal(r.json.longReview.blockingLoop, true);
   assert.equal(r.json.longReview.recommended, 'stop and park or split', 'the trip-wire refusal carries the word the normal answer carries');
 });
+
+// Failure caught (#848): after the owner chose "one more round" at the process review, the blocking-loop dialog's FIRST option was "No, stop and park (Recommended)", so the owner's first click parked the PR they had just chosen to continue.
+test('round-request --after-process-review in a blocking loop issues round-v2-chosen (Yes first, no recommendation); the flag without a trip, and a plain run, change nothing', (t) => {
+  const tripped = roundWorld(t, { review: '  trip_wire_extra_rounds: 1\n' });
+  tripped.atCap();
+  withRounds(tripped, [['SUGGESTION'], ['BLOCKING'], ['BLOCKING']]);
+  const refused = ask(tripped);
+  assertExit(refused, 1, refused.stderr + refused.stdout);
+  const after = tripped.cli(['triage', 'round-request', '--pr', '7', '--after-process-review', '--ask']);
+  assertExit(after, 0, after.stderr + after.stdout);
+  assert.equal(after.json.longReview.blockingLoop, true);
+  assert.equal(after.json.dialogVariant, 'round-v2-chosen', 'the owner already chose another round: the dialog must not put Park first');
+  assert.match(after.json.longReview.recommended, /stop and park/, 'the summary still recommends stopping; only the dialog stops contradicting the owner\'s choice');
+
+  const untripped = roundWorld(t, NO_WIRE);
+  untripped.atCap();
+  withRounds(untripped, [['SUGGESTION'], ['BLOCKING'], ['BLOCKING']]);
+  const flagOnly = untripped.cli(['triage', 'round-request', '--pr', '7', '--after-process-review']);
+  assertExit(flagOnly, 0, flagOnly.stderr + flagOnly.stdout);
+  assert.equal(flagOnly.json.tripWire, undefined);
+  assert.equal(flagOnly.json.dialogVariant, 'round-v2-park', 'no trip, no process review: the flag alone changes nothing');
+});

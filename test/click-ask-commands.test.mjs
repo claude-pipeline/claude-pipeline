@@ -251,11 +251,12 @@ test('merge-many: a PR whose own worktree has owner_go.click off, or is not in c
 // ---- triage round-request / ruling-request ---------------------------------------------------------------------------------------------------------
 
 // A repo at PR 12 whose review state is at the round cap (max_rounds 1, one reviewed round with open items) and holds two items to rule on.
-function triageWorld(yml = CHAT(), over = {}) {
+function triageWorld(yml = CHAT(), over = {}, { secondRound = false } = {}) {
   const s = scenario({ yml, report: null, state: null });
   let st = emptyState({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', risk: 'high', maxRounds: 1 });
   const item = (id, title) => ({ id, source: 'codex', bucket: 'BLOCKING', category: 'security', title, file: 'src/app.js', line: 1, detail: 'detail', codexReasoning: 'why', final: null, ...over });
   st = addRound(st, { n: 1, fromHead: 'a', toHead: s.head, contentHashAtToHead: s.hash, items: [item('R1-B1', 'Missing check'), item('R1-S3', 'Another\nmultiline   finding')] });
+  if (secondRound) st = addRound(st, { n: 2, fromHead: s.head, toHead: s.head, contentHashAtToHead: s.hash, items: [item('R2-B1', 'Second missing check')] }); // a second reviewed round: with trip_wire_extra_rounds 1 (max_rounds 1 + 1) the trip-wire fires
   saveState(s.repo.dir, st);
   s.fake.setScript([REPO]);
   return s;
@@ -279,6 +280,28 @@ test('triage round-request --ask: the question is the title and exactly the prin
   assert.deepEqual(q.options.map((o) => o.label), ['Yes, one more round (Recommended)', 'No'], 'the recommended choice the summary names is the first option');
   assert.equal(presentedRoundRequest(q.question).pr, PR);
   assert.equal(readAsk(r.output.ask.askId, { home }).ask.kind, 'round');
+});
+
+test('triage round-request --ask --after-process-review after a real trip: the dialog is round-v2-chosen (Yes first, no recommendation), the lever still narrows to legacy, and the flag without a trip changes nothing', async () => {
+  // failure caught (#848): the owner chose one more round at the process review and the dialog's first option was "No, stop and park (Recommended)", so their first click parked the PR
+  const run = async (s, env, ...more) => {
+    const r = await triageRun(['round-request', '--pr', String(PR), '--ask', ...more], { cwd: s.repo.dir, env: { ...baseEnv(s), ...env }, home: newHome(), managedPaths: [] });
+    return r;
+  };
+  const tripped = triageWorld(CHAT('review:\n  trip_wire_extra_rounds: 1\n'), {}, { secondRound: true });
+  const refused = await run(tripped, {});
+  assert.equal(refused.exitCode, 1, JSON.stringify(refused.output));
+  assert.equal(refused.output.error, 'trip-wire');
+  const after = await run(tripped, {}, '--after-process-review');
+  assert.equal(after.exitCode, 0, JSON.stringify(after.output));
+  assert.equal(after.output.dialogVariant, 'round-v2-chosen');
+  assert.deepEqual(after.output.ask.questions[0].options.map((o) => o.label), ['Yes, one more round (your choice)', 'No, stop and park']);
+  const legacy = await run(tripped, { PIPELINE_ROUND_DIALOG: 'legacy' }, '--after-process-review');
+  assert.equal(legacy.output.dialogVariant, 'round-v1');
+  const untripped = triageWorld();
+  const flagOnly = await run(untripped, {}, '--after-process-review');
+  assert.equal(flagOnly.exitCode, 0, JSON.stringify(flagOnly.output));
+  assert.equal(flagOnly.output.dialogVariant, 'round-v2-extra-round', 'no trip, no process review: the flag alone changes nothing');
 });
 
 test('triage round-request --ask: the recommended variant is issued (v 2) unless the lever is the exact string "legacy", which issues the legacy ask byte for byte (v 1, no variant key); a reader from before the variants refuses the v 2 ask', async () => {

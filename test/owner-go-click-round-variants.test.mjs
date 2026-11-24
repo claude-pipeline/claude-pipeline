@@ -22,14 +22,19 @@ const V2 = ROUND_VARIANT_IDS.filter((id) => id !== 'round-v1');
 const parts = (variant) => roundAsk({ repo: REPO, pr: 58, line: LINE, variant });
 const sha = (s) => createHash('sha256').update(s).digest('hex');
 const tmpHome = () => mkdtempSync(join(tmpdir(), 'owner-go-click-variants-'));
-const YES = { 'round-v1': 'Yes, one more round', 'round-v2-follow-up': 'Yes, one more round', 'round-v2-extra-round': 'Yes, one more round (Recommended)', 'round-v2-park': 'Yes, one more round' };
+const YES = { 'round-v1': 'Yes, one more round', 'round-v2-follow-up': 'Yes, one more round', 'round-v2-extra-round': 'Yes, one more round (Recommended)', 'round-v2-park': 'Yes, one more round', 'round-v2-chosen': 'Yes, one more round (your choice)' };
 
 // ---- 1 the table ----------------------------------------------------------------------------------------------------------------------------
 
 test('variant table: a v2 dialog shows its recommended choice FIRST with the suffix, has exactly one grant label and at most one instruction; the legacy dialog has no recommendation and no variant key', () => {
   // failure caught: a shipped variant whose first button is not the one the summary recommends, or two buttons that grant a round
-  assert.deepEqual(ROUND_VARIANT_IDS, ['round-v1', 'round-v2-follow-up', 'round-v2-extra-round', 'round-v2-park']);
-  for (const id of V2) {
+  assert.deepEqual(ROUND_VARIANT_IDS, ['round-v1', 'round-v2-follow-up', 'round-v2-extra-round', 'round-v2-park', 'round-v2-chosen']);
+  // round-v2-chosen (#848) is the one v2 dialog with NO recommendation: it follows the owner's own choice at a process review, Yes first, and must not contradict a summary that recommends stopping
+  const chosen = parts('round-v2-chosen');
+  assert.deepEqual(chosen.options.map((o) => o.label), ['Yes, one more round (your choice)', 'No, stop and park']);
+  assert.deepEqual(chosen.actions, { 'Yes, one more round (your choice)': 'extra round', 'No, stop and park': null });
+  assert.equal(chosen.options.some((o) => /Recommended/.test(o.label)), false);
+  for (const id of V2.filter((x) => x !== 'round-v2-chosen')) {
     const p = parts(id);
     assert.equal(p.variant, id);
     assert.match(p.options[0].label, / \(Recommended\)$/, id);
@@ -66,6 +71,7 @@ const PINNED = {
   'round-v2-follow-up': '61ab87edc7cb6cdf1077f6868ffb98a9f87a3056c22f9e54df9c161b5d79e20d',
   'round-v2-extra-round': '8219888dba1ac84da6e097b121c2c2add8ed2195aeff1667e0a5f4301a458bfb',
   'round-v2-park': '3c217adface77b46f45245433ae59a6b387789a459886a900944feb214e9747e',
+  'round-v2-chosen': '77496c8be34ed52840aa074470d1be60491a3bb87f9c51859bb071b7c3442349',
 };
 test('the variants are immutable: a pinned sha256 per id (legacy included) fails when shipped text is edited, and no two ids build the same dialog', () => {
   // failure caught: a reworded label or description under an id that asks and grants already carry (the verifier would call every issued ask of that id invalid)
@@ -166,6 +172,19 @@ test('a v2 Yes click is recorded with the variant on its record; the verifier ta
       assert.equal(clickProvenance({ ...r.recorded, ask }, { home: w.home }), 'synthetic', `${id}: ${JSON.stringify(ask.variant)}`);
     }
   }
+});
+
+test('round-v2-chosen: "No, stop and park" is a decline (spent marker declined, no grant record); "Yes, one more round (your choice)" is the extra-round grant', async (t) => {
+  // failure caught (#848): the park button of the post-process-review dialog granting a round, or its Yes button being unbound so the owner's chosen round is never recorded
+  const no = world(t, { parts: parts('round-v2-chosen'), answer: 'No, stop and park' });
+  await no.click();
+  assert.deepEqual(no.records(), []);
+  assert.equal(JSON.parse(readFileSync(join(asksDir(no.home), `${no.askId}.spent`), 'utf8')).declined, true);
+  assert.equal(ownerGrantedRounds({ repo: REPO, pr: 58, k: 4, head: GHEAD, home: no.home, now: no.now }).length, 0);
+  const yes = world(t, { parts: parts('round-v2-chosen'), answer: 'Yes, one more round (your choice)' });
+  const r = await yes.click();
+  assert.equal(r.recorded?.kind, 'extra-round', JSON.stringify(r));
+  assert.equal(r.recorded.prompt, 'extra round');
 });
 
 test('"Other" text that is the label of ANOTHER variant\'s button binds nothing: a Follow-up label typed into the extra-round dialog records nothing and consumes nothing', async (t) => {
@@ -412,6 +431,8 @@ test('hook lines: a Follow-up instruction says it is no grant and names defer-fi
   assert.doesNotMatch(pend('round-v2-extra-round'), /defer-fixes/);
   assert.doesNotMatch(pend('round-v2-park'), /defer-fixes/);
   assert.match(pend('round-v2-park'), /No, stop and park \(Recommended\)/);
+  assert.doesNotMatch(pend('round-v2-chosen'), /defer-fixes/);
+  assert.match(pend('round-v2-chosen'), /"Yes, one more round \(your choice\)".*"No, stop and park"/);
   assert.equal(pend(undefined), pend('round-v2-extra-round'), 'legacy and the extra-round variant keep today\'s wording');
 });
 
@@ -429,6 +450,10 @@ test('roundDialogVariant and the lever: the first option follows the summary\'s 
   assert.equal(roundDialogVariant(undefined, null), 'round-v1', 'a display failure with no loop: the legacy dialog, no recommendation');
   assert.equal(roundDialogVariant('park', calm), 'round-v1', 'an unknown recommendation is no recommendation');
   assert.equal(issuedRoundVariant({ env: { PIPELINE_ROUND_DIALOG: 'legacy' }, recommend: 'follow-up', longReview: loop }), 'round-v1');
+  // #848: after a process review the owner already chose another round, so no variant puts a stop/park/follow-up first; the legacy lever still wins
+  for (const [recommend, longReview] of [['follow-up', calm], ['extra-round', loop], [undefined, loop], [undefined, null]]) assert.equal(issuedRoundVariant({ env: {}, recommend, longReview, afterProcessReview: true }), 'round-v2-chosen');
+  assert.equal(issuedRoundVariant({ env: { PIPELINE_ROUND_DIALOG: 'legacy' }, recommend: 'follow-up', longReview: loop, afterProcessReview: true }), 'round-v1');
+  assert.equal(issuedRoundVariant({ env: {}, recommend: 'follow-up', longReview: loop, afterProcessReview: false }), 'round-v2-park');
   for (const env of [{}, { PIPELINE_ROUND_DIALOG: 'LEGACY' }, { PIPELINE_ROUND_DIALOG: '1' }, { PIPELINE_ROUND_DIALOG: '' }, undefined]) assert.equal(issuedRoundVariant({ env, recommend: 'follow-up' }), 'round-v2-follow-up');
 });
 
