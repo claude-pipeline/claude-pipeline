@@ -3421,12 +3421,15 @@ function evalString(str, startDir, ctx, level, child = false) {
       if (x.cdMissing) {
         if (!stayed) {
           dir = x.cdWas; stayed = true; ctx.bashState.cdWord ??= x.cdWord;
-          // (#586 R4-B1: `test -f f && cd a && cd b; P`: when the test fails the whole && chain never ran and P runs where the chain STARTED. The directory there is dirAt of the first command of the chain (walk back over commands of this level joined by &&); not worked out: unknown (null), never a directory that allows more)
+          // (#586 R4-B1, R5-B1: `cd a && test -f f && cd b && cd c; P`: when a link of the && chain fails the rest never runs and P runs where the chain STOPPED: at any of its commands. Those directories are dirAt of each command of the chain (walk back over commands of this level joined by &&) other than the one B judges (cdWas); a chain not worked out has an unknown (null) one, never a directory that allows more.
+          // B counts them (cdChain); the 'chain' readings each take one (chainPick, kept inside this tracker's own count))
           if (x.andOnly) {
             let j = x.cdAt;
             while (j > 0 && cmds[j].sep === '&&' && cmds[j - 1].up.length === x.up.length && x.up.every((e, k) => cmds[j - 1].up[k] === e)) j--;
-            const start = cmds[j].sep === '&&' ? null : (dirAt.get(j) ?? null);
-            if (start !== x.cdWas) { if (ctx.bashState.cdFails === 'chain') dir = start; else ctx.bashState.cdChain ??= true; }
+            const stops = cmds[j].sep === '&&' ? [null] : [];
+            for (let k = j; k < x.cdAt; k++) stops.push(dirAt.get(k) ?? null);
+            const others = [...new Set(stops)].filter((d) => d !== x.cdWas);
+            if (others.length) { if (ctx.bashState.cdFails === 'chain') dir = others[Math.min(ctx.bashState.chainPick ?? 0, others.length - 1)]; else ctx.bashState.cdChain = Math.max(ctx.bashState.cdChain ?? 0, others.length); }
           }
         }
         return false;
@@ -3989,9 +3992,14 @@ export function evaluateGitCommand(command, opts = {}) {
   const msg = (r) => ({ ...r.v, reason: `\`cd ${r.state.cdWord ?? a.state.cdDoubt}\` may fail (the folder is not shown to exist), and the shell then stays where it was: ${r.v.reason} Use \`cd ${r.state.cdWord ?? a.state.cdDoubt} && …\` or \`cd ${r.state.cdWord ?? a.state.cdDoubt} || exit 1\`.` });
   if (b.v.decision === 'deny') return msg(b);
   if (!b.state.cdChain) return a.v;
-  // (#586 R4-B1: a THIRD reading, only when B met a cd after && whose chain started elsewhere: the chain never ran, and the line goes on where it STARTED)
-  const c3 = reading({ cdFails: 'chain', carry: Object.fromEntries(READING_CAPS.filter((k) => k in b.state.budget).map((k) => [k, b.state.budget[k]])) });
-  return c3.v.decision === 'deny' ? msg(c3) : a.v;
+  // (#586 R4-B1, R5-B1: more readings, only when B met a cd after && whose chain can stop elsewhere: one per directory the chain can stop in, each spending what the one before left)
+  let prev = b;
+  for (let n = 0; n < b.state.cdChain; n++) {
+    const c3 = reading({ cdFails: 'chain', chainPick: n, carry: Object.fromEntries(READING_CAPS.filter((k) => k in prev.state.budget).map((k) => [k, prev.state.budget[k]])) });
+    if (c3.v.decision === 'deny') return msg(c3);
+    prev = c3;
+  }
+  return a.v;
 }
 function evaluateGitOnce(command, {
   cwd,

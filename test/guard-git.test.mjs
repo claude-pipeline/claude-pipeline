@@ -734,6 +734,14 @@ test('DENY #586 test -f .frontend-build && cd frontend && cd dist; npm run build
   const v = evaluate('test -f .frontend-build && cd frontend && cd dist; npm run build', o);
   assert.equal(v.decision, 'deny', 'expected deny, got allow');
 });
+// (R5-B1: `cd apps && test … && cd frontend && cd dist; P`: the test fails midway and P runs in `apps`, which is neither where the chain started nor where B puts the shell: every directory the chain can stop in is judged)
+test('DENY #586 cd apps && test -f .frontend-build && cd frontend && cd dist; npm run build (the chain stops in apps: its script pushes)', () => {
+  const pkgs = { [resolve('/work/repo/package.json')]: { build: 'echo hi' }, [resolve('/work/repo/apps/frontend/package.json')]: { build: 'echo hi' }, [resolve('/work/repo/apps/package.json')]: { build: ['git', 'push', 'origin', 'main'].join(' ') } };
+  const dirs = [resolve('/work/repo/apps'), resolve('/work/repo/apps/frontend')];
+  const o = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || dirs.includes(resolve(p)) || resolve(p) in pkgs, readDir: (p) => (dirs.includes(resolve(p)) ? [] : cdWorld.readDir(p)), readText: (p) => (resolve(p) in pkgs ? JSON.stringify({ name: 'x', scripts: pkgs[resolve(p)] }) : null) };
+  const v = evaluate('cd apps && test -f .frontend-build && cd frontend && cd dist; npm run build', o);
+  assert.equal(v.decision, 'deny', 'expected deny, got allow');
+});
 // (R3-B4: reading B starts with fresh command-order state: the `npm pkg set` AFTER the lint run must not refuse the lint run)
 test('ALLOW #586 npm run ok; npm pkg set private=true; cd frontend (the write comes after the script)', () => {
   const v = evaluate('npm run ok; npm pkg set private=true; cd frontend', cdPkg);
