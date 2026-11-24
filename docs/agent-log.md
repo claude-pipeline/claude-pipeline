@@ -341,3 +341,4 @@ full record.
 - 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 11 · arbiter 11 (fix-verify 7) · blocked · Codex 7d: 745 runs (259 high)
 - 2026-11-24 · #851 · guard-git: a cd to a folder that does not exist leaves the folder unknown after ; (#586) · risk high · rounds 5 · arbiter 5 · needs-human · Codex 7d: 742 runs (260 high)
 - 2026-11-24 · #807 · Guard psql-family lines that can reach a non-local database (#262) · risk high · rounds 12 · arbiter 12 (fix-verify 8) · blocked · Codex 7d: 745 runs (264 high)
+- 2026-11-24 · #865 · Owner-go merge of a held PR waits for the guard re-run (#847) · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 759 runs (274 high)
