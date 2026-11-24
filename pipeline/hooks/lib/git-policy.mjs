@@ -3835,13 +3835,15 @@ const CD_MAKERS = new Set(['mkdir', 'install', 'cp', 'mv', 'ln', 'tar', 'unzip',
 function cdUnproven(cmds, i, dirAt, ctx, name, argv, next, was) {
   if (name !== 'cd' && name !== 'pushd') return false;
   const ops = argv.slice(1).filter((a) => a !== '--' && !/^-[LP]+$/.test(a));
-  if (ops.length === 0 || ops.some((a) => a.startsWith('~'))) return false;
+  if (ops.length === 0 || ops.some((a) => a === '~')) return false; // (`~/missing` is asked like any other path)
   const isDir = (p) => { try { return ctx.pathExists(p) && ctx.readDir(p) !== null; } catch { return false; } };
   const into = (a, b) => b === a || b.startsWith(a.endsWith(path.sep) ? a : a + path.sep);
   if (isDir(next) || [ctx.cwd, was].some((d) => typeof d === 'string' && into(next, path.resolve(d)))) return false;
   for (let j = 0; j < i; j++) {
     const m = cmds[j].argv;
     if (!m.length || !CD_MAKERS.has(baseName(m[0]))) continue;
+    if (baseName(m[0]) === 'git' && !m.some((w) => w === 'clone' || w === 'init' || w === 'worktree')) continue; // (`git status DIR` names DIR, it does not make it)
+    if (baseName(m[0]) === 'gh' && !m.includes('clone')) continue;
     const base = dirAt.get(j);
     const words = m.slice(1).filter((w) => !w.startsWith('-'));
     if (baseName(m[0]) === 'git' && m.includes('clone') && words.filter((w) => w !== 'clone').length === 1) words.push(path.basename(words[words.length - 1]).replace(/\.git$/, '')); // (git clone URL names its directory after the repository)

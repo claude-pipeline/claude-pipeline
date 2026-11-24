@@ -665,7 +665,7 @@ for (const [command, o] of MORE_ALLOW) {
 
 // #586: `cd /work/other; cd /work/repo/missing; git push`: the second cd fails, `;` goes on, and the push runs in /work/other (on main) while the guard judged /work/repo (agent/x)
 const CD_DIRS = ['/work/other', '/work/repo', '/work/repo/sub']; // (the directories that exist; /work/repo/file.txt is a file)
-const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/repo/file.txt': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
+const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/repo/file.txt': 'agent/x', '/home/u/missing': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
 const CD_DENY = [
   'cd /work/other; cd /work/repo/missing; git push',
   'cd /work/other; pushd /work/repo/missing; git push',
@@ -673,6 +673,8 @@ const CD_DENY = [
   'cd /work/other; cd /work/repo/file.txt; git push', // a file fails the cd as a missing directory does
   'cd /work/other; mkdir /work/else; cd /work/repo/missing; git push', // (a mkdir of another path proves nothing)
   'cd /work/other; echo /work/repo/missing; cd /work/repo/missing; git push', // (naming the path is not making it)
+  'cd /work/other; git status /work/repo/missing; cd /work/repo/missing; git push', // (a git command that does not create a directory proves nothing)
+  'cd /work/other; cd ~/missing; git push', // (a path under ~ is asked like any other)
 ];
 const CD_ALLOW = [
   'cd /work/other; cd /work/repo/sub; git push', // the target exists
