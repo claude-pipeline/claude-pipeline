@@ -980,12 +980,14 @@ export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before
   let rerun = false; // (a re-run was seen: the statuses it posts are told from the old run's by their link)
   const started = now();
   const deadline = started + waitMs;
-  if (before !== null && typeof before === 'object' && Object.keys(before).length > 0) { // (no guard row before the lift: nothing to wait for)
+  const watching = before !== null && typeof before === 'object' && Object.keys(before).length > 0; // (no guard row before the lift: nothing to wait for)
+  const seenRerun = (rows) => Array.isArray(rows) && rows.some((r) => GUARD_CHECKS.includes(r?.name) && (r.bucket === 'pending' || (r.link ?? null) !== (before[r.name] ?? null)));
+  if (watching) {
     const graceEnd = started + Math.min(graceMs, waitMs);
     for (;;) {
       let rows = null;
       try { rows = gh.checks(pr); } catch { rows = null; } // (an unreadable read is reported by the loop below once the grace is over)
-      const seen = Array.isArray(rows) && rows.some((r) => GUARD_CHECKS.includes(r?.name) && (r.bucket === 'pending' || (r.link ?? null) !== (before[r.name] ?? null)));
+      const seen = seenRerun(rows);
       const left = graceEnd - now();
       if (seen) rerun = true;
       if (seen || left <= 0) break;
@@ -1003,17 +1005,21 @@ export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before
       rows = null;
     }
     if (rows !== null) {
+      if (watching && seenRerun(rows)) rerun = true; // (the grace may have ended on the old rows: the re-run can show itself here)
       const guards = rows.filter((r) => PROVENANCE_CHECKS.includes(r?.name));
       const pending = guards.filter((r) => r.bucket === 'pending');
       const stale = !rerun ? [] : [...GUARD_CHECKS, ...(reviewCheck ? [REVIEW_CHECK] : [])].filter((name) => { const row = guards.find((r) => r.name === name); return !row || (row.link ?? null) === (before[name] ?? null); });
       if (pending.length === 0) {
         const bad = guards.filter((r) => r.bucket !== 'pass' && !stale.includes(r.name));
         if (bad.length > 0) return [`guard check(s) not passing after the hold lift re-ran them: ${bad.map((r) => `${r.name}=${r.bucket ?? r.state}`).join(', ')}`];
-        if (stale.length === 0) {
+        // Every status of one run carries that run's link: guards of two runs, or guards beside another run's review row, are not settled.
+        const posted = stale.length > 0 || !rerun ? [] : guards.filter((r) => GUARD_CHECKS.includes(r.name) || (reviewCheck && r.name === REVIEW_CHECK));
+        const mixed = new Set(posted.map((r) => r.link ?? null)).size > 1;
+        if (stale.length === 0 && !mixed) {
           const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
           return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
         }
-        why = `the re-run has not posted yet: ${stale.join(', ')}`;
+        why = mixed ? `the re-run's statuses are not all from one run yet: ${posted.map((r) => `${r.name}=${r.link ?? 'no link'}`).join(', ')}` : `the re-run has not posted yet: ${stale.join(', ')}`;
       } else {
         why = `guard check(s) still pending: ${pending.map((r) => r.name).join(', ')}`;
       }

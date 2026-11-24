@@ -932,6 +932,17 @@ test('settleGuardStatuses with a before-snapshot: old green rows are not trusted
   const reviewLate = await run([withReview(1), withReview(1), withReview(2)], { before: REVIEW_OLD, reviewCheck: true });
   assert.deepEqual(reviewLate.out, []);
   assert.equal(reviewLate.polls(), 3, 'one read for the grace, one still showing the old review row (not settled), then the new one: it did not return on two new rows beside the old review row');
+  // R2-B1: the grace ended on the old rows (graceMs 0), the settle loop itself then sees the re-run pending: the review row of the old run must still be waited out.
+  const lateSight = await run([both('pass', 1), both('pending', 2), withReview(1), withReview(2)], { before: REVIEW_OLD, reviewCheck: true, graceMs: 0 });
+  assert.deepEqual(lateSight.out, []);
+  assert.equal(lateSight.polls(), 4, 'old rows, pending re-run, guards of run 2 beside the old review row (not settled), then the review of run 2');
+  // R2-B2: a new link is not enough: the statuses must be one run's (guards of run 3 beside a review row of run 2 may still get a failing review from run 3).
+  const mixedRun = (guardRun, reviewRun) => [row('Test integrity', 'pass', guardRun), row('Hard-stop scan', 'pass', guardRun), row('Cross-model review', 'pass', reviewRun)];
+  const oneRun = await run([mixedRun(3, 2), mixedRun(3, 2), mixedRun(3, 3)], { before: REVIEW_OLD, reviewCheck: true });
+  assert.deepEqual(oneRun.out, []);
+  assert.equal(oneRun.polls(), 3, 'one read for the grace, one with run 3 guards beside the run 2 review row (not settled), then all of run 3');
+  const twoRuns = await run([[row('Test integrity', 'pass', 3), row('Hard-stop scan', 'pass', 2), row('Cross-model review', 'pass', 3)]], { before: REVIEW_OLD, reviewCheck: true, waitMs: 20_000 });
+  assert.match(twoRuns.out[0], /the re-run's statuses are not all from one run yet.*after 20 s/);
   const reviewRed = await run([withReview(2, 'fail')], { before: REVIEW_OLD, reviewCheck: true });
   assert.match(reviewRed.out[0], /not passing after the hold lift re-ran them: Cross-model review=fail/);
   const reviewOff = await run([withReview(1)], { before: OLD });
