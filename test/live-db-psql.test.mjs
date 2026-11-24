@@ -384,6 +384,8 @@ test('lines that run no client pass even when they name psql and PG* variables; 
     "printf '%s\\n' pg_repack | xargs -n1 env", // R7-B2: a data-only producer names the program a stdin launcher runs
     "printf 'true\\npg_repack\\n' | xargs -n1 env", // R8-B1: one producer word holding two programs (backslash-n spelling)
     "printf 'true\npg_repack\n' | xargs -n1 env", // R8-B1: the same with a real newline inside the quotes
+    "printf 'true\\012pg_repack' | xargs -n1 env", // R9: octal escape as the separator
+    "printf 'true\\x0apg_repack' | xargs env", // R9: hex escape as the separator
     'pgloader x.load', 'kubectl exec db -- pgloader x.load', // R7-B1: non-pg_ clients as a command word
     'gh codespace ssh -- pg_repack', 'gh cs ssh -c x -- pg_dump db', 'gh extension exec pg_repack', 'gh ext exec pg_repack', // R7-B3: gh subcommands that run a program
     'ack +pager=pg_repack needle', // R7-B4: ack's `+` option spelling

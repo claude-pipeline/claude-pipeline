@@ -937,7 +937,7 @@ function pgFamilyRefusal(cmds, reading, scanRaw, lineText, wordsOf, io) {
     // (a data-only command that feeds a launcher built from stdin, `printf '%s\n' pg_repack | xargs -n1 env`, supplies the name the launcher runs: its words are judged too)
     // (xargs splits stdin on whitespace, so every piece of a producer word is a candidate program, split on whitespace and the printf / echo escapes `\n` `\t` `\0`)
     const words = [...c.argv, ...typedWords(c)];
-    return (feeds || (!pgDataOnly(c, true) && (runs || !dataOperands(c.argv)))) && (feeds ? words.flatMap((w) => [w, ...String(w).split(/\s+|\\[nt0]/)]) : words).some((w) => laterPgOpt(w, runs));
+    return (feeds || (!pgDataOnly(c, true) && (runs || !dataOperands(c.argv)))) && (feeds ? words.flatMap((w) => [w, ...String(w).split(/\s+|\\(?:0?[0-7]{1,3}|x[0-9a-fA-F]{1,2}|u[0-9a-fA-F]{1,4}|U[0-9a-fA-F]{1,8}|[abcefnrtv0])/)]) : words).some((w) => laterPgOpt(w, runs));
   });
   const sdb = SDB_TEXT.test(seen);
   if (!token && !sdb) return null;
