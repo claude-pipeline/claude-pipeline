@@ -512,19 +512,25 @@ test('a home directory is never listed: a bad script in a folder of the home is 
 });
 
 // Why (D4): the candidates are alternatives, so what one sibling's script changes (a package.json write, a config file it writes, a `command cd`) is not what the NEXT sibling sees; afterwards a real later command sees it as "may have changed".
-test('order: a sibling whose script runs `npm pkg set` does not make a harmless sibling look like a later command, in either listing order; a later real run still sees the mark', () => {
-  for (const [first, second] of [['a-writer', 'b-clean'], ['a-clean', 'b-writer']]) {
-    const files = { [`${first}/package.json`]: pk({ a: first === 'a-writer' ? 'npm pkg set x=1' : 'echo hi' }), [`${second}/package.json`]: pk({ a: second === 'b-writer' ? 'npm pkg set x=1' : 'echo hi' }) };
+test('order: a sibling whose script runs `npm pkg set` does not make the next sibling\'s own `npm run` look like a later command, in either listing order; a later real run still sees the mark', () => {
+  const writer = pk({ a: 'npm pkg set x=1' });
+  const caller = pk({ a: 'npm run c', c: 'echo hi' }); // (its `npm run c` is judged after the writer's `npm pkg set` only when the two are not kept apart)
+  for (const [first, second] of [['a-writer', 'b-caller'], ['a-caller', 'b-writer']]) {
+    const files = { [`${first}/package.json`]: first === 'a-writer' ? writer : caller, [`${second}/package.json`]: second === 'b-writer' ? writer : caller };
     allows('cd "$X" && npm run a', files);
     const later = run('git', 'cd "$X" && npm run a && npm run a', files);
     assert.equal(later.decision, 'deny', `${first}/${second}: ${later.reason}`);
     assert.match(later.reason, /changes package\.json or the package manager's configuration/, `${first}/${second}: ${later.reason}`);
   }
 });
-test('order: a config file one sibling writes for the whole user (~/.npmrc) is not read by the next sibling, in either listing order', () => {
+test('order: a config file one sibling writes for the whole user (~/.npmrc) is not read by the next sibling, in either listing order; a later real run does read it', () => {
+  const writer = pk({ a: "echo 'x=1' > /home/u/.npmrc" });
   for (const [first, second] of [['a-writer', 'b-clean'], ['a-clean', 'b-writer']]) {
-    const files = { [`${first}/package.json`]: pk({ a: first === 'a-writer' ? "echo 'x=1' > /home/u/.npmrc" : 'echo hi' }), [`${second}/package.json`]: pk({ a: second === 'b-writer' ? "echo 'x=1' > /home/u/.npmrc" : 'echo hi' }) };
+    const files = { [`${first}/package.json`]: first === 'a-writer' ? writer : pk({ a: 'echo hi' }), [`${second}/package.json`]: second === 'b-writer' ? writer : pk({ a: 'echo hi' }) };
     allows('cd "$X" && npm run a', files);
+    const later = run('git', 'cd "$X" && npm run a && npm run a', files);
+    assert.equal(later.decision, 'deny', `${first}/${second}: ${later.reason}`);
+    assert.match(later.reason, /writes \/home\/u\/\.npmrc/, `${first}/${second}: ${later.reason}`);
   }
 });
 test('no leak: a sibling whose script is `command cd dist && ls` does not leave "a cd behind command may have moved the shell" for the line that ran the sibling', () => {
