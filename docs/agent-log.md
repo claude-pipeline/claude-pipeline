@@ -364,3 +364,4 @@ full record.
 - 2026-11-27 · #883 · Auto-apply merged migrations to the live database when the owner switched it on · risk high · rounds 7 · arbiter 7 (fix-verify 2) · substitute 3 · merged · Codex 7d: 625 runs (244 high)
 - 2026-11-27 · #899 · Tests: timing flakes under load read work, not the clock (#725, #893) · risk low · rounds 3 · arbiter 0 · awaiting-owner-merge · Codex 7d: 642 runs (251 high)
 - 2026-11-27 · #898 · owner-go: the owner's merge binds after a ! command (#897) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 650 runs (256 high)
+- 2026-11-27 · #907 · Auto-apply 'after deploy' migrations once GitHub shows the production deploy succeeded (#882); #894 test, #896 comment · risk high · rounds 5 · arbiter 5 (fix-verify 2) · blocked · Codex 7d: 687 runs (267 high)
