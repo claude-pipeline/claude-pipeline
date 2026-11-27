@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { git as realGit } from '../pipeline/lib/git.mjs';
+import { release, tryAcquire } from '../pipeline/lib/locks.mjs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -1155,7 +1156,7 @@ const bot = (login = 'vercel') => ({ __typename: 'Bot', login });
 const dnode = (over = {}) => ({ commitOid: COMMIT, createdAt: isoAt(NOW - 3_100_000), environment: 'Production', originalEnvironment: 'Production', latestEnvironment: 'Production', state: 'ACTIVE', creator: bot(), latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot() }, ...over });
 const withStatus = (over) => dnode({ latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot(), ...over } });
 // GitHub's answer to the deploy query
-const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {}, head = HEAD_SHA } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, defaultBranchRef: head === null ? null : { name: 'main', target: { oid: head } }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
+const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {}, head = HEAD_SHA, branchName = 'main' } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, defaultBranchRef: head === null ? null : { name: branchName, target: { oid: head } }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
 const argOf = (args, key) => args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
 const queryOf = (call) => argOf(call.args, 'query');
 
@@ -1231,6 +1232,7 @@ test('after-deploy: anything GitHub shows other than the one trusted, successful
     ['merged before the registration, though the commit is dated after it', { pr: { mergedAt: isoAt(NOW - 9_000_000) } }, /before the after-deploy registration/],
     ['the default branch moved since the file was read', { head: OTHER_SHA }, /default branch moved during the check/],
     ['no default branch in the answer', { head: null }, /default branch moved during the check/],
+    ['another branch made the default at the same commit (the PR\'s base no longer matches)', { branchName: 'release' }, /default branch moved during the check/],
   ];
   for (const [what, over, reason] of cases) {
     const s = await deployScene(t);
@@ -1274,6 +1276,34 @@ test('after-deploy: a registration the owner switches off while GitHub is asked 
   assert.match(r.reason, /changed the after-deploy registration during the check/);
   assert.deepEqual(hist(s), [], 'nothing claimed');
   assert.equal(markers(s).length, 0);
+});
+
+test('after-deploy: the final registry check and the claim run under the registry lock the owner\'s db-refs writes take, released after; a lock the owner holds past the wait claims nothing', async (t) => {
+  // Failure caught: the owner's `after-deploy off` finishing between the hook's last registry read and its claim, and the migration still being allowed.
+  const s = await deployScene(t);
+  const lockDir = join(STATE(s.home), 'locks', 'db-refs.lock');
+  const heldAtCreate = [];
+  s.ctx.io.openSync = (file, ...rest) => { if (String(file).includes('live-db-attempts')) heldAtCreate.push(existsSync(lockDir)); return openSync(file, ...rest); };
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.ok(heldAtCreate.length >= 2 && heldAtCreate.every(Boolean), 'both attempt records were created while the registry lock was held');
+  assert.equal(existsSync(lockDir), false, 'released after the claim');
+  // the owner's command holds the lock (an `off` mid-write): the hook waits a moment, then claims nothing and spends no attempt; once it is free the same call applies
+  const busy = await deployScene(t);
+  busy.ctx.io.registryLockWaitMs = 100;
+  const owner = tryAcquire('db-refs', { dir: join(STATE(busy.home), 'locks') });
+  assert.ok(owner.acquired);
+  const denied = applyMarked(busy);
+  assert.equal(denied.decision, 'deny');
+  assert.match(denied.reason, /db-refs command is changing the registry/);
+  assert.deepEqual(hist(busy), []);
+  release(owner.lock);
+  assert.equal(applyMarked(busy).decision, 'allow');
+  // an unmarked file never touches the lock
+  const plain = await deployScene(t);
+  plain.answer = () => ghBase();
+  const own = tryAcquire('db-refs', { dir: join(STATE(plain.home), 'locks') });
+  assert.equal(apply(plain).decision, 'allow');
+  release(own.lock);
 });
 
 test('after-deploy: a merge within the clock-skew margin after the registration keeps the click; one after the margin applies', async (t) => {
