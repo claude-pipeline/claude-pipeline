@@ -39,8 +39,8 @@ const validEntry = (e) => e && typeof e === 'object' && !Array.isArray(e)
   // the after-deploy registration: all three keys or none, only with the auto switch on; github-actions is no trusted deployer (an agent can make a workflow create a deployment for any commit). An older install ignores the keys.
   && ((e.deployEnv === undefined && e.deployBot === undefined && e.deploySince === undefined && e.deployClock === undefined)
     || (e.autoMigrations === true && validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince)
-      // `github`: deploySince is GitHub's own clock (the command writes it so). A registration without it was made by an earlier revision (the owner's clock) and the guard does not trust it (live-db-auto.mjs).
-      && (e.deployClock === undefined || e.deployClock === 'github')));
+      // `github`: deploySince is GitHub's own clock and the registration is finished (the command writes it so). `pending`: the command's first write, before it finished (or it was cut off). A registration without the key was made by an earlier revision (the owner's clock). The guard trusts only `github` (live-db-auto.mjs).
+      && (e.deployClock === undefined || e.deployClock === 'github' || e.deployClock === 'pending')));
 
 // { ok:true, refs, servers } | { ok:true, refs:[], servers:[], missing:true } | { ok:false, reason:'unreadable'|'invalid' }
 // `io.readFileSync` is the test seam.
@@ -101,7 +101,7 @@ export function writeDbRefs(home, state) {
     if (e.autoMigrations === true && !isoZone(e.autoSince)) throw new Error(`entry ${e.ref} has auto-migrations on without a valid autoSince`);
     const deploy = e.autoMigrations === true && e.deployEnv != null && e.deployBot != null && e.deploySince != null;
     if (deploy && !(validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince))) throw new Error(`entry ${e.ref} has an invalid after-deploy registration`);
-    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}), ...(deploy ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince, ...(e.deployClock === 'github' ? { deployClock: 'github' } : {}) } : {}) };
+    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}), ...(deploy ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince, ...(e.deployClock === 'github' || e.deployClock === 'pending' ? { deployClock: e.deployClock } : {}) } : {}) };
   });
   const body = `${JSON.stringify({ v: 1, refs, servers: state.servers ?? [] }, null, 2)}\n`;
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;

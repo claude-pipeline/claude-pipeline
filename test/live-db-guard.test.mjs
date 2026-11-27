@@ -1206,6 +1206,16 @@ test('after-deploy: a registration an earlier revision stamped with the owner\'s
   assert.deepEqual(hist(s), []);
 });
 
+test('after-deploy: a registration still pending (the command was cut off before it finished) is not trusted: nothing is asked or claimed', async (t) => {
+  // Failure caught: a half-finished registration, whose cut-off was not yet checked against GitHub's clock, letting a marked file apply.
+  const s = await deployScene(t, { registration: { ...DEPLOY_REG, deployClock: 'pending' } });
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /did not finish.*after-deploy on/);
+  assert.equal(s.calls.length, 0);
+  assert.deepEqual(hist(s), []);
+});
+
 test('after-deploy: a marked file of an entry without the registration is refused with GitHub asked nothing (the owner\'s click stays)', async (t) => {
   // Failure caught: a marked file applying before its code is deployed on a project whose owner never registered the deploy.
   const s = await deployScene(t, { registration: null });
