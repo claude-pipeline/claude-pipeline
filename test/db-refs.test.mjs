@@ -519,7 +519,17 @@ test('readDbRefs: the after-deploy keys are all-or-none, only with auto-apply on
   }
 });
 
-test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for github-actions[bot] and a malformed env; [bot] is stripped; deploySince is now every time; off, auto-migrations off, a repo change and --dev clear all three keys, a label-only set keeps them', async (t) => {
+// a fake `gh` for the child process (PIPELINE_GH, honoured in a checkout only): answers `api --include rate_limit` with the given Date header, or fails when `date` is null
+const fakeGithubClock = (t, date) => {
+  const dir = scratchHome(t);
+  const script = join(dir, 'fake-gh.mjs');
+  writeFileSync(script, date === null
+    ? 'process.stderr.write("gh: not signed in\\n"); process.exit(4);\n'
+    : `process.stdout.write("HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\nDate: ${date}\\r\\n\\r\\n{}\\n");\n`);
+  return { PIPELINE_GH: `node "${script}"` };
+};
+
+test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for github-actions[bot] and a malformed env; [bot] is stripped; deploySince is GitHub's time every time, and gh failing refuses; off, auto-migrations off, a repo change and --dev clear all three keys, a label-only set keeps them', async (t) => {
   // Failure caught: an agent registering a deployer for itself, a workflow-created deployment counting as production, a registration reaching back to earlier merges, or the trust surviving a change of repo.
   const home = scratchHome(t);
   seedRegistry(home, { refs: [LIVE(ON), LIVE({ ref: REF2, repo: 'acme/other' })] });
@@ -538,7 +548,14 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   ]) await assert.rejects(() => run(bad, ownerCtx(home)), UsageError, bad.join(' '));
   assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, 'nothing written');
 
-  const r = runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'Vercel[bot]'], {});
+  // Failure caught: the cut-off stamped from the owner's own clock (a slow clock lets a PR merged before the registration pass), or the registration written when GitHub's time cannot be read.
+  const unreachable = runOwnerCli(home, on, fakeGithubClock(t, null));
+  assert.equal(unreachable.exitCode, 1);
+  assert.equal(unreachable.output.error, 'github-unreachable');
+  assert.match(unreachable.output.message, /GitHub's time could not be read/);
+  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, 'nothing written when GitHub cannot be reached');
+  const GITHUB_DATE = 'Fri, 20 Nov 2026 10:00:00 GMT';
+  const r = runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'Vercel[bot]'], fakeGithubClock(t, GITHUB_DATE));
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
   assert.match(r.output.note, /Production/);
   assert.match(r.output.note, /vercel\[bot\]/);
@@ -546,12 +563,12 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   assert.match(r.output.note, /after-deploy off/);
   const entry = readDbRefs(home).refs[0];
   assert.deepEqual([entry.deployEnv, entry.deployBot, entry.autoMigrations], ['Production', 'vercel', true]);
-  assert.ok(Math.abs(Date.parse(entry.deploySince) - Date.now()) < 60_000, 'deploySince is now');
+  assert.equal(entry.deploySince, '2026-11-20T10:00:00.000Z', 'deploySince is GitHub\'s time, not this machine\'s');
   const shown = (await run(['show'], ownerCtx(home))).output.refs[0];
   assert.deepEqual([shown.deployEnv, shown.deployBot, shown.deploySince], ['Production', 'vercel', entry.deploySince]);
   // a second on replaces both and moves the cut-off to now
   seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY, deployBot: 'old-bot' })] });
-  runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Staging', '--bot', 'vercel']);
+  runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Staging', '--bot', 'vercel'], fakeGithubClock(t, GITHUB_DATE));
   const again = readDbRefs(home).refs[0];
   assert.deepEqual([again.deployEnv, again.deployBot], ['Staging', 'vercel']);
   assert.notEqual(again.deploySince, DEPLOY.deploySince);
