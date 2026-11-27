@@ -274,6 +274,14 @@ const GRAPHQL = `query($o:String!,$n:String!,$p:String!){ repository(owner:$o,na
 const GRAPHQL_PAGE = `query($o:String!,$n:String!,$num:Int!,$after:String){ repository(owner:$o,name:$n){ pullRequest(number:$num){ files(first:100, after:$after){ pageInfo { hasNextPage endCursor }
   nodes { path changeType } } } } }`;
 
+// The deploy proof for a file marked apply-after-deploy (#882), one call made as the last GitHub read before the claim. `D`: the fields of one deployment the proof reads.
+const GRAPHQL_DEPLOY = `query($o:String!,$n:String!,$env:String!,$num:Int!){ repository(owner:$o,name:$n){ nameWithOwner
+  environment(name:$env){ name latestCompletedDeployment { ...D } }
+  deployments(environments:[$env], first:1, orderBy:{field:CREATED_AT, direction:DESC}){ nodes { ...D } }
+  pullRequest(number:$num){ number merged mergedAt mergeCommit { oid } } } }
+fragment D on Deployment { commitOid createdAt environment originalEnvironment latestEnvironment state creator { __typename login }
+  latestStatus { state createdAt creator { __typename login } } }`;
+
 const notEligible = (reason) => ({ status: 'not-eligible', reason });
 const NO_TIME = { status: 'no-time', reason: 'not enough time was left to check: try the call again' };
 const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
@@ -346,6 +354,45 @@ function prFileChange(pr, file, { owner, repoName, env, io, leftMs }) {
   return 'absent';
 }
 
+// Has GitHub shown that the production deploy of the merge commit succeeded? Both the newest deployment of the environment (by any creator) and GitHub's latest COMPLETED one must be the merge
+// commit, made by the registered bot, ACTIVE with a SUCCESS status by the same bot; the PR of the answer must be the matched one, merged after the registration. Every refusal claims nothing, so the call can be
+// made again once the deploy has finished. -> { facts } | { stop: <result of autoApply> }
+function deployProof({ entry, pr, commit, committed, owner, repoName, env, io, leftMs, now }) {
+  const got = ask(['-f', `query=${GRAPHQL_DEPLOY}`, '-f', `o=${owner}`, '-f', `n=${repoName}`, '-f', `env=${entry.deployEnv}`, '-F', `num=${pr.number}`], { env, io, leftMs });
+  if (got.stop) return got;
+  const no = (why) => ({ stop: notEligible(`the production deploy is not confirmed (${why}): wait for the deploy to finish and call again, or ask for the owner's go`) });
+  const repo = got.json.data.repository;
+  const e = entry.deployEnv;
+  const short = (s) => (typeof s === 'string' && s !== '' ? s.slice(0, 12) : 'unknown');
+  if (!isObj(repo) || !sameRepo(repo.nameWithOwner, entry.repo)) return no(`GitHub answered for ${isObj(repo) ? repo.nameWithOwner : 'no repository'} instead of ${entry.repo}`);
+  const p = repo.pullRequest;
+  if (!isObj(p) || p.number !== pr.number || p.merged !== true || p.mergeCommit?.oid !== commit.oid) return no('GitHub does not show the pull request as merged at this commit');
+  const mergedAt = typeof p.mergedAt === 'string' && ISO_RE.test(p.mergedAt) ? Date.parse(p.mergedAt) : NaN;
+  if (!Number.isFinite(mergedAt)) return no('the pull request has no readable merge time');
+  if (!(mergedAt >= Date.parse(entry.deploySince))) return no(`the pull request was merged before the after-deploy registration of ${entry.deploySince}, so it keeps the owner's go`);
+  if (!isObj(repo.environment) || repo.environment.name !== e) return no(`GitHub shows no deployment environment named "${e}"`);
+  const newest = Array.isArray(repo.deployments?.nodes) && repo.deployments.nodes.length === 1 ? repo.deployments.nodes[0] : null;
+  const live = repo.environment.latestCompletedDeployment;
+  if (!isObj(newest) && !isObj(live)) return no(`GitHub shows no deployment in "${e}" yet`);
+  const judge = (d, what) => {
+    if (!isObj(d)) return `${what} is missing`;
+    if (d.environment !== e || d.originalEnvironment !== e || d.latestEnvironment !== e) return `${what} is for another environment`;
+    if (d.commitOid !== commit.oid) return `${what} is commit ${short(d.commitOid)}, not the merge commit ${short(commit.oid)}`;
+    if (d.state !== 'ACTIVE') return `${what} is ${typeof d.state === 'string' ? d.state.toLowerCase() : 'in an unknown state'}, not active`;
+    const bot = (c) => isObj(c) && c.__typename === 'Bot' && typeof c.login === 'string' && c.login.toLowerCase() === entry.deployBot;
+    if (!bot(d.creator)) return `${what} was not made by ${entry.deployBot}[bot]`;
+    const s = d.latestStatus;
+    if (!isObj(s) || s.state !== 'SUCCESS') return `${what} has not succeeded (status ${isObj(s) && typeof s.state === 'string' ? s.state.toLowerCase() : 'none'})`;
+    if (!bot(s.creator)) return `the status of ${what} was not set by ${entry.deployBot}[bot]`;
+    const at = typeof s.createdAt === 'string' && ISO_RE.test(s.createdAt) ? Date.parse(s.createdAt) : NaN;
+    if (!Number.isFinite(at) || at < committed || at > now() + FUTURE_SKEW_MS) return `the success time of ${what} is not credible`;
+    return null;
+  };
+  const bad = judge(newest, 'the newest deployment') ?? judge(live, 'the deployment GitHub shows as live');
+  if (bad !== null) return no(bad);
+  return { facts: { afterDeploy: true, deployEnv: e, deployedAt: newest.latestStatus.createdAt } };
+}
+
 // Is this migration a file a merged PR added to the registered repo's default branch, identical to the call, recent, and not attempted before? Then the next attempt generation of both keys is claimed.
 // -> { status: 'claimed', facts } | { status: 'not-eligible' | 'spent' | 'error' | 'no-time', reason } (`reason` is one plain sentence; never a throw)
 export function autoApply({ home, entry, name, query, session, now, leftMs, env, io = {} }) {
@@ -357,7 +404,10 @@ export function autoApply({ home, entry, name, query, session, now, leftMs, env,
 }
 
 function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) {
-  if (AFTER_DEPLOY_RE.test(query)) return notEligible('the file is marked apply-after-deploy: it takes the owner\'s go after the deploy');
+  // a marked file waits for the production deploy when the owner registered it (`pipeline db-refs after-deploy on`: all three keys); otherwise it keeps the owner's click after the deploy
+  const marked = AFTER_DEPLOY_RE.test(query);
+  const registered = typeof entry.deployEnv === 'string' && typeof entry.deployBot === 'string' && typeof entry.deploySince === 'string';
+  if (marked && !registered) return notEligible('the file is marked apply-after-deploy: it takes the owner\'s go after the deploy (the owner can register the production deploy with `pipeline db-refs after-deploy on`, and marked files then apply once GitHub shows it succeeded)');
   if (typeof name !== 'string' || !STEM_RE.test(name)) return notEligible('the migration name is not a plain file name');
   const charProblem = sqlCharProblem(query);
   if (charProblem !== null) return notEligible(charProblem);
@@ -402,7 +452,14 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
     if (change === 'ADDED') { pr = p; break; }
   }
   if (pr === null) return notEligible(`no merged pull request of ${entry.repo} into ${branch.name} added ${file} (a direct push, a rename, a merge commit?)`);
-  const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null };
+  // the deploy proof is the LAST GitHub read before the claim: a rollback GitHub shows while the file pages above were read is seen
+  let proven = {};
+  if (marked) {
+    const proof = deployProof({ entry, pr, commit, committed, owner, repoName, env, io, leftMs, now });
+    if (proof.stop) return proof.stop;
+    proven = proof.facts;
+  }
+  const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null, ...proven };
   const next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
   if (next.status === 'claimed') {
     // The go path claims its marker and then re-reads the history; this side claims the generations and then re-reads the markers: in every interleaving one of the two sees the other.
@@ -548,14 +605,14 @@ export function readAttemptLog({ home, sinceMs = 0, io = {} }) {
     const at = isoOf(body.at) ?? mtime;
     const ev = events.get(body.event) ?? { files: new Set(), first: null };
     ev.files.add(m[1]);
-    const row = { at, atIso: new Date(at).toISOString(), via: String(body.via ?? ''), ref: body.ref ?? null, label: body.label ?? null, name: body.name ?? null, file: body.file ?? null, pr: body.pr ?? null, commit: body.commit ?? null, repo: body.repo ?? null, session: body.session ?? null, generation: Number(m[3]) };
+    const row = { at, atIso: new Date(at).toISOString(), via: String(body.via ?? ''), ref: body.ref ?? null, label: body.label ?? null, name: body.name ?? null, file: body.file ?? null, pr: body.pr ?? null, commit: body.commit ?? null, repo: body.repo ?? null, session: body.session ?? null, generation: Number(m[3]), afterDeploy: body.afterDeploy === true ? true : null, deployEnv: typeof body.deployEnv === 'string' ? body.deployEnv : null };
     if (ev.first === null || (m[1] === 'name' && ev.first.key !== 'name')) ev.first = { key: m[1], row };
     events.set(body.event, ev);
   }
   for (const ev of events.values()) {
     const { row } = ev.first;
     if (row.at < sinceMs) continue;
-    out.events.push({ at: row.atIso, via: row.via, outcome: row.via === 'go-import' ? 'imported' : ev.files.size === 2 ? 'attempted' : 'reserved', ref: row.ref, label: row.label, name: row.name, file: row.file, pr: row.pr, commit: row.commit, repo: row.repo, session: row.session, generation: row.generation, _ms: row.at });
+    out.events.push({ at: row.atIso, via: row.via, outcome: row.via === 'go-import' ? 'imported' : ev.files.size === 2 ? 'attempted' : 'reserved', ref: row.ref, label: row.label, name: row.name, file: row.file, pr: row.pr, commit: row.commit, repo: row.repo, session: row.session, generation: row.generation, afterDeploy: row.afterDeploy, deployEnv: row.deployEnv, _ms: row.at });
   }
   out.events.sort((a, b) => b._ms - a._ms);
   for (const e of out.events) delete e._ms;

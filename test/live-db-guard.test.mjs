@@ -715,10 +715,10 @@ const firstPr = (a) => firstCommit(a).associatedPullRequests.nodes[0];
 const GH_OK = { code: 0, stdout: '', stderr: '', timedOut: false, overBuffer: false };
 
 // No go anywhere: a scratch home with the registry (REF flagged unless `flag` is false), the history folder, and a fake gh that records its calls and answers from `s.answer()` (or `s.respond(args, opts)`: a partial gh result)
-async function autoScene(t, { flag = true, since = '2026-11-01T00:00:00Z', refs = [] } = {}) {
+async function autoScene(t, { flag = true, since = '2026-11-01T00:00:00Z', refs = [], deploy = null } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'cp-live-db-auto-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', ...(flag ? { autoMigrations: true, autoSince: since } : {}) }, ...refs] });
+  seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', ...(flag ? { autoMigrations: true, autoSince: since, ...(deploy ?? {}) } : {}) }, ...refs] });
   mkdirSync(attempts({ home }), { recursive: true });
   const s = { home, calls: [], answer: () => ghBase(), respond: null };
   s.tweak = (fn, over) => { s.answer = () => { const a = ghBase(over); fn(a); return a; }; };
@@ -1144,4 +1144,145 @@ test('through the real hook entry: GitHub that never answers, even with 5,000 pe
   assert.equal(many.decision, 'deny', many.reason);
   assert.ok(many.ms < 14_000, `${many.ms} ms`);
   assert.deepEqual(hist(s), []);
+});
+
+// ---- auto-apply after the deploy (#882): a file marked apply-after-deploy applies once GitHub shows its production deploy succeeded ---------------------------------------------------------------
+
+const MARKED = `-- pipeline: apply-after-deploy\n${SQL}`;
+const OTHER_SHA = 'c'.repeat(40);
+const DEPLOY_REG = { deployEnv: 'Production', deployBot: 'vercel', deploySince: isoAt(NOW - 7_200_000) };
+const bot = (login = 'vercel') => ({ __typename: 'Bot', login });
+const dnode = (over = {}) => ({ commitOid: COMMIT, createdAt: isoAt(NOW - 3_100_000), environment: 'Production', originalEnvironment: 'Production', latestEnvironment: 'Production', state: 'ACTIVE', creator: bot(), latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot() }, ...over });
+const withStatus = (over) => dnode({ latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot(), ...over } });
+// GitHub's answer to the deploy query
+const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {} } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
+const argOf = (args, key) => args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
+const queryOf = (call) => argOf(call.args, 'query');
+
+// autoScene whose registry carries the after-deploy registration; its gh stub answers the file query, the file-list pages and the deploy query, each by what was asked: the deploy answer is the stub's `s.deploy()` only when the call asks for env=Production and pr 42
+async function deployScene(t, { registration = DEPLOY_REG, ...opts } = {}) {
+  const s = await autoScene(t, { deploy: registration, ...opts });
+  s.deploy = () => deployAnswer();
+  s.answer = () => ghBase({ text: MARKED });
+  s.respond = (args) => {
+    const q = queryOf({ args });
+    if (q.includes('latestCompletedDeployment')) return { stdout: JSON.stringify(argOf(args, 'env') === 'Production' && argOf(args, 'num') === '42' ? s.deploy() : deployAnswer({ envName: null, newest: null })) };
+    if (q.includes('after:$after')) return { stdout: JSON.stringify(s.page()) };
+    return { stdout: JSON.stringify(s.answer()) };
+  };
+  return s;
+}
+const applyMarked = (s) => apply(s, { query: MARKED });
+const { readAttemptLog } = await import('../pipeline/hooks/lib/live-db-auto.mjs');
+
+test('after-deploy: a marked file whose newest and latest completed Production deployments are its merge commit, ACTIVE, SUCCESS by the registered bot applies with no go; the history and the log say it waited for a deploy', async (t) => {
+  // Failure caught: the feature not working (a marked file still waiting for a click after a successful deploy), or an apply that leaves no trace of the deploy that allowed it.
+  const s = await deployScene(t);
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.equal(s.calls.length, 2, 'the file query and the deploy query');
+  const n = body(gfile(s, 'name', 1, { sql: MARKED }));
+  assert.deepEqual([n.via, n.afterDeploy, n.deployEnv, n.deployedAt, n.commit, n.pr], ['auto', true, 'Production', isoAt(NOW - 3_000_000), COMMIT, 42]);
+  const [ev] = readAttemptLog({ home: s.home }).events;
+  assert.deepEqual([ev.via, ev.afterDeploy, ev.deployEnv], ['auto', true, 'Production']);
+  // an unmarked apply on the same registry carries no deploy fields, and an attempt-log row without them (older install) reads null
+  const plain = await deployScene(t);
+  plain.answer = () => ghBase();
+  assert.equal(apply(plain).decision, 'allow');
+  assert.equal(plain.calls.length, 1, 'no deploy query for an unmarked file');
+  const [old] = readAttemptLog({ home: plain.home }).events;
+  assert.deepEqual([old.afterDeploy, old.deployEnv], [null, null]);
+  assert.equal('afterDeploy' in body(gfile(plain, 'name', 1)), false);
+});
+
+test('after-deploy: a marked file of an entry without the registration is refused with GitHub asked nothing (the owner\'s click stays)', async (t) => {
+  // Failure caught: a marked file applying before its code is deployed on a project whose owner never registered the deploy.
+  const s = await deployScene(t, { registration: null });
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /after-deploy on/);
+  assert.equal(s.calls.length, 0);
+  assert.deepEqual(hist(s), []);
+});
+
+test('after-deploy: anything GitHub shows other than the one trusted, successful deploy of the merge commit is refused with a plain reason, nothing claimed, no go burnt', async (t) => {
+  // Failure caught: a forged, stale, rolled-back or half-finished deploy counting as live (a marked migration applied before the code that needs it, or after it was rolled back), and a registration reaching back to earlier merges.
+  const other = { commitOid: OTHER_SHA };
+  const cases = [
+    ['no deployment at all', { live: null, newest: null }, /no deployment in "Production" yet/],
+    ['no such environment', { envName: null }, /no deployment environment named "Production"/],
+    ['another environment name', { envName: 'Staging' }, /no deployment environment named "Production"/],
+    ['the latest completed one is another commit (stub-level: a rollback GitHub recorded)', { live: dnode(other) }, /the deployment GitHub shows as live is commit c+, not the merge commit/],
+    ['the newest one is another commit, the live one is trusted', { newest: dnode(other) }, /the newest deployment is commit c+/],
+    ['the newest one is by an untrusted creator ahead of a trusted live one', { newest: dnode({ creator: { __typename: 'User', login: 'vercel' } }) }, /not made by vercel\[bot\]/],
+    ['the deployment is not ACTIVE', { newest: dnode({ state: 'INACTIVE' }) }, /not active/],
+    ['status FAILURE', { newest: withStatus({ state: 'FAILURE' }), live: withStatus({ state: 'FAILURE' }) }, /has not succeeded/],
+    ['status IN_PROGRESS', { newest: withStatus({ state: 'IN_PROGRESS' }) }, /has not succeeded/],
+    ['status INACTIVE', { newest: withStatus({ state: 'INACTIVE' }) }, /has not succeeded/],
+    ['creator a User named vercel', { live: dnode({ creator: { __typename: 'User', login: 'vercel' } }) }, /not made by vercel\[bot\]/],
+    ['status set by another bot', { newest: withStatus({ creator: bot('github-actions') }) }, /status of the newest deployment was not set by vercel\[bot\]/],
+    ['a Preview deployment an agent moved into Production by a status', { newest: dnode({ originalEnvironment: 'Preview' }) }, /another environment/],
+    ['a deployment of another environment', { live: dnode({ environment: 'Preview', latestEnvironment: 'Preview' }) }, /another environment/],
+    ['status time before the commit', { newest: withStatus({ createdAt: isoAt(NOW - 7_200_000) }) }, /not credible/],
+    ['status time without a zone', { newest: withStatus({ createdAt: '2026-11-17T11:10:00' }) }, /not credible/],
+    ['status time in the future', { newest: withStatus({ createdAt: isoAt(NOW + 3_600_000) }) }, /not credible/],
+    ['another repository answered', { repoName: 'evil/widgets' }, /evil\/widgets instead of acme\/widgets/],
+    ['another pull request', { pr: { number: 43 } }, /does not show the pull request as merged/],
+    ['merged at another commit', { pr: { mergeCommit: { oid: OTHER_SHA } } }, /does not show the pull request as merged/],
+    ['merged before the registration, though the commit is dated after it', { pr: { mergedAt: isoAt(NOW - 9_000_000) } }, /before the after-deploy registration/],
+  ];
+  for (const [what, over, reason] of cases) {
+    const s = await deployScene(t);
+    s.deploy = () => deployAnswer(over);
+    const r = applyMarked(s);
+    assert.equal(r.decision, 'deny', what);
+    assert.match(r.reason, reason, what);
+    assert.match(r.reason, /wait for the deploy to finish and call again, or ask for the owner's go/, what);
+    assert.equal(s.calls.length, 2, what);
+    assert.equal(markers(s).length, 0, what);
+    assert.deepEqual(hist(s), [], `${what}: nothing claimed`);
+  }
+  // the reverse ordering of the merge time and the commit date is allowed: merged after the registration, the commit dated before it
+  const late = await deployScene(t, { registration: { ...DEPLOY_REG, deploySince: isoAt(NOW - 3_550_000) } });
+  assert.equal(applyMarked(late).decision, 'allow', 'the cut-off is the merge time, not the commit date');
+  // a hand-written registry with the bot github-actions is invalid: every Supabase write is refused, GitHub is asked nothing
+  const forged = await deployScene(t, { registration: { ...DEPLOY_REG, deployBot: 'github-actions' } });
+  assert.equal(applyMarked(forged).decision, 'deny');
+  assert.equal(forged.calls.length, 0);
+});
+
+test('after-deploy: the deploy query is the last GitHub read, after a second page of the PR\'s files', async (t) => {
+  // Failure caught: the proof read before the file pages, so a rollback GitHub shows while the pages are read goes unseen.
+  const s = await deployScene(t);
+  s.answer = () => { const a = ghBase({ text: MARKED }); firstPr(a).files = fileList([{ path: 'README.md', changeType: 'MODIFIED' }], 'cursor-1'); return a; };
+  s.page = () => ({ data: { repository: { pullRequest: { files: fileList([{ path: FILE, changeType: 'ADDED' }]) } } } });
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.deepEqual(s.calls.map((c) => (queryOf(c).includes('latestCompletedDeployment') ? 'deploy' : queryOf(c).includes('after:$after') ? 'page' : 'file')), ['file', 'page', 'deploy']);
+});
+
+test('after-deploy: denied before the deploy finished, the same call after GitHub shows success applies (no attempt was spent)', async (t) => {
+  // Failure caught: an early call spending the attempt, so the owner needs a go for a migration whose deploy was only seconds late.
+  const s = await deployScene(t);
+  s.deploy = () => deployAnswer({ newest: withStatus({ state: 'PENDING' }) });
+  assert.equal(applyMarked(s).decision, 'deny');
+  assert.deepEqual(hist(s), []);
+  s.deploy = () => deployAnswer();
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.ok(existsSync(gfile(s, 'name', 1, { sql: MARKED })));
+});
+
+test('after-deploy: the unmarked file sends the same file query as before and nothing more; the deploy query asks for this environment, this PR and every field the proof reads', async (t) => {
+  // Failure caught: the unmarked path changing (an extra call or a different query), and a deploy query that does not ask what the proof reads (the stub answers success only for env=Production and pr 42).
+  const plain = await deployScene(t);
+  plain.answer = () => ghBase();
+  assert.equal(apply(plain).decision, 'allow');
+  assert.equal(plain.calls.length, 1);
+  const q = queryOf(plain.calls[0]);
+  assert.ok(!/deployments|environment\(|latestCompletedDeployment/.test(q), 'the file query is unchanged');
+  assert.deepEqual(plain.calls[0].args.filter((a, i) => plain.calls[0].args[i - 1] === '-f').map((a) => a.split('=')[0]), ['query', 'o', 'n', 'p']);
+  const s = await deployScene(t);
+  assert.equal(applyMarked(s).decision, 'allow');
+  const call = s.calls[1];
+  const dq = queryOf(call);
+  assert.deepEqual([argOf(call.args, 'env'), argOf(call.args, 'num'), argOf(call.args, 'o'), argOf(call.args, 'n')], ['Production', '42', 'acme', 'widgets']);
+  for (const piece of ['latestCompletedDeployment', 'first:1', 'direction:DESC', 'field:CREATED_AT', 'environments:[$env]', 'creator { __typename login }', 'latestStatus { state createdAt creator { __typename login } }', 'commitOid', 'originalEnvironment', 'latestEnvironment', 'state', 'mergedAt', 'mergeCommit { oid }', 'nameWithOwner']) assert.ok(dq.includes(piece), piece);
 });
