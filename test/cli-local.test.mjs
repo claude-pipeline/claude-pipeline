@@ -469,6 +469,10 @@ test('job: start returns runId and a tag (default: the repo HEAD sha, or --tag)'
   assert.equal(b.json.tag, 'tree-abc');
   assert.notEqual(b.json.runId, a.json.runId);
   assert.equal(cli(repo.dir, ['job', 'read', 'tagged', '--run-id', b.json.runId]).json.tag, 'tree-abc');
+  // Let the second job exit before cleanup: on Windows its still-running process holds the temp repo open and rmSync fails with EPERM (#739).
+  const wb = cli(repo.dir, ['job', 'wait', 'tagged', '--timeout', '30', '--run-id', b.json.runId]);
+  assertExit(wb, 0, wb.stdout);
+  assert.equal(wb.json.state, 'done'); // a wait that times out also exits 0, with state running
 });
 
 test('job: wait/read with the runId of a replaced run exit 1 with state replaced', (t) => {
