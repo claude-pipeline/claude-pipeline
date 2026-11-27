@@ -1420,7 +1420,7 @@ pipeline db-refs server add <segment> | server remove <segment>   (an MCP server
 
 ## live-db
 
-live-database guard: build the block the owner is shown before a live Supabase change (present), print the catalog look-up SQL that needs no go (catalog)
+live-database guard: build the block the owner is shown before a live Supabase change (present), print the catalog look-up SQL that needs no go (catalog), list the recorded migration attempts (auto-log)
 
 ```
 pipeline live-db present --op migration --pr <N> --file supabase/migrations/<f>.sql --project <ref> --summary "<one line>"
@@ -1431,6 +1431,7 @@ pipeline live-db present --op data --project <ref> --sql-file <path> --summary "
   -> {ok, block, sqlSha256, sql} : the SQL is canonicalised (BOM and trailing whitespace stripped; CR, NUL, a fence line, a line with trailing spaces, over 60 lines or 4000 characters are refused: make it a migration). Pass `sql` verbatim as execute_sql query; the owner types `go data <sha12>`.
   -> --ask on a data fix: the same dialog (Yes, run <sha12> | Not yet), when the checkout has an origin remote; otherwise ask: null and askSkipped.
 pipeline live-db catalog <kind> [args…]   -> {ok, sql} : the only execute_sql text a live project takes without a go; pass sql verbatim. kinds: tables <schema> · columns <schema> <table> · function-def <schema> <name> · view-def <schema> <view> · policies <schema> <table> · indexes <schema> <table> · triggers <schema> <table> · table-grants <schema> <table> · constraints <schema> <table> · extensions · setting <guc>
+pipeline live-db auto-log [--days N]   -> {ok, events: [{at, via (auto | go | go-import), outcome, ref, label, name, file, pr, commit, repo, session, generation}], unreadable: [path]} : the migration attempts recorded on this machine for projects whose owner switched auto-apply on, newest first, the last N days (default 30). Read-only; runs anywhere. outcome `attempted` = an allowed call (attempted, not necessarily applied: the session's effect check says whether it applied), `reserved` = only one of its two records exists (a lost race or a failed write: nothing was allowed), `imported` = a go the owner's auto-migrations switch-on imported (nothing was allowed by it).
   arguments are lower-case names (a-z 0-9 _, up to 63 characters); setting takes one of: server_version server_version_num search_path statement_timeout lock_timeout idle_in_transaction_session_timeout max_connections timezone default_transaction_isolation row_security shared_preload_libraries
 ```
 

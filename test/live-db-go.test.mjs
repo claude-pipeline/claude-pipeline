@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { OWNER_ENTRY, linesOf, runHook } from './helpers/owner-go.mjs';
 import { run } from '../pipeline/commands/live-db.mjs';
@@ -272,4 +272,39 @@ test('checkedTopLevel: POSIX needs the exact string; the Windows branch accepts 
   assert.equal(checkedTopLevel(dir, { git: gitSays(winTop), platform: 'win32', realpath: () => { throw new Error('gone'); } }), null, 'an unresolvable path fails closed');
   assert.equal(checkedTopLevel('relative/dir', { git: gitSays(dir), platform: 'win32', realpath }), null, 'still absolute only');
   assert.equal(checkedTopLevel(join(dir, 'nope'), { git: gitSays(dir), platform: 'win32', realpath }), null, 'still a real directory only');
+});
+
+test('auto-log lists each allowed call once, a lost reservation as reserved, an imported go as imported, and an unreadable record', async (t) => {
+  // Failure caught: an allowed call missing from the log (or counted twice for its two files), a lost race shown as an apply, or one unreadable file hiding the rest.
+  const home = mkdtempSync(join(tmpdir(), 'cp-live-db-autolog-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const dir = join(home, '.claude', 'pipeline-state', 'owner-go', 'live-db-attempts');
+  mkdirSync(dir, { recursive: true });
+  const NOW = Date.parse('2026-11-27T12:00:00Z');
+  const id = (kind, key) => createHash('sha256').update(`${kind}|${REF}|${kind === 'name' ? key : sha256Of(key)}`).digest('hex').slice(0, 32);
+  const put = (kind, key, n, body) => writeFileSync(join(dir, `${kind}-${id(kind, key)}-${n}.json`), body === '' ? '' : `${JSON.stringify(body)}\n`);
+  const both = (key, name, n, event, ageMs, extra) => { for (const kind of ['name', 'sql']) put(kind, kind === 'name' ? name : `${SQL}-- ${name}`, n, { v: 1, event, at: new Date(NOW - ageMs).toISOString(), ref: REF, name, ...extra }); };
+  const H = 3_600_000;
+  both(null, NAME, 1, 'e-auto', 3 * H, { via: 'auto', pr: 42, commit: 'c'.repeat(40), file: FILE, repo: 'acme/widgets', label: 'EagleWatch prod', session: 's1' });
+  both(null, NAME, 2, 'e-go', 1 * H, { via: 'go', session: 's2' });
+  put('name', '20261117000009_lost', 1, { v: 1, event: 'e-lost', at: new Date(NOW - 4 * H).toISOString(), via: 'auto', ref: REF, name: '20261117000009_lost' });
+  both(null, '20261117000008_imp', 1, 'e-imp', 5 * H, { via: 'go-import' });
+  both(null, '20261101000000_old', 1, 'e-old', 40 * 24 * H, { via: 'auto' });
+  writeFileSync(join(dir, `name-${'0'.repeat(32)}-1.json`), '');
+  const ctx = { home, now: () => NOW };
+  const r = (await run(['auto-log'], ctx)).output;
+  assert.equal(r.ok, true);
+  assert.deepEqual(r.events.map((e) => [e.name, e.via, e.outcome, e.generation]), [
+    [NAME, 'go', 'attempted', 2],
+    [NAME, 'auto', 'attempted', 1],
+    ['20261117000009_lost', 'auto', 'reserved', 1],
+    ['20261117000008_imp', 'go-import', 'imported', 1],
+  ]);
+  assert.deepEqual([r.events[1].pr, r.events[1].commit, r.events[1].repo, r.events[1].session], [42, 'c'.repeat(40), 'acme/widgets', 's1']);
+  assert.deepEqual(r.unreadable, [join(dir, `name-${'0'.repeat(32)}-1.json`)]);
+  const wide = (await run(['auto-log', '--days', '60'], ctx)).output;
+  assert.equal(wide.events.length, 5);
+  assert.equal(wide.events[4].name, '20261101000000_old');
+  for (const days of ['0', 'x', '1.5']) await assert.rejects(() => run(['auto-log', '--days', days], ctx), UsageError, days);
+  await assert.rejects(() => run(['auto-log', '--op', 'data'], ctx), UsageError);
 });
