@@ -464,6 +464,22 @@ test('answer order inside a unit: a later click is never admitted ahead of an ea
   assert.equal(allSettled(w.home).length, 2);
 });
 
+test('out of time inside a unit: the deadline is checked before EACH member, so a click behind a settled one stays pending (no .settled) and settles with time', async (t) => {
+  // Failure caught: the budget checked once per ask lets every later pointer of the same ask run settleOne and write a durable .settled after the hook's time is gone.
+  const w = pw(t);
+  assert.ok((await w.hook()).pending); // click A
+  w.t += 1000;
+  const b = w.extra('toolu_second');
+  assert.equal((await w.hook({}, { tool_use_id: b.id })).pending?.clickId, b.clickId);
+  b.flush();
+  w.flush();
+  const first = w.settle({ leftMs: () => (w.records().length === 0 ? 60_000 : 0) }); // time is up once A is recorded
+  assert.deepEqual(first.outcomes, [{ askId: w.askId, clickId: w.clickId, outcome: 'recorded' }]);
+  assert.deepEqual(first.problems, ['no-time']);
+  assert.equal(allSettled(w.home).length, 1, 'B has no .settled');
+  assert.deepEqual(w.settle().outcomes, [{ askId: w.askId, clickId: b.clickId, outcome: 'refused', reason: 'spent' }], 'with time, B settles as before');
+});
+
 test('supersession at the answer: before -> superseded; equal -> superseded; after -> recorded; a garbled marker or an unreadable superseding ask -> superseded', async (t) => {
   const supersede = (w, issuedAtMs) => { const next = issueAsk({ ...w.parts, home: w.home, now: () => issuedAtMs }); assert.ok(next.askId); return next.askId; };
   for (const [label, delta, want] of [['before', -1000, 'superseded'], ['equal', 0, 'superseded'], ['after', 1, 'recorded']]) {

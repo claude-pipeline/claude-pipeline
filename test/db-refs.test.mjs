@@ -2,15 +2,18 @@
 // and the preflight hint. Every test uses a scratch home; the account's real file is never touched.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, statSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { UsageError } from '../pipeline/lib/cli.mjs';
+import { release, tryAcquire } from '../pipeline/lib/locks.mjs';
 import { run } from '../pipeline/commands/db-refs.mjs';
-import { DB_REFS_REL, dbRefsFile, isDevRef, readDbRefs, targetOf, trustedServer } from '../pipeline/hooks/lib/db-refs.mjs';
+import { DB_REFS_REL, autoEntry, dbRefsFile, isDevRef, readDbRefs, targetOf, trustedServer } from '../pipeline/hooks/lib/db-refs.mjs';
 import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
+import { history } from '../pipeline/hooks/lib/live-db-auto.mjs';
 import { runPreflight } from '../pipeline/lib/preflight.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, createFakeCodex, fullProtection, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
@@ -39,8 +42,8 @@ test('set / show / remove round-trip; a duplicate ref replaces its entry; the fi
   const shown = await run(['show'], ownerCtx(home));
   assert.equal(shown.exitCode, 0);
   assert.deepEqual(shown.output.refs, [
-    { ref: REF, name: 'EagleWatch prod', repo: 'eaglewatch-ph/eaglewatch', kind: 'live' },
-    { ref: REF2, name: 'Scratch', repo: 'o/r', kind: 'dev' },
+    { ref: REF, name: 'EagleWatch prod', repo: 'eaglewatch-ph/eaglewatch', kind: 'live', autoMigrations: false },
+    { ref: REF2, name: 'Scratch', repo: 'o/r', kind: 'dev', autoMigrations: false },
   ]);
   if (process.platform !== 'win32') assert.equal(statSync(dbRefsFile(home)).mode & 0o777, 0o600);
   await set(['--ref', REF2, '--name', 'Renamed', '--repo', 'o/r']);
@@ -157,6 +160,8 @@ test('guard: an agent line running `pipeline db-refs set|remove|server` is refus
     `${PIPE} db-refs set --ref ${REF} --name x --repo o/r --dev`,
     `${PIPE} db-refs remove --ref ${REF}`,
     `${PIPE} db-refs server add evil`,
+    `${PIPE} db-refs auto-migrations on --ref ${REF}`,
+    `${PIPE} db-refs auto-migrations off --ref ${REF}`,
     'pipeline db-refs set --ref x',
     `${PIPE} db-refs`,
     `cd /tmp && ${PIPE} db-refs set --ref ${REF} --name x --repo o/r`,
@@ -288,4 +293,200 @@ test('preflight: an invalid registry file is reported when the repo has supabase
   const repo = repoWith(true);
   const r = await runPreflight({ cwd: repo.dir, env: healthy({ HOME: home, USERPROFILE: home }) });
   assert.ok(r.warnings.some((w) => /db-refs/.test(w) && /invalid/.test(w)), JSON.stringify(r.warnings));
+});
+
+// ---- auto-apply (Task 1): the registry's autoMigrations flag -------------------------------------------------------------------------------------------------------------
+
+const ON = { autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' };
+const LIVE = (over = {}) => ({ ref: REF, name: 'EagleWatch live', repo: 'acme/widgets', kind: 'live', ...over });
+
+test('readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry, one without repo or one without a valid autoSince, is invalid', (t) => {
+  // Failure caught: a hand-edited or half-written registry that the guard still believes, turning auto-apply on for a project it should not cover.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE()] });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: false, autoSince: null });
+  seedRegistry(home, { refs: [LIVE(ON)] });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' });
+  seedRegistry(home, { refs: [LIVE({ autoMigrations: false })] });
+  assert.equal(readDbRefs(home).refs[0].autoMigrations, false);
+  for (const bad of [LIVE({ autoMigrations: 'true' }), LIVE({ autoMigrations: 1 }), LIVE({ autoMigrations: null }), LIVE({ ...ON, kind: 'dev' }), LIVE({ ...ON, repo: null }), LIVE({ autoMigrations: true }), LIVE({ autoMigrations: true, autoSince: '2026-11-27' }), LIVE({ autoMigrations: true, autoSince: 'yesterday' }), LIVE({ autoMigrations: true, autoSince: '2026-11-27T01:00:00' })]) {
+    seedRegistry(home, { refs: [bad] });
+    assert.deepEqual(readDbRefs(home), { ok: false, reason: 'invalid' }, JSON.stringify(bad));
+  }
+});
+
+test('autoEntry: two enabled entries with the same repo (hand-written registry) answer ambiguous for both; off and dev answer off', (t) => {
+  // Failure caught: auto-apply choosing one of two projects that share a repo, applying an EagleWatch file to the wrong database.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE({ repo: 'o/R', ...ON }), LIVE({ ref: REF2, repo: 'O/r', ...ON })] });
+  const state = readDbRefs(home);
+  for (const ref of [REF, REF2]) {
+    const r = autoEntry(ref, state);
+    assert.equal(r.entry, null);
+    assert.match(r.reason, /^ambiguous: [a-z0-9]{20} has the same repo$/);
+  }
+  seedRegistry(home, { refs: [LIVE({ repo: 'o/R', ...ON }), LIVE({ ref: REF2, repo: 'o/r' })] });
+  assert.equal(autoEntry(REF, readDbRefs(home)).entry.ref, REF);
+  assert.deepEqual(autoEntry(REF2, readDbRefs(home)), { entry: null, reason: 'off' });
+  assert.deepEqual(autoEntry('nnnnnnnnnnnnnnnnnnnn', readDbRefs(home)), { entry: null, reason: 'off' });
+});
+
+const OTHER_REF = 'klmnopqrst0123456789';
+const NO_REPO_REF = 'nnnnnnnnnnnnnnnnnnnn';
+const GO_DIR = (home) => join(home, '.claude', 'pipeline-state', 'owner-go');
+const attemptsDir = (home) => join(GO_DIR(home), 'live-db-attempts');
+const writeText = (file, text) => { mkdirSync(join(file, '..'), { recursive: true }); writeFileSync(file, text); };
+const jsonl = (v) => `${JSON.stringify(v)}\n`;
+
+test('auto-migrations on|off: the owner turns it on and off for a live ref with a repo; show prints it; on says what it trusts and makes the history folder', async (t) => {
+  // Failure caught: a switch that does not stick, or that gives no hint of the trust it grants (every PR merged into the repo).
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE()] });
+  const on = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF]);
+  assert.equal(on.exitCode, 0, JSON.stringify(on.output));
+  assert.match(on.output.note, /acme\/widgets/);
+  assert.match(on.output.note, /again after any rollback/);
+  assert.equal(readDbRefs(home).refs[0].autoMigrations, true);
+  assert.ok(existsSync(attemptsDir(home)), 'the history folder exists');
+  assert.equal(on.output.refs[0].autoMigrations, true);
+  assert.equal((await run(['show'], ownerCtx(home))).output.refs[0].autoMigrations, true);
+  const off = runOwnerCli(home, ['auto-migrations', 'off', '--ref', REF]);
+  assert.equal(off.exitCode, 0);
+  assert.equal(readDbRefs(home).refs[0].autoMigrations, false);
+  assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /autoMigrations|autoSince/);
+  assert.ok(existsSync(attemptsDir(home)), 'off keeps the history');
+});
+
+test('auto-migrations refuses inside Claude Code; an unknown ref, a dev ref, an entry without repo and a second ref of the same repo are usage errors; nothing is written', async (t) => {
+  // Failure caught: an agent switching the trust on for itself, or the switch landing on a project it cannot safely name (dev, no repo, two projects for one repo).
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE({ ref: REF, repo: 'o/R', ...ON }), LIVE({ ref: REF2, repo: 'O/r' }), { ref: OTHER_REF, name: 'Dev', repo: 'x/y', kind: 'dev' }, { ref: NO_REPO_REF, name: 'No repo', repo: null, kind: 'live' }] });
+  const before = readFileSync(dbRefsFile(home), 'utf8');
+  const inside = await run(['auto-migrations', 'on', '--ref', REF2], ownerCtx(home, { env: { CLAUDECODE: '1' } }));
+  assert.equal(inside.exitCode, 2);
+  assert.equal(inside.output.error, 'refused');
+  assert.equal((await run(['auto-migrations', 'off', '--ref', REF], ownerCtx(home, { env: { CLAUDECODE: '1' } }))).exitCode, 2);
+  for (const ref of ['qqqqqqqqqqqqqqqqqqqq', OTHER_REF, NO_REPO_REF, REF2]) await assert.rejects(() => run(['auto-migrations', 'on', '--ref', ref], ownerCtx(home)), UsageError, ref);
+  for (const bad of [['auto-migrations'], ['auto-migrations', 'maybe', '--ref', REF], ['auto-migrations', 'on'], ['auto-migrations', 'on', '--ref', 'bad'], ['auto-migrations', 'on', '--ref', REF, '--name', 'x'], ['auto-migrations', 'off', '--ref', REF, '--accept-unmatched']]) await assert.rejects(() => run(bad, ownerCtx(home)), UsageError, bad.join(' '));
+  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, 'nothing written');
+  assert.equal(existsSync(attemptsDir(home)), false);
+});
+
+test('auto-migrations on imports this project\'s earlier go applies; an apply with no recoverable name refuses until accepted', async (t) => {
+  // Failure caught: an apply made before the switch, of a file later changed in its PR under the same name, being auto-applied again because the history never heard of the earlier apply.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE()] });
+  const sha = (q) => createHash('sha256').update(q).digest('hex');
+  const go = GO_DIR(home);
+  const marker = (id, body) => writeText(join(go, 'live-db-consumed', `${id}.json`), jsonl({ v: 1, op: 'migration', projectRef: REF, ...body }));
+  const idOf = (kind, session, key) => createHash('sha256').update(`${kind}|${session}|${key}`).digest('hex').slice(0, 32);
+  const rec = (session, extra) => ({ v: 1, kind: 'live-db-go', ts: '2026-11-10T09:59:00.000Z', session, op: 'migration', projectRef: REF, head: 'a'.repeat(40), file: 'f', repo: 'acme/widgets', prompt: 'go', ...extra });
+  const A = { name: '20261110000000_a', sql: 'select 1;\n', session: 'sess-a' };
+  const B = { name: '20261112000000_b', sql: 'select 2;\n', session: 'sess-b' };
+  writeText(join(go, 'sess-a.jsonl'), jsonl(rec(A.session, { sqlSha256: sha(A.sql), name: A.name, prompt_id: 'p-a' })));
+  writeText(join(go, 'sess-b.jsonl'), jsonl(rec(B.session, { sqlSha256: sha(B.sql), name: B.name, prompt_id: null, via: 'ask', ask: { askId: 'ask-000000000001', toolUseId: 'tu1', clickId: 'c1c1c1c1c1c1c1c1' } })));
+  marker(idOf('live-db', A.session, 'p-a'), { consumedAt: '2026-11-10T10:00:00.000Z', sqlSha256: sha(A.sql) });
+  marker(idOf('live-db-click', B.session, 'c1c1c1c1c1c1c1c1'), { consumedAt: '2026-11-12T10:00:00.000Z', sqlSha256: sha(B.sql) });
+  const gone = 'select 3;\n';
+  marker('f'.repeat(32), { consumedAt: '2026-11-14T10:00:00.000Z', sqlSha256: sha(gone) });
+  writeText(join(go, 'live-db-consumed', `${'e'.repeat(32)}.json`), jsonl({ v: 1, op: 'migration', projectRef: OTHER_REF, consumedAt: '2026-11-15T10:00:00.000Z', sqlSha256: sha('select 4;\n') }));
+  const before = readFileSync(dbRefsFile(home), 'utf8');
+  const refused = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF]);
+  assert.equal(refused.exitCode, 2);
+  assert.equal(refused.output.error, 'unmatched-applies');
+  assert.deepEqual(refused.output.unmatched, [{ sqlSha256: sha(gone).slice(0, 12), consumedAt: '2026-11-14T10:00:00.000Z' }]);
+  assert.match(refused.output.message, /--accept-unmatched/);
+  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, 'nothing written');
+  assert.equal(existsSync(attemptsDir(home)), false);
+  const ok = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF, '--accept-unmatched']);
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
+  assert.deepEqual(ok.output.imported.map((i) => i.name), [A.name, B.name]);
+  for (const x of [A, B]) {
+    const h = history({ home, ref: REF, name: x.name, sqlSha256: sha(x.sql) });
+    assert.deepEqual([h.name.n, h.sql.n], [1, 1], x.name);
+  }
+  const g = history({ home, ref: REF, name: 'unknown', sqlSha256: sha(gone) });
+  assert.deepEqual([g.name.n, g.sql.n], [0, 1], 'the unmatched apply gives the SQL key only');
+  assert.equal(history({ home, ref: REF, name: 'unknown', sqlSha256: sha('select 4;\n') }).sql.n, 0, 'another project\'s apply is not imported');
+  const files = readdirSync(attemptsDir(home)).sort();
+  assert.equal(files.length, 5);
+  assert.equal(JSON.parse(readFileSync(join(attemptsDir(home), files.find((n) => n.startsWith('name-'))), 'utf8')).via, 'go-import');
+  runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF, '--accept-unmatched']);
+  assert.deepEqual(readdirSync(attemptsDir(home)).sort(), files, 'running it again adds nothing');
+});
+
+test('auto-migrations on refuses naming an unreadable consumed marker (of any project) and writes nothing', async (t) => {
+  // Failure caught: an empty or garbled marker hiding an earlier apply from the history, so the same migration is applied again.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE()] });
+  const marker = join(GO_DIR(home), 'live-db-consumed', `${'a'.repeat(32)}.json`);
+  writeText(marker, '');
+  const before = readFileSync(dbRefsFile(home), 'utf8');
+  const r = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF]);
+  assert.equal(r.exitCode, 1);
+  assert.ok(r.output.message.includes(marker), r.output.message);
+  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before);
+});
+
+test('auto-migrations on: a registry change made by another terminal during the import is not overwritten; the command refuses and says to run it again', async (t) => {
+  // Failure caught: switching project A on writes back the registry as it was read before the import, restoring the auto-apply permission the owner has just turned off for project B.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE({ ref: REF, repo: 'acme/widgets' }), LIVE({ ref: REF2, repo: 'acme/other', ...ON })] });
+  const changed = { v: 1, refs: [LIVE({ ref: REF, repo: 'acme/widgets' }), LIVE({ ref: REF2, repo: 'acme/other' })], servers: [] };
+  const r = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF], {}, changed);
+  assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+  assert.match(r.output.message, /run this again/i);
+  const after = readDbRefs(home).refs;
+  assert.deepEqual(after.map((e) => e.autoMigrations), [false, false], 'B stays off and A was not switched on');
+  const again = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF]);
+  assert.equal(again.exitCode, 0, JSON.stringify(again.output));
+});
+
+test('auto-migrations on: a consumed marker that carries its migration name is imported under that name with no session record left, and is not listed as unmatched', async (t) => {
+  // Failure caught: the importer dropping the marker's own name, so only the SQL key is imported and an older go for the same name with different SQL still passes the freshness rule.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE()] });
+  const sha = (q) => createHash('sha256').update(q).digest('hex');
+  const NAMED = '20261120000000_named';
+  writeText(join(GO_DIR(home), 'live-db-consumed', `${'c'.repeat(32)}.json`), jsonl({ v: 1, op: 'migration', projectRef: REF, consumedAt: '2026-11-20T10:00:00.000Z', sqlSha256: sha('select 5;\n'), name: NAMED }));
+  const r = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF]);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual(r.output.imported.map((i) => i.name), [NAMED]);
+  assert.deepEqual(r.output.unmatched, []);
+  const h = history({ home, ref: REF, name: NAMED, sqlSha256: sha('select 6;\n') });
+  assert.deepEqual([h.name.n, h.sql.n], [1, 0], 'another SQL under the same name now finds an attempt on the name key');
+});
+
+test('set keeps auto-migrations for a label-only edit; a new repo or --dev clears it', async (t) => {
+  // Failure caught: reassigning a project to another repository (or to dev) that carries the old repository's trust along.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE(ON)] });
+  runOwnerCli(home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'ACME/widgets']);
+  const kept = readDbRefs(home).refs[0];
+  assert.deepEqual([kept.autoMigrations, kept.autoSince, kept.name], [true, '2026-11-27T01:00:00Z', 'Renamed']);
+  runOwnerCli(home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'other/x']);
+  assert.equal(readDbRefs(home).refs[0].autoMigrations, false);
+  seedRegistry(home, { refs: [LIVE(ON)] });
+  runOwnerCli(home, ['set', '--ref', REF, '--name', 'x', '--repo', 'acme/widgets', '--dev']);
+  assert.equal(readDbRefs(home).refs[0].autoMigrations, false);
+});
+
+test('a registry writer holding the db-refs lock makes every other writer refuse and write nothing; the same command works once the lock is free', async (t) => {
+  // Failure caught: `auto-migrations on` and a concurrent `off` / `set` / `remove` each passing their read-compare-write and the later rename restoring the auto-apply permission the other just revoked.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE({ ref: REF, repo: 'acme/widgets' }), LIVE({ ref: REF2, repo: 'acme/other', ...ON })] });
+  const before = readFileSync(dbRefsFile(home), 'utf8');
+  const held = tryAcquire('db-refs', { dir: join(dirname(dbRefsFile(home)), 'locks'), machineId: null });
+  assert.equal(held.acquired, true);
+  const ctx = { home, env: { [SWITCH]: '1' }, lockWaitMs: 100 };
+  for (const args of [['auto-migrations', 'on', '--ref', REF], ['auto-migrations', 'off', '--ref', REF2], ['remove', '--ref', REF2], ['set', '--ref', REF, '--name', 'x', '--repo', 'a/b'], ['server', 'add', 'my_db']]) {
+    const r = await run(args, ctx);
+    assert.equal(r.exitCode, 1, args.join(' '));
+    assert.match(r.output.message, /another db-refs command is running.*nothing was written.*run this again/i, args.join(' '));
+    assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, `${args.join(' ')} wrote while the lock was held`);
+  }
+  release(held.lock);
+  const ok = runOwnerCli(home, ['auto-migrations', 'off', '--ref', REF2]);
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
+  assert.equal(existsSync(join(dirname(dbRefsFile(home)), 'locks', 'db-refs.lock')), false, 'the lock is released after a write');
 });

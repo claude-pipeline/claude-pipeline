@@ -1,10 +1,11 @@
 // `pipeline live-db present | catalog`: the Claude side of the live-database guard (#262; the rules are in hooks/lib/live-db-guard.mjs, the block and the recorder in hooks/lib/live-db-go.mjs).
 // `present` builds the block the owner must be shown before a live Supabase change (a migration file, or a data fix); the owner's typed go is recorded only when the reply ends with exactly that block.
 // `--ask` (click-to-approve, #261): also prints the choice dialog the owner may answer with a click instead of typing the go (the typed go stays as the fallback).
+// `auto-log` lists the migration attempts the guard recorded for projects whose owner switched auto-apply on (read-only).
 // `catalog` prints the fixed catalog look-up SQL that execute_sql may run on a live project without a go (hooks/lib/live-db-catalog.mjs). Both only read: neither applies anything.
 import { readFileSync } from 'node:fs';
 import path from 'node:path';
-import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
+import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { git } from '../lib/git.mjs';
 import { createGitHub } from '../lib/github.mjs';
 import { requireConfig } from '../lib/cmd-common.mjs';
@@ -13,10 +14,11 @@ import { accountHome } from '../lib/paths.mjs';
 import { CATALOG_TEMPLATES, GUC_NAMES, buildCatalogQuery } from '../hooks/lib/live-db-catalog.mjs';
 import { readDbRefs } from '../hooks/lib/db-refs.mjs';
 import { liveDbAsk } from '../hooks/lib/owner-go-click.mjs';
+import { readAttemptLog } from '../hooks/lib/live-db-auto.mjs';
 import { blobAt, buildBlock, canonicalDataSql, liveLabel, migrationSqlProblem, repoOf, sha256Of, summaryProblem } from '../hooks/lib/live-db-go.mjs';
 
 export const meta = {
-  summary: 'live-database guard: build the block the owner is shown before a live Supabase change (present), print the catalog look-up SQL that needs no go (catalog)',
+  summary: 'live-database guard: build the block the owner is shown before a live Supabase change (present), print the catalog look-up SQL that needs no go (catalog), list the recorded migration attempts (auto-log)',
   usage: [
     'pipeline live-db present --op migration --pr <N> --file supabase/migrations/<f>.sql --project <ref> --summary "<one line>"',
     '  -> {ok, block, sqlSha256, name} : refuses unless the working-tree file equals HEAD:<file>, HEAD is the PR head on GitHub, the bytes are valid (UTF-8, no CR/NUL, no fence line, at most 300 lines) and the project is live.',
@@ -26,6 +28,7 @@ export const meta = {
     '  -> {ok, block, sqlSha256, sql} : the SQL is canonicalised (BOM and trailing whitespace stripped; CR, NUL, a fence line, a line with trailing spaces, over 60 lines or 4000 characters are refused: make it a migration). Pass `sql` verbatim as execute_sql query; the owner types `go data <sha12>`.',
     '  -> --ask on a data fix: the same dialog (Yes, run <sha12> | Not yet), when the checkout has an origin remote; otherwise ask: null and askSkipped.',
     `pipeline live-db catalog <kind> [args…]   -> {ok, sql} : the only execute_sql text a live project takes without a go; pass sql verbatim. kinds: ${Object.entries(CATALOG_TEMPLATES).map(([k, t]) => [k, ...t.args.map((a) => `<${a}>`)].join(' ')).join(' · ')}`,
+    'pipeline live-db auto-log [--days N]   -> {ok, events: [{at, via (auto | go | go-import), outcome, ref, label, name, file, pr, commit, repo, session, generation}], unreadable: [path]} : the migration attempts recorded on this machine for projects whose owner switched auto-apply on, newest first, the last N days (default 30). Read-only; runs anywhere. outcome `attempted` = both of its records exist: the call was allowed, or it was denied after the second record was written (making it durable failed, time ran out, a consumed-go record could not be read, or a go was consumed meanwhile), so it counts as an attempt and the live state is checked (attempted, not necessarily applied: the session\'s effect check says whether it applied), `reserved` = only one of its two records exists (a lost race or a failed write: nothing was allowed), `imported` = a go the owner\'s auto-migrations switch-on imported (nothing was allowed by it).',
     `  arguments are lower-case names (a-z 0-9 _, up to 63 characters); setting takes one of: ${GUC_NAMES.join(' ')}`,
   ].join('\n'),
 };
@@ -36,7 +39,7 @@ export async function run(argv, ctx = {}) {
   const env = ctx.env ?? process.env;
   const home = ctx.home ?? accountHome();
   const { values, positionals } = parseCommandArgs(argv, {
-    ask: { type: 'boolean' }, op: { type: 'string' }, pr: { type: 'string' }, file: { type: 'string' }, project: { type: 'string' }, summary: { type: 'string' }, 'sql-file': { type: 'string' },
+    ask: { type: 'boolean' }, days: { type: 'string' }, op: { type: 'string' }, pr: { type: 'string' }, file: { type: 'string' }, project: { type: 'string' }, summary: { type: 'string' }, 'sql-file': { type: 'string' },
   });
   const sub = positionals[0];
 
@@ -50,7 +53,15 @@ export async function run(argv, ctx = {}) {
     }
   }
 
-  if (sub !== 'present' || positionals.length > 1) throw new UsageError('usage: pipeline live-db present … | catalog <kind> [args…]');
+  if (sub === 'auto-log') {
+    for (const k of Object.keys(values)) if (k !== 'days') throw new UsageError(`auto-log takes no --${k}`);
+    if (positionals.length > 1) throw new UsageError('usage: pipeline live-db auto-log [--days N]');
+    const days = intOption(values, 'days', { min: 1, max: 3650 }) ?? 30;
+    const { events, unreadable } = readAttemptLog({ home, sinceMs: (ctx.now ?? Date.now)() - days * 24 * 3600 * 1000 });
+    return { exitCode: EXIT.OK, output: { ok: true, events, unreadable } };
+  }
+
+  if (sub !== 'present' || positionals.length > 1) throw new UsageError('usage: pipeline live-db present … | catalog <kind> [args…] | auto-log [--days N]');
   const op = values.op;
   if (op !== 'migration' && op !== 'data') throw new UsageError('--op must be migration or data');
   if (!values.project) throw new UsageError('missing --project <20-character project ref>');

@@ -41,4 +41,4 @@ The full section 3.
    `Head <sha12> · items <digest> · repo <owner/name>`
    `🔀 Ready to merge #N — say "merge"`
 
-A migration that must reach a LIVE database is applied only with the owner's go (a click, or the typed fallback): `reference/owner-merge.md` section "Live-database go".
+A migration that must reach a LIVE database is applied only with the owner's go (a click, or the typed fallback): `reference/owner-merge.md` section "Live-database go" (a project whose owner switched auto-apply on also applies a migration file a merged PR added, with no go, after the merge: section "Auto-apply after the merge").

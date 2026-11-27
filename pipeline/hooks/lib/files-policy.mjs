@@ -27,7 +27,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
 
 const posix = path.posix;
@@ -880,9 +880,9 @@ function physicalTargets(target, ctx) {
 
 // #58: the owner-go recorder (installed in ~/.claude/pipeline/hooks, or a source checkout's pipeline/hooks) and its library.
 // #472: and the click libraries (lib/owner-go-click.mjs, lib/owner-go-click-hook.mjs): run by hand with an injected check they would write a pending click with a made-up capture-time hook result.
-// #262: and the live-database go recorder (lib/live-db-go.mjs): run by hand it would write a "typed go" the owner never typed. ONE alternation feeds both expressions, so the path check and the word / stdin checks cannot drift apart.
+// #262: and the live-database go recorder (lib/live-db-go.mjs): run by hand it would write a "typed go" the owner never typed; and its attempt-history writer (lib/live-db-auto.mjs): run by hand it would write markers in the protected tree. ONE alternation feeds both expressions, so the path check and the word / stdin checks cannot drift apart.
 // #683: and the database registry writer (lib/db-refs.mjs, commands/db-refs.mjs): run by hand it would rewrite which databases count as live. A scratch file that imports it is stopped by the writer itself, not by this text scan.
-const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go|db-refs`;
+const OWNER_GO_LIBS = String.raw`owner-go(?:-click(?:-hook)?)?|live-db-go|live-db-auto|db-refs`;
 const OWNER_GO_RECORDER = new RegExp(String.raw`(?:^|/)hooks/(?:lib/)?(?:${OWNER_GO_LIBS})\.mjs$`, 'i');
 const OWNER_GO_WORD = new RegExp(String.raw`(?:${OWNER_GO_LIBS})\.mjs`, 'i');
 
@@ -935,8 +935,10 @@ function evaluateMcp(tool, ti, input, opts) {
   const match = supabaseMatch(tool, readDbRefs(home), ti, { home, env });
   if (!match) return generic;
   if (env.PIPELINE_ADMIN === '1') return allow();
+  // the whole decision runs inside what is left of the hook's wall cap (the git reads and the GitHub question of the live-database guard are bounded by it)
+  const budget = opts._budget ?? newEvalBudget(opts.now, opts.cpu, opts.wall0);
   const verdict = evaluateSupabaseMcp(tool, ti, {
-    home, sessionId: input?.session_id, transcriptPath: input?.transcript_path, now: opts.now, io: opts.liveDbIo,
+    home, sessionId: input?.session_id, transcriptPath: input?.transcript_path, now: opts.now, io: opts.liveDbIo, leftMs: () => wallLeftMs(budget), env,
   });
   return verdict.decision === 'deny' && SUPABASE_MATCH_HINT[match] ? { ...verdict, reason: `${verdict.reason} ${SUPABASE_MATCH_HINT[match](serverSegment(tool))}` } : verdict;
 }

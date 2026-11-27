@@ -2,9 +2,13 @@
 // 2.1.323 click transcript (test/fixtures/click). The typed go (test/live-db-guard.test.mjs) is the fallback and stays unchanged.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { createHash } from 'node:crypto';
+import { git as realGit } from '../pipeline/lib/git.mjs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { ymlFor } from './helpers/gate-env.mjs';
 import { seedRegistry } from './helpers/db-refs-owner.mjs';
@@ -14,6 +18,7 @@ import { claimLiveDbGo, evaluateSupabaseMcp } from '../pipeline/hooks/lib/live-d
 import { asksDir, clickProvenance, liveDbAsk, issueAsk, matchesInstalledDialog, readAsk, recordClick } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { readRecords } from '../pipeline/hooks/lib/owner-go.mjs';
 
+const realGitPath = '/usr/bin/git';
 const REF = 'abcdefghij0123456789';
 const OTHER = 'klmnopqrst0123456789';
 const NAME = '20261117000000_add_col';
@@ -29,11 +34,11 @@ const text = (es) => `${es.map((e) => JSON.stringify(e)).join('\n')}\n`;
 // One world: registry, a repo with the migration, the block `present` prints, the issued ask and a 2.1.323 transcript (prompt + tool_use; the answer's entry is appended by w.flush()).
 // `reply`: the assistant texts printed before the dialog, one transcript entry each, or a function (block, dir) -> texts (default: the block `present` printed, pasted last).
 const dir0 = (repo) => repo.dir;
-async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null } = {}) {
+async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null, flag = false } = {}) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'cp-live-db-click-')));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   mkdirSync(join(home, '.claude'), { recursive: true });
-  seedRegistry(home, { refs: [{ ref: REF, name: LABEL, repo: 'acme/widgets', kind: 'live' }, { ref: OTHER, name: 'Other live', repo: 'acme/widgets', kind: 'live' }] });
+  seedRegistry(home, { refs: [{ ref: REF, name: LABEL, repo: 'acme/widgets', kind: 'live', ...(flag ? { autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' } : {}) }, { ref: OTHER, name: 'Other live', repo: 'acme/widgets', kind: 'live' }] });
   const repo = createTmpRepo();
   repo.git(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
   repo.write(FILE, SQL);
@@ -69,7 +74,7 @@ async function world(t, { op = 'migration', answer = null, flush = false, modelA
   w.hook = () => recordClick(w.input, { home, now: () => w.t, sleep: noSleep, pollMs: 0, hookCheck: OK });
   w.flush = () => appendFileSync(file, text([result]));
   w.claim = (over = {}) => claimLiveDbGo({ home, sessionId: w.session, transcriptPath: file, op, projectRef: REF, name: op === 'migration' ? NAME : null, sqlSha256: sha256Of(op === 'migration' ? SQL : dataSql), now: () => w.t, ...over });
-  w.apply = (over = {}) => evaluateSupabaseMcp(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: SQL, ...over }, { home, sessionId: w.session, transcriptPath: file, now: () => w.t });
+  w.apply = (over = {}, ctx = {}) => evaluateSupabaseMcp(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: SQL, ...over }, { home, sessionId: w.session, transcriptPath: file, now: () => w.t, ...ctx });
   w.records = () => readRecords({ home, session: w.session, now: () => w.t, maxAgeMs: Infinity, settle: false });
   return w;
 }
@@ -222,4 +227,81 @@ test('live-db present --ask: a migration whose ask file would be over the 64 KB 
   assert.equal(r.output.ask, null);
   assert.match(r.output.askSkipped, /too-large: \d+ bytes/);
   assert.equal(readdirSync(asksDir(w.home)).length, before, 'no ask file written');
+});
+
+// ---- auto-apply, Task 2: the click's go time on a project whose owner switched auto-apply on ---------------------------------------------------------------------------------
+
+test('flag on: a click dialog issued before an attempt and answered after it is not a later go', async (t) => {
+  // Failure caught: ordering a click by its answer time, so a dialog shown before a failed attempt but answered after it applied the migration a second time.
+  const w = await world(t, { flush: true, flag: true });
+  assert.ok((await w.hook()).recorded);
+  const issued = Date.parse(readAsk(w.askId, { home: w.home }).ask.issuedAt);
+  assert.ok(w.answeredAt - issued > 2000, 'the fixture answers well after the dialog was issued');
+  const attempts = join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-attempts');
+  mkdirSync(attempts, { recursive: true });
+  const id = (kind, key) => createHash('sha256').update(`${kind}|${REF}|${key}`).digest('hex').slice(0, 32);
+  for (const [kind, key] of [['name', NAME], ['sql', sha256Of(SQL)]]) writeFileSync(join(attempts, `${kind}-${id(kind, key)}-1.json`), `${JSON.stringify({ v: 1, event: 'seed', at: new Date(issued + 1000).toISOString(), via: 'go' })}\n`);
+  const r = w.apply();
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /after this go/);
+});
+
+test('out of time: a click go whose pending click must still be settled is a deny that burns nothing; with time, the same click applies', async (t) => {
+  // Failure caught: the click-settling route (pending pointer, ask file, transcript, block rebuild with git) running past the hook's budget, or an out-of-time call consuming the click.
+  const w = await world(t, { flush: false, flag: true });
+  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
+  w.flush();
+  let spawns = 0;
+  const r = w.apply({}, { leftMs: () => 0, io: { git: (args, opts) => { spawns += 1; return realGit(args, opts); } } });
+  assert.equal(r.decision, 'deny');
+  assert.equal(spawns, 0, 'no git process was started');
+  assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
+  assert.equal(w.apply().decision, 'allow', 'with time left the click settles and applies');
+});
+
+// Skipped on Windows: the test puts a POSIX sh git shim on PATH.
+test('out of time in the middle of settling: the valid click stays pending (no .settled, nothing consumed) and settles with a full budget', { skip: process.platform === 'win32' }, async (t) => {
+  // Failure caught: the budget running out between two git reads of the settling turned the block rebuild into "ask invalid" and wrote a terminal `refused` marker, so a retry with time left skipped the owner's click.
+  const w = await world(t, { flush: false, flag: true });
+  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
+  w.flush();
+  const shim = join(w.home, 'shim-git');
+  mkdirSync(shim);
+  const marker = join(w.home, 'git-ran');
+  writeFileSync(join(shim, 'git'), `#!/bin/sh\ntouch '${marker}'\nexec ${realGitPath} "$@"\n`, { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${shim}${delimiter}${oldPath}`;
+  let r;
+  try {
+    r = w.apply({}, { leftMs: () => (existsSync(marker) ? 0 : 60_000) }); // time is up right after the first git read
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  assert.ok(existsSync(marker), 'a git read ran before the budget ended');
+  assert.equal(r.decision, 'deny');
+  assert.deepEqual(readdirSync(asksDir(w.home)).filter((n) => n.endsWith('.settled')), [], 'no terminal verdict was written');
+  assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
+  assert.equal(w.apply().decision, 'allow', 'with time left the same click settles and applies');
+});
+
+test('through the real hook entry: a pending click of this session and a git that never answers is a deny within the host timeout, with nothing consumed', async (t) => {
+  // Failure caught: the click-settling route (pending click -> ask file -> block rebuild with git) running past the hook's 15 s host timeout when git hangs; Claude Code then ALLOWS the call.
+  const w = await world(t, { flush: false, flag: true });
+  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
+  w.flush();
+  const shim = join(w.home, 'shim');
+  mkdirSync(shim);
+  writeFileSync(join(shim, 'git'), '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+  const slowGh = join(w.home, 'slow-gh.mjs');
+  writeFileSync(slowGh, 'setTimeout(() => {}, 30000);\n');
+  const env = { ...process.env, HOME: w.home, USERPROFILE: w.home, PATH: `${shim}${delimiter}${process.env.PATH}`, PIPELINE_GH: `${process.execPath} ${slowGh}` };
+  delete env[['PIPELINE', 'ADMIN'].join('_')];
+  delete env.PIPELINE_GUARD_LOG;
+  const input = { hook_event_name: 'PreToolUse', tool_name: `${TOOL}apply_migration`, tool_input: { project_id: REF, name: NAME, query: SQL }, session_id: w.session, transcript_path: w.file, cwd: w.repo.dir };
+  const t0 = Date.now();
+  const r = spawnSync(process.execPath, [fileURLToPath(new URL('../pipeline/hooks/guard-files.mjs', import.meta.url))], { input: JSON.stringify(input), encoding: 'utf8', env, timeout: 30_000 });
+  const ms = Date.now() - t0;
+  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny', r.stdout);
+  assert.ok(ms < 14_000, `${ms} ms`);
+  assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
 });

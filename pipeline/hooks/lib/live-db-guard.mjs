@@ -4,20 +4,17 @@
 // migration the name), consumed AT THE ATTEMPT with an exclusive-create marker (a failed or interrupted apply needs a new go, and the live state must be checked read-only first).
 //
 // A tripwire, not a boundary: the boundary is the agent not holding prod credentials.
-import { createHash } from 'node:crypto';
-import { closeSync, constants, fsyncSync, openSync, writeSync } from 'node:fs';
-import path from 'node:path';
 import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore, replyBeforeToolUse } from './owner-go.mjs';
 import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.mjs';
-import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
+import { autoEntry, isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { activeBinding, identify } from './mcp-servers.mjs';
-import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock } from './live-db-go.mjs';
+import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock, withGitDeadline } from './live-db-go.mjs';
+import { AUTO_MIN_CLAIM_MS, autoApply, claimGoMarker, claimNext, history } from './live-db-auto.mjs';
 
-export const LIVE_DB_CONSUMED_REL = '.claude/pipeline-state/owner-go/live-db-consumed';
+export { LIVE_DB_CONSUMED_REL } from './live-db-auto.mjs';
 const PREFIX = '[claude-pipeline guard-files] live database:';
-const OPEN_EXCL = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
 const CLI = 'node ~/.claude/pipeline/bin/pipeline.mjs';
 
 export const SUPABASE_WRITE_NAMES = ['apply_migration', 'execute_sql', 'run_notebook', 'deploy_edge_function', 'create_edge_function_secret', 'create_branch', 'delete_branch', 'merge_branch', 'reset_branch', 'rebase_branch', 'create_project', 'pause_project', 'restore_project', 'create_notebook', 'delete_notebook'];
@@ -82,49 +79,19 @@ const allow = () => ({ decision: 'allow', reason: '' });
 const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
 
 // ---- the claim ----------------------------------------------------------------------------------------------------------------------
+// The go's consumed marker and the attempt history are written by live-db-auto.mjs (claimGoMarker, claimNext): exclusive create, durable before they answer.
 
-// Exclusive-create marker, durable before it answers `claimed`: write, fsync the file, close, fsync the folder. Any failure -> 'error' (the leftover marker stays spent). EEXIST -> 'spent'.
-// `io` ({openSync, writeSync, fsyncSync, closeSync}) are the fault seams of the tests. `promptId` is the typed go's prompt id, or (`click`) the click's id: one go, one apply either way, and
-// the two key spaces ('live-db' vs 'live-db-click') cannot collide.
-function takeMarker({ home, session, promptId, click = false, op, projectRef, sqlSha256, now, io = {} }) {
-  const id = createHash('sha256').update(`${click ? 'live-db-click' : 'live-db'}|${session}|${promptId}`).digest('hex').slice(0, 32);
-  const open = io.openSync ?? openSync;
-  const write = io.writeSync ?? writeSync;
-  const sync = io.fsyncSync ?? fsyncSync;
-  const close = io.closeSync ?? closeSync;
-  try {
-    if (!realDirChain(home, LIVE_DB_CONSUMED_REL)) return 'error';
-    const dir = path.join(home, ...LIVE_DB_CONSUMED_REL.split('/'));
-    let fd;
-    try {
-      fd = open(path.join(dir, `${id}.json`), OPEN_EXCL, 0o600);
-    } catch (err) {
-      return err?.code === 'EEXIST' ? 'spent' : 'error';
-    }
-    try {
-      write(fd, `${JSON.stringify({ v: 1, consumedAt: new Date(now()).toISOString(), op, projectRef, sqlSha256 })}\n`);
-      sync(fd);
-    } finally {
-      close(fd);
-    }
-    try {
-      const dfd = open(dir, constants.O_RDONLY);
-      try { sync(dfd); } catch (err) { if (!['EISDIR', 'EINVAL', 'EPERM'].includes(err?.code)) throw err; } finally { close(dfd); }
-    } catch (err) {
-      if (!['EISDIR', 'EINVAL', 'EPERM'].includes(err?.code)) return 'error';
-    }
-    return 'claimed';
-  } catch {
-    return 'error';
-  }
-}
-
-// -> { status: 'claimed'|'none'|'spent'|'unverified'|'expired'|'error', reason }
-export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef, name = null, sqlSha256, now = Date.now, io = {} }) {
+// -> { status: 'claimed'|'none'|'spent'|'unverified'|'expired'|'error'|'no-time', reason }
+// `leftMs` (optional): what is left of the hook's time budget. A migration go on a project whose owner switched auto-apply on (the registry entry's raw flag) also walks the attempt history:
+// an attempt at this name or this exact SQL recorded after the go blocks it, and the claim creates the next generation of both keys (live-db-auto.mjs). Any other call is judged as before.
+export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef, name = null, sqlSha256, now = Date.now, io = {}, leftMs }) {
   if (typeof sessionId !== 'string' || sessionId === '') return { status: 'none', reason: 'the call carries no session id' };
+  const flagged = op === 'migration' ? flaggedEntry(home, projectRef) : null;
+  const noTime = { status: 'no-time', reason: 'not enough time was left to check the owner\'s go: try the call again' };
   // A click the owner has just made may still be a pending pointer (Claude Code 2.1.323 writes the answer to the transcript only after the PostToolUse hook returns): verify it now, before the read below.
   // `waiting`: a live-database click of this session that could not be settled yet.
-  const settled = settlePendingClicks({ home, now, session: sessionId });
+  const settled = settlePendingClicks({ home, now, session: sessionId, leftMs });
+  if (settled.problems.includes('no-time')) return noTime;
   const waiting = settled.outcomes.some((o) => (o.outcome === 'waiting' || o.outcome === 'retry') && readAsk(o.askId, { home }).ask?.kind === 'live-db');
   const records = liveDbRecords({ home, session: sessionId, now })
     .filter((r) => r.op === op && r.projectRef === projectRef && r.sqlSha256 === sqlSha256 && (op !== 'migration' || r.name === name))
@@ -136,6 +103,7 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
   for (const r of records) {
     const skip = (status, reason) => { first ??= { status, reason }; };
     let at;
+    let goAt = null;
     let click = false;
     if (r.via === 'ask') {
       // The owner's click. clickProvenance re-reads the transcript: the question the dialog showed (its block re-passes verifyBlock in bindAnswer), the answer and the ask's own file must give exactly this
@@ -152,6 +120,12 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
         continue;
       }
       at = Date.parse(r.ts);
+      // the go's time for the history rules is when its dialog was issued, never the answer: a dialog shown before an attempt and answered after it is not a later go
+      const issued = flagged === null ? null : readAsk(r.ask.askId, { home });
+      if (flagged !== null) {
+        goAt = issued.ok ? Date.parse(issued.ask.issuedAt) : NaN;
+        if (!Number.isFinite(goAt)) { skip('unverified', 'the click\'s dialog cannot be read, so its time is unknown'); continue; }
+      }
     } else {
       if (typeof r.prompt_id !== 'string' || r.prompt_id === '') { skip('unverified', 'the recorded go has no prompt id, so it cannot be tied to the owner\'s prompt'); continue; }
       const found = promptEntryOf(r, { home });
@@ -165,16 +139,55 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
       const f = v.fields;
       if (!v.ok || f.op !== r.op || f.ref !== r.projectRef || f.sqlSha256 !== r.sqlSha256 || f.head !== r.head || f.file !== r.file || f.repo !== r.repo || f.name !== r.name) { skip('unverified', `the block the owner was shown before that go does not match the record${v.ok ? '' : ` (${v.reason})`}`); continue; }
       at = Date.parse(found.entry.timestamp);
+      goAt = at;
     }
     const age = now() - at;
     if (!Number.isFinite(age) || age > LIVE_DB_MAX_AGE_MS || age < -FUTURE_SKEW_MS) { skip('expired', `the owner's go is older than ${LIVE_DB_MAX_AGE_MS / 3600000} hours (or from the future)`); continue; }
-    const m = takeMarker({ home, session: sessionId, promptId: click ? r.ask.clickId : r.prompt_id, click, op, projectRef, sqlSha256, now, io });
-    if (m === 'claimed') return { status: 'claimed', reason: '' };
+    let seen = null;
+    if (flagged !== null) {
+      // (a) the attempt history of this name and this SQL; (b) a go older than the latest attempt, or stamped ahead of the clock, is not used (a retry needs a go given after the attempt)
+      const h = history({ home, ref: projectRef, name, sqlSha256, leftMs, io });
+      if (h.status === 'no-time') return noTime;
+      if (h.status === 'error') return { status: 'error', reason: `the attempt history ${h.path} cannot be read (${h.reason}), so nothing is applied; the owner looks at it` };
+      if (h.name.n > 0 || h.sql.n > 0) {
+        const last = Math.max(h.name.at, h.sql.at);
+        if (last >= goAt || goAt > now()) { skip('spent', `an attempt at this migration (this name or this exact SQL) was recorded at ${new Date(last).toISOString()}, after this go: check the live state read-only, then ask for a new go`); spent = true; continue; }
+      }
+      seen = h;
+      // (b2) time for the claim itself, before the go is consumed
+      if (typeof leftMs === 'function' && leftMs() < AUTO_MIN_CLAIM_MS) return noTime;
+    }
+    const m = claimGoMarker({ home, session: sessionId, promptId: click ? r.ask.clickId : r.prompt_id, click, op, projectRef, name, sqlSha256, now, io });
     if (m === 'spent') { spent = true; continue; }
-    return { status: 'error', reason: 'the go could not be marked as used (the folder is not a real directory, or a write failed), so nothing is applied' };
+    if (m !== 'claimed') return { status: 'error', reason: 'the go could not be marked as used (the folder is not a real directory, or a write failed), so nothing is applied' };
+    let hist = seen;
+    let label = flagged?.name;
+    if (seen === null) {
+      // read as unflagged: the owner may have switched auto-apply on, and an auto call claimed generations, between that read and this marker. Re-read the switch now that the marker is written (live-db-auto.mjs does the mirror image).
+      const nowFlagged = op === 'migration' ? flaggedEntry(home, projectRef) : null;
+      if (nowFlagged === null) return { status: 'claimed', reason: '' };
+      // the marker is written: from here the go is used, so a denial says so (never "try again")
+      const h = history({ home, ref: projectRef, name, sqlSha256, leftMs, io });
+      if (h.status === 'no-time') return { status: 'error', reason: 'not enough time was left to re-check the attempt history after the go was marked as used, so nothing is applied; the go is used' };
+      if (h.status === 'error') return { status: 'error', reason: `the attempt history ${h.path} cannot be read (${h.reason}), so nothing is applied; the go is used; the owner looks at it` };
+      if (h.name.n > 0 || h.sql.n > 0) return { status: 'spent', reason: 'an attempt at this migration was recorded while this go was being claimed (auto-apply was switched on meanwhile): this go is used; check the live state read-only, then ask for a new go' };
+      // nothing recorded yet: this go claims the generations now, so a later auto call (or another go) finds this attempt
+      hist = h;
+      label = nowFlagged.name;
+    }
+    const next = claimNext({ home, via: 'go', session: sessionId, now, facts: { ref: projectRef, sqlSha256, name, label, file: r.file ?? null, repo: r.repo ?? null, head: r.head ?? null }, seen: hist, leftMs, io });
+    if (next.status === 'claimed') return { status: 'claimed', reason: '' };
+    if (next.status === 'spent') return { status: 'spent', reason: 'another session attempted this migration meanwhile; this go is used' };
+    return { status: 'error', reason: `the attempt could not be recorded (${next.reason}), so nothing is applied; the go is used` };
   }
   if (spent && first === null) return { status: 'spent', reason: 'that go was already used' };
   return first ?? { status: 'spent', reason: 'that go was already used' };
+}
+
+// The registry entry of `ref` when its RAW flag is on (even when two entries make auto ambiguous: the go-path history rules then still apply), else null.
+function flaggedEntry(home, ref) {
+  const state = readDbRefs(home);
+  return state.ok ? state.refs.find((e) => e.ref === ref && e.autoMigrations === true) ?? null : null;
 }
 
 // ---- the decision ---------------------------------------------------------------------------------------------------------------------
@@ -184,8 +197,13 @@ const presentHint = (op, ref) => (op === 'migration'
   : `${CLI} live-db present --op data --sql-file <file> --project ${ref} --summary "…"`);
 const show = (query) => `sha256 ${sha256Of(query)} over ${Buffer.byteLength(query, 'utf8')} bytes`;
 
-// -> { decision, reason }. `ctx`: { home, sessionId, transcriptPath, now, io }
+// -> { decision, reason }. `ctx`: { home, sessionId, transcriptPath, now, io, leftMs, env }. `leftMs` is what is left of the hook's time budget: the whole decision runs inside it (every git read under the go's
+// verification, by any route, is clamped to it and is not started when nothing is left: unverified, a deny).
 export function evaluateSupabaseMcp(tool, ti, ctx) {
+  return withGitDeadline(ctx.leftMs, () => decide(tool, ti, ctx));
+}
+
+function decide(tool, ti, ctx) {
   const name = lastSegment(tool);
   if (SUPABASE_READ_NAMES.includes(name)) return allow();
   const home = ctx.home;
@@ -205,12 +223,23 @@ export function evaluateSupabaseMcp(tool, ti, ctx) {
     const op = name === 'apply_migration' ? 'migration' : 'data';
     const migName = name === 'apply_migration' && typeof ti?.name === 'string' ? ti.name : null;
     if (op === 'migration' && migName === null) return deny(`apply_migration on ${where} has no name to bind a go to`);
-    const c = claimLiveDbGo({ home, sessionId: ctx.sessionId, transcriptPath: ctx.transcriptPath, op, projectRef: target.ref, name: migName, sqlSha256: sha256Of(query), now: ctx.now ?? Date.now, io: ctx.io });
+    const c = claimLiveDbGo({ home, sessionId: ctx.sessionId, transcriptPath: ctx.transcriptPath, op, projectRef: target.ref, name: migName, sqlSha256: sha256Of(query), now: ctx.now ?? Date.now, io: ctx.io, leftMs: ctx.leftMs });
     if (c.status === 'claimed') return allow();
+    // the owner's go failed to apply: a migration of a project whose owner switched auto-apply on may still be applied with no go when a merged PR added exactly this file (live-db-auto.mjs). Not after an
+    // error (the go was consumed or the history unreadable) or when time ran out: those deny as before.
+    let autoNote = '';
+    if (op === 'migration' && c.status !== 'error' && c.status !== 'no-time') {
+      const auto = autoEntry(target.ref, state);
+      if (auto.entry) {
+        const a = autoApply({ home, entry: auto.entry, name: migName, query, session: ctx.sessionId, now: ctx.now ?? Date.now, leftMs: ctx.leftMs, env: ctx.env, io: ctx.io });
+        if (a.status === 'claimed') return allow();
+        autoNote = ` Auto-apply did not apply: ${a.reason}.`;
+      }
+    }
     const lookup = name === 'execute_sql' ? ` If the SQL only reads (a SELECT, an EXPLAIN, a count), do not ask the owner: write it to a file and run \`supabase db query --read-only --remote=${target.ref} -f <file.sql>\` (a file, so the shell cannot change the SQL), which the guard allows. For a schema look-up use \`${CLI} live-db catalog <kind> …\` and pass its sql verbatim.` : '';
     const ask = `Run \`${presentHint(op, target.ref)} --ask\`, end the reply with its block, then call AskUserQuestion with its ask.questions verbatim (when ask is null, wait for the owner's typed go instead).`;
     const after = c.status === 'spent' || c.status === 'error' ? ' A used go is never reused: check the live state read-only (list_migrations or a catalog query) before asking for a new one.' : '';
-    return deny(`${name} on ${where} needs the owner's go for exactly this query (${show(query)}${op === 'migration' ? `, name ${migName}` : ''}): ${c.reason}.${lookup} ${ask}${after}`);
+    return deny(`${name} on ${where} needs the owner's go for exactly this query (${show(query)}${op === 'migration' ? `, name ${migName}` : ''}): ${c.reason}.${autoNote}${lookup} ${ask}${after}`);
   }
   return deny(`${name} is not allowed on the live database ${where}; the owner does this in the dashboard`);
 }
