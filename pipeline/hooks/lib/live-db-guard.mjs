@@ -6,12 +6,12 @@
 // A tripwire, not a boundary: the boundary is the agent not holding prod credentials.
 import { FUTURE_SKEW_MS, promptEntryOf, promptTextOf, realDirChain, replyBefore, replyBeforeToolUse } from './owner-go.mjs';
 import { clickProvenance, readAsk, settlePendingClicks } from './owner-go-click.mjs';
-import { isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
+import { autoEntry, isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { activeBinding, identify } from './mcp-servers.mjs';
 import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock, withGitDeadline } from './live-db-go.mjs';
-import { AUTO_MIN_CLAIM_MS, claimGoMarker, claimNext, history } from './live-db-auto.mjs';
+import { AUTO_MIN_CLAIM_MS, autoApply, claimGoMarker, claimNext, history } from './live-db-auto.mjs';
 
 export { LIVE_DB_CONSUMED_REL } from './live-db-auto.mjs';
 const PREFIX = '[claude-pipeline guard-files] live database:';
@@ -211,10 +211,21 @@ function decide(tool, ti, ctx) {
     if (op === 'migration' && migName === null) return deny(`apply_migration on ${where} has no name to bind a go to`);
     const c = claimLiveDbGo({ home, sessionId: ctx.sessionId, transcriptPath: ctx.transcriptPath, op, projectRef: target.ref, name: migName, sqlSha256: sha256Of(query), now: ctx.now ?? Date.now, io: ctx.io, leftMs: ctx.leftMs });
     if (c.status === 'claimed') return allow();
+    // the owner's go failed to apply: a migration of a project whose owner switched auto-apply on may still be applied with no go when a merged PR added exactly this file (live-db-auto.mjs). Not after an
+    // error (the go was consumed or the history unreadable) or when time ran out: those deny as before.
+    let autoNote = '';
+    if (op === 'migration' && c.status !== 'error' && c.status !== 'no-time') {
+      const auto = autoEntry(target.ref, state);
+      if (auto.entry) {
+        const a = autoApply({ home, entry: auto.entry, name: migName, query, session: ctx.sessionId, now: ctx.now ?? Date.now, leftMs: ctx.leftMs, env: ctx.env, io: ctx.io });
+        if (a.status === 'claimed') return allow();
+        autoNote = ` Auto-apply did not apply: ${a.reason}.`;
+      }
+    }
     const lookup = name === 'execute_sql' ? ` If the SQL only reads (a SELECT, an EXPLAIN, a count), do not ask the owner: write it to a file and run \`supabase db query --read-only --remote=${target.ref} -f <file.sql>\` (a file, so the shell cannot change the SQL), which the guard allows. For a schema look-up use \`${CLI} live-db catalog <kind> …\` and pass its sql verbatim.` : '';
     const ask = `Run \`${presentHint(op, target.ref)} --ask\`, end the reply with its block, then call AskUserQuestion with its ask.questions verbatim (when ask is null, wait for the owner's typed go instead).`;
     const after = c.status === 'spent' || c.status === 'error' ? ' A used go is never reused: check the live state read-only (list_migrations or a catalog query) before asking for a new one.' : '';
-    return deny(`${name} on ${where} needs the owner's go for exactly this query (${show(query)}${op === 'migration' ? `, name ${migName}` : ''}): ${c.reason}.${lookup} ${ask}${after}`);
+    return deny(`${name} on ${where} needs the owner's go for exactly this query (${show(query)}${op === 'migration' ? `, name ${migName}` : ''}): ${c.reason}.${autoNote}${lookup} ${ask}${after}`);
   }
   return deny(`${name} is not allowed on the live database ${where}; the owner does this in the dashboard`);
 }

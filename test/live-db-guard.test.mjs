@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { git as realGit } from '../pipeline/lib/git.mjs';
-import { execFileSync, spawn } from 'node:child_process';
+import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { OWNER_ENTRY, linesOf } from './helpers/owner-go.mjs';
@@ -697,4 +697,371 @@ test('two gos of the same migration in two sessions after one failed attempt: ex
   assert.deepEqual(outcomes, ['claimed', 'spent']);
   assert.ok(existsSync(gfile(a, 'name', 2)) && existsSync(gfile(a, 'sql', 2)));
   assert.ok(!existsSync(gfile(a, 'name', 3)));
+});
+
+// ---- auto-apply, Task 3: a migration a merged PR added is applied with no go when the owner switched it on ---------------------------------------------------------------------
+
+const COMMIT = 'a'.repeat(40);
+const HEAD_SHA = 'b'.repeat(40);
+const NAME2 = '20261117000001_add_col2';
+const isoAt = (ms) => new Date(ms).toISOString();
+const fileList = (nodes, next = null) => ({ pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes });
+const prNode = (over = {}) => ({ number: 42, merged: true, baseRefName: 'main', baseRepository: { nameWithOwner: 'acme/widgets' }, mergeCommit: { oid: COMMIT }, files: fileList([{ path: FILE, changeType: 'ADDED' }]), ...over });
+// GitHub's answer for an eligible file: on main, identical text, one history node (PR 42's merge commit, an hour old), the PR ADDED the file
+const ghBase = ({ name = NAME, text = SQL } = {}) => ({ data: { repository: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main', target: { oid: HEAD_SHA, file: { object: { text, isBinary: false, isTruncated: false } }, history: { nodes: [{ oid: COMMIT, committedDate: isoAt(NOW - 3_600_000), associatedPullRequests: { nodes: [prNode({ files: fileList([{ path: `supabase/migrations/${name}.sql`, changeType: 'ADDED' }]) })] } }] } } } } } });
+const tip = (a) => a.data.repository.defaultBranchRef.target;
+const firstCommit = (a) => tip(a).history.nodes[0];
+const firstPr = (a) => firstCommit(a).associatedPullRequests.nodes[0];
+const GH_OK = { code: 0, stdout: '', stderr: '', timedOut: false, overBuffer: false };
+
+// No go anywhere: a scratch home with the registry (REF flagged unless `flag` is false), the history folder, and a fake gh that records its calls and answers from `s.answer()` (or `s.respond(args, opts)`: a partial gh result)
+async function autoScene(t, { flag = true, since = '2026-11-01T00:00:00Z', refs = [] } = {}) {
+  const home = mkdtempSync(join(tmpdir(), 'cp-live-db-auto-'));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', ...(flag ? { autoMigrations: true, autoSince: since } : {}) }, ...refs] });
+  mkdirSync(attempts({ home }), { recursive: true });
+  const s = { home, calls: [], answer: () => ghBase(), respond: null };
+  s.tweak = (fn, over) => { s.answer = () => { const a = ghBase(over); fn(a); return a; }; };
+  s.gh = (args, opts) => { s.calls.push({ args, opts }); return { ...GH_OK, ...(s.respond ? s.respond(args, opts) : { stdout: JSON.stringify(s.answer()) }) }; };
+  s.ctx = { home, sessionId: `auto-${randomUUID()}`, transcriptPath: join(home, 'none.jsonl'), now: () => NOW, io: { gh: s.gh } };
+  return s;
+}
+const hist = (s) => (existsSync(attempts(s)) ? readdirSync(attempts(s)) : []);
+
+test('auto: a merged, identical, recent file applies with no go, once; the history names the PR and commit', async (t) => {
+  // Failure caught: a merged file applied twice (a double apply), or applied with no record of which PR and commit it came from.
+  const s = await autoScene(t);
+  assert.equal(apply(s).decision, 'allow');
+  const [n, q] = [body(gfile(s, 'name', 1)), body(gfile(s, 'sql', 1))];
+  assert.deepEqual([n.via, n.pr, n.commit, n.repo, n.file, n.head], ['auto', 42, COMMIT, 'acme/widgets', FILE, HEAD_SHA]);
+  assert.equal(n.event, q.event);
+  assert.equal(s.calls.length, 1);
+  const again = apply(s);
+  assert.equal(again.decision, 'deny');
+  assert.match(again.reason, /already attempted/);
+  assert.equal(s.calls.length, 1, 'the history answers before GitHub is asked');
+});
+
+test('auto off (flag absent) and execute_sql with the switch on: the go is needed and GitHub is asked nothing', async (t) => {
+  // Failure caught: auto-apply reaching a project the owner did not switch on, or data SQL (execute_sql) applied with no go.
+  const off = await autoScene(t, { flag: false });
+  assert.equal(apply(off).decision, 'deny');
+  assert.equal(off.calls.length, 0);
+  assert.deepEqual(hist(off), []);
+  const on = await autoScene(t);
+  for (const query of ['update t set a = 1 where id = 7', 'begin;\ndrop table t;\nrollback;', SQL]) assert.equal(sql(on, query).decision, 'deny', query);
+  assert.equal(on.calls.length, 0);
+  assert.deepEqual(hist(on), []);
+});
+
+test('auto: one byte different (trailing newline, BOM, CRLF) needs the go and burns nothing', async (t) => {
+  // Failure caught: an edited copy of a merged file (one extra byte) applied under the merged file's name.
+  const s = await autoScene(t);
+  for (const query of [`${SQL}\n`, SQL.trimEnd(), `﻿${SQL}`, SQL.replace(/\n/g, '\r\n')]) assert.equal(apply(s, { query }).decision, 'deny', JSON.stringify(query));
+  assert.deepEqual(hist(s), []);
+  assert.equal(apply(s).decision, 'allow', 'the exact file still applies');
+});
+
+test('auto: GitHub\'s answer does not prove the file is on github.com\'s default branch of this repo', async (t) => {
+  // Failure caught: an unmerged file, a moved repository, a partial answer or another repository's file treated as the registered repo's merged file.
+  const cases = [
+    ['file missing', (a) => { tip(a).file = null; }, /whole text file/],
+    ['repository null (renamed or moved)', (a) => { a.data.repository = null; }, /acme\/widgets/],
+    ['errors with partial data', (a) => { a.errors = [{ message: 'partial' }]; }, /errors/],
+    ['another repository', (a) => { a.data.repository.nameWithOwner = 'other/widgets'; }, /other\/widgets/],
+    ['no default branch', (a) => { a.data.repository.defaultBranchRef = null; }, /default branch/],
+    ['binary blob', (a) => { tip(a).file.object.isBinary = true; }, /whole text file/],
+    ['truncated blob', (a) => { tip(a).file.object.isTruncated = true; }, /whole text file/],
+  ];
+  const s = await autoScene(t);
+  for (const [what, tweak, reason] of cases) {
+    s.tweak(tweak);
+    const r = apply(s);
+    assert.equal(r.decision, 'deny', what);
+    assert.match(r.reason, reason, what);
+  }
+  assert.deepEqual(hist(s), []);
+});
+
+test('auto: an old, edited or re-added file needs the go; the date is read strictly', async (t) => {
+  // Failure caught: a stale, edited or re-added file (or a date read loosely: no zone, not a date, from the future) applied with no go.
+  const s = await autoScene(t);
+  const day = 24 * 3600 * 1000;
+  const cases = [
+    ['two history nodes', (a) => { tip(a).history.nodes.push({ ...firstCommit(a), oid: 'c'.repeat(40) }); }],
+    ['7 d + 1 ms old', (a) => { firstCommit(a).committedDate = isoAt(NOW - 7 * day - 1); }],
+    ['6 min in the future', (a) => { firstCommit(a).committedDate = isoAt(NOW + 6 * 60_000); }],
+    ['no zone', (a) => { firstCommit(a).committedDate = '2026-11-17T11:00:00'; }],
+    ['not a date', (a) => { firstCommit(a).committedDate = 'yesterday'; }],
+  ];
+  for (const [what, tweak] of cases) {
+    s.tweak(tweak);
+    assert.equal(apply(s).decision, 'deny', what);
+  }
+  assert.deepEqual(hist(s), []);
+  const edge = await autoScene(t);
+  edge.tweak((a) => { firstCommit(a).committedDate = isoAt(NOW - 7 * day); });
+  assert.equal(apply(edge).decision, 'allow', 'exactly 7 d');
+  const zone = await autoScene(t);
+  zone.tweak((a) => { firstCommit(a).committedDate = '2026-11-17T19:00:00+08:00'; });
+  assert.equal(apply(zone).decision, 'allow', 'an in-window time written with an offset');
+});
+
+test('auto: only a file a merged PR ADDED counts', async (t) => {
+  // Failure caught: a direct push, an unmerged or other-branch PR, a rename, or a PR that never touched the path accepted as "merged by a PR".
+  const s = await autoScene(t);
+  const cases = [
+    ['direct push (no associated PR)', (a) => { firstCommit(a).associatedPullRequests.nodes = []; }],
+    ['not merged', (a) => { firstPr(a).merged = false; }],
+    ['merged into release', (a) => { firstPr(a).baseRefName = 'release'; }],
+    ['merge commit of the PR is another commit', (a) => { firstPr(a).mergeCommit = { oid: 'd'.repeat(40) }; }],
+    ['no merge commit', (a) => { firstPr(a).mergeCommit = null; }],
+    ['renamed', (a) => { firstPr(a).files.nodes[0].changeType = 'RENAMED'; }],
+    ['path missing from the files', (a) => { firstPr(a).files = fileList([{ path: 'supabase/migrations/other.sql', changeType: 'ADDED' }]); }],
+  ];
+  for (const [what, tweak] of cases) {
+    s.tweak(tweak);
+    assert.equal(apply(s).decision, 'deny', what);
+  }
+  assert.deepEqual(hist(s), []);
+  // the first 100 files of the PR do not hold the path and there is a next page: the second call names the PR and the cursor
+  const paged = (found) => async () => {
+    const p = await autoScene(t);
+    p.tweak((a) => { firstPr(a).files = fileList([{ path: 'supabase/migrations/other.sql', changeType: 'ADDED' }], 'CUR'); });
+    const first = p.answer;
+    p.respond = (args) => ({ stdout: JSON.stringify(args.includes('num=42') ? { data: { repository: { pullRequest: { files: fileList(found ? [{ path: FILE, changeType: 'ADDED' }] : [{ path: 'x.sql', changeType: 'ADDED' }]) } } } } : first()) });
+    return p;
+  };
+  const yes = await paged(true)();
+  assert.equal(apply(yes).decision, 'allow');
+  assert.equal(yes.calls.length, 2);
+  assert.ok(yes.calls[1].args.includes('num=42') && yes.calls[1].args.includes('after=CUR'), JSON.stringify(yes.calls[1].args));
+  const no = await paged(false)();
+  assert.equal(apply(no).decision, 'deny');
+  assert.equal(no.calls.length, 2);
+});
+
+test('auto: the GitHub question is pinned to github.com and names the registry repo and the migration path', async (t) => {
+  // Failure caught: a GH_HOST in the environment (or a look-alike repo) pointing the question at another server or repository.
+  const s = await autoScene(t);
+  assert.equal(apply(s, {}, { env: { GH_HOST: 'ghe.example' } }).decision, 'allow');
+  const { args, opts } = s.calls[0];
+  assert.deepEqual(args.slice(0, 4), ['api', '--hostname', 'github.com', 'graphql']);
+  for (const a of ['o=acme', 'n=widgets', `p=${FILE}`]) assert.ok(args.includes(a), a);
+  assert.equal(opts.env.GH_HOST, 'ghe.example', 'the call env reaches gh (the hostname flag wins over it)');
+});
+
+test('auto: a bad name or an after-deploy marker needs the go and asks GitHub nothing', async (t) => {
+  // Failure caught: a policy-tightening file (marked apply-after-deploy) running before its code is deployed, or a hostile name building the GitHub path.
+  const s = await autoScene(t);
+  for (const name of ['a/b', 'a b', '.lead', 'x'.repeat(201), '../etc']) assert.equal(apply(s, { name }).decision, 'deny', name);
+  const marked = [
+    `-- pipeline: apply-after-deploy\n${SQL}`,
+    `﻿-- pipeline: apply-after-deploy\n${SQL}`,
+    ` -- pipeline: apply-after-deploy\n${SQL}`,
+    `\t-- pipeline:\tapply-after-deploy\n${SQL}`,
+    `-- one\n-- two\n-- pipeline: apply-after-deploy\n${SQL}`,
+    `-- PIPELINE: APPLY-AFTER-DEPLOY\n${SQL}`,
+    `/* pipeline: apply-after-deploy */\n${SQL}`,
+  ];
+  for (const query of marked) assert.equal(apply(s, { query }).decision, 'deny', JSON.stringify(query.slice(0, 40)));
+  assert.equal(s.calls.length, 0);
+  assert.deepEqual(hist(s), []);
+});
+
+test('auto: gh fails (exit 1), times out, overflows or prints non-JSON: deny, never allow', async (t) => {
+  // Failure caught: a GitHub outage, timeout or garbled answer read as "eligible" (or thrown out of the hook, which Claude Code treats as an allow).
+  const s = await autoScene(t);
+  for (const respond of [() => ({ code: 1, stderr: 'boom' }), () => ({ code: null, timedOut: true }), () => ({ overBuffer: true, stdout: '{' }), () => ({ stdout: 'not json' }), () => ({ stdout: '[]' }), () => { throw new Error('spawn'); }]) {
+    s.respond = respond;
+    const r = apply(s);
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /Auto-apply did not apply/);
+  }
+  assert.deepEqual(hist(s), []);
+});
+
+test('auto: little time left: no gh call under 1.5 s, no claim under 0.5 s; the gh timeout never exceeds what is left', async (t) => {
+  // Failure caught: a GitHub call or a claim started with no time left, carrying the hook past its host timeout (Claude Code then allows the call).
+  const low = await autoScene(t);
+  const r = apply(low, {}, { leftMs: () => 1000 });
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /try the call again/);
+  assert.equal(low.calls.length, 0);
+  const late = await autoScene(t);
+  let asked = false;
+  late.respond = () => { asked = true; return { stdout: JSON.stringify(ghBase()) }; };
+  assert.equal(apply(late, {}, { leftMs: () => (asked ? 400 : 5000) }).decision, 'deny');
+  assert.equal(late.calls.length, 1);
+  assert.deepEqual(hist(late), []);
+  const bounded = await autoScene(t);
+  assert.equal(apply(bounded, {}, { leftMs: () => 4000 }).decision, 'allow');
+  assert.ok(bounded.calls[0].opts.timeoutMs <= 4000 && bounded.calls[0].opts.timeoutMs > 0, String(bounded.calls[0].opts.timeoutMs));
+});
+
+test('auto: a go is used first; after it, auto never applies the same migration again', async (t) => {
+  // Failure caught: the owner's go applying a migration and auto-apply then applying it a second time in the same session (a double apply).
+  const s = await scene(t, { flag: true });
+  const calls = [];
+  const gh = (args) => { calls.push(args); return { ...GH_OK, stdout: JSON.stringify(ghBase()) }; };
+  assert.equal(apply(s, {}, { io: { gh } }).decision, 'allow');
+  assert.equal(body(gfile(s, 'name', 1)).via, 'go');
+  assert.equal(calls.length, 0, 'the go path never asks GitHub');
+  const again = apply(s, {}, { io: { gh } });
+  assert.equal(again.decision, 'deny');
+  assert.equal(calls.length, 0);
+});
+
+test('auto: the same SQL under a second name is refused', async (t) => {
+  // Failure caught: one file applied twice by renaming it (the SQL key of the history is what stops it).
+  const s = await autoScene(t);
+  assert.equal(apply(s).decision, 'allow');
+  const r = apply(s, { name: NAME2 });
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /already attempted/);
+  assert.equal(s.calls.length, 1);
+});
+
+test('auto: an imported earlier go apply (generation via go-import) blocks it', async (t) => {
+  // Failure caught: switching auto-apply on, and the migration the owner's go applied before that applying a second time.
+  for (const keys of [['name'], ['sql']]) {
+    const s = await autoScene(t);
+    seedGen(s, 1, NOW - 100_000, keys);
+    const r = apply(s);
+    assert.equal(r.decision, 'deny', keys.join());
+    assert.match(r.reason, /already attempted/);
+    assert.equal(s.calls.length, 0);
+  }
+});
+
+test('auto: a go consumed with no history (a rollback, a go during the import) blocks it; an unreadable consumed marker refuses', async (t) => {
+  // Failure caught: a go consumed by an older guard (no history written) not counting as an attempt, so auto applies the same migration a second time.
+  const marker = (s, name, o) => { mkdirSync(consumed(s), { recursive: true }); writeFileSync(join(consumed(s), `${name}.json`), o); };
+  const bySql = await autoScene(t);
+  marker(bySql, 'a', `${JSON.stringify({ v: 1, consumedAt: isoAt(NOW - 100_000), op: 'migration', projectRef: REF, sqlSha256: sha256Of(SQL), name: null })}\n`);
+  assert.match(apply(bySql).reason, /already attempted/);
+  const byName = await autoScene(t);
+  marker(byName, 'a', `${JSON.stringify({ v: 1, consumedAt: isoAt(NOW - 100_000), op: 'migration', projectRef: REF, sqlSha256: sha256Of('select 2;'), name: NAME })}\n`);
+  assert.match(apply(byName).reason, /already attempted/);
+  const other = await autoScene(t);
+  marker(other, 'a', `${JSON.stringify({ v: 1, consumedAt: isoAt(NOW - 100_000), op: 'migration', projectRef: 'zzzzzzzzzzzzzzzzzzzz', sqlSha256: sha256Of(SQL), name: NAME })}\n`);
+  assert.equal(apply(other).decision, 'allow', 'another project\'s consumed go is not an attempt here');
+  const empty = await autoScene(t);
+  marker(empty, 'broken', '');
+  const r = apply(empty);
+  assert.equal(r.decision, 'deny');
+  assert.ok(r.reason.includes(join(consumed(empty), 'broken.json')), r.reason);
+  for (const s of [bySql, byName, empty]) assert.equal(s.calls.length, 0);
+});
+
+test('auto: a file merged before the switch-on time, or a PR from another repository, needs the go', async (t) => {
+  // Failure caught: migrations merged before the owner switched auto-apply on (possibly applied by hand) applied again, or a fork's PR of the same number accepted.
+  const early = await autoScene(t, { since: isoAt(NOW - 3_600_000 + 60_000) });
+  assert.equal(apply(early).decision, 'deny');
+  assert.match(apply(early).reason, /before auto-apply was switched on/);
+  const fork = await autoScene(t);
+  fork.tweak((a) => { firstPr(a).baseRepository.nameWithOwner = 'fork/widgets'; });
+  assert.equal(apply(fork).decision, 'deny');
+  assert.deepEqual([...hist(early), ...hist(fork)], []);
+});
+
+test('auto: two enabled entries with the same repo: auto is off for both and GitHub is asked nothing', async (t) => {
+  // Failure caught: one merged file applied to the wrong one of two databases registered for the same repository.
+  const s = await autoScene(t, { refs: [{ ref: 'qqqqqqqqqqqqqqqqqqqq', name: 'Other prod', repo: 'Acme/Widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' }] });
+  assert.equal(apply(s).decision, 'deny');
+  assert.equal(apply(s, { project_id: 'qqqqqqqqqqqqqqqqqqqq' }).decision, 'deny');
+  assert.equal(s.calls.length, 0);
+});
+
+test('the module exports only fixed-destination claims; hostile names stay inside their folders', async () => {
+  // Failure caught: an export that lets a caller write an arbitrary protected file (the registry, a go record) through the history module.
+  const auto = await import('../pipeline/hooks/lib/live-db-auto.mjs');
+  assert.deepEqual(Object.keys(auto).sort(), ['AFTER_DEPLOY_RE', 'AUTO_GH_TIMEOUT_MS', 'AUTO_MAX_AGE_MS', 'AUTO_MIN_CLAIM_MS', 'AUTO_MIN_START_MS', 'LIVE_DB_ATTEMPTS_REL', 'LIVE_DB_CONSUMED_REL', 'MAX_GENERATIONS', 'STEM_RE', 'autoApply', 'claimGoMarker', 'claimNext', 'history', 'importGoHistory', 'readAttemptLog']);
+  const home = mkdtempSync(join(tmpdir(), 'cp-live-db-hostile-'));
+  try {
+    const seen = { name: { n: 0, at: 0 }, sql: { n: 0, at: 0 } };
+    assert.equal(auto.claimNext({ home, via: 'auto', session: 's', now: () => NOW, facts: { ref: REF, sqlSha256: sha256Of(SQL), name: '../../db-refs' }, seen }).status, 'claimed');
+    assert.equal(auto.claimGoMarker({ home, session: 's', promptId: '../../x', op: 'migration', projectRef: REF, name: '../../db-refs', sqlSha256: sha256Of(SQL), now: () => NOW }), 'claimed');
+    const state = join(home, '.claude', 'pipeline-state');
+    assert.deepEqual(readdirSync(home), ['.claude']);
+    assert.deepEqual(readdirSync(join(home, '.claude')), ['pipeline-state']);
+    assert.deepEqual(readdirSync(state), ['owner-go']);
+    assert.deepEqual(readdirSync(join(state, 'owner-go')).sort(), ['live-db-attempts', 'live-db-consumed']);
+    const made = readdirSync(join(state, 'owner-go', 'live-db-attempts'));
+    assert.equal(made.length, 2);
+    assert.ok(made.every((f) => /^(name|sql)-[0-9a-f]{32}-1\.json$/.test(f)), made.join());
+    assert.ok(readdirSync(join(state, 'owner-go', 'live-db-consumed')).every((f) => /^[0-9a-f]{32}\.json$/.test(f)));
+    assert.ok(!existsSync(join(state, 'db-refs.json')));
+  } finally {
+    rmSync(home, { recursive: true, force: true });
+  }
+});
+
+// each child waits for the same instant, then runs the whole decision once with a fake gh that answers `answer`; -> the decisions
+function decideInChildren(home, jobs) {
+  const guardUrl = new URL('../pipeline/hooks/lib/live-db-guard.mjs', import.meta.url).href;
+  const at = Date.now() + 1500;
+  const child = `const { evaluateSupabaseMcp } = await import(${JSON.stringify(guardUrl)});
+const a = JSON.parse(process.argv[1]);
+while (Date.now() < a.at) { /* start together */ }
+const gh = () => ({ code: 0, stdout: a.answer, stderr: '', timedOut: false, overBuffer: false });
+const r = evaluateSupabaseMcp(a.tool, { project_id: a.ref, name: a.name, query: a.query }, { home: a.home, sessionId: a.session, transcriptPath: a.transcript, now: () => a.now, io: { gh } });
+process.stdout.write(r.decision);`;
+  return Promise.all(jobs.map((j) => new Promise((resolve, reject) => {
+    const args = JSON.stringify({ home, tool: `${TOOL}apply_migration`, ref: REF, query: SQL, at, now: NOW, ...j });
+    const p = spawn(process.execPath, ['--input-type=module', '-e', child, args], { stdio: ['ignore', 'pipe', 'pipe'] });
+    let out = '';
+    let err = '';
+    p.stdout.on('data', (d) => { out += d; });
+    p.stderr.on('data', (d) => { err += d; });
+    p.on('error', reject);
+    p.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`child exit ${code}: ${err}`))));
+  })));
+}
+
+test('auto races (two processes): the same file twice, the same SQL under two names, an auto and a go claim: exactly one allow each', async (t) => {
+  // Failure caught: two calls that both read "no attempt yet" each getting an allow (a double apply on a live database).
+  const same = await autoScene(t);
+  const answer = JSON.stringify(ghBase());
+  const mk = (session, name = NAME, ans = answer) => ({ session, transcript: join(same.home, 'none.jsonl'), name, answer: ans });
+  assert.deepEqual((await decideInChildren(same.home, [mk('a'), mk('b')])).sort(), ['allow', 'deny']);
+  const names = await autoScene(t);
+  assert.deepEqual((await decideInChildren(names.home, [mk('a', NAME, answer), mk('b', NAME2, JSON.stringify(ghBase({ name: NAME2 })))])).sort(), ['allow', 'deny']);
+  const withGo = await scene(t, { flag: true, typedAt: NOW - 60_000 });
+  const jobs = [{ session: withGo.session, transcript: withGo.transcript, name: NAME, answer }, { session: 'someone-else', transcript: join(withGo.home, 'none.jsonl'), name: NAME, answer }];
+  assert.deepEqual((await decideInChildren(withGo.home, jobs)).sort(), ['allow', 'deny']);
+  assert.ok(existsSync(gfile(withGo, 'name', 1)) && !existsSync(gfile(withGo, 'name', 2)));
+});
+
+// ---- the real hook entry: GitHub that never answers is a deny within the host timeout ----------------------------------------------------------------------------------------
+
+const HOOK = fileURLToPath(new URL('../pipeline/hooks/guard-files.mjs', import.meta.url));
+function runHook(home, sessionId, env) {
+  const childEnv = { ...process.env, HOME: home, USERPROFILE: home, ...env };
+  delete childEnv[['PIPELINE', 'ADMIN'].join('_')];
+  delete childEnv.PIPELINE_GUARD_LOG;
+  const input = { hook_event_name: 'PreToolUse', tool_name: `${TOOL}apply_migration`, tool_input: { project_id: REF, name: NAME, query: SQL }, session_id: sessionId, transcript_path: join(home, 'none.jsonl'), cwd: home };
+  const t0 = Date.now();
+  const r = spawnSync(process.execPath, [HOOK], { input: JSON.stringify(input), encoding: 'utf8', env: childEnv, timeout: 30_000 });
+  const out = r.stdout.trim() === '' ? { permissionDecision: 'allow' } : JSON.parse(r.stdout).hookSpecificOutput;
+  return { ms: Date.now() - t0, decision: out.permissionDecision, reason: out.permissionDecisionReason ?? '' };
+}
+
+test('through the real hook entry: GitHub that never answers, even with 5,000 pending click files, is a deny within the host timeout', async (t) => {
+  // Failure caught: a hung gh (or a scan of thousands of pending clicks first) carrying the hook past its 15 s host timeout, which Claude Code treats as an allow.
+  const s = await autoScene(t);
+  const slow = join(s.home, 'slow-gh.mjs');
+  writeFileSync(slow, 'setTimeout(() => {}, 30000);\n');
+  const env = { PIPELINE_GH: `${process.execPath} ${slow}` };
+  const one = runHook(s.home, 'hook-1', env);
+  assert.equal(one.decision, 'deny', one.reason);
+  assert.match(one.reason, /GitHub did not answer in time/);
+  assert.ok(one.ms < 14_000, `${one.ms} ms`);
+  const asks = join(STATE(s.home), 'owner-go', 'asks');
+  mkdirSync(asks, { recursive: true });
+  for (let i = 0; i < 5000; i += 1) writeFileSync(join(asks, `ask-${i.toString(16).padStart(12, '0')}.${i.toString(16).padStart(16, '0')}.pending`), '{}');
+  const many = runHook(s.home, 'hook-2', env);
+  assert.equal(many.decision, 'deny', many.reason);
+  assert.ok(many.ms < 14_000, `${many.ms} ms`);
+  assert.deepEqual(hist(s), []);
 });

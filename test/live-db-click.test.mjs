@@ -6,7 +6,9 @@ import { createHash } from 'node:crypto';
 import { git as realGit } from '../pipeline/lib/git.mjs';
 import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { delimiter, join } from 'node:path';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { ymlFor } from './helpers/gate-env.mjs';
 import { seedRegistry } from './helpers/db-refs-owner.mjs';
@@ -254,4 +256,26 @@ test('out of time: a click go whose pending click must still be settled is a den
   assert.equal(spawns, 0, 'no git process was started');
   assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
   assert.equal(w.apply().decision, 'allow', 'with time left the click settles and applies');
+});
+
+test('through the real hook entry: a pending click of this session and a git that never answers is a deny within the host timeout, with nothing consumed', async (t) => {
+  // Failure caught: the click-settling route (pending click -> ask file -> block rebuild with git) running past the hook's 15 s host timeout when git hangs; Claude Code then ALLOWS the call.
+  const w = await world(t, { flush: false, flag: true });
+  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
+  w.flush();
+  const shim = join(w.home, 'shim');
+  mkdirSync(shim);
+  writeFileSync(join(shim, 'git'), '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+  const slowGh = join(w.home, 'slow-gh.mjs');
+  writeFileSync(slowGh, 'setTimeout(() => {}, 30000);\n');
+  const env = { ...process.env, HOME: w.home, USERPROFILE: w.home, PATH: `${shim}${delimiter}${process.env.PATH}`, PIPELINE_GH: `${process.execPath} ${slowGh}` };
+  delete env[['PIPELINE', 'ADMIN'].join('_')];
+  delete env.PIPELINE_GUARD_LOG;
+  const input = { hook_event_name: 'PreToolUse', tool_name: `${TOOL}apply_migration`, tool_input: { project_id: REF, name: NAME, query: SQL }, session_id: w.session, transcript_path: w.file, cwd: w.repo.dir };
+  const t0 = Date.now();
+  const r = spawnSync(process.execPath, [fileURLToPath(new URL('../pipeline/hooks/guard-files.mjs', import.meta.url))], { input: JSON.stringify(input), encoding: 'utf8', env, timeout: 30_000 });
+  const ms = Date.now() - t0;
+  assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny', r.stdout);
+  assert.ok(ms < 14_000, `${ms} ms`);
+  assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
 });

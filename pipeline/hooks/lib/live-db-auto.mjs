@@ -16,14 +16,22 @@ import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFi
 import path from 'node:path';
 import { insideClaudeCode } from '../../lib/owner-only.mjs';
 import { REF_RE } from './db-refs.mjs';
-import { LIVE_DB_KIND } from './live-db-go.mjs';
-import { readRecords } from './owner-go.mjs';
+import { gh } from '../../lib/proc.mjs';
+import { LIVE_DB_KIND, sha256Of, sqlCharProblem } from './live-db-go.mjs';
+import { FUTURE_SKEW_MS, readRecords } from './owner-go.mjs';
 
 export const LIVE_DB_CONSUMED_REL = '.claude/pipeline-state/owner-go/live-db-consumed';
 export const LIVE_DB_ATTEMPTS_REL = '.claude/pipeline-state/owner-go/live-db-attempts';
 const OWNER_GO_DIR_REL = '.claude/pipeline-state/owner-go';
 export const MAX_GENERATIONS = 64;
 export const AUTO_MIN_CLAIM_MS = 500; // the first create of a claim is not started with less than this left
+export const AUTO_MAX_AGE_MS = 7 * 24 * 3600 * 1000; // a file merged longer ago than this needs the owner's go
+export const AUTO_GH_TIMEOUT_MS = 6000;
+export const AUTO_MIN_START_MS = 1500; // a GitHub call is not started with less than this left
+export const STEM_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
+export const AFTER_DEPLOY_RE = /pipeline:[ \t]*apply-after-deploy/i; // anywhere in the query: detection only, the bytes stay exact
+const MAX_PR_FILE_PAGES = 30;
+const GH_MAX_BUFFER = 8 * 1024 * 1024;
 const OPEN_EXCL = constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | (constants.O_NOFOLLOW ?? 0);
 const WIN_FOLDER_FSYNC = ['EISDIR', 'EINVAL', 'EPERM'];
 const MAX_BODY_READ = 64 * 1024;
@@ -254,6 +262,150 @@ export function claimNext({ home, via, session, now, facts, seen, leftMs, io = {
   } catch {
     return { status: 'error', reason: 'the attempt record could not be written' };
   }
+}
+
+// ---- the auto check -----------------------------------------------------------------------------------------------------------------------
+
+const GRAPHQL = `query($o:String!,$n:String!,$p:String!){ repository(owner:$o,name:$n){ nameWithOwner defaultBranchRef { name target { ... on Commit {
+  oid file(path:$p){ object { ... on Blob { text isBinary isTruncated } } }
+  history(path:$p, first:2){ nodes { oid committedDate associatedPullRequests(first:5){ nodes { number merged baseRefName
+    baseRepository { nameWithOwner } mergeCommit { oid }
+    files(first:100){ pageInfo { hasNextPage endCursor } nodes { path changeType } } } } } } } } } } }`;
+const GRAPHQL_PAGE = `query($o:String!,$n:String!,$num:Int!,$after:String){ repository(owner:$o,name:$n){ pullRequest(number:$num){ files(first:100, after:$after){ pageInfo { hasNextPage endCursor }
+  nodes { path changeType } } } } }`;
+
+const notEligible = (reason) => ({ status: 'not-eligible', reason });
+const NO_TIME = { status: 'no-time', reason: 'not enough time was left to check: try the call again' };
+const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
+const isObj = (v) => v !== null && typeof v === 'object' && !Array.isArray(v);
+
+// Every consumed go of this ref that names this SQL or this name, whatever wrote it: a go consumed by a guard that wrote no history (a rollback to the previous release, or a go that landed
+// while `on` imported) also means the migration was attempted. -> { spent: consumedAt } | { error: { path, reason } } | { noTime: true } | {}
+function consumedAttempt({ home, ref, name, sqlSha256, leftMs, io = {} }) {
+  const dir = dirOf(home, LIVE_DB_CONSUMED_REL);
+  const lstat = io.lstatSync ?? lstatSync;
+  const read = io.readFileSync ?? readFileSync;
+  let names;
+  try {
+    if (!lstat(dir).isDirectory()) return { error: { path: dir, reason: 'is not a real folder' } };
+    names = (io.readdirSync ?? readdirSync)(dir).filter((n) => n.endsWith('.json')).sort();
+  } catch (err) {
+    if (err?.code === 'ENOENT') return {};
+    return { error: { path: dir, reason: `cannot be read (${err?.code ?? 'error'})` } };
+  }
+  for (const n of names) {
+    if (outOfTime(leftMs)) return { noTime: true };
+    const file = path.join(dir, n);
+    let b;
+    try {
+      const st = lstat(file);
+      if (!st.isFile() || st.size > MAX_BODY_READ) return { error: { path: file, reason: 'is not a regular file of a usable size' } };
+      b = JSON.parse(read(file, 'utf8'));
+    } catch (err) {
+      return { error: { path: file, reason: err instanceof SyntaxError ? 'is empty or not valid JSON' : `cannot be read (${err?.code ?? 'error'})` } };
+    }
+    if (!isObj(b)) return { error: { path: file, reason: 'does not hold a consumed go' } };
+    if (b.op === 'migration' && b.projectRef === ref && (b.sqlSha256 === sqlSha256 || b.name === name)) return { spent: typeof b.consumedAt === 'string' ? b.consumedAt : 'an unknown time' };
+  }
+  return {};
+}
+
+// One gh call, bounded by what is left. -> { json } | { stop: <result of autoApply> }
+function ask(args, { env, io, leftMs }) {
+  const left = typeof leftMs === 'function' ? leftMs() : Infinity;
+  if (!(left >= AUTO_MIN_START_MS)) return { stop: NO_TIME };
+  let r;
+  try {
+    r = (io.gh ?? gh)(['api', '--hostname', 'github.com', 'graphql', ...args], { env, timeoutMs: Math.floor(Math.min(AUTO_GH_TIMEOUT_MS, left)), maxBuffer: GH_MAX_BUFFER });
+  } catch {
+    return { stop: notEligible('GitHub could not be asked (gh did not run)') };
+  }
+  if (r?.timedOut) return { stop: notEligible('GitHub did not answer in time') };
+  if (r?.overBuffer) return { stop: notEligible('GitHub\'s answer was larger than the guard reads') };
+  if (r?.code !== 0) return { stop: notEligible(`GitHub could not be asked (gh exit ${r?.code})`) };
+  let json;
+  try { json = JSON.parse(r.stdout); } catch { return { stop: notEligible('GitHub\'s answer is not JSON') }; }
+  if (!isObj(json) || 'errors' in json || !isObj(json.data)) return { stop: notEligible('GitHub\'s answer holds errors or no data') };
+  return { json };
+}
+
+// The change a PR made to `file`, from the first answer's files and, while `hasNextPage`, further pages. -> 'ADDED' | 'other' | 'absent' | { stop }
+function prFileChange(pr, file, { owner, repoName, env, io, leftMs }) {
+  let page = pr.files;
+  for (let i = 0; i < MAX_PR_FILE_PAGES; i += 1) {
+    if (!isObj(page) || !Array.isArray(page.nodes) || !isObj(page.pageInfo)) return 'absent';
+    const hit = page.nodes.find((f) => isObj(f) && f.path === file);
+    if (hit) return hit.changeType === 'ADDED' ? 'ADDED' : 'other';
+    if (page.pageInfo.hasNextPage !== true || typeof page.pageInfo.endCursor !== 'string') return 'absent';
+    const got = ask(['-f', `query=${GRAPHQL_PAGE}`, '-f', `o=${owner}`, '-f', `n=${repoName}`, '-F', `num=${pr.number}`, '-f', `after=${page.pageInfo.endCursor}`], { env, io, leftMs });
+    if (got.stop) return { stop: got.stop };
+    page = got.json.data?.repository?.pullRequest?.files;
+  }
+  return 'absent';
+}
+
+// Is this migration a file a merged PR added to the registered repo's default branch, identical to the call, recent, and not attempted before? Then the next attempt generation of both keys is claimed.
+// -> { status: 'claimed', facts } | { status: 'not-eligible' | 'spent' | 'error' | 'no-time', reason } (`reason` is one plain sentence; never a throw)
+export function autoApply({ home, entry, name, query, session, now, leftMs, env, io = {} }) {
+  try {
+    return autoCheck({ home, entry, name, query, session, now, leftMs, env, io });
+  } catch {
+    return { status: 'error', reason: 'the auto-apply check failed unexpectedly' };
+  }
+}
+
+function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) {
+  if (AFTER_DEPLOY_RE.test(query)) return notEligible('the file is marked apply-after-deploy: it takes the owner\'s go after the deploy');
+  if (typeof name !== 'string' || !STEM_RE.test(name)) return notEligible('the migration name is not a plain file name');
+  const charProblem = sqlCharProblem(query);
+  if (charProblem !== null) return notEligible(charProblem);
+  const sqlSha256 = sha256Of(query);
+  const h = history({ home, ref: entry.ref, name, sqlSha256, leftMs, io });
+  if (h.status === 'no-time') return NO_TIME;
+  if (h.status === 'error') return { status: 'error', reason: `the attempt history ${h.path} cannot be read (${h.reason}), so nothing is applied; the owner looks at it` };
+  const spent = (at) => ({ status: 'spent', reason: `auto-apply was already attempted for ${name} on this machine at ${at}: check the live state read-only, then ask for the owner's go` });
+  if (h.name.n > 0 || h.sql.n > 0) return spent(new Date(Math.max(h.name.at, h.sql.at)).toISOString());
+  const c = consumedAttempt({ home, ref: entry.ref, name, sqlSha256, leftMs, io });
+  if (c.noTime) return NO_TIME;
+  if (c.error) return { status: 'error', reason: `the consumed-go record ${c.error.path} cannot be read (${c.error.reason}), so nothing is applied; the owner looks at it` };
+  if (c.spent) return spent(c.spent);
+  const [owner, repoName, ...extra] = String(entry.repo).split('/');
+  if (!owner || !repoName || extra.length > 0) return notEligible(`the registry's repo "${entry.repo}" is not owner/name`);
+  const file = `supabase/migrations/${name}.sql`;
+  const first = ask(['-f', `query=${GRAPHQL}`, '-f', `o=${owner}`, '-f', `n=${repoName}`, '-f', `p=${file}`], { env, io, leftMs });
+  if (first.stop) return first.stop;
+  const repo = first.json.data.repository;
+  if (!isObj(repo)) return notEligible(`GitHub does not know the repository ${entry.repo} (renamed or moved? the owner updates the registry)`);
+  if (!sameRepo(repo.nameWithOwner, entry.repo)) return notEligible(`GitHub answered for ${repo.nameWithOwner} instead of ${entry.repo}`);
+  const branch = repo.defaultBranchRef;
+  if (!isObj(branch) || typeof branch.name !== 'string' || !isObj(branch.target)) return notEligible('GitHub shows no default branch for the repository');
+  const blob = branch.target.file?.object;
+  if (!isObj(blob) || typeof blob.text !== 'string' || blob.isBinary !== false || blob.isTruncated !== false) return notEligible(`${file} is not on the default branch of ${entry.repo} as a whole text file`);
+  if (!Buffer.from(query, 'utf8').equals(Buffer.from(blob.text, 'utf8'))) return notEligible(`the query is not byte for byte the file ${file} on the default branch`);
+  const nodes = branch.target.history?.nodes;
+  if (!Array.isArray(nodes) || nodes.length !== 1 || !isObj(nodes[0])) return notEligible(`${file} was not added by exactly one commit on the default branch (it was edited, or re-added)`);
+  const commit = nodes[0];
+  const committed = typeof commit.committedDate === 'string' && ISO_RE.test(commit.committedDate) ? Date.parse(commit.committedDate) : NaN;
+  if (typeof commit.oid !== 'string' || commit.oid === '' || !Number.isFinite(committed)) return notEligible('the commit that added the file has no readable date');
+  const t = now();
+  if (committed > t + FUTURE_SKEW_MS) return notEligible('the commit that added the file is dated in the future');
+  if (t - committed > AUTO_MAX_AGE_MS) return notEligible('the file was merged more than 7 days ago: it takes the owner\'s go');
+  if (!(committed >= Date.parse(entry.autoSince))) return notEligible('the file was merged before auto-apply was switched on for this project: it takes the owner\'s go');
+  const prs = commit.associatedPullRequests?.nodes;
+  let pr = null;
+  for (const p of Array.isArray(prs) ? prs : []) {
+    if (!isObj(p) || p.merged !== true || p.baseRefName !== branch.name || !sameRepo(p.baseRepository?.nameWithOwner, entry.repo) || p.mergeCommit?.oid !== commit.oid || !Number.isInteger(p.number)) continue;
+    const change = prFileChange(p, file, { owner, repoName, env, io, leftMs });
+    if (change.stop) return change.stop;
+    if (change === 'ADDED') { pr = p; break; }
+  }
+  if (pr === null) return notEligible(`no merged pull request of ${entry.repo} into ${branch.name} added ${file} (a direct push, a rename, a merge commit?)`);
+  const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null };
+  const next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
+  if (next.status === 'claimed') return { status: 'claimed', facts };
+  if (next.status === 'no-time') return NO_TIME;
+  if (next.status === 'spent') return { status: 'spent', reason: `auto-apply was already attempted for ${name} on this machine just now (another call got there first): check the live state read-only, then ask for the owner's go` };
+  return { status: 'error', reason: `the attempt could not be recorded (${next.reason}), so nothing is applied` };
 }
 
 // ---- the import of earlier go applies (the owner's terminal, `db-refs auto-migrations on`) --------------------------------------------------
