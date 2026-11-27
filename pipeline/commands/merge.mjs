@@ -24,7 +24,7 @@ import { askFields, clickConfigRefusal, clickGate } from '../lib/click-ask.mjs';
 import { listWorktrees } from '../lib/local-branches.mjs';
 import { RESTORE_NOTE, findOrphanedLift, holdTiming, mergeInProgress, parkNoteOf, readEligibleHold, recoverOrphanedLift, withHoldLifted, withMergeLock } from '../lib/hold.mjs';
 import {
-  GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, ownerItemsMoved, substituteRouteProblem, preMergeProblems, readReviewJson,
+  GATE_FILE, PR_FIELDS, READABLE_MERGE_STATES, abandonMerge, baseMovedAfterMerge, disableAutoMerge, evaluateGate, evaluateOwnerGo, gateRefusals, localContentHash, mergeTiming, ownerGoBaseProblem, ownerItemsMoved, substituteRouteProblem, preMergeProblems, readReviewJson,
   waitBlockers, waitForMerge,
 } from '../lib/finalgate.mjs';
 import { classifyMergeCommand, cleanStatusRetry, commandTail, waitFailureNote } from '../lib/merge-cleanup.mjs';
@@ -534,11 +534,12 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
     return refuse('blocked', [`a new needs-human hold (${hold.id}) is on #${pr} after the one the owner lifted (${recHold.id}): the PR was not re-queued. The owner must say "merge" for the new hold`], { head, queue: true, queued: false });
   }
   // The live scan first: the owner's record is bound to the owner items and areas IT found (read-only; nothing is written).
-  const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null, ...(queue.on ? { queueMode: true } : {}) });
+  // The queue decision is this run's one read: passed explicitly (false too), so the evaluation never reads the queue again and waives the behind rule on a second answer.
+  const live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null, queueMode: queue.on === true });
   if (live.head !== head) return refuse('live-check', [`the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`], { head });
   if (!live.ok) return refuse('live-check', live.checks.filter((c) => !c.ok).map((c) => `${c.name}: ${c.detail}`), { head });
   // A.4: never merge without the base re-read below, even if scan-range stops requiring a base sha.
-  const noBase = ownerGoBaseProblem(live);
+  const noBase = ownerGoBaseProblem(live, { queueMode: queue.on === true });
   if (noBase !== null) return refuse('live-check', [noBase], { head });
   const asked = { repo, pr, head, items: live.ownerItems, areas: live.areas, hold: hold ?? recHold ?? undefined, rulings: live.rulingsBlockDigest }; // (absent hold = none: a record that names a hold never approves a PR without one)
   const gap = queue.on ? approvalGapSince(asked, pre.since) : approvalGap(asked);
@@ -560,7 +561,8 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
   }
 
   // A.4: the scan was of GitHub's base and head as read by evaluateOwnerGo; the last look re-reads both and refuses if either moved since.
-  const late = await preMergeProblems({ gh, pr, head, base: live.baseRefOid, exemptHold: hold !== null, ...(queue.on ? { queueMode: true } : {}) });
+  // (outside queue mode the base branch's tip is held against the one the live check evaluated: `evaluated`)
+  const late = await preMergeProblems({ gh, pr, head, base: live.baseRefOid, evaluated: live.evaluated, exemptHold: hold !== null, ...(queue.on ? { queueMode: true } : {}) });
   if (late.length > 0) return refuse('pre-merge', late, { head });
 
   if (queue.on) {
@@ -577,14 +579,19 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
     running.pid = undefined; // (gone: its pid may be reused)
     track.ended();
     const commandOutput = commandTail(ran);
-    const merged = (mergeSha, extra = {}) => ({
-      exitCode: EXIT.OK,
-      output: mergeSha
-        ? { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha, ...extra }
-        : { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...extra },
-    });
-    // Every --owner-go merge (behind or not) waits with GitHub's baseRefOid pinned to the evaluated one: a queued merge (--auto) must not land on a base nobody checked.
-    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { base: live.baseRefOid }), log: progress, heartbeatMs: queueTiming(ctx.env ?? process.env).heartbeatMs });
+    // A merge that happened stays a success; where it landed is read from the merge commit (baseMovedAfterMerge): main moving after the last observation is reported, not hidden.
+    const merged = async (mergeSha, extra = {}) => {
+      const landed = await baseMovedAfterMerge({ gh, mergeSha, evaluated: live.evaluated, command });
+      return {
+        exitCode: EXIT.OK,
+        output: mergeSha
+          ? { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha, ...landed, ...extra }
+          : { ok: true, merged: true, mode: 'owner-go', head, behind: live.behind ?? null, mergeSha: null, warning: 'the PR is MERGED but GitHub did not report its merge commit after re-reading', ...landed, ...extra },
+      };
+    };
+    // Every --owner-go merge (behind or not) waits with GitHub's baseRefOid pinned to the evaluated one AND the base branch's tip (compare API) held against the evaluated tip:
+    // a queued merge (--auto) must not land on a base nobody checked.
+    const outcome = await waitForMerge({ gh, pr, waitMs: ran.code === 0 ? waitMs : 0, pollMs, blockers: waitBlockers(gh, { base: live.baseRefOid, evaluated: live.evaluated, head }), log: progress, heartbeatMs: queueTiming(ctx.env ?? process.env).heartbeatMs });
     if (outcome.state === 'merged') return merged(outcome.mergeSha, classifyMergeCommand(ran));
     const abandoned = await abandonMerge({ gh, pr, cwd: root, env: ctx.env, pollMs });
     if (abandoned.merged) return merged(abandoned.mergeSha, { note: 'the PR merged while auto-merge was being disabled', autoMergeDisabled: abandoned.autoMergeDisabled });
@@ -616,7 +623,7 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
     if (guardsBefore === null) return refuse('pre-merge', [`could not read the PR's checks before lifting the hold, so the guards' re-run could not be told from their old results: nothing was changed`], { head });
   }
   // The plain pre-merge look: withHoldLifted runs it right after the lift, the settle wait below runs it again right before the merge / enqueue (a blocker may appear during the wait).
-  const check = () => preMergeProblems({ gh, pr, head, base: live.baseRefOid, ...(queue.on ? { queueMode: true } : {}) });
+  const check = () => preMergeProblems({ gh, pr, head, base: live.baseRefOid, evaluated: live.evaluated, ...(queue.on ? { queueMode: true } : {}) });
   const settleGuards = async () => {
     if (hold === null) return null;
     const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
@@ -656,28 +663,55 @@ const queueRecheckOwnerGo = ({ ctx, ...rest }) => recheckOwnerGo({ ...rest, env:
 // (READABLE_MERGE_STATES is finalgate's: the real --owner-go merge and this dry run accept exactly the same GitHub states.)
 
 // Behind-ness without the update: GitHub's own mergeStateStatus, then the compare API. Never "not behind" by default.
-// `accepted` (--owner-go, merge.behind_base: disjoint): the behind summary the live evaluation accepted. A compare "behind" whose base tip is
-// the very baseRefOid that evaluation scanned is then no blocker; any other base tip (main moved in between) still is.
-function readBehind(gh, pr, { accepted = null, queueMode = false } = {}) {
+// -> { list: [{ kind, detail }], why, accepted }. `why` = the reason the PR is not accepted as behind (also the owner's behindRefusal note), else null; `accepted` = it is behind and
+// accepted for the very tip that was evaluated.
+// --owner-go (`ownerGo`): GitHub's baseRefOid never follows the base branch, so the compare API's base tip is the observation. `evaluated` is what the live check recorded about the tip
+// (evaluateOwnerGo: { branch, tip, behind, accepted, reason }): this ONE look (the dry run's final observation) is held against it. The same tip = the evaluated verdict (accepted: no
+// blocker; refused: its reason). Another branch or tip = "was not evaluated", never the old verdict (an acceptance of A says nothing about B). `refusal` = the live result's behindRefusal.
+// `queueMode`: being behind is no problem there (the queue builds on the current base), so only conflicts are asked, and nothing is compared.
+const BEHIND_ADVICE = 'update the branch (P update-branch), re-verify and run final-gate again';
+const GATED_NOT_EVALUATED = 'not evaluated: the gated route does not apply merge.behind_base';
+function readBehind(gh, pr, { ownerGo = false, evaluated = null, refusal = null, queueMode = false } = {}) {
   const view = gh.prView(pr, [...PR_FIELDS, 'baseRefOid']);
   const state = view?.mergeStateStatus;
-  // Queue mode: being behind is no problem (the queue builds on the current base), so only conflicts are asked, and nothing is compared.
-  if (queueMode) return state === 'DIRTY' ? [{ kind: 'conflicts', detail: 'GitHub reports merge conflicts (mergeStateStatus DIRTY)' }] : [];
-  if (state === 'BEHIND') return [{ kind: 'behind-base', detail: 'GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND): update the branch (P update-branch), re-verify and run final-gate again' }];
+  const reasoned = (what, why) => (why ? `${what}; ${why}; ${BEHIND_ADVICE}` : `${what}: ${BEHIND_ADVICE}`);
+  const why = ownerGo ? refusal : GATED_NOT_EVALUATED;
+  if (queueMode) return { list: state === 'DIRTY' ? [{ kind: 'conflicts', detail: 'GitHub reports merge conflicts (mergeStateStatus DIRTY)' }] : [], why: null, accepted: false };
+  if (state === 'BEHIND') return { list: [{ kind: 'behind-base', detail: reasoned('GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND)', why) }], why: why ?? null, accepted: false };
   const out = [];
   if (state === 'DIRTY') out.push({ kind: 'conflicts', detail: 'GitHub reports merge conflicts (mergeStateStatus DIRTY)' });
   if (!READABLE_MERGE_STATES.has(state)) {
     out.push({ kind: 'behind-base-unverified', detail: `mergeStateStatus is ${JSON.stringify(state ?? null)}, so whether the PR is behind its base is not known` });
-    return out;
+    return { list: out, why: null, accepted: false };
   }
   try {
     const cmp = gh.compare(view.baseRefName, view.headRefOid);
-    if (cmp.behindBy > 0 && accepted !== null && cmp.baseSha === accepted.baseRefOid) return out;
-    if (cmp.behindBy > 0) return [{ kind: 'behind-base', detail: `the PR head lacks ${cmp.behindBy} commit(s) of ${view.baseRefName} (compare API${accepted !== null ? `; its base tip ${String(cmp.baseSha).slice(0, 8)} is not the ${accepted.baseRefOid.slice(0, 8)} that was checked` : ''}): update the branch (P update-branch), re-verify and run final-gate again` }];
+    const branch = view.baseRefName;
+    const lack = `the PR head lacks ${cmp.behindBy} commit(s) of ${branch} (compare API; ${branch}'s tip is ${String(cmp.baseSha).slice(0, 8)})`;
+    if (!ownerGo) {
+      if (cmp.behindBy > 0) return { list: [{ kind: 'behind-base', detail: reasoned(lack, GATED_NOT_EVALUATED) }], why: GATED_NOT_EVALUATED, accepted: false };
+      return { list: out, why: null, accepted: false };
+    }
+    if (evaluated === null) {
+      return { list: [{ kind: 'behind-base-unverified', detail: "the live check recorded no tip of the base branch (its compare could not be read), so whether the PR is behind its base is not known" }], why: null, accepted: false };
+    }
+    if (view.baseRefName !== evaluated.branch || cmp.baseSha !== evaluated.tip) {
+      const was = String(evaluated.tip).slice(0, 8);
+      const now = String(cmp.baseSha).slice(0, 8);
+      const moved = view.baseRefName === evaluated.branch
+        ? `${branch}'s tip changed from ${was} to ${now} after the check: ${now} was not evaluated`
+        : `the PR's base changed from ${evaluated.branch} at ${was} to ${branch} at ${now} after the check: ${now} was not evaluated`;
+      return { list: [{ kind: 'behind-base', detail: `${moved}; ${BEHIND_ADVICE}` }], why: moved, accepted: false };
+    }
+    if (cmp.behindBy > 0 && evaluated.accepted === true) return { list: out, why: null, accepted: true };
+    if (cmp.behindBy > 0) {
+      const reason = evaluated.reason ?? 'the check found the PR up to date with it';
+      return { list: [{ kind: 'behind-base', detail: reasoned(lack, reason) }], why: reason, accepted: false };
+    }
   } catch (err) {
-    return [{ kind: 'behind-base-unverified', detail: `could not compare the head with its base (${String(err?.message ?? err).slice(0, 200)})` }];
+    return { list: [{ kind: 'behind-base-unverified', detail: `could not compare the head with its base (${String(err?.message ?? err).slice(0, 200)})` }], why: null, accepted: false };
   }
-  return out;
+  return { list: out, why: null, accepted: false };
 }
 
 // ---- click-to-approve: --ask (#261, plan Rev 6 B6) -------------------------------------------------------------------------------------------------------------------------------
@@ -812,7 +846,8 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
   if (ownerGo) {
     if (gh.repo().host !== 'github.com') add('owner-go', hostProblem(gh));
     ({ hold } = await readEligibleHold({ gh, pr, config }));
-    live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null, ...qm });
+    // (the queue decision is the one read above, passed explicitly: an unreadable queue has no `on`, so it stays "not queue" and keeps its blocker)
+    live = await evaluateOwnerGo({ root, config, pr, gh, env: ctx.env, exemptHold: hold !== null, queueMode: queue.on === true });
     if (live.head !== head) add('live-check', `the worktree moved from ${head.slice(0, 12)} to ${String(live.head).slice(0, 12)} while checking`);
     const failed = live.checks.filter((x) => !x.ok);
     crashed = scanCrashed(failed);
@@ -823,7 +858,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       // hardstops / integrity only as a real verdict (c.verdict): a scan that threw ("could not evaluate") or could not diff is no hand-off.
       if (ownerRuns && (c.name === 'owner-items' || (['hardstops', 'integrity'].includes(c.name) && c.verdict === true))) handOffBlockers.add(b);
     }
-    const noBase = ownerGoBaseProblem(live);
+    const noBase = ownerGoBaseProblem(live, { queueMode: queue.on === true });
     if (noBase !== null) add('live-check', noBase);
   } else {
     gate = readReviewJson(root, GATE_FILE);
@@ -852,8 +887,10 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
     ownerRuns = !crashed && (Number(live.ownerMerge) > 0 || Number(gate?.ownerMerge) > 0);
   }
 
-  const behind = ownerGo ? (live.behind ?? null) : null;
-  for (const b of readBehind(gh, pr, { accepted: behind, queueMode: queue.on })) add(b.kind, b.detail);
+  // ONE final observation of the base branch's tip builds both the blocker and the owner's note (readBehind); the tip check of preMergeProblems is not asked here (no `evaluated`).
+  const look = readBehind(gh, pr, { ownerGo, evaluated: ownerGo ? (live.evaluated ?? null) : null, refusal: ownerGo ? (live.behindRefusal ?? null) : null, queueMode: queue.on });
+  for (const b of look.list) add(b.kind, b.detail);
+  const behind = ownerGo && look.accepted ? (live.behind ?? null) : null; // (an acceptance is shown only for the tip that was evaluated)
   for (const reason of await preMergeProblems({ gh, pr, head, base: ownerGo ? live.baseRefOid : null, exemptHold: hold !== null, ...qm })) add('pre-merge', reason);
 
   // A repo with the hold keys: its read-only check (the only shell command a dry run runs). A hold ahead, or an answer that cannot be
@@ -867,7 +904,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       add('merge-hold', held.reason);
       if (held.error === 'queued-behind') {
         for (const b of blockers) {
-          if (b.kind === 'behind-base') b.detail = 'the PR is behind its base, but do NOT update the branch while another PR\'s merge hold is ahead (see the merge-hold blocker)';
+          if (b.kind === 'behind-base') b.detail = `the PR is behind its base, but do NOT update the branch while another PR's merge hold is ahead (see the merge-hold blocker)${look.why ? `; ${look.why}` : ''}`;
           // The pr-open live check carries the same advice ("behind-base: ...; update the branch from <base> and re-verify before merging").
           else if (b.kind === 'live-check') b.detail = b.detail.replace(/; update the branch from \S+ and re-verify before merging/g, '; do NOT update the branch while another PR\'s merge hold is ahead (see the merge-hold blocker)');
         }
@@ -926,6 +963,7 @@ async function dryRunMerge({ root, config, pr, gh, ctx, ownerGo }) {
       }
       // Behind its base but accepted (merge.behind_base: disjoint): the owner is told so in the request, above the Areas / Head lines.
       if (queue.on) ownerStep = { ...ownerStep, queueNote: 'GitHub\'s merge queue tests it on top of main and everything ahead of it, then merges it — one "merge" is enough.' };
+      if (look.why !== null) ownerStep = { ...ownerStep, behindRefusal: look.why }; // (prose above the block, like behindNote: never part of what the owner's "merge" binds)
       if (behind !== null) ownerStep = { ...ownerStep, behindNote: `behind ${hashBranch(root, config)} by ${behind.behindBy} commit(s); ${hashBranch(root, config)}'s ${behind.mainFiles} new file(s) touch none of this PR's files` };
       ownerStep = { ...ownerStep, closing: closingBlock(ownerStep, pr) };
     }

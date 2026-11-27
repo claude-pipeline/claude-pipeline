@@ -30,7 +30,7 @@ import { verifyOwnerGrants } from './owner-grants.mjs';
 import { docsExemptFrom } from './docs-exempt.mjs';
 import { readReviewGate } from './model-floor.mjs';
 import { skipOf } from './verify-steps.mjs';
-import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, displayRef, git, headSha, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
+import { NETWORK_TIMEOUT_MS, commitTime, diffFiles, displayRef, git, headSha, isAncestor, mergeBase, revParse, reviewBaseRef, reviewContentHash, showFile, treeFingerprint } from './git.mjs';
 import { ownerItemsDigest, rulingsBlockDigest } from '../hooks/lib/owner-go.mjs';
 import { QueueUnreadable, queueModeFor } from './merge-queue.mjs';
 
@@ -205,7 +205,7 @@ function resolveTrustedBranch({ root, config, gh }) {
 }
 
 // `trusted` ({ tdb, branch, ghDefault }): resolveTrustedBranch's answer, which pr-open holds the PR's base and the local anchor against.
-function prOpenCheck({ info, head, config, behind = null, queueMode = false, trusted }) {
+function prOpenCheck({ info, head, config, behind = null, queueMode = false, trusted, unverified = null }) {
   const { tdb, branch, ghDefault } = trusted;
   const problems = [];
   if (info.state !== 'OPEN') problems.push(`PR state is ${info.state}`);
@@ -216,6 +216,8 @@ function prOpenCheck({ info, head, config, behind = null, queueMode = false, tru
   // Branch protection is not strict (spec 6.6), so GitHub will merge a PR that is behind its base: that would land code on a
   // base nobody verified it against. The branch must be updated (and re-verified) first.
   if (behind && !queueMode) problems.push(`behind-base: ${behind}; update the branch from ${branch} and re-verify before merging`);
+  // --owner-go: GitHub's baseRefOid does not follow the base branch, so the compare API is the only witness of behind-ness; no answer is no all-clear.
+  if (unverified !== null && !queueMode) problems.push(unverified);
   // The hard-stop, integrity and review diffs are taken against the default branch; any other base would be judged on the wrong diff.
   if (info.baseRefName !== branch) problems.push(`PR base is ${JSON.stringify(info.baseRefName)}, not ${branch}`);
   // The local answer must be GitHub's: an unanchored one (the working tree is its only source, and a PR can edit it), a stale origin/HEAD or a renamed / missing origin remote (the 'config' anchor)
@@ -282,7 +284,8 @@ const namedFiles = (list) => `${list.slice(0, NAMED_SHOWN).join(', ')}${list.len
 //   3. the paths main changed since the merge base share none with the PR's paths (both read by diffFiles + pathsOf, compared folded);
 //   4. none of main's paths changes how the checks run (built-in list, the base's verify.ci_proof_inputs and merge.behind_base_stale_paths);
 //   4b. main did not remove a directory the PR adds into.
-// -> { ok: true, behindBy, mergeBase, mainFiles } or { ok: false, reason }. Never throws, never null: every doubt is a refusal.
+// -> { ok: true, behindBy, mergeBase, mainFiles } or { ok: false, reason, notEvaluated? } (notEvaluated: the base's config does not turn the rule on or cannot be read).
+// Never throws, never null: every doubt is a refusal. `baseSha` is the tip of the base branch that is judged (--owner-go: the compare API's tip, never GitHub's stale baseRefOid).
 export function behindFreshEnough({ root, config, diff, baseSha, info, branch: given }) {
   const no = (reason) => ({ ok: false, reason });
   const o = { cwd: root };
@@ -290,7 +293,7 @@ export function behindFreshEnough({ root, config, diff, baseSha, info, branch: g
   try {
     if (typeof baseSha !== 'string' || !FULL_SHA.test(baseSha)) return no('GitHub did not name the base commit (baseRefOid)');
     const settings = baseBehindSettings({ root, baseSha });
-    if (!settings.ok) return no(settings.reason);
+    if (!settings.ok) return { ...no(settings.reason), notEvaluated: true }; // (the rule was never applied: the owner is told that, not "refused")
     const state = info?.mergeStateStatus;
     if (!READABLE_MERGE_STATES.has(state)) return no(`GitHub's mergeStateStatus is ${JSON.stringify(state ?? null)}, not one of ${[...READABLE_MERGE_STATES].join('|')}`);
     if (info?.mergeable !== 'MERGEABLE') return no(`GitHub's mergeable is ${JSON.stringify(info?.mergeable ?? null)}, not MERGEABLE`);
@@ -338,6 +341,30 @@ export function behindFreshEnough({ root, config, diff, baseSha, info, branch: g
   } catch (err) {
     return no(`could not compare ${branch}'s new commits with the PR: ${firstLine(err)}`);
   }
+}
+
+// --owner-go, a PR behind its base: the compare API's tip of the base branch must be a local object (a gate never fetches) and must share the PR's fork point
+// with the scan (merge-base(tip, HEAD) = merge-base(baseRefOid, HEAD)): the PR side of the comparison is the reviewed scan, the main side is the tip, and
+// one ancestor must join them. Returns the refusal reason, or null. `baseSha` = GitHub's baseRefOid (the scan's base), `d` = the scan's diff.
+function compareTipProblem({ root, tip, baseSha, d, branch }) {
+  const o = { cwd: root };
+  try {
+    git(['cat-file', '-e', `${tip}^{commit}`], o);
+  } catch {
+    return `${branch}'s tip ${short(tip)} is not in this repository: run \`git fetch origin ${branch}\` (a gate never fetches)`;
+  }
+  let mb;
+  try {
+    mb = mergeBase(tip, 'HEAD', o);
+  } catch (err) {
+    return `could not find the PR's fork point against ${branch}'s tip ${short(tip)}: ${firstLine(err)}`;
+  }
+  if (mb === d.mb) return null;
+  // The branch merged ${branch} in, but GitHub's base commit still names the old fork point: the scan's range is stale, not the history diverged.
+  if (baseSha === d.mb && isAncestor(d.mb, mb, o)) {
+    return `the PR's base on GitHub (${short(baseSha)}) predates the branch's own merge of ${branch}: push or update the branch (P update-branch) so GitHub refreshes it`;
+  }
+  return `the PR's fork point against ${branch}'s tip (${short(mb)}) differs from the scanned one (${short(d.mb)})`;
 }
 
 export const validLabels = (labels) => Array.isArray(labels) && labels.every((l) => isObject(l) && typeof l.name === 'string');
@@ -1102,8 +1129,11 @@ export async function reviewCompletionCheck({ root, config, pr, gh, hash, sleep 
 }
 
 // `exemptHold` (Rev-4 8): the labels check ignores needs-human for the eligible hold the owner's "merge" names; nothing else does.
-// `queueMode` (merge queue): true/false when the caller already read it, undefined = read it live HERE, but only for a PR that is behind (the one
-// case where it matters), with queueModeFor. An unreadable queue adds a failing `queue-state` check and keeps the behind refusal.
+// `queueMode` (merge queue): true/false when the caller already read it (the real route and the dry run always pass it), undefined = read it live HERE, but only
+// for a PR that is behind (the one case where it matters), with queueModeFor. An unreadable queue adds a failing `queue-state` check and keeps the behind refusal.
+// Behind-ness (#625): GitHub's PR `baseRefOid` stays at the fork point until the branch is pushed again, so it never shows a PR that is behind main. Outside queue mode the
+// compare API (head against the base branch, `gh.compare`) is read once; its base tip is what behindFreshEnough judges, and the observation is recorded as `evaluated`
+// { branch, tip, behind, accepted, reason } for the last look, the merge wait and the dry run to hold against. A compare that cannot be read refuses (pr-open).
 export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defaultSleep, exemptHold = false, queueMode }) {
   const head = headSha({ cwd: root });
   const info = await readPrSettled({ gh, pr, fields: [...OWNER_GO_FIELDS], sleep, pauseMs: mergeablePause(env) });
@@ -1130,26 +1160,61 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   // Behind its base: refused as always, unless the BASE's merge.behind_base is "disjoint" and main's new commits are fresh enough (behindFreshEnough).
   let behind = null;
   let queueError = null;
+  let evaluated = null;
+  let behindRefusal = queueMode === true ? 'not evaluated: the merge queue builds the PR on the current base' : null;
+  let cmp = null;
+  let unverified = null;
+  if (queueMode !== true) {
+    try {
+      if (typeof info?.baseRefName !== 'string' || info.baseRefName === '') throw new Error("GitHub did not name the PR's base branch");
+      cmp = gh.compare(info.baseRefName, head);
+    } catch (err) {
+      unverified = `could not compare the head with its base (${firstLine(err).slice(0, 200)}): whether the PR is behind ${branch} is not known`;
+      behindRefusal = `not evaluated: ${unverified}`;
+    }
+  }
   let behindReason = behindBase({ info, diff, root, config, baseSha, queueMode: queueMode === true, branch });
+  if (behindReason === null && cmp !== null && cmp.behindBy > 0) {
+    behindReason = `${cmp.behindBy} commit(s) of ${info.baseRefName} (tip ${short(cmp.baseSha)}) are missing from the PR head (compare API; GitHub's base commit ${short(baseSha)} does not follow the branch)`;
+  }
   if (behindReason !== null && queueMode === undefined) {
     try {
-      if (queueModeFor({ gh, pr }).queue) behindReason = null;
+      if (queueModeFor({ gh, pr }).queue) { behindReason = null; unverified = null; }
     } catch (err) {
       if (!(err instanceof QueueUnreadable)) throw err;
       queueError = err.message;
     }
   }
+  const isBehind = behindReason !== null;
+  let accepted = null;
+  let refusal = null; // the phrase the owner is shown: "not accepted as behind-but-fresh-enough: <why>" or "not evaluated: <why>" (the rule was never applied)
   if (behindReason !== null) {
-    const fresh = behindFreshEnough({ root, config, diff, baseSha, info, branch });
-    if (fresh.ok) {
-      behind = { behindBy: fresh.behindBy, mergeBase: fresh.mergeBase, baseRefOid: baseSha, mainFiles: fresh.mainFiles, rule: 'disjoint' };
+    const tip = cmp?.baseSha ?? null;
+    let plain = null; // <why>, the part pr-open repeats
+    let fresh = null;
+    if (tip === null) plain = unverified ?? "GitHub's compare gave no base tip";
+    else {
+      const d = diff();
+      plain = d.ok ? compareTipProblem({ root, tip, baseSha, d, branch: info.baseRefName }) : null; // (a failed diff is behindFreshEnough's refusal)
+      if (plain === null) {
+        fresh = behindFreshEnough({ root, config, diff, baseSha: tip, info, branch });
+        if (!fresh.ok) plain = fresh.reason;
+      }
+    }
+    if (fresh?.ok) {
+      behind = { behindBy: fresh.behindBy, mergeBase: fresh.mergeBase, baseRefOid: baseSha, baseTip: tip, mainFiles: fresh.mainFiles, rule: 'disjoint' };
       behindReason = null;
+      accepted = true;
     } else {
-      behindReason = `${behindReason} (not accepted as behind-but-fresh-enough: ${fresh.reason})`;
+      accepted = false;
+      refusal = tip === null || fresh?.notEvaluated === true ? `not evaluated: ${plain}` : `not accepted as behind-but-fresh-enough: ${plain}`;
+      behindRefusal = refusal;
+      behindReason = `${behindReason} (not accepted as behind-but-fresh-enough: ${plain})`;
     }
   }
+  if (cmp !== null) evaluated = { branch: info.baseRefName, tip: cmp.baseSha, behind: isBehind, accepted, reason: refusal };
   const checks = [
-    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason, queueMode: queueMode === true, trusted })),
+    await safely('pr-open', () => prOpenCheck({ info, head, config, behind: behindReason, queueMode: queueMode === true, trusted, unverified })),
     await safely('labels', () => labelsCheck(info, { exemptHold })),
     await safely('ci', () => ciCheck({ gh, pr, head, diff, config, explicitEmpty: ciExplicitlyEmpty(root) })),
     await safely('scan-range', () => scanRangeCheck({ root, gh, pr, diff, info, explicit })),
@@ -1169,6 +1234,10 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
     headRefOid: typeof info?.headRefOid === 'string' ? info.headRefOid : null,
     // Set only when the PR lacks commits of its base and was accepted anyway (merge.behind_base: disjoint): what the owner is told and what the merge output carries.
     behind,
+    // What the compare API said about the base branch at the check (null: queue mode, or the compare could not be read): the last look, the merge wait and the dry run hold the tip against it.
+    evaluated,
+    // Why a behind PR was not accepted ("not accepted as behind-but-fresh-enough: ..." / "not evaluated: ..."), else null.
+    behindRefusal,
     // The owner items of the diff, all from ONE list: their digest ('none' without items), the lines, and the areas they fall in.
     ownerItems: ownerItemsDigest(items),
     ownerItemLines: items,
@@ -1228,11 +1297,55 @@ export async function readMergeSha({ gh, pr, first, sleep, pollMs }) {
 }
 
 // --owner-go: the scan's base commit must be a full sha, whatever the scan-range check says, because the last look (preMergeProblems) only
-// re-reads GitHub's baseRefOid when it is given one. Returns the reason to refuse, or null.
-export function ownerGoBaseProblem(live) {
+// re-reads GitHub's baseRefOid when it is given one. Outside queue mode the base branch's tip the live check observed (`evaluated`, from the compare API) must be
+// there too, with its branch: the last look and the merge wait hold the tip against it, and a missing observation is no "not behind" (#625). Returns the reason to refuse, or null.
+export function ownerGoBaseProblem(live, { queueMode = false } = {}) {
   const sha = live?.baseRefOid;
-  if (typeof sha === 'string' && FULL_SHA.test(sha)) return null;
-  return `GitHub did not name the PR's base commit as a full 40-character sha (baseRefOid is ${JSON.stringify(sha ?? null)}): the base cannot be re-read before the merge`;
+  if (typeof sha !== 'string' || !FULL_SHA.test(sha)) {
+    return `GitHub did not name the PR's base commit as a full 40-character sha (baseRefOid is ${JSON.stringify(sha ?? null)}): the base cannot be re-read before the merge`;
+  }
+  const e = live?.evaluated;
+  if (!queueMode && !(isObject(e) && typeof e.tip === 'string' && FULL_SHA.test(e.tip) && typeof e.branch === 'string' && e.branch !== '')) {
+    return "the base branch's tip was not recorded by the live check (the compare of the head with its base gave no full-sha tip): the base cannot be re-read before the merge";
+  }
+  return null;
+}
+
+// --owner-go, outside queue mode: the base branch's tip now, held against the one the live check evaluated (`evaluated`, see evaluateOwnerGo). -> the problem, or null.
+// `branch` is the PR's base branch as GitHub reports it NOW (a retarget at the same sha is a different base). An unreadable compare is a problem: no answer is no all-clear.
+function baseTipProblem({ gh, evaluated, head, branch }) {
+  let cmp;
+  try {
+    if (typeof branch !== 'string' || branch === '') throw new Error("GitHub did not name the PR's base branch");
+    cmp = gh.compare(branch, head);
+  } catch (err) {
+    return `could not re-read ${evaluated.branch}'s tip to hold it against the check (${firstLine(err).slice(0, 200)})`;
+  }
+  if (branch !== evaluated.branch) return `the PR's base is now ${branch} at ${short(cmp.baseSha)}, the check was of ${evaluated.branch} at ${short(evaluated.tip)}: scan again`;
+  if (cmp.baseSha !== evaluated.tip) return `${branch} moved since the check (${short(evaluated.tip)} → ${short(cmp.baseSha)}): scan again`;
+  return null;
+}
+
+// After a MERGED --owner-go outcome (outside queue mode): where did the merge land? The merge commit's first parent is the base branch's tip at merge time for a squash or a
+// merge commit; if it is not the tip the check evaluated, main moved between the last look and GitHub's merge (no server-side "expected base" exists without the merge queue or
+// strict protection). A merge that happened stays a success: this only adds { baseMoved: { from, to }, warning } or { baseNote }. A rebase merge (the command says --rebase) puts
+// rebased PR commits on the branch, so its first parent says nothing: noted, not judged. Never throws.
+export async function baseMovedAfterMerge({ gh, mergeSha, evaluated, command = '' }) {
+  if (!isObject(evaluated)) return { baseNote: 'the base branch was not checked after the merge (no evaluated tip)' };
+  if (/(^|\s)--rebase(\s|$)/.test(String(command))) return { baseNote: `${evaluated.branch} was not checked after a rebase merge (its first parent is a rebased PR commit)` };
+  if (typeof mergeSha !== 'string' || !FULL_SHA.test(mergeSha)) return { baseNote: `${evaluated.branch} was not checked after the merge (GitHub did not name the merge commit)` };
+  let parents;
+  try {
+    parents = gh.commitParents(mergeSha);
+  } catch (err) {
+    return { baseNote: `${evaluated.branch} was not checked after the merge (could not read the merge commit's parents: ${firstLine(err).slice(0, 160)})` };
+  }
+  const first = parents[0];
+  if (first === evaluated.tip) return {};
+  return {
+    baseMoved: { from: evaluated.tip, to: first },
+    warning: `${evaluated.branch}'s tip moved from ${short(evaluated.tip)} to ${short(first)} before the PR landed: it merged on a base the check did not evaluate (a non-queue repo cannot refuse that server-side)`,
+  };
 }
 
 // The last look before the merge command: GitHub as it is NOW. The live gate read the PR and ran slow probes (Codex, CI)
@@ -1242,11 +1355,16 @@ export function ownerGoBaseProblem(live) {
 // `exemptHold` (--owner-go, only the look BEFORE the hold is lifted): needs-human is not counted. Once it is lifted the plain rule applies, and so does the wait.
 // `queueMode` (merge queue): GitHub tests the PR on top of the current base itself, so the base moving is no problem and `base` is ignored;
 // the head moving still refuses.
-export async function preMergeProblems({ gh, pr, head, base: scanBase = null, exemptHold = false, queueMode = false }) {
+// `evaluated` (--owner-go, outside queue mode): the base branch's tip the live check observed (evaluateOwnerGo); the branch and tip must still be those (baseTipProblem).
+// Not given (the gated route, the queue, the dry run which holds the tip itself) = no tip check. The owner-go route always gives it (ownerGoBaseProblem refuses without).
+// Guarantee boundary: a tip that moved BEFORE the merge command runs refuses the command; one seen after it started (a poll of waitBlockers) cancels the queued merge. A merge
+// that lands in between cannot be refused server-side outside the merge queue (or strict protection): baseMovedAfterMerge reports it.
+export async function preMergeProblems({ gh, pr, head, base: scanBase = null, exemptHold = false, queueMode = false, evaluated = null }) {
   const base = queueMode ? null : scanBase;
+  const tip = queueMode ? null : evaluated;
   let view;
   try {
-    view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : []), 'body']);
+    view = gh.prView(pr, ['state', 'headRefOid', 'labels', 'isDraft', ...(base !== null ? ['baseRefOid'] : []), 'body', ...(tip !== null ? ['baseRefName'] : [])]);
   } catch (err) {
     return [`could not re-read the PR before merging: ${String(err?.message ?? err)}`];
   }
@@ -1258,6 +1376,10 @@ export async function preMergeProblems({ gh, pr, head, base: scanBase = null, ex
   if (view?.isDraft !== false) problems.push('PR is a draft');
   if (view?.headRefOid !== head) problems.push(`PR head is now ${short(view?.headRefOid)}, the gate approved ${short(head)}`);
   if (base !== null && view?.baseRefOid !== base) problems.push(`PR base is now ${short(view?.baseRefOid)}, the scan was of ${short(base)}: scan again`);
+  if (tip !== null) {
+    const moved = baseTipProblem({ gh, evaluated: tip, head, branch: view?.baseRefName });
+    if (moved !== null) problems.push(moved);
+  }
   problems.push(...(await waitBlockers(gh, { exemptHold })(view)));
   return problems;
 }
@@ -1266,10 +1388,16 @@ export async function preMergeProblems({ gh, pr, head, base: scanBase = null, ex
 // counts as a blocker (the safe direction here is "disable auto-merge").
 // `base` (--owner-go): the base commit the merge was evaluated on; GitHub's baseRefOid moving off it is a blocker too (a queued merge
 // must not land on a base nobody checked). The blocker function lists the extra PR fields it needs in `fields` (waitForMerge reads them).
-export function waitBlockers(gh, { base = null, exemptHold = false } = {}) {
+// `evaluated` + `head` (--owner-go, outside queue mode): every poll also re-reads the base branch's tip (compare API) and holds it against the evaluated one, because GitHub's
+// baseRefOid does not follow the branch; not given = no tip check (the gated route, the queue).
+export function waitBlockers(gh, { base = null, exemptHold = false, evaluated = null, head = null } = {}) {
   const blockers = async (view) => {
     const problems = [];
     if (base !== null && view?.baseRefOid !== base) problems.push(`PR base is now ${short(view?.baseRefOid)}, the merge was evaluated on ${short(base)}`);
+    if (evaluated !== null && head !== null) {
+      const moved = baseTipProblem({ gh, evaluated, head, branch: view?.baseRefName });
+      if (moved !== null) problems.push(moved);
+    }
     const blocking = validLabels(view?.labels) ? withoutHold(blockingLabelsOf(view.labels), exemptHold) : [];
     if (!validLabels(view?.labels)) problems.push('PR labels could not be read (labels is missing or malformed)');
     else if (blocking.length > 0) problems.push(`blocking label(s): ${blocking.join(', ')}`);
@@ -1284,7 +1412,7 @@ export function waitBlockers(gh, { base = null, exemptHold = false } = {}) {
     }
     return problems;
   };
-  blockers.fields = base !== null ? ['baseRefOid'] : [];
+  blockers.fields = [...(base !== null ? ['baseRefOid'] : []), ...(evaluated !== null && head !== null ? ['baseRefName'] : [])];
   return blockers;
 }
 

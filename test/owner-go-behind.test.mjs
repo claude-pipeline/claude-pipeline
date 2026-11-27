@@ -250,7 +250,7 @@ test('behind_base disjoint: GitHub mergeable CONFLICTING / UNKNOWN is never acce
 const QUICK = { PIPELINE_MERGE_WAIT_MS: '1500', PIPELINE_MERGE_POLL_MS: '50' };
 // The poll (state,mergeCommit,labels,baseRefOid) says OPEN on base `baseRefOid`; so does the look after the abandon (state,mergeCommit).
 const pollOpen = (s, baseRefOid) => [
-  { match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid } },
+  { match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid, baseRefName: 'main' } },
   { match: '^pr view 12 --json state,mergeCommit$', stdoutJson: { state: 'OPEN', mergeCommit: null } },
 ];
 
@@ -428,7 +428,7 @@ test('compare API: the PR\'s fork point against main\'s tip differs from the sca
   behindScript(s, tip, { prHead: head, baseOid: x, prFiles: diffFiles(s, s.repo.git(['merge-base', x, head]).trim(), head) });
   ownerSays(t, 'merge', mergeRequest(PR, head, 'none'));
   const r = goMerge(s);
-  refusedBehind(r, s, /fork point against main's tip \w{8} differs from the scanned one \w{8}/);
+  refusedBehind(r, s, /fork point against main's tip \(\w{8}\) differs from the scanned one \(\w{8}\)/);
 });
 
 test('F6: the branch merged main in but GitHub\'s baseRefOid still names the old fork point -> the reason says to push / update the branch so GitHub refreshes it', (t) => {
@@ -539,9 +539,9 @@ test('F1: ownerGoBaseProblem refuses a non-queue live result with no evaluated t
   const base = 'a'.repeat(40);
   const evaluated = { branch: 'main', tip: 'b'.repeat(40), behind: false, accepted: null, reason: null };
   assert.equal(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated }), null);
-  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: null }), /base tip .* was not recorded/);
-  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: { ...evaluated, tip: 'main' } }), /base tip .* was not recorded/);
-  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: { ...evaluated, branch: '' } }), /base tip .* was not recorded/);
+  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: null }), /tip was not recorded/);
+  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: { ...evaluated, tip: 'main' } }), /tip was not recorded/);
+  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: { ...evaluated, branch: '' } }), /tip was not recorded/);
   assert.equal(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: null }, { queueMode: true }), null);
   assert.match(gate.ownerGoBaseProblem({ baseRefOid: null, evaluated }), /baseRefOid/);
 });
