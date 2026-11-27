@@ -26,13 +26,16 @@ command. Do exactly that, prove it, and report briefly. Work through the task li
 4. Commit in small, coherent steps: `git add <specific files>` (never `git add -A` / `.`), a
    conventional message (`feat:`, `fix:`, `test:`, `refactor:`), plus any trailer the controller
    gave you.
-5. Run the quick-verify command you were given. If it fails, fix and rerun until it passes. If a
-   command can run longer than 9 minutes, start it with
-   `node ~/.claude/pipeline/bin/pipeline.mjs job start <name> -- <command>` and poll with
-   `node ~/.claude/pipeline/bin/pipeline.mjs job wait <name> --run-id <runId> --timeout 540` (`runId` is in the
-   start output). Waiting is capped:
+5. Run the quick-verify command you were given ALWAYS as a managed job, like the verifier: start it with
+   `node ~/.claude/pipeline/bin/pipeline.mjs job start verify-quick -- <command>` and poll with
+   `node ~/.claude/pipeline/bin/pipeline.mjs job wait verify-quick --run-id <runId> --timeout 540` (`runId` is in the
+   start output). A command with `&&`, a pipe or a redirect runs whole inside the job only through an explicit shell:
+   `job start verify-quick -- bash -c '<command>'`: the command is ONE literal single-quoted argument (each `'` inside it
+   written as `'\''`), so your shell expands nothing before the job starts. If it fails, fix and rerun until it passes. Any other command that can run longer than 9 minutes
+   goes the same way, under its own job name. Waiting is capped:
    - No unmanaged background process and no hand-written wait loop, ever (`until … sleep`, `while … sleep`,
-     `gh run watch`, polling a file or a port). Long commands go only through `pipeline job start`.
+     `gh run watch`, polling a file or a port). Never set `run_in_background` on a Bash call. Long commands go only
+     through `pipeline job start`.
    - Commit finished work BEFORE starting a job that can touch the worktree.
    - At most 3 `job wait --timeout 540` calls (~27 min) per dispatch. When they are spent and the job still
      runs, make no further edits and return `Status: waiting-on-job <name> <runId>` (a managed job may outlive
@@ -73,6 +76,11 @@ passed (bug not real) with the one-line output. The controller records the resul
   `NEEDS_CONTEXT` instead of guessing.
 
 ## Report (≤ 15 lines, nothing else)
+
+The report goes out exactly ONCE, as your last step. When a SubagentHandback tool is offered, make one call carrying
+the whole report block and nothing after it (a second hand-back is refused); never send a progress report through it.
+When a call budget stops you, that stop answer is the one report, in the same block shape (Status DONE_WITH_CONCERNS or
+BLOCKED, with what is left under Concerns).
 
 ```
 Status: DONE | DONE_WITH_CONCERNS | NEEDS_CONTEXT | BLOCKED
