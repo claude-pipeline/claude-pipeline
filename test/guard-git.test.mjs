@@ -2224,3 +2224,24 @@ test('#746 C2 review: a directory, a variable, a wildcard filter and the last of
     assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
   }
 });
+
+// Review R2-B1. Failure caught: `npx playwright test -c e2e --grep 'login.*'` (and `-c ok -c bad`) reads `-c` only as npx's shell text, so the config inside e2e/ (or the last config) is never judged.
+test('#746 C2 review R2-B1: a loose npx line is judged as shell text AND as `playwright test`', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const evil = `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`;
+  const o = withFiles({ 'e2e/playwright.config.ts': evil, 'bad.ts': evil, 'ok.ts': 'export default {};\n' });
+  for (const line of ["npx playwright test -c e2e --grep 'login.*'", 'npx playwright test -c ok.ts -c bad.ts', "npx playwright test -c bad.ts --grep 'login.*'"]) assert.equal(evaluate(line, o).decision, 'deny', line);
+});
+
+// Review R2-B2 / R2-F1. Failure caught: a harmless config next to a quoted regex filter, a `**` spec glob, a wide spec glob or a positional filter is refused, because every word of a loose line was a script candidate
+// (a `^` or `**` word makes the candidate list "too big to resolve"); only a word holding a dollar sign or a backtick can hold one more config option.
+test('#746 C2 review R2-B2/F1: a harmless config next to a regex filter or a spec glob is allowed', () => {
+  const o = withFiles({ 'ok.config.ts': "export default {};\n", 'e2e/playwright.config.ts': 'export default {};\n' });
+  for (const line of [
+    "npx playwright test --config=ok.config.ts --grep '^login.*'", "playwright test --config=ok.config.ts --grep '^login.*'", 'npx playwright test --config=ok.config.ts e2e/**/*.spec.ts', 'npx playwright test --config=ok.config.ts e2e/*.spec.ts',
+    "npx playwright test --config=ok.config.ts '^auth'", "npx playwright test -c e2e --grep '^login.*'",
+  ]) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+});

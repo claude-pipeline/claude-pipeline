@@ -551,7 +551,11 @@ const PLAYWRIGHT_CONFIG_NAMES = ['ts', 'js', 'mts', 'mjs', 'cts', 'cjs'].map((e)
 // and one literal config option; `trust` is false when the line can make `npx` or PATH something else (see rebindsRunner). Every other shape keeps the -c / --call reading
 const unwrapNpx = (argv, trust) => {
   const cfg = trust && argv[0] === 'npx' && argv[1] === 'playwright' && argv[2] === 'test' ? playwrightConfigOf(argv.slice(3)) : null;
-  return cfg && !cfg.loose ? rest(argv, 1) : unwrapPackageRunner(argv, 1);
+  if (cfg && !cfg.loose) return rest(argv, 1);
+  const r = unwrapPackageRunner(argv, 1);
+  // a loose line keeps today's reading (npx's -c text is shell text) AND is judged as `playwright test` too (an alt reading): both are judged, not one or the other (R2-B1)
+  if (cfg && r && r.argv[0] !== 'playwright') return { ...r, alts: [argv.slice(1)] };
+  return cfg && !r ? rest(argv, 1) : r;
 };
 const runnerAt = (subs) => (argv) => (subs.includes(argv[1]) ? unwrapPackageRunner(argv, 2) : null);
 
@@ -1046,8 +1050,9 @@ function scriptFileOfArgv(argv) {
   // (#746 C2) `playwright test -c FILE` / `--config FILE` / `--config=FILE`: node runs the config, so it is judged like `node FILE`. Only the bare word `playwright` (a path or `=playwright` is a program of its own: today's record below)
   if (argv[0] === 'playwright' && argv[1] === 'test') {
     const cfg = playwrightConfigOf(argv.slice(2));
-    // every config word is a candidate, and so is the config file inside each (Playwright loads a directory's own); `--config=$C` is a word that holds the option too, so the value itself is named (R1-B1..B4)
-    if (cfg) return { kind: 'interp', file: cfg.file, ambiguous: true, words: [...(cfg.loose ? argv.slice(1) : []), ...cfg.files, ...cfg.files.flatMap((f) => PLAYWRIGHT_CONFIG_NAMES.map((n) => `${f.replace(/\/+$/, '')}/${n}`))], needExt: false };
+    // every config word is a candidate, and so is the config file inside each (Playwright loads a directory's own); `--config=$C` is a word that holds the option too, so the value itself is named (R1-B1..B4).
+    // On a loose line only a word holding a dollar sign or a backtick may hold one more config option; a quoted `^login.*` filter, a `**` spec glob or a positional regex is no candidate (R2-B2, R2-F1)
+    if (cfg) return { kind: 'interp', file: cfg.file, ambiguous: true, words: [...(cfg.loose ? argv.slice(1).filter((w) => /[$`]/.test(w)) : []),...cfg.files, ...cfg.files.flatMap((f) => PLAYWRIGHT_CONFIG_NAMES.map((n) => `${f.replace(/\/+$/, '')}/${n}`))], needExt: false };
   }
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
