@@ -7,6 +7,8 @@ import { mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync
 import { join } from 'node:path';
 import { readRepoMoves, sameRepo } from '../hooks/lib/repo-moves.mjs';
 import { GUARD_CHECKS, PROVENANCE_CHECKS, REVIEW_CHECK } from './config.mjs';
+import { GUARD_WORKFLOW_PATH } from './guard-provenance.mjs';
+import { listAll } from './ci-proof.mjs';
 import { forgedGuards, labelNames, readMergeSha, validLabels, waitBlockers } from './finalgate.mjs';
 import { HOLD_LABEL, RESTORE_NOTE } from './hold.mjs';
 import { gitCommonDir } from './repo.mjs';
@@ -976,7 +978,33 @@ export function guardRerunGraceMs(waitMs, env = {}) {
   const grace = Math.min(120_000, waitMs);
   return Number.isInteger(set) && set >= 0 ? Math.min(set, grace) : grace;
 }
-export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before = null, graceMs = 0, reviewCheck = false, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
+// #866: pipeline-guards.yml posts `pending` only from its first step, so a re-run still QUEUED (no runner yet) is invisible in the statuses and the old green rows look
+// settled. The runs list of the head says whether a guards run is still queued or running. It only ever EXTENDS the wait: every verdict still comes from a checks sample.
+// -> { ok: true, runs: [{ id, status }] } (the not-completed runs of the guards workflow on this head, every page read), or { ok: false, error } on any read failure,
+// unexpected shape or malformed row (the caller then judges the statuses as before).
+export function guardRunsInFlight({ gh, slug, head }) {
+  try {
+    const file = GUARD_WORKFLOW_PATH.split('/').at(-1);
+    const all = listAll(gh, `repos/${slug}/actions/workflows/${encodeURIComponent(file)}/runs?head_sha=${head}&event=pull_request_target`, 'workflow_runs', 'workflow run');
+    const runs = [];
+    for (const run of all) {
+      const ok = run !== null && typeof run === 'object' && Number.isInteger(run.id) && run.id > 0 && typeof run.path === 'string' && run.path !== '' && typeof run.status === 'string' && run.status !== '';
+      if (!ok) throw new Error('a listed workflow run has no usable id, path or status');
+      if (run.path.split('@')[0] === GUARD_WORKFLOW_PATH && run.status !== 'completed') runs.push({ id: run.id, status: run.status });
+    }
+    return { ok: true, runs };
+  } catch (err) {
+    return { ok: false, error: msgOf(err) };
+  }
+}
+// How long a run seen only `queued` (a runner backlog) may extend the wait: 5 min; the env seam (tests) may only shorten it.
+export const QUEUED_EXTENSION_MS = 300_000;
+export function guardQueuedCapMs(env = {}) {
+  const set = Number(env.PIPELINE_GUARD_QUEUED_CAP_MS);
+  return Number.isInteger(set) && set >= 0 ? Math.min(set, QUEUED_EXTENSION_MS) : QUEUED_EXTENSION_MS;
+}
+const runIdOfLink = (link) => { const id = /\/actions\/runs\/(\d+)(?:[/?#]|$)/.exec(String(link ?? ''))?.[1]; return id ? Number(id) : null; };
+export async function settleGuardStatuses({ gh, pr, head, slug = null, waitMs, pollMs, before = null, graceMs = 0, reviewCheck = false, queuedCapMs = QUEUED_EXTENSION_MS, now = Date.now, sleep = defaultSleep, provenance = forgedGuards }) {
   let rerun = false; // (a re-run was seen: the statuses it posts are told from the old run's by their link)
   const started = now();
   const deadline = started + waitMs;
@@ -995,8 +1023,31 @@ export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before
     }
   }
   let why = 'the checks were not read';
+  // #866 (with a `slug`, when watching): a verdict is returned only from a checks sample read AFTER a runs lookup that found nothing in flight.
+  const gating = watching && typeof slug === 'string' && slug !== '';
+  let lookups = 0; // (runs lookups so far; a sample is stamped with the count when it was read)
+  let clearAt = 0; // (the number of the last lookup that found nothing in flight; 0 = none)
+  const firstQueued = new Map(); // run id -> when a lookup first saw it queued
+  const startedRuns = new Set(); // run ids seen in any status but queued
+  // -> 'verdict' (judge the rows as they are), 'again' (read a fresh sample now), 'wait' (a guards run is in flight; `why` says which)
+  const gate = (sampleAt, ownRun) => {
+    lookups += 1;
+    const found = guardRunsInFlight({ gh, slug, head });
+    if (!found.ok) { clearAt = 0; return 'verdict'; }
+    const at = now();
+    const live = found.runs.filter((run) => {
+      if (run.status === 'queued') { if (!firstQueued.has(run.id)) firstQueued.set(run.id, at); } else startedRuns.add(run.id);
+      if (run.id === ownRun) return false; // (its Publish step was its last status write; its later steps only touch pending rows)
+      return startedRuns.has(run.id) || at - firstQueued.get(run.id) < queuedCapMs;
+    });
+    if (live.length > 0) { clearAt = 0; why = `the guards' re-run has not finished: run ${live[0].id} is ${live[0].status}`; return 'wait'; }
+    if (clearAt > 0 && sampleAt >= clearAt) return 'verdict';
+    clearAt = lookups;
+    return 'again';
+  };
   for (;;) {
     let rows = null;
+    const sampleAt = lookups;
     try {
       rows = gh.checks(pr);
       if (!Array.isArray(rows)) throw new Error('the checks reply is not a list');
@@ -1011,15 +1062,21 @@ export async function settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before
       const stale = !rerun ? [] : [...GUARD_CHECKS, ...(reviewCheck ? [REVIEW_CHECK] : [])].filter((name) => { const row = guards.find((r) => r.name === name); return !row || (row.link ?? null) === (before[name] ?? null); });
       if (pending.length === 0) {
         const bad = guards.filter((r) => r.bucket !== 'pass' && !stale.includes(r.name));
-        if (bad.length > 0) return [`guard check(s) not passing after the hold lift re-ran them: ${bad.map((r) => `${r.name}=${r.bucket ?? r.state}`).join(', ')}`];
         // Every status of one run carries that run's link: guards of two runs, or guards beside another run's review row, are not settled.
         const posted = stale.length > 0 || !rerun ? [] : guards.filter((r) => GUARD_CHECKS.includes(r.name) || (reviewCheck && r.name === REVIEW_CHECK));
         const mixed = new Set(posted.map((r) => r.link ?? null)).size > 1;
-        if (stale.length === 0 && !mixed) {
-          const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
-          return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
+        const settled = stale.length === 0 && !mixed;
+        // #866: both verdict points (the failing-guard refusal and the settled return) wait for a guards run still in flight on this head.
+        const gated = gating && (bad.length > 0 || settled) ? gate(sampleAt, settled && posted.length > 0 ? runIdOfLink(posted[0].link) : null) : 'verdict';
+        if (gated === 'again') continue;
+        if (gated === 'verdict') {
+          if (bad.length > 0) return [`guard check(s) not passing after the hold lift re-ran them: ${bad.map((r) => `${r.name}=${r.bucket ?? r.state}`).join(', ')}`];
+          if (settled) {
+            const forged = guards.length > 0 ? provenance({ gh, pr, head, names: guards.map((r) => r.name) }) : [];
+            return forged.length > 0 ? [`guard status not posted by the pipeline-guards workflow: ${forged.join('; ')}`] : [];
+          }
         }
-        why = mixed ? `the re-run's statuses are not all from one run yet: ${posted.map((r) => `${r.name}=${r.link ?? 'no link'}`).join(', ')}` : `the re-run has not posted yet: ${stale.join(', ')}`;
+        if (gated === 'verdict') why = mixed ? `the re-run's statuses are not all from one run yet: ${posted.map((r) => `${r.name}=${r.link ?? 'no link'}`).join(', ')}` : `the re-run has not posted yet: ${stale.join(', ')}`;
       } else {
         why = `guard check(s) still pending: ${pending.map((r) => r.name).join(', ')}`;
       }
