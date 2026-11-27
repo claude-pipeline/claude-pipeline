@@ -244,20 +244,27 @@ test('job missing (its folder is gone) stops with the job JSON, exit 2', { skip:
 
 test('job replaced by another run: next reconcile, exit 1, nothing discarded', { skip: process.platform === 'win32' }, async (t) => {
   const w = roundWorld(t, { max: 3 });
-  // The fake Codex is gated on a file, not a 3 s timer: a loaded runner could finish the job before the rewrite below was read (state "missing", exit 2, #893). The rewrite is a rename, so a
-  // poll of the command never reads a half-written meta.json (a truncated file is "missing" too). The gate opens only after the command has answered.
+  // The fake Codex is gated on a file, not a 3 s timer: a loaded runner could finish the job before the rewrite below was read (state "missing", exit 2, #893). The command is held before its wait
+  // (PIPELINE_ROUND_HOLD_BEFORE_WAIT): by then `job start` has made its last write to meta.json (the runner pid), which would otherwise overwrite the replacement. The rewrite is a rename, so a
+  // poll of the command never reads a half-written meta.json (a truncated file is "missing" too). The gate opens only after the command has answered, and also when an assertion fails.
   const gate = join(w.scratch, 'codex-release');
-  const run = startRound(w, [], { ...ok(w), FAKE_CODEX_GATE: gate });
+  const hold = join(w.scratch, `adopt-hold-${holds++}`);
   const dir = join(jobsDir(w), 'codex-r1');
-  await untilExists(join(dir, 'child.json'));
-  writeFileSync(join(dir, 'meta.json.next'), JSON.stringify({ ...metaOf(w), runId: 'another-sessions-run' }));
-  renameSync(join(dir, 'meta.json.next'), join(dir, 'meta.json'));
-  const r = await run.done;
-  assert.equal(r.code, 1, r.out);
-  assert.deepEqual([r.json.state, r.json.next], ['replaced', 'reconcile']);
-  assert.doesNotMatch(r.out, /discard-round/);
-  writeFileSync(gate, 'go\n'); // let the orphaned fake Codex finish before the world is removed
-  await untilExists(join(dir, 'exit.json'));
+  const run = startRound(w, [], { ...ok(w), FAKE_CODEX_GATE: gate, PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  try {
+    await untilExists(`${hold}.reached`);
+    writeFileSync(join(dir, 'meta.json.next'), JSON.stringify({ ...metaOf(w), runId: 'another-sessions-run' }));
+    renameSync(join(dir, 'meta.json.next'), join(dir, 'meta.json'));
+    writeFileSync(hold, 'go\n');
+    const r = await run.done;
+    assert.equal(r.code, 1, r.out);
+    assert.deepEqual([r.json.state, r.json.next], ['replaced', 'reconcile']);
+    assert.doesNotMatch(r.out, /discard-round/);
+  } finally {
+    writeFileSync(hold, 'go\n'); // (a command still held is let go, so it ends)
+    writeFileSync(gate, 'go\n'); // let the orphaned fake Codex finish before the world is removed
+    await untilExists(join(dir, 'exit.json'), 20_000).catch(() => {}); // (bounded; a timeout here must not hide the failure above)
+  }
 });
 
 test('a finished job with no stdout capture (an older runner) or a cut one: the report comes from the state when round R is recorded', (t) => {
