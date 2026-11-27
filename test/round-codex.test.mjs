@@ -2,7 +2,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn, spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, openSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync, writeFileSync, rmSync, openSync, renameSync } from 'node:fs';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { roundWorld, findingsOf, low } from './helpers/round-world.mjs';
@@ -244,15 +244,20 @@ test('job missing (its folder is gone) stops with the job JSON, exit 2', { skip:
 
 test('job replaced by another run: next reconcile, exit 1, nothing discarded', { skip: process.platform === 'win32' }, async (t) => {
   const w = roundWorld(t, { max: 3 });
-  const run = startRound(w, [], slowCodex(w, 3));
-  const metaFile = join(jobsDir(w), 'codex-r1', 'meta.json');
-  await untilExists(join(jobsDir(w), 'codex-r1', 'child.json'));
-  writeFileSync(metaFile, JSON.stringify({ ...metaOf(w), runId: 'another-sessions-run' }));
+  // The fake Codex is gated on a file, not a 3 s timer: a loaded runner could finish the job before the rewrite below was read (state "missing", exit 2, #893). The rewrite is a rename, so a
+  // poll of the command never reads a half-written meta.json (a truncated file is "missing" too). The gate opens only after the command has answered.
+  const gate = join(w.scratch, 'codex-release');
+  const run = startRound(w, [], { ...ok(w), FAKE_CODEX_GATE: gate });
+  const dir = join(jobsDir(w), 'codex-r1');
+  await untilExists(join(dir, 'child.json'));
+  writeFileSync(join(dir, 'meta.json.next'), JSON.stringify({ ...metaOf(w), runId: 'another-sessions-run' }));
+  renameSync(join(dir, 'meta.json.next'), join(dir, 'meta.json'));
   const r = await run.done;
   assert.equal(r.code, 1, r.out);
   assert.deepEqual([r.json.state, r.json.next], ['replaced', 'reconcile']);
   assert.doesNotMatch(r.out, /discard-round/);
-  await sleep(4000); // let the orphaned fake Codex finish before the world is removed
+  writeFileSync(gate, 'go\n'); // let the orphaned fake Codex finish before the world is removed
+  await untilExists(join(dir, 'exit.json'));
 });
 
 test('a finished job with no stdout capture (an older runner) or a cut one: the report comes from the state when round R is recorded', (t) => {
