@@ -289,3 +289,22 @@ test('state fix-scope #742: a conflicted merge whose resolution adds new lines s
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.baseKind, r.json.fixScope.nonTestLines], ['own-change', 1]);
 });
+
+// #742 R1-B2: a fix that renames a source file the round only edited is a new non-test file (fixRoundScope's rule), even though every line of it was already in the PR's diff at the round.
+test('state fix-scope #742: a conflicted merge, then a fix that renames a file the round edited: the destination is a new file (the rename is not cancelled by the old path\'s lines)', (t) => {
+  const w = reviewed(t);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/big.js', body(60, 'export const other')); // add/add conflict with the reviewed head's src/big.js
+  w.repo.commit('main adds its own big.js');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  assert.throws(() => w.repo.git(['merge', '--no-edit', 'main']));
+  w.repo.git(['checkout', '--ours', 'src/big.js']);
+  w.repo.git(['add', 'src/big.js']);
+  w.repo.commit('merge main, resolved');
+  w.repo.git(['mv', 'src/a.js', 'src/renamed.js']);
+  w.repo.commit('rename a to renamed');
+  const r = scopeOf(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.baseKind, 'own-change');
+  assert.deepEqual([r.json.flagged, r.json.fixScope.newFiles], [true, ['src/renamed.js']]);
+});

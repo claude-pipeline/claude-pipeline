@@ -89,13 +89,15 @@ function ownChangeFiles({ from, head, baseRef }, o) {
   for (const f of diffFiles(baseRef, head, o)) {
     const earlier = then.get(f.path) ?? then.get(f.oldPath);
     if (earlier === undefined) { out.push(f); continue; }
+    const viaOldPath = !then.has(f.path); // the destination was not in the PR's diff at the round: a fix-round rename of a file the round only edited is still a new file
     const left = new Map(earlier);
     const added = f.added.filter((l) => {
       const n = left.get(l.text) ?? 0;
       if (n > 0) { left.set(l.text, n - 1); return false; }
       return true;
     });
-    if (added.length > 0) out.push({ ...f, added, status: f.status === 'A' || f.status === 'R' || f.status === 'C' ? 'M' : f.status });
+    if (viaOldPath) out.push({ ...f, added });
+    else if (added.length > 0) out.push({ ...f, added, status: f.status === 'A' || f.status === 'R' || f.status === 'C' ? 'M' : f.status });
   }
   return out;
 }
