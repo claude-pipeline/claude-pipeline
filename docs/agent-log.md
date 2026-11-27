@@ -345,3 +345,4 @@ full record.
 - 2026-11-27 · #872 · Owner-go: a queued "merge" is refused with its real reason; no click ask on an unverified build (#740, #713) · risk high · rounds 1 · arbiter 1 · blocked · Codex 7d: 564 runs (214 high)
 - 2026-11-27 · #871 · A model recorded in sub-agent meta on a default launch is not a per-call override (Claude Code 2.1.330) · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 564 runs (216 high)
 - 2026-11-27 · #872 · Owner-go: a queued "merge" is refused with its real reason; no click ask on an unverified build (#740, #713) · risk high · rounds 3 · arbiter 3 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 544 runs (212 high)
+- 2026-11-27 · #875 · CI shard timings: a nested test run no longer wipes them; weights take only complete runs; baseline script · risk high · rounds 5 · arbiter 4 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 546 runs (211 high)
