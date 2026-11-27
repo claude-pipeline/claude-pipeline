@@ -9,6 +9,8 @@ import { isClean } from './git.mjs';
 import { run, codexCommand } from './proc.mjs';
 import { createGitHub } from './github.mjs';
 import { claudeCodeStatus } from './claude-code-version.mjs';
+import { clickConfigRefusal } from './click-ask.mjs';
+import { CLICK_BUILDS } from '../hooks/lib/owner-go-click.mjs';
 import { evaluateBashForFiles } from '../hooks/lib/files-policy.mjs';
 import { MIN_FABLE, readFloor, readableAllowedIds, standingBypasses } from './model-floor.mjs';
 import { readDbRefs } from '../hooks/lib/db-refs.mjs';
@@ -142,6 +144,11 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   const warnings = [];
   if (claudeCode.stale === true) {
     warnings.push(`this terminal runs Claude Code ${claudeCode.running} but ${claudeCode.installed} is installed: restart it before a review's Fable pass`);
+  }
+  // #714: a Claude Code update moves the running build out of CLICK_BUILDS and the recorder then refuses every click, so the owner's one-click answers go off without a word. Same config
+  // reasons as clickGate (click-ask.mjs); an unknown build says nothing.
+  if (config.ok && cfg && clickConfigRefusal(cfg) === null && claudeCode.running !== null && !CLICK_BUILDS.includes(claudeCode.running)) {
+    warnings.push(`clicks off on this build (${claudeCode.running}) [verified builds: ${CLICK_BUILDS.join(', ')}]: run scripts/click-spike.mjs from your terminal`);
   }
 
   // #161: the guard refuses a script an agent runs when the script's text spells the config-root path (even in a comment) and writes. The rule stays strict (no
