@@ -1155,7 +1155,7 @@ const bot = (login = 'vercel') => ({ __typename: 'Bot', login });
 const dnode = (over = {}) => ({ commitOid: COMMIT, createdAt: isoAt(NOW - 3_100_000), environment: 'Production', originalEnvironment: 'Production', latestEnvironment: 'Production', state: 'ACTIVE', creator: bot(), latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot() }, ...over });
 const withStatus = (over) => dnode({ latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot(), ...over } });
 // GitHub's answer to the deploy query
-const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {} } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
+const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {}, head = HEAD_SHA } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, defaultBranchRef: head === null ? null : { name: 'main', target: { oid: head } }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
 const argOf = (args, key) => args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
 const queryOf = (call) => argOf(call.args, 'query');
 
@@ -1229,6 +1229,8 @@ test('after-deploy: anything GitHub shows other than the one trusted, successful
     ['another pull request', { pr: { number: 43 } }, /does not show the pull request as merged/],
     ['merged at another commit', { pr: { mergeCommit: { oid: OTHER_SHA } } }, /does not show the pull request as merged/],
     ['merged before the registration, though the commit is dated after it', { pr: { mergedAt: isoAt(NOW - 9_000_000) } }, /before the after-deploy registration/],
+    ['the default branch moved since the file was read', { head: OTHER_SHA }, /default branch moved during the check/],
+    ['no default branch in the answer', { head: null }, /default branch moved during the check/],
   ];
   for (const [what, over, reason] of cases) {
     const s = await deployScene(t);
@@ -1243,6 +1245,7 @@ test('after-deploy: anything GitHub shows other than the one trusted, successful
   }
   // the reverse ordering of the merge time and the commit date is allowed: merged after the registration, the commit dated before it
   const late = await deployScene(t, { registration: { ...DEPLOY_REG, deploySince: isoAt(NOW - 3_550_000) } });
+  late.deploy = () => deployAnswer({ pr: { mergedAt: isoAt(NOW - 3_550_000 + 6 * 60_000) } });
   assert.equal(applyMarked(late).decision, 'allow', 'the cut-off is the merge time, not the commit date');
   // a hand-written registry with the bot github-actions is invalid: every Supabase write is refused, GitHub is asked nothing
   const forged = await deployScene(t, { registration: { ...DEPLOY_REG, deployBot: 'github-actions' } });
@@ -1257,6 +1260,34 @@ test('after-deploy: the deploy query is the last GitHub read, after a second pag
   s.page = () => ({ data: { repository: { pullRequest: { files: fileList([{ path: FILE, changeType: 'ADDED' }]) } } } });
   assert.equal(applyMarked(s).decision, 'allow');
   assert.deepEqual(s.calls.map((c) => (queryOf(c).includes('latestCompletedDeployment') ? 'deploy' : queryOf(c).includes('after:$after') ? 'page' : 'file')), ['file', 'page', 'deploy']);
+});
+
+test('after-deploy: a registration the owner switches off while GitHub is asked claims nothing', async (t) => {
+  // Failure caught: the owner running `after-deploy off` (a rollback) while the deploy query is out, and the hook still applying the migration on the registration it read before.
+  const s = await deployScene(t);
+  s.deploy = () => {
+    seedRegistry(s.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' }] });
+    return deployAnswer();
+  };
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /changed the after-deploy registration during the check/);
+  assert.deepEqual(hist(s), [], 'nothing claimed');
+  assert.equal(markers(s).length, 0);
+});
+
+test('after-deploy: a merge within the clock-skew margin after the registration keeps the click; one after the margin applies', async (t) => {
+  // Failure caught: an owner machine whose clock is minutes slow stamping the registration early, so a PR merged just before the owner registered is applied with no go.
+  const since = NOW - 7_200_000;
+  const inside = await deployScene(t);
+  inside.deploy = () => deployAnswer({ pr: { mergedAt: isoAt(since + 60_000) } });
+  const r = applyMarked(inside);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /before the after-deploy registration/);
+  assert.deepEqual(hist(inside), []);
+  const outside = await deployScene(t);
+  outside.deploy = () => deployAnswer({ pr: { mergedAt: isoAt(since + 6 * 60_000) } });
+  assert.equal(applyMarked(outside).decision, 'allow');
 });
 
 test('after-deploy: denied before the deploy finished, the same call after GitHub shows success applies (no attempt was spent)', async (t) => {
@@ -1284,5 +1315,5 @@ test('after-deploy: the unmarked file sends the same file query as before and no
   const call = s.calls[1];
   const dq = queryOf(call);
   assert.deepEqual([argOf(call.args, 'env'), argOf(call.args, 'num'), argOf(call.args, 'o'), argOf(call.args, 'n')], ['Production', '42', 'acme', 'widgets']);
-  for (const piece of ['latestCompletedDeployment', 'first:1', 'direction:DESC', 'field:CREATED_AT', 'environments:[$env]', 'creator { __typename login }', 'latestStatus { state createdAt creator { __typename login } }', 'commitOid', 'originalEnvironment', 'latestEnvironment', 'state', 'mergedAt', 'mergeCommit { oid }', 'nameWithOwner']) assert.ok(dq.includes(piece), piece);
+  for (const piece of ['latestCompletedDeployment', 'first:1', 'direction:DESC', 'field:CREATED_AT', 'environments:[$env]', 'creator { __typename login }', 'latestStatus { state createdAt creator { __typename login } }', 'commitOid', 'originalEnvironment', 'latestEnvironment', 'state', 'mergedAt', 'mergeCommit { oid }', 'nameWithOwner', 'defaultBranchRef { name target { oid } }']) assert.ok(dq.includes(piece), piece);
 });

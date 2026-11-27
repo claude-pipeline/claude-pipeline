@@ -15,7 +15,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { insideClaudeCode } from '../../lib/owner-only.mjs';
-import { REF_RE } from './db-refs.mjs';
+import { REF_RE, autoEntry, readDbRefs } from './db-refs.mjs';
 import { gh } from '../../lib/proc.mjs';
 import { LIVE_DB_KIND, sha256Of, sqlCharProblem } from './live-db-go.mjs';
 import { FUTURE_SKEW_MS, readRecords } from './owner-go.mjs';
@@ -276,6 +276,7 @@ const GRAPHQL_PAGE = `query($o:String!,$n:String!,$num:Int!,$after:String){ repo
 
 // The deploy proof for a file marked apply-after-deploy (#882), one call made as the last GitHub read before the claim. `D`: the fields of one deployment the proof reads.
 const GRAPHQL_DEPLOY = `query($o:String!,$n:String!,$env:String!,$num:Int!){ repository(owner:$o,name:$n){ nameWithOwner
+  defaultBranchRef { name target { oid } }
   environment(name:$env){ name latestCompletedDeployment { ...D } }
   deployments(environments:[$env], first:1, orderBy:{field:CREATED_AT, direction:DESC}){ nodes { ...D } }
   pullRequest(number:$num){ number merged mergedAt mergeCommit { oid } } } }
@@ -357,7 +358,7 @@ function prFileChange(pr, file, { owner, repoName, env, io, leftMs }) {
 // Has GitHub shown that the production deploy of the merge commit succeeded? Both the newest deployment of the environment (by any creator) and GitHub's latest COMPLETED one must be the merge
 // commit, made by the registered bot, ACTIVE with a SUCCESS status by the same bot; the PR of the answer must be the matched one, merged after the registration. Every refusal claims nothing, so the call can be
 // made again once the deploy has finished. -> { facts } | { stop: <result of autoApply> }
-function deployProof({ entry, pr, commit, committed, owner, repoName, env, io, leftMs, now }) {
+function deployProof({ entry, pr, commit, committed, head, owner, repoName, env, io, leftMs, now }) {
   const got = ask(['-f', `query=${GRAPHQL_DEPLOY}`, '-f', `o=${owner}`, '-f', `n=${repoName}`, '-f', `env=${entry.deployEnv}`, '-F', `num=${pr.number}`], { env, io, leftMs });
   if (got.stop) return got;
   const no = (why) => ({ stop: notEligible(`the production deploy is not confirmed (${why}): wait for the deploy to finish and call again, or ask for the owner's go`) });
@@ -365,11 +366,14 @@ function deployProof({ entry, pr, commit, committed, owner, repoName, env, io, l
   const e = entry.deployEnv;
   const short = (s) => (typeof s === 'string' && s !== '' ? s.slice(0, 12) : 'unknown');
   if (!isObj(repo) || !sameRepo(repo.nameWithOwner, entry.repo)) return no(`GitHub answered for ${isObj(repo) ? repo.nameWithOwner : 'no repository'} instead of ${entry.repo}`);
+  // the file was read from this head: a default branch that moved since (a corrective merge) means the file may be gone, so the call is made again
+  if (typeof head !== 'string' || repo.defaultBranchRef?.target?.oid !== head) return no('the default branch moved during the check: call again');
   const p = repo.pullRequest;
   if (!isObj(p) || p.number !== pr.number || p.merged !== true || p.mergeCommit?.oid !== commit.oid) return no('GitHub does not show the pull request as merged at this commit');
   const mergedAt = typeof p.mergedAt === 'string' && ISO_RE.test(p.mergedAt) ? Date.parse(p.mergedAt) : NaN;
   if (!Number.isFinite(mergedAt)) return no('the pull request has no readable merge time');
-  if (!(mergedAt >= Date.parse(entry.deploySince))) return no(`the pull request was merged before the after-deploy registration of ${entry.deploySince}, so it keeps the owner's go`);
+  // the registration time is the owner's machine clock and the merge time GitHub's: a merge within the skew margin after it cannot be told from one before it, so it keeps the owner's go too
+  if (!(mergedAt >= Date.parse(entry.deploySince) + FUTURE_SKEW_MS)) return no(`the pull request was merged before the after-deploy registration of ${entry.deploySince} (or within ${FUTURE_SKEW_MS / 60000} minutes after it), so it keeps the owner's go`);
   if (!isObj(repo.environment) || repo.environment.name !== e) return no(`GitHub shows no deployment environment named "${e}"`);
   const newest = Array.isArray(repo.deployments?.nodes) && repo.deployments.nodes.length === 1 ? repo.deployments.nodes[0] : null;
   const live = repo.environment.latestCompletedDeployment;
@@ -455,9 +459,12 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
   // the deploy proof is the LAST GitHub read before the claim: a rollback GitHub shows while the file pages above were read is seen
   let proven = {};
   if (marked) {
-    const proof = deployProof({ entry, pr, commit, committed, owner, repoName, env, io, leftMs, now });
+    const proof = deployProof({ entry, pr, commit, committed, head: branch.target.oid, owner, repoName, env, io, leftMs, now });
     if (proof.stop) return proof.stop;
     proven = proof.facts;
+    // the owner can switch the registration off while GitHub was asked: it must still be the one this check used, or nothing is claimed
+    const fresh = autoEntry(entry.ref, readDbRefs(home, io)).entry;
+    if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot || fresh.deploySince !== entry.deploySince) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
   }
   const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null, ...proven };
   const next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
