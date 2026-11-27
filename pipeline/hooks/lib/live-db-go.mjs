@@ -25,7 +25,7 @@ import { parseRemote } from '../../lib/remote-url.mjs';
 import { REF_RE, isDevRef, readDbRefs } from './db-refs.mjs';
 import { describeSql } from './sql-classify.mjs';
 import {
-  GO_PROMPT_MAX, LIVE_DB_BINDING as BINDING, SESSION_RE, accountHome, appendRecord, lastReply, notOwnerPrompt, notOwnerWords, parseGo, queuedAnswer, readRecords,
+  GO_PROMPT_MAX, SESSION_RE, accountHome, appendRecord, lastReply, notOwnerPrompt, notOwnerWords, parseGo, queuedAnswer, readRecords,
 } from './owner-go.mjs';
 
 export { parseGo };
@@ -155,6 +155,7 @@ export function buildBlock({ op, ref, label, name = null, file = null, head = nu
   ];
 }
 
+const BINDING = /^Live-DB (migration|data) · project ([a-z0-9]{20}) · sql ([0-9a-f]{64}) · head ([0-9a-f]{40}|-) · file (.+?) · repo ([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+|-) · dir (.+)$/;
 const SUMMARY_LINE = /^Claude's summary: (\S.*)$/;
 
 // The label for a project the owner may be asked to apply to: its registered name, or `unregistered project <ref>`; null for a dev ref or a bad one.
@@ -274,29 +275,6 @@ export function verifyBlock(replyText, { home = accountHome(), io = {} } = {}) {
   return { ok: true, fields: { op, ref, label, name, sqlSha256: sha, head, file, repo, dir, summary, sql } };
 }
 
-// #741 (B1a, Fable P1-2): `go migration <name>` binds the NAME only. A migration block the owner sees in a turn the harness started (a promoted slot) must not replace, under the same name, the block the owner
-// last saw in a turn they started. A TEXT comparison, no git (a failed rebuild of an earlier block proves nothing). `reply.before` is every reply slot before the selected one, newest first ({ text, promoted }): walk
-// back through promoted and owner-started slots alike and refuse when ANY binding line of the same migration (file basename) shows another project, SQL or head, or of the same data SQL another project (neither typed
-// go names the project); stop after the first owner-started slot that itself shows a binding line for that name or SQL (R2: the agent controls the text around a block, so not only the last line counts). No binding line, or
-// another migration or SQL, is no conflict. `reply` is what lastReply / replyBefore returned (text, promoted, before), `fields` the verified fields of reply.text. -> a reason | null. Recorder and claim both run it.
-export function swappedBlockReason(reply, fields) {
-  if (!reply?.promoted || !Array.isArray(reply.before)) return null;
-  for (const slot of reply.before) {
-    let shows = false;
-    for (const line of String(slot?.text ?? '').replace(/\r\n/g, '\n').split('\n')) {
-      if (!line.startsWith('Live-DB ')) continue; // (trimEnd, not the quadratic /\s+$/: the text is the agent's)
-      const m = BINDING.exec(line.trimEnd());
-      if (m === null || m[1] !== fields?.op) continue;
-      const [, op, ref, sha, head, file] = m;
-      if (op === 'migration' ? path.posix.basename(file, '.sql') !== fields.name : sha !== fields.sqlSha256) continue;
-      shows = true;
-      if (op === 'migration' ? ref !== fields.ref || sha !== fields.sqlSha256 || head !== fields.head : ref !== fields.ref) return 'the block changed in a turn you did not start: present again';
-    }
-    if (shows && slot.promoted !== true) break;
-  }
-  return null;
-}
-
 // ---- the recorder -------------------------------------------------------------------------------------------------------------------
 
 // What the hook's input amounts to: null (the prompt is no go), { record } (written) or { reason } (it reads as a go and nothing was recorded; the hook prints it so Claude presents again).
@@ -312,12 +290,10 @@ export function liveDbGoOutcome(input, { home = accountHome(), now = Date.now, i
     if (queuedAnswer(input)) return { reason: 'the owner typed it while the agent was still working' };
     const prompt = String(input.prompt);
     if (prompt.length > GO_PROMPT_MAX) return { reason: 'the prompt is too long for a go' };
-    const reply = lastReply(transcript, { prompt, skipSynthetic: true, liveDb: true });
-    const v = verifyBlock(reply.text, { home, io });
+    const reply = lastReply(transcript, { prompt, skipSynthetic: true, liveDb: true }).text;
+    const v = verifyBlock(reply, { home, io });
     if (!v.ok) return { reason: v.reason };
     const f = v.fields;
-    const swapped = swappedBlockReason(reply, f);
-    if (swapped) return { reason: swapped };
     if (go.op !== f.op) return { reason: `the owner typed a ${go.op} go but the block asks for a ${f.op}` };
     const want = f.op === 'migration' ? f.name : f.sqlSha256.slice(0, 12);
     if (go.arg !== want) return { reason: `the typed "${go.arg}" is not "${want}"` };

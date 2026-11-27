@@ -441,48 +441,13 @@ const toolUseText = (input) => {
 };
 const inputSurfacesAsk = (input) => { const text = toolUseText(input); return text === null || surfacesAsk(text); };
 
-// #741 (B1a): what the live-database readers (the typed go's recorder and claim, and the click claim) add to the ruling reader's rules. The block ends the reply: the last line is the `🗄️ Apply to LIVE` line and the
-// one above it is the binding line. LIVE_DB_BINDING is the one pattern live-db-go.mjs rebuilds the block with.
-export const LIVE_DB_BINDING = /^Live-DB (migration|data) · project ([a-z0-9]{20}) · sql ([0-9a-f]{64}) · head ([0-9a-f]{40}|-) · file (.+?) · repo ([A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+|-) · dir (.+)$/;
-const APPLY_PREFIX = '🗄️ Apply to LIVE ';
-const liveDbTail = (text) => {
-  const lines = String(text ?? '').replace(/\r\n/g, '\n').split('\n');
-  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
-  const bind = lines[lines.length - 2];
-  const apply = lines[lines.length - 1];
-  if (!(bind !== undefined && LIVE_DB_BINDING.test(bind.replace(/\s+$/, '')) && apply.startsWith(APPLY_PREFIX))) return null;
-  // the block starts three lines above its SQL fence, found the way verifyBlock finds it (the closing fence is four lines above the end; the opening one is the nearest fence line above that), never from a header-like line in the SQL
-  let open = -1;
-  for (let i = lines.length - 5; i >= 0; i--) if (lines[i].startsWith('```')) { open = i; break; }
-  return { bind, apply, block: open < 3 ? null : lines.slice(open - 3).join('\n') }; // (block: the whole trailing block, from its first line)
-};
-const liveDbPromotes = (text) => liveDbTail(text) !== null;
+// #741 (B1b): what the live-database readers (the typed go's recorder and claim, and the click claim) add to the ruling reader's rules: a tool block of another visible turn that shows a block counts as shown.
 // A tool input or result that shows a live-database block, its binding or apply line, or a go word: what the owner may have answered instead of the block in the reply text (a stale-ask detector, like surfacesAsk).
 const LIVE_SURFACED = /Live-DB (?:migration|data) · project |🗄️ Apply to LIVE |go (?:migration|data) /iu;
 export const liveDbSurfaced = (text) => LIVE_SURFACED.test(String(text ?? ''));
 const liveInputSurfaces = (input) => { const text = toolUseText(input); return text === null || liveDbSurfaced(text); };
 const liveResultSurfaces = (b) => b?.type === 'tool_result' && liveDbSurfaced(toolResultText(b.content));
 const blockSurfaces = (b) => (b?.type === 'tool_use' && liveInputSurfaces(b.input)) || liveResultSurfaces(b);
-// Fable P1-3: the standard `--ask` flow ends the reply with the block and then calls AskUserQuestion, whose input repeats that block and the go words. Such an input is the reply's own dialog only when every binding line,
-// every apply line and every go word in it is byte-identical to the last block of the text so far; anything else in it (another block, another go word) still counts as surfacing.
-const GO_WORD = /go (?:migration|data) [A-Za-z0-9_.-]+/giu;
-function ownDialogInput(input, text) {
-  const own = liveDbTail(text);
-  const ownGo = own === null ? null : / — say "(go (?:migration|data) [^"\s]+)"$/.exec(own.apply.replace(/\s+$/, ''))?.[1];
-  const shown = toolUseText(input);
-  if (!ownGo || shown === null || own.block === null) return false;
-  const flat = shown.replace(/\r\n/g, '\n');
-  if (flat.split(own.block).length !== 2) return false; // R1-B4: the whole block (its SQL and summary too), exactly once (R2-B3), not only its binding and apply lines
-  for (const line of flat.replace(own.block, '').split('\n')) if (line.startsWith('```') || line.startsWith('🗄️ LIVE database change — ')) return false; // (no second block or SQL fence outside it)
-  let binds = 0;
-  let applies = 0;
-  for (const line of flat.split('\n')) {
-    if (/Live-DB (?:migration|data) · project /.test(line)) { if (line !== own.bind) return false; binds++; }
-    if (line.includes(APPLY_PREFIX)) { if (line !== own.apply) return false; applies++; }
-  }
-  for (const m of shown.matchAll(GO_WORD)) if (m[0] !== ownGo) return false;
-  return binds === 1 && applies === 1;
-}
 // #189 (owner decision, plan docs/plans/2026-11-06-followups-185-188-ruling-compaction.md section 3): a context compaction is transparent. Claude Code writes the summary of the
 // earlier conversation as a `user` entry (string content, no promptSource / origin) after a `compact_boundary`; it is a prompt entry to isPromptEntry and of source 'unknown', so
 // it used to open a new, empty reply slot between an ask and the owner's answer, and the ask was lost. Such an entry is skipped by every reader: it opens no slot, adds no text and
@@ -584,9 +549,8 @@ function originsOf(entries) {
   return { origin, parent };
 }
 
-// #741 (B1a) `liveDb` (the live-database readers only; the ruling reader and every other caller are unchanged): a visible synthetic turn is promoted when its text ends with a live-database block (liveDbTail), not a ruling
-// line; a tool input or result that shows another block or a go word voids it (liveDbSurfaced) and clears the turn's text, so a later text cannot rebuild the first block around a shown second one (the reply then holds only
-// what came after); and the same detector counts a tool block of any OTHER visible turn as shown. The result also carries `before`: the text of the visible slot before the selected one (the swapped-block check of live-db-go.mjs).
+// #741 (B1b) `liveDb` (the live-database readers only; the ruling reader and every other caller are unchanged): a tool input or result of any OTHER visible turn that shows a live-database block, its binding or apply
+// line or a go word counts as shown (liveDbSurfaced), so a later request of the selected turn is stale.
 export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false, liveDb = false } = {}) {
   return replyOf(tailEntries(transcriptPath, tailBytes).entries, { prompt, skipSynthetic, liveDb });
 }
@@ -636,23 +600,16 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
     let anything = false;
     for (const e of t.content) {
       if (e.type === 'user') {
-        for (const b of e.message.content) {
-          if (liveDb && liveResultSurfaces(b)) { surfacedAfterText = true; anything = true; text = ''; }
-          else if (b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content))) { surfacedAfterText = true; anything = true; }
-        }
+        if (e.message.content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { surfacedAfterText = true; anything = true; }
         continue;
       }
       for (const b of e.message.content) {
         if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { text += `${b.text}\n`; surfacedAfterText = false; anything = true; }
-        else if (b?.type === 'tool_use') {
-          if (liveDb && b.name === 'AskUserQuestion' && ownDialogInput(b.input, text)) continue;
-          if (liveDb && liveInputSurfaces(b.input)) { surfacedAfterText = true; anything = true; text = ''; }
-          else if (inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
-        }
+        else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
       }
     }
     const visible = visibleSynthetic(t.e) && !hidden(t.pos); // (#246: a system turn written under an invisible one is on nobody's screen)
-    if (visible && !surfacedAfterText && (liveDb ? liveDbPromotes(text) : presentedRuling(text) !== null)) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
+    if (visible && !surfacedAfterText && presentedRuling(text) !== null) slots.push({ turn: t, lastPos: t.lastPos, text, promoted: true, voided: false });
     else if (anything) {
       const before = slots[slots.length - 1];
       if (before && before.lastPos < t.pos) before.voided = true; // (a slot still being written when this turn opened was not replaced by it: interleaved, not later)
@@ -672,8 +629,7 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
   // a later request of another slot. #241: a tool block of another visible slot that surfaces an ask (shownPos) counts as shown too, not the selected slot's own. R3-F1: so does a visibleSynthetic skip turn's.
   const shownAfter = !last || candidates.some((x) => x !== last && x.turn.shownPos > last.turn.textPos) || shownSkips.some((pos) => pos > last.turn.textPos);
   if (!last || last.voided || shownAfter || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
-  // R1-B2 / R2: `before` is every slot before the selected one, newest first, promoted or not: swappedBlockReason walks it to what the owner last read in a turn they started
-  return { text: last.text, promoted: last.promoted, ...(liveDb ? { before: candidates.slice(0, candidates.indexOf(last)).reverse().map((x) => ({ text: x.text, promoted: x.promoted })) } : {}) };
+  return { text: last.text, promoted: last.promoted };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
 
@@ -688,8 +644,7 @@ export function replyBefore(transcriptPath, promptId, { tailBytes = REPLY_BEFORE
   entries.forEach((e, i) => { if (isPromptEntry(e) && e.promptId === promptId) at.push(i); });
   if (at.length === 0) return { reason: 'the owner\'s prompt is not in the transcript window' };
   if (at.length > 1) return { reason: 'two prompt entries carry that prompt id' };
-  const { text, promoted, before } = replyOf(entries.slice(0, at[0] + 1), { prompt: promptTextOf(entries[at[0]]), skipSynthetic: true, liveDb: true });
-  return { text, promoted, before };
+  return { text: replyOf(entries.slice(0, at[0] + 1), { prompt: promptTextOf(entries[at[0]]), skipSynthetic: true, liveDb: true }).text };
 }
 
 // #262 (R6-F1): what the owner could read right BEFORE an AskUserQuestion call: the assistant text of the call's own turn (the entries that chain to the same prompt as the tool_use entry, in transcript
