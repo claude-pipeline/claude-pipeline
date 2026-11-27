@@ -349,8 +349,8 @@ const invisibleTurn = (e) => {
 // a compact_boundary / hidden summary by logicalParentUuid, and a resumed session continues the SAME chain through its SessionStart attachments (probed on 2.1.3xx transcripts), so both reach
 // the typed prompt behind them. An entry with no parentUuid at all (not even null) leaves its own fields to decide, as an unplaced note does. The walk keeps a visited set and `memo` (index ->
 // verdict, shared across the calls of one lastReply), so n chained notes cost O(n), not O(n^2).
-// R2-B1 (#898): a chain that passes through a `!` stdout entry (bangStdout: it carries turnOrigin) must end at a known turn, never at the parentless fallback: the memo keeps { hidden, bare } (bare: the
-// verdict is visible only because the walk ended at an entry with no parentUuid), and every entry of a walk from the stdout entry down to it is hidden when its end is bare. The bare note itself (an ancestor) keeps its verdict.
+// R2-B1 / R3-B1 (#898): a chain that passes through a `!` stdout entry (bangStdout: it carries turnOrigin) must end at a known turn (the owner's typed prompt: entrySource 'owner'), never at the parentless fallback
+// or a plain boundary: the memo keeps { hidden, bare } (bare: the verdict is visible, but the walk did not end at an owner prompt), and every entry of a walk from the stdout entry down to it is hidden when its end is bare. The bare note itself (an ancestor) keeps its verdict.
 function invisibleNote(entries, parent, first, memo = new Map()) {
   const path = [];
   const seen = new Set();
@@ -362,7 +362,7 @@ function invisibleNote(entries, parent, first, memo = new Map()) {
     path.push(i);
     seen.add(i);
     if (invisibleTurn(e)) verdict = true;
-    else if (!unplacedNote(e) && !visibleSynthetic(e)) verdict = false; // the owner's prompt, or a plain boundary of its own: its own fields said so
+    else if (!unplacedNote(e) && !visibleSynthetic(e)) { verdict = false; bare = entrySource(e) !== 'owner'; } // the owner's prompt, or a plain boundary of its own: its own fields said so (R3-B1: only the owner's is a known turn)
     else if (typeof e.parentUuid !== 'string') { verdict = false; bare = true; }
     else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
     else i = parent[i];

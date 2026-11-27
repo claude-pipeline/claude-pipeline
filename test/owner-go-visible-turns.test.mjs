@@ -886,3 +886,16 @@ test('#898 R2-B1: a turnOrigin-human stdout entry under a parentless `<bash-inpu
     }
   }
 });
+
+// R3-B1 (#898). Failure caught: the parentless `<bash-input>` note carries `isCompactSummary: false`, so it is a plain boundary of its own (not an unplaced note) and the walk ended visible there with
+// no `bare` mark: the stdout entry under it, and the request chained to that, bound with no chain to the owner's typed prompt.
+test('#898 R3-B1: a turnOrigin-human stdout entry under a parentless plain-boundary `<bash-input>` note (isCompactSummary false) is muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    for (const [name, parentless] of [['missing parentUuid', { parentUuid: undefined }], ['null parentUuid', { parentUuid: null }]]) {
+      const o = prompt('ship it');
+      const input = { ...prompt('<bash-input> sh ~/x.sh</bash-input>', { entrypoint: 'cli', userType: 'external', isCompactSummary: false }), ...parentless };
+      const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', BASH_STDOUT), parentUuid: input.uuid };
+      assert.equal(run(kind, [o, of(o, said('working')), input, out, of(out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});
