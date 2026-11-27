@@ -598,6 +598,51 @@ const WRAPPERS = {
   busybox: plain(),
 };
 
+// #903 B: a bare npm runner (`npx`, `npm exec`: no command word, no -c text) starts npm's script shell, which reads its stdin as shell text. Is this argv one, and does it run once per workspace?
+// null: not a bare runner (a command word or a -c / --call text is there, an info flag makes npm exit first, `npm help`, another command). Else { workspace }.
+// The option lists are npm's own: the value options take the next word; the no-value ones (npx-cli's `switches`: every Boolean npm option) do not. An option the list does not know that is followed by exactly ONE more
+// non-option word and nothing else reads as bare too (that word may be its value: more readings, never fewer); with two or more words after it a command word is there either way (npm: an unknown option never takes the command word).
+const RUN_INFO = new Set(['--version', '-v', '--help', '-h', '-H', '--usage', '-?']);
+const RUN_VALUE = new Set(['-p', '--package', '--prefix', '--workspace', '-w', '--registry', '--cache', '--userconfig', '--loglevel', '--shell']);
+const RUN_BOOL = new Set(['-y', '--yes', '--no-yes', '--no', '--no-install', '-q', '--quiet', '-s', '--silent', '-d', '-dd', '-ddd', '--verbose', '--offline', '--prefer-offline', '--prefer-online', '--json', '--color', '--no-color',
+  '--ignore-scripts', '--foreground-scripts', '--include-workspace-root', '--workspaces', '-ws', '--no-workspaces', '--legacy-peer-deps', '--force', '-f', '--global', '-g', '--if-present', '--ignore-existing', '--always-spawn', '--shell-auto-fallback']);
+const RUN_WS = /^(?:-w.*|--workspaces?(?:=.*)?)$/; // (`-w`, `-ws`, `-wDIR`, `--workspace[=D]`, `--workspaces[=B]`)
+const RUN_SUBS = new Set(['exec', 'x', 'exe']); // (`exe` is the unique abbreviation npm reads as exec)
+function bareRunner(argv) {
+  const name = base(argv[0] ?? '');
+  if (name !== 'npx' && name !== 'npm') return null;
+  let i = 1;
+  let workspace = false;
+  let info = false;
+  const scan = (from, stopAtSub) => {
+    for (i = from; i < argv.length; i++) {
+      const t = argv[i];
+      if (t === '--') { i++; return argv[i] === undefined ? 'bare' : stopAtSub ? 'sub' : 'command'; }
+      if (!t.startsWith('-') || t === '-') return stopAtSub ? 'sub' : 'command';
+      if (RUN_WS.test(t)) workspace = true;
+      if (t === '-c' || t === '--call' || t.startsWith('--call=')) {
+        const text = t === '-c' || t === '--call' ? argv[i + 1] : t.slice('--call='.length);
+        if (text !== undefined && text !== '') return 'text'; // (the text runs as a shell line already; an empty or missing one falls back to the stdin shell)
+        if (t === '-c' || t === '--call') i++;
+        continue;
+      }
+      if (RUN_INFO.has(t)) { info = true; continue; }
+      if (RUN_VALUE.has(t)) { i++; continue; }
+      if (RUN_BOOL.has(t) || RUN_WS.test(t) || t.includes('=') || /^-p./.test(t)) continue;
+      if (argv[i + 1] !== undefined && !argv[i + 1].startsWith('-')) i++; // (an option not known: it may take the next word)
+    }
+    return 'bare';
+  };
+  if (name === 'npm') {
+    // npm [global options] exec|x|exe [exec options] [--]
+    if (scan(1, true) !== 'sub' || !RUN_SUBS.has(argv[i])) return null; // (`npm help exec`, another subcommand, none, or a -c text before it)
+    const r = scan(i + 1, false);
+    return r === 'bare' && !info ? { workspace } : null;
+  }
+  const r = scan(1, false);
+  return r === 'bare' && !info ? { workspace } : null;
+}
+
 const SHELL_OWN_WRAPPERS = new Set(['command', 'builtin', 'exec', 'noglob', 'nocorrect', 'time']);
 const PACKAGE_RUNNERS = new Set(['npx', 'bunx', 'pnpx', 'npm', 'pnpm', 'yarn']);
 function unwrap(argv, trust = false) {
@@ -3727,11 +3772,13 @@ class Parser {
     let spawn = isExec; // (#352 R10-F6: a wrapper that starts a child process (env, nohup, nice, timeout, sudo, xargs ...), find -exec, a launcher: what the command changes is the child's; command / builtin / exec / noglob / nocorrect / time stay this shell's)
     let wrapped = false; // (any wrapper unwrapped, one this shell runs itself too: `command exit 1` / `noglob exit 1` / `time exit 1` may leave no shell either; see plainExit. A leading `coproc` is also `spawn`, below)
     let viaRunner = false; // a package runner (npx, npm exec, pnpm dlx ...) started it: a bare name is looked up in node_modules/.bin
+    let runnerIn = null; // (#903 B) a bare npx / npm exec among the wrappers: it reads its stdin as shell text (bareRunner)
     // extCd (T2): a `time`, `command` or `builtin` stood in front. Whether it ran the command as the shell's own builtin or as an external program differs by shell and spelling (dash has no `time` keyword, zsh's `command cd` runs /usr/bin/cd,
     // bash's `time` after an assignment is a program), so a `cd` behind it may or may not have moved THIS shell: git-policy leaves the directory unknown. Not `spawn` (bash really moves), not truncated (`\time make` is everyday).
     let extCd = false;
     for (let guard = 0; guard < 32 && a.length; guard++) {
       if (base(a[0]) === 'xargs' || base(a[0]) === 'parallel') fanRuns = true;
+      if (runnerIn === null && !fan) runnerIn = bareRunner(a); // (not behind an xargs / parallel: the pipe is that program's stdin, not the runner's)
       const un = unwrap(a, this.ctx.runnerPlain);
       if (!un) break;
       wrapped = true;
@@ -3832,7 +3879,28 @@ class Parser {
       addFeeds(cmd, st);
     }
     this.interpret(a, seg, cmd);
+    if (cmd && runnerIn) this.runnerStdin(seg, cmd, runnerIn);
     return cmd;
+  }
+
+  // (#903 B) What a bare npm runner's stdin holds is the text of npm's script shell: read as `sh` with no script operand reads it (pipe, heredoc, here-string, `< file`; an unknown feed is flagged). The command itself is not
+  // rewritten: it stays `npx` / `npm exec`, so every other reading of it is as before. A new process (a `cd` in the text does not move this shell), with node_modules/.bin on its PATH (as for `npx sh -c TEXT`); with a workspace
+  // option npm runs it once per workspace, in that workspace's directory: unknown (null), like the commands of a script text a `sudo -D` started. The mark `runnerStdin` ({ workspace, fed }) is for the policies' own rules.
+  runnerStdin(seg, cmd, r) {
+    const saved = this.cmd;
+    const savedBin = this.ctx.binPath;
+    const savedChdir = this.ctx.chdirInherit;
+    this.cmd = cmd;
+    this.ctx.binPath = true;
+    if (r.workspace) this.ctx.chdirInherit = null;
+    else if (cmd.chdir !== undefined) this.ctx.chdirInherit = cmd.chdir;
+    let src;
+    try {
+      this.markProc();
+      src = this.runStdin(seg, seg.depth + 1);
+    } finally { this.cmd = saved; this.ctx.binPath = savedBin; this.ctx.chdirInherit = savedChdir; }
+    const fed = src.texts.length > 0 || src.unknown || src.st.files.length > 0 || src.st.computed.length > 0;
+    Object.defineProperty(cmd, 'runnerStdin', { value: { workspace: r.workspace, fed }, enumerable: false });
   }
 
   // Why: `xargs -I{} sh -c '{}' < f.sh`, `xargs bash -c < f.sh`, `cat f.sh | xargs -0 sh -c`: xargs puts the text it reads into the command line of the shell, as the
@@ -3969,6 +4037,7 @@ class Parser {
     for (const text of src.texts) this.subParse(text, depth);
     if (src.unknown) this.ctx.dynamic = true;
     addFeeds(this.cmd, src.st);
+    return src;
   }
 
   // bash <(cmd) / source <(cmd): the script is whatever cmd prints
