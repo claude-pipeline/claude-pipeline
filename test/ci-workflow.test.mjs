@@ -1,15 +1,18 @@
 // Structure of .github/workflows/ci.yml, parsed with the vendored YAML reader. What it pins: the required check names in
-// .claude/pipeline.yml are real job names, and both suites are split behind an aggregate (Windows: three shards behind "test (windows)";
-// Ubuntu: Node 20 and 24 jobs behind "test (ubuntu)") that is red (never green or skipped) unless every part succeeded, except on a
+// .claude/pipeline.yml are real job names, and both suites are split behind an aggregate (Windows: shards behind "test (windows)";
+// Ubuntu: Node 20 and 24 jobs, each in shards, behind "test (ubuntu)") that is red (never green or skipped) unless every part succeeded, except on a
 // draft PR, where the suite is skipped as a whole (ci.draft_while_iterating). Only a real CI run proves the matrix expands
 // and the runners schedule; this guards the wiring that would silently weaken the required check.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
+import { selectTestFiles } from '../scripts/lib/select-tests.mjs';
+import { shardFiles } from '../scripts/lib/shard.mjs';
+import { expandJob, stepRuns } from './helpers/ci-matrix.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const load = (rel) => parseYaml(readFileSync(join(root, rel), 'utf8'));
@@ -29,14 +32,10 @@ const runsOn = (cond, { event, draft = false }) => {
   return new Function('always', 'github', `return Boolean(${cond.replaceAll('github.event.pull_request.draft', 'github.draft').replaceAll('github.event_name', 'github.event')});`)(() => true, { event, draft });
 };
 
-// The check names GitHub shows: a matrix job's name has its ${{ matrix.* }} expressions expanded, one per combination.
-const expandedNames = (job) => {
-  const keys = Object.keys(job.strategy?.matrix ?? {});
-  if (keys.length === 0) return [job.name];
-  assert.equal(keys.length, 1, 'one matrix dimension: the Windows shard or the Ubuntu Node version');
-  assert.ok(['shard', 'node'].includes(keys[0]), keys[0]);
-  return job.strategy.matrix[keys[0]].map((v) => job.name.replace(`\${{ matrix.${keys[0]} }}`, String(v)));
-};
+// The check names GitHub shows: a matrix job's name has its ${{ matrix.* }} expressions expanded, one per combination of every matrix key.
+const expandedNames = (job) => expandJob(job).map((row) => row.name);
+const testsStepOf = (row) => row.steps.find((st) => /node scripts\/test\.mjs/.test(st.run ?? ''));
+const nodeOf = (row) => String(row.steps.find((st) => String(st.uses).startsWith('actions/setup-node@')).with['node-version']);
 
 test('every ci.required_checks name in .claude/pipeline.yml is the name of a job in ci.yml', () => {
   const names = Object.values(jobs).flatMap(expandedNames);
@@ -44,28 +43,94 @@ test('every ci.required_checks name in .claude/pipeline.yml is the name of a job
   for (const required of config.ci.required_checks) assert.ok(names.includes(required), `no job is named ${JSON.stringify(required)}`);
 });
 
-test('job names are unique and no shard is named like a required check', () => {
+test('job names are unique and no matrix row is named like a required check', () => {
   const live = Object.entries(jobs).filter(([, j]) => j.if !== '${{ false }}'); // proof-anchor never runs and has no name
   const names = live.flatMap(([, j]) => expandedNames(j));
   assert.equal(new Set(names).size, names.length, names.join(' | '));
-  assert.deepEqual(expandedNames(shardJob), ['test (windows 1/3)', 'test (windows 2/3)', 'test (windows 3/3)']);
-  assert.deepEqual(expandedNames(nodeJob), ['test (ubuntu node 20)', 'test (ubuntu node 24)']);
+  assert.equal(expandedNames(shardJob).length, shardJob.strategy.matrix.shard.length, 'a Windows row per shard');
+  assert.equal(expandedNames(nodeJob).length, nodeJob.strategy.matrix.node.length * nodeJob.strategy.matrix.shard.length, 'an Ubuntu row per Node version x shard');
   for (const required of config.ci.required_checks) assert.ok(!expandedNames(shardJob).includes(required) && !expandedNames(nodeJob).includes(required), required);
 });
 
-test('the shard job runs shards 1..3 of 3 on Windows with Node 24 and does not cancel its siblings', () => {
+// Failure caught: an `exclude`/`include` matrix key makes GitHub drop or add a row the expander would still run (or miss), so the aggregate
+// stays green over a shard that never ran.
+test('the matrix expander refuses include and exclude keys instead of misreading them as a dimension', () => {
+  for (const key of ['include', 'exclude']) {
+    assert.throws(() => expandJob({ strategy: { matrix: { shard: [1, 2], [key]: [{ shard: 2 }] } } }), new RegExp(`matrix\\.${key}`));
+  }
+});
+
+// Failure caught: a matrix row renamed (or a second matrix key added) without its push-skip JOB_NAME following. tested-tree.mjs looks the job
+// up by that exact name in the PR run, finds none, and every push to main re-runs the suite (or the skip silently never applies).
+test('each expanded row display name equals its push-skip JOB_NAME', () => {
+  for (const job of [shardJob, nodeJob]) {
+    for (const row of expandJob(job)) {
+      const skip = row.steps.find((st) => String(st.run).includes('tested-tree.mjs'));
+      assert.ok(skip, `${row.name}: has the push-skip step`);
+      assert.equal(skip.env.JOB_NAME, row.name);
+    }
+  }
+});
+
+test('the shard job runs on Windows with Node 24 and does not cancel its siblings', () => {
   assert.equal(shardJob['runs-on'], 'windows-latest');
+  assert.equal(shardJob['timeout-minutes'], 45);
   assert.equal(shardJob.strategy['fail-fast'], false);
-  assert.deepEqual(shardJob.strategy.matrix.shard, [1, 2, 3]);
-  const runs = shardJob.steps.map((s) => s.run).filter(Boolean);
-  assert.ok(runs.includes('node scripts/test.mjs --shard ${{ matrix.shard }}/3'), runs.join('\n'));
   const node = shardJob.steps.filter((s) => String(s.uses).startsWith('actions/setup-node@'));
   assert.equal(node.length, 1);
   assert.equal(node[0].with['node-version'], 24);
 });
 
+// The `--shard I/N` each expanded row actually runs, per OS and Node version: one N, and I = 1..N exactly once.
+const shardsOf = (job) => {
+  const byNode = new Map();
+  for (const row of expandJob(job)) {
+    const step = testsStepOf(row);
+    assert.ok(step, `${row.name}: runs the suite`);
+    const m = /--shard (\d+)\/(\d+)\b/.exec(step.run);
+    assert.ok(m, `${row.name}: ${step.run} has no --shard I/N`);
+    const node = nodeOf(row);
+    if (!byNode.has(node)) byNode.set(node, []);
+    byNode.get(node).push({ name: row.name, i: Number(m[1]), n: Number(m[2]) });
+  }
+  return byNode;
+};
+const allTestFiles = () => {
+  const dir = join(root, 'test');
+  return selectTestFiles(readdirSync(dir), []).names.map((name) => ({ name, size: statSync(join(dir, name)).size }));
+};
+
+// Failures caught: a 4-row matrix whose command says I/5 (bin 5 is never run: its files are untested, the aggregate is still green), and a
+// duplicated row (a bin runs twice, another is missing).
+for (const [what, job] of [['Windows', shardJob], ['Ubuntu', nodeJob]]) {
+  test(`${what}: for every Node version the rows' --shard I/N commands use one N and cover I = 1..N exactly once`, () => {
+    const byNode = shardsOf(job);
+    assert.ok(byNode.size >= 1);
+    for (const [node, rows] of byNode) {
+      const n = rows[0].n;
+      assert.ok(n >= 2, `Node ${node}: sharded`);
+      assert.ok(rows.every((r) => r.n === n), `Node ${node}: one N: ${rows.map((r) => r.name + ' ' + r.i + '/' + r.n).join(', ')}`);
+      assert.deepEqual(rows.map((r) => r.i).sort((a, b) => a - b), Array.from({ length: n }, (_, k) => k + 1), `Node ${node}`);
+    }
+  });
+
+  // Failure caught: the bins computed with the real file list overlap or leave a file out, so a test file is run by no shard (or twice).
+  test(`${what}: the bins of the real test file list are disjoint and together are every test file`, () => {
+    const files = allTestFiles();
+    const weights = JSON.parse(readFileSync(join(root, 'scripts', 'lib', 'test-weights.json'), 'utf8'));
+    for (const [node, rows] of shardsOf(job)) {
+      const seen = new Map();
+      for (const r of rows) for (const name of shardFiles(files, r.i, r.n, weights)) {
+        assert.ok(!seen.has(name), `Node ${node}: ${name} runs in ${seen.get(name)} and ${r.name}`);
+        seen.set(name, r.name);
+      }
+      assert.deepEqual([...seen.keys()].sort(), files.map((f) => f.name).sort(), `Node ${node}: a file no shard runs`);
+    }
+  });
+}
+
 test('each Windows shard records per-file times and prints them between marker lines even when the tests failed', () => {
-  const tests = shardJob.steps.find((s) => s.run === 'node scripts/test.mjs --shard ${{ matrix.shard }}/3');
+  const tests = testsStepOf({ steps: shardJob.steps });
   assert.equal(tests.env.CP_TEST_TIMES, '${{ runner.temp }}/cp-file-times.json');
   const print = shardJob.steps.find((s) => String(s.run).includes('CP-FILE-TIMES-BEGIN'));
   assert.ok(print, 'a step prints the times');
@@ -76,10 +141,26 @@ test('each Windows shard records per-file times and prints them between marker l
   assert.equal(print.shell, undefined, 'no step overrides the workflow-wide bash default (self-verify)');
 });
 
-test('the installer round trip runs on Windows in shard 3 only', () => {
-  const installer = shardJob.steps.filter((s) => String(s.run).includes('installer-round-trip.sh'));
-  assert.equal(installer.length, 1);
-  assert.match(installer[0].if, /^matrix\.shard == 3 && \(/);
+// Failure caught: the round trip's `if` matching no row (the installer is never checked) or several (it runs twice into the same
+// claude-home path on one runner). Evaluated against every expanded row, on a pull_request and on a push that did not skip.
+const installerRows = (job, event, tested) => expandJob(job).filter((row) => {
+  const installer = row.steps.filter((s) => String(s.run).includes('installer-round-trip.sh'));
+  assert.equal(installer.length, 1, row.name);
+  return stepRuns(installer[0].if, row.combo, { event, tested });
+});
+test('the installer round trip runs on exactly one Windows row, and on exactly one row per Ubuntu Node version', () => {
+  for (const [event, tested] of [['pull_request', ''], ['merge_group', ''], ['push', ''], ['push', 'true']]) {
+    assert.equal(installerRows(shardJob, event, tested).length, 1, `Windows ${event}`);
+    const rows = installerRows(nodeJob, event, tested);
+    assert.deepEqual(rows.map((r) => r.combo.node).sort((a, b) => a - b), [...nodeJob.strategy.matrix.node].sort((a, b) => a - b), `Ubuntu ${event}: one row per Node version`);
+  }
+  // a push whose tree already passed (the skip step answers 'false') skips the round trip with the rest of the job
+  assert.equal(installerRows(shardJob, 'push', 'false').length, 0);
+  assert.equal(installerRows(nodeJob, 'push', 'false').length, 0);
+  for (const row of expandJob(nodeJob)) {
+    const installer = row.steps.find((s) => String(s.run).includes('installer-round-trip.sh'));
+    assert.ok(installer.run.includes(`claude home ${row.combo.node}`), `${row.name}: a claude-home path per Node version`);
+  }
 });
 
 test('test (windows) aggregates the shard job: needs it, runs always (but on a draft PR), on ubuntu', () => {
@@ -101,7 +182,7 @@ test('the aggregate step exits 0 only for a result of exactly "success"', () => 
   }
 });
 
-test('the Ubuntu Node job runs the whole suite on Node 20 and 24 in parallel, does not cancel its sibling, and each runs the installer round trip', () => {
+test('the Ubuntu Node job runs Node 20 and 24, each sharded, in parallel and does not cancel its siblings', () => {
   assert.equal(nodeJob['runs-on'], 'ubuntu-latest');
   assert.equal(nodeJob['timeout-minutes'], 45);
   assert.equal(nodeJob.strategy['fail-fast'], false);
@@ -109,11 +190,16 @@ test('the Ubuntu Node job runs the whole suite on Node 20 and 24 in parallel, do
   const node = nodeJob.steps.filter((s) => String(s.uses).startsWith('actions/setup-node@'));
   assert.equal(node.length, 1);
   assert.equal(node[0].with['node-version'], '${{ matrix.node }}');
-  assert.equal(nodeJob.steps.filter((s) => s.run === 'node scripts/test.mjs').length, 1, 'the full suite, no shard');
-  const installer = nodeJob.steps.filter((s) => String(s.run).includes('installer-round-trip.sh'));
-  assert.equal(installer.length, 1);
-  assert.ok(installer[0].run.includes('claude home ${{ matrix.node }}'), 'a home per Node version');
-  assert.ok(!installer[0].if || !/matrix\./.test(installer[0].if), 'it runs for every Node version');
+  assert.equal(nodeJob.steps.filter((s) => /node scripts\/test\.mjs/.test(s.run ?? '')).length, 1, 'one suite step');
+});
+
+// Failure caught: an aggregate that needs another job (or none) goes green without the matrix having run.
+test('each aggregate needs exactly its own matrix job and reads the result of that job', () => {
+  for (const [agg, matrixId] of [[aggregate, 'test-windows-shard'], [ubuntuAggregate, 'test-ubuntu-node']]) {
+    assert.equal(agg.needs, matrixId);
+    assert.ok(Object.keys(jobs[agg.needs].strategy.matrix).length >= 1, `${agg.name}: ${matrixId} is a matrix job`);
+    assert.ok(JSON.stringify(agg.steps[0].env).includes(`needs.${matrixId}.result`), agg.name);
+  }
 });
 
 test('test (ubuntu) aggregates the Node job: needs it, runs always (but on a draft PR), on ubuntu, one unconditional step', () => {
@@ -136,7 +222,7 @@ test('the test (ubuntu) step exits 0 only for a result of exactly "success"', ()
   }
 });
 
-test('the CI proof for `tests` still points at the ubuntu aggregate (green only when both Node jobs passed)', () => {
+test('the CI proof for `tests` still points at the ubuntu aggregate (green only when every Node job and shard passed)', () => {
   assert.equal(config.verify.ci_proof.tests.job, 'test (ubuntu)');
   assert.equal(jobs['test-ubuntu'].name, 'test (ubuntu)');
   assert.equal(jobs['test-ubuntu'].needs, 'test-ubuntu-node');

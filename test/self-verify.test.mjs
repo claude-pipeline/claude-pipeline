@@ -46,13 +46,12 @@ test('the self pipeline.yml loads, names the project verify.mjs uses, and makes 
 test('CI job names are exactly the required checks', async () => {
   const ci = read('.github/workflows/ci.yml');
   const all = [...ci.matchAll(/^ {4}name: (.+)$/gm)].map((m) => m[1].trim());
-  // the Windows shards (one matrix job) are not required themselves: the aggregate `test (windows)` stands for them
-  const shards = all.filter((n) => n.includes('${{ matrix.shard }}'));
-  assert.deepEqual(shards, ['test (windows ${{ matrix.shard }}/3)']);
-  // ...and so are the Ubuntu Node jobs: the aggregate `test (ubuntu)` stands for them
-  const nodes = all.filter((n) => n.includes('${{ matrix.node }}'));
-  assert.deepEqual(nodes, ['test (ubuntu node ${{ matrix.node }})']);
-  const names = all.filter((n) => !shards.includes(n) && !nodes.includes(n));
+  // the matrix jobs (Windows shards, Ubuntu Node versions x shards) are not required themselves: the aggregates `test (windows)` and
+  // `test (ubuntu)` stand for them. Their per-row names are checked against the expanded matrix in ci-workflow.test.mjs.
+  const matrixNames = all.filter((n) => n.includes('${{ matrix.'));
+  assert.equal(matrixNames.length, 2, matrixNames.join(' | '));
+  assert.ok(matrixNames.some((n) => n.startsWith('test (windows ')) && matrixNames.some((n) => n.startsWith('test (ubuntu node ')), matrixNames.join(' | '));
+  const names = all.filter((n) => !matrixNames.includes(n));
   assert.deepEqual(names.sort(), [...(await selfConfig()).ci.required_checks].sort());
   const shells = [...ci.matchAll(/^\s*shell:\s*(\S+)/gm)].map((m) => m[1]);
   assert.deepEqual(shells, ['bash'], 'one workflow-wide default, bash, and no step overrides it');

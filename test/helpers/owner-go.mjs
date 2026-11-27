@@ -3,7 +3,7 @@
 // deletes it afterwards (t.after, and at process exit for a test that died before t.after ran). A random temp-repo head never matches anything else.
 // ISOLATION (#122): the folder is shared by every test and every concurrent run of the suite, and a ruling or a round grant matches on
 // repository, PR and item (or round) only. A test that records those must build its world with a repository name of its own
-// (test/cli-review.test.mjs ownerWorld: a unique slug per test), so its records can never match another test's or another process's.
+// (test/helpers/cli-review-world.mjs ownerWorld: a unique slug per test), so its records can never match another test's or another process's.
 // Approval records are bound to a head instead; the temp repos use fixed author details, so identical fixtures made in the same second
 // can share heads - callers of ownerSays keep that known risk (tracked in a follow-up issue).
 import { mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs';

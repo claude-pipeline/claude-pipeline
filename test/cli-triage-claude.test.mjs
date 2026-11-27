@@ -1,7 +1,7 @@
 // End-to-end tests for `pipeline triage claude-ruling` and for what the rest of the review loop does with a Claude ruling (plan
 // 2026-11-05-claude-rulings.md section 10 + E1-E11): settle, arbiter apply and the cache leave Claude's and forced finals alone, the owner's typed
 // ruling can still override an unimplemented one, a retry of the arbiter clears malfunctions in dispute rounds, a newer state version is refused.
-// The setup follows test/cli-review.test.mjs: the real CLI against a throwaway git repo, a scripted fake gh and a scripted fake codex.
+// The setup follows test/cli-review-part*.test.mjs (helpers/cli-review-world.mjs): the real CLI against a throwaway git repo, a scripted fake gh and a scripted fake codex.
 import { createHash, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

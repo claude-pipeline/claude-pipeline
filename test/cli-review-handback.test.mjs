@@ -1,6 +1,6 @@
 // End-to-end: `triage validate --from-tag` and `arbiter apply` accept a subagent whose report arrives as a SubagentHandback
 // call (plain text at the end of such a session is not delivered), and refuse one whose hand-back is not acknowledged.
-// Kept apart from cli-review.test.mjs; the world/transcript plumbing below is a trimmed copy of that file's helpers.
+// Kept apart from cli-review-part*.test.mjs; the world/transcript plumbing below is a trimmed copy of helpers/cli-review-world.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';

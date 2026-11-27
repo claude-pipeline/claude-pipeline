@@ -41,6 +41,21 @@ function api(endpoint) {
   try { return JSON.parse(out); } catch { return mustRun(`${endpoint}: reply is not JSON`); }
 }
 
+// Every job of a run, following the listing's pages: a run with many attempts (each attempt lists all of its jobs) spills past one
+// page of 100, and a passed job that sat on a later page would be missed (the push-skip then re-runs the suite: safe but slow).
+const JOBS_PER_PAGE = 100;
+const MAX_JOB_PAGES = 20;
+function runJobs(runId) {
+  const all = [];
+  for (let page = 1; page <= MAX_JOB_PAGES; page++) {
+    const jobs = api(`repos/${REPO}/actions/runs/${runId}/jobs?filter=all&per_page=${JOBS_PER_PAGE}&page=${page}`).jobs;
+    if (!Array.isArray(jobs)) mustRun(`run ${runId}: no jobs list`);
+    all.push(...jobs);
+    if (jobs.length < JOBS_PER_PAGE) return all;
+  }
+  return all;
+}
+
 // Path A. Returns the evidence line, or throws (a Run with the reason, or any other error) when it proves nothing.
 function mergeGroupEvidence() {
   const runs = api(`repos/${REPO}/actions/workflows/${WORKFLOW_FILE}/runs?head_sha=${SHA}&event=merge_group&per_page=100`).workflow_runs;
@@ -48,8 +63,7 @@ function mergeGroupEvidence() {
   for (const wr of runs) {
     if (wr.status !== 'completed' || wr.conclusion !== 'success' || wr.event !== 'merge_group' || wr.head_sha !== SHA) continue;
     if (wr.head_repository?.full_name !== REPO) continue;
-    const jobs = api(`repos/${REPO}/actions/runs/${wr.id}/jobs?filter=all&per_page=100`).jobs;
-    if (!Array.isArray(jobs)) mustRun(`run ${wr.id}: no jobs list`);
+    const jobs = runJobs(wr.id);
     const ok = jobs.find((j) => j.name === JOB_NAME && j.conclusion === 'success');
     if (ok) return `evidence: run ${wr.id} (${wr.html_url ?? 'no url'}) job "${JOB_NAME}" concluded ${ok.conclusion} in the merge_group run on ${SHA}`;
   }
@@ -90,8 +104,7 @@ function decide() {
   if (!Array.isArray(runs)) mustRun('no workflow_runs list');
   for (const wr of runs) {
     if (wr.status !== 'completed') continue;
-    const jobs = api(`repos/${REPO}/actions/runs/${wr.id}/jobs?filter=all&per_page=100`).jobs;
-    if (!Array.isArray(jobs)) mustRun(`run ${wr.id}: no jobs list`);
+    const jobs = runJobs(wr.id);
     const ok = jobs.find((j) => j.name === JOB_NAME && j.conclusion === 'success');
     if (ok) {
       console.log(`evidence: run ${wr.id} (${wr.html_url ?? 'no url'}) job "${JOB_NAME}" concluded ${ok.conclusion} on PR head ${head}`);

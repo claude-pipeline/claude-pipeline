@@ -1,6 +1,6 @@
 // Old Fable proofs are re-reviewed, not grandfathered (plan 2026-11-10, A4b): which proven Fable rounds are stale, and how an uncounted
 // "Fable refresh" round is treated by the round cap and the Fable-pending rule. The CLI side (state fable-refresh, review-complete, the final
-// gate) is in cli-review.test.mjs.
+// gate) is in cli-review-part*.test.mjs.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { emptyState, addRound } from '../pipeline/lib/state.mjs';
