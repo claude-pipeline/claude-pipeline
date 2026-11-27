@@ -367,3 +367,4 @@ full record.
 - 2026-11-27 · #907 · Auto-apply 'after deploy' migrations once GitHub shows the production deploy succeeded (#882); #894 test, #896 comment · risk high · rounds 5 · arbiter 5 (fix-verify 2) · blocked · Codex 7d: 687 runs (267 high)
 - 2026-11-27 · #906 · Guard: /usr/bin/grep 2>/dev/null and npx playwright test -c pass; the config is judged as a program (#746) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 687 runs (267 high)
 - 2026-11-27 · #907 · Auto-apply 'after deploy' migrations once GitHub shows the production deploy succeeded (#882); #894 test, #896 comment · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 691 runs (268 high)
+- 2026-11-27 · #917 · test: hung-git hook-entry test reaches its route (#894); race comment fix (#896) · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 702 runs (275 high)
