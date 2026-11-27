@@ -15,7 +15,7 @@ import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { insideClaudeCode } from '../../lib/owner-only.mjs';
-import { REF_RE, autoEntry, dbRefsFile, readDbRefs } from './db-refs.mjs';
+import { REF_RE, autoEntry, dbRefsFile, readDbRefs, trustedServer } from './db-refs.mjs';
 import { readMachineId, release, tryAcquire } from '../../lib/locks.mjs';
 import { gh } from '../../lib/proc.mjs';
 import { LIVE_DB_KIND, sha256Of, sqlCharProblem } from './live-db-go.mjs';
@@ -420,15 +420,15 @@ function takeRegistryLock({ home, leftMs, io = {} }) {
 
 // Is this migration a file a merged PR added to the registered repo's default branch, identical to the call, recent, and not attempted before? Then the next attempt generation of both keys is claimed.
 // -> { status: 'claimed', facts } | { status: 'not-eligible' | 'spent' | 'error' | 'no-time', reason } (`reason` is one plain sentence; never a throw)
-export function autoApply({ home, entry, name, query, session, now, leftMs, env, io = {} }) {
+export function autoApply({ home, entry, server, name, query, session, now, leftMs, env, io = {} }) {
   try {
-    return autoCheck({ home, entry, name, query, session, now, leftMs, env, io });
+    return autoCheck({ home, entry, server, name, query, session, now, leftMs, env, io });
   } catch {
     return { status: 'error', reason: 'the auto-apply check failed unexpectedly' };
   }
 }
 
-function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) {
+function autoCheck({ home, entry, server, name, query, session, now, leftMs, env, io }) {
   // a marked file waits for the production deploy when the owner registered it (`pipeline db-refs after-deploy on`: environment + bot; an entry with cutoff-era keys reads as not registered); otherwise it keeps the owner's click after the deploy
   const marked = AFTER_DEPLOY_RE.test(query);
   const registered = typeof entry.deployEnv === 'string' && typeof entry.deployBot === 'string';
@@ -487,7 +487,7 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
     proven = proof.facts;
   }
   const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null, ...proven };
-  // A marked file: the owner can switch the registration off while GitHub was asked, or just before the claim. The registry is read again under the registry lock the owner's db-refs writes take, and the lock is held until the claim is made,
+  // A marked file: the owner can switch the registration off, or remove the MCP server the call came through, while GitHub was asked or just before the claim. The registry is read again under the registry lock the owner's db-refs writes take, and the lock is held until the claim is made,
   // so an `off` that finished earlier is seen and a later one waits (no GitHub call is made under the lock).
   let lock = null;
   let next;
@@ -495,7 +495,9 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
     if (marked) {
       lock = takeRegistryLock({ home, leftMs, io });
       if (lock === null) return notEligible('the owner\'s db-refs command is changing the registry (or no time was left to wait for it): call again, or ask for the owner\'s go');
-      const fresh = autoEntry(entry.ref, readDbRefs(home, io)).entry;
+      const freshState = readDbRefs(home, io);
+      if (!trustedServer(server, freshState)) return notEligible('the owner removed the MCP server this call came through from the trusted list during the check: call again, or ask for the owner\'s go');
+      const fresh = autoEntry(entry.ref, freshState).entry;
       if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
     }
     next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });

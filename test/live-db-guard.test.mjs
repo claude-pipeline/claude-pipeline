@@ -1342,6 +1342,23 @@ test('after-deploy: a registration the owner switches off while GitHub is asked 
   assert.equal(markers(s).length, 0);
 });
 
+test('after-deploy: an MCP server the owner removes while GitHub is asked claims nothing; one that stays listed applies', async (t) => {
+  // Failure caught: `db-refs server remove` finishing during the GitHub reads, and the migration still being applied through the server the owner just revoked.
+  const entry = { ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z', ...DEPLOY_REG };
+  const via = (s) => evaluateSupabaseMcp('mcp__mine__apply_migration', { project_id: REF, name: NAME, query: MARKED }, s.ctx);
+  const s = await deployScene(t);
+  seedRegistry(s.home, { refs: [entry], servers: ['mine'] });
+  s.deploy = () => { seedRegistry(s.home, { refs: [entry], servers: [] }); return deployAnswer(); };
+  const r = via(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /removed the MCP server/);
+  assert.deepEqual(hist(s), [], 'nothing claimed');
+  assert.equal(markers(s).length, 0);
+  const kept = await deployScene(t);
+  seedRegistry(kept.home, { refs: [entry], servers: ['mine'] });
+  assert.equal(via(kept).decision, 'allow');
+});
+
 test('after-deploy: the final registry check and the claim run under the registry lock the owner\'s db-refs writes take, released after; a lock the owner holds past the wait claims nothing', async (t) => {
   // Failure caught: the owner's `after-deploy off` finishing between the hook's last registry read and its claim, and the migration still being allowed.
   const s = await deployScene(t);
