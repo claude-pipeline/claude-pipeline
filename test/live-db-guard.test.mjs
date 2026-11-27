@@ -1183,14 +1183,14 @@ test('after-deploy: a marked file whose newest and latest completed Production d
   const n = body(gfile(s, 'name', 1, { sql: MARKED }));
   assert.deepEqual([n.via, n.afterDeploy, n.deployEnv, n.deployedAt, n.commit, n.pr], ['auto', true, 'Production', isoAt(NOW - 3_000_000), COMMIT, 42]);
   const [ev] = readAttemptLog({ home: s.home }).events;
-  assert.deepEqual([ev.via, ev.afterDeploy, ev.deployEnv], ['auto', true, 'Production']);
+  assert.deepEqual([ev.via, ev.afterDeploy, ev.deployEnv, ev.deployedAt], ['auto', true, 'Production', isoAt(NOW - 3_000_000)]);
   // an unmarked apply on the same registry carries no deploy fields, and an attempt-log row without them (older install) reads null
   const plain = await deployScene(t);
   plain.answer = () => ghBase();
   assert.equal(apply(plain).decision, 'allow');
   assert.equal(plain.calls.length, 1, 'no deploy query for an unmarked file');
   const [old] = readAttemptLog({ home: plain.home }).events;
-  assert.deepEqual([old.afterDeploy, old.deployEnv], [null, null]);
+  assert.deepEqual([old.afterDeploy, old.deployEnv, old.deployedAt], [null, null, null]);
   assert.equal('afterDeploy' in body(gfile(plain, 'name', 1)), false);
 });
 
