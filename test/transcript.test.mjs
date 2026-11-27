@@ -116,6 +116,37 @@ test('a per-call model override in meta fails unless it is the expected one', ()
   assert.deepEqual(other.errors, ['per-call model override present: claude-nonexistent-0']);
 });
 
+// Claude Code 2.1.330 records the resolved model in meta even for a call with no override; only
+// launchedWithDefaults === true plus a model inside the proven prefix is treated as that default launch.
+test('meta recording the pinned model on a default launch is not an override; anything else still is', () => {
+  const meta = (extra) => JSON.stringify({ agentType: 'arbiter', description: 'd', model: 'claude-fable-5-2', ...extra });
+  const allowed = prove('fable-ok', { metaText: meta({ launchedWithDefaults: true }) });
+  assert.deepEqual(allowed.errors, []);
+  assert.equal(allowed.ok, true);
+  const err = ['per-call model override present: claude-fable-5-2'];
+  assert.deepEqual(prove('fable-ok', { metaText: meta({}) }).errors, err);
+  assert.deepEqual(prove('fable-ok', { metaText: meta({ launchedWithDefaults: false }) }).errors, err);
+  assert.deepEqual(prove('fable-ok', { metaText: meta({ launchedWithDefaults: 'true' }) }).errors, err);
+  assert.deepEqual(
+    prove('fable-ok', { metaText: meta({ launchedWithDefaults: true, model: 'claude-sonnet-5-5' }) }).errors,
+    ['per-call model override present: claude-sonnet-5-5'],
+  );
+  assert.deepEqual(
+    prove('fable-ok', { metaText: meta({ launchedWithDefaults: true, model: null }) }).errors,
+    ['per-call model override present: null'],
+  );
+});
+
+// An explicit expectMetaModel means the caller asked for exactly that override; a default launch recording a
+// different in-family model must not slip through the default-launch exemption.
+test('an explicit expectMetaModel is compared exactly even on a default launch', () => {
+  const meta = (model) => JSON.stringify({ agentType: 'arbiter', description: 'd', launchedWithDefaults: true, model });
+  const refused = prove('fable-ok', { metaText: meta('claude-fable-5-2'), expectMetaModel: 'claude-fable-5-1' });
+  assert.equal(refused.ok, false);
+  assert.deepEqual(refused.errors, ['per-call model override present: claude-fable-5-2']);
+  assert.deepEqual(prove('fable-ok', { metaText: meta('claude-fable-5-2'), expectMetaModel: 'claude-fable-5-2' }).errors, []);
+});
+
 // ---------- proveModel: fail-closed edge shapes ----------
 
 test('unparseable, non-object, or missing meta fails closed', () => {
