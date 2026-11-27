@@ -369,3 +369,4 @@ full record.
 - 2026-11-27 · #907 · Auto-apply 'after deploy' migrations once GitHub shows the production deploy succeeded (#882); #894 test, #896 comment · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 691 runs (268 high)
 - 2026-11-27 · #917 · test: hung-git hook-entry test reaches its route (#894); race comment fix (#896) · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 702 runs (275 high)
 - 2026-11-27 · #913 · Live DB: refuse numbered migrations on apply_migration (#811); fix the click reader and newline diagnosis (#741) · risk high · rounds 5 · arbiter 5 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 713 runs (280 high)
+- 2026-11-27 · #913 · Live DB: refuse numbered migrations on apply_migration (#811); fix the click reader and newline diagnosis (#741) · risk high · rounds 6 · arbiter 6 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 739 runs (291 high)
