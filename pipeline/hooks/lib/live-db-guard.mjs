@@ -160,17 +160,22 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
     const m = claimGoMarker({ home, session: sessionId, promptId: click ? r.ask.clickId : r.prompt_id, click, op, projectRef, name, sqlSha256, now, io });
     if (m === 'spent') { spent = true; continue; }
     if (m !== 'claimed') return { status: 'error', reason: 'the go could not be marked as used (the folder is not a real directory, or a write failed), so nothing is applied' };
+    let hist = seen;
+    let label = flagged?.name;
     if (seen === null) {
       // read as unflagged: the owner may have switched auto-apply on, and an auto call claimed generations, between that read and this marker. Re-read the switch now that the marker is written (live-db-auto.mjs does the mirror image).
-      if (op === 'migration' && flaggedEntry(home, projectRef) !== null) {
-        const h = history({ home, ref: projectRef, name, sqlSha256, leftMs, io });
-        if (h.status === 'no-time') return noTime;
-        if (h.status === 'error') return { status: 'error', reason: `the attempt history ${h.path} cannot be read (${h.reason}), so nothing is applied; the go is used; the owner looks at it` };
-        if (h.name.n > 0 || h.sql.n > 0) return { status: 'spent', reason: 'an attempt at this migration was recorded while this go was being claimed (auto-apply was switched on meanwhile): this go is used; check the live state read-only, then ask for a new go' };
-      }
-      return { status: 'claimed', reason: '' };
+      const nowFlagged = op === 'migration' ? flaggedEntry(home, projectRef) : null;
+      if (nowFlagged === null) return { status: 'claimed', reason: '' };
+      // the marker is written: from here the go is used, so a denial says so (never "try again")
+      const h = history({ home, ref: projectRef, name, sqlSha256, leftMs, io });
+      if (h.status === 'no-time') return { status: 'error', reason: 'not enough time was left to re-check the attempt history after the go was marked as used, so nothing is applied; the go is used' };
+      if (h.status === 'error') return { status: 'error', reason: `the attempt history ${h.path} cannot be read (${h.reason}), so nothing is applied; the go is used; the owner looks at it` };
+      if (h.name.n > 0 || h.sql.n > 0) return { status: 'spent', reason: 'an attempt at this migration was recorded while this go was being claimed (auto-apply was switched on meanwhile): this go is used; check the live state read-only, then ask for a new go' };
+      // nothing recorded yet: this go claims the generations now, so a later auto call (or another go) finds this attempt
+      hist = h;
+      label = nowFlagged.name;
     }
-    const next = claimNext({ home, via: 'go', session: sessionId, now, facts: { ref: projectRef, sqlSha256, name, label: flagged.name, file: r.file ?? null, repo: r.repo ?? null, head: r.head ?? null }, seen, leftMs, io });
+    const next = claimNext({ home, via: 'go', session: sessionId, now, facts: { ref: projectRef, sqlSha256, name, label, file: r.file ?? null, repo: r.repo ?? null, head: r.head ?? null }, seen: hist, leftMs, io });
     if (next.status === 'claimed') return { status: 'claimed', reason: '' };
     if (next.status === 'spent') return { status: 'spent', reason: 'another session attempted this migration meanwhile; this go is used' };
     return { status: 'error', reason: `the attempt could not be recorded (${next.reason}), so nothing is applied; the go is used` };

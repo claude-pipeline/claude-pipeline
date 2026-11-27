@@ -305,6 +305,8 @@ function consumedAttempt({ home, ref, name, sqlSha256, leftMs, io = {} }) {
       return { error: { path: file, reason: err instanceof SyntaxError ? 'is empty or not valid JSON' : `cannot be read (${err?.code ?? 'error'})` } };
     }
     if (!isObj(b) || typeof b.op !== 'string' || typeof b.projectRef !== 'string') return { error: { path: file, reason: 'does not hold a consumed go' } };
+    // (as the importer: a migration marker of this project with no usable SQL hash may be the only record of an earlier apply)
+    if (b.op === 'migration' && b.projectRef === ref && !SHA_RE.test(String(b.sqlSha256))) return { error: { path: file, reason: 'does not hold a consumed migration go (no usable SQL hash)' } };
     if (b.op === 'migration' && b.projectRef === ref && (b.sqlSha256 === sqlSha256 || b.name === name)) return { spent: typeof b.consumedAt === 'string' ? b.consumedAt : 'an unknown time' };
   }
   return {};
@@ -406,8 +408,9 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
     // The go path claims its marker and then re-reads the history; this side claims the generations and then re-reads the markers: in every interleaving one of the two sees the other.
     // The generations just created stay (they count as an attempt); a go consumed in the gap since the first scan means that go owns the apply.
     const late = consumedAttempt({ home, ref: entry.ref, name, sqlSha256, leftMs, io });
-    if (late.noTime) return NO_TIME;
-    if (late.error) return { status: 'error', reason: `the consumed-go record ${late.error.path} cannot be read (${late.error.reason}), so nothing is applied; the owner looks at it` };
+    // both generations exist from here: a denial says the attempt is used (a retry would only find it spent), never "try the call again"
+    if (late.noTime) return { status: 'spent', reason: `auto-apply recorded its attempt at ${name} but ran out of time checking for a go consumed meanwhile, so nothing is applied: the attempt is used; check the live state read-only, then ask for the owner's go` };
+    if (late.error) return { status: 'error', reason: `the consumed-go record ${late.error.path} cannot be read (${late.error.reason}), so nothing is applied; the attempt is used (it was recorded before this read): check the live state read-only, then ask for the owner's go; the owner looks at the record` };
     if (late.spent) return spent(late.spent);
     return { status: 'claimed', facts };
   }
@@ -516,7 +519,7 @@ export function importGoHistory({ home, ref, now = Date.now, acceptUnmatched = f
 // ---- the log reader -----------------------------------------------------------------------------------------------------------------------
 
 // Every attempt file of the last `sinceMs` as EVENTS, newest first (best-effort parsing lives only here). -> { events, unreadable: [path] }
-// `outcome`: 'attempted' when both files of the event exist (an allowed call, or one denied after the second file was written because its sync failed: the live state says whether it applied), 'reserved' when only one does (a lost race or a failed
+// `outcome`: 'attempted' when both files of the event exist (an allowed call, or one denied after the second file was written: its sync failed, time ran out, a consumed-go record could not be read, or a go was consumed meanwhile; the live state says whether it applied), 'reserved' when only one does (a lost race or a failed
 // write: nothing was allowed), 'imported' for a go the owner's switch-on imported (nothing was allowed by it).
 export function readAttemptLog({ home, sinceMs = 0, io = {} }) {
   const out = { events: [], unreadable: [] };

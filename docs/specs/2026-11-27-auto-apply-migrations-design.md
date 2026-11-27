@@ -165,8 +165,8 @@ Outcomes:
 ### 4. What the owner can see
 
 - The history is the record. `pipeline live-db auto-log [--days N]` (read-only, runs anywhere) lists one line per event, newest
-  first: `attempted` (both files: an allowed call, auto or go, or rarely one denied after the second file was written because making it
-  durable failed; it counts as an attempt and the live state is checked) or `reserved` (one file: nothing was allowed), and any unreadable record
+  first: `attempted` (both files: an allowed call, auto or go, or one denied after the second file was written: its sync failed, time ran out, a consumed-go
+  record could not be read, or a go was consumed meanwhile; it counts as an attempt and the live state is checked) or `reserved` (one file: nothing was allowed), and any unreadable record
   (which is what refuses calls). "Applied" is only what the session's effect check confirms.
 - The session reports each apply in plain English (section 5).
 

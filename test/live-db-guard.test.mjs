@@ -954,9 +954,9 @@ test('auto: a go consumed with no history (a rollback, a go during the import) b
   for (const s of [bySql, byName, empty]) assert.equal(s.calls.length, 0);
 });
 
-test('auto: a consumed marker with no op or no projectRef cannot rule out an earlier apply: refuse naming it', async (t) => {
+test('auto: a consumed marker with no op, no projectRef or no SQL hash cannot rule out an earlier apply: refuse naming it', async (t) => {
   // Failure caught: a `{}` marker silently skipped by the run-time scan (the importer refuses the same body), so a migration the marker may stand for is applied a second time.
-  for (const body of [{}, { v: 1, projectRef: REF, sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', sqlSha256: sha256Of(SQL) }]) {
+  for (const body of [{}, { v: 1, projectRef: REF, sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', projectRef: REF }]) {
     const s = await autoScene(t);
     mkdirSync(consumed(s), { recursive: true });
     writeFileSync(join(consumed(s), 'odd.json'), `${JSON.stringify(body)}\n`);
@@ -1005,6 +1005,31 @@ test('race: a go that read the switch off, then auto claimed the same migration 
   const quiet = await scene(t);
   const io2 = { openSync: (p, flags, mode) => { if (String(p).includes('live-db-consumed')) seedRegistry(quiet.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' }] }); return real(p, flags, mode); } };
   assert.equal(apply(quiet, {}, { io: io2 }).decision, 'allow');
+  // R2-B2 (failure caught: the go allowed with no generation recorded, so a second session's earlier go for the same migration is applied again): it claims the generations before allowing
+  assert.ok(existsSync(gfile(quiet, 'name', 1)) && existsSync(gfile(quiet, 'sql', 1)), 'the go claimed the generations');
+  assert.equal(JSON.parse(readFileSync(gfile(quiet, 'name', 1), 'utf8')).via, 'go');
+  // R2-F1 (failure caught: "try the call again" for a go whose marker is already written): out of time during the re-read says the go is used
+  const late = await scene(t);
+  let marked = false;
+  const io3 = { openSync: (p, flags, mode) => { if (String(p).includes('live-db-consumed')) { marked = true; seedRegistry(late.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' }] }); } return real(p, flags, mode); } };
+  const out = apply(late, {}, { io: io3, leftMs: () => (marked ? 0 : 5000) });
+  assert.equal(out.decision, 'deny');
+  assert.match(out.reason, /go is used/);
+  assert.doesNotMatch(out.reason, /try the call again/);
+  assert.equal(markers(late).length, 1);
+});
+
+test('auto: out of time after the claim wrote both generations says the attempt is used, never "try the call again"', async (t) => {
+  // Failure caught: R2-B4, a spent attempt answered with "try the call again", so the retry only finds it already attempted and the owner is told the right step one call too late.
+  const s = await autoScene(t);
+  mkdirSync(consumed(s), { recursive: true });
+  writeFileSync(join(consumed(s), 'a.json'), `${JSON.stringify({ v: 1, consumedAt: isoAt(NOW - 100_000), op: 'migration', projectRef: 'zzzzzzzzzzzzzzzzzzzz', sqlSha256: sha256Of('select 9;'), name: 'other' })}\n`);
+  const r = apply(s, {}, { leftMs: () => (existsSync(gfile(s, 'sql', 1)) ? 0 : 5000) });
+  assert.equal(r.decision, 'deny');
+  assert.ok(existsSync(gfile(s, 'name', 1)) && existsSync(gfile(s, 'sql', 1)));
+  assert.match(r.reason, /attempt is used/);
+  assert.match(r.reason, /check the live state read-only/);
+  assert.doesNotMatch(r.reason, /try the call again/);
 });
 
 test('auto: a file merged before the switch-on time, or a PR from another repository, needs the go', async (t) => {
