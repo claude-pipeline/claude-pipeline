@@ -10,7 +10,7 @@ import { randomUUID } from 'node:crypto';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { BASE_SHA, MERGE_SHA, PR, QUEUE_AWARE_SHA, bump, cli, scenario, ymlFor } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
@@ -441,6 +441,37 @@ test('terminal record for head H: P merge again without a newer owner-go is queu
   assert.equal(rec.attempts, 1, 'a new record with a new budget');
   assert.equal(rec.removals.length, 0);
   assert.equal(rec.terminal, 'merged');
+});
+
+// #740: the owner's "merge" newer than the record's end was typed while the agent was working (queued): still refused (#191 B2), but the reason says so, not "already left the merge queue".
+test('terminal record for head H, a "merge" newer than the end whose entry is queued: refused as owner-go naming the queued word; an older queued word keeps queue-removed (#740)', (t) => {
+  const ended = (s, terminalAtMs) => {
+    const approval = { items: 'none', areas: [], rulings: null };
+    beginAttempt(s.repo.dir, PR, s.head, approval, { repo: 'acme/widgets', repoId: 4242, now: () => terminalAtMs - 5000 });
+    noteRemoval(s.repo.dir, PR, { reason: 'failed_checks', beforeCommit: QUEUE_COMMIT, at: STAMP });
+    noteRemoval(s.repo.dir, PR, { reason: 'failed_checks', beforeCommit: QUEUE_COMMIT_2, at: STAMP });
+    endRecord(s.repo.dir, PR, 'removed', { now: () => terminalAtMs });
+  };
+  const queuedWord = (s) => ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'), undefined, { ...OWNER_ENTRY, promptSource: 'queued' });
+
+  const fresh = world({ route: 'owner-go', command: 'default', after: [[Q(), M()]] });
+  queuedWord(fresh);
+  ended(fresh, Date.now() - 60_000); // the record ended BEFORE the queued word
+  const refused = fresh.run();
+  assertExit(refused, 1);
+  assert.equal(refused.json.error, 'owner-go');
+  assert.match(refused.json.reasons[0], /typed while the agent was still working[\s\S]*FRESH closing lines/);
+  assert.doesNotMatch(refused.json.reasons[0], /already left the merge queue/);
+  assert.equal(fresh.enqueueCalls().length, 0);
+  assert.equal(fresh.record().terminal, 'removed');
+
+  const older = world({ route: 'owner-go', command: 'default', after: [[Q(), M()]] });
+  queuedWord(older);
+  ended(older, Date.now() + 3_600_000); // the record ended AFTER the queued word: it is not what is missing
+  const stale = older.run();
+  assertExit(stale, 1);
+  assert.equal(stale.json.error, 'queue-removed');
+  assert.match(stale.json.reasons[0], /already left the merge queue/);
 });
 
 // ---- preMergeProblems, queue variant ----------------------------------------------------------------------------------------------

@@ -18,7 +18,7 @@ import { createRunRecorder, inFlightSince, resumedRunState } from '../lib/run-pr
 import { bringUpToDate, updateTiming } from '../lib/updatebranch.mjs';
 import { loadState } from '../lib/state.mjs';
 import { capLowItems, substituteInventory } from '../lib/triage.mjs';
-import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, holdDigest, readyLine } from '../hooks/lib/owner-go.mjs';
+import { approvalConfigDirHint, approvalGap, areasBlock, holdBlock, holdDigest, queuedApprovalAt, readyLine } from '../hooks/lib/owner-go.mjs';
 import { clickNotes, mergeAsk, mergeManyAsk } from '../hooks/lib/owner-go-click.mjs';
 import { askFields, clickConfigRefusal, clickGate } from '../lib/click-ask.mjs';
 import { listWorktrees } from '../lib/local-branches.mjs';
@@ -542,6 +542,14 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
   if (noBase !== null) return refuse('live-check', [noBase], { head });
   const asked = { repo, pr, head, items: live.ownerItems, areas: live.areas, hold: hold ?? recHold ?? undefined, rulings: live.rulingsBlockDigest }; // (absent hold = none: a record that names a hold never approves a PR without one)
   const gap = queue.on ? approvalGapSince(asked, pre.since) : approvalGap(asked);
+  // #740: a "merge" the owner typed while the agent was still working (Claude Code queued it, #191 B2) never approves, but that is what the refusal says, not a stale record or a generic provenance gap.
+  // On the queue route only a word newer than the ended record's end counts (the same window approvalGapSince uses).
+  const sinceAge = pre?.since !== undefined ? Date.now() - pre.since - 1 : undefined;
+  const queuedAt = gap !== 'ok' && !(sinceAge !== undefined && sinceAge <= 0) ? queuedApprovalAt({ ...asked, ...(sinceAge !== undefined ? { maxAgeMs: sinceAge } : {}) }) : null;
+  if (queuedAt !== null) {
+    const reason = `the owner's "merge" at ${queuedAt} for ${repo} #${pr} head ${head.slice(0, 12)} was typed while the agent was still working (Claude Code queued it), so it does not count: re-run \`P merge --pr ${pr} --dry-run --owner-go\`, show the FRESH closing lines, and ask the owner once more after the reply ends`;
+    return refuse('owner-go', [reason], { reason, head });
+  }
   if (gap !== 'ok' && pre?.since !== undefined) return pre.staleTerminal(); // (the record of this head already ended: only a fresh "merge" re-queues it)
   if (gap !== 'ok') {
     const lines = requestLines({ head, items: live.ownerItems, repo, areas: live.areas, hold, rulings: live.rulings });

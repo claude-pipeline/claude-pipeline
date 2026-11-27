@@ -12,7 +12,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { existsSync, readdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
-import { approvalFlags, mergeRequest, ownerSays } from './helpers/owner-go.mjs';
+import { OWNER_ENTRY, approvalFlags, mergeRequest, ownerSays } from './helpers/owner-go.mjs';
 import { cli, scenario, ymlFor, ghEntries, PR } from './helpers/gate-env.mjs';
 import { CANONICAL_CHECKS } from '../pipeline/lib/finalgate.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
@@ -276,6 +276,23 @@ test('--owner-go and the gate flags: a "merge" whose prompt is synthetic or miss
   assertExit(r, 1);
   assert.match(JSON.stringify(r.json), /cannot be confirmed as typed by the owner/);
   assert.equal(c.mergeCalls().length, 0);
+});
+
+// #740: the owner's "merge" was typed while the agent was still working (the hook ran before the entry was in the transcript, the entry is promptSource queued): refused as it must be,
+// but the refusal says THAT, so the agent re-asks instead of debugging the record. A synthetic one (a scheduled turn) keeps the generic provenance reason.
+test('--owner-go: a recorded "merge" whose transcript entry is queued is refused with the queued reason, naming the word and the re-ask (#740)', (t) => {
+  const s = goScenario();
+  ownerSays(t, 'merge', mergeRequest(PR, s.head, 'none'), undefined, { ...OWNER_ENTRY, promptSource: 'queued' });
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.equal(r.json.error, 'owner-go');
+  assert.match(r.json.reason, /typed while the agent was still working[\s\S]*does not count[\s\S]*P merge --pr \d+ --dry-run --owner-go[\s\S]*FRESH closing lines/);
+  assert.match(r.json.reason, /"merge" at \d{4}-\d\d-\d\dT/, 'names when the word was typed');
+  assert.doesNotMatch(r.json.reason, /cannot be confirmed as typed by the owner/);
+  assert.deepEqual(s.mergeCalls(), []);
+  const synthetic = goScenario();
+  ownerSays(t, 'merge', mergeRequest(PR, synthetic.head, 'none'), undefined, { promptSource: 'system', isMeta: true, entrypoint: 'cli' });
+  assert.match(goMerge(synthetic).json.reason, /cannot be confirmed as typed by the owner/, 'a synthetic prompt keeps the generic reason');
 });
 
 // R2-F3: the transcript root comes from the environment of the process that checks, so a record whose transcript is in a custom config dir is refused where that
