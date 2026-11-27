@@ -519,13 +519,20 @@ test('readDbRefs: the after-deploy keys are all-or-none, only with auto-apply on
   }
 });
 
-// a fake `gh` for the child process (PIPELINE_GH, honoured in a checkout only): answers `api --include rate_limit` with the given Date header, or fails when `date` is null
+// a fake `gh` for the child process (PIPELINE_GH, honoured in a checkout only): answers `api --include rate_limit` with the given Date header (a list: one per call), or fails when `date` is null
 const fakeGithubClock = (t, date) => {
   const dir = scratchHome(t);
   const script = join(dir, 'fake-gh.mjs');
+  const dates = [date].flat();
+  // (one Date per call, the last one repeated: the command reads GitHub's time twice)
   writeFileSync(script, date === null
     ? 'process.stderr.write("gh: not signed in\\n"); process.exit(4);\n'
-    : `process.stdout.write("HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\nDate: ${date}\\r\\n\\r\\n{}\\n");\n`);
+    : `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+const counter = ${JSON.stringify(join(dir, 'calls'))};
+const n = existsSync(counter) ? Number(readFileSync(counter, 'utf8')) : 0;
+writeFileSync(counter, String(n + 1));
+const dates = ${JSON.stringify(dates)};
+process.stdout.write(\`HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\nDate: \${dates[Math.min(n, dates.length - 1)]}\\r\\n\\r\\n{}\\n\`);\n`);
   return { PIPELINE_GH: `node "${script}"` };
 };
 
@@ -565,17 +572,16 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   assert.deepEqual([entry.deployEnv, entry.deployBot, entry.autoMigrations], ['Production', 'vercel', true]);
   assert.equal(entry.deploySince, '2026-11-20T10:00:00.000Z', 'deploySince is GitHub\'s time, not this machine\'s');
   assert.equal(entry.deployClock, 'github');
-  // Failure caught: a terminal suspended between GitHub's answer and the write backdating the registration by minutes (the guard's 5-minute margin only covers a minute).
+  // Failure caught: a terminal that stalls after reading GitHub's time (or whose local clock is corrected backwards) finishing a registration backdated by minutes: GitHub's time read AFTER the first write must be within a minute of the first.
   seedRegistry(home, { refs: [LIVE(ON)] });
-  const seeded = readFileSync(dbRefsFile(home), 'utf8');
-  const clock = [Date.parse('2026-11-20T10:00:00Z'), Date.parse('2026-11-20T10:01:01Z')];
-  const stale = await run(on, ownerCtx(home, { now: () => clock.shift(), gh: () => ({ code: 0, stdout: `HTTP/2.0 200 OK\r\nDate: ${GITHUB_DATE}\r\n\r\n{}`, stderr: '' }) }));
+  const stale = runOwnerCli(home, on, fakeGithubClock(t, ['Fri, 20 Nov 2026 10:00:00 GMT', 'Fri, 20 Nov 2026 10:01:01 GMT']));
   assert.equal(stale.exitCode, 1);
   assert.equal(stale.output.error, 'github-time-stale');
-  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), seeded, 'nothing written after a stale answer');
+  assert.deepEqual([readDbRefs(home).refs[0].deploySince, readDbRefs(home).refs[0].deployClock], ['2026-11-20T10:00:00.000Z', 'pending'], 'left pending, which the guard does not trust');
   seedRegistry(home, { refs: [LIVE(ON)] });
-  runOwnerCli(home, on, fakeGithubClock(t, GITHUB_DATE));
-  assert.equal(readDbRefs(home).refs[0].deployClock, 'github');
+  const finished = runOwnerCli(home, on, fakeGithubClock(t, ['Fri, 20 Nov 2026 10:00:00 GMT', 'Fri, 20 Nov 2026 10:00:05 GMT']));
+  assert.equal(finished.exitCode, 0, JSON.stringify(finished.output));
+  assert.deepEqual([readDbRefs(home).refs[0].deploySince, readDbRefs(home).refs[0].deployClock], ['2026-11-20T10:00:00.000Z', 'github']);
   const shown = (await run(['show'], ownerCtx(home))).output.refs[0];
   assert.deepEqual([shown.deployEnv, shown.deployBot, shown.deploySince], ['Production', 'vercel', entry.deploySince]);
   // a second on replaces both and moves the cut-off to now

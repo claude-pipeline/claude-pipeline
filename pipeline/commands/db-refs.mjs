@@ -36,7 +36,7 @@ const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
 const DEPLOY_NOTE = (repo, env, bot) => `after-deploy registered (environment "${env}", bot ${bot}[bot]): a marked migration merged more than 5 minutes after GitHub's clock reads now is applied once the newest "${env}" deployment of ${repo} (by ANY creator) and GitHub's latest completed one are both its merge commit, made by ${bot}[bot], and succeeded. Not seen: a rollback or promote done outside GitHub (the host's dashboard makes no GitHub deployment or status; Vercel's instant rollback is one), and a SUCCESS status only means the host built and assigned the deploy, not that it serves now. Run \`pipeline db-refs after-deploy off --ref <ref>\` while production is rolled back or auto-promotion is off. Your own GitHub token can also mark a newer deployment inactive or delete it. Details: docs/cli.md "Live database guard".`;
 const GITHUB_TIME_TIMEOUT_MS = 10_000;
-const GITHUB_TIME_MAX_AGE_MS = 60_000; // GitHub's time is written only if it is no older than this: the guard's 5-minute margin after deploySince then always covers the gap
+const GITHUB_TIME_MAX_GAP_MS = 60_000; // the registration is finished only if GitHub's clock moved no more than this between the first write's time and the read after that write: the guard's 5-minute margin after deploySince then always covers it
 const TRUST_NOTE = (repo) => `auto-apply trusts every PR merged into ${repo}'s default branch on github.com: migrations there must need your merge (a hard stop on supabase/migrations/**). Run this command again after any rollback of the pipeline install.`;
 
 export async function run(argv, ctx = {}) {
@@ -193,12 +193,20 @@ function afterDeploy({ action, ref, deploy, current, home, ctx, env }) {
   if (!entry) throw new UsageError(`${ref} is not in the registry: add it with \`pipeline db-refs set --ref ${ref} --name "<label>" --repo <owner/name>\` first`);
   if (action === 'off') return writeSnapshot({ home, current, state, extra: {}, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: null, deployBot: null, deploySince: null, deployClock: null } : e)) });
   if (entry.autoMigrations !== true) throw new UsageError(`${ref} has auto-apply off: switch auto-migrations on first with \`pipeline db-refs auto-migrations on --ref ${ref}\``);
-  const asked = (ctx.now ?? Date.now)();
+  const unreachable = { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-unreachable', message: `GitHub's time could not be read (\`gh api rate_limit\` failed: is gh installed, signed in to github.com and online?), so the after-deploy registration is not in force: its cut-off time is GitHub's clock, not this machine's. Fix gh, then run this again` } };
+  // Two phases, both on GitHub's clock only: (1) write the registration with T1 and deployClock "pending" (the guard does not trust it); (2) read GitHub's time T2 AFTER that write is in the file; (3) finish it ("github") only when T2 - T1 is at most a minute.
+  // Every PR merged before the write in (1) is merged before T2, so it is before T1 + 1 minute, inside the guard's 5-minute margin after deploySince: nothing here uses this machine's clock, and a stall only delays the switch-on.
   const since = githubNow({ ctx, env });
-  if (since === null) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-unreachable', message: `GitHub's time could not be read (\`gh api rate_limit\` failed: is gh installed, signed in to github.com and online?), so the after-deploy registration was not written: its cut-off time is GitHub's clock, not this machine's. Fix gh, then run this again` } };
-  // (the registry lock is held from here to the write: a process that was suspended after GitHub answered must not write a time that old)
-  if ((ctx.now ?? Date.now)() - asked > GITHUB_TIME_MAX_AGE_MS) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-time-stale', message: `more than ${GITHUB_TIME_MAX_AGE_MS / 1000} seconds passed between GitHub's answer and the registry write, so the after-deploy registration was not written: its cut-off time must be fresh. Run this again` } };
-  return writeSnapshot({ home, current, state, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: deploy.env, deployBot: deploy.bot, deploySince: since, deployClock: 'github' } : e)), extra: { note: DEPLOY_NOTE(entry.repo, deploy.env, deploy.bot) } });
+  if (since === null) return unreachable;
+  const first = writeSnapshot({ home, current, state, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: deploy.env, deployBot: deploy.bot, deploySince: since, deployClock: 'pending' } : e)), extra: {} });
+  if (first.exitCode !== EXIT.OK) return first;
+  const later = githubNow({ ctx, env });
+  if (later === null) return unreachable;
+  if (Date.parse(later) - Date.parse(since) > GITHUB_TIME_MAX_GAP_MS) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-time-stale', message: `more than ${GITHUB_TIME_MAX_GAP_MS / 1000} seconds of GitHub's time passed while the after-deploy registration was written, so it is not in force (marked files keep the owner's go): run this again` } };
+  const now2 = readDbRefs(home);
+  const mine = now2.ok ? now2.refs.find((e) => e.ref === ref) : null;
+  if (!mine || mine.deployEnv !== deploy.env || mine.deployBot !== deploy.bot || mine.deploySince !== since || mine.deployClock !== 'pending') return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-changed', message: `${dbRefsFile(home)} was changed by another command while the registration was written; it is not in force. Run this again` } };
+  return writeSnapshot({ home, current: now2, state: now2, refs: now2.refs.map((e) => (e.ref === ref ? { ...e, deployClock: 'github' } : e)), extra: { note: DEPLOY_NOTE(entry.repo, deploy.env, deploy.bot) } });
 }
 
 // GitHub's clock: the Date header of an answer to a call that costs no rate limit (`gh api --include rate_limit`). -> ISO time | null (gh missing, not signed in, no answer in time, no readable Date)
