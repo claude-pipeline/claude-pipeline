@@ -1,5 +1,5 @@
 // #262 (live-database guard): the owner's registry of Supabase projects, `<home>/.claude/pipeline-state/db-refs.json`.
-// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev'}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
+// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev', autoMigrations?, autoSince?}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
 // (`pipeline db-refs set|remove|server …`, commands/db-refs.mjs); the guard protects the file (files-policy.mjs PROTECTED_REL) and refuses the command to an agent.
 // Every hosted project counts as LIVE unless the owner declared it `dev` here. A project that is not listed is live too, so a MISSING file is the safe default
 // and needs no test of where the agent stands. A file that cannot be read or is not valid denies every Supabase write (no go can help) until the owner fixes it.
@@ -16,6 +16,9 @@ export const BUILTIN_SERVERS = ['plugin_supabase_supabase', 'supabase'];
 const SEGMENT_RE = /^[A-Za-z0-9_.-]{1,80}$/;
 const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const NAME_MAX = 120;
+// a strict ISO time with a zone (the time `auto-migrations on` set the flag)
+export const ISO_ZONE_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/;
+const isoZone = (v) => typeof v === 'string' && ISO_ZONE_RE.test(v) && Number.isFinite(Date.parse(v));
 
 export const dbRefsFile = (home) => path.join(home, ...DB_REFS_REL.split('/'));
 
@@ -23,7 +26,10 @@ const validEntry = (e) => e && typeof e === 'object' && !Array.isArray(e)
   && typeof e.ref === 'string' && REF_RE.test(e.ref)
   && typeof e.name === 'string' && e.name.length > 0 && e.name.length <= NAME_MAX && !/[\r\n\u0000]/.test(e.name)
   && (e.repo === undefined || e.repo === null || (typeof e.repo === 'string' && REPO_RE.test(e.repo)))
-  && (e.kind === 'live' || e.kind === 'dev');
+  && (e.kind === 'live' || e.kind === 'dev')
+  // the owner's auto-apply switch: absent or a boolean; true only on a live entry with a repo and the time it was set. An older install reads a newer file by ignoring the keys it does not know.
+  && (e.autoMigrations === undefined || typeof e.autoMigrations === 'boolean')
+  && (e.autoMigrations !== true || (e.kind === 'live' && typeof e.repo === 'string' && isoZone(e.autoSince)));
 
 // { ok:true, refs, servers } | { ok:true, refs:[], servers:[], missing:true } | { ok:false, reason:'unreadable'|'invalid' }
 // `io.readFileSync` is the test seam.
@@ -42,7 +48,18 @@ export function readDbRefs(home, io = {}) {
   const servers = j.servers === undefined ? [] : j.servers;
   if (!Array.isArray(servers) || !servers.every((s) => typeof s === 'string' && SEGMENT_RE.test(s))) return { ok: false, reason: 'invalid' };
   if (!j.refs.every(validEntry) || new Set(j.refs.map((e) => e.ref)).size !== j.refs.length) return { ok: false, reason: 'invalid' };
-  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind })), servers: [...servers] };
+  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, autoMigrations: e.autoMigrations === true, autoSince: e.autoMigrations === true ? e.autoSince : null })), servers: [...servers] };
+}
+
+// The entry auto-apply may use for `ref`: live, with a repo, the flag on, and no OTHER enabled entry with the same repo (case-insensitive: one unambiguous target per repo).
+// -> { entry } | { entry: null, reason: 'off' | 'ambiguous: <other ref> has the same repo' }
+export function autoEntry(ref, state) {
+  const refs = state?.refs ?? [];
+  const entry = refs.find((e) => e.ref === ref);
+  if (!entry || entry.kind !== 'live' || !entry.repo || entry.autoMigrations !== true) return { entry: null, reason: 'off' };
+  const key = entry.repo.toLowerCase();
+  const other = refs.find((e) => e.ref !== entry.ref && e.autoMigrations === true && typeof e.repo === 'string' && e.repo.toLowerCase() === key);
+  return other ? { entry: null, reason: `ambiguous: ${other.ref} has the same repo` } : { entry };
 }
 
 export const isDevRef = (ref, state) => (state?.refs ?? []).some((e) => e.ref === ref && e.kind === 'dev');
@@ -69,7 +86,11 @@ export function writeDbRefs(home, state) {
   if (inside) throw new Error(`the database registry is written only from the owner's own terminal (${inside}); run \`pipeline db-refs set|remove|server\` there`);
   const file = dbRefsFile(home);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const body = `${JSON.stringify({ v: 1, refs: state.refs, servers: state.servers ?? [] }, null, 2)}\n`;
+  const refs = state.refs.map((e) => {
+    if (e.autoMigrations === true && !isoZone(e.autoSince)) throw new Error(`entry ${e.ref} has auto-migrations on without a valid autoSince`);
+    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}) };
+  });
+  const body = `${JSON.stringify({ v: 1, refs, servers: state.servers ?? [] }, null, 2)}\n`;
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
   try {
     fs.writeFileSync(tmp, body, { mode: 0o600, flag: 'wx' });

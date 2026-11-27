@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { UsageError } from '../pipeline/lib/cli.mjs';
 import { run } from '../pipeline/commands/db-refs.mjs';
-import { DB_REFS_REL, dbRefsFile, isDevRef, readDbRefs, targetOf, trustedServer } from '../pipeline/hooks/lib/db-refs.mjs';
+import { DB_REFS_REL, autoEntry, dbRefsFile, isDevRef, readDbRefs, targetOf, trustedServer } from '../pipeline/hooks/lib/db-refs.mjs';
 import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runPreflight } from '../pipeline/lib/preflight.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -39,8 +39,8 @@ test('set / show / remove round-trip; a duplicate ref replaces its entry; the fi
   const shown = await run(['show'], ownerCtx(home));
   assert.equal(shown.exitCode, 0);
   assert.deepEqual(shown.output.refs, [
-    { ref: REF, name: 'EagleWatch prod', repo: 'eaglewatch-ph/eaglewatch', kind: 'live' },
-    { ref: REF2, name: 'Scratch', repo: 'o/r', kind: 'dev' },
+    { ref: REF, name: 'EagleWatch prod', repo: 'eaglewatch-ph/eaglewatch', kind: 'live', autoMigrations: false },
+    { ref: REF2, name: 'Scratch', repo: 'o/r', kind: 'dev', autoMigrations: false },
   ]);
   if (process.platform !== 'win32') assert.equal(statSync(dbRefsFile(home)).mode & 0o777, 0o600);
   await set(['--ref', REF2, '--name', 'Renamed', '--repo', 'o/r']);
@@ -288,4 +288,40 @@ test('preflight: an invalid registry file is reported when the repo has supabase
   const repo = repoWith(true);
   const r = await runPreflight({ cwd: repo.dir, env: healthy({ HOME: home, USERPROFILE: home }) });
   assert.ok(r.warnings.some((w) => /db-refs/.test(w) && /invalid/.test(w)), JSON.stringify(r.warnings));
+});
+
+// ---- auto-apply (Task 1): the registry's autoMigrations flag -------------------------------------------------------------------------------------------------------------
+
+const ON = { autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' };
+const LIVE = (over = {}) => ({ ref: REF, name: 'EagleWatch live', repo: 'acme/widgets', kind: 'live', ...over });
+
+test('readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry, one without repo or one without a valid autoSince, is invalid', (t) => {
+  // Failure caught: a hand-edited or half-written registry that the guard still believes, turning auto-apply on for a project it should not cover.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE()] });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: false, autoSince: null });
+  seedRegistry(home, { refs: [LIVE(ON)] });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' });
+  seedRegistry(home, { refs: [LIVE({ autoMigrations: false })] });
+  assert.equal(readDbRefs(home).refs[0].autoMigrations, false);
+  for (const bad of [LIVE({ autoMigrations: 'true' }), LIVE({ autoMigrations: 1 }), LIVE({ autoMigrations: null }), LIVE({ ...ON, kind: 'dev' }), LIVE({ ...ON, repo: null }), LIVE({ autoMigrations: true }), LIVE({ autoMigrations: true, autoSince: '2026-11-27' }), LIVE({ autoMigrations: true, autoSince: 'yesterday' }), LIVE({ autoMigrations: true, autoSince: '2026-11-27T01:00:00' })]) {
+    seedRegistry(home, { refs: [bad] });
+    assert.deepEqual(readDbRefs(home), { ok: false, reason: 'invalid' }, JSON.stringify(bad));
+  }
+});
+
+test('autoEntry: two enabled entries with the same repo (hand-written registry) answer ambiguous for both; off and dev answer off', (t) => {
+  // Failure caught: auto-apply choosing one of two projects that share a repo, applying an EagleWatch file to the wrong database.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE({ repo: 'o/R', ...ON }), LIVE({ ref: REF2, repo: 'O/r', ...ON })] });
+  const state = readDbRefs(home);
+  for (const ref of [REF, REF2]) {
+    const r = autoEntry(ref, state);
+    assert.equal(r.entry, null);
+    assert.match(r.reason, /^ambiguous: [a-z0-9]{20} has the same repo$/);
+  }
+  seedRegistry(home, { refs: [LIVE({ repo: 'o/R', ...ON }), LIVE({ ref: REF2, repo: 'o/r' })] });
+  assert.equal(autoEntry(REF, readDbRefs(home)).entry.ref, REF);
+  assert.deepEqual(autoEntry(REF2, readDbRefs(home)), { entry: null, reason: 'off' });
+  assert.deepEqual(autoEntry('nnnnnnnnnnnnnnnnnnnn', readDbRefs(home)), { entry: null, reason: 'off' });
 });

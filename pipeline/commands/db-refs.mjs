@@ -6,10 +6,13 @@ import { accountHome } from '../lib/paths.mjs';
 import { insideClaudeCode } from '../lib/owner-only.mjs';
 import { BUILTIN_SERVERS, REF_RE, dbRefsFile, readDbRefs, writeDbRefs } from '../hooks/lib/db-refs.mjs';
 
+// the entries as `show` and the owner's commands print them: the switch's time only while it is on
+const shown = (refs) => refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo, kind: e.kind, autoMigrations: e.autoMigrations === true, ...(e.autoMigrations === true ? { autoSince: e.autoSince } : {}) }));
+
 export const meta = {
   summary: 'the owner\'s registry of Supabase projects for the live-database guard: show it; set / remove a project, add / remove a trusted MCP server (owner only, own terminal)',
   usage: [
-    'pipeline db-refs show   -> {ok, file, refs: [{ref, name, repo, kind}], servers, missing?} : READ-ONLY, runs anywhere; exit 0, or 1 when the file is unreadable or invalid (every Supabase write is then refused)',
+    'pipeline db-refs show   -> {ok, file, refs: [{ref, name, repo, kind, autoMigrations}], servers, missing?} : READ-ONLY, runs anywhere; exit 0, or 1 when the file is unreadable or invalid (every Supabase write is then refused)',
     'pipeline db-refs set --ref <20 lowercase letters/digits> --name "<label>" --repo <owner/name> [--dev]   (a duplicate ref replaces its entry)',
     'pipeline db-refs remove --ref <ref>',
     'pipeline db-refs server add <segment> | server remove <segment>   (an MCP server name the owner trusts for Supabase: the part between mcp__ and the tool name)',
@@ -37,7 +40,7 @@ export async function run(argv, ctx = {}) {
     const r = readDbRefs(home);
     const file = dbRefsFile(home);
     return r.ok
-      ? { exitCode: EXIT.OK, output: { ok: true, file, refs: r.refs, servers: r.servers, builtinServers: BUILTIN_SERVERS, ...(r.missing ? { missing: true } : {}) } }
+      ? { exitCode: EXIT.OK, output: { ok: true, file, refs: shown(r.refs), servers: r.servers, builtinServers: BUILTIN_SERVERS, ...(r.missing ? { missing: true } : {}) } }
       : { exitCode: EXIT.FAILED, output: { ok: false, file, error: `db-refs-${r.reason}`, message: `${file} is ${r.reason}: every Supabase write is refused until the owner fixes it (\`pipeline db-refs set …\` rewrites it from a valid state; delete the file to start again)` } };
   }
 
@@ -78,7 +81,7 @@ export async function run(argv, ctx = {}) {
   const next = change(current.ok ? current : { refs: [], servers: [] });
   try {
     const file = writeDbRefs(home, next);
-    return { exitCode: EXIT.OK, output: { ok: true, file, refs: next.refs, servers: next.servers } };
+    return { exitCode: EXIT.OK, output: { ok: true, file, refs: shown(next.refs), servers: next.servers } };
   } catch (err) {
     return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-unwritable', message: `cannot write ${dbRefsFile(home)}: ${err?.code ?? err?.message}` } };
   }

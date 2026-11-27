@@ -1408,7 +1408,7 @@ The spec table was written before the build; the CLI that shipped differs as fol
 the owner's registry of Supabase projects for the live-database guard: show it; set / remove a project, add / remove a trusted MCP server (owner only, own terminal)
 
 ```
-pipeline db-refs show   -> {ok, file, refs: [{ref, name, repo, kind}], servers, missing?} : READ-ONLY, runs anywhere; exit 0, or 1 when the file is unreadable or invalid (every Supabase write is then refused)
+pipeline db-refs show   -> {ok, file, refs: [{ref, name, repo, kind, autoMigrations}], servers, missing?} : READ-ONLY, runs anywhere; exit 0, or 1 when the file is unreadable or invalid (every Supabase write is then refused)
 pipeline db-refs set --ref <20 lowercase letters/digits> --name "<label>" --repo <owner/name> [--dev]   (a duplicate ref replaces its entry)
 pipeline db-refs remove --ref <ref>
 pipeline db-refs server add <segment> | server remove <segment>   (an MCP server name the owner trusts for Supabase: the part between mcp__ and the tool name)
