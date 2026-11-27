@@ -356,3 +356,4 @@ full record.
 - 2026-11-27 · #881 · Preflight warns when one-click answers are off on this Claude Code build (#714) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 568 runs (225 high)
 - 2026-11-27 · #885 · Merge: judge 'behind main' from GitHub's real base tip, so the disjoint rule works and every refusal says why (#625) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 575 runs (226 high)
 - 2026-11-27 · #885 · Merge: judge 'behind main' from GitHub's real base tip, so the disjoint rule works and every refusal says why (#625) · risk high · rounds 2 · arbiter 2 · merged · Codex 7d: 584 runs (227 high)
+- 2026-11-27 · #892 · Test: a job test no longer leaves a running job behind on Windows (#739) · risk low · rounds 2 · arbiter 0 · awaiting-owner-merge · Codex 7d: 585 runs (228 high)
