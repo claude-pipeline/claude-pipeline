@@ -48,7 +48,7 @@ import { git } from './git.mjs';
 
 const SHA = /^[0-9a-f]{40}$/;
 const WORKFLOW = /^\.github\/workflows\/[^/]+\.ya?ml$/;
-const PER_PAGE = 100;
+export const PER_PAGE = 100;
 const MAX_PAGES = 20;
 const PENDING_STATUSES = new Set(['queued', 'in_progress', 'waiting', 'requested', 'pending']);
 
@@ -67,7 +67,7 @@ class Verdict extends Error {
 const missing = (reason) => new Verdict('missing', reason);
 
 // Every page of a `{ total_count, <key>: [...] }` listing. Fail closed on anything that does not add up.
-function listAll(gh, path, key, what) {
+export function listAll(gh, path, key, what) {
   const joiner = path.includes('?') ? '&' : '?';
   const items = [];
   let total = null;

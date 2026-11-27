@@ -17,9 +17,10 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { readyLine } from '../pipeline/hooks/lib/owner-go.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { withHoldLifted } from '../pipeline/lib/hold.mjs';
+import { PER_PAGE } from '../pipeline/lib/ci-proof.mjs';
 import {
   beginAttempt, clearSessionHold, confirmAttempt, endRecord, holdOnSignal, liveRecords, noteRemoval, openRecord, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift,
-  guardLinks, settleGuardStatuses, settleRecord, setHold,
+  guardLinks, guardQueuedCapMs, settleGuardStatuses, settleRecord, setHold,
 } from '../pipeline/lib/merge-queue.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
@@ -1102,4 +1103,123 @@ test('custom merge command + a held PR whose branch lacks the marker commit: ref
   assert.deepEqual(s.st().labels, ['needs-human'], 'the label was never lifted');
   assert.equal(s.mergeCalls().length, 0, 'the merge command never ran');
   assert.equal(s.rec(), null, 'no record was begun');
+});
+
+// ---- #866: a guards run still QUEUED (no runner yet) posts nothing, so the old green rows looked settled ------------------------------------
+// The fake `gh` serves the statuses (`checks`, a function of the poll and of how many runs lists were read) and the Actions runs list (`runs`, a function of the lookup number).
+const GUARDS_WF = '.github/workflows/pipeline-guards.yml';
+const runLink = (n) => `https://github.com/acme/widgets/actions/runs/${n}`;
+const gRow = (name, bucket, n) => ({ name, bucket, link: runLink(n) });
+const gRows = (bucket, n) => [gRow('Test integrity', bucket, n), gRow('Hard-stop scan', bucket, n), gRow('Cross-model review', 'pass', 1)];
+const redRows = (n) => [gRow('Test integrity', 'pass', n), gRow('Hard-stop scan', 'fail', n), gRow('Cross-model review', 'pass', 1)];
+const wfRun = (id, status) => ({ id, path: GUARDS_WF, status });
+const BEFORE_A = { 'Test integrity': runLink(1), 'Hard-stop scan': runLink(1) };
+async function guardWorld({ checks, runs, over = {} }) {
+  const c = clock();
+  const w = { polls: 0, lookups: 0, last: null, lastRun: null, paths: [] };
+  const gh = {
+    checks: () => { w.polls += 1; w.last = checks(w); return w.last; },
+    api: (method, path) => {
+      assert.equal(method, 'GET');
+      assert.match(path, /^repos\/acme\/widgets\/actions\/workflows\/pipeline-guards\.yml\/runs\?head_sha=a{40}&event=pull_request_target&per_page=\d+&page=\d+$/);
+      const page = Number(/page=(\d+)$/.exec(path)[1]);
+      if (page === 1) { w.lookups += 1; w.lastRun = runs(w.lookups); }
+      if (w.lastRun instanceof Error) throw w.lastRun;
+      if (!Array.isArray(w.lastRun)) return w.lastRun;
+      return { total_count: w.lastRun.length, workflow_runs: w.lastRun.slice((page - 1) * 100, page * 100) };
+    },
+  };
+  const out = await settleGuardStatuses({ gh, slug: 'acme/widgets', pr: 7, head: HEAD, waitMs: 60_000, pollMs: 10_000, graceMs: 30_000, before: BEFORE_A, now: c.now, sleep: c.sleep, provenance: () => [], ...over });
+  return { out, w, waited: c.t - Date.parse('2026-11-09T09:00:00Z') };
+}
+const linkOf = (w) => w.last.find((r) => r.name === 'Test integrity').link;
+
+test('#866 settleGuardStatuses: a guards run still queued after the grace is waited for; the verdict is never taken on the old run\'s rows', async () => {
+  // A (run 1) is green all through the grace and the first verdict read; B is queued, then completes and posts. Today's code returns [] on A.
+  const r = await guardWorld({ checks: (w) => gRows('pass', w.lookups >= 3 ? 2 : 1), runs: (n) => (n < 3 ? [wfRun(2, 'queued')] : []) });
+  assert.deepEqual(r.out, []);
+  assert.equal(linkOf(r.w), runLink(2), 'the verdict came from a sample showing B\'s rows, not A\'s');
+});
+
+test('#866 settleGuardStatuses: another run\'s rows (green or red) do not end the wait while the queued run has not finished', async () => {
+  // C posts (link 3) while B (link 2) is still queued; only B's rows settle it.
+  const green = await guardWorld({ checks: (w) => gRows('pass', w.lookups >= 3 ? 2 : 3), runs: (n) => (n < 3 ? [wfRun(2, 'queued')] : []) });
+  assert.deepEqual(green.out, []);
+  assert.equal(linkOf(green.w), runLink(2), 'C\'s green rows did not release the wait: judged on B');
+  // C's rows are RED while B is queued: no refusal on C; B turns out green.
+  const red = await guardWorld({ checks: (w) => (w.lookups >= 3 ? gRows('pass', 2) : redRows(3)), runs: (n) => (n < 3 ? [wfRun(2, 'queued')] : []) });
+  assert.deepEqual(red.out, [], 'a red row of another run is no verdict while B is in flight');
+  assert.equal(linkOf(red.w), runLink(2));
+});
+
+test('#866 settleGuardStatuses: a run that finishes between the sample and the runs read is judged from a fresh sample (red B is refused, not A\'s green)', async () => {
+  const r = await guardWorld({ checks: (w) => (w.lookups >= 2 ? redRows(2) : gRows('pass', 1)), runs: (n) => (n < 2 ? [wfRun(2, 'in_progress')] : []) });
+  assert.match(r.out[0], /not passing after the hold lift re-ran them: Hard-stop scan=fail/);
+  // No earlier report at all: B ran and posted red between the sample (A green) and the first lookup.
+  const first = await guardWorld({ checks: (w) => (w.lookups >= 1 ? redRows(2) : gRows('pass', 1)), runs: () => [] });
+  assert.match(first.out[0], /Hard-stop scan=fail/);
+  assert.equal(first.w.lookups, 2, 'a lookup, one fresh sample, a second lookup: no unbounded no-sleep loop');
+  assert.equal(first.waited, 30_000, 'only the grace was slept');
+});
+
+test('#866 settleGuardStatuses: a run that re-posts nothing does not hold the verdict to the deadline', async () => {
+  const r = await guardWorld({ checks: () => gRows('pass', 1), runs: (n) => (n < 2 ? [wfRun(2, 'queued')] : []) });
+  assert.deepEqual(r.out, []);
+  assert.ok(r.waited < 60_000, `ended before the deadline (waited ${r.waited} ms)`);
+});
+
+test('#866 settleGuardStatuses: an unreadable or malformed runs list judges the statuses as before (no refusal, no hang)', async () => {
+  const first = await guardWorld({ checks: () => gRows('pass', 1), runs: () => new Error('HTTP 502') });
+  assert.deepEqual(first.out, []);
+  assert.equal(first.waited, 30_000, 'no wait beyond the grace');
+  const later = await guardWorld({ checks: () => gRows('pass', 1), runs: (n) => (n < 2 ? [wfRun(2, 'in_progress')] : new Error('HTTP 502')) });
+  assert.deepEqual(later.out, [], 'a failure after an in-flight report: the current rows, not a timeout');
+  const noStatus = await guardWorld({ checks: () => gRows('pass', 1), runs: () => [{ id: 2, path: GUARDS_WF }] });
+  assert.deepEqual(noStatus.out, []);
+  assert.equal(noStatus.waited, 30_000, 'a row without a status is no in-flight run');
+  const noApi = await settleGuardStatuses({ gh: { checks: () => gRows('pass', 1) }, slug: 'acme/widgets', pr: 7, head: HEAD, waitMs: 60_000, pollMs: 10_000, graceMs: 0, before: BEFORE_A, provenance: () => [] });
+  assert.deepEqual(noApi, [], 'a gh without api is a failed lookup, not a crash');
+});
+
+test('#866 settleGuardStatuses: the runs list is read on every page (a guards run on page 2 is still waited for)', async () => {
+  const done = Array.from({ length: PER_PAGE }, (_, i) => wfRun(1000 + i, 'completed'));
+  const r = await guardWorld({ checks: (w) => gRows('pass', w.lookups >= 3 ? 2 : 1), runs: (n) => (n < 3 ? [...done, wfRun(2, 'in_progress')] : done) });
+  assert.deepEqual(r.out, []);
+  assert.equal(linkOf(r.w), runLink(2), 'absence was not decided from the first page');
+});
+
+test('#866 settleGuardStatuses: a run still in flight at the deadline is a timeout refusal naming it', async () => {
+  const r = await guardWorld({ checks: () => gRows('pass', 1), runs: () => [wfRun(2, 'in_progress')] });
+  assert.match(r.out[0], /the guards' re-run has not finished: run 2 is in_progress after 60 s/);
+});
+
+test('#866 settleGuardStatuses: a run only ever seen queued extends the wait by the queued cap; one seen started is waited for to the deadline', async () => {
+  const r = await guardWorld({ checks: () => gRows('pass', 1), runs: () => [wfRun(2, 'queued')], over: { queuedCapMs: 20_000 } });
+  assert.deepEqual(r.out, [], 'a runner backlog: the old rows are judged once the cap has passed');
+  assert.ok(r.waited < 60_000, `before the deadline (waited ${r.waited} ms)`);
+  const started = await guardWorld({ checks: () => gRows('pass', 1), runs: (n) => [wfRun(2, n === 2 ? 'in_progress' : 'queued')], over: { queuedCapMs: 20_000 } });
+  assert.match(started.out[0], /the guards' re-run has not finished: run 2 is queued after 60 s/, 'a run seen in progress is no longer capped');
+  assert.equal(guardQueuedCapMs({}), 300_000);
+  assert.equal(guardQueuedCapMs({ PIPELINE_GUARD_QUEUED_CAP_MS: '5000' }), 5000);
+  assert.equal(guardQueuedCapMs({ PIPELINE_GUARD_QUEUED_CAP_MS: '9999999' }), 300_000, 'the env seam may only shorten it');
+});
+
+test('#866 settleGuardStatuses: the run whose rows already settled is not waited for while its later steps still run', async () => {
+  const r = await guardWorld({ checks: () => gRows('pass', 2), runs: () => [wfRun(2, 'in_progress')] });
+  assert.deepEqual(r.out, []);
+  assert.equal(r.waited, 0, 'no wait at all: B\'s one link is on every settled row');
+});
+
+test('#866 R1-B1 settleGuardStatuses: a queued-only run still inside its allowance at a short deadline is not waited past it; the old rows are judged from a fresh sample', async () => {
+  // waitMs (40 s) is below grace (30 s) + the 5-min queued cap: B stays queued, A stays green. Without the fix this is the timeout refusal and the hold goes back.
+  const r = await guardWorld({ checks: () => gRows('pass', 1), runs: () => [wfRun(2, 'queued')], over: { waitMs: 40_000 } });
+  assert.deepEqual(r.out, [], 'judged on A\'s rows, not the "has not finished" refusal');
+});
+
+test('#866 R1-B3 settleGuardStatuses: a clear lookup does not survive a pending poll: the verdict comes from a sample read after a NEW clear lookup', async () => {
+  // polls: 1 grace (A green), 2 sample (A green; lookup 1 clear), 3 pending (sleeps), 4 red rows of another run (lookup 2 clear), 5 green. Without the fix poll 4 is judged on lookup 1's clear.
+  const rowsAt = [null, gRows('pass', 1), gRows('pass', 1), gRows('pending', 3), redRows(3), gRows('pass', 3)];
+  const r = await guardWorld({ checks: (w) => rowsAt[w.polls], runs: () => [], over: { graceMs: 0 } });
+  assert.deepEqual(r.out, [], 'the red rows read before the new clear lookup were not judged');
+  assert.equal(r.w.polls, 5);
 });

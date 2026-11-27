@@ -32,7 +32,7 @@ import { hashBranch } from '../lib/risk.mjs';
 
 // The default branch the gate resolved for its run (finalgate.mjs#evaluateGate's trustedBranch), recorded in the gate file; absent (an older gate file) -> undefined, so the hash helper works it out.
 const trustedBranchOf = (gate) => (typeof gate?.trustedBranch === 'string' && gate.trustedBranch !== '' ? gate.trustedBranch : undefined);
-import { QueueUnreadable, clearSessionHold, endRecord, guardLinks, guardRerunGraceMs, holdOnSignal, predatesQueueMessage, queueCatchUpState, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
+import { QueueUnreadable, clearSessionHold, endRecord, guardLinks, guardQueuedCapMs, guardRerunGraceMs, holdOnSignal, predatesQueueMessage, queueCatchUpState, queueModeFor, readQueueRecord, recordOwnsHold, recordedHold, recoverQueuedLift, restoreHoldLabel, setHold, settleGuardStatuses } from '../lib/merge-queue.mjs';
 import { approvalGapSince, createQueueRoute, queueTiming, isDefaultMergeCommand, gateFreshSince, recheckGated, recheckOwnerGo, restoreHoldOnTerminal } from '../lib/queue-route.mjs';
 import { bestEffortSweep } from '../lib/queue-sweep.mjs';
 import { checkHolds, holdBeforeUpdate, holdGate, holdGateFrom, holdsConfigured, queuedBehindFrom, queuedBehindRefusal, recordSuccessor, releaseHold, unreleasedWarning } from '../lib/merge-hold.mjs';
@@ -627,7 +627,7 @@ async function ownerGoMergeCarrying({ root, config, pr, gh, ctx, track, carried 
   const settleGuards = async () => {
     if (hold === null) return null;
     const { waitMs, pollMs } = mergeTiming(config, ctx.env ?? process.env);
-    const problems = await settleGuardStatuses({ gh, pr, head, waitMs, pollMs, before: guardsBefore, graceMs: guardRerunGraceMs(waitMs, ctx.env ?? process.env), reviewCheck });
+    const problems = await settleGuardStatuses({ gh, pr, head, slug: gh.repo().slug, waitMs, pollMs, before: guardsBefore, graceMs: guardRerunGraceMs(waitMs, ctx.env ?? process.env), reviewCheck, queuedCapMs: guardQueuedCapMs(ctx.env ?? process.env) });
     if (problems.length > 0) return refuse('pre-merge', problems, { head });
     const late = await check();
     return late.length > 0 ? refuse('pre-merge', late, { head }) : null;
