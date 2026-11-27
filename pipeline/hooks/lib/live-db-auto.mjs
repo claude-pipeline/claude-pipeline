@@ -304,7 +304,7 @@ function consumedAttempt({ home, ref, name, sqlSha256, leftMs, io = {} }) {
     } catch (err) {
       return { error: { path: file, reason: err instanceof SyntaxError ? 'is empty or not valid JSON' : `cannot be read (${err?.code ?? 'error'})` } };
     }
-    if (!isObj(b)) return { error: { path: file, reason: 'does not hold a consumed go' } };
+    if (!isObj(b) || typeof b.op !== 'string' || typeof b.projectRef !== 'string') return { error: { path: file, reason: 'does not hold a consumed go' } };
     if (b.op === 'migration' && b.projectRef === ref && (b.sqlSha256 === sqlSha256 || b.name === name)) return { spent: typeof b.consumedAt === 'string' ? b.consumedAt : 'an unknown time' };
   }
   return {};
@@ -402,7 +402,15 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
   if (pr === null) return notEligible(`no merged pull request of ${entry.repo} into ${branch.name} added ${file} (a direct push, a rename, a merge commit?)`);
   const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null };
   const next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
-  if (next.status === 'claimed') return { status: 'claimed', facts };
+  if (next.status === 'claimed') {
+    // The go path claims its marker and then re-reads the history; this side claims the generations and then re-reads the markers: in every interleaving one of the two sees the other.
+    // The generations just created stay (they count as an attempt); a go consumed in the gap since the first scan means that go owns the apply.
+    const late = consumedAttempt({ home, ref: entry.ref, name, sqlSha256, leftMs, io });
+    if (late.noTime) return NO_TIME;
+    if (late.error) return { status: 'error', reason: `the consumed-go record ${late.error.path} cannot be read (${late.error.reason}), so nothing is applied; the owner looks at it` };
+    if (late.spent) return spent(late.spent);
+    return { status: 'claimed', facts };
+  }
   if (next.status === 'no-time') return NO_TIME;
   if (next.status === 'spent') return { status: 'spent', reason: `auto-apply was already attempted for ${name} on this machine just now (another call got there first): check the live state read-only, then ask for the owner's go` };
   return { status: 'error', reason: `the attempt could not be recorded (${next.reason}), so nothing is applied` };
@@ -410,7 +418,7 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
 
 // ---- the import of earlier go applies (the owner's terminal, `db-refs auto-migrations on`) --------------------------------------------------
 
-// Reads every consumed marker of `dir` -> { markers: [{ id, consumedAt, consumedMs, sqlSha256 }] of op migration and this ref } | { problem: { path, reason } }. An unreadable marker of ANY ref refuses.
+// Reads every consumed marker of `dir` -> { markers: [{ id, consumedAt, consumedMs, sqlSha256, name }] of op migration and this ref } | { problem: { path, reason } }. An unreadable marker of ANY ref refuses.
 function consumedMarkers(home, ref) {
   const dir = dirOf(home, LIVE_DB_CONSUMED_REL);
   let names;
@@ -435,13 +443,13 @@ function consumedMarkers(home, ref) {
     if (body.op !== 'migration' || body.projectRef !== ref) continue;
     const consumedMs = isoOf(body.consumedAt);
     if (consumedMs === null || !SHA_RE.test(String(body.sqlSha256))) return { problem: { path: file, reason: 'does not hold a consumed migration go (time or sha)' } };
-    markers.push({ id: n.slice(0, -'.json'.length), consumedAt: body.consumedAt, consumedMs, sqlSha256: body.sqlSha256 });
+    markers.push({ id: n.slice(0, -'.json'.length), consumedAt: body.consumedAt, consumedMs, sqlSha256: body.sqlSha256, name: typeof body.name === 'string' && body.name !== '' ? body.name : null });
   }
   return { markers };
 }
 
-// Every migration go of `ref` ever consumed on this machine becomes generation history: a go whose record is still there (matched by the marker's id) gives its name and SQL keys, one whose
-// record is gone gives the SQL key only and is listed in `unmatched`. A key is only advanced when its latest time is earlier than the apply's own, so running it again adds nothing.
+// Every migration go of `ref` ever consumed on this machine becomes generation history: a go whose marker carries its name, or whose record is still there (matched by the marker's id), gives its name and SQL keys, one with
+// neither gives the SQL key only and is listed in `unmatched`. A key is only advanced when its latest time is earlier than the apply's own, so running it again adds nothing.
 // With `unmatched` non-empty and no `acceptUnmatched` nothing is written (`written: false`). Owner terminal only. -> { ok, written, imported: [{ name, sqlSha256, consumedAt }], unmatched: [{ sqlSha256, consumedAt }] } | { ok: false, path, reason }
 export function importGoHistory({ home, ref, now = Date.now, acceptUnmatched = false, io = {} }) {
   const inside = insideClaudeCode(process.env);
@@ -464,9 +472,11 @@ export function importGoHistory({ home, ref, now = Date.now, acceptUnmatched = f
     const applies = [];
     for (const m of found.markers.sort((a, b) => a.consumedMs - b.consumedMs || a.id.localeCompare(b.id))) {
       const rec = byId.get(m.id);
-      if (rec && rec.sqlSha256 === m.sqlSha256) {
-        imported.push({ name: rec.name, sqlSha256: m.sqlSha256, consumedAt: m.consumedAt });
-        applies.push({ ...m, name: rec.name });
+      // the marker's own name (written by the claim) first; the session's record only for a marker from before it carried one
+      const known = m.name ?? (rec && rec.sqlSha256 === m.sqlSha256 ? rec.name : null);
+      if (known !== null) {
+        imported.push({ name: known, sqlSha256: m.sqlSha256, consumedAt: m.consumedAt });
+        applies.push({ ...m, name: known });
       } else {
         unmatched.push({ sqlSha256: m.sqlSha256, consumedAt: m.consumedAt });
         applies.push({ ...m, name: null });
@@ -506,7 +516,7 @@ export function importGoHistory({ home, ref, now = Date.now, acceptUnmatched = f
 // ---- the log reader -----------------------------------------------------------------------------------------------------------------------
 
 // Every attempt file of the last `sinceMs` as EVENTS, newest first (best-effort parsing lives only here). -> { events, unreadable: [path] }
-// `outcome`: 'attempted' when both files of the event exist (an allowed call: the session's effect check says whether it applied), 'reserved' when only one does (a lost race or a failed
+// `outcome`: 'attempted' when both files of the event exist (an allowed call, or one denied after the second file was written because its sync failed: the live state says whether it applied), 'reserved' when only one does (a lost race or a failed
 // write: nothing was allowed), 'imported' for a go the owner's switch-on imported (nothing was allowed by it).
 export function readAttemptLog({ home, sinceMs = 0, io = {} }) {
   const out = { events: [], unreadable: [] };

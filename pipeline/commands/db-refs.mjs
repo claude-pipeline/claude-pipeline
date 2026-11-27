@@ -112,6 +112,8 @@ function autoMigrations({ action, ref, accept, current, home, ctx }) {
   const entry = state.refs.find((e) => e.ref === ref);
   if (!entry) throw new UsageError(`${ref} is not in the registry: add it with \`pipeline db-refs set --ref ${ref} --name "<label>" --repo <owner/name>\` first`);
   const write = (refs, extra = {}) => {
+    // the import above takes a moment: another owner terminal may have changed the registry since it was read, and writing the old snapshot back would undo that change
+    if (JSON.stringify(readDbRefs(home)) !== JSON.stringify(current)) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-changed', message: `${dbRefsFile(home)} was changed by another command while this one ran; nothing was written to it. Run this again (what was imported is kept, and importing again is safe)` } };
     try {
       const file = writeDbRefs(home, { ...state, refs });
       return { exitCode: EXIT.OK, output: { ok: true, file, refs: shown(refs), servers: state.servers, ...extra } };

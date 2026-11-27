@@ -427,6 +427,35 @@ test('auto-migrations on refuses naming an unreadable consumed marker (of any pr
   assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before);
 });
 
+test('auto-migrations on: a registry change made by another terminal during the import is not overwritten; the command refuses and says to run it again', async (t) => {
+  // Failure caught: switching project A on writes back the registry as it was read before the import, restoring the auto-apply permission the owner has just turned off for project B.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE({ ref: REF, repo: 'acme/widgets' }), LIVE({ ref: REF2, repo: 'acme/other', ...ON })] });
+  const changed = { v: 1, refs: [LIVE({ ref: REF, repo: 'acme/widgets' }), LIVE({ ref: REF2, repo: 'acme/other' })], servers: [] };
+  const r = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF], {}, changed);
+  assert.equal(r.exitCode, 1, JSON.stringify(r.output));
+  assert.match(r.output.message, /run this again/i);
+  const after = readDbRefs(home).refs;
+  assert.deepEqual(after.map((e) => e.autoMigrations), [false, false], 'B stays off and A was not switched on');
+  const again = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF]);
+  assert.equal(again.exitCode, 0, JSON.stringify(again.output));
+});
+
+test('auto-migrations on: a consumed marker that carries its migration name is imported under that name with no session record left, and is not listed as unmatched', async (t) => {
+  // Failure caught: the importer dropping the marker's own name, so only the SQL key is imported and an older go for the same name with different SQL still passes the freshness rule.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE()] });
+  const sha = (q) => createHash('sha256').update(q).digest('hex');
+  const NAMED = '20261120000000_named';
+  writeText(join(GO_DIR(home), 'live-db-consumed', `${'c'.repeat(32)}.json`), jsonl({ v: 1, op: 'migration', projectRef: REF, consumedAt: '2026-11-20T10:00:00.000Z', sqlSha256: sha('select 5;\n'), name: NAMED }));
+  const r = runOwnerCli(home, ['auto-migrations', 'on', '--ref', REF]);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual(r.output.imported.map((i) => i.name), [NAMED]);
+  assert.deepEqual(r.output.unmatched, []);
+  const h = history({ home, ref: REF, name: NAMED, sqlSha256: sha('select 6;\n') });
+  assert.deepEqual([h.name.n, h.sql.n], [1, 0], 'another SQL under the same name now finds an attempt on the name key');
+});
+
 test('set keeps auto-migrations for a label-only edit; a new repo or --dev clears it', async (t) => {
   // Failure caught: reassigning a project to another repository (or to dev) that carries the old repository's trust along.
   const home = scratchHome(t);

@@ -954,6 +954,59 @@ test('auto: a go consumed with no history (a rollback, a go during the import) b
   for (const s of [bySql, byName, empty]) assert.equal(s.calls.length, 0);
 });
 
+test('auto: a consumed marker with no op or no projectRef cannot rule out an earlier apply: refuse naming it', async (t) => {
+  // Failure caught: a `{}` marker silently skipped by the run-time scan (the importer refuses the same body), so a migration the marker may stand for is applied a second time.
+  for (const body of [{}, { v: 1, projectRef: REF, sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', sqlSha256: sha256Of(SQL) }]) {
+    const s = await autoScene(t);
+    mkdirSync(consumed(s), { recursive: true });
+    writeFileSync(join(consumed(s), 'odd.json'), `${JSON.stringify(body)}\n`);
+    const r = apply(s);
+    assert.equal(r.decision, 'deny', JSON.stringify(body));
+    assert.ok(r.reason.includes(join(consumed(s), 'odd.json')), r.reason);
+    assert.equal(s.calls.length, 0);
+  }
+});
+
+test('race: a go consumed after the auto check scanned the markers but before it claimed: auto is refused, the go keeps its apply', async (t) => {
+  // Failure caught: an auto apply and a go apply of the same migration both allowed (a double apply on a live database) when the go lands in the gap between auto's marker scan and its claim.
+  const s = await autoScene(t);
+  s.respond = () => {
+    mkdirSync(consumed(s), { recursive: true });
+    writeFileSync(join(consumed(s), 'late.json'), `${JSON.stringify({ v: 1, consumedAt: isoAt(NOW - 1000), op: 'migration', projectRef: REF, sqlSha256: sha256Of(SQL), name: NAME })}\n`);
+    return { stdout: JSON.stringify(ghBase()) };
+  };
+  const r = apply(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /already attempted|check the live state/);
+  assert.ok(existsSync(gfile(s, 'name', 1)) && existsSync(gfile(s, 'sql', 1)), 'its generations stay: they count as an attempt');
+});
+
+test('race: a go that read the switch off, then auto claimed the same migration before the go\'s marker landed: the go is refused and spent', async (t) => {
+  // Failure caught: the owner's switch-on landing between a go's registry read and its claim lets the go and an auto apply both be allowed (a double apply).
+  const s = await scene(t);
+  const real = openSync;
+  let fired = 0;
+  const io = {
+    openSync: (p, flags, mode) => {
+      if (String(p).includes('live-db-consumed') && fired === 0) {
+        fired += 1;
+        seedRegistry(s.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' }] });
+        seedGen(s, 1, NOW - 1000); // (auto's claim, made while the go was between its read and its marker)
+      }
+      return real(p, flags, mode);
+    },
+  };
+  const r = apply(s, {}, { io });
+  assert.equal(fired, 1);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /check the live state/);
+  assert.equal(markers(s).length, 1, 'the go is spent');
+  // the same switch-on with no attempt recorded yet: the go keeps its apply (auto will find the go's marker and refuse itself)
+  const quiet = await scene(t);
+  const io2 = { openSync: (p, flags, mode) => { if (String(p).includes('live-db-consumed')) seedRegistry(quiet.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' }] }); return real(p, flags, mode); } };
+  assert.equal(apply(quiet, {}, { io: io2 }).decision, 'allow');
+});
+
 test('auto: a file merged before the switch-on time, or a PR from another repository, needs the go', async (t) => {
   // Failure caught: migrations merged before the owner switched auto-apply on (possibly applied by hand) applied again, or a fork's PR of the same number accepted.
   const early = await autoScene(t, { since: isoAt(NOW - 3_600_000 + 60_000) });
