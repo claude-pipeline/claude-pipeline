@@ -451,8 +451,10 @@ const liveDbTail = (text) => {
   const bind = lines[lines.length - 2];
   const apply = lines[lines.length - 1];
   if (!(bind !== undefined && LIVE_DB_BINDING.test(bind.replace(/\s+$/, '')) && apply.startsWith(APPLY_PREFIX))) return null;
-  const header = lines.findLastIndex((l) => l.startsWith('🗄️ LIVE database change — '));
-  return { bind, apply, block: header < 0 ? null : lines.slice(header).join('\n') }; // (block: the whole trailing block, from its first line)
+  // the block starts three lines above its SQL fence, found the way verifyBlock finds it (the closing fence is four lines above the end; the opening one is the nearest fence line above that), never from a header-like line in the SQL
+  let open = -1;
+  for (let i = lines.length - 5; i >= 0; i--) if (lines[i].startsWith('```')) { open = i; break; }
+  return { bind, apply, block: open < 3 ? null : lines.slice(open - 3).join('\n') }; // (block: the whole trailing block, from its first line)
 };
 const liveDbPromotes = (text) => liveDbTail(text) !== null;
 // A tool input or result that shows a live-database block, its binding or apply line, or a go word: what the owner may have answered instead of the block in the reply text (a stale-ask detector, like surfacesAsk).
@@ -469,15 +471,17 @@ function ownDialogInput(input, text) {
   const ownGo = own === null ? null : / — say "(go (?:migration|data) [^"\s]+)"$/.exec(own.apply.replace(/\s+$/, ''))?.[1];
   const shown = toolUseText(input);
   if (!ownGo || shown === null || own.block === null) return false;
-  if (!shown.replace(/\r\n/g, '\n').includes(own.block)) return false; // R1-B4: the whole block (its SQL and summary too), not only its binding and apply lines
+  const flat = shown.replace(/\r\n/g, '\n');
+  if (flat.split(own.block).length !== 2) return false; // R1-B4: the whole block (its SQL and summary too), exactly once (R2-B3), not only its binding and apply lines
+  for (const line of flat.replace(own.block, '').split('\n')) if (line.startsWith('```') || line.startsWith('🗄️ LIVE database change — ')) return false; // (no second block or SQL fence outside it)
   let binds = 0;
   let applies = 0;
-  for (const line of shown.replace(/\r\n/g, '\n').split('\n')) {
+  for (const line of flat.split('\n')) {
     if (/Live-DB (?:migration|data) · project /.test(line)) { if (line !== own.bind) return false; binds++; }
     if (line.includes(APPLY_PREFIX)) { if (line !== own.apply) return false; applies++; }
   }
   for (const m of shown.matchAll(GO_WORD)) if (m[0] !== ownGo) return false;
-  return binds > 0 && applies > 0;
+  return binds === 1 && applies === 1;
 }
 // #189 (owner decision, plan docs/plans/2026-11-06-followups-185-188-ruling-compaction.md section 3): a context compaction is transparent. Claude Code writes the summary of the
 // earlier conversation as a `user` entry (string content, no promptSource / origin) after a `compact_boundary`; it is a prompt entry to isPromptEntry and of source 'unknown', so
@@ -668,9 +672,8 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
   // a later request of another slot. #241: a tool block of another visible slot that surfaces an ask (shownPos) counts as shown too, not the selected slot's own. R3-F1: so does a visibleSynthetic skip turn's.
   const shownAfter = !last || candidates.some((x) => x !== last && x.turn.shownPos > last.turn.textPos) || shownSkips.some((pos) => pos > last.turn.textPos);
   if (!last || last.voided || shownAfter || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
-  // R1-B2: \`before\` is the newest slot an OWNER started before the selected one, stepping over every promoted (notice) slot: the last thing the owner read in a turn they started
-  const ownerSlot = candidates.slice(0, -1).findLast((x) => !x.promoted);
-  return { text: last.text, promoted: last.promoted, ...(liveDb ? { before: ownerSlot?.text ?? '' } : {}) };
+  // R1-B2 / R2: `before` is every slot before the selected one, newest first, promoted or not: swappedBlockReason walks it to what the owner last read in a turn they started
+  return { text: last.text, promoted: last.promoted, ...(liveDb ? { before: candidates.slice(0, candidates.indexOf(last)).reverse().map((x) => ({ text: x.text, promoted: x.promoted })) } : {}) };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
 

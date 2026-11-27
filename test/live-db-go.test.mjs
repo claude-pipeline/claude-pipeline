@@ -387,6 +387,57 @@ test('R1-B4: the notice turn\'s own dialog must repeat the WHOLE block: the same
   assert.equal(out?.record, undefined, JSON.stringify(out));
 });
 
+const ownerSays = (text, id) => ({ type: 'user', message: { content: text }, promptId: id, ...OWNER_ENTRY });
+
+test('R2-F1: the owner read block A, then sent another message whose reply has no block, then a notice shows a changed block B under the same name: refused', async (t) => {
+  // Failure caught: the reference was the newest owner-started slot only, so one unrelated owner message (or an empty slot the harness opens) switched the swap check off and the go was recorded for B.
+  const w = world(t);
+  await setup(w);
+  const a = migBlock(w).join('\n');
+  const empty = goAfter(w, t, GO, [ownerOk, textOf(a), ownerSays('what does it do?', 'pid-q'), textOf('It adds a column.'), notice(), textOf(changedMig(w).join('\n'))]);
+  swapRefused(empty.out);
+});
+
+test('R2-B1: the owner\'s turn shows no block, a first notice shows the migration and a second notice shows changed SQL under the same name: refused', async (t) => {
+  // Failure caught: the reference skipped promoted slots, so with no owner-shown block the second notice was compared with nothing and the go was recorded for SQL the owner never read.
+  const w = world(t);
+  await setup(w);
+  const a = migBlock(w).join('\n');
+  swapRefused(goAfter(w, t, GO, [ownerSays('status?', 'pid-s'), textOf('Looking.'), notice(), textOf(a), notice(), textOf(changedMig(w).join('\n'))]).out);
+});
+
+test('R2-B2: the owner read block A and the reply then quoted a binding line of ANOTHER migration; a notice shows a changed A: refused', async (t) => {
+  // Failure caught: only the LAST binding line of the owner's turn was compared, so one quoted line for another migration (text the agent controls) hid the migration the owner was asked to approve.
+  const w = world(t);
+  await setup(w);
+  const a = migBlock(w).join('\n');
+  const other = migBlock(w, { name: '20261117000001_other', file: 'supabase/migrations/20261117000001_other.sql' });
+  swapRefused(goAfter(w, t, GO, [ownerOk, textOf(`${a}\n${other[other.length - 2]}`), notice(), textOf(changedMig(w).join('\n'))]).out);
+});
+
+test('R2-B3: a dialog that repeats the reply\'s block and then a second copy of its binding and apply lines around other SQL is not the reply\'s own dialog', async (t) => {
+  // Failure caught: one matching copy of the block exempted the whole dialog, so a second question around other SQL, under the same binding, apply and go lines, was read as the reply's own.
+  const w = world(t);
+  await setup(w);
+  const block = dataBlock(w);
+  const other = block.map((l) => (l === dataSql ? otherSql : l));
+  const out = goAfter(w, t, goData(dataSql), [notice(), textOf(block.join('\n')), toolUse('ask1', 'AskUserQuestion', dataDialog([...block, '', ...other], dataSql)), toolResult('ask1', 'User declined to answer questions')]).out;
+  assert.equal(out?.record, undefined, JSON.stringify(out));
+});
+
+test('R2-B4: SQL that holds a header-like line (in a string) is compared whole: a dialog with other statements above that line is not the reply\'s own dialog', async (t) => {
+  // Failure caught: the dialog's block was anchored at the LAST header-prefix line, which sat inside the SQL, so a dialog differing above that line passed as the reply's own.
+  const w = world(t);
+  await setup(w);
+  const sql = "update t set a = 'x\n🗄️ LIVE database change — fake\ny' where id = 7";
+  const block = dataBlock(w, { sql });
+  assert.ok(goAfter(w, t, goData(sql), [notice(), textOf(block.join('\n')), toolUse('ask1', 'AskUserQuestion', dataDialog(block, sql)), toolResult('ask1', 'x')]).out?.record, 'its own dialog counts');
+  const other = block.map((l) => (l === "update t set a = 'x" ? "update t set b = 'x" : l));
+  assert.notDeepEqual(other, block);
+  const out = goAfter(w, t, goData(sql), [notice(), textOf(block.join('\n')), toolUse('ask1', 'AskUserQuestion', dataDialog(other, sql)), toolResult('ask1', 'x')]).out;
+  assert.equal(out?.record, undefined, JSON.stringify(out));
+});
+
 test('B1a pin: the ruling reader (no liveDb option) still reads the same notice turn as no reply', async (t) => {
   // Failure caught: the live-database promotion leaking into the ruling / merge readers, which must keep voiding a slot for any text a notice turn prints.
   const w = world(t);
