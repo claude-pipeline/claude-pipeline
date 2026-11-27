@@ -13,6 +13,7 @@
 //   FAKE_CODEX_HANG_ONCE=<f>   hang (until the timeout kills it) when <f> does not exist yet, creating it; later runs behave normally
 //   FAKE_CODEX_NO_WRITE=1      exit 0 without writing the output file (a run that "succeeded" but produced nothing)
 //   FAKE_CODEX_OUTPUT=<file>   copy that file's bytes to the `-o` path (a findings JSON, or garbage for a malformed run)
+//   FAKE_CODEX_GATE=<file>     stay running until <file> exists (polled), then carry on: a test holds the job open for as long as it needs, never for a fixed time
 //   FAKE_CODEX_DURING=<cmd>    run this shell command (synchronously) before answering: lets a test change the world
 //                              while "Codex is thinking"
 //   FAKE_CODEX_DURING_OUTPUT=<file>  FAKE_CODEX_OUTPUT for that command (cmd.exe has no `VAR=x cmd` prefix)
@@ -36,6 +37,10 @@ if (process.env.FAKE_CODEX_FAIL_ONCE && !existsSync(process.env.FAKE_CODEX_FAIL_
   const id = process.env.FAKE_CODEX_THREAD_ID || '01a1c97d-8cee-7c50-83a7-9994cab1b194';
   for (const e of [{ type: 'thread.started', thread_id: id }, { type: 'turn.started' }, { type: 'turn.failed', error: { message: process.env.FAKE_CODEX_TURN_FAILED ?? '' } }]) writeSync(1, `${JSON.stringify(e)}\n`);
   process.exit(1);
+}
+
+if (process.env.FAKE_CODEX_GATE) {
+  while (!existsSync(process.env.FAKE_CODEX_GATE)) await new Promise((r) => setTimeout(r, 25));
 }
 
 if (process.env.FAKE_CODEX_DURING) {

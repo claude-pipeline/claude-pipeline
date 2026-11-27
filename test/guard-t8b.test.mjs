@@ -9,7 +9,15 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
-import { cpuTime, cpuTimed } from './helpers/timing.mjs';
+import { cpuTimed } from './helpers/timing.mjs';
+
+// A CPU-time bound on a loaded runner: noise only ever ADDS time (a busy machine inflates one run, not every run), so a run that is over the limit is repeated, up to `tries` times in all, and the
+// fastest counts. A real blow-up (the 5 s pattern these tests were written against) is over the limit on every run and still fails; a normal run is measured once, as before (#725).
+const cpuTimedWithin = (limitMs, run, tries = 3) => {
+  let best = cpuTimed(run);
+  for (let i = 1; i < tries && best.ms >= limitMs; i++) { const again = cpuTimed(run); if (again.ms < best.ms) best = again; }
+  return best;
+};
 
 const CL = '.cl' + 'aude';
 const none = { readText: () => null, readHead: () => null, pathExists: () => false, readDir: () => null };
@@ -72,7 +80,7 @@ for (const [name, unit] of Object.entries(SHAPES)) {
   test(`H2 a ${LIMIT}-character line of ${name} is answered in under 6 s of CPU time by each guard (allow or deny, never a throw)`, () => {
     const line = fill(unit);
     for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
-      const { r, ms } = cpuTimed(run);
+      const { r, ms } = cpuTimedWithin(6000, run);
       assert.ok(r.decision === 'allow' || r.decision === 'deny', `${who}: ${r.decision}`);
       assert.ok(ms < 6000, `${who}: ${Math.round(ms)} ms of CPU for ${name}`);
     }
@@ -83,7 +91,8 @@ const OLD_DEFAULTED_WORD = /\$\{!?(?:[A-Za-z_]\w*(?:\[[^\]}]*\])?|\d+|[@*#?$!-])
 // Why: the Windows CI runner is ~3-4x slower than a Mac (the worst shape: 0.33 s on the Mac, 1.08 s on Windows); 4 s there is still far below
 // the old pattern's ~20 s on that runner (5.2 s on the Mac) and below the guard's 5 s deadline.
 // (a shared CI runner measured 1184 ms on the worst shape, ~3.5× a Mac, with no code change: CI gets its own cap)
-const SUBSCRIPT_CAP_MS = process.platform === 'win32' ? 4000 : process.env.CI ? 2500 : 1000;
+// (local 1000 -> 2000 ms, #725: a Mac under load reads ~3-4x its 0.2-0.33 s, past 1 s; the old pattern's 5.2 s there is still 2.6x above the cap, and a run over the cap is repeated, see cpuTimedWithin)
+const SUBSCRIPT_CAP_MS = process.platform === 'win32' ? 4000 : process.env.CI ? 2500 : 2000;
 test(`H2 a long word of unclosed subscripts after a command that can take options is answered in under ${SUBSCRIPT_CAP_MS} ms of CPU time by each guard (allow or deny, never a throw)`, () => {
   const prefixes = ['bash ', 'source ', 'node ', 'find . '];
   const units = ['${a[', '${a[x', '${a[${b[', '${!a[', '${a[1]:-${a[', '${a[]'];
@@ -92,7 +101,7 @@ test(`H2 a long word of unclosed subscripts after a command that can take option
       const line = prefix + unit.repeat(Math.floor((LIMIT - prefix.length) / unit.length));
       assert.ok(line.length <= LIMIT);
       for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
-        const { r, ms } = cpuTimed(run);
+        const { r, ms } = cpuTimedWithin(SUBSCRIPT_CAP_MS, run);
         assert.ok(r.decision === 'allow' || r.decision === 'deny', `${who}: ${r.decision}`);
         assert.ok(ms < SUBSCRIPT_CAP_MS, `${who}: ${Math.round(ms)} ms of CPU for ${prefix}${unit}...`); // (~0.2-0.33 s on a Mac on the worst shape)
       }
@@ -135,7 +144,7 @@ test('H2 a long run of quotes or blanks inside a word that ends in a slash is re
   const quotes = "a'" + "'".repeat(LIMIT / 2) + '/b';
   const blanks = "x '" + ' '.repeat(LIMIT / 2) + "/'";
   for (const line of [quotes, blanks, `echo ${quotes}`, `echo > ${blanks}`]) {
-    const ms = cpuTime(() => files(line));
+    const { ms } = cpuTimedWithin(3000, () => files(line));
     assert.ok(ms < 3000, `${Math.round(ms)} ms of CPU`);
   }
 });
@@ -157,7 +166,7 @@ test('H1 an assigned word longer than the scan keeps is the unknown word, not a 
 test('H2 a line of open braces is read without flattening the word for each one (well under the general bound)', () => {
   const line = fill('{');
   for (const run of [() => git(line), () => files(line)]) {
-    const ms = cpuTime(run);
+    const { ms } = cpuTimedWithin(1000, run);
     assert.ok(ms < 1000, `${Math.round(ms)} ms of CPU`);
   }
 });
@@ -201,7 +210,7 @@ test('H2 a 200 kB line of nested name-subscripts is answered quickly by both gua
   const line = fill('a[');
   // (bounds: ~0.2 s / 0.4 s locally, ~4x that on a Windows runner; the uncapped scan took 2.7 s locally, 10 s there)
   for (const [run, bound] of [[() => git(line), 1500], [() => files(line), 3000]]) {
-    const ms = cpuTime(run);
+    const { ms } = cpuTimedWithin(bound, run);
     assert.ok(ms < bound, `${Math.round(ms)} ms of CPU`);
   }
   const r = git(`${'a['.repeat(30000)}; git ${'pu' + 'sh'} origin ${'ma' + 'in'}`);
@@ -233,7 +242,7 @@ test('H2 lines of unclosed subscripts after `${` are answered well under the gen
   for (const unit of ['${a[', '${!a[', '"${a["', 'a[${', '${#a[', '${a[1]:-${a[']) {
     const line = fill(unit);
     for (const [who, run] of [['guard-git', () => git(line)], ['guard-files', () => files(line)]]) {
-      const ms = cpuTime(run);
+      const { ms } = cpuTimedWithin(2500, run);
       assert.ok(ms < 2500, `${who}: ${Math.round(ms)} ms of CPU for ${unit}`); // (~0.2 s locally, ~4x on a Windows runner)
     }
   }
