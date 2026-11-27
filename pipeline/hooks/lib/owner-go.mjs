@@ -1165,7 +1165,7 @@ export const approvedRequest = (q) => approvalGap(q) === 'ok';
 // #740: when approvalGap is not 'ok', was the reason that the owner's word WAS recorded for this request but typed while the agent was still working (its transcript entry is promptSource
 // 'queued', #191 B2)? -> the ISO ts of the newest such matching record, else null. Read-only: it changes nothing about what approves (the same `q`, incl. maxAgeMs, as approvalGap / approvalGapSince).
 export function queuedApprovalAt(q) {
-  const queued = approvalsFor(q).filter((r) => r.via !== 'ask' && promptEntryOf(r, { home: q.home }).entry?.promptSource === 'queued');
+  const queued = approvalsFor({ ...q, settle: false }).filter((r) => r.via !== 'ask' && promptEntryOf(r, { home: q.home }).entry?.promptSource === 'queued');
   return queued.length === 0 ? null : queued.map((r) => r.ts).sort().at(-1);
 }
 
