@@ -236,6 +236,7 @@ const stubGh = (s) => ({
   prView: () => ({ state: 'OPEN', headRefOid: s.head, baseRefName: 'main', baseRefOid: s.baseTip, isDraft: false, labels: [], mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN' }),
   checks: () => [{ name: 'ci', state: 'SUCCESS', bucket: 'pass' }],
   pullFiles: () => s.prFiles,
+  compare: () => ({ status: 'ahead', behindBy: 0, aheadBy: 1, baseSha: s.baseTip }), // (the live check reads the base branch's tip from the compare API: #625)
   repo: () => ({ slug: 'acme/widgets', host: 'github.com', defaultBranch: 'main' }), // the real gh.repo() always carries it; pr-open holds the local default branch against it (#430)
   viewer: () => 'me', // review-complete: no comment of ours, no history
   listComments: () => [],
