@@ -31,6 +31,9 @@ const now = () => {
   if (during !== null && !fired) {
     fired = true;
     const file = dbRefsFile(home);
+    // (and never through a symlinked folder above it: its real parent must still be under the test home)
+    const parent = canonical(dirname(file));
+    if (parent === null || !parent.startsWith(real + sep)) throw new Error(`db-refs-owner-child: refusing to write to ${file}: its folder resolves outside the test home`);
     let linked = false;
     try { linked = lstatSync(file).isSymbolicLink(); } catch { /* absent: the write creates it */ }
     if (linked) throw new Error(`db-refs-owner-child: refusing to write through the symlink ${file}`);
