@@ -12,6 +12,7 @@ import { presentedRoundRequest } from '../pipeline/hooks/lib/owner-go.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { aFile, findingsOf, low, roundWorld } from './helpers/round-world.mjs';
 import { REPO_VIEW } from './helpers/fakegh-env.mjs';
+import { addOrigin } from './helpers/origin.mjs';
 
 const usdTotals = (usd, calls = 1) => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd, calls });
 const summaryComment = (cost) => ({ id: 77, user: { login: 'me' }, body: `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), ...(cost ? { cost } : {}) })}` });
@@ -282,7 +283,7 @@ test('round-request trip-wire #549: a base branch GitHub cannot name is shown as
   assert.match(scopeLine(r), /it may over-count.*retry when GitHub answers/);
 });
 
-test('round-request trip-wire #549: a merge of the default branch that conflicted is shown as a round-head measure that may over-count', (t) => {
+test('round-request trip-wire #549/#742: a merge of the default branch that conflicted is shown as measured from the PR\'s own change', (t) => {
   const w = roundWorld(t, WIRE_NOT_FALLING);
   w.atCap();
   w.repo.git(['checkout', '-q', 'main']);
@@ -295,7 +296,28 @@ test('round-request trip-wire #549: a merge of the default branch that conflicte
   w.prHead(merged);
   const r = ask(w);
   assertExit(r, 1, r.stderr + r.stdout);
-  assert.match(scopeLine(r), /conflict.*round's reviewed head, it may over-count/);
+  assert.match(scopeLine(r), /conflict.*PR's own change/);
+});
+
+// #742: after a GitHub-side update-branch the local origin/main is behind; the process review's fix-scope line must still leave out what main brought in (the cached ref is refreshed first).
+test('round-request trip-wire #742: main merged in cleanly while the local origin/main is stale: main\'s lines are not counted as fix lines', (t) => {
+  const w = roundWorld(t, WIRE_NOT_FALLING);
+  w.atCap();
+  const bare = addOrigin(t, w.repo);
+  const stale = w.repo.git(['rev-parse', 'main']).trim();
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/from-main.js', Array.from({ length: 300 }, (_, i) => `export const m${i} = ${i};`).join('\n') + '\n');
+  w.repo.commit('main gains a big new file');
+  w.repo.git(['push', '-q', 'origin', 'main']);
+  w.repo.git(['update-ref', 'refs/remotes/origin/main', stale]); // the clone has not fetched since: what `git pull` of the PR branch alone leaves behind
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  w.repo.git(['merge', '--no-edit', 'main']);
+  w.prHead(w.repo.git(['rev-parse', 'HEAD']).trim());
+  assert.ok(bare);
+  const r = ask(w);
+  assertExit(r, 1, r.stderr + r.stdout);
+  assert.doesNotMatch(scopeLine(r), /from-main|added lines >/, scopeLine(r)); // only the round-2 fix (src/fix2.js, one line) is the fix
+  assert.match(scopeLine(r), /new non-test file: src\/fix2\.js\)/, scopeLine(r));
 });
 
 test('round-request trip-wire #549: a clean measure adds no note to the fix-scope line', (t) => {

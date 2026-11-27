@@ -254,12 +254,15 @@ test('state fix-scope #490: no merge since round R keeps the plain round-head me
   assert.deepEqual([r.json.flagged, r.json.fixScope.nonTestLines, r.json.baseKind], [false, 5, 'previous']);
 });
 
-test('state fix-scope #490: a merge of main that conflicted cannot give an exact base: today\'s measure is kept and the output says so', (t) => {
+// #742: a merge of main that conflicted cannot give a synthetic base, but the fix is still measured as the PR's OWN change growth (its diff against main now, minus its diff at round R),
+// so the 300 lines main brought in with that merge are not counted as fix lines and the 5-line fix is not flagged.
+test('state fix-scope #742: a merge of main that conflicted does not count what main brought in: measured as the PR\'s own change (baseKind own-change)', (t) => {
   const w = reviewed(t);
-  // main rewrites src/a.js line 12, which the reviewed head changed too: merging main into that head conflicts, so there is no exact base
+  // main rewrites src/a.js line 12, which the reviewed head changed too (merging main into that head conflicts), and adds a big new file
   w.repo.git(['checkout', '-q', 'main']);
   w.repo.write('src/a.js', aFile(false).replace('export const v12 = 12;', 'export const v12 = 1200;'));
-  w.repo.commit('main edits a');
+  w.repo.write('src/from-main.js', body(300, 'export const m'));
+  w.repo.commit('main edits a and adds a big file');
   w.repo.git(['checkout', '-q', 'feat/x']);
   assert.throws(() => w.repo.git(['merge', '--no-edit', 'main']));
   w.repo.write('src/a.js', aFile(true));
@@ -267,7 +270,22 @@ test('state fix-scope #490: a merge of main that conflicted cannot give an exact
   w.repo.commit('merge main, resolved, plus a small fix');
   const r = scopeOf(w);
   assertExit(r, 0, r.stderr + r.stdout);
-  assert.equal(r.json.baseKind, 'round-head');
-  assert.match(r.json.baseNote, /conflict.*round's reviewed head/);
+  assert.deepEqual([r.json.flagged, r.json.fixScope.newFiles, r.json.fixScope.nonTestLines], [false, [], 5]);
+  assert.equal(r.json.baseKind, 'own-change');
+  assert.match(r.json.baseNote, /conflict.*PR's own change/);
   assert.equal(r.json.warnings.includes(r.json.baseNote), true);
+});
+
+test('state fix-scope #742: a conflicted merge whose resolution adds new lines still counts those lines (the own-change measure is not blind to them)', (t) => {
+  const w = reviewed(t);
+  w.repo.git(['checkout', '-q', 'main']);
+  w.repo.write('src/a.js', aFile(false).replace('export const v12 = 12;', 'export const v12 = 1200;'));
+  w.repo.commit('main edits a');
+  w.repo.git(['checkout', '-q', 'feat/x']);
+  assert.throws(() => w.repo.git(['merge', '--no-edit', 'main']));
+  w.repo.write('src/a.js', aFile(true).replace('export const v12 = compute(x.y);', 'export const v12 = compute(x.y, 1200);'));
+  w.repo.commit('merge main, resolved with a new line');
+  const r = scopeOf(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.baseKind, r.json.fixScope.nonTestLines], ['own-change', 1]);
 });
