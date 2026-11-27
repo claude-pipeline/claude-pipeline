@@ -1151,7 +1151,7 @@ test('through the real hook entry: GitHub that never answers, even with 5,000 pe
 
 const MARKED = `-- pipeline: apply-after-deploy\n${SQL}`;
 const OTHER_SHA = 'c'.repeat(40);
-const DEPLOY_REG = { deployEnv: 'Production', deployBot: 'vercel', deploySince: isoAt(NOW - 7_200_000) };
+const DEPLOY_REG = { deployEnv: 'Production', deployBot: 'vercel', deploySince: isoAt(NOW - 7_200_000), deployClock: 'github' };
 const bot = (login = 'vercel') => ({ __typename: 'Bot', login });
 const dnode = (over = {}) => ({ commitOid: COMMIT, createdAt: isoAt(NOW - 3_100_000), environment: 'Production', originalEnvironment: 'Production', latestEnvironment: 'Production', state: 'ACTIVE', creator: bot(), latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot() }, ...over });
 const withStatus = (over) => dnode({ latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot(), ...over } });
@@ -1193,6 +1193,17 @@ test('after-deploy: a marked file whose newest and latest completed Production d
   const [old] = readAttemptLog({ home: plain.home }).events;
   assert.deepEqual([old.afterDeploy, old.deployEnv, old.deployedAt], [null, null, null]);
   assert.equal('afterDeploy' in body(gfile(plain, 'name', 1)), false);
+});
+
+test('after-deploy: a registration an earlier revision stamped with the owner\'s clock (no deployClock) is not trusted: nothing is asked or claimed, the owner is told to register again', async (t) => {
+  // Failure caught: an old registration whose cut-off came from a slow local clock still letting a PR merged before the real registration apply with no go.
+  const { deployClock, ...old } = DEPLOY_REG;
+  const s = await deployScene(t, { registration: old });
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /earlier version of the pipeline.*after-deploy on/);
+  assert.equal(s.calls.length, 0);
+  assert.deepEqual(hist(s), []);
 });
 
 test('after-deploy: a marked file of an entry without the registration is refused with GitHub asked nothing (the owner\'s click stays)', async (t) => {
