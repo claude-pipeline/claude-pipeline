@@ -35,8 +35,11 @@ const now = () => {
     const parent = canonical(dirname(file));
     if (parent === null || !parent.startsWith(real + sep)) throw new Error(`db-refs-owner-child: refusing to write to ${file}: its folder resolves outside the test home`);
     let linked = false;
-    try { linked = lstatSync(file).isSymbolicLink(); } catch { /* absent: the write creates it */ }
+    let hardLinked = false;
+    try { const st = lstatSync(file); linked = st.isSymbolicLink(); hardLinked = st.nlink > 1; } catch { /* absent: the write creates it */ }
     if (linked) throw new Error(`db-refs-owner-child: refusing to write through the symlink ${file}`);
+    // (a hard link could point at a registry outside the test home)
+    if (hardLinked) throw new Error(`db-refs-owner-child: refusing to write to ${file}: it is a hard link (link count above 1)`);
     writeFileSync(file, `${JSON.stringify(during, null, 2)}\n`);
   }
   return Date.now();
