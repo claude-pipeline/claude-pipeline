@@ -300,8 +300,8 @@ test('preflight: an invalid registry file is reported when the repo has supabase
 // ---- auto-apply (Task 1): the registry's autoMigrations flag -------------------------------------------------------------------------------------------------------------
 
 const ON = { autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' };
-const DEPLOY = { deployEnv: 'Production', deployBot: 'vercel', deploySince: '2026-11-28T01:00:00Z', deployClock: 'github' };
-const NO_DEPLOY = { deployEnv: null, deployBot: null, deploySince: null, deployClock: null };
+const DEPLOY = { deployEnv: 'Production', deployBot: 'vercel', deploySince: '2026-11-28T01:00:00Z', deployClock: 'github', deployProof: 'two-phase' };
+const NO_DEPLOY = { deployEnv: null, deployBot: null, deploySince: null, deployClock: null, deployProof: null, deployPending: null };
 const LIVE = (over = {}) => ({ ref: REF, name: 'EagleWatch live', repo: 'acme/widgets', kind: 'live', ...over });
 
 test('readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry, one without repo or one without a valid autoSince, is invalid', (t) => {
@@ -503,7 +503,10 @@ test('readDbRefs: the after-deploy keys are all-or-none, only with auto-apply on
   seedRegistry(home, { refs: [LIVE(ON)] });
   assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...NO_DEPLOY }, 'a registry without the keys reads as before');
   seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY })] });
-  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...DEPLOY });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...DEPLOY, deployPending: null });
+  const pending = { env: 'Production', bot: 'vercel', since: '2026-11-28T01:00:00Z' };
+  seedRegistry(home, { refs: [LIVE({ ...ON, deployPending: pending })] });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...NO_DEPLOY, deployPending: pending }, 'a staged registration alone is a valid registry and carries no active keys');
   seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY, deployEnv: 'Production – eaglewatch' })] });
   assert.equal(readDbRefs(home).refs[0].deployEnv, 'Production – eaglewatch', 'an en dash is a valid environment character');
   const { deployEnv, deployBot, deploySince } = DEPLOY;
@@ -512,6 +515,7 @@ test('readDbRefs: the after-deploy keys are all-or-none, only with auto-apply on
     LIVE({ ...DEPLOY }), LIVE({ autoMigrations: false, ...DEPLOY }),
     LIVE({ ...ON, ...DEPLOY, deployBot: 'github-actions' }), LIVE({ ...ON, ...DEPLOY, deployBot: 'Vercel' }), LIVE({ ...ON, ...DEPLOY, deployBot: 'vercel[bot]' }), LIVE({ ...ON, ...DEPLOY, deployBot: '' }),
     LIVE({ ...ON, ...DEPLOY, deployEnv: '' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'x'.repeat(101) }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'Prod\nuction' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 7 }),
+    LIVE({ ...ON, ...DEPLOY, deployClock: 'pending' }), LIVE({ ...ON, ...DEPLOY, deployProof: 'x' }), LIVE({ ...ON, deployPending: { ...pending, bot: 'github-actions' } }), LIVE({ autoMigrations: false, deployPending: pending }), LIVE({ ...ON, deployPending: 'x' }),
     LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28' }), LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28T01:00:00' }), LIVE({ ...ON, ...DEPLOY, deployEnv: null }),
   ]) {
     seedRegistry(home, { refs: [bad] });
@@ -524,15 +528,15 @@ const fakeGithubClock = (t, date) => {
   const dir = scratchHome(t);
   const script = join(dir, 'fake-gh.mjs');
   const dates = [date].flat();
-  // (one Date per call, the last one repeated: the command reads GitHub's time twice)
-  writeFileSync(script, date === null
-    ? 'process.stderr.write("gh: not signed in\\n"); process.exit(4);\n'
-    : `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
+  // (one Date per call, the last one repeated: the command reads GitHub's time twice; a null entry is a failing call)
+  writeFileSync(script, `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
 const counter = ${JSON.stringify(join(dir, 'calls'))};
 const n = existsSync(counter) ? Number(readFileSync(counter, 'utf8')) : 0;
 writeFileSync(counter, String(n + 1));
 const dates = ${JSON.stringify(dates)};
-process.stdout.write(\`HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\nDate: \${dates[Math.min(n, dates.length - 1)]}\\r\\n\\r\\n{}\\n\`);\n`);
+const d = dates[Math.min(n, dates.length - 1)];
+if (d === null) { process.stderr.write('gh: not signed in\\n'); process.exit(4); }
+process.stdout.write(\`HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\nDate: \${d}\\r\\n\\r\\n{}\\n\`);\n`);
   return { PIPELINE_GH: `node "${script}"` };
 };
 
@@ -572,16 +576,36 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   assert.deepEqual([entry.deployEnv, entry.deployBot, entry.autoMigrations], ['Production', 'vercel', true]);
   assert.equal(entry.deploySince, '2026-11-20T10:00:00.000Z', 'deploySince is GitHub\'s time, not this machine\'s');
   assert.equal(entry.deployClock, 'github');
-  // Failure caught: a terminal that stalls after reading GitHub's time (or whose local clock is corrected backwards) finishing a registration backdated by minutes: GitHub's time read AFTER the first write must be within a minute of the first.
+  assert.equal(entry.deployProof, 'two-phase');
+  assert.equal(entry.deployPending, null, 'the staged registration is gone once it is published');
+  // Failure caught: a registration published although GitHub's clock moved backwards or by more than a minute between the staging write and the second read (a stall, a cached answer), or one that goes active, for an older reader, before it finished; and a failed second phase wrongly telling the owner an earlier registration is gone.
+  const earlier = LIVE({ ...ON, ...DEPLOY, deployBot: 'old-bot' });
+  const T1 = 'Fri, 20 Nov 2026 10:00:00 GMT';
+  for (const [what, second] of [['61 s later', 'Fri, 20 Nov 2026 10:01:01 GMT'], ['10 s earlier', 'Fri, 20 Nov 2026 09:59:50 GMT']]) {
+    seedRegistry(home, { refs: [earlier] });
+    const stale = runOwnerCli(home, on, fakeGithubClock(t, [T1, second]));
+    assert.equal(stale.exitCode, 1, what);
+    assert.equal(stale.output.error, 'github-time-stale', what);
+    assert.match(stale.output.message, /did not finish.*earlier registration, if any, is still in force with its old settings/, what);
+    const left = readDbRefs(home).refs[0];
+    assert.deepEqual({ ...left, deployPending: null }, { ...earlier, deployProof: 'two-phase', deployClock: 'github', deployPending: null, repo: 'acme/widgets', autoMigrations: true, autoSince: ON.autoSince }, `${what}: the active registration is untouched`);
+    assert.deepEqual(left.deployPending, { env: 'Production', bot: 'vercel', since: '2026-11-20T10:00:00.000Z' }, `${what}: staged only`);
+  }
+  // the second read failing leaves the earlier registration in force; the first failing changes nothing at all
+  seedRegistry(home, { refs: [earlier] });
+  const midway = runOwnerCli(home, on, fakeGithubClock(t, [T1, null]));
+  assert.equal(midway.output.error, 'github-unreachable');
+  assert.match(midway.output.message, /did not finish.*earlier registration, if any, is still in force with its old settings/);
+  assert.deepEqual([readDbRefs(home).refs[0].deployBot, readDbRefs(home).refs[0].deploySince], ['old-bot', DEPLOY.deploySince]);
+  seedRegistry(home, { refs: [earlier] });
+  const untouched = readFileSync(dbRefsFile(home), 'utf8');
+  const before1 = runOwnerCli(home, on, fakeGithubClock(t, null));
+  assert.match(before1.output.message, /nothing was changed.*earlier after-deploy registration, if any, is still in force/);
+  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), untouched, 'byte-identical');
   seedRegistry(home, { refs: [LIVE(ON)] });
-  const stale = runOwnerCli(home, on, fakeGithubClock(t, ['Fri, 20 Nov 2026 10:00:00 GMT', 'Fri, 20 Nov 2026 10:01:01 GMT']));
-  assert.equal(stale.exitCode, 1);
-  assert.equal(stale.output.error, 'github-time-stale');
-  assert.deepEqual([readDbRefs(home).refs[0].deploySince, readDbRefs(home).refs[0].deployClock], ['2026-11-20T10:00:00.000Z', 'pending'], 'left pending, which the guard does not trust');
-  seedRegistry(home, { refs: [LIVE(ON)] });
-  const finished = runOwnerCli(home, on, fakeGithubClock(t, ['Fri, 20 Nov 2026 10:00:00 GMT', 'Fri, 20 Nov 2026 10:00:05 GMT']));
+  const finished = runOwnerCli(home, on, fakeGithubClock(t, [T1, 'Fri, 20 Nov 2026 10:00:05 GMT']));
   assert.equal(finished.exitCode, 0, JSON.stringify(finished.output));
-  assert.deepEqual([readDbRefs(home).refs[0].deploySince, readDbRefs(home).refs[0].deployClock], ['2026-11-20T10:00:00.000Z', 'github']);
+  assert.deepEqual([readDbRefs(home).refs[0].deploySince, readDbRefs(home).refs[0].deployClock, readDbRefs(home).refs[0].deployProof], ['2026-11-20T10:00:00.000Z', 'github', 'two-phase']);
   const shown = (await run(['show'], ownerCtx(home))).output.refs[0];
   assert.deepEqual([shown.deployEnv, shown.deployBot, shown.deploySince], ['Production', 'vercel', entry.deploySince]);
   // a second on replaces both and moves the cut-off to now
@@ -595,7 +619,7 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   const kept = LIVE({ ...ON, ...DEPLOY });
   seedRegistry(home, { refs: [kept] });
   runOwnerCli(home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'ACME/widgets']);
-  assert.deepEqual(readDbRefs(home).refs[0], { ...kept, name: 'Renamed', repo: 'ACME/widgets' }, 'a label-only set keeps the registration');
+  assert.deepEqual(readDbRefs(home).refs[0], { ...kept, deployPending: null, name: 'Renamed', repo: 'ACME/widgets' }, 'a label-only set keeps the registration');
   for (const args of [['after-deploy', 'off', '--ref', REF], ['auto-migrations', 'off', '--ref', REF], ['set', '--ref', REF, '--name', 'x', '--repo', 'other/x'], ['set', '--ref', REF, '--name', 'x', '--repo', 'acme/widgets', '--dev']]) {
     seedRegistry(home, { refs: [kept] });
     const done = runOwnerCli(home, args);
