@@ -165,7 +165,7 @@ const stepOf = (over = {}) => ({ kind: 'say-merge', line: `Head ${'a'.repeat(12)
 
 test('withAsk: an ownerStep that is not a say-merge, or a closing that binds nothing, is not asked (the reason is named)', () => {
   const home = newHome();
-  const args = { root: tmpdir(), config: OK_CONFIG, pr: 5, slug: 'acme/widgets', ctx: { home, managedPaths: [] } };
+  const args = { root: tmpdir(), config: OK_CONFIG, pr: 5, slug: 'acme/widgets', ctx: { home, env: { AI_AGENT: 'claude-code_2-1-323_agent' }, managedPaths: [] } };
   for (const ownerStep of [null, { kind: 'owner-runs', command: 'x' }, { kind: 'owner-approval-flags', reason: 'x' }]) {
     const r = withAsk({ exitCode: 0, output: { ownerStep, blockers: [] } }, args);
     assert.equal(r.output.ask, null);
