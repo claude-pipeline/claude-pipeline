@@ -29,7 +29,8 @@ command. Do exactly that, prove it, and report briefly. Work through the task li
 5. Run the quick-verify command you were given ALWAYS as a managed job, like the verifier: start it with
    `node ~/.claude/pipeline/bin/pipeline.mjs job start verify-quick -- <command>` and poll with
    `node ~/.claude/pipeline/bin/pipeline.mjs job wait verify-quick --run-id <runId> --timeout 540` (`runId` is in the
-   start output). If it fails, fix and rerun until it passes. Any other command that can run longer than 9 minutes
+   start output). A command with `&&`, a pipe or a redirect runs whole inside the job only through an explicit shell:
+   `job start verify-quick -- bash -c "<command>"`. If it fails, fix and rerun until it passes. Any other command that can run longer than 9 minutes
    goes the same way, under its own job name. Waiting is capped:
    - No unmanaged background process and no hand-written wait loop, ever (`until … sleep`, `while … sleep`,
      `gh run watch`, polling a file or a port). Never set `run_in_background` on a Bash call. Long commands go only
