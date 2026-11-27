@@ -1,6 +1,9 @@
 # Auto-apply merged migrations: design
 
-Status: design, owner approach pick 2026-11-27 ("After the merge only"). Plan: `docs/plans/2026-11-27-auto-apply-migrations.md`.
+Status: design, owner approach pick 2026-11-27 ("After the merge only"), approved as written 11-27. **Revision 2 (11-27):** the Codex
+plan review R1 (7 × P1) hardened the claim, the time budget, the GitHub proof and the marker files; the owner chose (11-27) that a
+migration marked `-- pipeline: apply-after-deploy` keeps the go (one click after the deploy; the deploy-checked variant is idea #882).
+Plan: `docs/plans/2026-11-27-auto-apply-migrations.md`.
 
 ## Why
 
@@ -12,48 +15,56 @@ said: "go with auto apply already do it now disregard the pause". For a migratio
 
 ## Goals
 
-- A migration file that is on the default branch of the repo the owner registered for a live project is applied by Claude
-  (Supabase MCP `apply_migration`) with no further owner word, when the owner switched auto-apply on for that project.
+- A migration file that a merged PR added to the default branch of the repo the owner registered for a live project is applied by
+  Claude (Supabase MCP `apply_migration`) with no further owner word, when the owner switched auto-apply on for that project.
 - The switch is the owner's alone (own terminal), per project, default off.
-- Each auto-apply leaves a record the owner can read (what, where, which PR, when).
+- Each attempt leaves a record the owner can read (what, where, which PR, when).
 - Claude says in the merge request that merging also applies the PR's migrations, and reports each apply afterwards.
 
 ## Non-goals
 
 - Data SQL (`execute_sql` writes), including a live dry run (`begin; … rollback;`), keeps the go.
 - A migration applied BEFORE its PR merges keeps the go (the existing `live-db present --ask` path, unchanged).
+- A migration marked `-- pipeline: apply-after-deploy` keeps the go (owner, 11-27): the guard has no deploy evidence it can trust
+  without new owner setup (#882).
 - `supabase db push` stays owner-only. DRMed is not covered: its rule is the owner's `db push` before the merge, never MCP
   `apply_migration`; its switch stays off.
 - No change to how the guard handles any other Supabase tool or any dev project.
 
 ## Anti-goals (a failure even if it "works")
 
-- An agent applies SQL the owner never approved through a merge (a PR branch, a local file, an edited copy, another repo's file).
+- An agent applies SQL the owner never approved through a merge (a PR branch, a local file, an edited copy, another repo's file, a
+  direct push, an old migration renamed into a new name).
 - An agent turns the switch on, or makes the guard believe it is on.
-- The migration reaches the wrong project (an EagleWatch file applied to DRMed's database).
-- The pipeline applies the same migration twice (a retry, a second session, an edited file with the same name).
-- A GitHub outage or an unreadable answer becomes an allow.
+- The migration reaches the wrong project (an EagleWatch file applied to DRMed's database) or is read from the wrong GitHub host.
+- The pipeline applies the same migration twice (a retry, a second session, an old go, an edited file with the same name, the same
+  SQL under a second name).
+- A GitHub outage, an unreadable answer, an unreadable record or a hook that runs out of time becomes an allow.
 - A failed apply goes unreported.
 
 ## Approaches
 
 1. **After the merge only; GitHub's default branch is the proof (picked by the owner, 11-27).** The guard asks GitHub for the file on
-   the registered repo's default branch and allows the call only when the query is byte-identical. Simple, self-contained, works from
-   any session. Cost: a migration that fails on the live database no longer stops the merge; the code is already merged and going
-   live, so Claude flags it at once (revert or fix forward).
-2. **Also at the owner's "merge", before merging.** "Before" migrations apply when the owner says merge, and a failed one blocks the
-   merge. Rejected for now: the guard would also have to verify the owner's recorded merge word (transcript proof, clicks, queue),
-   more code in the most sensitive part, more review rounds, later ship. Can be added later if a post-merge failure ever happens.
+   the registered repo's default branch and allows the call only when the query is byte-identical and a merged PR added the file.
+   Simple, self-contained, works from any session. Cost: a migration that fails on the live database no longer stops the merge; the
+   code is already merged and going live, so Claude flags it at once (revert or fix forward).
+2. **Also at the owner's "merge", before merging.** Rejected for now: the guard would also have to verify the owner's recorded merge
+   word (transcript proof, clicks, queue), more code in the most sensitive part, more review rounds, later ship.
 3. **Local `origin/main` as the proof.** Rejected: an agent can rewrite local refs (`git update-ref`), so a local ref proves nothing.
 
 ## Facts checked (2026-11-27)
 
-- One GitHub GraphQL call returns, for `eaglewatch-ph/eaglewatch`: the default branch and its head, the file's text byte-identical to
-  `git show origin/main:<file>` (checked on a 3,939-byte and a 100,008-byte migration; `isTruncated: false`), and the last commit that
-  touched the file with its date and PR number (#2582). 0.8 s and 1.5 s. The guard hook's timeout is 15 s.
+- One GitHub GraphQL call (`gh api --hostname github.com graphql`) returns, for `eaglewatch-ph/eaglewatch`: the repository's
+  `nameWithOwner`, the default branch and its head, the file's text byte-identical to `git show origin/main:<file>` (a 3,939-byte and a
+  100,008-byte migration; `isTruncated: false`; 0.8 s and 1.5 s), and the commits on that branch that touched the path. For #2582's
+  migration: exactly one commit `5ce2dd82d904`, which is the PR's `mergeCommit`; the PR is `merged: true`, base `main`, 53 files, and the
+  file's `changeType` in it is `ADDED` (EagleWatch merges by squash through its merge queue).
+- The guard hook's host timeout is 15 s (`HOOK_TIMEOUT_S`); the guard's own hard wall cap is 10 s from the hook process start
+  (`EVAL_WALL_CAP_MS`, `HOOK_CLOCK`), and a child process is bounded by what is left of it (`wallLeftMs`, the `git-wiring.mjs` pattern).
+  Claude Code ALLOWS a hook that outruns its timeout, so every blocking step must fit the cap.
 - EagleWatch makes migrations a hard stop (`supabase/migrations/**`), so a migration reaches main only through the owner's "merge".
 - The owner's registry `~/.claude/pipeline-state/db-refs.json` does not exist yet on the Mac (every project counts as live, unnamed).
-  EagleWatch's live ref is `qhptbmafrosgibooelpp`.
+  EagleWatch's live ref is `qhptbmafrosgibooelpp`. The Mac holds 44 consumed go markers, none empty.
 - EagleWatch applies migrations at two moments: before the code deploys (schema the new code needs) and after the deploy (tightening
   the old code would trip over; #2582's second migration). Its prod ledger holds `apply_migration` stamps, so "is it live?" is
   answered by the effect (column, policy, function body), not the ledger.
@@ -64,73 +75,111 @@ said: "go with auto apply already do it now disregard the pause". For a migratio
 
 ### 1. The switch (owner-only)
 
-- A registry entry may carry `autoMigrations: true`, only on a `kind: live` entry that has a `repo`. `readDbRefs` returns it; a value
-  that is present but not a boolean makes the registry invalid (fail closed, as for any bad field).
+- A registry entry may carry `autoMigrations: true`, only on a `kind: live` entry that has a `repo`. `readDbRefs` returns it as a
+  boolean (false when absent); a value that is present but not a boolean, or true on a dev entry or one without a repo, makes the
+  registry invalid (fail closed, as for any bad field). The writer writes the key only when it is true.
 - New owner command: `pipeline db-refs auto-migrations on|off --ref <ref>`. Refused inside Claude Code (same `insideClaudeCode` check
-  as `set`) and refused to an agent's Bash line by the existing `db-refs` rule (anything but `show`). Refuses an unknown ref, a dev
-  ref and an entry without `repo`. `show` prints the flag.
-- `set` on an existing ref keeps its flag; `set --dev` drops it (a dev project needs no go at all).
-- Default off: nothing changes until the owner runs it.
+  as `set`) and refused to an agent's Bash line by the existing `db-refs` rule (anything but `show`). `on` refuses an unknown ref, a
+  dev ref, an entry without `repo`, and a repo another enabled entry already has (one unambiguous target per repo). `on` prints what it
+  trusts: every PR merged by squash into that repo's default branch; migrations there must need the owner's merge (a hard stop on
+  `supabase/migrations/**`). `show` prints the flag.
+- `set` on an existing ref keeps the flag only when it stays live with the same repo (a label-only edit); a changed repo or `--dev`
+  clears it.
+- Default off: nothing changes until the owner runs it. Rollout default: on ONE machine (the Mac), so markers, which are per machine,
+  are on the machine that applies.
 
-### 2. The guard's auto path (`apply_migration` only)
+### 2. The attempt record (both paths)
+
+- Two exclusive-create markers per apply in `~/.claude/pipeline-state/owner-go/live-db-attempts/` (inside the protected `owner-go`
+  tree): `name-<id>.json`, id = first 32 hex of sha256(`name|<ref>|<name>`), and `sql-<id>.json`, id = first 32 hex of
+  sha256(`sql|<ref>|<sha256 of the query>`). Same body in both: time, `via` (`auto` | `go`), session, ref, label, name, file, sha256, and
+  for `auto` the GitHub facts (repo, branch, head, commit, commit date, PR).
+- Lookups are by exact filename, never a search: missing folder or file = none; a regular file = an attempt at its recorded time, or at
+  its mtime when the body has no valid time (empty, unparsable, a partial write); anything else (a folder, a symlink, a read error) = the history
+  is unreadable, which disables auto-apply and refuses the go path for that call, naming the path.
+- Written completely (every `writeSync` byte counted), fsynced, closed, the folder fsynced (POSIX; Windows cannot fsync a folder and
+  relies on NTFS metadata journaling: documented) before the allow.
+- The consumed go markers written before this change (`live-db-consumed/`, no name) are scanned once per auto check for a migration
+  marker of this ref with this sha256: an unreadable folder, entry or body disables auto-apply (fail closed; the reason names the file).
+- One private writer in the new module; it exports only fixed-destination claims that derive the folder, the id and the body
+  themselves (an attempt claim, the go's consumed marker), so no caller can create the registry or any other protected file through
+  it. Every marker it can create only ever withholds an allow.
+
+### 3. The guard (`apply_migration` only)
 
 Inside `evaluateSupabaseMcp`, after every existing check (registry readable, well-formed project id, trusted server, not dev, a query
-and a name). Only when the ref's entry has `autoMigrations: true`; otherwise the existing go claim runs unchanged.
+and a name). One time budget for the call: what is left of the hook's wall cap (`leftMs`), passed through every blocking step (the go
+path's git reads and the GitHub calls); a step that cannot start in time is not run and the call is denied ("try again").
 
-Local checks first, in this order (no network until they pass):
-1. `name` is a plain file stem (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$`); the file is `supabase/migrations/<name>.sql`.
-2. The query passes the character rules of the typed go (not empty, no CR or NUL, no control or bidirectional-text characters) but
-   NOT its display rules (300-line cap, fence lines): nobody has to read it on screen.
-3. No earlier attempt on this machine: no auto marker for (ref, name) (step 7), and no auto or consumed go marker for this ref with
-   this sha256 (the exact SQL was already applied, under this name or another).
+**The go first** (local, fast when no go is recorded). For each verified, unexpired go record:
+1. If an attempt marker for this name or this SQL is at or after the go's own time, the go is not used (it is older than the attempt:
+   a retry needs a go given after it, after a read-only check of the live state).
+2. Consume the go (its existing exclusive marker), then create the two attempt markers (`via: go`). A marker that already exists is
+   fine when its time is before the go's; one at or after it means another session attempted meanwhile: deny. A write failure: deny.
+3. Allow.
 
-Then ONE GitHub call (`gh api graphql`, through the pipeline's `gh` runner, ≤ 8 s) on the entry's `repo`: default branch name and
-head; the file at that head (text, binary, truncated); the last two commits on that branch that touched the path (oid, date, first PR).
-4. The file exists there, is text, not truncated, and its bytes equal the query's bytes exactly.
-5. Exactly ONE commit on that branch touched the path (the file was added and never edited: a later edit of an old, already-applied
-   migration must not make it "recent" again), and that commit is at most 7 days old (not in the future past the usual skew). An
-   older or edited file is a deliberate act: it takes the owner's go. This also bounds a session that "catches up" on old files.
-6. Any GitHub failure (no `gh`, non-zero exit, timeout, bad JSON, no such repo or branch) makes the call not eligible.
+**Then auto**, only when no go was claimed, the call's ref has `autoMigrations: true` and no other enabled entry has the same repo.
+Local checks first (no network until they pass):
+1. The query has no line `-- pipeline: apply-after-deploy` (anywhere, any case): those keep the go.
+2. `name` is a plain file stem (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$`); the file is `supabase/migrations/<name>.sql`.
+3. The query passes the character rules of the typed go (not empty, valid UTF-8, no CR or NUL, no control or bidirectional-text
+   characters) but NOT its display rules (300-line cap, fence lines): nobody has to read it on screen.
+4. No attempt marker for this name or this SQL; no legacy consumed migration marker for this ref and SQL.
 
-Claim:
-7. Exclusive-create marker `~/.claude/pipeline-state/owner-go/live-db-auto/<sha256(ref|name), 32 hex>.json`, written durably before the
-   allow (same open/fsync pattern as the go marker), holding: time, session, ref, label, name, file, sha256, repo, branch, head,
-   commit, commit date, PR. `EEXIST` means already attempted. The folder is inside the protected `owner-go` tree, so an agent cannot
-   delete a marker to retry.
+Then ONE GitHub GraphQL call, `gh api --hostname github.com graphql` (pinned host), timeout min(6 s, time left): the repository's
+`nameWithOwner`, default branch and head, the file at that head, the commits on that branch that touched the path (at most two), and
+for that commit its associated PRs (merged, base, merge commit, files with change type). Eligible only when ALL hold:
+5. The answer has no `errors` (a partial answer counts as a failure); `nameWithOwner` equals the registry `repo` (case-insensitive).
+6. The file exists at the head, is text, not truncated, and its bytes equal the query's bytes exactly.
+7. Exactly ONE commit on the branch touched the path, committed (strict ISO time with a zone) at most 7 days ago and not past the
+   future skew.
+8. That commit is the `mergeCommit` of a PR that is `merged`, whose base is the default branch, and whose files list the path as
+   `ADDED` (a rename, a direct push, a merge-commit or rebase merge, a delete and re-add are not eligible). A PR with more than 100
+   files is paged while time is left; not found = not eligible.
+9. Any GitHub failure (no `gh`, non-zero exit, timeout, bad JSON, no such repo or branch) = not eligible.
+
+Claim: create the two attempt markers (`via: auto`); either one already there = already attempted. Both created: allow.
 
 Outcomes:
-- Eligible and claimed: allow. Consumed at the attempt, like a go: a failed or interrupted auto-apply is never retried
-  automatically; the next attempt needs the owner's go, after a read-only check of the live state.
-- Not eligible: fall through to the existing go claim. If no go is recorded, the deny says why auto-apply did not apply, then the
-  existing go guidance.
-- Every `apply_migration` allowed through a go also takes the (ref, name) marker (best effort; `EEXIST` ignored), so a migration the
-  owner applied with a go is never auto-applied again.
+- A failed or interrupted auto-apply is never retried automatically; the next attempt needs the owner's go given after the attempt,
+  after a read-only check of the live state.
+- Not eligible: the deny gives the existing go guidance plus why auto-apply did not apply.
 
-### 3. What the owner can see
+### 4. What the owner can see
 
-- The markers are the record. `pipeline live-db auto-log [--days N]` (read-only, runs anywhere) lists them, newest first.
-- The session reports each apply in plain English (section 4).
+- The markers are the record. `pipeline live-db auto-log [--days N]` (read-only, runs anywhere) lists ATTEMPTS (auto and go), newest
+  first, and any unreadable record (which is what disables auto-apply). "Applied" is only what the session's effect check confirms.
+- The session reports each apply in plain English (section 5).
 
-### 4. The review skill (`skills/review/reference/owner-merge.md` "Live-database go", `ready-and-handoff.md`, `docs/cli.md`)
+### 5. The review skill (`skills/review/reference/owner-merge.md` "Live-database go", `ready-and-handoff.md`, `docs/cli.md`)
 
-- **Merge request:** when `P db-refs show` has auto-apply on for the repo's project and the PR adds migration files, say in plain
-  English above the closing lines that merging also applies them to the live database right after the merge (naming any that wait
-  for the deploy).
-- **After the merge job reports merged,** for each migration file the PR added, in filename order:
-  1. A file whose first line is `-- pipeline: apply-after-deploy` waits until the production deployment of the merge commit is live
-     (the repo's production watch: its workflow run on the merge commit, or GitHub's deployment status for that sha). The others apply
-     right away: the new version is usually still building, so the schema lands first.
-  2. Is it already live? A read-only check of its effect (and `list_migrations` by name). Live ⇒ skip it and say so.
-  3. `apply_migration` with `name` = the file stem and `query` = the bytes of `git show origin/main:<file>` after a fetch.
-  4. Read-only check of the effect. Report it.
+- **Merge request:** when `P db-refs show` has exactly one enabled live entry whose `repo` is this repo and the PR adds migration files,
+  say in plain English above the closing lines that merging also applies them to that project right after the merge, naming any marked
+  apply-after-deploy (they wait for the deploy and one click). A file marked after-deploy that sorts BEFORE an unmarked one is fixed
+  (renumbered) before the merge request.
+- **After the merge:** only on the merge job's `merged: true` (its `mergeSha`) or `error: hold-recovery` with `prMerged: true` (the
+  merge commit from `gh pr view N --json mergeCommit`). A merge reported under a veto (the queue's "merged while it was being dequeued
+  for a stop condition", or the sweep's report) applies nothing: tell the owner, then the go path on their word. The files are those
+  `git diff --name-status <mergeSha>^ <mergeSha> -- supabase/migrations/` lists as added, in filename order, read with
+  `git show <mergeSha>:<file>` after `git fetch origin <mergeSha>` (never `origin/main`: the default branch may have another name).
+  For each file:
+  1. Marked apply-after-deploy: stop the automatic sequence here; wait for the production deployment of `mergeSha` (the repo's
+     production watch, at most `deploy_timeout_minutes`; a failed or rolled-back deploy, or a timeout: tell the owner, apply nothing);
+     then the go path for that file; then carry on with the next files.
+  2. State the expected effect (every object the file creates or changes; for a policy: its roles, command and predicate, and the
+     table's RLS state).
+  3. Is it already live? A read-only check of that effect. Live ⇒ skip it and say so.
+  4. `apply_migration` with `name` = the file stem and `query` = those bytes.
+  5. Read-only check of the full effect. Report "applied" only when every part matches; an inconclusive check stops the sequence.
   - A refusal or failure stops the remaining files of that PR: 🚨 tell the owner (the code is live without that schema), read-only
-    look at the live state, then the go path.
+    look at the live state, then the go path. Rolling the code back and repairing the database are separate owner decisions.
 - A migration that must be live before its code deploys and cannot take the build-time gap or a failed apply after the merge: apply
   it before the merge with the go (unchanged), or split it into its own PR first.
-- With auto-apply, DO-wrap a top-level `DROP` in the file itself; a file the tool cannot pass byte-for-byte (a literal `\uXXXX`) still
-  takes the owner's go.
+- With auto-apply, DO-wrap a top-level `DROP` in the file itself. A file the tool cannot pass byte-for-byte (a literal `\uXXXX`) is
+  refused by both paths: the owner applies it in their own terminal.
+- The report names the machine that applied (markers are per machine).
 
-### 5. EagleWatch's local rules (outside the PR, when the owner turns the switch on)
+### 6. EagleWatch's local rules (outside the PR, when the owner turns the switch on)
 
 `~/Claude/eaglewatch/AGENTS.md` step 3 ("Prod gets a migration only with the owner's explicit go") and the `eaglewatch-db-changes`
 skill (prod dry run, DROP wrap, the after-deploy header) are rewritten to match, in the same session that confirms the switch is on.
@@ -138,40 +187,32 @@ Before that they would contradict the guard.
 
 ## Tests (at the seams; each names the failure it catches)
 
-Guard (`test/live-db-guard.test.mjs`, GitHub faked through the `liveDbIo` seam):
-- allow: switch on, file on the default branch, identical bytes, recent; the marker holds the PR and commit. *(the feature works)*
-- switch off: same call needs the go and makes no GitHub call. *(default off really is off)*
-- one byte different (trailing newline): needs the go. *(an edited copy is not the merged file)*
-- file absent on the default branch (only on a PR branch): needs the go. *(an unmerged file is not applied)*
-- last commit older than 7 days: needs the go. *(old files take a deliberate go)*
-- two commits touched the file (added, later edited): needs the go. *(an edited old migration is not re-applied)*
-- second attempt, same ref and name, even with other bytes: needs the go. *(no double apply, no edited re-apply)*
-- a consumed go marker for this ref and sha: needs the go. *(already applied with a go)*
-- GitHub fails or times out: deny, not allow. *(fail closed)*
-- the GitHub question names the entry's `repo`. *(no cross-project apply)*
-- `execute_sql` data SQL with the switch on: still needs the go. *(scope stays migrations)*
-- a go-claimed apply takes the (ref, name) marker; a later auto attempt is refused. *(go then auto = twice)*
-
-Registry (`test/db-refs.test.mjs`): `auto-migrations on` refused inside Claude Code, refused for dev / no repo / unknown ref; `set`
-keeps the flag, `set --dev` drops it; a non-boolean flag makes the registry invalid. The agent-line refusal of
-`pipeline db-refs auto-migrations on` (existing rule): one assertion.
+Listed per task in the plan. In short: the feature works once; switch off asks GitHub nothing; edited bytes, an unmerged file, an old
+or edited file, a rename, a direct push, a non-squash merge, a partial GitHub answer, another repo's answer and another host are not
+eligible; an old go cannot apply a second time after an auto attempt (one session and across sessions); auto and go, two processes,
+and the same SQL under two names give one allow; short writes and unreadable history refuse; a slow GitHub answer through the real hook
+entry is a deny within the host timeout; `execute_sql` keeps the go; the switch's owner-only rules and repo-change rules hold.
 
 ## Residual risks (accepted)
 
-- Deliberate subversion (a replaced `gh` or `git` binary, an edited gh config that reroutes its requests) is outside the threat model,
-  as for the guard's existing git reads: a tripwire, not a boundary.
-- Markers are per machine: the Mac and the PC could each auto-apply once. The skill's "is it live?" check covers it.
+- Deliberate subversion (a replaced `gh` or `git` binary, an edited gh config, a script that writes or deletes protected files
+  directly) is outside the threat model, as for the guard's existing reads: a tripwire, not a boundary.
+- Markers are per machine: with the switch on two machines, each could attempt once. Mitigation: switch on one machine; the skill's
+  "is it live?" check.
 - A migration the owner applied outside the guard (`!` in a terminal) leaves no marker: the skill's "is it live?" check covers it.
 - A failed apply after the merge leaves the new code live without its schema until fixed (the owner's accepted trade-off).
+- Auto-apply trusts the repo's merge rules: a PR that merges without the owner (a repo with no hard stop on migrations) would apply.
+  `auto-migrations on` says so; the owner enables it only for such a repo.
+- The MCP server must honor the call's `project_id` (the existing guard's assumption: only trusted servers).
 
 ## Left to the builder
 
-The exact GraphQL text and timeout; the marker and `auto-log` output formats; how the character rules are factored out of
-`migrationSqlProblem`; the deny wording.
+The exact GraphQL text; the marker and `auto-log` output formats; how the character rules are factored out of `migrationSqlProblem`;
+the deny wording.
 
 ## Rollout
 
-PR → owner "merge" → `pipeline update` (Mac; the PC when it is online) → owner, own terminal:
+PR → owner "merge" → `pipeline update` (Mac; the PC when it is online) → owner, own terminal, on the Mac only:
 `pipeline db-refs set --ref qhptbmafrosgibooelpp --name "EagleWatch live" --repo eaglewatch-ph/eaglewatch`, then
-`pipeline db-refs auto-migrations on --ref qhptbmafrosgibooelpp` → Claude updates EagleWatch's local rules (section 5) → the next
-merged EagleWatch migration is the live check (applied with no go, marker present, `auto-log` lists it).
+`pipeline db-refs auto-migrations on --ref qhptbmafrosgibooelpp` → Claude updates EagleWatch's local rules (section 6) → the next
+merged EagleWatch migration is the live check (applied with no go, its attempt in `auto-log`, the effect check matches).
