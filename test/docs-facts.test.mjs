@@ -239,6 +239,7 @@ test('extra-round discipline: the ask shows rounds, cost and severity; "follow u
   const implementer = read('agents/implementer.md');
   assert.match(implementer, /the whole change of a PR \(or one part of a big one\)/);
   assert.match(implementer, /Work through the task list in order, commit per step/);
+  assert.match(implementer, /ALWAYS as a managed job[^]*job start verify-quick --/);
   const cli = read('docs/cli.md');
   assert.match(cli, /Follow up instead of a round/);
   assert.match(cli, /pipeline triage defer-fixes --pr N --ids/);
