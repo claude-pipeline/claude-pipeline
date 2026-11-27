@@ -6,6 +6,7 @@ import { dirname, join } from 'node:path';
 import { accountHome } from '../lib/paths.mjs';
 import { LockLostError, LockTimeoutError, readMachineId, withLock } from '../lib/locks.mjs';
 import { insideClaudeCode } from '../lib/owner-only.mjs';
+import { gh } from '../lib/proc.mjs';
 import { BUILTIN_SERVERS, DEPLOY_ENV_MAX, REF_RE, dbRefsFile, readDbRefs, validDeployBot, validDeployEnv, writeDbRefs } from '../hooks/lib/db-refs.mjs';
 import { importGoHistory } from '../hooks/lib/live-db-auto.mjs';
 
@@ -33,7 +34,8 @@ const LOCK_WAIT_MS = 15_000;
 const SEGMENT = /^[A-Za-z0-9_.-]{1,80}$/;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
-const DEPLOY_NOTE = (repo, env, bot) => `after-deploy registered (environment "${env}", bot ${bot}[bot]): a marked migration merged more than 5 minutes from now is applied once the newest "${env}" deployment of ${repo} (by ANY creator) and GitHub's latest completed one are both its merge commit, made by ${bot}[bot], and succeeded. Not seen: a rollback or promote done outside GitHub (the host's dashboard makes no GitHub deployment or status; Vercel's instant rollback is one), and a SUCCESS status only means the host built and assigned the deploy, not that it serves now. Run \`pipeline db-refs after-deploy off --ref <ref>\` while production is rolled back or auto-promotion is off. Your own GitHub token can also mark a newer deployment inactive or delete it. Details: docs/cli.md "Live database guard".`;
+const DEPLOY_NOTE = (repo, env, bot) => `after-deploy registered (environment "${env}", bot ${bot}[bot]): a marked migration merged more than 5 minutes after GitHub's clock reads now is applied once the newest "${env}" deployment of ${repo} (by ANY creator) and GitHub's latest completed one are both its merge commit, made by ${bot}[bot], and succeeded. Not seen: a rollback or promote done outside GitHub (the host's dashboard makes no GitHub deployment or status; Vercel's instant rollback is one), and a SUCCESS status only means the host built and assigned the deploy, not that it serves now. Run \`pipeline db-refs after-deploy off --ref <ref>\` while production is rolled back or auto-promotion is off. Your own GitHub token can also mark a newer deployment inactive or delete it. Details: docs/cli.md "Live database guard".`;
+const GITHUB_TIME_TIMEOUT_MS = 10_000;
 const TRUST_NOTE = (repo) => `auto-apply trusts every PR merged into ${repo}'s default branch on github.com: migrations there must need your merge (a hard stop on supabase/migrations/**). Run this command again after any rollback of the pipeline install.`;
 
 export async function run(argv, ctx = {}) {
@@ -130,7 +132,7 @@ export async function run(argv, ctx = {}) {
     if (!current.ok && current.reason === 'unreadable') {
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-unreadable', message: `${dbRefsFile(home)} cannot be read; fix its permissions or remove it, then run this again` } };
     }
-    if (deployAction !== null) return afterDeploy({ action: deployAction, ref: values.ref, deploy, current, home, ctx });
+    if (deployAction !== null) return afterDeploy({ action: deployAction, ref: values.ref, deploy, current, home, ctx, env });
     if (autoAction !== null) return autoMigrations({ action: autoAction, ref: values.ref, accept: values['accept-unmatched'] === true, current, home, ctx });
     const next = change(current.ok ? current : { refs: [], servers: [] });
     try {
@@ -181,14 +183,26 @@ function writeSnapshot({ home, current, state, refs, extra }) {
   }
 }
 
-// `after-deploy on|off` (the owner's terminal; the caller has checked insideClaudeCode, the arguments and that the registry is readable). On needs a live entry whose auto-apply is already on; deploySince is now
-// every time (a marked file merged before the registration was promised a click and keeps it), also when an earlier environment or bot is replaced.
-function afterDeploy({ action, ref, deploy, current, home, ctx }) {
+// `after-deploy on|off` (the owner's terminal; the caller has checked insideClaudeCode, the arguments and that the registry is readable). On needs a live entry whose auto-apply is already on; deploySince is GITHUB'S time now
+// every time (a marked file merged before the registration was promised a click and keeps it; the merge time the guard compares it with is GitHub's too, so the owner's own clock does not matter), also when an earlier environment or bot is replaced.
+// On is refused when GitHub's time cannot be read.
+function afterDeploy({ action, ref, deploy, current, home, ctx, env }) {
   const state = current.ok ? current : { refs: [], servers: [] };
   const entry = state.refs.find((e) => e.ref === ref);
   if (!entry) throw new UsageError(`${ref} is not in the registry: add it with \`pipeline db-refs set --ref ${ref} --name "<label>" --repo <owner/name>\` first`);
   if (action === 'off') return writeSnapshot({ home, current, state, extra: {}, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: null, deployBot: null, deploySince: null } : e)) });
   if (entry.autoMigrations !== true) throw new UsageError(`${ref} has auto-apply off: switch auto-migrations on first with \`pipeline db-refs auto-migrations on --ref ${ref}\``);
-  const since = new Date((ctx.now ?? Date.now)()).toISOString();
+  const since = githubNow({ ctx, env });
+  if (since === null) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-unreachable', message: `GitHub's time could not be read (\`gh api rate_limit\` failed: is gh installed, signed in to github.com and online?), so the after-deploy registration was not written: its cut-off time is GitHub's clock, not this machine's. Fix gh, then run this again` } };
   return writeSnapshot({ home, current, state, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: deploy.env, deployBot: deploy.bot, deploySince: since } : e)), extra: { note: DEPLOY_NOTE(entry.repo, deploy.env, deploy.bot) } });
+}
+
+// GitHub's clock: the Date header of an answer to a call that costs no rate limit (`gh api --include rate_limit`). -> ISO time | null (gh missing, not signed in, no answer in time, no readable Date)
+function githubNow({ ctx, env }) {
+  let r;
+  try { r = (ctx.gh ?? gh)(['api', '--hostname', 'github.com', '--include', 'rate_limit'], { env, timeoutMs: GITHUB_TIME_TIMEOUT_MS }); } catch { return null; }
+  if (r?.code !== 0 || r.timedOut || typeof r.stdout !== 'string') return null;
+  const date = /^date:[ \t]*(.+?)[ \t]*$/im.exec(r.stdout.split(/\r?\n\r?\n/)[0])?.[1];
+  const ms = date ? Date.parse(date) : NaN;
+  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
 }
