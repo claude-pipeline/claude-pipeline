@@ -6,12 +6,11 @@ import { dirname, join } from 'node:path';
 import { accountHome } from '../lib/paths.mjs';
 import { LockLostError, LockTimeoutError, readMachineId, withLock } from '../lib/locks.mjs';
 import { insideClaudeCode } from '../lib/owner-only.mjs';
-import { gh } from '../lib/proc.mjs';
 import { BUILTIN_SERVERS, DEPLOY_ENV_MAX, REF_RE, dbRefsFile, readDbRefs, validDeployBot, validDeployEnv, writeDbRefs } from '../hooks/lib/db-refs.mjs';
 import { importGoHistory } from '../hooks/lib/live-db-auto.mjs';
 
-// the entries as `show` and the owner's commands print them: the switch's time only while it is on, the after-deploy registration only while it is set
-const shown = (refs) => refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo, kind: e.kind, autoMigrations: e.autoMigrations === true, ...(e.autoMigrations === true ? { autoSince: e.autoSince } : {}), ...(e.autoMigrations === true && e.deployEnv ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince, deployClock: e.deployClock ?? null, deployProof: e.deployProof ?? null } : {}), ...(e.autoMigrations === true && e.deployPending ? { deployPending: e.deployPending } : {}) }));
+// the entries as `show` and the owner's commands print them: the switch's time only while it is on, the after-deploy registration only while it is set (an entry with cutoff-era keys shows `deployLegacy: true` and no registration: run `after-deploy on` again)
+const shown = (refs) => refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo, kind: e.kind, autoMigrations: e.autoMigrations === true, ...(e.autoMigrations === true ? { autoSince: e.autoSince } : {}), ...(e.autoMigrations === true && e.deployEnv ? { deployEnv: e.deployEnv, deployBot: e.deployBot } : {}), ...(e.autoMigrations === true && e.deployLegacy === true ? { deployLegacy: true } : {}) }));
 
 export const meta = {
   summary: 'the owner\'s registry of Supabase projects for the live-database guard: show it; set / remove a project, add / remove a trusted MCP server, switch auto-apply of merged migrations on / off for a project, register / unregister the GitHub deployment after which a marked migration applies (owner only, own terminal)',
@@ -20,7 +19,7 @@ export const meta = {
     'pipeline db-refs set --ref <20 lowercase letters/digits> --name "<label>" --repo <owner/name> [--dev]   (a duplicate ref replaces its entry)',
     'pipeline db-refs remove --ref <ref>',
     'pipeline db-refs auto-migrations on|off --ref <ref> [--accept-unmatched]   (owner only; default off) ON: a migration file a merged PR added to the default branch of the project\'s registered repo is applied to that live project with no further go (docs/cli.md "Live database guard"). It first imports this machine\'s earlier go applies of the project into the attempt history; an apply whose go record is gone is listed and refused until --accept-unmatched. Refused for an unknown or dev ref, an entry without --repo, or a repo another enabled ref already has. OFF clears the switch and keeps the history. A repo or --dev change by `set` clears it. Run ON again after any rollback of the pipeline install.',
-    'pipeline db-refs after-deploy on --ref <ref> --env "<environment>" --bot <app>   (owner only; needs auto-migrations on) Registers which GitHub deployment means "production" for the project: <environment> is the deployment environment name (exact, case-sensitive; 1-100 characters), <app> the GitHub App that makes those deployments (its login without [bot], e.g. vercel; never github-actions). A migration file marked `-- pipeline: apply-after-deploy` that a PR merges from NOW ON is then applied with no go once GitHub shows that the newest <environment> deployment of the repo, and GitHub\'s latest completed one, are both the merge commit, made by <app>[bot], and succeeded. Without this registration a marked file keeps the owner\'s click. Running it again replaces the environment and bot and restarts the cut-off time. Residuals: docs/cli.md "Live database guard".',
+    'pipeline db-refs after-deploy on --ref <ref> --env "<environment>" --bot <app>   (owner only; needs auto-migrations on) Registers which GitHub deployment means "production" for the project: <environment> is the deployment environment name (exact, case-sensitive; 1-100 characters), <app> the GitHub App that makes those deployments (its login without [bot], e.g. vercel; never github-actions). A migration file marked `-- pipeline: apply-after-deploy` that a merged PR added after auto-apply was switched on is then applied with no go once the merge commit is the newest commit of the default branch and GitHub shows that the newest <environment> deployment of the repo, and GitHub\'s latest completed one, are both that commit, made by <app>[bot], and succeeded. This is checked when Claude asks to apply, not frozen now: a marked file whose merge is live already, or goes live later, applies without a click; to keep the click for everything merged so far, run `auto-migrations on` again right after this (it resets the auto-apply start time). If any later commit lands on the default branch first, that file takes the owner\'s click. Without this registration a marked file keeps the owner\'s click. Running it again replaces the environment and bot. Runs offline (no GitHub call). Residuals: docs/cli.md "Live database guard".',
     'pipeline db-refs after-deploy off --ref <ref>   (owner only) Removes the registration: marked files take the owner\'s click again. Run it while production is rolled back or not auto-promoted. auto-migrations off, and a repo or --dev change by set, remove it too.',
     'pipeline db-refs server add <segment> | server remove <segment>   (an MCP server name the owner trusts for Supabase: the part between mcp__ and the tool name)',
     '  Every hosted project is LIVE unless declared --dev here; a project that is not listed is live too, with the name `unregistered project <ref>`.',
@@ -34,9 +33,7 @@ const LOCK_WAIT_MS = 15_000;
 const SEGMENT = /^[A-Za-z0-9_.-]{1,80}$/;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
-const DEPLOY_NOTE = (repo, env, bot) => `after-deploy registered (environment "${env}", bot ${bot}[bot]): a marked migration merged more than 5 minutes after GitHub's clock reads now is applied once the newest "${env}" deployment of ${repo} (by ANY creator) and GitHub's latest completed one are both its merge commit, made by ${bot}[bot], and succeeded. Not seen: a rollback or promote done outside GitHub (the host's dashboard makes no GitHub deployment or status; Vercel's instant rollback is one), and a SUCCESS status only means the host built and assigned the deploy, not that it serves now. Run \`pipeline db-refs after-deploy off --ref <ref>\` while production is rolled back or auto-promotion is off. Your own GitHub token can also mark a newer deployment inactive or delete it. Details: docs/cli.md "Live database guard".`;
-const GITHUB_TIME_TIMEOUT_MS = 10_000;
-const GITHUB_TIME_MAX_GAP_MS = 60_000; // the registration is finished only if GitHub's clock moved no more than this between the first write's time and the read after that write: the guard's 5-minute margin after deploySince then always covers it
+const DEPLOY_NOTE = (repo, env, bot) => `after-deploy registered (environment "${env}", bot ${bot}[bot]), no start time recorded: a marked migration that a merged PR added after auto-apply was switched on is applied, when Claude asks, once its merge commit is the newest commit of ${repo}'s default branch and the newest "${env}" deployment (by ANY creator) and GitHub's latest completed one are both that commit, made by ${bot}[bot], and succeeded. A marked migration already live, or still deploying, is applied too: run \`pipeline db-refs auto-migrations on --ref <ref>\` again now to keep the click for everything merged so far. If any later commit lands on the default branch before the apply, that migration takes your click. Not seen: a rollback or promote done outside GitHub (the host's dashboard makes no GitHub deployment or status; Vercel's instant rollback is one), and a SUCCESS status only means the host built and assigned the deploy, not that it serves now. Run \`pipeline db-refs after-deploy off --ref <ref>\` while production is rolled back or auto-promotion is off. Your own GitHub token can also mark a newer deployment inactive or delete it. Details: docs/cli.md "Live database guard".`;
 const TRUST_NOTE = (repo) => `auto-apply trusts every PR merged into ${repo}'s default branch on github.com: migrations there must need your merge (a hard stop on supabase/migrations/**). Run this command again after any rollback of the pipeline install.`;
 
 export async function run(argv, ctx = {}) {
@@ -73,7 +70,7 @@ export async function run(argv, ctx = {}) {
     change = (s) => {
       const old = s.refs.find((e) => e.ref === entry.ref);
       const keep = old?.autoMigrations === true && entry.kind === 'live' && sameRepo(old.repo, entry.repo);
-      const kept = keep ? { ...entry, autoMigrations: true, autoSince: old.autoSince, ...(old.deployEnv ? { deployEnv: old.deployEnv, deployBot: old.deployBot, deploySince: old.deploySince, deployClock: old.deployClock, deployProof: old.deployProof } : {}), ...(old.deployPending ? { deployPending: old.deployPending } : {}) } : entry;
+      const kept = keep ? { ...entry, autoMigrations: true, autoSince: old.autoSince, ...(old.deployEnv ? { deployEnv: old.deployEnv, deployBot: old.deployBot } : {}) } : entry;
       return { ...s, refs: [...s.refs.filter((e) => e.ref !== entry.ref), kept] };
     };
   } else if (sub === 'remove') {
@@ -133,7 +130,7 @@ export async function run(argv, ctx = {}) {
     if (!current.ok && current.reason === 'unreadable') {
       return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-unreadable', message: `${dbRefsFile(home)} cannot be read; fix its permissions or remove it, then run this again` } };
     }
-    if (deployAction !== null) return afterDeploy({ action: deployAction, ref: values.ref, deploy, current, home, ctx, env });
+    if (deployAction !== null) return afterDeploy({ action: deployAction, ref: values.ref, deploy, current, home });
     if (autoAction !== null) return autoMigrations({ action: autoAction, ref: values.ref, accept: values['accept-unmatched'] === true, current, home, ctx });
     const next = change(current.ok ? current : { refs: [], servers: [] });
     try {
@@ -153,7 +150,7 @@ function autoMigrations({ action, ref, accept, current, home, ctx }) {
   if (!entry) throw new UsageError(`${ref} is not in the registry: add it with \`pipeline db-refs set --ref ${ref} --name "<label>" --repo <owner/name>\` first`);
   const write = (refs, extra = {}) => writeSnapshot({ home, current, state, refs, extra });
   // off also clears the after-deploy registration: it is valid only with the switch on
-  if (action === 'off') return write(state.refs.map((e) => (e.ref === ref ? { ...e, autoMigrations: false, autoSince: null, deployEnv: null, deployBot: null, deploySince: null, deployClock: null, deployProof: null, deployPending: null } : e)));
+  if (action === 'off') return write(state.refs.map((e) => (e.ref === ref ? { ...e, autoMigrations: false, autoSince: null, deployEnv: null, deployBot: null } : e)));
   if (entry.kind !== 'live') throw new UsageError(`${ref} is declared dev: auto-apply covers live projects only`);
   if (!entry.repo) throw new UsageError(`${ref} has no repo: set it with \`pipeline db-refs set --ref ${ref} --name "${entry.name}" --repo <owner/name>\` first (auto-apply needs to know which repository's merges to trust)`);
   const other = state.refs.find((e) => e.ref !== ref && e.autoMigrations === true && sameRepo(e.repo, entry.repo));
@@ -184,39 +181,13 @@ function writeSnapshot({ home, current, state, refs, extra }) {
   }
 }
 
-// `after-deploy on|off` (the owner's terminal; the caller has checked insideClaudeCode, the arguments and that the registry is readable). On needs a live entry whose auto-apply is already on; deploySince is GITHUB'S time now
-// every time (a marked file merged before the registration was promised a click and keeps it; the merge time the guard compares it with is GitHub's too, so the owner's own clock does not matter), also when an earlier environment or bot is replaced.
-// On is refused when GitHub's time cannot be read.
-function afterDeploy({ action, ref, deploy, current, home, ctx, env }) {
+// `after-deploy on|off` (the owner's terminal; the caller has checked insideClaudeCode, the arguments and that the registry is readable). On needs a live entry whose auto-apply is already on and writes the environment and the bot only:
+// no time, no GitHub call (the guard decides at apply time: the merge commit must be the default branch's head, N1, and be merged after autoSince, N2). Running it again replaces them; a legacy cutoff-era entry (N3) is replaced by the pair alone.
+function afterDeploy({ action, ref, deploy, current, home }) {
   const state = current.ok ? current : { refs: [], servers: [] };
   const entry = state.refs.find((e) => e.ref === ref);
   if (!entry) throw new UsageError(`${ref} is not in the registry: add it with \`pipeline db-refs set --ref ${ref} --name "<label>" --repo <owner/name>\` first`);
-  if (action === 'off') return writeSnapshot({ home, current, state, extra: {}, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: null, deployBot: null, deploySince: null, deployClock: null, deployProof: null, deployPending: null } : e)) });
+  if (action === 'off') return writeSnapshot({ home, current, state, extra: {}, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: null, deployBot: null } : e)) });
   if (entry.autoMigrations !== true) throw new UsageError(`${ref} has auto-apply off: switch auto-migrations on first with \`pipeline db-refs auto-migrations on --ref ${ref}\``);
-  const unreachable = (staged) => ({ exitCode: EXIT.FAILED, output: { ok: false, error: 'github-unreachable', message: `GitHub's time could not be read (\`gh api rate_limit\` failed: is gh installed, signed in to github.com and online?), ${staged ? 'so the new after-deploy registration did not finish: an earlier registration, if any, is still in force with its old settings' : 'so nothing was changed: an earlier after-deploy registration, if any, is still in force'}. Fix gh, then run this again` } });
-  // Two phases, both on GitHub's clock only: (1) stage the registration under `deployPending` with T1 (no guard, old or new, reads that key, and the active keys are untouched); (2) read GitHub's time T2 AFTER that write is in the file; (3) publish the active keys (deploySince = T1, deployClock "github", deployProof "two-phase")
-  // only when 0 <= T2 - T1 <= 60 s. Every PR merged before the write in (1) is merged before T2, so before T1 + 1 minute, inside the guard's 5-minute margin after deploySince: nothing here uses this machine's clock, and a stall only delays the switch-on.
-  const since = githubNow({ ctx, env });
-  if (since === null) return unreachable(false);
-  const staged = { env: deploy.env, bot: deploy.bot, since };
-  const first = writeSnapshot({ home, current, state, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployPending: staged } : e)), extra: {} });
-  if (first.exitCode !== EXIT.OK) return first;
-  const later = githubNow({ ctx, env });
-  if (later === null) return unreachable(true);
-  const gap = Date.parse(later) - Date.parse(since);
-  if (!(gap >= 0 && gap <= GITHUB_TIME_MAX_GAP_MS)) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-time-stale', message: `GitHub's time moved by ${Math.round(gap / 1000)} seconds while the after-deploy registration was staged (it must be between 0 and ${GITHUB_TIME_MAX_GAP_MS / 1000}), so the new registration did not finish: an earlier registration, if any, is still in force with its old settings. Run this again` } };
-  const now2 = readDbRefs(home);
-  const mine = now2.ok ? now2.refs.find((e) => e.ref === ref) : null;
-  if (!mine || JSON.stringify(mine.deployPending) !== JSON.stringify(staged)) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-changed', message: `${dbRefsFile(home)} was changed by another command while the registration was staged; the new registration did not finish (an earlier one, if any, is still in force with its old settings). Run this again` } };
-  return writeSnapshot({ home, current: now2, state: now2, refs: now2.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: deploy.env, deployBot: deploy.bot, deploySince: since, deployClock: 'github', deployProof: 'two-phase', deployPending: null } : e)), extra: { note: DEPLOY_NOTE(entry.repo, deploy.env, deploy.bot) } });
-}
-
-// GitHub's clock: the Date header of an answer to a call that costs no rate limit (`gh api --include rate_limit`). -> ISO time | null (gh missing, not signed in, no answer in time, no readable Date)
-function githubNow({ ctx, env }) {
-  let r;
-  try { r = (ctx.gh ?? gh)(['api', '--hostname', 'github.com', '--include', 'rate_limit'], { env, timeoutMs: GITHUB_TIME_TIMEOUT_MS }); } catch { return null; }
-  if (r?.code !== 0 || r.timedOut || typeof r.stdout !== 'string') return null;
-  const date = /^date:[ \t]*(.+?)[ \t]*$/im.exec(r.stdout.split(/\r?\n\r?\n/)[0])?.[1];
-  const ms = date ? Date.parse(date) : NaN;
-  return Number.isFinite(ms) ? new Date(ms).toISOString() : null;
+  return writeSnapshot({ home, current, state, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: deploy.env, deployBot: deploy.bot } : e)), extra: { note: DEPLOY_NOTE(entry.repo, deploy.env, deploy.bot) } });
 }

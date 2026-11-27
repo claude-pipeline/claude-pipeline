@@ -1,5 +1,5 @@
 // #262 (live-database guard): the owner's registry of Supabase projects, `<home>/.claude/pipeline-state/db-refs.json`.
-// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev', autoMigrations?, autoSince?, deployEnv?, deployBot?, deploySince?, deployClock?, deployProof?, deployPending?}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
+// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev', autoMigrations?, autoSince?, deployEnv?, deployBot?}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
 // (`pipeline db-refs set|remove|server …`, commands/db-refs.mjs); the guard protects the file (files-policy.mjs PROTECTED_REL) and refuses the command to an agent.
 // Every hosted project counts as LIVE unless the owner declared it `dev` here. A project that is not listed is live too, so a MISSING file is the safe default
 // and needs no test of where the agent stands. A file that cannot be read or is not valid denies every Supabase write (no go can help) until the owner fixes it.
@@ -24,6 +24,9 @@ export const DEPLOY_ENV_MAX = 100;
 export const DEPLOY_BOT_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
 export const validDeployEnv = (v) => typeof v === 'string' && v.length >= 1 && v.length <= DEPLOY_ENV_MAX && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(v);
 export const validDeployBot = (v) => typeof v === 'string' && DEPLOY_BOT_RE.test(v) && v !== 'github-actions';
+// the keys the unreleased cutoff-era revisions of #907 wrote (N3): such an entry stays valid, reads as NOT registered and loses every deploy key at the next write
+const LEGACY_DEPLOY_KEYS = ['deploySince', 'deployClock', 'deployProof', 'deployPending'];
+const hasLegacyDeploy = (e) => LEGACY_DEPLOY_KEYS.some((k) => e[k] !== undefined);
 const validPending = (p) => p !== null && typeof p === 'object' && !Array.isArray(p) && validDeployEnv(p.env) && validDeployBot(p.bot) && isoZone(p.since);
 const isoZone = (v) => typeof v === 'string' && ISO_ZONE_RE.test(v) && Number.isFinite(Date.parse(v));
 
@@ -37,12 +40,12 @@ const validEntry = (e) => e && typeof e === 'object' && !Array.isArray(e)
   // the owner's auto-apply switch: absent or a boolean; true only on a live entry with a repo and the time it was set. An older install reads a newer file by ignoring the keys it does not know.
   && (e.autoMigrations === undefined || typeof e.autoMigrations === 'boolean')
   && (e.autoMigrations !== true || (e.kind === 'live' && typeof e.repo === 'string' && isoZone(e.autoSince)))
-  // the after-deploy registration: all three keys or none, only with the auto switch on; github-actions is no trusted deployer (an agent can make a workflow create a deployment for any commit). An older install ignores the keys.
-  && ((e.deployEnv === undefined && e.deployBot === undefined && e.deploySince === undefined && e.deployClock === undefined && e.deployProof === undefined)
-    || (e.autoMigrations === true && validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince)
-      // `deployClock: github`: deploySince is GitHub's own clock; `deployProof: two-phase`: the command finished its two-phase registration (a second GitHub read after the write, within a minute of the first). Only the guard's reading of BOTH makes a registration count (live-db-auto.mjs); an earlier revision's entry lacks one of them.
-      && (e.deployClock === undefined || e.deployClock === 'github') && (e.deployProof === undefined || e.deployProof === 'two-phase')))
-  // `deployPending`: a registration the command has staged and not finished ({env, bot, since}); no guard reads it, and an earlier revision ignores the key, so a staged registration never counts anywhere.
+  // the after-deploy registration: both keys or none, only with the auto switch on; github-actions is no trusted deployer (an agent can make a workflow create a deployment for any commit). An older install ignores the keys.
+  && ((e.deployEnv === undefined && e.deployBot === undefined) || (e.autoMigrations === true && validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot)))
+  // N3: cutoff-era keys (deploySince / deployClock incl. 'pending' / deployProof / deployPending), in every shape an unreleased #907 commit wrote, keep the file valid; the entry is not registered
+  && (e.deploySince === undefined || (e.autoMigrations === true && isoZone(e.deploySince)))
+  && (e.deployClock === undefined || e.deployClock === 'github' || e.deployClock === 'pending')
+  && (e.deployProof === undefined || e.deployProof === 'two-phase')
   && (e.deployPending === undefined || (e.autoMigrations === true && validPending(e.deployPending)));
 
 // { ok:true, refs, servers } | { ok:true, refs:[], servers:[], missing:true } | { ok:false, reason:'unreadable'|'invalid' }
@@ -62,7 +65,8 @@ export function readDbRefs(home, io = {}) {
   const servers = j.servers === undefined ? [] : j.servers;
   if (!Array.isArray(servers) || !servers.every((s) => typeof s === 'string' && SEGMENT_RE.test(s))) return { ok: false, reason: 'invalid' };
   if (!j.refs.every(validEntry) || new Set(j.refs.map((e) => e.ref)).size !== j.refs.length) return { ok: false, reason: 'invalid' };
-  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, autoMigrations: e.autoMigrations === true, autoSince: e.autoMigrations === true ? e.autoSince : null, deployEnv: e.deployEnv ?? null, deployBot: e.deployBot ?? null, deploySince: e.deploySince ?? null, deployClock: e.deployClock ?? null, deployProof: e.deployProof ?? null, deployPending: e.deployPending ? { env: e.deployPending.env, bot: e.deployPending.bot, since: e.deployPending.since } : null })), servers: [...servers] };
+  // an entry with cutoff-era keys (N3) is reported with no registration and `deployLegacy: true`, so no reader (the guard, `db-refs show`, the merge workflow) sees a registration
+  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, autoMigrations: e.autoMigrations === true, autoSince: e.autoMigrations === true ? e.autoSince : null, deployEnv: hasLegacyDeploy(e) ? null : e.deployEnv ?? null, deployBot: hasLegacyDeploy(e) ? null : e.deployBot ?? null, ...(hasLegacyDeploy(e) ? { deployLegacy: true } : {}) })), servers: [...servers] };
 }
 
 // The entry auto-apply may use for `ref`: live, with a repo, the flag on, and no OTHER enabled entry with the same repo (case-insensitive: one unambiguous target per repo).
@@ -102,10 +106,10 @@ export function writeDbRefs(home, state) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const refs = state.refs.map((e) => {
     if (e.autoMigrations === true && !isoZone(e.autoSince)) throw new Error(`entry ${e.ref} has auto-migrations on without a valid autoSince`);
-    const deploy = e.autoMigrations === true && e.deployEnv != null && e.deployBot != null && e.deploySince != null;
-    if (deploy && !(validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince))) throw new Error(`entry ${e.ref} has an invalid after-deploy registration`);
-    if (e.autoMigrations === true && e.deployPending && !validPending(e.deployPending)) throw new Error(`entry ${e.ref} has an invalid staged after-deploy registration`);
-    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}), ...(deploy ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince, ...(e.deployClock === 'github' ? { deployClock: 'github' } : {}), ...(e.deployProof === 'two-phase' ? { deployProof: 'two-phase' } : {}) } : {}), ...(e.autoMigrations === true && e.deployPending ? { deployPending: e.deployPending } : {}) };
+    // the pair is written whenever both are set; a cutoff-era key (N3) is never written, so every write drops it
+    const deploy = e.autoMigrations === true && e.deployEnv != null && e.deployBot != null;
+    if (deploy && !(validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot))) throw new Error(`entry ${e.ref} has an invalid after-deploy registration`);
+    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}), ...(deploy ? { deployEnv: e.deployEnv, deployBot: e.deployBot } : {}) };
   });
   const body = `${JSON.stringify({ v: 1, refs, servers: state.servers ?? [] }, null, 2)}\n`;
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;

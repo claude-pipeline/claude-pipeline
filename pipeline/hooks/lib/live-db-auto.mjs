@@ -359,7 +359,7 @@ function prFileChange(pr, file, { owner, repoName, env, io, leftMs }) {
 }
 
 // Has GitHub shown that the production deploy of the merge commit succeeded? Both the newest deployment of the environment (by any creator) and GitHub's latest COMPLETED one must be the merge
-// commit, made by the registered bot, ACTIVE with a SUCCESS status by the same bot; the PR of the answer must be the matched one, merged after the registration. Every refusal claims nothing, so the call can be
+// commit, made by the registered bot, ACTIVE with a SUCCESS status by the same bot; the PR of the answer must be the matched one, merged after auto-apply was switched on (N2). Every refusal claims nothing, so the call can be
 // made again once the deploy has finished. -> { facts } | { stop: <result of autoApply> }
 function deployProof({ entry, pr, commit, committed, head, branchName, owner, repoName, env, io, leftMs, now }) {
   const got = ask(['-f', `query=${GRAPHQL_DEPLOY}`, '-f', `o=${owner}`, '-f', `n=${repoName}`, '-f', `env=${entry.deployEnv}`, '-F', `num=${pr.number}`], { env, io, leftMs });
@@ -375,8 +375,8 @@ function deployProof({ entry, pr, commit, committed, head, branchName, owner, re
   if (!isObj(p) || p.number !== pr.number || p.merged !== true || p.mergeCommit?.oid !== commit.oid) return no('GitHub does not show the pull request as merged at this commit');
   const mergedAt = typeof p.mergedAt === 'string' && ISO_RE.test(p.mergedAt) ? Date.parse(p.mergedAt) : NaN;
   if (!Number.isFinite(mergedAt)) return no('the pull request has no readable merge time');
-  // the registration time is GitHub's own clock (the Date of its answer when the owner registered); the command stages it first (deployPending) and publishes it only when GitHub's clock, read after that write, is 0 to 60 seconds after it, so every merge before the write is before deploySince + 1 minute and the margin covers that and the rounding of both times to the second: a merge that close to it keeps the owner's go too
-  if (!(mergedAt >= Date.parse(entry.deploySince) + FUTURE_SKEW_MS)) return no(`the pull request was merged before the after-deploy registration of ${entry.deploySince} (or within ${FUTURE_SKEW_MS / 60000} minutes after it), so it keeps the owner's go`);
+  // N2: the merge time is GitHub's own zoned time; a PR merged before auto-apply was switched on keeps the owner's go even when the commit that added the file is dated later
+  if (!(mergedAt >= Date.parse(entry.autoSince))) return no('the pull request was merged before auto-apply was switched on for this project, so it keeps the owner\'s go');
   if (!isObj(repo.environment) || repo.environment.name !== e) return no(`GitHub shows no deployment environment named "${e}"`);
   const newest = Array.isArray(repo.deployments?.nodes) && repo.deployments.nodes.length === 1 ? repo.deployments.nodes[0] : null;
   const live = repo.environment.latestCompletedDeployment;
@@ -429,11 +429,9 @@ export function autoApply({ home, entry, name, query, session, now, leftMs, env,
 }
 
 function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) {
-  // a marked file waits for the production deploy when the owner registered it (`pipeline db-refs after-deploy on`: all three keys); otherwise it keeps the owner's click after the deploy
+  // a marked file waits for the production deploy when the owner registered it (`pipeline db-refs after-deploy on`: environment + bot; an entry with cutoff-era keys reads as not registered); otherwise it keeps the owner's click after the deploy
   const marked = AFTER_DEPLOY_RE.test(query);
-  const keyed = typeof entry.deployEnv === 'string' && typeof entry.deployBot === 'string' && typeof entry.deploySince === 'string';
-  const registered = keyed && entry.deployClock === 'github' && entry.deployProof === 'two-phase';
-  if (marked && keyed && !registered) return notEligible('the after-deploy registration was made by an earlier version of the pipeline: the owner runs `pipeline db-refs after-deploy on` again (it now takes GitHub\'s clock and checks it twice); until then a marked file takes the owner\'s go');
+  const registered = typeof entry.deployEnv === 'string' && typeof entry.deployBot === 'string';
   if (marked && !registered) return notEligible('the file is marked apply-after-deploy: it takes the owner\'s go after the deploy (the owner can register the production deploy with `pipeline db-refs after-deploy on`, and marked files then apply once GitHub shows it succeeded)');
   if (typeof name !== 'string' || !STEM_RE.test(name)) return notEligible('the migration name is not a plain file name');
   const charProblem = sqlCharProblem(query);
@@ -482,6 +480,8 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
   // the deploy proof is the LAST GitHub read before the claim: a rollback GitHub shows while the file pages above were read is seen
   let proven = {};
   if (marked) {
+    // N1: only the newest commit of the default branch can qualify, so a redeploy or rollback of an older merge never does; a later commit (even a docs-only one) means the owner's go. A final answer: calling again does not help.
+    if (branch.target.oid !== commit.oid) return notEligible('a later commit is on the default branch: this file takes the owner\'s go');
     const proof = deployProof({ entry, pr, commit, committed, head: branch.target.oid, branchName: branch.name, owner, repoName, env, io, leftMs, now });
     if (proof.stop) return proof.stop;
     proven = proof.facts;
@@ -496,7 +496,7 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
       lock = takeRegistryLock({ home, leftMs, io });
       if (lock === null) return notEligible('the owner\'s db-refs command is changing the registry (or no time was left to wait for it): call again, or ask for the owner\'s go');
       const fresh = autoEntry(entry.ref, readDbRefs(home, io)).entry;
-      if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot || fresh.deploySince !== entry.deploySince || fresh.deployClock !== entry.deployClock || fresh.deployProof !== entry.deployProof) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
+      if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
     }
     next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
   } finally {
