@@ -81,6 +81,7 @@ export function mergeInIneligible({ pr, gh, root, config }) {
 function ownChangeFiles({ from, head, baseRef }, o) {
   const then = new Map();
   for (const f of diffFiles(baseRef, from, o)) {
+    if (f.status === 'D') continue; // a path the round deleted is not in the PR at the round: a later add or rename onto it is a new file
     const counts = new Map();
     for (const l of f.added) counts.set(l.text, (counts.get(l.text) ?? 0) + 1);
     then.set(f.path, counts);
