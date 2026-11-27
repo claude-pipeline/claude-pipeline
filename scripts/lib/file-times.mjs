@@ -103,7 +103,10 @@ export function validateRun(jobs) {
       times[f] = { spanMs: ms };
     }
   }
+  if (union.size === 0) return fail('the shards list no files');
   if (union.size !== full.count) return fail(`the shards list ${union.size} files, the full list has ${full.count}`);
+  // the same count is not the same list: the files the shards ran must be the ones the manifests declared by hash
+  if (fileListHash([...union]) !== full.hash) return fail('the files the shards list are not the full file list (hash differs)');
   return { ok: true, times };
 }
 

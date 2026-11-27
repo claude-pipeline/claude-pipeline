@@ -206,6 +206,9 @@ test('a nested runner probe wipes the shard\'s timing file', () => {
     assert.equal(r.status, 0, r.stdout + r.stderr);
     // glob.test.mjs finished long before the probe started its nested runner; its entry must survive that
     assert.deepEqual(Object.keys(JSON.parse(readFileSync(out, 'utf8'))), ['glob.test.mjs', 'runner-env-probe.test.mjs']);
+    // ...and so must the manifest: the nested runner would otherwise rewrite it with its own one-file list
+    const both = ['glob.test.mjs', 'runner-env-probe.test.mjs'];
+    assert.deepEqual(JSON.parse(readFileSync(`${out}.manifest`, 'utf8')), { shard: null, files: both, fullCount: 2, fullHash: fileListHash(both) });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -312,6 +315,12 @@ test('a partial timing sample overwrites weights: validateRun takes a whole run 
   const short = wholeRun();
   short[2] = wjob(3, ['c.test.mjs']);
   reject(short, 'the shards list 5 files, the full list has 6');
+  // the right count of the wrong files: shard 3 ran g.test.mjs instead of f.test.mjs, so f.test.mjs would drop out of the weights
+  const swapped = wholeRun();
+  swapped[2] = wjob(3, ['c.test.mjs', 'g.test.mjs']);
+  reject(swapped, 'not the full file list');
+  // manifests that all declare an empty list pass every count check but measured nothing
+  reject([1, 2, 3].map((i) => wjob(i, [], { manifest: buildManifest({ shard: `${i}/3`, files: [], full: [] }) })), 'list no files');
   const wrongLabel = wholeRun();
   wrongLabel[0].manifest = buildManifest({ shard: '3/3', files: ['a.test.mjs', 'd.test.mjs'], full: fullList });
   reject(wrongLabel, 'manifest says shard "3/3"');
