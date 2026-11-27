@@ -314,9 +314,9 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
     }
     const u = e?.message?.usage;
     if (!isPlainObject(u)) continue;
-    // A usage object with no token count field at all (`{}`) is not a usage-bearing message; explicit zeros are (a real call that spent nothing).
+    // A usage object with no token count field at all (`{}`) is not a usage-bearing message; explicit zeros are (a real call that spent nothing); a negative or non-numeric count is treated as missing.
     const cc0 = isPlainObject(u.cache_creation) ? u.cache_creation : {};
-    if (![u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].some((v) => typeof v === 'number')) continue;
+    if (![u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].some((v) => Number.isFinite(v) && v >= 0)) continue;
     byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model });
   }
   // usd: each message at its own model's list price; unpricedMessages: messages the price table cannot price

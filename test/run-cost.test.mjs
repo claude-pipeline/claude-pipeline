@@ -756,3 +756,17 @@ test('P cost --role plan-codex --model sonnet: tokens only, no USD and no price 
   assertExit(usd, 0);
   assert.equal(usd.json.cost.byRole['plan-codex'].usd, 0.5);
 });
+
+// Issue #820 (round 2): a negative-only usage (`input_tokens: -1`) counted as a usage-bearing message and was only clamped to 0 afterwards, so the first --retry booking wrote an entry + a retry and the real booking later made 2 calls and 2 retries.
+test('P cost --from-transcript: a transcript whose only usage is negative counts as empty (skipped)', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: -1 } } })}\n`);
+  const args = ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const first = costCli(s, args);
+  assertExit(first, 0);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  const second = costCli(s, args);
+  assertExit(second, 0);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries], [1, 1]);
+});
