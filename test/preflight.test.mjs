@@ -8,6 +8,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, createFakeCodex, fullProtection, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { floorEnv, scratchFloorDir } from './helpers/floor-env.mjs';
 import { resetFloor } from '../pipeline/lib/model-floor.mjs';
+import { CLICK_BUILDS } from '../pipeline/hooks/lib/owner-go-click.mjs';
 
 function repoWith(enforcement = 'github', checks) {
   const repo = createTmpRepo();
@@ -413,4 +414,32 @@ test('default_branch check: a config that did not load (null cfg) skips it, with
   const r = await runPreflight({ cwd: repo.dir, env: world().env });
   assert.equal(r.config.ok, false);
   assert.equal(r.reasons.some((x) => /default_branch/.test(x)), false, r.reasons.join('|'));
+});
+
+// ---- #714: one-click owner answers silently go off on a Claude Code build that is not in CLICK_BUILDS ----
+function chatRepo(extra = '') {
+  const repo = createTmpRepo();
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github')}owner_approval: chat\n${extra}`);
+  repo.commit('init');
+  return repo;
+}
+const clickWarnings = (r) => r.warnings.filter((w) => /clicks off on this build/.test(w));
+
+test('chat repo with clicks on: a running build outside CLICK_BUILDS adds the click warning; an allowlisted or unknown build adds none (#714)', async () => {
+  const repo = chatRepo();
+  const on = (build) => runPreflight({ cwd: repo.dir, env: world([], { env: build ? { AI_AGENT: `claude-code_${build.replaceAll('.', '-')}_agent` } : {} }).env });
+  const off = await on('2.1.999');
+  assert.equal(clickWarnings(off).length, 1);
+  assert.match(clickWarnings(off)[0], /^clicks off on this build \(2\.1\.999\) \[verified builds: .*2\.1\.323.*\]: the owner types the closing words meanwhile; to verify the build, run `node scripts\/click-spike\.mjs` in their own terminal \(not inside Claude Code\) from a claude-pipeline source checkout/);
+  assert.equal(off.canMerge, true, 'a warning never changes canMerge');
+  assert.deepEqual(clickWarnings(await on(CLICK_BUILDS[0])), [], 'an allowlisted build keeps clicks on');
+  assert.deepEqual(clickWarnings(await on(null)), [], 'an unknown build never warns');
+});
+
+test('no click warning when owner_go.click is off or the repo is in label mode (#714)', async () => {
+  const env = world([], { env: { AI_AGENT: 'claude-code_2-1-999_agent' } }).env;
+  const clickOff = await runPreflight({ cwd: chatRepo('owner_go:\n  click: off\n').dir, env });
+  assert.deepEqual(clickWarnings(clickOff), []);
+  const label = await runPreflight({ cwd: repoWith('github').dir, env });
+  assert.deepEqual(clickWarnings(label), []);
 });

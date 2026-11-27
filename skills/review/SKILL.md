@@ -18,7 +18,7 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
    (3.3). You never run `gh pr merge` or the repo's merge command yourself, never push to `main`/`master`
    or force-push (`git push -u origin agent/<slug>`), never add `human-approved` / `test-change-approved`, never remove
    `needs-human` / `pipeline-blocked` / `pipeline-pause` / `pipeline-rollback` yourself (`P merge --owner-go` lifts exactly the `needs-human` hold the owner's verified "merge" named, 3.3). The guards block these; don't route around them.
-2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) with `substitute.eligible` ⇒ the substitute path (2.1), not a stop. `reason: model` (Codex refused `review.codex_model`) WITHOUT `substitute.eligible` ⇒ not `awaiting-review` (Codex will not answer until the default branch is fixed and the fork point moves): park `needs-human`, tell the owner the CLI `message` (fix `review.codex_model` on the default branch, then bring that fix into the branch). Otherwise ⇒ `gh pr edit N --add-label awaiting-review`,
+2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) with `substitute.eligible` ⇒ the substitute path (2.1), not a stop. `reason: model` (Codex refused `review.codex_model`) WITHOUT `substitute.eligible` ⇒ not `awaiting-review` (Codex will not answer until the default branch is fixed and the fork point moves): park `needs-human`, tell the owner the CLI `message`. Otherwise ⇒ `gh pr edit N --add-label awaiting-review`,
    `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`, tell the owner, stop (outcome `awaiting-review`). A failed Codex run is never "no findings".
 3. Never pass a `model` parameter to `judge`, `arbiter`, `arbiter-fix`, `implementer`, `substitute-opus` or `substitute-fable`: their agent files pin the model (Sonnet, Fable, Fable, Sonnet, Opus, Fable).
 4. Keep your context lean: work from `P` JSON, subagent summaries and file paths; hand paths, not logs or diffs, to subagents.
@@ -33,8 +33,8 @@ Opt-out: `PIPELINE_OFF=1` or the user says not to use the pipeline ⇒ do the ta
 ## 0. Preflight
 
 `P preflight` (exit 2, no config ⇒ offer pipeline-setup; you may still open a PR but nothing merges), `P config` (note
-`verify.quick`, `default_branch`, `worktree_dir`, `review.max_rounds`, `merge.command`), `P labels ensure` (exit 3 ⇒ GitHub unreachable: say so, stop). A `claudeCode` warning in the preflight JSON (this terminal's build is older than the installed one) ⇒ tell the owner to restart before a Fable round; it never blocks anything else.
-Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state show --pr N`, then continue at section 2 with the round it shows. A PR parked `needs-human` for a refused Codex model (`reason: model`, no `substitute.eligible`) is picked up only after `review.codex_model` is fixed on the default branch and the branch includes that fix (`P update-branch`): then run codex-review again.
+`verify.quick`, `default_branch`, `worktree_dir`, `review.max_rounds`, `merge.command`), `P labels ensure` (exit 3 ⇒ GitHub unreachable: say so, stop). A `claudeCode` warning (this terminal's build is older than the installed one) ⇒ tell the owner to restart before a Fable round; `clicks off on this build` ⇒ tell the owner clicks are off, they type the closing words meanwhile, and re-record (`node scripts/click-spike.mjs`, own terminal, claude-pipeline checkout); neither blocks.
+Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state show --pr N`, then continue at section 2 with the round it shows. A PR parked `needs-human` for `reason: model` (no `substitute.eligible`) resumes once the default branch's `review.codex_model` fix is in the branch (`P update-branch`): rerun codex-review.
 
 ## 1. Branch and build
 
