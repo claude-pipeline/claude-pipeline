@@ -817,3 +817,85 @@ test('#253: 20000 pre-provenance prompts under one unresolved root resolve in bo
   assert.equal(r.text, '', 'every prompt is hidden: nothing binds');
   assert.ok(ms < 5000, `${ms} ms`);
 });
+
+// ---- #897: a `!` command's <bash-stdout> entry carries turnOrigin "human" (Claude Code writes turnOrigin / turnPromptId / turnPosition on it; the <bash-input> before it has none) ----------
+// Failure caught: the owner runs a `!` command, then a task notice (chained back through the stdout entry) holds the request; the stdout entry was counted as an invisible turn, so every later turn in
+// the chain was muted and the owner's typed "merge" bound nothing.
+const BASH_STDOUT = { turnOrigin: 'human', turnPosition: { promptIndex: 3, turnIndex: 9 }, entrypoint: 'cli', userType: 'external' };
+const bangChain = (stdoutMeta, head = prompt('ship it')) => {
+  const input = { ...prompt('<bash-input> sh ~/x.sh</bash-input>', { entrypoint: 'cli', userType: 'external' }), parentUuid: head.uuid };
+  const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', { ...stdoutMeta, turnPromptId: head.promptId }), parentUuid: input.uuid };
+  return { head, input, out };
+};
+
+test('#897: a task notice chained through a `!` command\'s stdout entry (turnOrigin human) under the owner\'s turn is visible: its ask binds', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const { head, input, out } = bangChain(BASH_STDOUT);
+    const n = { ...prompt('a task finished', NOTICE), parentUuid: out.uuid };
+    assert.deepEqual(pr(kind, record(kind, [head, of(head, said('working')), input, out, n, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: notice after the bang`);
+    // the owner's own reply written straight after the stdout entry binds too
+    const { head: h2, input: i2, out: o2 } = bangChain(BASH_STDOUT);
+    assert.deepEqual(pr(kind, record(kind, [h2, i2, o2, of(o2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: reply right after the bang`);
+  }
+});
+
+test('#897: the same chain under a headless turn, or with any other turnOrigin on the stdout entry, stays muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    // a headless run (sdk prompt) that wrote a bang-shaped stdout entry under itself: the chain walk reaches the invisible turn
+    const sdk = prompt('poll', SDK);
+    const { input, out } = bangChain(BASH_STDOUT, sdk);
+    const n = { ...prompt('a task finished', NOTICE), parentUuid: out.uuid };
+    assert.equal(run(kind, [prompt('ship it'), sdk, input, out, n, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: under an sdk turn`);
+    // a turnOrigin value other than "human" is still unplaced provenance (fail closed)
+    for (const value of ['sdk', 'task_notification', 'brand-new-turn']) {
+      const o = prompt('ship it');
+      const b = bangChain({ ...BASH_STDOUT, turnOrigin: value }, o);
+      const n2 = { ...prompt('a task finished', NOTICE), parentUuid: b.out.uuid };
+      assert.equal(run(kind, [o, b.input, b.out, n2, of(n2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: turnOrigin ${value}`);
+    }
+    // turnOrigin human with a promptSource / non-cli entrypoint is not the bare bang shape
+    for (const [name, extra] of [['promptSource set', { promptSource: 'brand-new-source' }], ['entrypoint other than cli', { entrypoint: 'brand-new-entry' }]]) {
+      const o = prompt('ship it');
+      const b = bangChain({ ...BASH_STDOUT, ...extra }, o);
+      assert.equal(run(kind, [o, b.input, b.out, of(b.out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});
+
+// R1-B1 (#898). Failure caught: an entry with only turnOrigin "human" and NO string parentUuid (a real `!` stdout entry always chains to its <bash-input> entry) was a plain note that
+// invisibleNote judged visible on its own fields, so a request chained under it bound the owner's next typed "merge" / "extra round" / ruling.
+test('#898 R1-B1: a turnOrigin-human stdout-shaped entry with a null or missing parentUuid is not a visible note: the request chained under it stays muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    for (const [name, parentless] of [['missing parentUuid', { parentUuid: undefined }], ['null parentUuid', { parentUuid: null }]]) {
+      const o = prompt('ship it');
+      const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', BASH_STDOUT), ...parentless };
+      assert.equal(run(kind, [o, of(o, said('working')), out, of(out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});
+
+// R2-B1 (#898). Failure caught: the stdout entry has a string parentUuid, but the `<bash-input>` note it points to is itself parentless: the walk ended VISIBLE at the parentless fallback (and the
+// input note's own 'visible' verdict was already in the memo, being earlier in the file), so a request chained under that stdout entry, which carries turnOrigin, bound with no chain to any known turn.
+test('#898 R2-B1: a turnOrigin-human stdout entry under a parentless `<bash-input>` note chains to no known turn: the request under it stays muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    for (const [name, parentless] of [['input note with missing parentUuid', { parentUuid: undefined }], ['input note with null parentUuid', { parentUuid: null }]]) {
+      const o = prompt('ship it');
+      const input = { ...prompt('<bash-input> sh ~/x.sh</bash-input>', { entrypoint: 'cli', userType: 'external' }), ...parentless };
+      const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', BASH_STDOUT), parentUuid: input.uuid };
+      assert.equal(run(kind, [o, of(o, said('working')), input, out, of(out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});
+
+// R3-B1 (#898). Failure caught: the parentless `<bash-input>` note carries `isCompactSummary: false`, so it is a plain boundary of its own (not an unplaced note) and the walk ended visible there with
+// no `bare` mark: the stdout entry under it, and the request chained to that, bound with no chain to the owner's typed prompt.
+test('#898 R3-B1: a turnOrigin-human stdout entry under a parentless plain-boundary `<bash-input>` note (isCompactSummary false) is muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    for (const [name, parentless] of [['missing parentUuid', { parentUuid: undefined }], ['null parentUuid', { parentUuid: null }]]) {
+      const o = prompt('ship it');
+      const input = { ...prompt('<bash-input> sh ~/x.sh</bash-input>', { entrypoint: 'cli', userType: 'external', isCompactSummary: false }), ...parentless };
+      const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', BASH_STDOUT), parentUuid: input.uuid };
+      assert.equal(run(kind, [o, of(o, said('working')), input, out, of(out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});

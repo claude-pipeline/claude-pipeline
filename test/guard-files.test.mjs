@@ -2510,3 +2510,58 @@ test('#691: a program over 200 KB that holds no link to the review folder is all
   assert.match(r.reason, /scan limit/);
   assert.doesNotMatch(r.reason, /refers to a protected pipeline file/);
 });
+
+// ---- #746: three harmless shapes the guard refused (A' message, B grep, C playwright config) -------------------------------------------
+
+const verdictOf = (command, opts = {}) => evaluateBashForFiles(command, { ...LINUX, cwd: '/repo', ...opts });
+const withFiles746 = (files) => ({ existsSync: (p) => p in files, readText: (p) => files[p] ?? null });
+
+// A'. Failure caught: the refusal of a quoted SQL line that starts with `select` says nothing about how to pass it, so the user is left guessing (the refusal itself is the R14 rule and stays).
+test('#746 A\': a loop-name refusal read from text carries the -f hint; one read from the parser does not; both are still refused', () => {
+  const sql = verdictOf('supabase db query --read-only --remote=R "with x as (\nselect 1\n) select 1"');
+  assert.equal(sql.decision, 'deny');
+  assert.match(sql.reason, /a loop variable that is a positional parameter/);
+  assert.match(sql.reason, /pass it from a file instead \(e\.g\. -f query\.sql\)/);
+  const loop = verdictOf('for 1 in a; do echo x; done');
+  assert.equal(loop.decision, 'deny');
+  assert.match(loop.reason, /a loop variable that is a positional parameter/);
+  assert.doesNotMatch(loop.reason, /-f query\.sql/);
+});
+
+// B. Failure caught: `/usr/bin/grep -rl X <home>/.claude/hooks <home>/.claude/settings.json 2>/dev/null` is refused as "writes a file that can declare hooks" because the discard redirect counts as a write.
+test('#746 B: /usr/bin/grep (alone, no wrapper) discarding into /dev/null is no write; every other shape keeps the hook-surface refusal', () => {
+  const S = '/home/u/.claude/settings.json';
+  const H = '/home/u/.claude/hooks';
+  const tail = (g) => `${g} -rl "subagent-budget" ${H} ${S}`;
+  for (const line of [`${tail('/usr/bin/grep')} 2>/dev/null`, `${tail('/usr/bin/grep')} >/dev/null`, `${tail('/usr/bin/grep')} &>/dev/null`, `${tail('/usr/bin/grep')} 2>>/dev/null`, `${tail('/bin/grep')} 2>/dev/null`]) {
+    const v = verdictOf(line);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+  for (const line of [
+    `${tail('grep')} 2>/dev/null`, `${tail('./grep')} 2>/dev/null`, `${tail('/repo/bin/grep')} 2>/dev/null`, `${tail('/usr/bin/GREP')} 2>/dev/null`,
+    `script -q ${S} ${tail('/usr/bin/grep')} 2>/dev/null`, `command time -o ${S} ${tail('/usr/bin/grep')} 2>/dev/null`, `env ${tail('/usr/bin/grep')} 2>/dev/null`, `nohup ${tail('/usr/bin/grep')} 2>/dev/null`,
+    `${tail('/usr/bin/grep')} > out.txt`, `${tail('/usr/bin/grep')} > '&1'`, `${tail('/usr/bin/grep')} 2>&1`, `${tail('/usr/bin/grep')} 2>/dev/null > ${S}`,
+    `less -o ${S} ${H} 2>/dev/null`, `echo '{"hooks":{}}' > ${S}`,
+  ]) {
+    const v = verdictOf(line);
+    assert.equal(v.decision, 'deny', line);
+    assert.match(v.reason, /writes a file that can declare hooks and mentions hooks/, line);
+  }
+});
+
+// C. Failure caught: `npx playwright test -c /abs/x.config.ts` runs the TypeScript config through the shell reader (npx's -c) and is refused, although it is Playwright's config option.
+test('#746 C: `npx playwright test -c / --config FILE` with a real config is allowed; a config or a shape the guard cannot trust keeps its refusal', () => {
+  const cfg = "import { defineConfig, devices } from '@playwright/test';\nexport default defineConfig({ projects: [{ name: 'p', use: { ...devices['Pixel 7'] } }] });\n";
+  const evil = 'echo x > /home/u/.claude/settings.json\n';
+  const o = withFiles746({ '/abs/x.config.ts': cfg, '/repo/f.sh': evil, '/repo/bad.ts': evil, '/repo/ok.ts': 'export default {};\n', '/dir/playwright': evil });
+  for (const line of ['npx playwright test -c /abs/x.config.ts', 'npx playwright test --config /abs/x.config.ts', 'npx playwright test --config=/abs/x.config.ts', 'npx playwright test -c /abs/x.config.ts --workers 2 a.spec.ts']) {
+    const v = verdictOf(line, o);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+  // a config that writes a protected file is a program that does so: refused whichever way the config is named
+  for (const line of ['npx playwright test -c bad.ts', 'npx playwright test --config bad.ts', 'npx playwright test --config=bad.ts', 'playwright test -c bad.ts']) assert.equal(verdictOf(line, o).decision, 'deny', line);
+  // today's rule where the npx unwrapping is not trusted: the -c text stays shell text, and `f.sh` is run as a script
+  for (const line of ['/dir/npx playwright test -c ./f.sh', 'PATH=/dir:$PATH npx playwright test -c ./f.sh', 'npx(){ echo x; }; npx playwright test -c ./f.sh', 'alias npx=foo; npx playwright test -c ./f.sh', 'npx playwright test --config=ok.ts -c ./f.sh', 'npx playwright test -c ./f.sh -c ok.ts']) {
+    assert.equal(verdictOf(line, o).decision, 'deny', line);
+  }
+});

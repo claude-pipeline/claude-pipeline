@@ -2175,3 +2175,85 @@ test('a push with many $ words: the mixes are bounded by the evaluation deadline
   assert.equal(probe.decision, 'deny');
   assert.ok(calls <= 2 && clock <= 1000, `${calls} lookups, ${clock} ms of injected time`);
 });
+
+// ---- #746 C2: the config of `playwright test` is a program node runs ----------------------------------------------------------------
+// Failure caught: a Playwright config holding a force push to main is allowed today under `npx playwright test -c F` and `--config=F` (the config is never read), and
+// the harmless config of a real project stays allowed.
+test('#746 C2: the config named by `playwright test -c / --config` is judged like `node FILE`', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const files = {
+    'bad.config.ts': `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`,
+    'ok.config.ts': "import { defineConfig, devices } from '@playwright/test';\nexport default defineConfig({ projects: [{ name: 'p', use: { ...devices['Pixel 7'] } }] });\n",
+    'ok.sh': 'echo hi\n',
+  };
+  const o = withFiles(files);
+  for (const line of ['npx playwright test -c bad.config.ts', 'npx playwright test --config bad.config.ts', 'npx playwright test --config=bad.config.ts', 'playwright test -c bad.config.ts', 'playwright test --config=bad.config.ts --workers 2']) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'deny', line);
+    assert.match(v.reason, /the program .*bad\.config\.ts contains a guarded command/, line);
+  }
+  for (const line of ['npx playwright test -c ok.config.ts', 'npx playwright test --config ok.config.ts', 'npx playwright test --config=ok.config.ts', 'playwright test -c ok.config.ts']) assert.equal(evaluate(line, o).decision, 'allow', line);
+  // the bare word only: a fake `playwright` script stays judged as the program it is (the exec of that path), whatever else the line says
+  const fake = withFiles({ 'bin/playwright': `${bad}\n`, 'ok.ts': 'export default {};\n' });
+  for (const line of ['./bin/playwright test -c ok.ts', './bin/playwright test --config=ok.ts', 'PATH=./bin:$PATH; =playwright test -c ok.ts']) {
+    const v = evaluate(line, fake);
+    assert.equal(v.decision, 'deny', line);
+  }
+  // npx's own -c / --call is still shell text, judged as such
+  for (const line of [`npx -c '${bad}'`, `npx --call='${bad}'`, `npx -y playwright test -c '${bad}'`, `npx playwright@1 test -c '${bad}'`, `npm exec foo -c '${bad}'`]) assert.equal(evaluate(line, o).decision, 'deny', line);
+  const bash = evaluate(`npx bash -c '${bad}'`, o);
+  assert.equal(bash.decision, 'deny');
+  assert.match(bash.reason, /guarded command/);
+});
+
+// Review R1-B1..B4. Failure caught: a Playwright config holding a force push to main is not read when it is named as a directory (`--config=e2e` loads e2e/playwright.config.ts), as `--config="$CFG"`,
+// next to a quoted filter with a wildcard (`--grep 'login.*'`), or as the last of several config options (the last one runs); the harmless twins stay allowed.
+test('#746 C2 review: a directory, a variable, a wildcard filter and the last of several config options are all judged', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const evil = `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`;
+  const fine = "import { defineConfig } from '@playwright/test';\nexport default defineConfig({});\n";
+  const o = withFiles({ 'e2e/playwright.config.ts': evil, 'fine/playwright.config.ts': fine, 'bad.config.ts': evil, 'ok.config.ts': fine });
+  for (const line of [
+    'npx playwright test --config=e2e', 'npx playwright test --config e2e/', 'playwright test -c e2e',
+    'CFG=bad.config.ts; npx playwright test --config="$CFG"', 'CFG=bad.config.ts; playwright test --config=$CFG',
+    "npx playwright test --config=bad.config.ts --grep 'login.*'", "playwright test --grep 'login.*' -c bad.config.ts",
+    'npx playwright test --config=ok.config.ts --config=bad.config.ts', 'playwright test --config=bad.config.ts --config=ok.config.ts',
+  ]) assert.equal(evaluate(line, o).decision, 'deny', line);
+  for (const line of ['npx playwright test --config=fine', 'CFG=ok.config.ts; npx playwright test --config="$CFG"', "npx playwright test --config=ok.config.ts --grep 'login.*'", 'npx playwright test --config=ok.config.ts --config=fine']) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+});
+
+// Review R2-B1. Failure caught: `npx playwright test -c e2e --grep 'login.*'` (and `-c ok -c bad`) reads `-c` only as npx's shell text, so the config inside e2e/ (or the last config) is never judged.
+test('#746 C2 review R2-B1: a loose npx line is judged as shell text AND as `playwright test`', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const evil = `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`;
+  const o = withFiles({ 'e2e/playwright.config.ts': evil, 'bad.ts': evil, 'ok.ts': 'export default {};\n' });
+  for (const line of ["npx playwright test -c e2e --grep 'login.*'", 'npx playwright test -c ok.ts -c bad.ts', "npx playwright test -c bad.ts --grep 'login.*'"]) assert.equal(evaluate(line, o).decision, 'deny', line);
+});
+
+// Review R2-B2 / R2-F1. Failure caught: a harmless config next to a quoted regex filter, a `**` spec glob, a wide spec glob or a positional filter is refused, because every word of a loose line was a script candidate
+// (a `^` or `**` word makes the candidate list "too big to resolve"); only a word holding a dollar sign or a backtick can hold one more config option.
+test('#746 C2 review R2-B2/F1: a harmless config next to a regex filter or a spec glob is allowed', () => {
+  const o = withFiles({ 'ok.config.ts': "export default {};\n", 'e2e/playwright.config.ts': 'export default {};\n' });
+  for (const line of [
+    "npx playwright test --config=ok.config.ts --grep '^login.*'", "playwright test --config=ok.config.ts --grep '^login.*'", 'npx playwright test --config=ok.config.ts e2e/**/*.spec.ts', 'npx playwright test --config=ok.config.ts e2e/*.spec.ts',
+    "npx playwright test --config=ok.config.ts '^auth'", "npx playwright test -c e2e --grep '^login.*'",
+  ]) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+});
+
+// Review R3-B1. Failure caught: a harmless config next to a title filter ending in a dollar sign (`--grep '^push notifications$'`) is refused, because that word is kept as a candidate, becomes run-time-only and the line holds `push`.
+test('#746 C2 review R3-B1: a filter whose dollar sign starts no expansion is no candidate; a real expansion still is', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const evil = `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`;
+  const o = withFiles({ 'ok.ts': 'export default {};\n', 'bad.ts': evil });
+  for (const line of ["npx playwright test -c ok.ts --grep '^push notifications$'", "playwright test -c ok.ts --grep '^push notifications$'", "npx playwright test --config=ok.ts --grep 'push$'"]) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+  for (const line of ['C=bad.ts; npx playwright test --grep x -c "$C"', 'C=bad.ts; playwright test --grep $C -c ok.ts', 'C=bad.ts; playwright test --grep x* -c ${C}']) assert.equal(evaluate(line, o).decision, 'deny', line);
+});

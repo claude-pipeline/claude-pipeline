@@ -406,7 +406,7 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
   const next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
   if (next.status === 'claimed') {
     // The go path claims its marker and then re-reads the history; this side claims the generations and then re-reads the markers: in every interleaving one of the two sees the other.
-    // The generations just created stay (they count as an attempt); a go consumed in the gap since the first scan means that go owns the apply.
+    // The generations just created stay (they count as an attempt). A go consumed in the gap since the first scan: when the go's own claim wins it owns the apply; in one interleaving the go loses the generation claim too, both deny and the owner gives a new go (fail-safe).
     const late = consumedAttempt({ home, ref: entry.ref, name, sqlSha256, leftMs, io });
     // both generations exist from here: a denial says the attempt is used (a retry would only find it spent), never "try the call again"
     if (late.noTime) return { status: 'spent', reason: `auto-apply recorded its attempt at ${name} but ran out of time checking for a go consumed meanwhile, so nothing is applied: the attempt is used; check the live state read-only, then ask for the owner's go` };

@@ -121,7 +121,7 @@ hard_stops:
 
 review:
   codex_model: gpt-6.2-astra
-  max_rounds: 3
+  max_rounds: 4 # owner 2026-11-27: was 3; fewer extra-round asks
   # #374 PR C (owner 2026-11-13 rule, scope chosen 2026-11-16): the bash/git guard's threat model. Read from the default branch's config only, so it
   # applies from the PR after the one that sets or changes it. Guard files only: the owner-go hooks (the typed "merge" recorder, dialog-hooks, and
   # hook-io / frontmatter which they share) are left out on purpose, since they defend against an agent forging the owner's approval.

@@ -527,6 +527,36 @@ function unwrapPackageRunner(argv, fromIndex) {
   }
   return rest(argv, skipOpts(argv, fromIndex, 'p', ['--package', '--prefix', '--workspace', '--registry', '--cache']));
 }
+// `playwright test` options: its config is the word `-c FILE`, `--config FILE` or `--config=FILE`. A word that is a config option or could be one but cannot be named (a cluster holding c, an attached `-cFILE`, a
+// config option with no file) gives null. Playwright uses the LAST config, so `loose` marks a line whose config is not exactly one literal file (several config options, or another word that expands: it may hold one,
+// and a quoted `'login.*'` filter looks the same once dequoted): every literal file is then a candidate. Returns { file, files, loose }, or null.
+function playwrightConfigOf(words) {
+  const used = new Set();
+  const files = [];
+  for (let i = 0; i < words.length; i++) {
+    const w = words[i];
+    if (!(w === '--config' || w.startsWith('--config=') || /^-[^-]*c/.test(w))) continue;
+    let file;
+    if (w === '-c' || w === '--config') { used.add(i + 1); file = words[i + 1]; } else if (w.startsWith('--config=')) file = w.slice('--config='.length); else return null;
+    if (file === undefined || file === '') return null;
+    used.add(i);
+    files.push(file);
+  }
+  if (!files.length) return null;
+  return { file: files[files.length - 1], files, loose: files.length > 1 || words.some((x, i) => !used.has(i) && hasExpansion(x)) };
+}
+// Playwright loads a config DIRECTORY's own file, in this order (the guard judges every one that exists)
+const PLAYWRIGHT_CONFIG_NAMES = ['ts', 'js', 'mts', 'mjs', 'cts', 'cjs'].map((e) => `playwright.config.${e}`);
+// (#746 C1) `npx playwright test -c FILE`: npm 11's npx stops reading its own flags at the first word that is not one (`playwright`), so `-c` there is Playwright's config. Only the bare word `npx`, exactly `playwright test`
+// and one literal config option; `trust` is false when the line can make `npx` or PATH something else (see rebindsRunner). Every other shape keeps the -c / --call reading
+const unwrapNpx = (argv, trust) => {
+  const cfg = trust && argv[0] === 'npx' && argv[1] === 'playwright' && argv[2] === 'test' ? playwrightConfigOf(argv.slice(3)) : null;
+  if (cfg && !cfg.loose) return rest(argv, 1);
+  const r = unwrapPackageRunner(argv, 1);
+  // a loose line keeps today's reading (npx's -c text is shell text) AND is judged as `playwright test` too (an alt reading): both are judged, not one or the other (R2-B1)
+  if (cfg && r && r.argv[0] !== 'playwright') return { ...r, alts: [argv.slice(1)] };
+  return cfg && !r ? rest(argv, 1) : r;
+};
 const runnerAt = (subs) => (argv) => (subs.includes(argv[1]) ? unwrapPackageRunner(argv, 2) : null);
 
 const WRAPPERS = {
@@ -539,7 +569,7 @@ const WRAPPERS = {
   screen: unwrapScreen,
   parallel: unwrapParallel,
   wsl: unwrapWsl,
-  npx: (argv) => unwrapPackageRunner(argv, 1),
+  npx: unwrapNpx,
   bunx: (argv) => unwrapPackageRunner(argv, 1),
   pnpx: (argv) => unwrapPackageRunner(argv, 1),
   npm: runnerAt(['exec', 'x']),
@@ -570,9 +600,9 @@ const WRAPPERS = {
 
 const SHELL_OWN_WRAPPERS = new Set(['command', 'builtin', 'exec', 'noglob', 'nocorrect', 'time']);
 const PACKAGE_RUNNERS = new Set(['npx', 'bunx', 'pnpx', 'npm', 'pnpm', 'yarn']);
-function unwrap(argv) {
+function unwrap(argv, trust = false) {
   const name = base(argv[0]);
-  return Object.hasOwn(WRAPPERS, name) ? WRAPPERS[name](argv) : null;
+  return Object.hasOwn(WRAPPERS, name) ? WRAPPERS[name](argv, trust) : null;
 }
 
 // ---- interpreter invocations --------------------------------------------------------------------
@@ -982,9 +1012,16 @@ function arithAssignsByName(line) {
   const d = p < 0 ? -1 : line.indexOf('$', p);
   return d >= 0 && line.indexOf('=', d) >= 0;
 }
-function bindsBash(text) {
+const bindsBash = (text) => bindsName(text, (s) => /(?<![A-Za-z0-9_])BASH(?![A-Za-z0-9_])/.test(s.replace(BASH_REF, '')));
+// (#746 C1: the same scan for the name PATH, and for the text that can make a command name run something else: a function, an alias, hash / enable / trap ..., the zsh tables (REDEF_CMDS, REDEF_TABLE). A bare `path` is zsh's PATH array; `$PATH` read is no binding, and a `path` in a file name (`/a/path/x`) is no mention)
+const PATH_MENTION = /(?<![A-Za-z0-9_/.~$-])path(?![A-Za-z0-9_/.-])/i;
+const REBIND_WORD = /(?<![\w.$/-])(?:function|alias|unalias|enable|disable|functions|unfunction|unhash|hash|autoload|emulate|zmodload|trap|aliases|galiases|saliases|builtins|reswords|commands)(?![\w-])|\(\s*\)/;
+function rebindsRunner(text) {
+  const plain = String(text).replace(/\\\r?\n/g, '').replace(/['"\\]/g, '');
+  return bindsName(text, (s) => PATH_MENTION.test(s)) || REBIND_WORD.test(plain) || REBIND_WORD.test(text);
+}
+function bindsName(text, mentions) {
   const str = text.replace(/\\\r?\n/g, ''); // (a backslash-newline inside a name is removed before the shell reads it: `BA\<nl>SH=x` binds BASH)
-  const mentions = (s) => /(?<![A-Za-z0-9_])BASH(?![A-Za-z0-9_])/.test(s.replace(BASH_REF, ''));
   if (mentions(str) || mentions(str.replace(/['"\\]/g, ''))) return true;
   if (/(?<![\w./$-])(?:source|eval)(?![\w-])/.test(str)) return true;
   // (blanks before the dot are not newlines: a newline is a boundary of its own, and `\s*` after each of 200 kB of them was quadratic)
@@ -1010,6 +1047,13 @@ const withArgs = (sf, argv) => Object.defineProperty(sf, 'args', { value: argv.s
 function scriptFileOfArgv(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
+  // (#746 C2) `playwright test -c FILE` / `--config FILE` / `--config=FILE`: node runs the config, so it is judged like `node FILE`. Only the bare word `playwright` (a path or `=playwright` is a program of its own: today's record below)
+  if (argv[0] === 'playwright' && argv[1] === 'test') {
+    const cfg = playwrightConfigOf(argv.slice(2));
+    // every config word is a candidate, and so is the config file inside each (Playwright loads a directory's own); `--config=$C` is a word that holds the option too, so the value itself is named (R1-B1..B4).
+    // On a loose line only a word with a real expansion (a dollar sign followed by a name character, `{`, `(` or a special parameter, or a backtick) may hold one more config option; a title filter ending in `$` is none (R3-B1); a quoted `^login.*` filter, a `**` spec glob or a positional regex is no candidate (R2-B2, R2-F1)
+    if (cfg) return { kind: 'interp', file: cfg.file, ambiguous: true, words: [...(cfg.loose ? argv.slice(1).filter((w) => /\$[\w{(@*#?$!-]|`/.test(w)) : []),...cfg.files, ...cfg.files.flatMap((f) => PLAYWRIGHT_CONFIG_NAMES.map((n) => `${f.replace(/\/+$/, '')}/${n}`))], needExt: false };
+  }
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
     if (r.alt) return { kind: 'shell', file: r.kind === 'file' ? r.text : r.alt.kind === 'file' ? r.alt.text : undefined, ambiguous: true, words: argv.slice(1) }; // (R17-F1: the two readings of the option cluster lead to other operands)
@@ -3688,7 +3732,7 @@ class Parser {
     let extCd = false;
     for (let guard = 0; guard < 32 && a.length; guard++) {
       if (base(a[0]) === 'xargs' || base(a[0]) === 'parallel') fanRuns = true;
-      const un = unwrap(a);
+      const un = unwrap(a, this.ctx.runnerPlain);
       if (!un) break;
       wrapped = true;
       if (base(a[0]) === 'time' || base(a[0]) === 'command' || base(a[0]) === 'builtin') extCd = true; // (`builtin`: dash has none, "not found": the cd never runs and the line goes on in the old directory)
@@ -4066,7 +4110,7 @@ class Parser {
 }
 
 function newCtx(maxDepth, expired, bashState) {
-  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, loopUps: new Map(), ctlBroken: false, ansiC: false, dqTrans: false, notPlain: false, notFlat: false, notWide: false, n0: 0, shapeEvents: [], shapeStack: [], hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, owedClose: null, up: [], upHold: null, neg: 0, grpOps: new Map(), refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
+  return { out: [], expired, maxDepth, truncated: false, dynamic: false, dynamicHead: false, subshell: false, grp: [], grpN: 0, ctl: { loop: 0, fn: 0, trap: 0, cond: 0 }, loops: [], loopSeq: 0, loopUps: new Map(), ctlBroken: false, ansiC: false, dqTrans: false, notPlain: false, notFlat: false, notWide: false, n0: 0, shapeEvents: [], shapeStack: [], hdOdd: false, undecidable: false, fns: new Set(), defs: { redef: false }, stopped: false, owedClose: null, up: [], upHold: null, neg: 0, grpOps: new Map(), refused: null, muted: 0, nest: 0, work: 0, braceWork: 0, varFeeds: new Map(), fdFeeds: new Map(), bashPlain: false, runnerPlain: false, bashState, rootSrc: null, hdSpans: [], hdForeign: false };
 }
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
@@ -4103,6 +4147,7 @@ export function simpleCommands(str, opts) {
     const binds = bindsBash(parser.src) && bindsBash(withoutComments(parser.src, requested, expired) ?? parser.src);
     if (binds && bashState) bashState.bound = true;
     ctx.bashPlain = (opts?.env ?? process.env).BASH === undefined && !binds && !bashState?.bound;
+    ctx.runnerPlain = !rebindsRunner(parser.src); // (#746 C1: nothing on the line can make `npx` or its PATH lookup something else)
     parser.parseTop(0);
   } catch {
     ctx.truncated = true;
