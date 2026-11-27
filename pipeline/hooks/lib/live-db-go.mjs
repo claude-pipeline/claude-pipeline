@@ -281,8 +281,8 @@ export function verifyBlock(replyText, { home = accountHome(), io = {} } = {}) {
 export function swappedBlockReason(reply, fields) {
   if (!reply?.promoted || !reply.before) return null;
   const lines = String(reply.before).replace(/\r\n/g, '\n').split('\n');
-  const prev = lines.findLast((l) => BINDING.test(right(l)));
-  const m = prev === undefined ? null : BINDING.exec(right(prev));
+  const prev = lines.findLast((l) => l.startsWith('Live-DB ') && BINDING.test(l.trimEnd())); // (trimEnd, not the quadratic /\s+$/: the text is the agent's)
+  const m = prev === undefined ? null : BINDING.exec(prev.trimEnd());
   if (m === null) return null;
   const [, op, ref, sha, head, file] = m;
   if (op !== fields?.op) return null;

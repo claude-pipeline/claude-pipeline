@@ -333,6 +333,60 @@ test('B1a: the owner saw block A in their own turn and a notice turn then re-pre
   assert.ok(same.out?.record, 'the same block again is no change');
 });
 
+const REF2 = 'klmnopqrst0123456789';
+const swapRefused = (out) => assert.match(out?.reason ?? '', /the block changed in a turn you did not start/, JSON.stringify(out));
+const changedMig = (w) => {
+  w.repo.write(FILE, `${SQL}-- changed\n`);
+  return migBlock(w, { head: w.repo.commit('changed'), sql: `${SQL}-- changed\n` });
+};
+const ownerOk = { type: 'user', message: { content: 'ok' }, promptId: 'pid-ok', ...OWNER_ENTRY };
+
+test('R1-B1: a notice turn shows the same migration, or the same data fix, for ANOTHER live project: the typed go (which names no project) is refused', async (t) => {
+  // Failure caught: neither typed go carries the project ref, so a notice turn re-presenting the owner's block for another live project was recorded with that notice's project, and the go ran the SQL there.
+  const w = world(t);
+  seedRegistry(w.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live' }, { ref: REF2, name: 'Other prod', repo: 'acme/widgets', kind: 'live' }] });
+  const mig = goAfter(w, t, GO, [ownerOk, textOf(migBlock(w).join('\n')), notice(), textOf(migBlock(w, { ref: REF2, label: 'Other prod' }).join('\n'))]);
+  swapRefused(mig.out);
+  const data = goAfter(w, t, goData(dataSql), [ownerOk, textOf(dataBlock(w).join('\n')), notice(), textOf(dataBlock(w, { ref: REF2, label: 'Other prod' }).join('\n'))]);
+  swapRefused(data.out);
+});
+
+test('R1-B2: the owner read block A, then TWO notice turns show a changed block B under the same name: the second notice is still compared with what the owner read', async (t) => {
+  // Failure caught: the comparison used the slot right before the notice, which was the first notice's B, so B against B passed and the go was recorded for SQL the owner never read.
+  const w = world(t);
+  await setup(w);
+  const a = migBlock(w).join('\n');
+  const b = changedMig(w).join('\n');
+  swapRefused(goAfter(w, t, GO, [ownerOk, textOf(a), notice(), textOf(b), notice(), textOf(b)]).out);
+});
+
+test('R1-B3: the owner\'s earlier block cannot be rebuilt (its checkout is gone) and a notice shows a changed block under the same name: refused, not waved through', async (t) => {
+  // Failure caught: the swap check rebuilt the earlier block from git, and a removed worktree made that fail, which switched the check off.
+  const w = world(t);
+  await setup(w);
+  const gone = migBlock(w, { dir: join(w.home, 'removed-worktree') }).join('\n');
+  swapRefused(goAfter(w, t, GO, [ownerOk, textOf(gone), notice(), textOf(changedMig(w).join('\n'))]).out);
+});
+
+test('R1-F1: the owner\'s turn printed block A and then a closing sentence; a notice shows a changed block B under the same name: refused', async (t) => {
+  // Failure caught: the check only knew a block that ENDS the earlier reply, so one line of text after block A (which the agent controls) switched it off.
+  const w = world(t);
+  await setup(w);
+  const a = migBlock(w).join('\n');
+  swapRefused(goAfter(w, t, GO, [ownerOk, textOf(a), textOf('I will apply it once you confirm.'), notice(), textOf(changedMig(w).join('\n'))]).out);
+});
+
+test('R1-B4: the notice turn\'s own dialog must repeat the WHOLE block: the same binding, apply and go lines around different SQL are not the reply\'s own dialog', async (t) => {
+  // Failure caught: ownDialogInput compared only the binding, apply and go lines, so a dialog showing other SQL under the reply's lines was accepted and the owner's go ran the reply's SQL.
+  const w = world(t);
+  await setup(w);
+  const block = dataBlock(w);
+  const shownOther = block.map((l) => (l === dataSql ? otherSql : l));
+  assert.notDeepEqual(shownOther, block);
+  const out = goAfter(w, t, goData(dataSql), [notice(), textOf(block.join('\n')), toolUse('ask1', 'AskUserQuestion', dataDialog(shownOther, dataSql)), toolResult('ask1', 'User declined to answer questions')]).out;
+  assert.equal(out?.record, undefined, JSON.stringify(out));
+});
+
 test('B1a pin: the ruling reader (no liveDb option) still reads the same notice turn as no reply', async (t) => {
   // Failure caught: the live-database promotion leaking into the ruling / merge readers, which must keep voiding a slot for any text a notice turn prints.
   const w = world(t);
