@@ -1164,6 +1164,7 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   let behindRefusal = queueMode === true ? 'not evaluated: the merge queue builds the PR on the current base' : null;
   let cmp = null;
   let unverified = null;
+  let queueWaived = false;
   if (queueMode !== true) {
     try {
       if (typeof info?.baseRefName !== 'string' || info.baseRefName === '') throw new Error("GitHub did not name the PR's base branch");
@@ -1179,13 +1180,20 @@ export async function evaluateOwnerGo({ root, config, pr, gh, env, sleep = defau
   }
   if (behindReason !== null && queueMode === undefined) {
     try {
-      if (queueModeFor({ gh, pr }).queue) { behindReason = null; unverified = null; }
+      if (queueModeFor({ gh, pr }).queue) { behindReason = null; unverified = null; queueWaived = true; }
     } catch (err) {
       if (!(err instanceof QueueUnreadable)) throw err;
       queueError = err.message;
     }
   }
   const isBehind = behindReason !== null;
+  // The scan is of GitHub's baseRefOid, which can name an old fork point even when the PR is NOT behind (main advanced to a commit the branch already holds): the scan and the
+  // observed tip must still share one merge base, or the checks that read the scan (hard-stops, integrity) judged another range than the tip's.
+  if (!isBehind && cmp !== null && !queueWaived) {
+    const d = diff();
+    const staleScan = d.ok ? compareTipProblem({ root, tip: cmp.baseSha, baseSha, d, branch: info.baseRefName }) : null;
+    if (staleScan !== null) unverified = `the base branch's tip does not match the scanned range: ${staleScan}`;
+  }
   let accepted = null;
   let refusal = null; // the phrase the owner is shown: "not accepted as behind-but-fresh-enough: <why>" or "not evaluated: <why>" (the rule was never applied)
   if (behindReason !== null) {
@@ -1332,7 +1340,8 @@ function baseTipProblem({ gh, evaluated, head, branch }) {
 // rebased PR commits on the branch, so its first parent says nothing: noted, not judged. Never throws.
 export async function baseMovedAfterMerge({ gh, mergeSha, evaluated, command = '' }) {
   if (!isObject(evaluated)) return { baseNote: 'the base branch was not checked after the merge (no evaluated tip)' };
-  if (/(^|\s)--rebase(\s|$)/.test(String(command))) return { baseNote: `${evaluated.branch} was not checked after a rebase merge (its first parent is a rebased PR commit)` };
+  const named = (long, short) => new RegExp(`(^|\\s)(--${long}|-${short})(\\s|$)`).test(String(command));
+  if (named('rebase', 'r')) return { baseNote: `${evaluated.branch} was not checked after a rebase merge (its first parent is a rebased PR commit)` };
   if (typeof mergeSha !== 'string' || !FULL_SHA.test(mergeSha)) return { baseNote: `${evaluated.branch} was not checked after the merge (GitHub did not name the merge commit)` };
   let parents;
   try {
@@ -1342,6 +1351,8 @@ export async function baseMovedAfterMerge({ gh, mergeSha, evaluated, command = '
   }
   const first = parents[0];
   if (first === evaluated.tip) return {};
+  // One parent and no squash named (a wrapper script may rebase): a rebased PR's last commit has a PR commit as first parent, so the method must be known to call it movement.
+  if (parents.length === 1 && !named('squash', 's')) return { baseNote: `${evaluated.branch} was not checked after the merge (the merge command names no squash method, so the merge commit's parent cannot be judged)` };
   return {
     baseMoved: { from: evaluated.tip, to: first },
     warning: `${evaluated.branch}'s tip moved from ${short(evaluated.tip)} to ${short(first)} before the PR landed: it merged on a base the check did not evaluate (a non-queue repo cannot refuse that server-side)`,

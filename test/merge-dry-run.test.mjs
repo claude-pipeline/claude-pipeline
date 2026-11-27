@@ -535,6 +535,29 @@ test('dry run --owner-go, behind with a merge hold ahead: the "do NOT update the
   assert.ok(kinds(d.r).includes('merge-hold'));
 });
 
+test('dry run --owner-go, behind with a hold ahead and a stale GitHub base (the branch merged main in): no "update the branch" advice anywhere, the reason stays', () => {
+  const s = scenario({ yml: holdYml().replace('  hold_command', '  behind_base: disjoint\n  hold_command'), baseFiles: holdFiles, report: null, state: null });
+  s.repo.git(['checkout', '-q', 'main']);
+  s.repo.write('m.txt', 'm\n');
+  const m = s.repo.commit('main m');
+  s.repo.write('t.txt', 't\n');
+  const tip = s.repo.commit('main t');
+  s.repo.git(['checkout', '-q', 'agent/feature']);
+  s.repo.git(['merge', '-q', '--no-ff', '-m', 'merge main m', m]);
+  s.head = s.repo.git(['rev-parse', 'HEAD']).trim();
+  s.prFiles = s.repo.git(['diff', '-M', '--name-status', s.baseTip, s.head]).trim().split('\n').filter(Boolean).map((line) => {
+    const [status, a, b] = line.split('\t');
+    return b === undefined ? { filename: a, status } : { filename: b, previous_filename: a, status };
+  });
+  s.fake.setScript(script(s, { baseRefOid: s.baseTip, behindBy: 1, gh: { compareBase: tip } }));
+  const d = dry(s, ['--owner-go'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) });
+  assertExit(d.r, 1);
+  assert.ok(kinds(d.r).includes('merge-hold') && kinds(d.r).includes('behind-base'), JSON.stringify(d.r.json.blockers));
+  const out = JSON.stringify(d.r.json).replace(/do NOT update the branch/g, '');
+  assert.doesNotMatch(out, /update the branch|P update-branch/i);
+  assert.match(d.r.json.ownerStep.behindRefusal, /predates the branch's own merge of main$/);
+});
+
 test('dry run --owner-go, main moved after the check: A refused then B -> the B entry says B was not evaluated and never carries A\'s reason', () => {
   const s = scenario({ yml: disjointYml(), report: null, state: null });
   const a = mainMoves(s, 'src/app.js');

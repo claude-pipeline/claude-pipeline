@@ -480,7 +480,7 @@ test('real run, Rev-4 8: a needs-human put back during the wait ends it as block
 
 test('real run: the base moves off the evaluated one while the lifted-hold merge waits => blocked, auto-merge disabled, the hold put back', async (t) => {
   const moved = 'f'.repeat(40);
-  const extra = [{ match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid$', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid: moved } }];
+  const extra = [{ match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid,baseRefName$', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid: moved, baseRefName: 'main' } }];
   const s = world({ gh: { mergeView: STILL_OPEN, extra }, env: { PIPELINE_MERGE_WAIT_MS: '30000', PIPELINE_MERGE_POLL_MS: '1' } });
   approve(t, s);
   const r = s.go();
@@ -506,7 +506,7 @@ test('real run: abandonMerge finds the PR MERGED after all => the label is not p
   const extra = [
     { match: '^pr view 12 --json state,mergeCommit$', stdoutJson: { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } } },
     // (the wait poll also reads baseRefOid: every --owner-go wait pins the base the scan was of, filled in below once the repo exists)
-    { match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid$', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid: 'BASE_TIP' } },
+    { match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid,baseRefName$', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid: 'BASE_TIP', baseRefName: 'main' } },
   ];
   const s = world({ gh: { extra }, env: { FAKE_MERGE_EXIT: '1' } });
   const script = join(s.fake.dir, 'script.json');

@@ -477,8 +477,11 @@ test('main moves while the queued merge waits (baseRefOid unchanged, compare tip
   assert.ok(s.fake.lines().some((l) => /^pr merge 12 --disable-auto/.test(l)));
 });
 
+// A squash is named in the merge command: only then is a single parent that is not the evaluated tip read as movement of main (a rebase puts PR commits there).
+const squashed = () => ({ yml: disjointYml().replace('--match-head-commit {sha}', '--squash --match-head-commit {sha}') });
+
 test('main moves during the wait but the cancellation re-read says MERGED -> the merged outcome is kept, with baseMoved from the merge commit\'s parent', (t) => {
-  const s = fresh();
+  const s = fresh(squashed());
   const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
   const moved = 'b'.repeat(40);
   behindScript(s, tip, { commitParents: { [MERGE_SHA]: [A_PARENT] }, extra: [pollOpen(s, s.baseTip)[0], { match: COMPARE, stdoutJsonSeq: [cmpReply(tip), cmpReply(tip), cmpReply(moved)] }] });
@@ -500,7 +503,7 @@ test('F3: a clean squash merge (first parent = the evaluated tip) reports no bas
   assertExit(a, 0);
   assert.equal('baseMoved' in a.json, false, JSON.stringify(a.json));
 
-  const moved = fresh();
+  const moved = fresh(squashed());
   const tipB = mainMoves(moved, (repo) => repo.write('other.txt', 'x\n'));
   behindScript(moved, tipB, { commitParents: { [MERGE_SHA]: [A_PARENT] } });
   withRecord(t, moved);
@@ -510,11 +513,37 @@ test('F3: a clean squash merge (first parent = the evaluated tip) reports no bas
   assert.deepEqual(b.json.baseMoved, { from: tipB, to: A_PARENT });
 });
 
+test('F3/B5: a merge command that names no squash (a wrapper may rebase) cannot call a one-parent merge commit movement of main: baseNote, no baseMoved', (t) => {
+  const s = fresh();
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  behindScript(s, tip, { commitParents: { [MERGE_SHA]: [A_PARENT] } });
+  withRecord(t, s);
+  const r = goMerge(s);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal('baseMoved' in r.json, false, JSON.stringify(r.json));
+  assert.match(r.json.baseNote, /names no squash method/);
+});
+
+test('B1: GitHub\'s baseRefOid names the old fork point while main advanced to a commit the branch already holds (compare: NOT behind) -> refused, the scan is of another range than the tip', (t) => {
+  const s = fresh();
+  const { m, head } = branchMergedMain(s);
+  behindScript(s, m, { behindBy: 0, prHead: head, baseOid: s.baseTip, prFiles: diffFiles(s, s.baseTip, head) });
+  ownerSays(t, 'merge', mergeRequest(PR, head, 'none'));
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.match(reasons(r), /pr-open: the base branch's tip does not match the scanned range: the PR's base on GitHub \(\w{8}\) predates the branch's own merge of main/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
 test('baseMovedAfterMerge: a rebase merge says the base was not checked (no baseMoved); an unreadable merge commit is a note, never a throw', async () => {
   const evaluated = { branch: 'main', tip: 'c'.repeat(40), behind: true, accepted: true, reason: null };
   const gh = (parents) => ({ commitParents: () => { if (parents instanceof Error) throw parents; return parents; } });
   const rebase = await gate.baseMovedAfterMerge({ gh: gh([A_PARENT]), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 --rebase --auto' });
   assert.deepEqual(Object.keys(rebase), ['baseNote']);
+  const alias = await gate.baseMovedAfterMerge({ gh: gh([A_PARENT]), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 -r --auto' });
+  assert.deepEqual(Object.keys(alias), ['baseNote'], 'the -r alias is a rebase merge too');
+  assert.ok('baseMoved' in await gate.baseMovedAfterMerge({ gh: gh([A_PARENT]), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 --squash' }));
   assert.match(rebase.baseNote, /not checked after a rebase merge/);
   const unreadable = await gate.baseMovedAfterMerge({ gh: gh(new Error('HTTP 502')), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 --squash' });
   assert.deepEqual(Object.keys(unreadable), ['baseNote']);
