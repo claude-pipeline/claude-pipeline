@@ -817,3 +817,47 @@ test('#253: 20000 pre-provenance prompts under one unresolved root resolve in bo
   assert.equal(r.text, '', 'every prompt is hidden: nothing binds');
   assert.ok(ms < 5000, `${ms} ms`);
 });
+
+// ---- #897: a `!` command's <bash-stdout> entry carries turnOrigin "human" (Claude Code writes turnOrigin / turnPromptId / turnPosition on it; the <bash-input> before it has none) ----------
+// Failure caught: the owner runs a `!` command, then a task notice (chained back through the stdout entry) holds the request; the stdout entry was counted as an invisible turn, so every later turn in
+// the chain was muted and the owner's typed "merge" bound nothing.
+const BASH_STDOUT = { turnOrigin: 'human', turnPosition: { promptIndex: 3, turnIndex: 9 }, entrypoint: 'cli', userType: 'external' };
+const bangChain = (stdoutMeta, head = prompt('ship it')) => {
+  const input = { ...prompt('<bash-input> sh ~/x.sh</bash-input>', { entrypoint: 'cli', userType: 'external' }), parentUuid: head.uuid };
+  const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', { ...stdoutMeta, turnPromptId: head.promptId }), parentUuid: input.uuid };
+  return { head, input, out };
+};
+
+test('#897: a task notice chained through a `!` command\'s stdout entry (turnOrigin human) under the owner\'s turn is visible: its ask binds', () => {
+  for (const kind of Object.keys(KINDS)) {
+    const { head, input, out } = bangChain(BASH_STDOUT);
+    const n = { ...prompt('a task finished', NOTICE), parentUuid: out.uuid };
+    assert.deepEqual(pr(kind, record(kind, [head, of(head, said('working')), input, out, n, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: notice after the bang`);
+    // the owner's own reply written straight after the stdout entry binds too
+    const { head: h2, input: i2, out: o2 } = bangChain(BASH_STDOUT);
+    assert.deepEqual(pr(kind, record(kind, [h2, i2, o2, of(o2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)])), bound58(kind), `${kind}: reply right after the bang`);
+  }
+});
+
+test('#897: the same chain under a headless turn, or with any other turnOrigin on the stdout entry, stays muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    // a headless run (sdk prompt) that wrote a bang-shaped stdout entry under itself: the chain walk reaches the invisible turn
+    const sdk = prompt('poll', SDK);
+    const { input, out } = bangChain(BASH_STDOUT, sdk);
+    const n = { ...prompt('a task finished', NOTICE), parentUuid: out.uuid };
+    assert.equal(run(kind, [prompt('ship it'), sdk, input, out, n, of(n, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: under an sdk turn`);
+    // a turnOrigin value other than "human" is still unplaced provenance (fail closed)
+    for (const value of ['sdk', 'task_notification', 'brand-new-turn']) {
+      const o = prompt('ship it');
+      const b = bangChain({ ...BASH_STDOUT, turnOrigin: value }, o);
+      const n2 = { ...prompt('a task finished', NOTICE), parentUuid: b.out.uuid };
+      assert.equal(run(kind, [o, b.input, b.out, n2, of(n2, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: turnOrigin ${value}`);
+    }
+    // turnOrigin human with a promptSource / non-cli entrypoint is not the bare bang shape
+    for (const [name, extra] of [['promptSource set', { promptSource: 'brand-new-source' }], ['entrypoint other than cli', { entrypoint: 'brand-new-entry' }]]) {
+      const o = prompt('ship it');
+      const b = bangChain({ ...BASH_STDOUT, ...extra }, o);
+      assert.equal(run(kind, [o, b.input, b.out, of(b.out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});

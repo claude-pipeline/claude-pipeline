@@ -313,18 +313,24 @@ const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource
 // harness line inside the owner's own visible turn (an isMeta skill body or system-reminder note, a `!` block's output, an interrupt marker) has promptSource / origin / turnOrigin null or
 // absent: none of that is provenance, so such a line is a plain boundary as before #191 and the request printed after it still binds. What counts: a promptSource, origin or turnOrigin that is
 // set (a value this list does not know stays invisible, fail closed) or an entrypoint other than "cli" (a headless sdk-cli is synthetic already, so that is an unknown future one).
+// #897: the one exception is the `<bash-stdout>` entry of an owner `!` command: Claude Code now writes turnOrigin "human" (with turnPromptId / turnPosition) on it, and none of promptSource / origin
+// (the `<bash-input>` entry before it carries no turnOrigin at all). turnOrigin "human" alone, entrypoint cli or unset, is a plain note: it walks its parentUuid chain like any other, so under an
+// invisible headless turn it stays invisible (R5-F1 / #246) and the turns chained through it under the owner's turn are no longer muted. Any other turnOrigin value stays fail-closed.
 const isSet = (v) => v !== undefined && v !== null;
 const unplacedProvenance = (e) => isSet(e.promptSource) || isSet(e.origin) || isSet(e.turnOrigin) || (isSet(e.entrypoint) && e.entrypoint !== 'cli');
+const bangStdout = (e) => e.turnOrigin === 'human' && !isSet(e.promptSource) && !isSet(e.origin) && (!isSet(e.entrypoint) || e.entrypoint === 'cli');
+// What the turn / note classification below uses: unplacedProvenance without the `!` stdout shape. (promptEntryOf's #418 twin check keeps the strict one, so a forged twin of the owner's prompt written with turnOrigin human still reads as two.)
+const unplacedTurnProvenance = (e) => unplacedProvenance(e) && !bangStdout(e);
 // #253, NOT SUPPORTED: a pre-provenance transcript (Claude Code older than 2.1.258: no prompt carries promptSource, origin, entrypoint or turnOrigin) has nothing to say who wrote a prompt, so
 // every one of its prompts is an unplaced note below, and the chain walk of invisibleNote ends at the first prompt, whose parentUuid (the SessionStart attachment, or an entry older than the tail
 // window) resolves to no prompt: all of them are hidden and no merge, extra-round or ruling request binds. That is deliberate and fails closed: "no provenance field" must never become authority
 // (a hidden headless run is the case it would let through), and no machine here runs such a client. The readers do not exempt such a file; the owner is asked again after upgrading
 // (promptProvenance's legacy branch for a stored record predates this and is unchanged). Pinned by test/owner-go-visible-turns.test.mjs (#253).
-const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
+const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedTurnProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
   const source = entrySource(e);
-  return source === 'synthetic' || (source === 'unknown' && unplacedProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined);
+  return source === 'synthetic' || (source === 'unknown' && unplacedTurnProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined);
 };
 // R5-F1 (Fable): a note of unknown source WITHOUT unplaced provenance (unplacedNote) is visible or not as the turn it ORIGINATES from, the principle of R1-B1 below: a headless run (top prompt
 // promptSource sdk, invisible) can write a skill body or system-reminder note whose own fields look interactive (isMeta, null provenance, entrypoint cli), and what it prints after it must not bind.
