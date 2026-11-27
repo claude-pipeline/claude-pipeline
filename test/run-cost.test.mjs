@@ -271,7 +271,7 @@ test('P cost --from-transcript: a transcript with no messages with usage warns (
   assert.deepEqual(warns(`${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 1, output_tokens: 1 } } })}\n`), [], 'a normal transcript');
 });
 
-// Issue #820: the empty-transcript booking still wrote a zero entry (calls +1) and a retry, so the re-run the warning invites showed one agent call as 2 calls and 2 retries.
+// Issue #501: a plan review books under plan / plan-review|plan-codex instead of falling into `other`.
 test('P cost --phase plan --role plan-review --from-transcript: books and prices under plan / plan-review, not other', () => {
   const s = scenario();
   s.repo.write('.review/plan.jsonl', `${JSON.stringify({ message: { id: 'm', model: 'claude-sonnet-5-5', usage: { input_tokens: 1000000, output_tokens: 1000000 } } })}\n`);
@@ -286,6 +286,7 @@ test('P cost --phase plan --role plan-review --from-transcript: books and prices
   assert.deepEqual([hand.json.cost.byRole['plan-codex'].input, hand.json.cost.byRole['plan-codex'].usd], [5000, 0]);
 });
 
+// Issue #820: the empty-transcript booking still wrote a zero entry (calls +1) and a retry, so the re-run the warning invites showed one agent call as 2 calls and 2 retries.
 test('P cost --from-transcript: an empty transcript with no hand amounts books nothing (no call, no retry, no write); the re-run then books exactly 1 call and 1 retry', () => {
   const s = scenario();
   s.repo.write('.review/t.jsonl', '');
@@ -312,7 +313,7 @@ test('P cost --from-transcript: an empty transcript with --session still records
   s.repo.write('.review/t.jsonl', '');
   const withSession = costCli(s, ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl', '--session', 'sess-9']);
   assertExit(withSession, 0);
-  assert.equal(withSession.json.recorded, true);
+  assert.equal(withSession.json.recorded, false);
   assert.equal(withSession.json.skipped, 'empty-transcript');
   assert.deepEqual(withSession.json.cost.sessions, ['sess-9']);
   assert.deepEqual([withSession.json.cost.total.calls, withSession.json.cost.retries], [0, 0]);

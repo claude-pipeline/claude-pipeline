@@ -16,7 +16,7 @@ export const meta = {
   usage: [
     'pipeline cost --pr N --phase plan|build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|plan-review|plan-codex|verifier|controller|other',
     '              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]',
-    '  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
+    '  -> {ok, recorded, skipped?, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
     '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped; a transcript with no usable messages gives a warning, and when no --input/--output/--cache-*/--usd came with it NOTHING is booked for that call (no entry, no retry; `recorded` false, `skipped: "empty-transcript"`; `--session` is still recorded): run the same command again in a few seconds);',
     '  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.',
     '  --phase plan books a plan review (before the PR exists, like build calls): --role plan-review (a Fable/Opus/Sonnet plan reviewer, priced from its transcript) or plan-codex (a hand-run Codex plan review: tokens only, no USD unless --usd); `P summary` shows plan ahead of build.',
@@ -137,7 +137,7 @@ export const run = guarded(async (argv, ctx) => {
     const ok = record !== null;
     return {
       exitCode: ok ? EXIT.OK : EXIT.FAILED,
-      output: { ok, recorded: ok, ...(emptyTranscript ? { skipped: 'empty-transcript' } : {}), bucketed: ok && bucketed, cost: ok ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
+      output: { ok, recorded: ok && !emptyTranscript, ...(emptyTranscript ? { skipped: 'empty-transcript' } : {}), bucketed: ok && bucketed, cost: ok ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
     };
   });
 });
