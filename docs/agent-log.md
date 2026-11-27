@@ -352,3 +352,4 @@ full record.
 - 2026-11-27 · #879 · P cost: an empty-transcript booking books nothing (no double count); a plan phase for plan reviews (#820, #501) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · blocked · Codex 7d: 552 runs (215 high)
 - 2026-11-27 · #877 · Fix-scope counts only the PR's own change after a conflicted base merge (#742) · risk high · rounds 3 · arbiter 3 · awaiting-owner-merge · Codex 7d: 551 runs (216 high)
 - 2026-11-27 · #880 · CI speed-up: split cli-review tests in 4, run Ubuntu in 2×2 and Windows in 7 shards; weights from complete runs · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 548 runs (217 high)
+- 2026-11-27 · #879 · P cost: an empty-transcript booking books nothing (no double count); a plan phase for plan reviews (#820, #501) · risk high · rounds 7 · arbiter 7 (fix-verify 4) · merged · Codex 7d: 551 runs (218 high)
