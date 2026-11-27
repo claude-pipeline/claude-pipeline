@@ -300,8 +300,15 @@ test('preflight: an invalid registry file is reported when the repo has supabase
 // ---- auto-apply (Task 1): the registry's autoMigrations flag -------------------------------------------------------------------------------------------------------------
 
 const ON = { autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' };
-const DEPLOY = { deployEnv: 'Production', deployBot: 'vercel', deploySince: '2026-11-28T01:00:00Z', deployClock: 'github', deployProof: 'two-phase' };
-const NO_DEPLOY = { deployEnv: null, deployBot: null, deploySince: null, deployClock: null, deployProof: null, deployPending: null };
+const DEPLOY = { deployEnv: 'Production', deployBot: 'vercel' };
+const NO_DEPLOY = { deployEnv: null, deployBot: null };
+// the keys the unreleased cutoff-era commits of #907 wrote (N3): 7ac5c1d3's staged clock, 39e28449's finished two-phase registration with its staging key, and a staging key alone
+const LEGACY_PENDING = { env: 'Production', bot: 'vercel', since: '2026-11-28T01:00:00Z' };
+const LEGACY_SHAPES = {
+  'deployClock pending (7ac5c1d3)': { ...DEPLOY, deploySince: '2026-11-28T01:00:00Z', deployClock: 'pending' },
+  'two-phase proof with a staged registration (39e28449)': { ...DEPLOY, deploySince: '2026-11-28T01:00:00Z', deployClock: 'github', deployProof: 'two-phase', deployPending: LEGACY_PENDING },
+  'a staged registration alone': { deployPending: LEGACY_PENDING },
+};
 const LIVE = (over = {}) => ({ ref: REF, name: 'EagleWatch live', repo: 'acme/widgets', kind: 'live', ...over });
 
 test('readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry, one without repo or one without a valid autoSince, is invalid', (t) => {
@@ -497,51 +504,44 @@ test('a registry writer holding the db-refs lock makes every other writer refuse
 
 // ---- after-deploy (#882): the registration of the GitHub deployment that lets a marked migration apply ---------------------------------------------------------------------
 
-test('readDbRefs: the after-deploy keys are all-or-none, only with auto-apply on, never the bot github-actions; a registry without them reads null', (t) => {
+test('readDbRefs: the after-deploy pair is both-or-none, only with auto-apply on, never the bot github-actions; a registry without it reads null', (t) => {
   // Failure caught: a half registration (an environment without a bot, or a bot of any creator) or a github-actions bot letting a marked file through without a creator check an agent cannot forge; and an older registry failing to read.
   const home = scratchHome(t);
   seedRegistry(home, { refs: [LIVE(ON)] });
   assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...NO_DEPLOY }, 'a registry without the keys reads as before');
   seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY })] });
-  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...DEPLOY, deployPending: null });
-  const pending = { env: 'Production', bot: 'vercel', since: '2026-11-28T01:00:00Z' };
-  seedRegistry(home, { refs: [LIVE({ ...ON, deployPending: pending })] });
-  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...NO_DEPLOY, deployPending: pending }, 'a staged registration alone is a valid registry and carries no active keys');
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...DEPLOY });
   seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY, deployEnv: 'Production – eaglewatch' })] });
   assert.equal(readDbRefs(home).refs[0].deployEnv, 'Production – eaglewatch', 'an en dash is a valid environment character');
-  const { deployEnv, deployBot, deploySince } = DEPLOY;
+  const { deployEnv, deployBot } = DEPLOY;
   for (const bad of [
-    LIVE({ ...ON, deployEnv }), LIVE({ ...ON, deployBot }), LIVE({ ...ON, deploySince }), LIVE({ ...ON, deployEnv, deployBot }), LIVE({ ...ON, deployBot, deploySince }),
+    LIVE({ ...ON, deployEnv }), LIVE({ ...ON, deployBot }),
     LIVE({ ...DEPLOY }), LIVE({ autoMigrations: false, ...DEPLOY }),
     LIVE({ ...ON, ...DEPLOY, deployBot: 'github-actions' }), LIVE({ ...ON, ...DEPLOY, deployBot: 'Vercel' }), LIVE({ ...ON, ...DEPLOY, deployBot: 'vercel[bot]' }), LIVE({ ...ON, ...DEPLOY, deployBot: '' }),
-    LIVE({ ...ON, ...DEPLOY, deployEnv: '' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'x'.repeat(101) }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'Prod\nuction' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 7 }),
-    LIVE({ ...ON, ...DEPLOY, deployClock: 'pending' }), LIVE({ ...ON, ...DEPLOY, deployProof: 'x' }), LIVE({ ...ON, deployPending: { ...pending, bot: 'github-actions' } }), LIVE({ autoMigrations: false, deployPending: pending }), LIVE({ ...ON, deployPending: 'x' }),
-    LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28' }), LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28T01:00:00' }), LIVE({ ...ON, ...DEPLOY, deployEnv: null }),
+    LIVE({ ...ON, ...DEPLOY, deployEnv: '' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'x'.repeat(101) }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'Prod\nuction' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 7 }), LIVE({ ...ON, ...DEPLOY, deployEnv: null }),
+    // a cutoff-era key that is malformed is still invalid, and none of them is valid without the auto switch
+    LIVE({ ...ON, ...DEPLOY, deployClock: 'x' }), LIVE({ ...ON, ...DEPLOY, deployProof: 'x' }), LIVE({ ...ON, deployPending: { ...LEGACY_PENDING, bot: 'github-actions' } }), LIVE({ autoMigrations: false, deployPending: LEGACY_PENDING }), LIVE({ ...ON, deployPending: 'x' }),
+    LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28' }), LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28T01:00:00' }), LIVE({ ...DEPLOY, deploySince: '2026-11-28T01:00:00Z' }),
   ]) {
     seedRegistry(home, { refs: [bad] });
     assert.deepEqual(readDbRefs(home), { ok: false, reason: 'invalid' }, JSON.stringify(bad));
   }
 });
 
-// a fake `gh` for the child process (PIPELINE_GH, honoured in a checkout only): answers `api --include rate_limit` with the given Date header (a list: one per call), or fails when `date` is null
-const fakeGithubClock = (t, date) => {
+// a fake `gh` for the child process (PIPELINE_GH, honoured in a checkout only): every call is counted in the returned file and fails, so a command that must stay offline shows it
+const ghTrap = (t) => {
   const dir = scratchHome(t);
   const script = join(dir, 'fake-gh.mjs');
-  const dates = [date].flat();
-  // (one Date per call, the last one repeated: the command reads GitHub's time twice; a null entry is a failing call)
-  writeFileSync(script, `import { existsSync, readFileSync, writeFileSync } from 'node:fs';
-const counter = ${JSON.stringify(join(dir, 'calls'))};
-const n = existsSync(counter) ? Number(readFileSync(counter, 'utf8')) : 0;
-writeFileSync(counter, String(n + 1));
-const dates = ${JSON.stringify(dates)};
-const d = dates[Math.min(n, dates.length - 1)];
-if (d === null) { process.stderr.write('gh: not signed in\\n'); process.exit(4); }
-process.stdout.write(\`HTTP/2.0 200 OK\\r\\nContent-Type: application/json\\r\\nDate: \${d}\\r\\n\\r\\n{}\\n\`);\n`);
-  return { PIPELINE_GH: `node "${script}"` };
+  const calls = join(dir, 'calls');
+  writeFileSync(script, `import { appendFileSync } from 'node:fs';
+appendFileSync(${JSON.stringify(calls)}, 'call\\n');
+process.stderr.write('gh: must not be called\\n');
+process.exit(4);\n`);
+  return { env: { PIPELINE_GH: `node "${script}"` }, calls };
 };
 
-test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for github-actions[bot] and a malformed env; [bot] is stripped; deploySince is the GitHub clock every time, and gh failing refuses; off, auto-migrations off, a repo change and --dev clear all three keys, a label-only set keeps them', async (t) => {
-  // Failure caught: an agent registering a deployer for itself, a workflow-created deployment counting as production, a registration reaching back to earlier merges, or the trust surviving a change of repo.
+test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for github-actions[bot] and a malformed env; [bot] is stripped; on writes the pair only and makes no GitHub call; off, auto-migrations off, a repo change and --dev clear it, a label-only set keeps it', async (t) => {
+  // Failure caught: an agent registering a deployer for itself, a workflow-created deployment counting as production, a registration that needs GitHub (or any time) to switch on, or the trust surviving a change of repo.
   const home = scratchHome(t);
   seedRegistry(home, { refs: [LIVE(ON), LIVE({ ref: REF2, repo: 'acme/other' })] });
   const before = readFileSync(dbRefsFile(home), 'utf8');
@@ -559,73 +559,69 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   ]) await assert.rejects(() => run(bad, ownerCtx(home)), UsageError, bad.join(' '));
   assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, 'nothing written');
 
-  // Failure caught: the cut-off stamped from the owner's own clock (a slow clock lets a PR merged before the registration pass), or the registration written when GitHub's time cannot be read.
-  const unreachable = runOwnerCli(home, on, fakeGithubClock(t, null));
-  assert.equal(unreachable.exitCode, 1);
-  assert.equal(unreachable.output.error, 'github-unreachable');
-  assert.match(unreachable.output.message, /GitHub's time could not be read/);
-  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, 'nothing written when GitHub cannot be reached');
-  const GITHUB_DATE = 'Fri, 20 Nov 2026 10:00:00 GMT';
-  const r = runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'Vercel[bot]'], fakeGithubClock(t, GITHUB_DATE));
+  const trap = ghTrap(t);
+  const r = runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'Vercel[bot]'], trap.env);
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
   assert.match(r.output.note, /Production/);
   assert.match(r.output.note, /vercel\[bot\]/);
   assert.match(r.output.note, /dashboard/);
   assert.match(r.output.note, /after-deploy off/);
+  assert.match(r.output.note, /auto-migrations on/, 'the note names the lever that keeps the click for earlier merges');
+  assert.equal(existsSync(trap.calls), false, 'after-deploy on makes no GitHub call');
   const entry = readDbRefs(home).refs[0];
   assert.deepEqual([entry.deployEnv, entry.deployBot, entry.autoMigrations], ['Production', 'vercel', true]);
-  assert.equal(entry.deploySince, '2026-11-20T10:00:00.000Z', 'deploySince is GitHub\'s time, not this machine\'s');
-  assert.equal(entry.deployClock, 'github');
-  assert.equal(entry.deployProof, 'two-phase');
-  assert.equal(entry.deployPending, null, 'the staged registration is gone once it is published');
-  // Failure caught: a registration published although GitHub's clock moved backwards or by more than a minute between the staging write and the second read (a stall, a cached answer), or one that goes active, for an older reader, before it finished; and a failed second phase wrongly telling the owner an earlier registration is gone.
-  const earlier = LIVE({ ...ON, ...DEPLOY, deployBot: 'old-bot' });
-  const T1 = 'Fri, 20 Nov 2026 10:00:00 GMT';
-  for (const [what, second] of [['61 s later', 'Fri, 20 Nov 2026 10:01:01 GMT'], ['10 s earlier', 'Fri, 20 Nov 2026 09:59:50 GMT']]) {
-    seedRegistry(home, { refs: [earlier] });
-    const stale = runOwnerCli(home, on, fakeGithubClock(t, [T1, second]));
-    assert.equal(stale.exitCode, 1, what);
-    assert.equal(stale.output.error, 'github-time-stale', what);
-    assert.match(stale.output.message, /did not finish.*earlier registration, if any, is still in force with its old settings/, what);
-    const left = readDbRefs(home).refs[0];
-    assert.deepEqual({ ...left, deployPending: null }, { ...earlier, deployProof: 'two-phase', deployClock: 'github', deployPending: null, repo: 'acme/widgets', autoMigrations: true, autoSince: ON.autoSince }, `${what}: the active registration is untouched`);
-    assert.deepEqual(left.deployPending, { env: 'Production', bot: 'vercel', since: '2026-11-20T10:00:00.000Z' }, `${what}: staged only`);
-  }
-  // the second read failing leaves the earlier registration in force; the first failing changes nothing at all
-  seedRegistry(home, { refs: [earlier] });
-  const midway = runOwnerCli(home, on, fakeGithubClock(t, [T1, null]));
-  assert.equal(midway.output.error, 'github-unreachable');
-  assert.match(midway.output.message, /did not finish.*earlier registration, if any, is still in force with its old settings/);
-  assert.deepEqual([readDbRefs(home).refs[0].deployBot, readDbRefs(home).refs[0].deploySince], ['old-bot', DEPLOY.deploySince]);
-  seedRegistry(home, { refs: [earlier] });
-  const untouched = readFileSync(dbRefsFile(home), 'utf8');
-  const before1 = runOwnerCli(home, on, fakeGithubClock(t, null));
-  assert.match(before1.output.message, /nothing was changed.*earlier after-deploy registration, if any, is still in force/);
-  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), untouched, 'byte-identical');
-  seedRegistry(home, { refs: [LIVE(ON)] });
-  const finished = runOwnerCli(home, on, fakeGithubClock(t, [T1, 'Fri, 20 Nov 2026 10:00:05 GMT']));
-  assert.equal(finished.exitCode, 0, JSON.stringify(finished.output));
-  assert.deepEqual([readDbRefs(home).refs[0].deploySince, readDbRefs(home).refs[0].deployClock, readDbRefs(home).refs[0].deployProof], ['2026-11-20T10:00:00.000Z', 'github', 'two-phase']);
+  assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deploySince|deployClock|deployProof|deployPending/, 'no time or proof key is written');
   const shown = (await run(['show'], ownerCtx(home))).output.refs[0];
-  assert.deepEqual([shown.deployEnv, shown.deployBot, shown.deploySince], ['Production', 'vercel', entry.deploySince]);
-  // a second on replaces both and moves the cut-off to now
-  seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY, deployBot: 'old-bot' })] });
-  runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Staging', '--bot', 'vercel'], fakeGithubClock(t, GITHUB_DATE));
+  assert.deepEqual([shown.deployEnv, shown.deployBot], ['Production', 'vercel']);
+  // a second on replaces both
+  runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Staging', '--bot', 'netlify'], trap.env);
   const again = readDbRefs(home).refs[0];
-  assert.deepEqual([again.deployEnv, again.deployBot], ['Staging', 'vercel']);
-  assert.notEqual(again.deploySince, DEPLOY.deploySince);
+  assert.deepEqual([again.deployEnv, again.deployBot], ['Staging', 'netlify']);
 
-  const absent = () => assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deployEnv|deployBot|deploySince|deployClock/);
+  const absent = () => assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deployEnv|deployBot/);
   const kept = LIVE({ ...ON, ...DEPLOY });
   seedRegistry(home, { refs: [kept] });
   runOwnerCli(home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'ACME/widgets']);
-  assert.deepEqual(readDbRefs(home).refs[0], { ...kept, deployPending: null, name: 'Renamed', repo: 'ACME/widgets' }, 'a label-only set keeps the registration');
+  assert.deepEqual(readDbRefs(home).refs[0], { ...kept, name: 'Renamed', repo: 'ACME/widgets' }, 'a label-only set keeps the registration');
   for (const args of [['after-deploy', 'off', '--ref', REF], ['auto-migrations', 'off', '--ref', REF], ['set', '--ref', REF, '--name', 'x', '--repo', 'other/x'], ['set', '--ref', REF, '--name', 'x', '--repo', 'acme/widgets', '--dev']]) {
     seedRegistry(home, { refs: [kept] });
     const done = runOwnerCli(home, args);
     assert.equal(done.exitCode, 0, args.join(' '));
     absent();
-    assert.deepEqual([readDbRefs(home).refs[0].deployEnv, readDbRefs(home).refs[0].deployBot, readDbRefs(home).refs[0].deploySince], [null, null, null], args.join(' '));
+    assert.deepEqual([readDbRefs(home).refs[0].deployEnv, readDbRefs(home).refs[0].deployBot], [null, null], args.join(' '));
   }
   assert.equal(readDbRefs(home).refs[0].kind, 'dev', 'the last case was the --dev one');
+});
+
+test('legacy cutoff-era keys (N3): the registry stays valid, the entry reads as not registered, every write drops all deploy keys, only a fresh after-deploy on writes a pair', async (t) => {
+  // Failure caught: an unreleased #907 registration invalidating the registry (every Supabase write refused), or an unrelated owner write (a label, a server) quietly turning a half-trusted legacy entry into a live registration.
+  const home = scratchHome(t);
+  const other = LIVE({ ref: REF2, name: 'Other', repo: 'acme/other', ...ON });
+  const writes = [
+    ['a label-only set', ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'acme/widgets']],
+    ['a server add', ['server', 'add', 'my-supabase']],
+    ['auto-migrations on again', ['auto-migrations', 'on', '--ref', REF]],
+    ['after-deploy off', ['after-deploy', 'off', '--ref', REF]],
+  ];
+  for (const [shape, keys] of Object.entries(LEGACY_SHAPES)) {
+    seedRegistry(home, { refs: [LIVE({ ...ON, ...keys }), other] });
+    const r = readDbRefs(home);
+    assert.equal(r.ok, true, shape);
+    assert.deepEqual(r.refs[0], { ...LIVE(), ...ON, ...NO_DEPLOY, deployLegacy: true }, `${shape}: read as not registered, flagged`);
+    assert.deepEqual(r.refs[1], { ...other, repo: 'acme/other', ...NO_DEPLOY }, `${shape}: another ref reads normally`);
+    const shownRefs = (await run(['show'], ownerCtx(home))).output.refs;
+    assert.equal(shownRefs[0].deployEnv, undefined, `${shape}: show prints no registration`);
+    assert.equal(shownRefs[0].deployLegacy, true, shape);
+    for (const [what, args] of writes) {
+      seedRegistry(home, { refs: [LIVE({ ...ON, ...keys }), other] });
+      assert.equal(runOwnerCli(home, args).exitCode, 0, `${shape} / ${what}`);
+      assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deployEnv|deployBot|deploySince|deployClock|deployProof|deployPending/, `${shape} / ${what}: every deploy key is gone`);
+      assert.equal(readDbRefs(home).refs.find((e) => e.ref === REF).deployLegacy, undefined, `${shape} / ${what}`);
+    }
+    seedRegistry(home, { refs: [LIVE({ ...ON, ...keys }), other] });
+    assert.equal(runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']).exitCode, 0, shape);
+    const after = readDbRefs(home).refs;
+    assert.deepEqual([after[0].deployEnv, after[0].deployBot, after[0].deployLegacy, after[1].deployEnv], ['Production', 'vercel', undefined, null], `${shape}: only the ref given is registered`);
+    assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deploySince|deployClock|deployProof|deployPending/, shape);
+  }
 });
