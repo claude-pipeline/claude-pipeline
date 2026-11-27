@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { cpuTimed } from './helpers/timing.mjs';
-import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync } from 'node:fs';
+import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync, mkdirSync, chmodSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -42,9 +42,13 @@ function evaluate(command, o = {}) {
     },
     readText: o.readText ?? (() => null),
     pathExists: o.pathExists ?? (() => false),
+    ...(o.readDir ? { readDir: o.readDir } : {}),
   });
   return Object.assign(verdict, { calls });
 }
+
+// (#586: a cd to a directory that is not shown to exist leaves the directory unknown after a ;: options for a fake disk where these directories exist)
+const dirsExist = (...ds) => { const set = ds.map((d) => resolve(d)); return { pathExists: (p) => set.includes(resolve(p)), readDir: (p) => (set.includes(resolve(p)) ? [] : null) }; };
 
 // [command, options]
 const DENY = [
@@ -659,6 +663,132 @@ for (const [command, o] of MORE_ALLOW) {
   });
 }
 
+// #586: `cd /work/other; cd /work/repo/missing; git push`: the second cd fails, `;` goes on, and the push runs in /work/other (on main) while the guard judged /work/repo (agent/x)
+const CD_DIRS = ['/work/other', '/work/repo', '/work/repo/sub']; // (the directories that exist; /work/repo/file.txt is a file)
+const cdWorld = { byDir: { '/work/other': 'main', '/work/repo': 'agent/x', '/work/repo/sub': 'agent/x', '/work/repo/missing': 'agent/x', '/work/other/missing': 'agent/x', '/work/repo/tdir': 'agent/x', '/work/repo/file.txt': 'agent/x', '/home/u/missing': 'agent/x' }, pathExists: (p) => CD_DIRS.includes(resolve(p)) || resolve(p) === resolve('/work/repo/file.txt'), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null) };
+const CD_DENY = [
+  'cd /work/other; cd /work/repo/missing; git push',
+  'cd /work/other; pushd /work/repo/missing; git push',
+  'cd /work/other\ncd /work/repo/missing\ngit push',
+  'cd /work/other; cd /work/repo/file.txt; git push', // a file fails the cd as a missing directory does
+  'cd /work/other; mkdir /work/else; cd /work/repo/missing; git push', // (a mkdir of another path proves nothing)
+  'cd /work/other; echo /work/repo/missing; cd /work/repo/missing; git push', // (naming the path is not making it)
+  'cd /work/other; git status /work/repo/missing; cd /work/repo/missing; git push', // (a git command that does not create a directory proves nothing)
+  'cd /work/other; cd ~/missing; git push', // (a path under ~ is asked like any other)
+  'cd /work/other; rm -rf /work/repo/sub; cd /work/repo/sub; git push', // (R1-B2: what an earlier rm / rmdir / mv took away is not there, whatever the disk says now)
+  'cd /work/other; rmdir /work/repo/sub; cd /work/repo/sub; git push',
+  'cd /work/other; mv /work/repo/sub /work/else; cd /work/repo/sub; git push',
+  'cd /work/other; rm -rf /work/repo; cd /work/repo/sub; git push', // (an ancestor of the target)
+  'cd /work/other; cp /work/other/f.txt /work/repo/missing; cd /work/repo/missing; git push', // (R1-B3: copying a file makes no directory)
+  'cd /work/other; mv /work/other/f.txt /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; ln -s /work/other/f.txt /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; install /work/other/f.sh /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; tar -xf /work/repo/missing; cd /work/repo/missing; git push', // (tar names a directory only through -C, unzip only through -d)
+  'cd /work/other; unzip /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/other; tar -xf /work/other/a.tgz -C /work/repo/tdir; cd /work/repo/tdir; git push', // (R2-B3: tar -C needs the folder to exist, it makes none)
+  'cd /work/repo/missing; cd /work/other; cd /work/other/missing; git push', // (R3-B1: every doubtful cd stays, each where it was)
+  'cd /work/other; (cd /tmp && ls); cd /work/repo/missing; git push', // (the failed cd is judged again after a subshell that moved elsewhere)
+];
+const CD_ALLOW = [
+  'cd /work/other; cd /work/repo/sub; git push', // the target exists
+  'cd /work/other && cd /work/repo/missing && git push', // && proves the move
+  'cd /work/other; cd /work/repo/missing || exit 1; git push',
+  'cd /work/other; cd /work/repo/missing || { echo no; exit 1; }; git push',
+  'cd /work/other; mkdir /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/repo; mkdir -p a/b; cd a/b; git push',
+  'cd /work/repo; mkdir new; cd new; git push',
+  'cd /work/other; git clone https://example.invalid/r.git /work/repo/missing; cd /work/repo/missing; git push',
+  'cd /work/repo; git clone https://example.invalid/r.git; cd r; git push',
+  'cd /work/repo/sub; cd ..; git push', // an ancestor of where the line stands exists
+  'git clone -- https://example.invalid/r.git r; cd r; bash ./build.sh', // (R2-B4: after git's --, the operands go on)
+  'git clone --depth 1 https://example.invalid/r.git; cd r; bash ./build.sh', // (R1-B5: the clone's directory is named after the repository whatever options come before the URL: as on main)
+  'git clone -b main https://example.invalid/r.git; cd r; bash ./build.sh',
+  'gh repo clone team/tool; cd tool; bash ./build.sh',
+  'gh repo clone team/tool dest; cd dest; bash ./build.sh',
+  'mkdir -p ~/build; cd ~/build; bash ./build.sh', // (R1-B6: mkdir's ~ is the home, as the cd's is)
+  'cp -r /work/repo/sub /work/repo/copy; cd /work/repo/copy; git push', // (R1-B3: what can make a directory still proves the cd)
+  'cd /work/other; mv /work/repo/sub /work/repo/moved; cd /work/repo/moved; git push',
+  'cd /work/other; install -d /work/repo/idir; cd /work/repo/idir; git push',
+  'cd /work/other; unzip /work/other/a.zip -d /work/repo/udir; cd /work/repo/udir; git push',
+];
+// (R1-B1: `cd frontend; npm run build` where frontend does not exist runs the ROOT package's build script: the directory the line was in is still judged, as main did by walking up from the presumed subdirectory)
+const cdPkg = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/package.json'), readText: (p) => (resolve(p) === resolve('/work/repo/package.json') ? JSON.stringify({ name: 'x', scripts: { build: ['git', 'push', 'origin', 'main'].join(' '), ok: 'echo hi' } }) : null) };
+for (const c of ['cd frontend; npm run build', 'cd frontend\nnpm run build', 'cd frontend; bash -c "npm run build"', 'cd frontend; (cd /tmp && ls); npm run build', 'cd frontend; X=$(cd /tmp && pwd); npm run build', 'cd frontend; bash -c "cd /tmp && ls"; npm run build', 'true && cd frontend; npm run build', 'cd frontend || true; npm run build', 'cd a && cd frontend; npm run build']) {
+  test(`DENY #586 package script ${c.replace(/\n/g, '\\n')}`, () => {
+    const v = evaluate(c, cdPkg);
+    assert.equal(v.decision, 'deny', `expected deny, got allow for: ${c}`);
+  });
+}
+// (R2-B1: `rmdir` of a folder that holds files fails, the cd then succeeds and npm runs the FRONTEND script: both folders are judged)
+test('DENY #586 rmdir frontend; cd frontend; npm run build (the frontend script is the one that pushes)', () => {
+  const mainPush = ['git', 'push', 'origin', 'main'].join(' ');
+  const pkgs = { [resolve('/work/repo/package.json')]: { build: 'echo hi' }, [resolve('/work/repo/frontend/package.json')]: { build: mainPush } };
+  const o = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/frontend') || resolve(p) in pkgs, readDir: (p) => (resolve(p) === resolve('/work/repo/frontend') ? [] : cdWorld.readDir(p)), readText: (p) => (resolve(p) in pkgs ? JSON.stringify({ name: 'x', scripts: pkgs[resolve(p)] }) : null) };
+  const v = evaluate('rmdir frontend; cd frontend; npm run build', o);
+  assert.equal(v.decision, 'deny', 'expected deny, got allow');
+});
+// (R4-B1: when `test` fails the shell skips BOTH cds of the && chain and runs the ROOT build, which pushes: the directory the chain started in is judged too)
+test('DENY #586 test -f .frontend-build && cd frontend && cd dist; npm run build (the chain never ran: the root script pushes)', () => {
+  const pkgs = { [resolve('/work/repo/package.json')]: { build: ['git', 'push', 'origin', 'main'].join(' ') }, [resolve('/work/repo/frontend/package.json')]: { build: 'echo hi' } };
+  const o = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => (cdWorld.pathExists(p) || resolve(p) === resolve('/work/repo/frontend') || resolve(p) in pkgs) && resolve(p) !== resolve('/work/repo/frontend/dist') && resolve(p) !== resolve('/work/repo/.frontend-build'), readDir: (p) => (resolve(p) === resolve('/work/repo/frontend') ? [] : cdWorld.readDir(p)), readText: (p) => (resolve(p) in pkgs ? JSON.stringify({ name: 'x', scripts: pkgs[resolve(p)] }) : null) };
+  const v = evaluate('test -f .frontend-build && cd frontend && cd dist; npm run build', o);
+  assert.equal(v.decision, 'deny', 'expected deny, got allow');
+});
+// (R5-B1: `cd apps && test … && cd frontend && cd dist; P`: the test fails midway and P runs in `apps`, which is neither where the chain started nor where B puts the shell: every directory the chain can stop in is judged)
+test('DENY #586 cd apps && test -f .frontend-build && cd frontend && cd dist; npm run build (the chain stops in apps: its script pushes)', () => {
+  const pkgs = { [resolve('/work/repo/package.json')]: { build: 'echo hi' }, [resolve('/work/repo/apps/frontend/package.json')]: { build: 'echo hi' }, [resolve('/work/repo/apps/package.json')]: { build: ['git', 'push', 'origin', 'main'].join(' ') } };
+  const dirs = [resolve('/work/repo/apps'), resolve('/work/repo/apps/frontend')];
+  const o = { ...cdWorld, cwd: '/work/repo', pathExists: (p) => cdWorld.pathExists(p) || dirs.includes(resolve(p)) || resolve(p) in pkgs, readDir: (p) => (dirs.includes(resolve(p)) ? [] : cdWorld.readDir(p)), readText: (p) => (resolve(p) in pkgs ? JSON.stringify({ name: 'x', scripts: pkgs[resolve(p)] }) : null) };
+  const v = evaluate('cd apps && test -f .frontend-build && cd frontend && cd dist; npm run build', o);
+  assert.equal(v.decision, 'deny', 'expected deny, got allow');
+});
+// (R3-B4: reading B starts with fresh command-order state: the `npm pkg set` AFTER the lint run must not refuse the lint run)
+test('ALLOW #586 npm run ok; npm pkg set private=true; cd frontend (the write comes after the script)', () => {
+  const v = evaluate('npm run ok; npm pkg set private=true; cd frontend', cdPkg);
+  assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
+});
+test('ALLOW #586 cd frontend && npm run ok / cd frontend || exit 1 (proven: the target is where it runs)', () => {
+  for (const c of ['cd frontend && npm run ok', 'cd frontend || exit 1; npm run ok']) assert.equal(evaluate(c, cdPkg).decision, 'allow', c);
+});
+test('DENY #586 the reason names the cd and the fix', () => {
+  const v = evaluate('cd /work/other; cd /work/repo/missing; git push', { ...cdWorld, cwd: '/work/repo' });
+  assert.match(v.reason, /^`cd \/work\/repo\/missing` may fail.*Use `cd \/work\/repo\/missing && …` or `cd \/work\/repo\/missing \|\| exit 1`\.$/s);
+});
+test('ALLOW #586 cd frontend; npm run ok (the root script is harmless)', () => {
+  const v = evaluate('cd frontend; npm run ok', cdPkg);
+  assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
+});
+// (R1-B4: a folder the user may search but not list is a directory the cd enters: the type, not the listing, decides. Real disk; skipped as root, who can list everything)
+test('ALLOW #586 cd into a searchable but unlistable directory, then a relative script', { skip: process.getuid?.() === 0 || process.platform === 'win32' }, () => {
+  const d = realpathSync(mkdtempSync(join(tmpdir(), 'cdlock-')));
+  try {
+    mkdirSync(join(d, 'locked'));
+    writeFileSync(join(d, 'locked', 'build.sh'), 'echo hi\n');
+    chmodSync(join(d, 'locked'), 0o111);
+    const v = evaluateGitCommand(`cd ${join(d, 'locked')}; bash ./build.sh`, { cwd: d, home: d });
+    assert.equal(v.decision, 'allow', `got deny (${v.reason})`);
+    writeFileSync(join(d, 'build.sh'), ['git', 'push', 'origin', 'main'].join(' ') + '\n');
+    const f = evaluateGitCommand(`cd ${join(d, 'locked', 'build.sh')}; bash ./build.sh`, { cwd: d, home: d });
+    assert.equal(f.decision, 'deny', 'a file target fails the cd: ./build.sh is the one next to the line');
+  } finally {
+    chmodSync(join(d, 'locked'), 0o755);
+    rmSync(d, { recursive: true, force: true });
+  }
+});
+for (const c of CD_DENY) {
+  test(`DENY #586 ${c.replace(/\n/g, '\\n')}`, () => {
+    const v = evaluate(c, { ...cdWorld, cwd: '/work/repo' });
+    assert.equal(v.decision, 'deny', `expected deny, got allow for: ${c}`);
+  });
+}
+for (const c of CD_ALLOW) {
+  test(`ALLOW #586 ${c}`, () => {
+    const o = { ...cdWorld, cwd: '/work/repo', byDir: { ...cdWorld.byDir, '/work/repo/a/b': 'agent/x', '/work/repo/new': 'agent/x', '/work/repo/r': 'agent/x', '/work/repo/copy': 'agent/x', '/work/repo/moved': 'agent/x', '/work/repo/idir': 'agent/x', '/work/repo/udir': 'agent/x', '/work/repo/tdir': 'agent/x' } };
+    const v = evaluate(c, o);
+    assert.equal(v.decision, 'allow', `expected allow, got deny (${v.reason}) for: ${c}`);
+  });
+}
+
 test('what the evaluator asks its collaborators', () => {
   let v = evaluate('git -C /other push', { byDir: { '/other': 'agent/y' } });
   assert.deepEqual(v.calls.branchDirs.map((c) => c.dir), [resolve('/other')]);
@@ -997,9 +1127,9 @@ test('an overridden branch is looked up by name, and only for the directory it c
   assert.deepEqual(v.calls.branchDirs, [], 'the override replaces the real branch lookup');
   v = evaluate('git switch main && git push origin agent/x');
   assert.equal(v.decision, 'allow');
-  v = evaluate('git switch main || exit 1; cd /other; git push', { byDir: { '/other': 'agent/y', '/work/repo': 'agent/x' } });
+  v = evaluate('git switch main || exit 1; cd /other; git push', { ...dirsExist('/other'), byDir: { '/other': 'agent/y', '/work/repo': 'agent/x' } });
   assert.equal(v.decision, 'allow');
-  v = evaluate('git switch main || exit 1; cd /other; git push', { byDir: { '/other': 'main', '/work/repo': 'agent/x' } });
+  v = evaluate('git switch main || exit 1; cd /other; git push', { ...dirsExist('/other'), byDir: { '/other': 'main', '/work/repo': 'agent/x' } });
   assert.equal(v.decision, 'deny');
   v = evaluate('git checkout src/a.ts && git push', { branch: 'main', pathExists: () => true });
   assert.equal(v.decision, 'deny', '#789: a one-operand checkout may restore a file: the branch after it is unknown');
@@ -1810,7 +1940,7 @@ test('a line that passes an unsure variable to something that runs code or picks
 // a pipeline stage, a subshell, a substitution) must not be trusted by the commands after it, and builtins that assign
 // variables without a NAME=value word make the variable unsure.
 test('directory / branch / variable state from a command that may not have run is unknown', () => {
-  const o = { byDir: { '/work/repo': 'main', '/safe': 'agent/x' }, labels: [] };
+  const o = { byDir: { '/work/repo': 'main', '/safe': 'agent/x' }, labels: [], ...dirsExist('/safe') };
   const denyCmds = [
     'false && cd /safe; git push',
     'cd /safe & git push',
@@ -2084,7 +2214,8 @@ test('state that becomes unknown mid-line stays enforced; control flow counts fr
     byDir: { '/work/repo': 'agent/x', '/other': 'agent/y' },
     labelsByNum: {},
     readText: (p) => abs[resolve(p)] ?? null,
-    pathExists: (p) => resolve(p) in abs,
+    pathExists: (p) => resolve(p) in abs || dirsExist('/other').pathExists(p),
+    readDir: dirsExist('/other').readDir,
   };
   const denyCmds = [
     // a variable known when the line was first checked, unknown after `source`

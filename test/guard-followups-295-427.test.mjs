@@ -297,6 +297,7 @@ describe('R6-B1: rsync --files-from into home is a contents merge', () => {
 
 // ---- #427: the git guard's `cd X || exit` ----
 // cwd /work/repo is on agent/x, /other on agent/y: a push is allowed where the directory is known, and denied ("cannot tell which directory") where the cd may not have taken effect.
+const CD_DIRS = ['/work/main', '/work/repo', '/other'].map((d) => resolve(d));
 const gitRun = (command) => evaluateGitCommand(command, {
   cwd: '/work/repo',
   home: HOME,
@@ -305,7 +306,8 @@ const gitRun = (command) => evaluateGitCommand(command, {
   pushDestination: () => null,
   issueLabels: () => [],
   readText: () => null,
-  pathExists: () => false,
+  // (#586: the directories the lines cd to exist: a cd to one not shown to exist leaves the directory unknown after a ;)
+  pathExists: (p) => CD_DIRS.includes(resolve(p)), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null),
 });
 describe('#427: only a plain `exit` (alone or with one number) makes the code after `cd X || exit` follow a successful cd', () => {
   const NOT = (name, line) => test(`not narrowed: ${name}`, () => {
@@ -369,7 +371,7 @@ describe('#352: a pipeline stage that is a { } group or an if is parsed, not giv
 // (zsh runs the external cd), and dash's plain `time cd D` (no `time` keyword) leave the shell in /work/main in at least one real shell, while the guard moved to /work/repo and judged the push there: it ran in main (allowed on main for all
 // of them; `>/dev/null time cd D && P` is the same line with a redirect first). The change is UNKNOWN, not "child's" (bash really moves) and not "refused" (`\time make` is everyday).
 const gitMain = (command, cwd = '/work/main') => evaluateGitCommand(command, {
-  cwd, home: HOME, currentBranch: (d) => ({ [resolve('/work/main')]: 'main', [resolve('/work/repo')]: 'agent/x' })[d] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: () => false,
+  cwd, home: HOME, currentBranch: (d) => ({ [resolve('/work/main')]: 'main', [resolve('/work/repo')]: 'agent/x' })[d] ?? null, pushDestination: () => null, issueLabels: () => [], readText: () => null, pathExists: (p) => CD_DIRS.includes(resolve(p)), readDir: (p) => (CD_DIRS.includes(resolve(p)) ? [] : null),
 });
 describe('T2: a cd behind time / command leaves the directory unknown', () => {
   const PUSH_CMD = 'git push origin HEAD';
