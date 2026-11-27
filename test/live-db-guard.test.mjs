@@ -967,7 +967,7 @@ test('auto: a consumed marker with no op, no projectRef or no SQL hash cannot ru
   }
 });
 
-test('race: a go consumed after the auto check scanned the markers but before it claimed: auto is refused, the go keeps its apply', async (t) => {
+test('race: a go consumed after the auto check scanned the markers but before it claimed: auto is refused, leaving the apply to the go\'s own claim', async (t) => {
   // Failure caught: an auto apply and a go apply of the same migration both allowed (a double apply on a live database) when the go lands in the gap between auto's marker scan and its claim.
   const s = await autoScene(t);
   s.respond = () => {
