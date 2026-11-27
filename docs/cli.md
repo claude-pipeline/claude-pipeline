@@ -1405,12 +1405,13 @@ The spec table was written before the build; the CLI that shipped differs as fol
 
 ## db-refs
 
-the owner's registry of Supabase projects for the live-database guard: show it; set / remove a project, add / remove a trusted MCP server (owner only, own terminal)
+the owner's registry of Supabase projects for the live-database guard: show it; set / remove a project, add / remove a trusted MCP server, switch auto-apply of merged migrations on / off for a project (owner only, own terminal)
 
 ```
 pipeline db-refs show   -> {ok, file, refs: [{ref, name, repo, kind, autoMigrations}], servers, missing?} : READ-ONLY, runs anywhere; exit 0, or 1 when the file is unreadable or invalid (every Supabase write is then refused)
 pipeline db-refs set --ref <20 lowercase letters/digits> --name "<label>" --repo <owner/name> [--dev]   (a duplicate ref replaces its entry)
 pipeline db-refs remove --ref <ref>
+pipeline db-refs auto-migrations on|off --ref <ref> [--accept-unmatched]   (owner only; default off) ON: a migration file a merged PR added to the default branch of the project's registered repo is applied to that live project with no further go (docs/cli.md "Live database guard"). It first imports this machine's earlier go applies of the project into the attempt history; an apply whose go record is gone is listed and refused until --accept-unmatched. Refused for an unknown or dev ref, an entry without --repo, or a repo another enabled ref already has. OFF clears the switch and keeps the history. A repo or --dev change by `set` clears it. Run ON again after any rollback of the pipeline install.
 pipeline db-refs server add <segment> | server remove <segment>   (an MCP server name the owner trusts for Supabase: the part between mcp__ and the tool name)
   Every hosted project is LIVE unless declared --dev here; a project that is not listed is live too, with the name `unregistered project <ref>`.
   Only a server on the built-in list (plugin_supabase_supabase, supabase) or one added with `server add` may carry a go-bound write; a --dev declaration exempts a call only on a server the owner added.
