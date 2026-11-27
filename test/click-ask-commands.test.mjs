@@ -34,7 +34,8 @@ function addDialogHook(home, event = 'PreToolUse') {
 }
 
 const CHAT = (extra = '') => `${ymlFor()}owner_approval: chat\n${extra}`;
-const baseEnv = (s) => ({ ...process.env, PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_MACHINE_ID: 'click-ask-test', ...s.fake.env, ...s.env });
+// #713: a click is only asked on a Claude Code build the recorder accepts (CLICK_BUILDS), read from AI_AGENT: every test here runs as one of them unless it sets another.
+const baseEnv = (s) => ({ ...process.env, AI_AGENT: 'claude-code_2-1-323_agent', PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_MACHINE_ID: 'click-ask-test', ...s.fake.env, ...s.env });
 // What GitHub says about the PR for the dry run (see merge-dry-run.test.mjs).
 const prView = (s) => ({ match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: { state: 'OPEN', headRefOid: s.head, baseRefName: 'main', isDraft: false, labels: [], mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', baseRefOid: s.baseTip } });
 const script = (s, gh = {}) => [REPO, prView(s), ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: 'CLEAN', ...gh })];
@@ -100,6 +101,33 @@ test('merge --ask: label mode -> ask null, askSkipped names owner_approval; noth
   assert.equal(r.output.ask, null);
   assert.match(r.output.askSkipped, /owner_approval is not chat/);
   assert.deepEqual(asks(home), []);
+});
+
+// #713: the recorder refuses a click from a build outside CLICK_BUILDS (build-not-allowlisted), so no ask is issued there: the owner would get a button that is then refused.
+test('merge --ask: an allowlisted build issues the ask; another build or an unknown one gets ask null and askSkipped, nothing written (#713)', async () => {
+  const s = chatWorld();
+  const askedAs = async (home, AI_AGENT) => {
+    s.fake.setScript(script(s));
+    const env = { ...baseEnv(s), AI_AGENT };
+    if (AI_AGENT === undefined) delete env.AI_AGENT;
+    return mergeRun(mergeArgs('--ask'), { ...mergeCtx(s, home), env });
+  };
+  for (const build of ['claude-code_2-1-322_agent', 'claude-code_2-1-323_agent']) {
+    const r = await askedAs(newHome(), build);
+    assert.match(r.output.ask?.askId ?? '', /^ask-[0-9a-f]{12}$/, build);
+  }
+  const other = newHome();
+  const o = await askedAs(other, 'claude-code_2-1-330_agent');
+  assert.equal(o.output.ask, null);
+  assert.equal(o.output.askSkipped, 'build 2.1.330 not allowlisted for clicks (verified builds: 2.1.322, 2.1.323; the owner types instead)');
+  assert.deepEqual(asks(other), []);
+  for (const agent of [undefined, 'something-else']) {
+    const unknown = newHome();
+    const u = await askedAs(unknown, agent);
+    assert.equal(u.output.ask, null);
+    assert.equal(u.output.askSkipped, 'the running Claude Code build is unknown, so a click cannot be verified (the owner types instead)');
+    assert.deepEqual(asks(unknown), []);
+  }
 });
 
 test('merge --ask: owner_go.click off -> ask null, askSkipped says so', async () => {
