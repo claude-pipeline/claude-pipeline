@@ -1051,8 +1051,8 @@ function scriptFileOfArgv(argv) {
   if (argv[0] === 'playwright' && argv[1] === 'test') {
     const cfg = playwrightConfigOf(argv.slice(2));
     // every config word is a candidate, and so is the config file inside each (Playwright loads a directory's own); `--config=$C` is a word that holds the option too, so the value itself is named (R1-B1..B4).
-    // On a loose line only a word holding a dollar sign or a backtick may hold one more config option; a quoted `^login.*` filter, a `**` spec glob or a positional regex is no candidate (R2-B2, R2-F1)
-    if (cfg) return { kind: 'interp', file: cfg.file, ambiguous: true, words: [...(cfg.loose ? argv.slice(1).filter((w) => /[$`]/.test(w)) : []),...cfg.files, ...cfg.files.flatMap((f) => PLAYWRIGHT_CONFIG_NAMES.map((n) => `${f.replace(/\/+$/, '')}/${n}`))], needExt: false };
+    // On a loose line only a word with a real expansion (a dollar sign followed by a name character, `{`, `(` or a special parameter, or a backtick) may hold one more config option; a title filter ending in `$` is none (R3-B1); a quoted `^login.*` filter, a `**` spec glob or a positional regex is no candidate (R2-B2, R2-F1)
+    if (cfg) return { kind: 'interp', file: cfg.file, ambiguous: true, words: [...(cfg.loose ? argv.slice(1).filter((w) => /\$[\w{(@*#?$!-]|`/.test(w)) : []),...cfg.files, ...cfg.files.flatMap((f) => PLAYWRIGHT_CONFIG_NAMES.map((n) => `${f.replace(/\/+$/, '')}/${n}`))], needExt: false };
   }
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);

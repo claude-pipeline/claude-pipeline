@@ -2245,3 +2245,15 @@ test('#746 C2 review R2-B2/F1: a harmless config next to a regex filter or a spe
     assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
   }
 });
+
+// Review R3-B1. Failure caught: a harmless config next to a title filter ending in a dollar sign (`--grep '^push notifications$'`) is refused, because that word is kept as a candidate, becomes run-time-only and the line holds `push`.
+test('#746 C2 review R3-B1: a filter whose dollar sign starts no expansion is no candidate; a real expansion still is', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const evil = `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`;
+  const o = withFiles({ 'ok.ts': 'export default {};\n', 'bad.ts': evil });
+  for (const line of ["npx playwright test -c ok.ts --grep '^push notifications$'", "playwright test -c ok.ts --grep '^push notifications$'", "npx playwright test --config=ok.ts --grep 'push$'"]) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+  for (const line of ['C=bad.ts; npx playwright test --grep x -c "$C"', 'C=bad.ts; playwright test --grep $C -c ok.ts', 'C=bad.ts; playwright test --grep x* -c ${C}']) assert.equal(evaluate(line, o).decision, 'deny', line);
+});
