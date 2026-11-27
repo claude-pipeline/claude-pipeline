@@ -9,15 +9,18 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { shardFiles } from '../scripts/lib/shard.mjs';
-import { collectFileTimes, extractTimes, medianWeights, MARK_BEGIN, MARK_END } from '../scripts/lib/file-times.mjs';
+import { buildManifest, collectFileTimes, extractManifest, extractTimes, fileListHash, medianWeights, validateRun, MANIFEST_BEGIN, MANIFEST_END, MARK_BEGIN, MARK_END } from '../scripts/lib/file-times.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const runner = join(root, 'scripts', 'test.mjs');
 // A nested `node --test` inside a test must not think it is a child of the outer run (it would speak the child protocol).
+// It also must not inherit the timing variables of a CI shard (a nested scripts/test.mjs would overwrite the shard's times file): a test that wants them passes its own in `extra`.
 const nestedEnv = (extra = {}) => {
-  const env = { ...process.env, ...extra };
+  const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
-  return env;
+  delete env.CP_TEST_TIMES;
+  delete env.CP_TEST_TIMES_LINES;
+  return { ...env, ...extra };
 };
 const preload = join(root, 'scripts', 'lib', 'file-times-preload.mjs');
 
@@ -139,10 +142,10 @@ test('file-times preload: each file of a two-file run gets its own wall-clock sp
     const out = join(dir, 'times.json');
     const fx = (n) => join(root, 'test', 'fixtures', 'file-times', n);
     const r = spawnSync(process.execPath, ['--test', '--import', pathToFileURL(preload).href, fx('slow.mjs'), fx('quick.mjs')], {
-      encoding: 'utf8', env: nestedEnv({ CP_TEST_TIMES: out }),
+      encoding: 'utf8', env: nestedEnv({ CP_TEST_TIMES_LINES: out }),
     });
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    const lines = readFileSync(`${out}.jsonl`, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const lines = readFileSync(out, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     const times = collectFileTimes(lines);
     assert.deepEqual(Object.keys(times).sort(), ['quick.mjs', 'slow.mjs']);
     // 300 setup + 200 + 100 + 50 after-hook = 650 ms of work in slow.mjs; the quick file is not given the slow file's time
@@ -154,11 +157,10 @@ test('file-times preload: each file of a two-file run gets its own wall-clock sp
   }
 });
 
-test('file-times preload does nothing unless CP_TEST_TIMES is set', () => {
+test('file-times preload does nothing unless CP_TEST_TIMES_LINES is set', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cp-times-'));
   try {
-    const env = nestedEnv();
-    delete env.CP_TEST_TIMES;
+    const env = nestedEnv({ CP_TEST_TIMES: join(dir, 'times.json') }); // the caller's CP_TEST_TIMES alone is not enough
     const r = spawnSync(process.execPath, ['--test', '--import', pathToFileURL(preload).href, join(root, 'test', 'fixtures', 'file-times', 'quick.mjs')], { encoding: 'utf8', env, cwd: dir });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.deepEqual(readdirSync(dir), [], 'no file written');
@@ -175,7 +177,7 @@ test('collectFileTimes: one entry per file by base name (Windows and POSIX paths
   assert.deepEqual(t, { 'one.test.mjs': { spanMs: 1234 }, 'two.test.mjs': { spanMs: 90 } });
 });
 
-test('scripts/test.mjs with CP_TEST_TIMES writes { file: { spanMs } } for the files it ran, then removes its scratch file', () => {
+test('scripts/test.mjs with CP_TEST_TIMES writes { file: { spanMs } } and a manifest for the files it ran, then removes its scratch file', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cp-times-'));
   try {
     const out = join(dir, 'times.json');
@@ -184,7 +186,29 @@ test('scripts/test.mjs with CP_TEST_TIMES writes { file: { spanMs } } for the fi
     const t = JSON.parse(readFileSync(out, 'utf8'));
     assert.deepEqual(Object.keys(t), ['glob.test.mjs']);
     assert.ok(t['glob.test.mjs'].spanMs > 0);
-    assert.deepEqual(readdirSync(dir), ['times.json'], 'the .jsonl scratch file is gone');
+    assert.deepEqual(readdirSync(dir).sort(), ['times.json', 'times.json.manifest'], 'the lines scratch file is gone');
+    // the manifest names this run's files, no shard, and the full list (here the same single file)
+    assert.deepEqual(JSON.parse(readFileSync(`${out}.manifest`, 'utf8')), { shard: null, files: ['glob.test.mjs'], fullCount: 1, fullHash: fileListHash(['glob.test.mjs']) });
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A test file that runs its own scripts/test.mjs (this very file does) inherits what the outer runner gave it. If that included the shard's
+// CP_TEST_TIMES, the nested runner deleted and overwrote the shard's timing files and the weights refresh saw a handful of entries.
+test('a nested runner probe wipes the shard\'s timing file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-times-'));
+  try {
+    const out = join(dir, 'times.json');
+    const r = spawnSync(process.execPath, [runner, 'glob.test.mjs', 'runner-env-probe.test.mjs'], {
+      encoding: 'utf8', env: nestedEnv({ CP_TEST_TIMES: out, CP_PROBE_NEST: '1' }),
+    });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    // glob.test.mjs finished long before the probe started its nested runner; its entry must survive that
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(out, 'utf8'))), ['glob.test.mjs', 'runner-env-probe.test.mjs']);
+    // ...and so must the manifest: the nested runner would otherwise rewrite it with its own one-file list
+    const both = ['glob.test.mjs', 'runner-env-probe.test.mjs'];
+    assert.deepEqual(JSON.parse(readFileSync(`${out}.manifest`, 'utf8')), { shard: null, files: both, fullCount: 2, fullHash: fileListHash(both) });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -231,6 +255,75 @@ test('scripts/shard-weights.mjs: no run id, or a non-numeric one, is a usage err
     assert.match(r.stderr, /usage/);
   }
   assert.equal(readFileSync(file, 'utf8'), before);
+});
+
+// One CI run of three Windows shards over six files, as shard-weights.mjs hands it to validateRun (times and manifest as parsed from each job log).
+const fullList = ['a.test.mjs', 'b.test.mjs', 'c.test.mjs', 'd.test.mjs', 'e.test.mjs', 'f.test.mjs'];
+const wjob = (i, files, over = {}) => ({
+  name: `test (windows ${i}/3)`, conclusion: 'success',
+  times: Object.fromEntries(files.map((f) => [f, { spanMs: 1000 }])),
+  manifest: buildManifest({ shard: `${i}/3`, files, full: fullList }),
+  ...over,
+});
+const wholeRun = () => [wjob(1, ['a.test.mjs', 'd.test.mjs']), wjob(2, ['b.test.mjs', 'e.test.mjs']), wjob(3, ['c.test.mjs', 'f.test.mjs'])];
+
+test('extractManifest: reads the manifest block of a job log, and the times block is not mistaken for it', () => {
+  const m = buildManifest({ shard: '2/3', files: ['b.test.mjs', 'a.test.mjs'], full: fullList });
+  const log = [`2026-11-04T10:00:00.0Z ${MARK_BEGIN}`, '2026-11-04T10:00:00.1Z {"a.test.mjs":{"spanMs":5}}', `2026-11-04T10:00:00.2Z ${MARK_END}`,
+    `2026-11-04T10:00:00.3Z ${MANIFEST_BEGIN}`, `2026-11-04T10:00:00.4Z ${JSON.stringify(m)}`, `2026-11-04T10:00:00.5Z ${MANIFEST_END}`].join('\r\n');
+  assert.deepEqual(extractManifest(log), { shard: '2/3', files: ['a.test.mjs', 'b.test.mjs'], fullCount: 6, fullHash: fileListHash(fullList) });
+  assert.deepEqual(extractTimes(log), { 'a.test.mjs': { spanMs: 5 } });
+  assert.equal(extractManifest('no markers here'), null);
+});
+
+// The failure: scripts/shard-weights.mjs merged whatever blocks it found, so a run with a missing, failed or half-measured shard
+// overwrote test-weights.json with a handful of entries and every later shard was balanced by (almost) bytes again.
+test('a partial timing sample overwrites weights: validateRun takes a whole run and rejects every partial one', () => {
+  const ok = validateRun(wholeRun());
+  assert.equal(ok.ok, true);
+  assert.deepEqual(Object.keys(ok.times), ['a.test.mjs', 'd.test.mjs', 'b.test.mjs', 'e.test.mjs', 'c.test.mjs', 'f.test.mjs']);
+
+  const reject = (jobs, why) => {
+    const v = validateRun(jobs);
+    assert.equal(v.ok, false, why);
+    assert.match(v.reason, new RegExp(why), JSON.stringify(v));
+  };
+  reject(wholeRun().slice(0, 2), 'shard 3/3 is missing'); // a whole job absent
+  reject([...wholeRun(), wjob(2, ['b.test.mjs', 'e.test.mjs'])], 'shard 2/3 appears more than once'); // duplicate shard index
+  reject(wholeRun().map((j, k) => (k === 1 ? { ...j, conclusion: 'failure' } : j)), 'concluded "failure"'); // failed job
+  reject(wholeRun().map((j, k) => (k === 2 ? { ...j, conclusion: null } : j)), 'concluded null');
+  for (const bad of [0, NaN, -5, undefined]) { // invalid span for a listed file
+    const jobs = wholeRun();
+    jobs[0].times['d.test.mjs'] = bad === undefined ? {} : { spanMs: bad };
+    reject(jobs, 'd.test.mjs has no valid spanMs');
+  }
+  const noTimes = wholeRun();
+  noTimes[1].times = null;
+  reject(noTimes, 'b.test.mjs has no valid spanMs');
+  const noManifest = wholeRun();
+  noManifest[2].manifest = null;
+  reject(noManifest, 'has no manifest');
+  reject([wjob(1, []), wjob(2, []), { ...wjob(3, []), name: 'test (windows 3/4)' }], 'disagree on the shard count');
+  reject([], 'no Windows shard jobs');
+  // manifests of different lists, overlapping shards, a shard that lost files
+  const other = wholeRun();
+  other[1].manifest = buildManifest({ shard: '2/3', files: ['b.test.mjs', 'e.test.mjs'], full: [...fullList, 'g.test.mjs'] });
+  reject(other, 'disagree on the full file list');
+  const overlap = wholeRun();
+  overlap[1] = wjob(2, ['b.test.mjs', 'a.test.mjs']);
+  reject(overlap, 'a.test.mjs is listed by more than one shard');
+  const short = wholeRun();
+  short[2] = wjob(3, ['c.test.mjs']);
+  reject(short, 'the shards list 5 files, the full list has 6');
+  // the right count of the wrong files: shard 3 ran g.test.mjs instead of f.test.mjs, so f.test.mjs would drop out of the weights
+  const swapped = wholeRun();
+  swapped[2] = wjob(3, ['c.test.mjs', 'g.test.mjs']);
+  reject(swapped, 'not the full file list');
+  // manifests that all declare an empty list pass every count check but measured nothing
+  reject([1, 2, 3].map((i) => wjob(i, [], { manifest: buildManifest({ shard: `${i}/3`, files: [], full: [] }) })), 'list no files');
+  const wrongLabel = wholeRun();
+  wrongLabel[0].manifest = buildManifest({ shard: '3/3', files: ['a.test.mjs', 'd.test.mjs'], full: fullList });
+  reject(wrongLabel, 'manifest says shard "3/3"');
 });
 
 // ---- name selection ------------------------------------------------------------------------------------------------
