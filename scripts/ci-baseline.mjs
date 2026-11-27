@@ -1,13 +1,15 @@
 // Read-only CI baseline: node scripts/ci-baseline.mjs [K] [--json]
-// For the last K merged PRs of this repo (default 20), from `gh` GET calls only (nothing is written, nothing is re-run):
+// For the last K PRs merged in this repo (default 20, newest merge first), from reads only (nothing is written, nothing is re-run): `gh` REST GETs, plus the
+// pipeline's queueEvents reader (pipeline/lib/github.mjs), which reads the queue history with a GraphQL query (a POST that only reads):
 //   ready -> both required checks green on the PR   (first ready_for_review, else PR creation; latest passing "test (ubuntu)" and "test (windows)" on the final head)
-//   queue entry -> queue run green                  (the last added_to_merge_queue event to the end of the merge_group run of that PR)
+//   queue entry -> queue run green                  (the last queue entry to the end of the ci.yml merge_group run of that entry that passed)
 //   ready -> merged
-//   runner wait                                     (per job: created_at -> started_at, over the PR's runs on the final head and its queue run; the table shows the longest)
-//   re-runs                                         (sum of run_attempt - 1 over those runs)
-//   queue bounces                                   (removed_from_merge_queue events before the merge)
+//   runner wait                                     (per job: created_at -> started_at, over the PR's ci.yml pull_request runs on the final head and its queue run, skipped jobs left out, nothing after the merge; the table shows the longest)
+//   re-runs                                         (per run, its highest attempt before the merge minus 1, summed over those runs)
+//   queue bounces                                   (queue removals whose reason is not "merged")
 // All times are UTC (ISO strings in --json); the table shows minutes. Run it from a clone of the repo (gh uses its remote).
 import { spawnSync } from 'node:child_process';
+import { createGitHub } from '../pipeline/lib/github.mjs';
 
 // The only way this script talks to GitHub. `gh api` is a GET unless a method or a body flag turns it into a write, so those are refused here.
 const gh = (args) => {
@@ -41,42 +43,67 @@ if (rest.length > 1 || !Number.isInteger(k) || k < 1) {
   process.exit(2);
 }
 
-// The workflow runs of one PR: the pull_request runs on its final head and its merge_group runs (the queue branch is gh-readonly-queue/<base>/pr-<N>-<sha>).
-function runsOf(n, headSha, queueRuns) {
-  const onHead = ghJson(['api', `repos/${repo}/actions/runs?head_sha=${headSha}&per_page=100`]).workflow_runs ?? [];
-  return [...onHead, ...queueRuns.filter((r) => new RegExp(`/pr-${n}-`).test(r.head_branch ?? ''))];
+const WORKFLOW = 'ci.yml'; // the one workflow whose runs are measured (as .github/scripts/tested-tree.mjs reads it)
+const gh_ = createGitHub({ cwd: process.cwd() });
+
+// The last K PRs by MERGE time. `gh pr list` cannot sort by merge time, so list by last update (a PR is never updated before it merged, so every PR
+// merged after the K-th newest merge has been updated after it too), sort by mergedAt, and widen the list until its tail is older than that cutoff.
+function lastMerged(count) {
+  for (let limit = Math.max(count * 3, 30); ; limit *= 2) {
+    const list = ghJson(['pr', 'list', '--state', 'merged', '--limit', String(limit), '--search', 'sort:updated-desc', '--json', 'number,title,createdAt,mergedAt,updatedAt,headRefOid']);
+    const byMerge = [...list].sort((a, b) => (a.mergedAt < b.mergedAt ? 1 : a.mergedAt > b.mergedAt ? -1 : 0));
+    const top = byMerge.slice(0, count);
+    const cutoff = top.at(-1)?.mergedAt;
+    // complete when the list ran out, or its least recently updated PR was updated before the cutoff (nothing further down can have merged after it)
+    if (list.length < limit || (top.length === count && list.at(-1).updatedAt < cutoff)) return top;
+  }
 }
 
-const merged = ghJson(['pr', 'list', '--state', 'merged', '--limit', String(k), '--json', 'number,title,createdAt,mergedAt,headRefOid']);
-const queueRuns = ghJson(['api', `repos/${repo}/actions/runs?event=merge_group&per_page=100`]).workflow_runs ?? [];
+// How many runs/checks/jobs one GET returns: every page, never just the first.
+const ghAll = (path, key) => ghJson(['api', '--paginate', '--slurp', path]).flatMap((page) => page[key] ?? []);
+
+const merged = lastMerged(k);
+// the merge-queue runs of the whole sample in one read, bounded to the days the sample covers
+const since = merged.map((pr) => pr.createdAt).sort()[0]?.slice(0, 10);
+const queueRuns = ghAll(`repos/${repo}/actions/workflows/${WORKFLOW}/runs?event=merge_group&created=%3E%3D${since}&per_page=100`, 'workflow_runs');
 
 const rows = merged.map((pr) => {
   const timeline = ghPages(`repos/${repo}/issues/${pr.number}/timeline?per_page=100`);
-  const at = (event) => timeline.filter((e) => e.event === event).map((e) => e.created_at).sort();
-  const readyAt = at('ready_for_review')[0] ?? pr.createdAt;
-  const added = at('added_to_merge_queue');
-  // GitHub also records a removal at the moment the queue merges the PR; only a removal before that is a bounce
-  const bounces = at('removed_from_merge_queue').filter((t) => t < pr.mergedAt).length;
-  const checks = ghJson(['api', `repos/${repo}/commits/${pr.headRefOid}/check-runs?per_page=100`]).check_runs ?? [];
+  const readyAt = timeline.filter((e) => e.event === 'ready_for_review').map((e) => e.created_at).sort()[0] ?? pr.createdAt;
+  // the queue history comes from the pipeline's own reader (order and removal reason): the removal GitHub records at the merge itself has reason "merged" and is not a bounce
+  const queue = gh_.queueEvents(pr.number);
+  const lastEntry = queue.filter((e) => e.type === 'added').map((e) => e.at).sort().at(-1) ?? null;
+  const bounces = queue.filter((e) => e.type === 'removed' && e.reason !== 'merged').length;
+  // Everything below ignores activity after the merge (a re-run started later, for instance, is not part of how long this PR took).
+  const before = (iso) => Boolean(iso) && iso <= pr.mergedAt;
+  const checks = ghAll(`repos/${repo}/commits/${pr.headRefOid}/check-runs?per_page=100`, 'check_runs');
   // the latest passing run of each required check on the final head; both must exist
-  const greenAt = REQUIRED.map((name) => checks.filter((c) => c.name === name && c.conclusion === 'success').map((c) => c.completed_at).sort().pop() ?? null);
+  const greenAt = REQUIRED.map((name) => checks.filter((c) => c.name === name && c.conclusion === 'success' && before(c.completed_at)).map((c) => c.completed_at).sort().pop() ?? null);
   const bothGreen = greenAt.every(Boolean) ? greenAt.sort().pop() : null;
-  const runs = runsOf(pr.number, pr.headRefOid, queueRuns);
-  const queueRun = runs.filter((r) => r.event === 'merge_group' && r.conclusion === 'success').sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))[0];
+  // the pull_request runs of ci.yml on the final head, and the merge_group run of this PR's last queue entry that passed
+  const headRuns = ghAll(`repos/${repo}/actions/workflows/${WORKFLOW}/runs?head_sha=${pr.headRefOid}&event=pull_request&per_page=100`, 'workflow_runs').filter((r) => before(r.run_started_at ?? r.created_at));
+  const queueRun = queueRuns
+    .filter((r) => new RegExp(`/pr-${pr.number}-`).test(r.head_branch ?? '') && r.conclusion === 'success' && lastEntry && r.created_at >= lastEntry && before(r.created_at))
+    .sort((a, b) => (a.updated_at < b.updated_at ? 1 : -1))[0];
   const jobWaits = [];
-  for (const run of runs) {
-    for (const job of (ghJson(['api', `repos/${repo}/actions/runs/${run.id}/jobs?filter=all&per_page=100`]).jobs ?? [])) {
+  let reruns = 0;
+  for (const run of [...headRuns, ...(queueRun ? [queueRun] : [])]) {
+    // filter=all: the jobs of every attempt, so a re-run's wait counts too; a job that started after the merge belongs to a later re-run
+    const jobs = ghAll(`repos/${repo}/actions/runs/${run.id}/jobs?filter=all&per_page=100`, 'jobs').filter((j) => before(j.started_at));
+    reruns += Math.max(1, ...jobs.map((j) => j.run_attempt ?? 1)) - 1;
+    for (const job of jobs) {
+      if (job.conclusion === 'skipped') continue; // never asked for a runner (proof-anchor, the draft-era run): not a wait
       jobWaits.push({ run: run.id, job: job.name, queuedAt: job.created_at, startedAt: job.started_at, waitMin: minutes(job.created_at, job.started_at) });
     }
   }
   return {
     pr: pr.number, title: pr.title, readyAt, mergedAt: pr.mergedAt,
     readyToChecksGreenMin: minutes(readyAt, bothGreen),
-    queueEnteredAt: added.at(-1) ?? null, queueRunGreenAt: queueRun?.updated_at ?? null,
-    queueToGreenMin: minutes(added.at(-1), queueRun?.updated_at),
+    queueEnteredAt: lastEntry, queueRunGreenAt: queueRun?.updated_at ?? null,
+    queueToGreenMin: minutes(lastEntry, queueRun?.updated_at),
     readyToMergedMin: minutes(readyAt, pr.mergedAt),
     maxRunnerWaitMin: jobWaits.every((j) => j.waitMin === null) ? null : Math.max(...jobWaits.map((j) => j.waitMin ?? 0)),
-    reruns: runs.reduce((sum, r) => sum + Math.max(0, (r.run_attempt ?? 1) - 1), 0),
+    reruns,
     queueBounces: bounces,
     jobWaits,
   };
