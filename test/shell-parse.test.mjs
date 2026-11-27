@@ -1377,3 +1377,71 @@ test('#662: pipeRec names the stages, the operators and wrappers of a pipeline; 
   assert.equal(simpleCommands('echo "$(git checkout main)" | git switch b')[0].argv.join(' '), 'git checkout main');
   for (const line of ['echo x | { git switch b; } && P', 'cat <<EOF | git switch b && P\nbody\nEOF', 'echo x', '(echo x) | git switch b']) assert.equal(rec(line), null, line);
 });
+
+// #746 C1. Failure caught: `npx playwright test -c /abs/x.config.ts` is read as `sh -c /abs/x.config.ts` (npx's own -c), so a real TypeScript config is parsed as shell and the harmless run is refused.
+test('#746 C1: `npx playwright test` with one config option runs playwright; every other npx shape keeps the -c / --call shell reading', () => {
+  for (const line of ['npx playwright test -c /abs/x.config.ts', 'npx playwright test --config /abs/x.config.ts', 'npx playwright test --config=/abs/x.config.ts', 'command npx playwright test -c /abs/x.config.ts', 'env npx playwright test -c /abs/x.config.ts']) {
+    const cmds = simpleCommands(line);
+    assert.equal(cmds.length, 1, `${line} -> ${JSON.stringify(argvs(line))}`);
+    assert.deepEqual(cmds[0].argv.slice(0, 2), ['playwright', 'test'], line);
+    assert.equal(cmds[0].viaRunner, true, line); // (still a package runner's tool: looked up in node_modules/.bin)
+  }
+  const G = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  // [line, the shell text npx runs, as today]. Each of these must still read the -c text as a shell command line
+  const SHELL_READ = [
+    ['/dir/npx playwright test -c f.sh', 'f.sh'], // (a path, not the bare word npx: any program)
+    ['PATH=/dir:$PATH npx playwright test -c f.sh', 'f.sh'],
+    ['export PATH=/dir:$PATH; npx playwright test -c f.sh', 'f.sh'],
+    ['"export" "P""ATH=/dir:$PATH"; npx playwright test -c f.sh', 'f.sh'],
+    ['export $N=/dir; npx playwright test -c f.sh', 'f.sh'], // (a name built at run time may be PATH)
+    ['npx(){ echo x; }; npx playwright test -c f.sh', 'f.sh'],
+    ['function npx { echo x; }; npx playwright test -c f.sh', 'f.sh'],
+    ['alias npx=foo; npx playwright test -c f.sh', 'f.sh'],
+    ['hash -p /dir/npx npx; npx playwright test -c f.sh', 'f.sh'],
+    ['npx playwright test --config=ok.ts -c bad.ts', 'bad.ts'], // (playwright uses the LAST config: two config options fail the single-config test)
+    ['npx playwright test -c ok -c bad', 'ok'],
+    ['npx playwright test --grep -c ok --config=bad', 'ok'],
+    ['npx playwright test $X -c f.ts', 'f.ts'], // (an expanded word may be one more config option)
+    [`npx -c '${G}'`, G],
+    [`npx --call='${G}'`, G],
+    [`npx -y playwright test -c '${G}'`, G],
+    [`npx playwright@1 test -c '${G}'`, G],
+    [`npx $P test -c '${G}'`, G],
+    [`npm exec foo -c '${G}'`, G],
+    [`npx playwright show-report -c '${G}'`, G], // (only `playwright test`)
+  ];
+  for (const [line, text] of SHELL_READ) assert.ok(argvs(line).includes(text), `${line} -> ${JSON.stringify(argvs(line))}`);
+  // a cluster or attached form is not a config the guard can name: the line keeps today's reading (no shell text is run from it, the tool gets the words)
+  for (const line of ['npx playwright test -cbad.ts', 'npx playwright test -xc bad.ts']) assert.deepEqual(argvs(line), [line.replace('npx ', '')], line);
+});
+
+// #746 C2. Failure caught: the config file named by `playwright test -c F` / `--config F` / `--config=F` is run by node, but the guards never read it, so a config holding a forbidden command is allowed (guard-git allows `--config=F` and `-c F` today).
+// Review R1-B1..B4 (same failure, other spellings): a config DIRECTORY (Playwright loads the config file inside it), `--config=$CFG` (the value itself must be a candidate, not only the word `--config=ci.config.ts`),
+// a `'login.*'` filter or another expanding word, and several config options (the last one runs) must all leave every literal config a candidate.
+test('#746 C2: scriptFileOf names the config of a bare `playwright test` as a program node runs; other spellings and shapes keep today\'s record', () => {
+  const f = (s) => scriptFileOf(s.split(' '));
+  const dirsOf = (d) => ['ts', 'js', 'mts', 'mjs', 'cts', 'cjs'].map((e) => `${d}/playwright.config.${e}`);
+  assert.deepEqual({ ...f('playwright test -c /abs/x.config.ts') }, { kind: 'interp', file: '/abs/x.config.ts', ambiguous: true, words: ['/abs/x.config.ts', ...dirsOf('/abs/x.config.ts')], needExt: false });
+  assert.equal(f('playwright test --config /abs/x.config.ts').file, '/abs/x.config.ts');
+  assert.equal(f('playwright test --config=/abs/x.config.ts --workers 2 a.spec.ts').file, '/abs/x.config.ts');
+  // R1-B1: a directory config: the file inside it (in Playwright's order) is a candidate, a trailing slash included
+  assert.deepEqual(f('playwright test --config=e2e').words, ['e2e', ...dirsOf('e2e')]);
+  assert.deepEqual(f('playwright test --config e2e/').words, ['e2e/', ...dirsOf('e2e')]);
+  // R1-B2: the extracted value is a word of its own
+  assert.ok(f('playwright test --config=$C').words.includes('$C'));
+  // R1-B3: a wildcard in another word keeps the literal config a candidate
+  assert.ok(f("playwright test --config=ci.config.ts --grep login.*").words.includes('ci.config.ts'));
+  assert.ok(f('playwright test $X -c ci.config.ts').words.includes('ci.config.ts'));
+  // R1-B4: several config options: every literal one is a candidate (the last one runs)
+  for (const s of ['playwright test --config=default.ts --config=ci.ts', 'playwright test -c default.ts -c ci.ts', 'playwright test --config=default.ts -c ci.ts']) {
+    const w = f(s).words;
+    assert.ok(w.includes('default.ts') && w.includes('ci.ts') && w.includes('ci.ts/playwright.config.ts'), s);
+    assert.equal(f(s).file, 'ci.ts', s);
+  }
+  // not the bare word: today's records stay (an exec of that path / of the PATH lookup)
+  assert.equal(f('/dir/playwright test -c ok.ts').kind, 'exec');
+  assert.equal(f('./node_modules/.bin/playwright test --config=ok.ts').kind, 'exec');
+  assert.equal(f('=playwright test -c ok.ts').kind, 'exec');
+  // a config that cannot be named exactly
+  for (const s of ['playwright test', 'playwright test -c', 'playwright test --config=', 'playwright test -cbad.ts', 'playwright test -xc bad.ts', 'playwright show-report -c a.ts', 'playwright -c a.ts test']) assert.equal(f(s), null, s);
+});
