@@ -15,7 +15,8 @@ import { createHash, randomBytes } from 'node:crypto';
 import { closeSync, constants, fsyncSync, lstatSync, mkdirSync, openSync, readFileSync, readdirSync, writeSync } from 'node:fs';
 import path from 'node:path';
 import { insideClaudeCode } from '../../lib/owner-only.mjs';
-import { REF_RE, autoEntry, readDbRefs } from './db-refs.mjs';
+import { REF_RE, autoEntry, dbRefsFile, readDbRefs } from './db-refs.mjs';
+import { readMachineId, release, tryAcquire } from '../../lib/locks.mjs';
 import { gh } from '../../lib/proc.mjs';
 import { LIVE_DB_KIND, sha256Of, sqlCharProblem } from './live-db-go.mjs';
 import { FUTURE_SKEW_MS, readRecords } from './owner-go.mjs';
@@ -28,6 +29,8 @@ export const AUTO_MIN_CLAIM_MS = 500; // the first create of a claim is not star
 export const AUTO_MAX_AGE_MS = 7 * 24 * 3600 * 1000; // a file merged longer ago than this needs the owner's go
 export const AUTO_GH_TIMEOUT_MS = 6000;
 export const AUTO_MIN_START_MS = 1500; // a GitHub call is not started with less than this left
+const REGISTRY_LOCK_WAIT_MS = 1000; // the longest the final registry check waits for the owner's db-refs command (it holds the lock for a write, or for its GitHub call)
+const REGISTRY_LOCK_POLL_MS = 25;
 export const STEM_RE = /^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$/;
 export const AFTER_DEPLOY_RE = /pipeline:[ \t]*apply-after-deploy/i; // anywhere in the query: detection only, the bytes stay exact
 const MAX_PR_FILE_PAGES = 30;
@@ -358,7 +361,7 @@ function prFileChange(pr, file, { owner, repoName, env, io, leftMs }) {
 // Has GitHub shown that the production deploy of the merge commit succeeded? Both the newest deployment of the environment (by any creator) and GitHub's latest COMPLETED one must be the merge
 // commit, made by the registered bot, ACTIVE with a SUCCESS status by the same bot; the PR of the answer must be the matched one, merged after the registration. Every refusal claims nothing, so the call can be
 // made again once the deploy has finished. -> { facts } | { stop: <result of autoApply> }
-function deployProof({ entry, pr, commit, committed, head, owner, repoName, env, io, leftMs, now }) {
+function deployProof({ entry, pr, commit, committed, head, branchName, owner, repoName, env, io, leftMs, now }) {
   const got = ask(['-f', `query=${GRAPHQL_DEPLOY}`, '-f', `o=${owner}`, '-f', `n=${repoName}`, '-f', `env=${entry.deployEnv}`, '-F', `num=${pr.number}`], { env, io, leftMs });
   if (got.stop) return got;
   const no = (why) => ({ stop: notEligible(`the production deploy is not confirmed (${why}): wait for the deploy to finish and call again, or ask for the owner's go`) });
@@ -366,13 +369,13 @@ function deployProof({ entry, pr, commit, committed, head, owner, repoName, env,
   const e = entry.deployEnv;
   const short = (s) => (typeof s === 'string' && s !== '' ? s.slice(0, 12) : 'unknown');
   if (!isObj(repo) || !sameRepo(repo.nameWithOwner, entry.repo)) return no(`GitHub answered for ${isObj(repo) ? repo.nameWithOwner : 'no repository'} instead of ${entry.repo}`);
-  // the file was read from this head: a default branch that moved since (a corrective merge) means the file may be gone, so the call is made again
-  if (typeof head !== 'string' || repo.defaultBranchRef?.target?.oid !== head) return no('the default branch moved during the check: call again');
+  // the file was read from this head of this branch: a default branch that moved since (a corrective merge), or another branch made the default at the same commit (the PR's base no longer matches), so the call is made again
+  if (typeof head !== 'string' || repo.defaultBranchRef?.target?.oid !== head || repo.defaultBranchRef?.name !== branchName) return no('the default branch moved during the check: call again');
   const p = repo.pullRequest;
   if (!isObj(p) || p.number !== pr.number || p.merged !== true || p.mergeCommit?.oid !== commit.oid) return no('GitHub does not show the pull request as merged at this commit');
   const mergedAt = typeof p.mergedAt === 'string' && ISO_RE.test(p.mergedAt) ? Date.parse(p.mergedAt) : NaN;
   if (!Number.isFinite(mergedAt)) return no('the pull request has no readable merge time');
-  // the registration time is the owner's machine clock and the merge time GitHub's: a merge within the skew margin after it cannot be told from one before it, so it keeps the owner's go too
+  // the registration time is GitHub's own clock (the Date of its answer when the owner registered); the margin covers the seconds between that answer and the registry write, and the rounding of both times to the second: a merge that close to it keeps the owner's go too
   if (!(mergedAt >= Date.parse(entry.deploySince) + FUTURE_SKEW_MS)) return no(`the pull request was merged before the after-deploy registration of ${entry.deploySince} (or within ${FUTURE_SKEW_MS / 60000} minutes after it), so it keeps the owner's go`);
   if (!isObj(repo.environment) || repo.environment.name !== e) return no(`GitHub shows no deployment environment named "${e}"`);
   const newest = Array.isArray(repo.deployments?.nodes) && repo.deployments.nodes.length === 1 ? repo.deployments.nodes[0] : null;
@@ -395,6 +398,24 @@ function deployProof({ entry, pr, commit, committed, head, owner, repoName, env,
   const bad = judge(newest, 'the newest deployment') ?? judge(live, 'the deployment GitHub shows as live');
   if (bad !== null) return no(bad);
   return { facts: { afterDeploy: true, deployEnv: e, deployedAt: newest.latestStatus.createdAt } };
+}
+
+// The registry lock the owner's db-refs writes take (commands/db-refs.mjs: name `db-refs`, the registry's own `locks` folder), waited for at most REGISTRY_LOCK_WAIT_MS and never past the call's time. -> the lock | null
+function takeRegistryLock({ home, leftMs, io = {} }) {
+  const stateDir = path.dirname(dbRefsFile(home));
+  const wait = Math.min(io.registryLockWaitMs ?? REGISTRY_LOCK_WAIT_MS, typeof leftMs === 'function' ? leftMs() - AUTO_MIN_CLAIM_MS : Infinity);
+  if (!(wait > 0)) return null;
+  const started = performance.now();
+  for (;;) {
+    try {
+      const r = tryAcquire('db-refs', { dir: path.join(stateDir, 'locks'), machineId: readMachineId({ stateDir }) });
+      if (r.acquired) return r.lock;
+    } catch {
+      return null;
+    }
+    if (performance.now() - started >= wait) return null;
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, REGISTRY_LOCK_POLL_MS);
+  }
 }
 
 // Is this migration a file a merged PR added to the registered repo's default branch, identical to the call, recent, and not attempted before? Then the next attempt generation of both keys is claimed.
@@ -459,15 +480,26 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
   // the deploy proof is the LAST GitHub read before the claim: a rollback GitHub shows while the file pages above were read is seen
   let proven = {};
   if (marked) {
-    const proof = deployProof({ entry, pr, commit, committed, head: branch.target.oid, owner, repoName, env, io, leftMs, now });
+    const proof = deployProof({ entry, pr, commit, committed, head: branch.target.oid, branchName: branch.name, owner, repoName, env, io, leftMs, now });
     if (proof.stop) return proof.stop;
     proven = proof.facts;
-    // the owner can switch the registration off while GitHub was asked: it must still be the one this check used, or nothing is claimed
-    const fresh = autoEntry(entry.ref, readDbRefs(home, io)).entry;
-    if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot || fresh.deploySince !== entry.deploySince) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
   }
   const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null, ...proven };
-  const next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
+  // A marked file: the owner can switch the registration off while GitHub was asked, or just before the claim. The registry is read again under the registry lock the owner's db-refs writes take, and the lock is held until the claim is made,
+  // so an `off` that finished earlier is seen and a later one waits (no GitHub call is made under the lock).
+  let lock = null;
+  let next;
+  try {
+    if (marked) {
+      lock = takeRegistryLock({ home, leftMs, io });
+      if (lock === null) return notEligible('the owner\'s db-refs command is changing the registry (or no time was left to wait for it): call again, or ask for the owner\'s go');
+      const fresh = autoEntry(entry.ref, readDbRefs(home, io)).entry;
+      if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot || fresh.deploySince !== entry.deploySince) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
+    }
+    next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
+  } finally {
+    if (lock !== null) { try { release(lock); } catch { /* a failed release must not turn an allow into a throw; the lock goes stale with this process */ } }
+  }
   if (next.status === 'claimed') {
     // The go path claims its marker and then re-reads the history; this side claims the generations and then re-reads the markers: in every interleaving one of the two sees the other.
     // The generations just created stay (they count as an attempt). A go consumed in the gap since the first scan: when the go's own claim wins it owns the apply; in one interleaving the go loses the generation claim too, both deny and the owner gives a new go (fail-safe).
