@@ -2561,7 +2561,7 @@ test('#746 C: `npx playwright test -c / --config FILE` with a real config is all
   // a config that writes a protected file is a program that does so: refused whichever way the config is named
   for (const line of ['npx playwright test -c bad.ts', 'npx playwright test --config bad.ts', 'npx playwright test --config=bad.ts', 'playwright test -c bad.ts']) assert.equal(verdictOf(line, o).decision, 'deny', line);
   // today's rule where the npx unwrapping is not trusted: the -c text stays shell text, and `f.sh` is run as a script
-  for (const line of ['/dir/npx playwright test -c f.sh', 'PATH=/dir:$PATH npx playwright test -c f.sh', 'npx(){ echo x; }; npx playwright test -c f.sh', 'alias npx=foo; npx playwright test -c f.sh', 'npx playwright test --config=ok.ts -c f.sh', 'npx playwright test -c ok.ts -c f.sh', 'npx playwright test -c f.sh -c ok.ts']) {
+  for (const line of ['/dir/npx playwright test -c ./f.sh', 'PATH=/dir:$PATH npx playwright test -c ./f.sh', 'npx(){ echo x; }; npx playwright test -c ./f.sh', 'alias npx=foo; npx playwright test -c ./f.sh', 'npx playwright test --config=ok.ts -c ./f.sh', 'npx playwright test -c ./f.sh -c ok.ts']) {
     assert.equal(verdictOf(line, o).decision, 'deny', line);
   }
 });
