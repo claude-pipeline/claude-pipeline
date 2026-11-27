@@ -75,11 +75,40 @@ export function mergeInIneligible({ pr, gh, root, config }) {
   return undefined;
 }
 
+// The PR's own change growth since round R (#742), for a base merge that conflicted: the added lines of the PR's diff against the default branch now (merge-base(baseRef, head)..head) that its diff at the round
+// (merge-base(baseRef, from)..from) did not have, per file, as a multiset of line texts (a range-diff-like measure). Lines main brought in are in neither diff; lines a conflict resolution adds are only in the first. A file
+// that did not exist in the PR at the round keeps its status (a new file), one that did becomes 'M'. -> diffFiles-shaped entries (fixRoundScope reads path/status/added). Throws GitError when either diff cannot be read.
+function ownChangeFiles({ from, head, baseRef }, o) {
+  const then = new Map();
+  for (const f of diffFiles(baseRef, from, o)) {
+    if (f.status === 'D') continue; // a path the round deleted is not in the PR at the round: a later add or rename onto it is a new file
+    const counts = new Map();
+    for (const l of f.added) counts.set(l.text, (counts.get(l.text) ?? 0) + 1);
+    then.set(f.path, counts);
+  }
+  const out = [];
+  for (const f of diffFiles(baseRef, head, o)) {
+    const earlier = then.get(f.path) ?? then.get(f.oldPath);
+    if (earlier === undefined) { out.push(f); continue; }
+    const viaOldPath = !then.has(f.path); // the destination was not in the PR's diff at the round: a fix-round rename of a file the round only edited is still a new file
+    const left = new Map(earlier);
+    const added = f.added.filter((l) => {
+      const n = left.get(l.text) ?? 0;
+      if (n > 0) { left.set(l.text, n - 1); return false; }
+      return true;
+    });
+    if (viaOldPath) out.push({ ...f, added });
+    else if (added.length > 0) out.push({ ...f, added, status: f.status === 'A' || f.status === 'R' || f.status === 'C' ? 'M' : f.status });
+  }
+  return out;
+}
+
 // The files the fix commits since round R's reviewed head (`from`) changed, measured against the base the NEXT review round would diff from (git.mjs#effectiveReviewBase): what the
 // default branch brought in with a clean merge since `from` is left out (#490), as the review packet leaves it out. `baseRef`: the default branch's ref (review-context.mjs#reviewBaseRef).
 // `ineligible` (mergeInIneligible's { reason, exact }): the plain from..head measure is kept, with the reason as baseNote; exact (a stack, an untrusted anchor: the review round leaves nothing out either) says so, else (GitHub unreadable) it may over-count.
-// A merge that conflicted, or a base that cannot be worked out, keeps the plain from..head measure and says so in baseNote. A synthetic base is a tree id, which only this caller diffs against (diffFiles' treeBase opt-in).
-// -> { files, baseKind: 'previous' | 'synthetic' | 'round-head', baseNote? }
+// A merge that conflicted has no synthetic base: the fix is measured as the PR's OWN change growth (ownChangeFiles, baseKind 'own-change', #742). A base that cannot be worked out (or that measure failing) keeps the plain
+// from..head measure and says so in baseNote. A synthetic base is a tree id, which only this caller diffs against (diffFiles' treeBase opt-in).
+// -> { files, baseKind: 'previous' | 'synthetic' | 'own-change' | 'round-head', baseNote? }
 export function fixRoundFiles({ from, head, baseRef, ineligible }, o) {
   if (ineligible !== undefined) {
     const tail = ineligible.exact
@@ -91,7 +120,12 @@ export function fixRoundFiles({ from, head, baseRef, ineligible }, o) {
   try {
     const since = effectiveReviewBase({ from, forkPoint: mergeBase(baseRef, head, o) }, o);
     if (since.kind === 'previous' || since.kind === 'synthetic') return { files: diffFiles(since.base, head, o, { treeBase: true }), baseKind: since.kind };
-    note = 'the default branch was merged in with a conflict since this round, so what it brought in cannot be told apart from the fix: measured from the round\'s reviewed head, it may over-count';
+    try {
+      return { files: ownChangeFiles({ from, head, baseRef }, o), baseKind: 'own-change', baseNote: 'the default branch was merged in with a conflict since this round, so it was measured as the PR\'s own change (its diff against the default branch now, minus its diff at the round): what the default branch brought in is left out, what the conflict resolution added is counted' };
+    } catch (err) {
+      if (!(err instanceof GitError)) throw err;
+      note = `the default branch was merged in with a conflict since this round and the PR's own change could not be measured (${String(err.message).split('\n')[0]}): measured from the round's reviewed head, it may over-count`;
+    }
   } catch (err) {
     if (!(err instanceof GitError)) throw err;
     note = `the review base could not be worked out (${String(err.message).split('\n')[0]}): measured from the round's reviewed head, it may over-count`;
