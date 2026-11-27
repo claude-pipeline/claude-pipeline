@@ -1221,6 +1221,28 @@ test('B2: an execute_sql query that differs from the approved SQL only by a fina
   assert.equal(sql(s, s.dataSql).decision, 'allow', 'the exact SQL still claims the go');
 });
 
+test('R1-B6: an unmatched execute_sql with a huge interior whitespace run is refused at once and without a byte hint', async (t) => {
+  // Failure caught: the byte-mismatch diagnostic ran a trailing-whitespace regex over the caller's whole query before any size limit; on a long interior run that is quadratic, and a hook that outlives its host timeout is an allow.
+  const s = await scene(t, { op: 'data' });
+  const t0 = Date.now();
+  const r = sql(s, `${s.dataSql}${' '.repeat(150_000)}x`);
+  const ms = Date.now() - t0;
+  assert.equal(r.decision, 'deny');
+  assert.doesNotMatch(r.reason, /only by/);
+  assert.ok(ms < 1500, `${ms} ms`);
+});
+
+test('R1-B8: an execute_sql call with no session id never gets a byte hint from another session\'s approval', async (t) => {
+  // Failure caught: with the session id missing the diagnostic read every session's approvals, so the refusal said "differs only by a final newline" about an approval that belongs to another session.
+  const s = await scene(t, { op: 'data' });
+  assert.match(sql(s, `${s.dataSql}\n`).reason, /only by a final newline/, 'this session\'s own approval is still named');
+  for (const sessionId of [undefined, null, '']) {
+    const r = sql(s, `${s.dataSql}\n`, { sessionId });
+    assert.equal(r.decision, 'deny');
+    assert.doesNotMatch(r.reason, /only by/, String(sessionId));
+  }
+});
+
 test('B2: a --sql-file that ends with a newline gives present.sql (no newline) and sqlBytes in UTF-8 bytes, and that sql claims on the first try', async (t) => {
   // Failure caught: the hash covering the file's bytes while present printed the canonical text, so the first execute_sql with the file text was refused; and sqlBytes counting characters for multibyte SQL.
   const s = await scene(t, { op: 'data' });
