@@ -316,9 +316,9 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
     }
     const u = e?.message?.usage;
     if (!isPlainObject(u)) continue;
-    // A usage object with no token count field at all (`{}`) is not a usage-bearing message; explicit zeros are (a real call that spent nothing); any other count is treated as missing.
+    // A message counts as a call only if some token field is a positive count: `{}`, negative, fractional, NaN, huge or all-zero usage (1e-400 parses to 0) is no real call (a real API call always has some tokens), so a transcript of only those is empty and its re-run is the one booking.
     const cc0 = isPlainObject(u.cache_creation) ? u.cache_creation : {};
-    if (![u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].some(isCount)) continue;
+    if (![u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].some((v) => isCount(v) && v > 0)) continue;
     byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model });
   }
   // usd: each message at its own model's list price; unpricedMessages: messages the price table cannot price

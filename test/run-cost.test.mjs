@@ -726,7 +726,7 @@ test('a trip-wire stop is the existing outcome blocked with detail process-revie
 });
 
 // Issue #820 (round 1): a message whose usage is `{}` counted as one usage-bearing message, so the first --retry booking of a not-yet-filled transcript wrote a transcript key + a retry and the real booking later made 2 calls and 2 retries.
-test('P cost --from-transcript: a transcript whose only usage is {} is empty (skipped); explicit zero token fields still count as a real call', () => {
+test('P cost --from-transcript: a transcript whose only usage is {} is empty (skipped); so is an all-zero usage (also what 1e-400 parses to), a message with no real tokens is not a call', () => {
   const s = scenario();
   s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: {} } })}\n`);
   const args = ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl'];
@@ -740,10 +740,9 @@ test('P cost --from-transcript: a transcript whose only usage is {} is empty (sk
   assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries], [1, 1]);
   const zero = scenario();
   zero.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 0, output_tokens: 0 } } })}\n`);
-  const z = costCli(zero, ['--phase', 'review', '--role', 'judge', '--from-transcript', '.review/t.jsonl']);
+  const z = costCli(zero, ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl']);
   assertExit(z, 0);
-  assert.equal(z.json.skipped, undefined);
-  assert.equal(z.json.cost.total.calls, 1);
+  assert.equal(z.json.skipped, 'empty-transcript');
 });
 
 // Issue #501 (round 1): the CLI promises plan-codex is tokens only unless --usd is given, but --model priced the tokens and added a Sonnet charge to the PR total.
