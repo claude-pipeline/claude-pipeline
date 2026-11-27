@@ -355,3 +355,4 @@ full record.
 - 2026-11-27 · #879 · P cost: an empty-transcript booking books nothing (no double count); a plan phase for plan reviews (#820, #501) · risk high · rounds 7 · arbiter 7 (fix-verify 4) · merged · Codex 7d: 551 runs (218 high)
 - 2026-11-27 · #881 · Preflight warns when one-click answers are off on this Claude Code build (#714) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 568 runs (225 high)
 - 2026-11-27 · #885 · Merge: judge 'behind main' from GitHub's real base tip, so the disjoint rule works and every refusal says why (#625) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 575 runs (226 high)
+- 2026-11-27 · #885 · Merge: judge 'behind main' from GitHub's real base tip, so the disjoint rule works and every refusal says why (#625) · risk high · rounds 2 · arbiter 2 · merged · Codex 7d: 584 runs (227 high)
