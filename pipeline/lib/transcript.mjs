@@ -352,8 +352,12 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
   if (promptTurns > 1) errors.push('multiple prompts (agent was resumed); ruling cannot be bound to one input');
   if (asst.length === 0) errors.push('no assistant messages');
 
-  // meta.json carries "model" only when the caller passed a per-call override, which beats the agent
+  // meta.json carried "model" only when the caller passed a per-call override, which beats the agent
   // definition — so any override (even null) is an error unless the caller expects exactly that one.
+  // Claude Code 2.1.330 also records the resolved (pinned) model on a default launch, marked
+  // launchedWithDefaults: true; that is no override when the model is inside the proven prefix and the caller
+  // named no expectMetaModel (an explicit one is always compared exactly), so a real override to another
+  // model is still refused.
   if (metaText === undefined || metaText === null) {
     errors.push('meta missing');
   } else {
@@ -366,7 +370,9 @@ export function proveModel({ jsonlText, metaText, expectModelPrefix, expectEffor
     if (!isPlainObject(meta)) {
       errors.push('unparseable meta');
     } else {
-      if (has(meta, 'model') && (expectMetaModel === null || meta.model !== expectMetaModel)) {
+      const defaultLaunch =
+        expectMetaModel === null && prefixOk && meta.launchedWithDefaults === true && typeof meta.model === 'string' && meta.model.startsWith(expectModelPrefix);
+      if (has(meta, 'model') && !defaultLaunch && (expectMetaModel === null || meta.model !== expectMetaModel)) {
         errors.push(`per-call model override present: ${String(meta.model)}`);
       }
       if (agentTypeGiven && typeof expectAgentType === 'string' && expectAgentType !== '' && meta.agentType !== expectAgentType) {
