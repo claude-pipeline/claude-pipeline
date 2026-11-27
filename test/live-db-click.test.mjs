@@ -347,6 +347,15 @@ test('B1b: a dialog whose message holds only a progress note is refused with tha
   assert.equal(w.apply().decision, 'deny');
 });
 
+test('R1-B7: a PENDING click (the label is not known yet) on a dialog with no reply text tells the agent to recover only if the owner chose to apply, and to stop otherwise', async (t) => {
+  // Failure caught: the pending click line told the agent unconditionally to show the dialog again, so after the owner's "Not yet" the agent asked for the same approval at once.
+  const w = await world(t, { reply: [progress] });
+  const line = await clickHookLine(w.input, { home: w.home, now: () => w.t, sleep: noSleep, pollMs: 0, check: OK });
+  assert.match(line, /no reply text before the dialog \(Claude Code recorded only a progress note\)/);
+  assert.match(line, /If the owner chose to apply, run live-db present again/);
+  assert.match(line, /if they chose not to, stop: nothing is applied/);
+});
+
 test('B1b: an older valid block, a tool result, then a progress-note-only dialog is refused; present, a tool result, then the block as text and the dialog is claimed', async (t) => {
   // Failure caught: the block printed earlier in the turn (before another tool call) counted as the reply right before the dialog, so a click bound to text the owner was no longer shown last.
   const old = await world(t, { flush: true, reply: (b) => [b, ...present(b), progress] });
@@ -367,6 +376,22 @@ test('B1b: a dialog whose turn chains to a headless (sdk) prompt is refused as a
   assert.notEqual(c.status, 'claimed');
   const line = await clickHookLine(w.input, { home: w.home, now: () => w.t, sleep: noSleep, pollMs: 0, check: OK });
   assert.match(line ?? '', /not one the owner sees/);
+});
+
+test('R1-B5: the first half of block A, another visible turn showing block B, then the rest of block A and the dialog: the pieces are not joined, the click is not claimed', async (t) => {
+  // Failure caught: the reader skipped other turns' entries while joining the reply's text pieces and looked for an interleaved block only after the LAST piece, so A's two halves around B passed as the block the owner last saw.
+  const w = await world(t, {
+    flush: true,
+    reply: (b, dir) => {
+      const lines = b.split('\n');
+      return [lines.slice(0, 5).join('\n'), { prompt: 'status?', own: false, uuid: 'u-p1' }, { blocks: [{ type: 'tool_use', id: 'toolu_other', name: 'Bash', input: { command: 'present' } }], own: false, uuid: 'u-tu', parent: 'u-p1' },
+        { result: JSON.stringify({ ok: true, block: buildBlock({ op: 'data', ref: REF, label: LABEL, repo: 'acme/widgets', dir, sql: 'update t set a = 2 where id = 7', summary: 'fix' }).join('\n') }), own: false, parent: 'u-tu' },
+        lines.slice(5).join('\n')];
+    },
+  });
+  await w.hook();
+  assert.equal(w.claim().status, 'unverified');
+  assert.equal(w.apply().decision, 'deny');
 });
 
 test('B1b: reply A, then another visible turn shows block B only in a tool result, then the dialog for A: refused', async (t) => {
