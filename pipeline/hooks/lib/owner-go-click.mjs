@@ -799,7 +799,7 @@ let settling = false;
 // verified grant would be past its 24 h use window. A missing or unreadable transcript is `waiting`; an unreadable spent marker, a failed write and the like are `retry` (no `.settled`); every
 // verdict (recorded, declined, instructed, refused) writes `<askId>.<clickId>.settled`, and a click that loses that race reports the winner's outcome. Garbled pointers are skipped (`skipped`, no budget).
 // -> { outcomes: [{ askId, clickId, outcome: 'recorded' | 'declined' | 'instructed' | 'refused' | 'waiting' | 'retry' | 'skipped', reason? }], problems }.
-// `leftMs` (optional; the live-database guard passes its time budget): the scan of the pending pointers and the walk over the units check it between entries and stop with a `no-time` problem
+// `leftMs` (optional; the live-database guard passes its time budget): the scan of the pending pointers and the walk over the units and their members check it between entries and stop with a `no-time` problem
 // when nothing is left, so a folder of thousands of pointers cannot carry the hook past its host timeout. Its git reads are bounded by live-db-go's withGitDeadline.
 export function settlePendingClicks({ home = accountHome(), now = Date.now, askId = null, session = null, io = {}, leftMs = null } = {}) {
   const out = { outcomes: [], problems: [] };
@@ -842,7 +842,8 @@ export function settlePendingClicks({ home = accountHome(), now = Date.now, askI
     for (const unit of [...active, ...retired]) {
       if (scans >= SETTLE_SCAN_BUDGET || noTime()) break;
       for (const p of unit.members) {
-        const o = settleOne(p, { home, now, nowMs, io, scanned: () => { scans++; } });
+        if (noTime()) return out; // checked before EACH member: every settled one is a durable write, and the rest stay pending for the next settle
+        const o = settleOne(p, { home, now, nowMs, io, noTime, scanned: () => { scans++; } });
         out.outcomes.push({ askId: p.askId, clickId: p.clickId, ...o });
         if (o.outcome === 'waiting' || o.outcome === 'retry') break; // a later click never goes ahead of an earlier one that is not terminal
       }
@@ -856,9 +857,11 @@ export function settlePendingClicks({ home = accountHome(), now = Date.now, askI
 }
 
 // One pointer -> { outcome, reason? }. See settlePendingClicks.
-function settleOne(p, { home, now, nowMs, io, scanned }) {
+function settleOne(p, { home, now, nowMs, io, scanned, noTime = () => false }) {
   const { askId, clickId } = p;
   const finish = (outcome, reason = null) => {
+    // Out of time: a refusal may only be the time running out inside a git read (live-db-go turns that into "unverified"). Never write it down as the click's final verdict: leave it pending for a settle with time.
+    if (outcome === 'refused' && noTime()) return { outcome: 'retry', reason: 'no-time' };
     const file = clickFile(askId, clickId, 'settled', home);
     const made = (io.writeExclusive ?? writeExclusive)(file, { v: 1, askId, clickId, outcome, reason, settledAt: new Date(now()).toISOString() }, home);
     if (made === 'ok') return { outcome, ...(reason === null ? {} : { reason }) };

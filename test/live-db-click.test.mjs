@@ -18,6 +18,7 @@ import { claimLiveDbGo, evaluateSupabaseMcp } from '../pipeline/hooks/lib/live-d
 import { asksDir, clickProvenance, liveDbAsk, issueAsk, matchesInstalledDialog, readAsk, recordClick } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { readRecords } from '../pipeline/hooks/lib/owner-go.mjs';
 
+const realGitPath = '/usr/bin/git';
 const REF = 'abcdefghij0123456789';
 const OTHER = 'klmnopqrst0123456789';
 const NAME = '20261117000000_add_col';
@@ -256,6 +257,30 @@ test('out of time: a click go whose pending click must still be settled is a den
   assert.equal(spawns, 0, 'no git process was started');
   assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
   assert.equal(w.apply().decision, 'allow', 'with time left the click settles and applies');
+});
+
+test('out of time in the middle of settling: the valid click stays pending (no .settled, nothing consumed) and settles with a full budget', async (t) => {
+  // Failure caught: the budget running out between two git reads of the settling turned the block rebuild into "ask invalid" and wrote a terminal `refused` marker, so a retry with time left skipped the owner's click.
+  const w = await world(t, { flush: false, flag: true });
+  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
+  w.flush();
+  const shim = join(w.home, 'shim-git');
+  mkdirSync(shim);
+  const marker = join(w.home, 'git-ran');
+  writeFileSync(join(shim, 'git'), `#!/bin/sh\ntouch '${marker}'\nexec ${realGitPath} "$@"\n`, { mode: 0o755 });
+  const oldPath = process.env.PATH;
+  process.env.PATH = `${shim}${delimiter}${oldPath}`;
+  let r;
+  try {
+    r = w.apply({}, { leftMs: () => (existsSync(marker) ? 0 : 60_000) }); // time is up right after the first git read
+  } finally {
+    process.env.PATH = oldPath;
+  }
+  assert.ok(existsSync(marker), 'a git read ran before the budget ended');
+  assert.equal(r.decision, 'deny');
+  assert.deepEqual(readdirSync(asksDir(w.home)).filter((n) => n.endsWith('.settled')), [], 'no terminal verdict was written');
+  assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
+  assert.equal(w.apply().decision, 'allow', 'with time left the same click settles and applies');
 });
 
 test('through the real hook entry: a pending click of this session and a git that never answers is a deny within the host timeout, with nothing consumed', async (t) => {
