@@ -255,6 +255,46 @@ test('P cost --from-transcript: a transcript with no messages with usage warns (
   assert.deepEqual(warns(`${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 1, output_tokens: 1 } } })}\n`), [], 'a normal transcript');
 });
 
+// Issue #820: the empty-transcript booking still wrote a zero entry (calls +1) and a retry, so the re-run the warning invites showed one agent call as 2 calls and 2 retries.
+test('P cost --from-transcript: an empty transcript with no hand amounts books nothing (no call, no retry, no write); the re-run then books exactly 1 call and 1 retry', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', '');
+  const args = ['--phase', 'review', '--role', 'judge', '--round', '1', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const before = s.fake.calls().length;
+  const first = costCli(s, args);
+  assertExit(first, 0);
+  assert.equal(first.json.ok, true);
+  assert.equal(first.json.recorded, false);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  assert.match(first.json.warnings.join('\n'), /nothing was booked; run this same command again in a few seconds/);
+  assert.equal(s.fake.calls().length, before, 'no GitHub read or write when there is nothing to book');
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  const second = costCli(s, args);
+  assertExit(second, 0);
+  assert.equal(second.json.recorded, true);
+  assert.equal(second.json.skipped, undefined);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries, second.json.cost.byRound['1'].calls], [1, 1, 1]);
+  assert.ok(written(s).cost.transcripts, 'the transcript key is booked only by the real booking');
+});
+
+test('P cost --from-transcript: an empty transcript with --session still records the session only; with a hand amount it still books it', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', '');
+  const withSession = costCli(s, ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl', '--session', 'sess-9']);
+  assertExit(withSession, 0);
+  assert.equal(withSession.json.recorded, true);
+  assert.equal(withSession.json.skipped, 'empty-transcript');
+  assert.deepEqual(withSession.json.cost.sessions, ['sess-9']);
+  assert.deepEqual([withSession.json.cost.total.calls, withSession.json.cost.retries], [0, 0]);
+  const hand = scenario();
+  hand.repo.write('.review/t.jsonl', '');
+  const r = costCli(hand, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl', '--input', '10']);
+  assertExit(r, 0);
+  assert.equal(r.json.skipped, undefined);
+  assert.deepEqual([r.json.cost.total.calls, r.json.cost.total.input], [1, 10]);
+  assert.ok(r.json.warnings.some((w) => /no messages with usage found/.test(w)));
+});
+
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
 test('P cost --from-transcript: booking a continued agent\'s transcript again books only the new usage (total = the whole transcript once)', () => {
   const s = scenario();
