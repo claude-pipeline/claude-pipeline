@@ -15,13 +15,13 @@ import { CATALOG_TEMPLATES, GUC_NAMES, buildCatalogQuery } from '../hooks/lib/li
 import { readDbRefs } from '../hooks/lib/db-refs.mjs';
 import { liveDbAsk } from '../hooks/lib/owner-go-click.mjs';
 import { readAttemptLog } from '../hooks/lib/live-db-auto.mjs';
-import { blobAt, buildBlock, canonicalDataSql, liveLabel, migrationSqlProblem, repoOf, sha256Of, summaryProblem } from '../hooks/lib/live-db-go.mjs';
+import { blobAt, buildBlock, canonicalDataSql, liveLabel, migrationSqlProblem, migrationVersionOf, numberedMigrationReason, repoOf, sha256Of, summaryProblem } from '../hooks/lib/live-db-go.mjs';
 
 export const meta = {
   summary: 'live-database guard: build the block the owner is shown before a live Supabase change (present), print the catalog look-up SQL that needs no go (catalog), list the recorded migration attempts (auto-log)',
   usage: [
     'pipeline live-db present --op migration --pr <N> --file supabase/migrations/<f>.sql --project <ref> --summary "<one line>"',
-    '  -> {ok, block, sqlSha256, name} : refuses unless the working-tree file equals HEAD:<file>, HEAD is the PR head on GitHub, the bytes are valid (UTF-8, no CR/NUL, no fence line, at most 300 lines) and the project is live.',
+    '  -> {ok, block, sqlSha256, name} : refuses a numbered migration (`0261_x.sql`: anything but a 14-digit date-time version; reason numbered-migration: the owner runs `supabase db push` by hand, no go can be asked for it) and refuses unless the working-tree file equals HEAD:<file>, HEAD is the PR head on GitHub, the bytes are valid (UTF-8, no CR/NUL, no fence line, at most 300 lines) and the project is live.',
     '     End your reply with `block` (its last line is the ask) and wait for the owner to type `go migration <name>`; then call apply_migration with name = <name> and query = the file text, unchanged.',
     '  -> --ask (click-to-approve): also {ask: {askId, questions}}: a choice question (Yes, apply <name> | Not yet) whose text is the title and then exactly `block`, written as an ask file (one-time use, expires after 24 h); after the block, pass `ask.questions` to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same go the typed `go migration <name>` records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | Claude Code build unknown or not allowlisted for clicks | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued): the owner types the go as before',
     'pipeline live-db present --op data --project <ref> --sql-file <path> --summary "<one line>"',
@@ -110,6 +110,7 @@ export async function run(argv, ctx = {}) {
   if (!Number.isInteger(pr) || pr < 1) throw new UsageError('--pr must be a pull request number');
   const file = values.file.replaceAll('\\', '/');
   if (!/^supabase\/migrations\/[^/]+\.sql$/.test(file)) throw new UsageError('--file must be supabase/migrations/<name>.sql, relative to the repository root');
+  if (migrationVersionOf(path.posix.basename(file)).kind === 'numbered') return FAIL(numberedMigrationReason(file), { reason: 'numbered-migration' });
   let head;
   try { head = git(['rev-parse', '--verify', 'HEAD'], { cwd: dir }).trim(); } catch { return FAIL('cannot read HEAD'); }
   const committed = blobAt(dir, head, file);

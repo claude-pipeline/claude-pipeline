@@ -10,7 +10,7 @@ import { autoEntry, isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { activeBinding, identify } from './mcp-servers.mjs';
-import { LIVE_DB_MAX_AGE_MS, canonicalDataSql, liveDbRecords, parseGo, sha256Of, swappedBlockReason, verifyBlock, withGitDeadline } from './live-db-go.mjs';
+import { LIVE_DB_MAX_AGE_MS, canonicalDataSql, liveDbRecords, migrationVersionOf, numberedMigrationReason, parseGo, sha256Of, swappedBlockReason, verifyBlock, withGitDeadline } from './live-db-go.mjs';
 import { AUTO_MIN_CLAIM_MS, autoApply, claimGoMarker, claimNext, history } from './live-db-auto.mjs';
 
 export { LIVE_DB_CONSUMED_REL } from './live-db-auto.mjs';
@@ -238,6 +238,8 @@ function decide(tool, ti, ctx) {
     const op = name === 'apply_migration' ? 'migration' : 'data';
     const migName = name === 'apply_migration' && typeof ti?.name === 'string' ? ti.name : null;
     if (op === 'migration' && migName === null) return deny(`apply_migration on ${where} has no name to bind a go to`);
+    // #811: before any go is read or spent, and before auto-apply: a numbered name would be recorded under a generated timestamp version and break every later `db push`
+    if (op === 'migration' && migrationVersionOf(migName, { stem: true }).kind === 'numbered') return deny(`apply_migration on ${where} is refused: ${numberedMigrationReason(`the name "${migName}"`)} No go is needed or used for it.`);
     const c = claimLiveDbGo({ home, sessionId: ctx.sessionId, transcriptPath: ctx.transcriptPath, op, projectRef: target.ref, name: migName, sqlSha256: sha256Of(query), now: ctx.now ?? Date.now, io: ctx.io, leftMs: ctx.leftMs });
     if (c.status === 'claimed') return allow();
     // the owner's go failed to apply: a migration of a project whose owner switched auto-apply on may still be applied with no go when a merged PR added exactly this file (live-db-auto.mjs). Not after an

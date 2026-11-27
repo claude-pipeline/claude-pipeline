@@ -30,7 +30,9 @@ const STATE = (home) => join(home, '.claude', 'pipeline-state');
 // one session: registry, repo, a transcript under the scratch home's config dir, the block shown, and the owner's go typed at `typedAt`
 // `flag`: the owner switched auto-apply on for REF (the attempt history applies); `home`: a second session in a home that already exists (its registry is the first scene's).
 // `middle`: (block) -> the transcript entries between the owner's first prompt and the typed go (default: the reply that shows the block)
-async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL, flag = false, home: shared = null, middle = null } = {}) {
+async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL, flag = false, home: shared = null, middle = null, name: mName = NAME, record = true } = {}) {
+  const FILE = `supabase/migrations/${mName}.sql`; // (shadows the module's: the migration this scene shows)
+  const NAME = mName;
   const home = shared ?? mkdtempSync(join(tmpdir(), 'cp-live-db-guard-'));
   if (shared === null) {
     t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -57,7 +59,7 @@ async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = S
   writeFileSync(transcript, linesOf(entries));
   const input = { hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: repo.dir, prompt, prompt_id: promptId };
   const out = liveDbGoOutcome(input, { home, now: () => typedAt });
-  assert.ok(out?.record, JSON.stringify(out));
+  if (record) assert.ok(out?.record, JSON.stringify(out));
   const ctx = { home, sessionId: session, transcriptPath: transcript, now: () => NOW };
   return { home, repo, head, session, transcript, input, ctx, dataSql, entries };
 }
@@ -1232,4 +1234,38 @@ test('B2: a --sql-file that ends with a newline gives present.sql (no newline) a
   const m = (await runLiveDb(['present', '--op', 'data', '--project', REF, '--sql-file', 'multi.sql', '--summary', 'fix'], ctx)).output;
   assert.equal(m.sqlBytes, Buffer.byteLength(m.sql, 'utf8'));
   assert.notEqual(m.sqlBytes, m.sql.length);
+});
+
+// ---- #811: apply_migration with a numbered name is refused before any go is read, spent or auto-applied ---------------------------------------------------------------------
+
+test('#811: apply_migration with a numbered name (0261_x, or the empty suffix 0261_) is refused on a live project with the by-hand message, whatever go there is, and no go is spent', async (t) => {
+  // Failure caught: a numbered migration applied through apply_migration (recorded under a generated timestamp version, 0261 left pending), or a go burnt on a call that could never be right.
+  for (const name of ['0261_x', '0261_']) {
+    const s = await scene(t, { name, record: false });
+    const r = apply(s, { name });
+    assert.equal(r.decision, 'deny', name);
+    assert.match(r.reason, /is a numbered migration.*The owner runs `supabase db push` by hand/s, name);
+    assert.equal(markers(s).length, 0, 'no go consumed');
+  }
+});
+
+test('#811: the auto-apply path cannot apply a merged numbered file either, and asks GitHub nothing', async (t) => {
+  // Failure caught: #883's auto mode applying a merged 0261_x.sql with no go at all.
+  for (const name of ['0261_x', '0261_']) {
+    const s = await autoScene(t);
+    s.tweak(() => {}, { name });
+    const r = apply(s, { name });
+    assert.equal(r.decision, 'deny', name);
+    assert.match(r.reason, /is a numbered migration/);
+    assert.equal(s.calls.length, 0, 'GitHub was not asked');
+    assert.deepEqual(hist(s), []);
+  }
+});
+
+test('#811 allow side: a timestamp migration with a go still applies; a listed dev server takes a numbered name', async (t) => {
+  // Failure caught: the refusal reaching timestamp names, or the dev early allow blocked for a numbered migration (a dev database applies it as before).
+  const s = await scene(t);
+  assert.equal(apply(s).decision, 'allow');
+  runOwnerCli(s.home, ['server', 'add', 'mine']);
+  assert.equal(evaluateSupabaseMcp('mcp__mine__apply_migration', { project_id: DEV, name: '0261_x', query: SQL }, s.ctx).decision, 'allow');
 });

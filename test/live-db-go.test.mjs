@@ -12,7 +12,7 @@ import { OWNER_ENTRY, linesOf, runHook } from './helpers/owner-go.mjs';
 import { run } from '../pipeline/commands/live-db.mjs';
 import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
-import { buildBlock, canonicalDataSql, checkedTopLevel, summaryProblem, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
+import { buildBlock, canonicalDataSql, checkedTopLevel, summaryProblem, migrationSqlProblem, migrationVersionOf, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { lastReply, queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { matchCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
@@ -340,6 +340,36 @@ test('B1a pin: the ruling reader (no liveDb option) still reads the same notice 
   const { transcript } = goAfter(w, t, goData(dataSql), [notice(), textOf(dataBlock(w).join('\n'))]);
   assert.deepEqual(lastReply(transcript, { prompt: goData(dataSql), skipSynthetic: true }), { text: '', promoted: false });
   assert.ok(lastReply(transcript, { prompt: goData(dataSql), skipSynthetic: true, liveDb: true }).promoted);
+});
+
+// ---- #811: a numbered migration is never presented, verified or applied through apply_migration ---------------------------------------------------------------------------
+
+test('migrationVersionOf: a version is a timestamp only when it is 14 digits starting with a valid date; every other digit run is numbered, an empty suffix too', () => {
+  // Failure caught: DRMed's 0261_x.sql read as a timestamp (or EagleWatch's counter-style 20260907240000_x.sql read as numbered and refused), so apply_migration recorded the wrong version or a real file was blocked.
+  const kind = (n, o) => migrationVersionOf(n, o).kind;
+  for (const n of ['20261117000000_add_col.sql', '20260907240000_x.sql', '20260513006000_x.sql', '20240229000000_leap.sql']) assert.equal(kind(n), 'timestamp', n);
+  for (const n of ['0261_x.sql', '0261_.sql', '2026111700000_x.sql', '202611170000000_x.sql', '20261332000000_x.sql', '00000000000001_x.sql', '20230229000000_not_leap.sql']) assert.equal(kind(n), 'numbered', n);
+  for (const n of ['abc.sql', 'add_col.sql', '_x.sql', '0261.sql']) assert.equal(kind(n), 'none', n);
+  assert.equal(migrationVersionOf('0261_x.sql').version, '0261');
+  assert.equal(kind('0261_', { stem: true }), 'numbered');
+  assert.equal(kind('20261117000000_add_col', { stem: true }), 'timestamp');
+  assert.equal(kind('add_col', { stem: true }), 'none');
+});
+
+test('#811: present refuses a numbered migration (also with an empty suffix) with reason numbered-migration, and an old block for one fails verification', async (t) => {
+  // Failure caught: a numbered file presented, clicked or typed, then applied by apply_migration under a generated timestamp version, leaving 0261 pending and breaking every later db push.
+  for (const stem of ['0261_x', '0261_']) {
+    const file = `supabase/migrations/${stem}.sql`;
+    const w = world(t, { file });
+    await setup(w);
+    const r = await run(['present', '--op', 'migration', '--pr', '5', '--file', file, '--project', REF, '--summary', 'adds c'], { ...w.ownerCtx, cwd: w.repo.dir, gh: { prView: () => ({ headRefOid: w.head }) } });
+    assert.equal(r.exitCode, 1, stem);
+    assert.equal(r.output.reason, 'numbered-migration');
+    assert.match(r.output.message, /numbered migration.*The owner runs `supabase db push` by hand/s);
+    const old = say(w, t, `go migration ${stem}`, migBlock(w, { name: stem, file }));
+    assert.equal(old.record, undefined, `an old block for ${stem}`);
+    assert.match(old.reason, /numbered migration/);
+  }
 });
 
 // ---- the guard keeps the recorder out of an agent's hands ----------------------------------------------------------------------------
