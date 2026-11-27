@@ -306,7 +306,7 @@ function consumedAttempt({ home, ref, name, sqlSha256, leftMs, io = {} }) {
     }
     if (!isObj(b) || typeof b.op !== 'string' || typeof b.projectRef !== 'string') return { error: { path: file, reason: 'does not hold a consumed go' } };
     // (as the importer: a migration marker of this project with no usable SQL hash may be the only record of an earlier apply)
-    if (b.op === 'migration' && b.projectRef === ref && !SHA_RE.test(String(b.sqlSha256))) return { error: { path: file, reason: 'does not hold a consumed migration go (no usable SQL hash)' } };
+    if (b.op === 'migration' && b.projectRef === ref && (typeof b.sqlSha256 !== 'string' || !SHA_RE.test(b.sqlSha256))) return { error: { path: file, reason: 'does not hold a consumed migration go (no usable SQL hash)' } };
     if (b.op === 'migration' && b.projectRef === ref && (b.sqlSha256 === sqlSha256 || b.name === name)) return { spent: typeof b.consumedAt === 'string' ? b.consumedAt : 'an unknown time' };
   }
   return {};
@@ -445,7 +445,7 @@ function consumedMarkers(home, ref) {
     if (body === null || typeof body !== 'object' || Array.isArray(body) || typeof body.op !== 'string' || typeof body.projectRef !== 'string') return { problem: { path: file, reason: 'does not hold a consumed go' } };
     if (body.op !== 'migration' || body.projectRef !== ref) continue;
     const consumedMs = isoOf(body.consumedAt);
-    if (consumedMs === null || !SHA_RE.test(String(body.sqlSha256))) return { problem: { path: file, reason: 'does not hold a consumed migration go (time or sha)' } };
+    if (consumedMs === null || typeof body.sqlSha256 !== 'string' || !SHA_RE.test(body.sqlSha256)) return { problem: { path: file, reason: 'does not hold a consumed migration go (time or sha)' } };
     markers.push({ id: n.slice(0, -'.json'.length), consumedAt: body.consumedAt, consumedMs, sqlSha256: body.sqlSha256, name: typeof body.name === 'string' && body.name !== '' ? body.name : null });
   }
   return { markers };

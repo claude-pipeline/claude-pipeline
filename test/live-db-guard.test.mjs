@@ -956,7 +956,7 @@ test('auto: a go consumed with no history (a rollback, a go during the import) b
 
 test('auto: a consumed marker with no op, no projectRef or no SQL hash cannot rule out an earlier apply: refuse naming it', async (t) => {
   // Failure caught: a `{}` marker silently skipped by the run-time scan (the importer refuses the same body), so a migration the marker may stand for is applied a second time.
-  for (const body of [{}, { v: 1, projectRef: REF, sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', projectRef: REF }]) {
+  for (const body of [{}, { v: 1, projectRef: REF, sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', sqlSha256: sha256Of(SQL) }, { v: 1, op: 'migration', projectRef: REF }, { v: 1, op: 'migration', projectRef: REF, sqlSha256: [sha256Of(SQL)] }]) {
     const s = await autoScene(t);
     mkdirSync(consumed(s), { recursive: true });
     writeFileSync(join(consumed(s), 'odd.json'), `${JSON.stringify(body)}\n`);
