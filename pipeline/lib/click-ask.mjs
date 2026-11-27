@@ -3,11 +3,13 @@
 // VERBATIM, or `ask: null, askSkipped: <reason>` when a click cannot count here (the owner then types, as before). Nothing here decides what the owner may approve: the question text is the
 // typed block and the recorder reads the click through the typed parsers.
 import { checkDialogHooks } from '../hooks/lib/dialog-hooks.mjs';
-import { issueAsk } from '../hooks/lib/owner-go-click.mjs';
+import { CLICK_BUILDS, issueAsk } from '../hooks/lib/owner-go-click.mjs';
+import { runningVersion } from './claude-code-version.mjs';
 
 // May a click stand in for the owner's typed words in this repository, on this machine, right now? -> { ok: true, hookLayersSha256 } | { ok: false, reason }.
 // Checked in this order: owner_approval chat (label mode has no typed words to replace), pipeline.yml `owner_go.click` (a repository may only switch clicks OFF), the dialog hooks (B5: a hook
-// that could answer the dialog for the owner must be one the owner approved, `pipeline owner-go approve-dialog-hooks`).
+// that could answer the dialog for the owner must be one the owner approved, `pipeline owner-go approve-dialog-hooks`). The running Claude Code build (AI_AGENT) must be one the recorder accepts (#713:
+// CLICK_BUILDS; it refuses a click from any other build, so an ask issued there is a button that is then refused).
 // Why a click cannot count under THIS config (the part of the gate that needs no hooks), or null. merge --prs reads it from each PR's own worktree (R26-B1).
 export function clickConfigRefusal(config) {
   if (config.owner_approval !== 'chat') return 'owner_approval is not chat (label mode: no typed words to replace)';
@@ -18,6 +20,9 @@ export function clickConfigRefusal(config) {
 export function clickGate({ config, root, ctx = {} }) {
   const refusal = clickConfigRefusal(config);
   if (refusal !== null) return { ok: false, reason: refusal };
+  const build = runningVersion(ctx.env ?? process.env);
+  if (build === null) return { ok: false, reason: 'the running Claude Code build is unknown, so a click cannot be verified (the owner types instead)' };
+  if (!CLICK_BUILDS.includes(build)) return { ok: false, reason: `build ${build} not allowlisted for clicks (verified builds: ${CLICK_BUILDS.join(', ')}; the owner types instead)` };
   let hooks;
   try {
     hooks = checkDialogHooks({ home: ctx.home, cwd: root, projectDirs: [process.env.CLAUDE_PROJECT_DIR], managedPaths: ctx.managedPaths });

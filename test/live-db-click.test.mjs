@@ -184,7 +184,7 @@ test('live-db present --ask: prints the block as before plus ask = title + blank
   mkdirSync(join(w.repo.dir, '.claude'), { recursive: true });
   const yml = (extra) => writeFileSync(join(w.repo.dir, '.claude', 'pipeline.yml'), `${ymlFor()}${extra}`);
   const args = ['present', '--op', 'migration', '--pr', '7', '--file', FILE, '--project', REF, '--summary', 'adds c'];
-  const ctx = { home: w.home, cwd: w.repo.dir, env: {}, gh: { prView: () => ({ headRefOid: w.head }) }, managedPaths: [] };
+  const ctx = { home: w.home, cwd: w.repo.dir, env: { AI_AGENT: 'claude-code_2-1-323_agent' }, gh: { prView: () => ({ headRefOid: w.head }) }, managedPaths: [] };
   const plain = await runLiveDb(args, ctx);
   assert.equal(plain.output.ok, true, JSON.stringify(plain.output));
   assert.equal('ask' in plain.output, false, 'no --ask, no ask fields');
@@ -214,7 +214,7 @@ test('live-db present --ask: a migration whose ask file would be over the 64 KB 
   const bigFile = `supabase/migrations/${bigName}.sql`;
   w.repo.write(bigFile, `${Array.from({ length: 250 }, (_, i) => `-- ${i} ${'x'.repeat(280)}`).join('\n')}\nalter table t add column d int;\n`);
   const head = w.repo.commit('big');
-  const ctx = { home: w.home, cwd: w.repo.dir, env: {}, gh: { prView: () => ({ headRefOid: head }) }, managedPaths: [] };
+  const ctx = { home: w.home, cwd: w.repo.dir, env: { AI_AGENT: 'claude-code_2-1-323_agent' }, gh: { prView: () => ({ headRefOid: head }) }, managedPaths: [] };
   const before = readdirSync(asksDir(w.home)).length;
   const r = await runLiveDb(['present', '--op', 'migration', '--pr', '7', '--file', bigFile, '--project', REF, '--summary', 'big', '--ask'], ctx);
   assert.equal(r.output.ok, true, JSON.stringify(r.output));

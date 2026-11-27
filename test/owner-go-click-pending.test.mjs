@@ -10,7 +10,7 @@ import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import {
-  MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantLookups, ownerGrantedRounds, ownerRuled, readApprovals, readGrantMarker, readRecords, recordRoundGrant, roundTicketKey,
+  MAX_AGE_MS, accountHome, appendRecord, approvalGap, approvedPr, claimGrantMarkers, grantIdOf, ownerGoDir, ownerGrantLookups, ownerGrantedRounds, ownerRuled, queuedApprovalAt, readApprovals, readGrantMarker, readRecords, recordRoundGrant, roundTicketKey,
   settleEnabled, verifyOwnerGrant,
 } from '../pipeline/hooks/lib/owner-go.mjs';
 import { CAPTURE_SKEW_MS, CLICK_BUILDS, MIN_ANSWER_MS, SETTLE_SCAN_BUDGET, WAIT_GRACE_MS, asksDir, clickNotes, clickProvenance, issueAsk, mergeAsk, mergeManyAsk, readAsk, recordClick, roundAsk, rulingAsk, rulingWhyRow, settlePendingClicks } from '../pipeline/hooks/lib/owner-go-click.mjs';
@@ -801,6 +801,17 @@ test('settle: false and the environment switch leave the pending alone; settle: 
   assert.equal(allSettled(w.home).length, 1);
   const d = await flushedWorld(t);
   assert.equal(withSwitch(undefined, () => d.gap({ settle: undefined })), 'ok', 'by default a reader settles');
+});
+
+// #740 / R1-B2: queuedApprovalAt only EXPLAINS a refusal, so it must not spend a pending click (settle with the switch on would write the .settled marker and the record while the command refuses).
+test('queuedApprovalAt never settles a pending click, even with settling on by default (#740)', async (t) => {
+  const w = await flushedWorld(t);
+  const q = { repo: REPO, pr: 58, head: HEAD, items: ITEMS, areas: [], home: w.home, now: w.now };
+  assert.equal(withSwitch(undefined, () => queuedApprovalAt(q)), null);
+  assert.deepEqual(allSettled(w.home), []);
+  assert.equal(existsSync(w.spentFile), false);
+  assert.equal(w.records().length, 0);
+  assert.equal(withSwitch(undefined, () => w.gap({ settle: undefined })), 'ok', 'the click was still ready: an ordinary read settles it');
 });
 
 test('a settle that cannot run never breaks readRecords: the typed records still count and the fault is a problem', async (t) => {

@@ -1162,6 +1162,12 @@ export function approvalGap(q) {
   return ownedBy(matching, { home: q.home }).length > 0 ? 'ok' : 'provenance';
 }
 export const approvedRequest = (q) => approvalGap(q) === 'ok';
+// #740: when approvalGap is not 'ok', was the reason that the owner's word WAS recorded for this request but typed while the agent was still working (its transcript entry is promptSource
+// 'queued', #191 B2)? -> the ISO ts of the newest such matching record, else null. Read-only: it changes nothing about what approves (the same `q`, incl. maxAgeMs, as approvalGap / approvalGapSince).
+export function queuedApprovalAt(q) {
+  const queued = approvalsFor({ ...q, settle: false }).filter((r) => r.via !== 'ask' && promptEntryOf(r, { home: q.home }).entry?.promptSource === 'queued');
+  return queued.length === 0 ? null : queued.map((r) => r.ts).sort().at(-1);
+}
 
 // R2-F3 (fix round): promptProvenance trusts a transcript only under a `.claude*` folder directly under the account's home (isTranscriptFile; $CLAUDE_CONFIG_DIR names no root: it is the agent's
 // word). So a genuine record refused for "missing" may only mean the owner's Claude Code config dir is somewhere else. That is likely when the record's transcript has the shape of a session
