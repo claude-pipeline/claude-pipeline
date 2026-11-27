@@ -251,6 +251,7 @@ test('job replaced by another run: next reconcile, exit 1, nothing discarded', {
   const hold = join(w.scratch, `adopt-hold-${holds++}`);
   const dir = join(jobsDir(w), 'codex-r1');
   const run = startRound(w, [], { ...ok(w), FAKE_CODEX_GATE: gate, PIPELINE_ROUND_HOLD_BEFORE_WAIT: hold });
+  let bodyFailed = false;
   try {
     await untilExists(`${hold}.reached`);
     writeFileSync(join(dir, 'meta.json.next'), JSON.stringify({ ...metaOf(w), runId: 'another-sessions-run' }));
@@ -260,10 +261,15 @@ test('job replaced by another run: next reconcile, exit 1, nothing discarded', {
     assert.equal(r.code, 1, r.out);
     assert.deepEqual([r.json.state, r.json.next], ['replaced', 'reconcile']);
     assert.doesNotMatch(r.out, /discard-round/);
+  } catch (e) {
+    bodyFailed = true;
+    throw e;
   } finally {
     writeFileSync(hold, 'go\n'); // (a command still held is let go, so it ends)
     writeFileSync(gate, 'go\n'); // let the orphaned fake Codex finish before the world is removed
-    await untilExists(join(dir, 'exit.json'), 20_000).catch(() => {}); // (bounded; a timeout here must not hide the failure above)
+    // (bounded; the runner must end: a timeout fails the test, unless a failure above is already propagating and must not be hidden)
+    const ended = untilExists(join(dir, 'exit.json'), 20_000);
+    if (bodyFailed) await ended.catch(() => {}); else await ended;
   }
 });
 
