@@ -316,11 +316,14 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
     }
     const u = e?.message?.usage;
     if (!isPlainObject(u)) continue;
-    // A message counts as a call only if some token field is a positive count: `{}`, negative, fractional, NaN, huge or all-zero usage (1e-400 parses to 0) is no real call (a real API call always has some tokens), so a transcript of only those is empty and its re-run is the one booking.
+    // Two questions. Which line is an id's snapshot: the last line with at least one token count (zero or more; `{}`, negative, fractional, NaN or huge fields are not counts), so a later all-zero line replaces an earlier snapshot.
+    // Whether the id is a call: only if its final snapshot has some positive count (a real API call always has tokens; 1e-400 parses to 0), so a transcript of only all-zero ids is empty and its re-run is the one booking.
     const cc0 = isPlainObject(u.cache_creation) ? u.cache_creation : {};
-    if (![u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].some((v) => isCount(v) && v > 0)) continue;
-    byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model });
+    const counts = [u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].filter(isCount);
+    if (counts.length === 0) continue;
+    byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model, positive: counts.some((v) => v > 0) });
   }
+  for (const [id, m] of byId) if (!m.positive) byId.delete(id);
   // usd: each message at its own model's list price; unpricedMessages: messages the price table cannot price
   const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, messages: byId.size, unpricedMessages: 0, byPrice: {} };
   const n = (v) => (isCount(v) ? v : 0);

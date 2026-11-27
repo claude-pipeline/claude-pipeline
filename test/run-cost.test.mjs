@@ -780,3 +780,20 @@ test('P cost --from-transcript: a transcript whose only usage is a fraction, NaN
     assert.equal(r.json.skipped, 'empty-transcript', `input_tokens ${JSON.stringify(bad)}`);
   }
 });
+
+// Issue #820 (round 5): a later all-zero line of a streamed message id is its final snapshot, but it was skipped before it could replace an earlier 10-token line, so the id kept the stale 10 and counted as a call.
+test('P cost --from-transcript: the last line of a message id is its snapshot: positive then all-zero is empty (skipped); zero then positive is one call with the positive totals', () => {
+  const line = (usage) => `${JSON.stringify({ message: { id: 'm', usage } })}\n`;
+  const args = ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const a = scenario();
+  a.repo.write('.review/t.jsonl', line({ input_tokens: 10, output_tokens: 5 }) + line({ input_tokens: 0, output_tokens: 0 }));
+  const first = costCli(a, args);
+  assertExit(first, 0);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  const b = scenario();
+  b.repo.write('.review/t.jsonl', line({ input_tokens: 0, output_tokens: 0 }) + line({ input_tokens: 10, output_tokens: 5 }));
+  const second = costCli(b, args);
+  assertExit(second, 0);
+  assert.equal(second.json.skipped, undefined);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.total.input, second.json.cost.total.output], [1, 10, 5]);
+});
