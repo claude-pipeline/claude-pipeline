@@ -7,10 +7,12 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 // Who spent the tokens. Anything not named here is booked as `other` (never dropped, never a new key).
-export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'substitute-opus', 'substitute-fable', 'verifier', 'controller', 'other']);
+export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'substitute-opus', 'substitute-fable', 'plan-review', 'plan-codex', 'verifier', 'controller', 'other']);
 // The run's phases are the record steps (a test pins this list to run-record's STEPS: that module imports this one, so it
 // cannot be imported back); a phase the caller invents is booked as `other`.
 export const PHASES = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended', 'other']);
+// The phases a cost entry can be booked under and `P summary` lists, in display order: `plan` (a plan review, run before the PR exists) comes first, ahead of build. It is NOT a record step, so it stays out of PHASES.
+export const COST_PHASES = Object.freeze(['plan', ...PHASES]);
 
 export const MAX_SESSIONS = 20;
 const SESSION_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
@@ -21,7 +23,7 @@ export const emptyTotals = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrit
 export const emptyCost = () => ({ total: emptyTotals(), byPhase: {}, byRole: {}, retries: 0, guardBlocks: null, sessions: [] });
 
 export const normaliseRole = (role) => (ROLES.includes(role) ? role : 'other');
-export const normalisePhase = (phase) => (PHASES.includes(phase) ? phase : 'other');
+export const normalisePhase = (phase) => (COST_PHASES.includes(phase) ? phase : 'other');
 
 // A count or amount from a flag / a file: a non-negative finite number, else a thrown error that names the field.
 function amount(v, what, { integer }) {
@@ -363,7 +365,7 @@ export function costLines(cost) {
     if (!keys.length) return;
     out.push(`- **${label}:** ${keys.map((k) => `${k} ${usd(map[k].usd)} (${num((Number(map[k].input) || 0) + (Number(map[k].output) || 0))} tok)`).join(' · ')}`);
   };
-  rows('By phase', PHASES, cost.byPhase);
+  rows('By phase', COST_PHASES, cost.byPhase);
   rows('By role', ROLES, cost.byRole);
   if (isPlainObject(cost.byRound)) {
     const keys = Object.keys(cost.byRound).filter((k) => isPlainObject(cost.byRound[k])).sort((a, b) => Number(a) - Number(b));

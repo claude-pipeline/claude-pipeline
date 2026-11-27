@@ -102,6 +102,22 @@ test('status block: shows totals, retries, guard blocks and the per-phase / per-
   assert.match(block, /\*\*By role:\*\* implementer \$1\.23 \(150 tok\) · judge \$2\.00 \(950 tok\)/);
 });
 
+// Issue #501: a plan review's cost folded into `other` (no phase fit it) and never showed ahead of build, so risky PRs looked cheaper than they were.
+test('plan phase: a plan-review / plan-codex entry is booked under plan (not other), shown ahead of build and counted in the total', () => {
+  let r = applyCheckpoint(rec(), { cost: { entry: entry({ usd: 1 }) } }, { host: 'h', now: NOW });
+  r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'plan', role: 'plan-review', input: 400, output: 100, usd: 3 }) } }, { host: 'h', now: NOW });
+  r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'plan', role: 'plan-codex', input: 50, output: 5, cacheRead: 0, cacheWrite: 0, usd: 0 }) } }, { host: 'h', now: NOW });
+  assert.equal(r.cost.byPhase.other, undefined);
+  assert.equal(r.cost.byRole.other, undefined);
+  assert.equal(r.cost.byPhase.plan.calls, 2);
+  assert.equal(r.cost.byRole['plan-review'].usd, 3);
+  assert.equal(r.cost.total.usd, 4);
+  const block = renderStatusBlock(r);
+  assert.match(block, /\*\*Cost:\*\* \$4\.00 .* 3 calls/);
+  assert.match(block, /\*\*By phase:\*\* plan \$3\.00 \(555 tok\) · build \$1\.00 \(150 tok\)/);
+  assert.match(block, /\*\*By role:\*\* implementer \$1\.00 \(150 tok\) · plan-review \$3\.00 \(500 tok\) · plan-codex \$0\.00 \(55 tok\)/);
+});
+
 test('costLines: an unknown guard count shows a dash; a cost section with nothing in it shows nothing', () => {
   assert.deepEqual(costLines(emptyCost()), []);
   assert.match(costLines(addRetries(null)).join('\n'), /Guard blocks:\*\* —/);
@@ -256,6 +272,20 @@ test('P cost --from-transcript: a transcript with no messages with usage warns (
 });
 
 // Issue #820: the empty-transcript booking still wrote a zero entry (calls +1) and a retry, so the re-run the warning invites showed one agent call as 2 calls and 2 retries.
+test('P cost --phase plan --role plan-review --from-transcript: books and prices under plan / plan-review, not other', () => {
+  const s = scenario();
+  s.repo.write('.review/plan.jsonl', `${JSON.stringify({ message: { id: 'm', model: 'claude-sonnet-5-5', usage: { input_tokens: 1000000, output_tokens: 1000000 } } })}\n`);
+  const r = costCli(s, ['--phase', 'plan', '--role', 'plan-review', '--from-transcript', '.review/plan.jsonl']);
+  assertExit(r, 0);
+  assert.equal(r.json.cost.byPhase.plan.usd, 12);
+  assert.equal(r.json.cost.byRole['plan-review'].calls, 1);
+  assert.equal(r.json.cost.byPhase.other, undefined);
+  assert.equal(r.json.cost.byRole.other, undefined);
+  const hand = costCli(scenario(), ['--phase', 'plan', '--role', 'plan-codex', '--input', '5000']);
+  assertExit(hand, 0);
+  assert.deepEqual([hand.json.cost.byRole['plan-codex'].input, hand.json.cost.byRole['plan-codex'].usd], [5000, 0]);
+});
+
 test('P cost --from-transcript: an empty transcript with no hand amounts books nothing (no call, no retry, no write); the re-run then books exactly 1 call and 1 retry', () => {
   const s = scenario();
   s.repo.write('.review/t.jsonl', '');
