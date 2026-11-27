@@ -10,7 +10,7 @@ import { autoEntry, isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { activeBinding, identify } from './mcp-servers.mjs';
-import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, verifyBlock, withGitDeadline } from './live-db-go.mjs';
+import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, swappedBlockReason, verifyBlock, withGitDeadline } from './live-db-go.mjs';
 import { AUTO_MIN_CLAIM_MS, autoApply, claimGoMarker, claimNext, history } from './live-db-auto.mjs';
 
 export { LIVE_DB_CONSUMED_REL } from './live-db-auto.mjs';
@@ -138,6 +138,8 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
       const v = verifyBlock(before.text, { home, io });
       const f = v.fields;
       if (!v.ok || f.op !== r.op || f.ref !== r.projectRef || f.sqlSha256 !== r.sqlSha256 || f.head !== r.head || f.file !== r.file || f.repo !== r.repo || f.name !== r.name) { skip('unverified', `the block the owner was shown before that go does not match the record${v.ok ? '' : ` (${v.reason})`}`); continue; }
+      const swapped = swappedBlockReason(before, f, { home, io });
+      if (swapped) { skip('unverified', `the block the owner was shown before that go does not match the record (${swapped})`); continue; }
       at = Date.parse(found.entry.timestamp);
       goAt = at;
     }

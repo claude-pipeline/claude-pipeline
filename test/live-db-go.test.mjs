@@ -13,7 +13,7 @@ import { run } from '../pipeline/commands/live-db.mjs';
 import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
 import { buildBlock, canonicalDataSql, checkedTopLevel, summaryProblem, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
-import { queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
+import { lastReply, queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { matchCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
 
@@ -234,6 +234,112 @@ test('the real hook script records the go and prints one line; a go it cannot re
   const bad = runHook(t, { entries, prompt: 'go migration other' });
   assert.equal(bad.record, null);
   assert.match(bad.stdout, /NOT recorded: the typed "other" is not/);
+});
+
+// ---- #741 (B1a): a turn the harness started that ends with the block ----------------------------------------------------------------------
+
+const NOTICE = { origin: { kind: 'task-notification' }, promptSource: 'system', entrypoint: 'cli' };
+const notice = (over = {}) => ({ type: 'user', message: { content: '<task-notification>background job finished</task-notification>' }, ...NOTICE, ...over });
+const textOf = (text) => ({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
+const toolUse = (id, name, input, over = {}) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] }, ...over });
+const toolResult = (id, content, over = {}) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content }] }, ...over });
+// the owner's turn, `middle`, then the owner's typed `prompt`; the outcome of the recorder, and the transcript for a reader
+function goAfter(w, t, prompt, middle) {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-live-db-go-n-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const transcript = join(dir, 'projects', '-repo', 't.jsonl');
+  mkdirSync(join(dir, 'projects', '-repo'), { recursive: true });
+  const promptId = `pid-${randomUUID()}`;
+  writeFileSync(transcript, linesOf([
+    { type: 'user', message: { content: 'start the job' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
+    textOf('Started it.'),
+    ...middle,
+    { type: 'user', message: { content: prompt }, promptId, ...OWNER_ENTRY },
+  ]));
+  const input = { hook_event_name: 'UserPromptSubmit', session_id: w.session, transcript_path: transcript, cwd: w.repo.dir, prompt, prompt_id: promptId };
+  return { out: liveDbGoOutcome(input, { home: w.home }), transcript, input };
+}
+const otherSql = 'update t set a = 2 where id = 7';
+const goData = (sql) => `go data ${sha256Of(sql).slice(0, 12)}`;
+// the dialog `present --ask` returns for a data fix, as the model passes it to AskUserQuestion
+const dataDialog = (block, sql) => {
+  const arg = sha256Of(sql).slice(0, 12);
+  return { questions: [{ question: `Run data SQL ${arg} on EagleWatch prod (${REF})? (ask-0123456789ab)\n\n${block.join('\n')}`, header: 'Live DB', multiSelect: false, options: [{ label: `Yes, run ${arg}`, description: `Apply exactly the SQL shown above to EagleWatch prod (${REF}), the same as typing "go data ${arg}". One go, used once.` }, { label: 'Not yet', description: 'Do not apply now.' }] }] };
+};
+
+test('B1a: a turn the interactive UI started (a task notice) that ends with the block counts, so the owner\'s typed go is recorded', async (t) => {
+  // Failure caught (transcript 9f16c301): the block was shown in a turn a task notice started; skipSynthetic read the whole reply as '', so the owner's go was refused and the block had to be shown again.
+  const w = world(t);
+  await setup(w);
+  const { out } = goAfter(w, t, goData(dataSql), [notice(), textOf(dataBlock(w).join('\n'))]);
+  assert.ok(out?.record, JSON.stringify(out));
+  assert.equal(out.record.sqlSha256, sha256Of(dataSql));
+});
+
+test('B1a: a headless turn (entrypoint sdk-cli) that ends with the block never counts', async (t) => {
+  // Failure caught: a `claude -p --resume` process writing a block into the owner's transcript, where the owner sees nothing, and a typed go binding to it.
+  const w = world(t);
+  await setup(w);
+  const { out } = goAfter(w, t, goData(dataSql), [notice({ entrypoint: 'sdk-cli' }), textOf(dataBlock(w).join('\n'))]);
+  assert.equal(out?.record, undefined);
+});
+
+test('B1a: block A as text, then block B only in a tool result of the same notice turn: neither go records', async (t) => {
+  // Failure caught: the owner was last shown block B in a tool box, but the reply text still ended with block A, so a go for A (or B) was recorded against what the owner did not last see.
+  const w = world(t);
+  await setup(w);
+  const shownB = JSON.stringify({ ok: true, block: dataBlock(w, { sql: otherSql }).join('\n') });
+  const middle = [notice(), textOf(dataBlock(w).join('\n')), toolUse('tu1', 'Bash', { command: 'node x present' }), toolResult('tu1', shownB)];
+  assert.equal(goAfter(w, t, goData(dataSql), middle).out?.record, undefined, 'a go for A');
+  assert.equal(goAfter(w, t, goData(otherSql), middle).out?.record, undefined, 'a go for B');
+});
+
+test('B1a: a notice turn shows block A while another visible turn shows block B only in a tool result: neither go records', async (t) => {
+  // Failure caught: the owner's other open turn printed a second block after the notice turn's text, and the reader still used the notice turn's block A.
+  const w = world(t);
+  await setup(w);
+  const shownB = JSON.stringify({ ok: true, block: dataBlock(w, { sql: otherSql }).join('\n') });
+  const middle = [
+    { type: 'user', message: { content: 'status?' }, promptId: 'pid-p1', uuid: 'u-p1', ...OWNER_ENTRY },
+    notice(), textOf(dataBlock(w).join('\n')),
+    toolUse('tu2', 'Bash', { command: 'node x present' }, { parentUuid: 'u-p1', uuid: 'u-tu2' }), toolResult('tu2', shownB, { parentUuid: 'u-tu2' }),
+  ];
+  assert.equal(goAfter(w, t, goData(dataSql), middle).out?.record, undefined, 'a go for A');
+  assert.equal(goAfter(w, t, goData(otherSql), middle).out?.record, undefined, 'a go for B');
+});
+
+test('B1a: the notice turn\'s own dialog (the same block and go words in AskUserQuestion) still counts; a dialog carrying another block does not', async (t) => {
+  // Failure caught: the standard --ask flow (block, then AskUserQuestion repeating the block) read as "another block shown", so no typed go ever worked in a notice turn; the opposite failure: any dialog text accepted.
+  const w = world(t);
+  await setup(w);
+  const own = [notice(), textOf(dataBlock(w).join('\n')), toolUse('ask1', 'AskUserQuestion', dataDialog(dataBlock(w), dataSql)), toolResult('ask1', 'User declined to answer questions')];
+  assert.ok(goAfter(w, t, goData(dataSql), own).out?.record, 'own dialog');
+  const swapped = [notice(), textOf(dataBlock(w).join('\n')), toolUse('ask1', 'AskUserQuestion', dataDialog(dataBlock(w, { sql: otherSql }), otherSql)), toolResult('ask1', 'User declined to answer questions')];
+  assert.equal(goAfter(w, t, goData(dataSql), swapped).out?.record, undefined, 'another block in the dialog');
+  assert.equal(goAfter(w, t, goData(otherSql), swapped).out?.record, undefined, 'a go for the dialog\'s block');
+});
+
+test('B1a: the owner saw block A in their own turn and a notice turn then re-presents the same migration name with other SQL: the typed go is refused', async (t) => {
+  // Failure caught: `go migration <name>` binds the name only, so a notice turn swapping the SQL under the same name was recorded as the go for the block the owner last read in their own turn.
+  const w = world(t);
+  await setup(w);
+  const blockA = migBlock(w);
+  w.repo.write(FILE, `${SQL}-- changed\n`);
+  const head2 = w.repo.commit('changed');
+  const blockB = migBlock(w, { head: head2, sql: `${SQL}-- changed\n` });
+  const swapped = goAfter(w, t, GO, [textOf(blockA.join('\n')), { type: 'user', message: { content: 'ok' }, promptId: 'pid-ok', ...OWNER_ENTRY }, textOf(blockA.join('\n')), notice(), textOf(blockB.join('\n'))]);
+  assert.match(swapped.out?.reason ?? '', /the block changed in a turn you did not start/);
+  const same = goAfter(w, t, GO, [{ type: 'user', message: { content: 'ok' }, promptId: 'pid-ok', ...OWNER_ENTRY }, textOf(blockB.join('\n')), notice(), textOf(blockB.join('\n'))]);
+  assert.ok(same.out?.record, 'the same block again is no change');
+});
+
+test('B1a pin: the ruling reader (no liveDb option) still reads the same notice turn as no reply', async (t) => {
+  // Failure caught: the live-database promotion leaking into the ruling / merge readers, which must keep voiding a slot for any text a notice turn prints.
+  const w = world(t);
+  await setup(w);
+  const { transcript } = goAfter(w, t, goData(dataSql), [notice(), textOf(dataBlock(w).join('\n'))]);
+  assert.deepEqual(lastReply(transcript, { prompt: goData(dataSql), skipSynthetic: true }), { text: '', promoted: false });
+  assert.ok(lastReply(transcript, { prompt: goData(dataSql), skipSynthetic: true, liveDb: true }).promoted);
 });
 
 // ---- the guard keeps the recorder out of an agent's hands ----------------------------------------------------------------------------

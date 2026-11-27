@@ -28,7 +28,8 @@ const STATE = (home) => join(home, '.claude', 'pipeline-state');
 
 // one session: registry, repo, a transcript under the scratch home's config dir, the block shown, and the owner's go typed at `typedAt`
 // `flag`: the owner switched auto-apply on for REF (the attempt history applies); `home`: a second session in a home that already exists (its registry is the first scene's).
-async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL, flag = false, home: shared = null } = {}) {
+// `middle`: (block) -> the transcript entries between the owner's first prompt and the typed go (default: the reply that shows the block)
+async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL, flag = false, home: shared = null, middle = null } = {}) {
   const home = shared ?? mkdtempSync(join(tmpdir(), 'cp-live-db-guard-'));
   if (shared === null) {
     t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -49,7 +50,7 @@ async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = S
   const promptId = `pid-${randomUUID()}`;
   const entries = [
     { type: 'user', message: { content: 'apply' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY, timestamp: new Date(typedAt - 5000).toISOString() },
-    { type: 'assistant', message: { content: [{ type: 'text', text: block }] } },
+    ...(middle === null ? [{ type: 'assistant', message: { content: [{ type: 'text', text: block }] } }] : middle(block)),
     { type: 'user', message: { content: prompt }, promptId, ...OWNER_ENTRY, timestamp: new Date(typedAt).toISOString() },
   ];
   writeFileSync(transcript, linesOf(entries));
@@ -1144,4 +1145,59 @@ test('through the real hook entry: GitHub that never answers, even with 5,000 pe
   assert.equal(many.decision, 'deny', many.reason);
   assert.ok(many.ms < 14_000, `${many.ms} ms`);
   assert.deepEqual(hist(s), []);
+});
+
+// ---- #741 (B1a): the claim reads a turn the harness started the same way the recorder does ----------------------------------------------------------------------------
+
+const NOTICE = { origin: { kind: 'task-notification' }, promptSource: 'system', entrypoint: 'cli' };
+const notice = (over = {}) => ({ type: 'user', message: { content: '<task-notification>background job finished</task-notification>' }, ...NOTICE, ...over });
+const textOf = (text) => ({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
+const toolUse = (id, name, input, over = {}) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] }, ...over });
+const toolResult = (id, content, over = {}) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content }] }, ...over });
+const otherDataSql = 'update t set a = 2 where id = 7';
+const dataBlockOf = (s, sqlText) => buildBlock({ op: 'data', ref: REF, label: 'EagleWatch prod', repo: 'acme/widgets', dir: s.repo.dir, sql: sqlText, summary: 'fix' }).join('\n');
+// the transcript after the fact: the owner's first prompt, `middle`, the typed go (the record made by the clean scene stays)
+const reshape = (s, middle) => writeFileSync(s.transcript, linesOf([s.entries[0], textOf('Started it.'), ...middle, s.entries[s.entries.length - 1]]));
+// the block of a scene whose middle ends with the block text
+const shownBlock = (s) => s.entries[s.entries.length - 2].message.content[0].text;
+
+test('B1a (claim): a go typed after a task-notice turn that ends with the block is recorded and claimed once', async (t) => {
+  // Failure caught (transcript 9f16c301): the block was shown in a notice-started turn, the reader saw '', and the owner had to be asked again after typing the go.
+  const s = await scene(t, { op: 'data', middle: (block) => [notice(), textOf(block)] });
+  assert.equal(sql(s, s.dataSql).decision, 'allow');
+  assert.equal(sql(s, s.dataSql).decision, 'deny', 'used once');
+  assert.equal(markers(s).length, 1);
+});
+
+test('B1a (claim): the notice turn\'s own dialog still claims; a headless turn, a second block in a tool result and another visible turn\'s tool result do not', async (t) => {
+  // Failure caught: a recorded go claimed against a block the owner was not last shown (a tool box, an interleaved turn, a headless run), or the --ask flow voiding its own go.
+  const own = await scene(t, { op: 'data', middle: (block) => [notice(), textOf(block), toolUse('ask1', 'AskUserQuestion', { questions: [{ question: `Run data SQL x on EagleWatch prod (${REF})? (ask-0123456789ab)\n\n${block}`, header: 'Live DB', multiSelect: false, options: [{ label: 'Yes', description: `the same as typing "go data ${sha256Of('update t set a = 1 where id = 7').slice(0, 12)}"` }, { label: 'Not yet', description: 'no' }] }] }), toolResult('ask1', 'User declined to answer questions')] });
+  assert.equal(sql(own, own.dataSql).decision, 'allow', 'own dialog');
+  const shownB = (s) => JSON.stringify({ ok: true, block: dataBlockOf(s, otherDataSql) });
+  const cases = {
+    'headless turn': (s) => [notice({ entrypoint: 'sdk-cli' }), textOf(shownBlock(s))],
+    'two-block fixture': (s) => [notice(), textOf(shownBlock(s)), toolUse('tu1', 'Bash', { command: 'node x present' }), toolResult('tu1', shownB(s))],
+    interleaved: (s) => [{ type: 'user', message: { content: 'status?' }, promptId: 'pid-p1', uuid: 'u-p1', ...OWNER_ENTRY }, notice(), textOf(shownBlock(s)), toolUse('tu2', 'Bash', { command: 'node x present' }, { parentUuid: 'u-p1', uuid: 'u-tu2' }), toolResult('tu2', shownB(s), { parentUuid: 'u-tu2' })],
+  };
+  for (const [what, middle] of Object.entries(cases)) {
+    const s = await scene(t, { op: 'data', middle: (block) => [notice(), textOf(block)] });
+    reshape(s, middle(s));
+    assert.equal(sql(s, s.dataSql).decision, 'deny', what);
+    assert.equal(sql(s, otherDataSql).decision, 'deny', `${what}: the other block was never recorded`);
+    assert.equal(markers(s).length, 0, `${what}: no go was spent`);
+  }
+});
+
+test('B1a (claim): a notice turn that re-presents the owner\'s migration name with other SQL is refused, the go unspent', async (t) => {
+  // Failure caught: `go migration <name>` binds the name only, so SQL swapped under the same name in a turn the owner did not start was claimed as the go for what they last read in their own turn.
+  const s = await scene(t, { middle: (block) => [notice(), textOf(block)] });
+  const blockB = shownBlock(s);
+  s.repo.write(FILE, `${SQL}-- changed\n`);
+  const head2 = s.repo.commit('changed');
+  const blockA = buildBlock({ op: 'migration', ref: REF, label: 'EagleWatch prod', name: NAME, file: FILE, head: head2, repo: 'acme/widgets', dir: s.repo.dir, sql: `${SQL}-- changed\n`, summary: 'adds c' }).join('\n');
+  reshape(s, [textOf(blockA), { type: 'user', message: { content: 'ok' }, promptId: 'pid-ok', ...OWNER_ENTRY }, textOf(blockA), notice(), textOf(blockB)]);
+  const r = apply(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /the block changed in a turn you did not start/);
+  assert.equal(markers(s).length, 0);
 });
