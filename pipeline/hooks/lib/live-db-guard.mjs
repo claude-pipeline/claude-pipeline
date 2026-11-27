@@ -10,7 +10,7 @@ import { autoEntry, isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { activeBinding, identify } from './mcp-servers.mjs';
-import { LIVE_DB_MAX_AGE_MS, canonicalDataSql, liveDbRecords, migrationVersionOf, numberedMigrationReason, parseGo, sha256Of, swappedBlockReason, verifyBlock, withGitDeadline } from './live-db-go.mjs';
+import { DATA_MAX_CHARS, LIVE_DB_MAX_AGE_MS, canonicalDataSql, liveDbRecords, migrationVersionOf, numberedMigrationReason, parseGo, sha256Of, swappedBlockReason, verifyBlock, withGitDeadline } from './live-db-go.mjs';
 import { AUTO_MIN_CLAIM_MS, autoApply, claimGoMarker, claimNext, history } from './live-db-auto.mjs';
 
 export { LIVE_DB_CONSUMED_REL } from './live-db-auto.mjs';
@@ -138,7 +138,7 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
       const v = verifyBlock(before.text, { home, io });
       const f = v.fields;
       if (!v.ok || f.op !== r.op || f.ref !== r.projectRef || f.sqlSha256 !== r.sqlSha256 || f.head !== r.head || f.file !== r.file || f.repo !== r.repo || f.name !== r.name) { skip('unverified', `the block the owner was shown before that go does not match the record${v.ok ? '' : ` (${v.reason})`}`); continue; }
-      const swapped = swappedBlockReason(before, f, { home, io });
+      const swapped = swappedBlockReason(before, f);
       if (swapped) { skip('unverified', `the block the owner was shown before that go does not match the record (${swapped})`); continue; }
       at = Date.parse(found.entry.timestamp);
       goAt = at;
@@ -199,16 +199,18 @@ const presentHint = (op, ref) => (op === 'migration'
   : `${CLI} live-db present --op data --sql-file <file> --project ${ref} --summary "…"`);
 // #741 (B2): an execute_sql query that does not hash to a go, but whose canonical form (what `present` hashes: BOM and trailing whitespace stripped) does hash to one of this session's, differs only by bytes the model added.
 // Says which, with both byte counts. The hash comparison itself stays exact: this only explains the refusal. -> '' | a sentence.
+// R1-B6/B8: only for this session (a missing id would read every session's records), and only for a query within the data limit plus slack (the whitespace search is quadratic on a long interior run, and this runs on every refusal).
 function exactBytesHint(query, { home, sessionId, projectRef, now }) {
-  const canon = canonicalDataSql(query);
+  if (typeof sessionId !== 'string' || sessionId === '' || query.length > DATA_MAX_CHARS + 1024) return '';
+  const canon = canonicalDataSql(query.trimEnd());
   if (canon.problem || canon.sql === query) return '';
   const want = sha256Of(canon.sql);
   if (!liveDbRecords({ home, session: sessionId, now }).some((r) => r.op === 'data' && r.projectRef === projectRef && r.sqlSha256 === want)) return '';
   const bom = query.startsWith('\uFEFF');
   const rest = bom ? query.slice(1) : query;
-  const tail = rest.slice(rest.replace(/\s+$/, '').length);
+  const tail = rest.slice(rest.trimEnd().length);
   const what = [bom ? 'a leading BOM' : null, tail === '\n' ? 'a final newline' : tail !== '' ? 'trailing whitespace' : null].filter(Boolean).join(' and ');
-  return ` The query differs from the SQL the owner approved only by ${what} (${Buffer.byteLength(query, 'utf8')} bytes sent, ${Buffer.byteLength(canon.sql, 'utf8')} approved): pass \`sql\` exactly as \`live-db present\` printed it, with no BOM and no final newline; the go is not used.`;
+  return ` The query differs from the SQL the owner approved only by ${what} (${Buffer.byteLength(query, 'utf8')} bytes sent, ${Buffer.byteLength(canon.sql, 'utf8')} approved): pass \`sql\` exactly as \`live-db present\` printed it, with no BOM and no final newline. This refused call used no go; a go that was already used or has expired needs a new one.`;
 }
 const show = (query) => `sha256 ${sha256Of(query)} over ${Buffer.byteLength(query, 'utf8')} bytes`;
 

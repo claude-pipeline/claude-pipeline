@@ -450,7 +450,9 @@ const liveDbTail = (text) => {
   while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
   const bind = lines[lines.length - 2];
   const apply = lines[lines.length - 1];
-  return bind !== undefined && LIVE_DB_BINDING.test(bind.replace(/\s+$/, '')) && apply.startsWith(APPLY_PREFIX) ? { bind, apply } : null;
+  if (!(bind !== undefined && LIVE_DB_BINDING.test(bind.replace(/\s+$/, '')) && apply.startsWith(APPLY_PREFIX))) return null;
+  const header = lines.findLastIndex((l) => l.startsWith('🗄️ LIVE database change — '));
+  return { bind, apply, block: header < 0 ? null : lines.slice(header).join('\n') }; // (block: the whole trailing block, from its first line)
 };
 const liveDbPromotes = (text) => liveDbTail(text) !== null;
 // A tool input or result that shows a live-database block, its binding or apply line, or a go word: what the owner may have answered instead of the block in the reply text (a stale-ask detector, like surfacesAsk).
@@ -466,7 +468,8 @@ function ownDialogInput(input, text) {
   const own = liveDbTail(text);
   const ownGo = own === null ? null : / — say "(go (?:migration|data) [^"\s]+)"$/.exec(own.apply.replace(/\s+$/, ''))?.[1];
   const shown = toolUseText(input);
-  if (!ownGo || shown === null) return false;
+  if (!ownGo || shown === null || own.block === null) return false;
+  if (!shown.replace(/\r\n/g, '\n').includes(own.block)) return false; // R1-B4: the whole block (its SQL and summary too), not only its binding and apply lines
   let binds = 0;
   let applies = 0;
   for (const line of shown.replace(/\r\n/g, '\n').split('\n')) {
@@ -665,7 +668,9 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
   // a later request of another slot. #241: a tool block of another visible slot that surfaces an ask (shownPos) counts as shown too, not the selected slot's own. R3-F1: so does a visibleSynthetic skip turn's.
   const shownAfter = !last || candidates.some((x) => x !== last && x.turn.shownPos > last.turn.textPos) || shownSkips.some((pos) => pos > last.turn.textPos);
   if (!last || last.voided || shownAfter || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
-  return { text: last.text, promoted: last.promoted, ...(liveDb ? { before: candidates[candidates.length - 2]?.text ?? '' } : {}) };
+  // R1-B2: \`before\` is the newest slot an OWNER started before the selected one, stepping over every promoted (notice) slot: the last thing the owner read in a turn they started
+  const ownerSlot = candidates.slice(0, -1).findLast((x) => !x.promoted);
+  return { text: last.text, promoted: last.promoted, ...(liveDb ? { before: ownerSlot?.text ?? '' } : {}) };
 }
 export const lastReplyText = (transcriptPath, opts = {}) => lastReply(transcriptPath, opts).text;
 
@@ -715,7 +720,13 @@ export function replyBeforeToolUse(transcriptPath, toolUseId, { tailBytes = REPL
   let progressNote = false;
   for (let i = resultAt + 1; i <= useAt; i++) {
     const e = entries[i];
-    if (e?.type !== 'assistant' || origin[i] !== origin[useAt]) continue;
+    if (origin[i] !== origin[useAt]) {
+      // R1-B5: another turn's text, or a live-database block it showed, inside the window: what was printed before it is not what the owner was last shown, so the pieces on either side are never joined
+      const visible = origin[i] < 0 || !invisibleNote(entries, parent, origin[i], verdicts);
+      if ((e?.type === 'assistant' && showsText(textOf(e))) || (visible && blocksOf(e).some(blockSurfaces))) { text = ''; lastTextAt = -1; }
+      continue;
+    }
+    if (e?.type !== 'assistant') continue;
     const t = i === useAt ? textOf(e, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : textOf(e);
     if (showsText(t)) lastTextAt = i;
     if (blocksOf(e).some((b) => b?.type === 'thinking' || b?.type === 'redacted_thinking')) progressNote = true;

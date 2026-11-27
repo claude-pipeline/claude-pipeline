@@ -275,13 +275,21 @@ export function verifyBlock(replyText, { home = accountHome(), io = {} } = {}) {
 }
 
 // #741 (B1a, Fable P1-2): `go migration <name>` binds the NAME only. A migration block the owner sees in a turn the harness started (a promoted slot) must not replace, under the same name, the block the owner
-// last saw in a turn they started: when the visible slot before it ends with a verifiable block for the same project and name but another SQL or head, the go is refused. `reply` is what lastReply / replyBefore
-// returned (text, promoted, before), `fields` the verified fields of reply.text. -> a reason | null. The recorder and the claim both run it.
-export function swappedBlockReason(reply, fields, { home = accountHome(), io = {} } = {}) {
-  if (!reply?.promoted || fields?.op !== 'migration' || !reply.before) return null;
-  const prev = verifyBlock(reply.before, { home, io });
-  if (!prev.ok || prev.fields.op !== 'migration' || prev.fields.ref !== fields.ref || prev.fields.name !== fields.name) return null;
-  return prev.fields.sqlSha256 !== fields.sqlSha256 || prev.fields.head !== fields.head ? 'the block changed in a turn you did not start: present again' : null;
+// last saw in a turn they started. R1: a TEXT comparison, no git (a failed rebuild of the earlier block proves nothing): the LAST binding line anywhere in `reply.before` (the newest slot an owner started, stepping
+// over every promoted slot) is refused when it names the same migration (file basename) with another project, SQL or head, or the same data SQL on another project (neither typed go names the project). No binding
+// line, or another migration or SQL, is no conflict. `reply` is what lastReply / replyBefore returned (text, promoted, before), `fields` the verified fields of reply.text. -> a reason | null. Recorder and claim both run it.
+export function swappedBlockReason(reply, fields) {
+  if (!reply?.promoted || !reply.before) return null;
+  const lines = String(reply.before).replace(/\r\n/g, '\n').split('\n');
+  const prev = lines.findLast((l) => BINDING.test(right(l)));
+  const m = prev === undefined ? null : BINDING.exec(right(prev));
+  if (m === null) return null;
+  const [, op, ref, sha, head, file] = m;
+  if (op !== fields?.op) return null;
+  const changed = op === 'migration'
+    ? path.posix.basename(file, '.sql') === fields.name && (ref !== fields.ref || sha !== fields.sqlSha256 || head !== fields.head)
+    : sha === fields.sqlSha256 && ref !== fields.ref;
+  return changed ? 'the block changed in a turn you did not start: present again' : null;
 }
 
 // ---- the recorder -------------------------------------------------------------------------------------------------------------------
@@ -303,7 +311,7 @@ export function liveDbGoOutcome(input, { home = accountHome(), now = Date.now, i
     const v = verifyBlock(reply.text, { home, io });
     if (!v.ok) return { reason: v.reason };
     const f = v.fields;
-    const swapped = swappedBlockReason(reply, f, { home, io });
+    const swapped = swappedBlockReason(reply, f);
     if (swapped) return { reason: swapped };
     if (go.op !== f.op) return { reason: `the owner typed a ${go.op} go but the block asks for a ${f.op}` };
     const want = f.op === 'migration' ? f.name : f.sqlSha256.slice(0, 12);

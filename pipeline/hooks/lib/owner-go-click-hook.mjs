@@ -13,7 +13,10 @@ function liveDbDialogRefusal(input, result) {
   let shown;
   try { shown = replyBeforeToolUse(String(input?.transcript_path ?? ''), input?.tool_use_id); } catch { return null; }
   if (shown.reason === undefined || shown.missing === true) return null;
-  return `${HEAD} the owner's click on the live-database dialog will not be accepted: ${shown.reason}. Nothing is applied; run live-db present again, end the reply with its block as text (the last thing before the dialog) and show the dialog again, or ask the owner to type the go`;
+  // a pending click does not say which label the owner chose (the answer is not in the transcript yet), so the recovery is conditional on an approval; a recorded click is a Yes
+  const again = 'run live-db present again, end the reply with its block as text (the last thing before the dialog) and show the dialog again, or ask the owner to type the go';
+  if (result?.pending) return `${HEAD} the owner's click on the live-database dialog is received, and if it approves the guard will not accept it: ${shown.reason}. Nothing is applied. If the owner chose to apply, ${again}; if they chose not to, stop: nothing is applied`;
+  return `${HEAD} the owner's click on the live-database dialog will not be accepted: ${shown.reason}. Nothing is applied; ${again}`;
 }
 
 // Why (#472): on Claude Code 2.1.323 the answer's transcript entry is written after the PostToolUse hooks return, so the click is only kept PENDING here (recordClick `{ pending }`) and is verified by
