@@ -11,7 +11,7 @@ import { BUILTIN_SERVERS, DEPLOY_ENV_MAX, REF_RE, dbRefsFile, readDbRefs, validD
 import { importGoHistory } from '../hooks/lib/live-db-auto.mjs';
 
 // the entries as `show` and the owner's commands print them: the switch's time only while it is on, the after-deploy registration only while it is set
-const shown = (refs) => refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo, kind: e.kind, autoMigrations: e.autoMigrations === true, ...(e.autoMigrations === true ? { autoSince: e.autoSince } : {}), ...(e.autoMigrations === true && e.deployEnv ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince, deployClock: e.deployClock ?? null } : {}) }));
+const shown = (refs) => refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo, kind: e.kind, autoMigrations: e.autoMigrations === true, ...(e.autoMigrations === true ? { autoSince: e.autoSince } : {}), ...(e.autoMigrations === true && e.deployEnv ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince, deployClock: e.deployClock ?? null, deployProof: e.deployProof ?? null } : {}), ...(e.autoMigrations === true && e.deployPending ? { deployPending: e.deployPending } : {}) }));
 
 export const meta = {
   summary: 'the owner\'s registry of Supabase projects for the live-database guard: show it; set / remove a project, add / remove a trusted MCP server, switch auto-apply of merged migrations on / off for a project, register / unregister the GitHub deployment after which a marked migration applies (owner only, own terminal)',
@@ -73,7 +73,7 @@ export async function run(argv, ctx = {}) {
     change = (s) => {
       const old = s.refs.find((e) => e.ref === entry.ref);
       const keep = old?.autoMigrations === true && entry.kind === 'live' && sameRepo(old.repo, entry.repo);
-      const kept = keep ? { ...entry, autoMigrations: true, autoSince: old.autoSince, ...(old.deployEnv ? { deployEnv: old.deployEnv, deployBot: old.deployBot, deploySince: old.deploySince, deployClock: old.deployClock } : {}) } : entry;
+      const kept = keep ? { ...entry, autoMigrations: true, autoSince: old.autoSince, ...(old.deployEnv ? { deployEnv: old.deployEnv, deployBot: old.deployBot, deploySince: old.deploySince, deployClock: old.deployClock, deployProof: old.deployProof } : {}), ...(old.deployPending ? { deployPending: old.deployPending } : {}) } : entry;
       return { ...s, refs: [...s.refs.filter((e) => e.ref !== entry.ref), kept] };
     };
   } else if (sub === 'remove') {
@@ -153,7 +153,7 @@ function autoMigrations({ action, ref, accept, current, home, ctx }) {
   if (!entry) throw new UsageError(`${ref} is not in the registry: add it with \`pipeline db-refs set --ref ${ref} --name "<label>" --repo <owner/name>\` first`);
   const write = (refs, extra = {}) => writeSnapshot({ home, current, state, refs, extra });
   // off also clears the after-deploy registration: it is valid only with the switch on
-  if (action === 'off') return write(state.refs.map((e) => (e.ref === ref ? { ...e, autoMigrations: false, autoSince: null, deployEnv: null, deployBot: null, deploySince: null, deployClock: null } : e)));
+  if (action === 'off') return write(state.refs.map((e) => (e.ref === ref ? { ...e, autoMigrations: false, autoSince: null, deployEnv: null, deployBot: null, deploySince: null, deployClock: null, deployProof: null, deployPending: null } : e)));
   if (entry.kind !== 'live') throw new UsageError(`${ref} is declared dev: auto-apply covers live projects only`);
   if (!entry.repo) throw new UsageError(`${ref} has no repo: set it with \`pipeline db-refs set --ref ${ref} --name "${entry.name}" --repo <owner/name>\` first (auto-apply needs to know which repository's merges to trust)`);
   const other = state.refs.find((e) => e.ref !== ref && e.autoMigrations === true && sameRepo(e.repo, entry.repo));
@@ -191,22 +191,24 @@ function afterDeploy({ action, ref, deploy, current, home, ctx, env }) {
   const state = current.ok ? current : { refs: [], servers: [] };
   const entry = state.refs.find((e) => e.ref === ref);
   if (!entry) throw new UsageError(`${ref} is not in the registry: add it with \`pipeline db-refs set --ref ${ref} --name "<label>" --repo <owner/name>\` first`);
-  if (action === 'off') return writeSnapshot({ home, current, state, extra: {}, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: null, deployBot: null, deploySince: null, deployClock: null } : e)) });
+  if (action === 'off') return writeSnapshot({ home, current, state, extra: {}, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: null, deployBot: null, deploySince: null, deployClock: null, deployProof: null, deployPending: null } : e)) });
   if (entry.autoMigrations !== true) throw new UsageError(`${ref} has auto-apply off: switch auto-migrations on first with \`pipeline db-refs auto-migrations on --ref ${ref}\``);
-  const unreachable = { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-unreachable', message: `GitHub's time could not be read (\`gh api rate_limit\` failed: is gh installed, signed in to github.com and online?), so the after-deploy registration is not in force: its cut-off time is GitHub's clock, not this machine's. Fix gh, then run this again` } };
-  // Two phases, both on GitHub's clock only: (1) write the registration with T1 and deployClock "pending" (the guard does not trust it); (2) read GitHub's time T2 AFTER that write is in the file; (3) finish it ("github") only when T2 - T1 is at most a minute.
-  // Every PR merged before the write in (1) is merged before T2, so it is before T1 + 1 minute, inside the guard's 5-minute margin after deploySince: nothing here uses this machine's clock, and a stall only delays the switch-on.
+  const unreachable = (staged) => ({ exitCode: EXIT.FAILED, output: { ok: false, error: 'github-unreachable', message: `GitHub's time could not be read (\`gh api rate_limit\` failed: is gh installed, signed in to github.com and online?), ${staged ? 'so the new after-deploy registration did not finish: an earlier registration, if any, is still in force with its old settings' : 'so nothing was changed: an earlier after-deploy registration, if any, is still in force'}. Fix gh, then run this again` } });
+  // Two phases, both on GitHub's clock only: (1) stage the registration under `deployPending` with T1 (no guard, old or new, reads that key, and the active keys are untouched); (2) read GitHub's time T2 AFTER that write is in the file; (3) publish the active keys (deploySince = T1, deployClock "github", deployProof "two-phase")
+  // only when 0 <= T2 - T1 <= 60 s. Every PR merged before the write in (1) is merged before T2, so before T1 + 1 minute, inside the guard's 5-minute margin after deploySince: nothing here uses this machine's clock, and a stall only delays the switch-on.
   const since = githubNow({ ctx, env });
-  if (since === null) return unreachable;
-  const first = writeSnapshot({ home, current, state, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: deploy.env, deployBot: deploy.bot, deploySince: since, deployClock: 'pending' } : e)), extra: {} });
+  if (since === null) return unreachable(false);
+  const staged = { env: deploy.env, bot: deploy.bot, since };
+  const first = writeSnapshot({ home, current, state, refs: state.refs.map((e) => (e.ref === ref ? { ...e, deployPending: staged } : e)), extra: {} });
   if (first.exitCode !== EXIT.OK) return first;
   const later = githubNow({ ctx, env });
-  if (later === null) return unreachable;
-  if (Date.parse(later) - Date.parse(since) > GITHUB_TIME_MAX_GAP_MS) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-time-stale', message: `more than ${GITHUB_TIME_MAX_GAP_MS / 1000} seconds of GitHub's time passed while the after-deploy registration was written, so it is not in force (marked files keep the owner's go): run this again` } };
+  if (later === null) return unreachable(true);
+  const gap = Date.parse(later) - Date.parse(since);
+  if (!(gap >= 0 && gap <= GITHUB_TIME_MAX_GAP_MS)) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'github-time-stale', message: `GitHub's time moved by ${Math.round(gap / 1000)} seconds while the after-deploy registration was staged (it must be between 0 and ${GITHUB_TIME_MAX_GAP_MS / 1000}), so the new registration did not finish: an earlier registration, if any, is still in force with its old settings. Run this again` } };
   const now2 = readDbRefs(home);
   const mine = now2.ok ? now2.refs.find((e) => e.ref === ref) : null;
-  if (!mine || mine.deployEnv !== deploy.env || mine.deployBot !== deploy.bot || mine.deploySince !== since || mine.deployClock !== 'pending') return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-changed', message: `${dbRefsFile(home)} was changed by another command while the registration was written; it is not in force. Run this again` } };
-  return writeSnapshot({ home, current: now2, state: now2, refs: now2.refs.map((e) => (e.ref === ref ? { ...e, deployClock: 'github' } : e)), extra: { note: DEPLOY_NOTE(entry.repo, deploy.env, deploy.bot) } });
+  if (!mine || JSON.stringify(mine.deployPending) !== JSON.stringify(staged)) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-changed', message: `${dbRefsFile(home)} was changed by another command while the registration was staged; the new registration did not finish (an earlier one, if any, is still in force with its old settings). Run this again` } };
+  return writeSnapshot({ home, current: now2, state: now2, refs: now2.refs.map((e) => (e.ref === ref ? { ...e, deployEnv: deploy.env, deployBot: deploy.bot, deploySince: since, deployClock: 'github', deployProof: 'two-phase', deployPending: null } : e)), extra: { note: DEPLOY_NOTE(entry.repo, deploy.env, deploy.bot) } });
 }
 
 // GitHub's clock: the Date header of an answer to a call that costs no rate limit (`gh api --include rate_limit`). -> ISO time | null (gh missing, not signed in, no answer in time, no readable Date)
