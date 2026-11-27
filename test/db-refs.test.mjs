@@ -619,7 +619,10 @@ test('legacy cutoff-era keys (N3): the registry stays valid, the entry reads as 
       assert.equal(readDbRefs(home).refs.find((e) => e.ref === REF).deployLegacy, undefined, `${shape} / ${what}`);
     }
     seedRegistry(home, { refs: [LIVE({ ...ON, ...keys }), other] });
-    assert.equal(runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']).exitCode, 0, shape);
+    const on = runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']);
+    assert.equal(on.exitCode, 0, shape);
+    // Failure caught: the response still telling the owner the entry is legacy after the write that cleared it
+    assert.deepEqual([on.output.refs[0].deployEnv, on.output.refs[0].deployLegacy], ['Production', undefined], `${shape}: the response prints what was written`);
     const after = readDbRefs(home).refs;
     assert.deepEqual([after[0].deployEnv, after[0].deployBot, after[0].deployLegacy, after[1].deployEnv], ['Production', 'vercel', undefined, null], `${shape}: only the ref given is registered`);
     assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deploySince|deployClock|deployProof|deployPending/, shape);
