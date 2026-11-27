@@ -102,6 +102,22 @@ test('status block: shows totals, retries, guard blocks and the per-phase / per-
   assert.match(block, /\*\*By role:\*\* implementer \$1\.23 \(150 tok\) · judge \$2\.00 \(950 tok\)/);
 });
 
+// Issue #501: a plan review's cost folded into `other` (no phase fit it) and never showed ahead of build, so risky PRs looked cheaper than they were.
+test('plan phase: a plan-review / plan-codex entry is booked under plan (not other), shown ahead of build and counted in the total', () => {
+  let r = applyCheckpoint(rec(), { cost: { entry: entry({ usd: 1 }) } }, { host: 'h', now: NOW });
+  r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'plan', role: 'plan-review', input: 400, output: 100, usd: 3 }) } }, { host: 'h', now: NOW });
+  r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'plan', role: 'plan-codex', input: 50, output: 5, cacheRead: 0, cacheWrite: 0, usd: 0 }) } }, { host: 'h', now: NOW });
+  assert.equal(r.cost.byPhase.other, undefined);
+  assert.equal(r.cost.byRole.other, undefined);
+  assert.equal(r.cost.byPhase.plan.calls, 2);
+  assert.equal(r.cost.byRole['plan-review'].usd, 3);
+  assert.equal(r.cost.total.usd, 4);
+  const block = renderStatusBlock(r);
+  assert.match(block, /\*\*Cost:\*\* \$4\.00 .* 3 calls/);
+  assert.match(block, /\*\*By phase:\*\* plan \$3\.00 \(555 tok\) · build \$1\.00 \(150 tok\)/);
+  assert.match(block, /\*\*By role:\*\* implementer \$1\.00 \(150 tok\) · plan-review \$3\.00 \(500 tok\) · plan-codex \$0\.00 \(55 tok\)/);
+});
+
 test('costLines: an unknown guard count shows a dash; a cost section with nothing in it shows nothing', () => {
   assert.deepEqual(costLines(emptyCost()), []);
   assert.match(costLines(addRetries(null)).join('\n'), /Guard blocks:\*\* —/);
@@ -253,6 +269,61 @@ test('P cost --from-transcript: a transcript with no messages with usage warns (
   assert.equal(warns(`${JSON.stringify({ type: 'user', message: { content: 'hi' } })}\n`).length, 1, 'lines without usage');
   assert.equal(warns('', ['--usd', '1']).length, 1, 'still warns with --usd');
   assert.deepEqual(warns(`${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 1, output_tokens: 1 } } })}\n`), [], 'a normal transcript');
+});
+
+// Issue #501: a plan review books under plan / plan-review|plan-codex instead of falling into `other`.
+test('P cost --phase plan --role plan-review --from-transcript: books and prices under plan / plan-review, not other', () => {
+  const s = scenario();
+  s.repo.write('.review/plan.jsonl', `${JSON.stringify({ message: { id: 'm', model: 'claude-sonnet-5-5', usage: { input_tokens: 1000000, output_tokens: 1000000 } } })}\n`);
+  const r = costCli(s, ['--phase', 'plan', '--role', 'plan-review', '--from-transcript', '.review/plan.jsonl']);
+  assertExit(r, 0);
+  assert.equal(r.json.cost.byPhase.plan.usd, 12);
+  assert.equal(r.json.cost.byRole['plan-review'].calls, 1);
+  assert.equal(r.json.cost.byPhase.other, undefined);
+  assert.equal(r.json.cost.byRole.other, undefined);
+  const hand = costCli(scenario(), ['--phase', 'plan', '--role', 'plan-codex', '--input', '5000']);
+  assertExit(hand, 0);
+  assert.deepEqual([hand.json.cost.byRole['plan-codex'].input, hand.json.cost.byRole['plan-codex'].usd], [5000, 0]);
+});
+
+// Issue #820: the empty-transcript booking still wrote a zero entry (calls +1) and a retry, so the re-run the warning invites showed one agent call as 2 calls and 2 retries.
+test('P cost --from-transcript: an empty transcript with no hand amounts books nothing (no call, no retry, no write); the re-run then books exactly 1 call and 1 retry', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', '');
+  const args = ['--phase', 'review', '--role', 'judge', '--round', '1', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const before = s.fake.calls().length;
+  const first = costCli(s, args);
+  assertExit(first, 0);
+  assert.equal(first.json.ok, true);
+  assert.equal(first.json.recorded, false);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  assert.match(first.json.warnings.join('\n'), /nothing was booked; run this same command again in a few seconds/);
+  assert.equal(s.fake.calls().length, before, 'no GitHub read or write when there is nothing to book');
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  const second = costCli(s, args);
+  assertExit(second, 0);
+  assert.equal(second.json.recorded, true);
+  assert.equal(second.json.skipped, undefined);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries, second.json.cost.byRound['1'].calls], [1, 1, 1]);
+  assert.ok(written(s).cost.transcripts, 'the transcript key is booked only by the real booking');
+});
+
+test('P cost --from-transcript: an empty transcript with --session still records the session only; with a hand amount it still books it', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', '');
+  const withSession = costCli(s, ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl', '--session', 'sess-9']);
+  assertExit(withSession, 0);
+  assert.equal(withSession.json.recorded, false);
+  assert.equal(withSession.json.skipped, 'empty-transcript');
+  assert.deepEqual(withSession.json.cost.sessions, ['sess-9']);
+  assert.deepEqual([withSession.json.cost.total.calls, withSession.json.cost.retries], [0, 0]);
+  const hand = scenario();
+  hand.repo.write('.review/t.jsonl', '');
+  const r = costCli(hand, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/t.jsonl', '--input', '10']);
+  assertExit(r, 0);
+  assert.equal(r.json.skipped, undefined);
+  assert.deepEqual([r.json.cost.total.calls, r.json.cost.total.input], [1, 10]);
+  assert.ok(r.json.warnings.some((w) => /no messages with usage found/.test(w)));
 });
 
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
@@ -652,4 +723,87 @@ test('a trip-wire stop is the existing outcome blocked with detail process-revie
   const decoded = decodeRecord(`${MARKERS.summary}\n\n${encodeRecord(record)}`);
   assert.equal(decoded.status, 'ok');
   assert.equal(decoded.record.outcome, 'blocked');
+});
+
+// Issue #820 (round 1): a message whose usage is `{}` counted as one usage-bearing message, so the first --retry booking of a not-yet-filled transcript wrote a transcript key + a retry and the real booking later made 2 calls and 2 retries.
+test('P cost --from-transcript: a transcript whose only usage is {} is empty (skipped); so is an all-zero usage (also what 1e-400 parses to), a message with no real tokens is not a call', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: {} } })}\n`);
+  const args = ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const first = costCli(s, args);
+  assertExit(first, 0);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  assert.equal(first.json.recorded, false);
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  const second = costCli(s, args);
+  assertExit(second, 0);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries], [1, 1]);
+  const zero = scenario();
+  zero.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 0, output_tokens: 0 } } })}\n`);
+  const z = costCli(zero, ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl']);
+  assertExit(z, 0);
+  assert.equal(z.json.skipped, 'empty-transcript');
+});
+
+// Issue #501 (round 1): the CLI promises plan-codex is tokens only unless --usd is given, but --model priced the tokens and added a Sonnet charge to the PR total.
+test('P cost --role plan-codex --model sonnet: tokens only, no USD and no price bucket; an explicit --usd still sets the amount', () => {
+  const r = costCli(scenario(), ['--phase', 'plan', '--role', 'plan-codex', '--input', '1000000', '--output', '1000000', '--model', 'sonnet']);
+  assertExit(r, 0);
+  assert.deepEqual([r.json.cost.byRole['plan-codex'].input, r.json.cost.byRole['plan-codex'].usd, r.json.cost.total.usd], [1000000, 0, 0]);
+  assert.equal(r.json.bucketed, false);
+  const usd = costCli(scenario(), ['--phase', 'plan', '--role', 'plan-codex', '--input', '1000', '--model', 'sonnet', '--usd', '0.5']);
+  assertExit(usd, 0);
+  assert.equal(usd.json.cost.byRole['plan-codex'].usd, 0.5);
+});
+
+// Issue #820 (round 2): a negative-only usage (`input_tokens: -1`) counted as a usage-bearing message and was only clamped to 0 afterwards, so the first --retry booking wrote an entry + a retry and the real booking later made 2 calls and 2 retries.
+test('P cost --from-transcript: a transcript whose only usage is negative counts as empty (skipped)', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: -1 } } })}\n`);
+  const args = ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const first = costCli(s, args);
+  assertExit(first, 0);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  const second = costCli(s, args);
+  assertExit(second, 0);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries], [1, 1]);
+});
+
+// Issue #820 (round 3): a fractional or otherwise non-integer count (`input_tokens: 0.5`) passed the has-usage check but was floored to 0 afterwards, so the first --retry booking wrote an entry + a retry and the real booking later made 2 calls and 2 retries.
+test('P cost --from-transcript: a transcript whose only usage is a fraction, NaN-like or unsafe number counts as empty (skipped)', () => {
+  for (const bad of [0.5, 1e300, 'abc', null]) {
+    const s = scenario();
+    s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: bad } } })}\n`);
+    const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl']);
+    assertExit(r, 0);
+    assert.equal(r.json.skipped, 'empty-transcript', `input_tokens ${JSON.stringify(bad)}`);
+  }
+});
+
+// Issue #820 (round 5): a later all-zero line of a streamed message id is its final snapshot, but it was skipped before it could replace an earlier 10-token line, so the id kept the stale 10 and counted as a call.
+test('P cost --from-transcript: the last line of a message id is its snapshot: positive then all-zero is empty (skipped); zero then positive is one call with the positive totals', () => {
+  const line = (usage) => `${JSON.stringify({ message: { id: 'm', usage } })}\n`;
+  const args = ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const a = scenario();
+  a.repo.write('.review/t.jsonl', line({ input_tokens: 10, output_tokens: 5 }) + line({ input_tokens: 0, output_tokens: 0 }));
+  const first = costCli(a, args);
+  assertExit(first, 0);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  const b = scenario();
+  b.repo.write('.review/t.jsonl', line({ input_tokens: 0, output_tokens: 0 }) + line({ input_tokens: 10, output_tokens: 5 }));
+  const second = costCli(b, args);
+  assertExit(second, 0);
+  assert.equal(second.json.skipped, undefined);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.total.input, second.json.cost.total.output], [1, 10, 5]);
+});
+
+// Issue #820 (round 6): id-less messages were keyed `anon-N`, the same namespace as real ids, so an id-less line could overwrite (and, all-zero, delete) a real message whose id was `anon-0`.
+test('P cost --from-transcript: an id-less line never replaces a message whose id looks like a generated key', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'anon-0', usage: { input_tokens: 10, output_tokens: 5 } } })}\n${JSON.stringify({ message: { usage: { input_tokens: 0, output_tokens: 0 } } })}\n`);
+  const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--from-transcript', '.review/t.jsonl']);
+  assertExit(r, 0);
+  assert.equal(r.json.skipped, undefined);
+  assert.deepEqual([r.json.cost.total.calls, r.json.cost.total.input, r.json.cost.total.output], [1, 10, 5]);
 });

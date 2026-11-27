@@ -7,10 +7,12 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 
 // Who spent the tokens. Anything not named here is booked as `other` (never dropped, never a new key).
-export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'substitute-opus', 'substitute-fable', 'verifier', 'controller', 'other']);
+export const ROLES = Object.freeze(['implementer', 'judge', 'arbiter', 'substitute-opus', 'substitute-fable', 'plan-review', 'plan-codex', 'verifier', 'controller', 'other']);
 // The run's phases are the record steps (a test pins this list to run-record's STEPS: that module imports this one, so it
 // cannot be imported back); a phase the caller invents is booked as `other`.
 export const PHASES = Object.freeze(['build', 'verify', 'pr', 'review', 'gate', 'awaiting-owner-merge', 'merge', 'prod-watch', 'ended', 'other']);
+// The phases a cost entry can be booked under and `P summary` lists, in display order: `plan` (a plan review, run before the PR exists) comes first, ahead of build. It is NOT a record step, so it stays out of PHASES.
+export const COST_PHASES = Object.freeze(['plan', ...PHASES]);
 
 export const MAX_SESSIONS = 20;
 const SESSION_RE = /^[A-Za-z0-9_.:-]{1,80}$/;
@@ -21,7 +23,7 @@ export const emptyTotals = () => ({ input: 0, output: 0, cacheRead: 0, cacheWrit
 export const emptyCost = () => ({ total: emptyTotals(), byPhase: {}, byRole: {}, retries: 0, guardBlocks: null, sessions: [] });
 
 export const normaliseRole = (role) => (ROLES.includes(role) ? role : 'other');
-export const normalisePhase = (phase) => (PHASES.includes(phase) ? phase : 'other');
+export const normalisePhase = (phase) => (COST_PHASES.includes(phase) ? phase : 'other');
 
 // A count or amount from a flag / a file: a non-negative finite number, else a thrown error that names the field.
 function amount(v, what, { integer }) {
@@ -300,8 +302,9 @@ export const listPriceUsd = (model, t, opts) => priceMessage(model, t, opts).usd
 // no model of their own (a message's own model always wins). `byPrice` ("<model id>|<tier>|<speed>" -> token sums and a message count)
 // holds every dimension the price depends on, so a later table can re-price the run exactly; `cacheWrite` stays the 5 m + 1 h total.
 export function usageFromTranscript(text, { defaultModel } = {}) {
+  // One notion of a usable token count for the has-usage check and the sums: a non-negative safe integer (a fraction, negative, NaN, Infinity, huge or non-number is missing).
+  const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
   const byId = new Map();
-  let anon = 0;
   for (const raw of String(text).split('\n')) {
     if (!raw.trim()) continue;
     let e;
@@ -312,11 +315,17 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
     }
     const u = e?.message?.usage;
     if (!isPlainObject(u)) continue;
-    byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model });
+    // Two questions. Which line is an id's snapshot: the last line with at least one token count (zero or more; `{}`, negative, fractional, NaN or huge fields are not counts), so a later all-zero line replaces an earlier snapshot.
+    // Whether the id is a call: only if its final snapshot has some positive count (a real API call always has tokens; 1e-400 parses to 0), so a transcript of only all-zero ids is empty and its re-run is the one booking.
+    const cc0 = isPlainObject(u.cache_creation) ? u.cache_creation : {};
+    const counts = [u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].filter(isCount);
+    if (counts.length === 0) continue;
+    byId.set(e.message.id ?? Symbol('id-less'), { u, model: e.message.model, positive: counts.some((v) => v > 0) });
   }
+  for (const [id, m] of byId) if (!m.positive) byId.delete(id);
   // usd: each message at its own model's list price; unpricedMessages: messages the price table cannot price
   const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, messages: byId.size, unpricedMessages: 0, byPrice: {} };
-  const n = (v) => (Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
+  const n = (v) => (isCount(v) ? v : 0);
   for (const { u, model } of byId.values()) {
     const cc = isPlainObject(u.cache_creation) ? u.cache_creation : {};
     const total = n(u.cache_creation_input_tokens);
@@ -363,7 +372,7 @@ export function costLines(cost) {
     if (!keys.length) return;
     out.push(`- **${label}:** ${keys.map((k) => `${k} ${usd(map[k].usd)} (${num((Number(map[k].input) || 0) + (Number(map[k].output) || 0))} tok)`).join(' · ')}`);
   };
-  rows('By phase', PHASES, cost.byPhase);
+  rows('By phase', COST_PHASES, cost.byPhase);
   rows('By role', ROLES, cost.byRole);
   if (isPlainObject(cost.byRound)) {
     const keys = Object.keys(cost.byRound).filter((k) => isPlainObject(cost.byRound[k])).sort((a, b) => Number(a) - Number(b));

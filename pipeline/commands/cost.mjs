@@ -14,11 +14,12 @@ import { PRICE_TABLE_DATE, costReport, modelFamily, normalisePhase, normaliseRol
 export const meta = {
   summary: 'book tokens / USD / retries of one agent call in the run record (shown by `P summary`)',
   usage: [
-    'pipeline cost --pr N --phase build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|verifier|controller|other',
+    'pipeline cost --pr N --phase plan|build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|plan-review|plan-codex|verifier|controller|other',
     '              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]',
-    '  -> {ok, recorded, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
-    '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped; a transcript with no usable messages gives a warning);',
+    '  -> {ok, recorded, skipped?, cost, warnings}; exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
+    '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped; a transcript with no usable messages gives a warning, and when no --input/--output/--cache-*/--usd came with it NOTHING is booked for that call (no entry, no retry; `recorded` false, `skipped: "empty-transcript"`; `--session` is still recorded): run the same command again in a few seconds);',
     '  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.',
+    '  --phase plan books a plan review (before the PR exists, like build calls): --role plan-review (a Fable/Opus/Sonnet plan reviewer, priced from its transcript) or plan-codex (a hand-run Codex plan review: tokens only, no USD unless --usd); `P summary` shows plan ahead of build.',
   '  --round R: the review round the call served (judge or arbiter of round R, and the implementer that fixes round R\'s accepts); the entry is also added to cost.byRound[R],',
   '  which the extra-round ask uses to name what the last round cost. Build-phase calls pass none.',
   '  USD: --usd X as given; otherwise the list price of each transcript message\'s own model version (--model M prices the messages that carry none)',
@@ -81,14 +82,21 @@ export const run = guarded(async (argv, ctx) => {
   const patch = { cost: {} };
   const notes = [];
   let bucketed = false;
-  if (spent) {
-    if (values['from-transcript'] && fromFile.messages === 0) notes.push(`--from-transcript ${values['from-transcript']}: no messages with usage found in it (empty, or not fully written yet): no tokens or USD were taken from it`);
+  // A transcript with no usable message and no hand amount books NOTHING for this call (no entry, no transcript key, no retry): the re-run the warning asks for must be the one booking, or the call counts twice (#820).
+  const handAmounts = ['input', 'output', 'cache-read', 'cache-write', 'usd'].some((k) => values[k] !== undefined);
+  const emptyTranscript = values['from-transcript'] !== undefined && fromFile.messages === 0 && !handAmounts;
+  if (values['from-transcript'] && fromFile.messages === 0) notes.push(`--from-transcript ${values['from-transcript']}: no messages with usage found in it (empty, or not fully written yet): no tokens or USD were taken from it${emptyTranscript ? '; nothing was booked; run this same command again in a few seconds' : ''}`);
+  if (spent && !emptyTranscript) {
     const own = { input: num('input'), output: num('output'), cacheRead: num('cache-read'), cacheWrite: num('cache-write') };
     const ownTokens = own.input + own.output + own.cacheRead + own.cacheWrite > 0;
     let usd = num('usd');
     let byPrice = {};
     let complete = false;
-    if (values.usd === undefined) {
+    // plan-codex is tokens only: its USD is never derived from --model or a transcript, only an explicit --usd sets it.
+    const tokensOnly = normaliseRole(role) === 'plan-codex';
+    if (values.usd === undefined && tokensOnly) {
+      usd = 0;
+    } else if (values.usd === undefined) {
       const ownPriced = ownTokens && values.model !== undefined ? priceMessage(values.model, own) : null;
       usd = fromFile.usd + (ownPriced?.usd ?? 0);
       // Buckets hold the tokens the table priced (a transcript's, and hand tokens given with --model); hand tokens without a model
@@ -120,9 +128,12 @@ export const run = guarded(async (argv, ctx) => {
       patch.cost.transcript = { key: `${basename(file).replace(/[^\w.-]/g, '_').slice(0, 100)}-${hash}`, usage: fromFile };
     }
   }
-  if (values.retry) patch.cost.retries = 1;
+  if (values.retry && !emptyTranscript) patch.cost.retries = 1;
   if (values.session?.length) patch.cost.sessions = values.session;
 
+  if (emptyTranscript && !values.session?.length) {
+    return { exitCode: EXIT.OK, output: { ok: true, recorded: false, skipped: 'empty-transcript', bucketed: false, cost: null, warnings: notes } };
+  }
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
     const recorder = createRunRecorder({ gh, pr });
@@ -130,7 +141,7 @@ export const run = guarded(async (argv, ctx) => {
     const ok = record !== null;
     return {
       exitCode: ok ? EXIT.OK : EXIT.FAILED,
-      output: { ok, recorded: ok, bucketed: ok && bucketed, cost: ok ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
+      output: { ok, recorded: ok && !emptyTranscript, ...(emptyTranscript ? { skipped: 'empty-transcript' } : {}), bucketed: ok && bucketed, cost: ok ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
     };
   });
 });
