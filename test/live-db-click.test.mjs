@@ -259,7 +259,8 @@ test('out of time: a click go whose pending click must still be settled is a den
   assert.equal(w.apply().decision, 'allow', 'with time left the click settles and applies');
 });
 
-test('out of time in the middle of settling: the valid click stays pending (no .settled, nothing consumed) and settles with a full budget', async (t) => {
+// Skipped on Windows: the test puts a POSIX sh git shim on PATH.
+test('out of time in the middle of settling: the valid click stays pending (no .settled, nothing consumed) and settles with a full budget', { skip: process.platform === 'win32' }, async (t) => {
   // Failure caught: the budget running out between two git reads of the settling turned the block rebuild into "ask invalid" and wrote a terminal `refused` marker, so a retry with time left skipped the owner's click.
   const w = await world(t, { flush: false, flag: true });
   assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
