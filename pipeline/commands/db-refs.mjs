@@ -2,7 +2,9 @@
 // hooks/lib/db-refs.mjs, the file `~/.claude/pipeline-state/db-refs.json`). `show` is read-only and runs anywhere. Everything that changes the file is the owner's:
 // refused inside Claude Code with the same check `pipeline update` uses (lib/owner-only.mjs), and the guard also refuses the command line to an agent.
 import { EXIT, UsageError, parseCommandArgs } from '../lib/cli.mjs';
+import { dirname, join } from 'node:path';
 import { accountHome } from '../lib/paths.mjs';
+import { LockLostError, LockTimeoutError, readMachineId, withLock } from '../lib/locks.mjs';
 import { insideClaudeCode } from '../lib/owner-only.mjs';
 import { BUILTIN_SERVERS, REF_RE, dbRefsFile, readDbRefs, writeDbRefs } from '../hooks/lib/db-refs.mjs';
 import { importGoHistory } from '../hooks/lib/live-db-auto.mjs';
@@ -24,6 +26,8 @@ export const meta = {
   ].join('\n'),
 };
 
+const LOCK_NAME = 'db-refs';
+const LOCK_WAIT_MS = 15_000;
 const SEGMENT = /^[A-Za-z0-9_.-]{1,80}$/;
 const REPO = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const sameRepo = (a, b) => typeof a === 'string' && typeof b === 'string' && a.toLowerCase() === b.toLowerCase();
@@ -90,18 +94,31 @@ export async function run(argv, ctx = {}) {
     const message = `pipeline db-refs ${sub} refuses to run inside a Claude Code session (${inside}): the registry decides which databases count as live. Run it in your own terminal (\`node ~/.claude/pipeline/bin/pipeline.mjs db-refs ${sub} …\`); \`db-refs show\` is allowed anywhere.`;
     return { exitCode: EXIT.USAGE, output: { ok: false, error: 'refused', message } };
   }
-  const current = readDbRefs(home);
-  // an invalid file is replaced from an empty state (the owner is the one fixing it); an unreadable one (a folder, a permission) is not touched
-  if (!current.ok && current.reason === 'unreadable') {
-    return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-unreadable', message: `${dbRefsFile(home)} cannot be read; fix its permissions or remove it, then run this again` } };
-  }
-  if (autoAction !== null) return autoMigrations({ action: autoAction, ref: values.ref, accept: values['accept-unmatched'] === true, current, home, ctx });
-  const next = change(current.ok ? current : { refs: [], servers: [] });
+  // every writer holds the registry lock from the read to the write, so two owner terminals never both pass their comparison and then replace each other's result (the registry's own folder, like the model floor's lock: processes with different $HOME share nothing else)
+  const stateDir = dirname(dbRefsFile(home));
+  const busy = (message) => ({ exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-busy', message } });
   try {
-    const file = writeDbRefs(home, next);
-    return { exitCode: EXIT.OK, output: { ok: true, file, refs: shown(next.refs), servers: next.servers } };
+    return await withLock(LOCK_NAME, () => apply(), { dir: join(stateDir, 'locks'), waitMs: ctx.lockWaitMs ?? LOCK_WAIT_MS, machineId: readMachineId({ stateDir }) });
   } catch (err) {
-    return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-unwritable', message: `cannot write ${dbRefsFile(home)}: ${err?.code ?? err?.message}` } };
+    if (err instanceof LockTimeoutError) return busy(`another db-refs command is running (${err.message.replace(/ To clear it by hand.*$/, '')}); nothing was written. Run this again once it has finished`);
+    if (err instanceof LockLostError) return busy(`the registry lock was taken over while this command ran, so its result may not stand; run \`pipeline db-refs show\` to see the file, then run this again`);
+    throw err;
+  }
+
+  async function apply() {
+    const current = readDbRefs(home);
+    // an invalid file is replaced from an empty state (the owner is the one fixing it); an unreadable one (a folder, a permission) is not touched
+    if (!current.ok && current.reason === 'unreadable') {
+      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-unreadable', message: `${dbRefsFile(home)} cannot be read; fix its permissions or remove it, then run this again` } };
+    }
+    if (autoAction !== null) return autoMigrations({ action: autoAction, ref: values.ref, accept: values['accept-unmatched'] === true, current, home, ctx });
+    const next = change(current.ok ? current : { refs: [], servers: [] });
+    try {
+      const file = writeDbRefs(home, next);
+      return { exitCode: EXIT.OK, output: { ok: true, file, refs: shown(next.refs), servers: next.servers } };
+    } catch (err) {
+      return { exitCode: EXIT.FAILED, output: { ok: false, error: 'db-refs-unwritable', message: `cannot write ${dbRefsFile(home)}: ${err?.code ?? err?.message}` } };
+    }
   }
 }
 

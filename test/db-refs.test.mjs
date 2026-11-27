@@ -7,8 +7,9 @@ import { createHash } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { dirname, join } from 'node:path';
 import { UsageError } from '../pipeline/lib/cli.mjs';
+import { release, tryAcquire } from '../pipeline/lib/locks.mjs';
 import { run } from '../pipeline/commands/db-refs.mjs';
 import { DB_REFS_REL, autoEntry, dbRefsFile, isDevRef, readDbRefs, targetOf, trustedServer } from '../pipeline/hooks/lib/db-refs.mjs';
 import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
@@ -468,4 +469,24 @@ test('set keeps auto-migrations for a label-only edit; a new repo or --dev clear
   seedRegistry(home, { refs: [LIVE(ON)] });
   runOwnerCli(home, ['set', '--ref', REF, '--name', 'x', '--repo', 'acme/widgets', '--dev']);
   assert.equal(readDbRefs(home).refs[0].autoMigrations, false);
+});
+
+test('a registry writer holding the db-refs lock makes every other writer refuse and write nothing; the same command works once the lock is free', async (t) => {
+  // Failure caught: `auto-migrations on` and a concurrent `off` / `set` / `remove` each passing their read-compare-write and the later rename restoring the auto-apply permission the other just revoked.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE({ ref: REF, repo: 'acme/widgets' }), LIVE({ ref: REF2, repo: 'acme/other', ...ON })] });
+  const before = readFileSync(dbRefsFile(home), 'utf8');
+  const held = tryAcquire('db-refs', { dir: join(dirname(dbRefsFile(home)), 'locks'), machineId: null });
+  assert.equal(held.acquired, true);
+  const ctx = { home, env: { [SWITCH]: '1' }, lockWaitMs: 100 };
+  for (const args of [['auto-migrations', 'on', '--ref', REF], ['auto-migrations', 'off', '--ref', REF2], ['remove', '--ref', REF2], ['set', '--ref', REF, '--name', 'x', '--repo', 'a/b'], ['server', 'add', 'my_db']]) {
+    const r = await run(args, ctx);
+    assert.equal(r.exitCode, 1, args.join(' '));
+    assert.match(r.output.message, /another db-refs command is running.*nothing was written.*run this again/i, args.join(' '));
+    assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, `${args.join(' ')} wrote while the lock was held`);
+  }
+  release(held.lock);
+  const ok = runOwnerCli(home, ['auto-migrations', 'off', '--ref', REF2]);
+  assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
+  assert.equal(existsSync(join(dirname(dbRefsFile(home)), 'locks', 'db-refs.lock')), false, 'the lock is released after a write');
 });
