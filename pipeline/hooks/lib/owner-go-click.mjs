@@ -799,8 +799,15 @@ let settling = false;
 // verified grant would be past its 24 h use window. A missing or unreadable transcript is `waiting`; an unreadable spent marker, a failed write and the like are `retry` (no `.settled`); every
 // verdict (recorded, declined, instructed, refused) writes `<askId>.<clickId>.settled`, and a click that loses that race reports the winner's outcome. Garbled pointers are skipped (`skipped`, no budget).
 // -> { outcomes: [{ askId, clickId, outcome: 'recorded' | 'declined' | 'instructed' | 'refused' | 'waiting' | 'retry' | 'skipped', reason? }], problems }.
-export function settlePendingClicks({ home = accountHome(), now = Date.now, askId = null, session = null, io = {} } = {}) {
+// `leftMs` (optional; the live-database guard passes its time budget): the scan of the pending pointers and the walk over the units check it between entries and stop with a `no-time` problem
+// when nothing is left, so a folder of thousands of pointers cannot carry the hook past its host timeout. Its git reads are bounded by live-db-go's withGitDeadline.
+export function settlePendingClicks({ home = accountHome(), now = Date.now, askId = null, session = null, io = {}, leftMs = null } = {}) {
   const out = { outcomes: [], problems: [] };
+  const noTime = () => {
+    if (typeof leftMs !== 'function' || leftMs() > 0) return false;
+    if (!out.problems.includes('no-time')) out.problems.push('no-time');
+    return true;
+  };
   if (settling) return out;
   settling = true;
   try {
@@ -817,6 +824,7 @@ export function settlePendingClicks({ home = accountHome(), now = Date.now, askI
     for (const name of names) {
       const m = PENDING_RE.exec(name);
       if (m === null || have.has(`${m[1]}.${m[2]}.settled`)) continue;
+      if (noTime()) return out;
       const r = readPending(name, home, nowMs);
       if (r.bad) { out.outcomes.push({ askId: m[1], clickId: m[2], outcome: 'skipped', reason: 'pending-invalid' }); continue; }
       if (!byAsk.has(m[1])) byAsk.set(m[1], []);
@@ -832,7 +840,7 @@ export function settlePendingClicks({ home = accountHome(), now = Date.now, askI
     const retired = units.filter((u) => nowMs - u.oldest >= WAIT_GRACE_MS).sort((a, b) => fifo(b, a));
     let scans = 0;
     for (const unit of [...active, ...retired]) {
-      if (scans >= SETTLE_SCAN_BUDGET) break;
+      if (scans >= SETTLE_SCAN_BUDGET || noTime()) break;
       for (const p of unit.members) {
         const o = settleOne(p, { home, now, nowMs, io, scanned: () => { scans++; } });
         out.outcomes.push({ askId: p.askId, clickId: p.clickId, ...o });

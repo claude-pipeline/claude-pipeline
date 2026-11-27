@@ -37,6 +37,25 @@ export const DATA_MAX_LINES = 60;
 export const DATA_MAX_CHARS = 4000;
 export const SUMMARY_MAX = 300;
 const GIT_TIMEOUT_MS = 5000;
+// The git reads of the block (checkedTopLevel, repoOf, blobAt) are the one choke point of every route to verifyBlock (the typed go, a click's block, click settling). A caller that has a time
+// budget sets it for the whole decision: each read then gets min(5 s, what is left) and is not started under 1 ms (it throws, which every reader here turns into "unverified": a deny).
+// Without a deadline the per-call 5 s is today's behaviour.
+let gitLeftMs = null;
+export function withGitDeadline(leftMs, fn) {
+  const prev = gitLeftMs;
+  gitLeftMs = typeof leftMs === 'function' ? leftMs : null;
+  try {
+    return fn();
+  } finally {
+    gitLeftMs = prev;
+  }
+}
+function gitTimeout() {
+  if (gitLeftMs === null) return GIT_TIMEOUT_MS;
+  const left = Math.floor(Math.min(GIT_TIMEOUT_MS, gitLeftMs()));
+  if (!(left > 0)) throw new Error('no time is left for a git read');
+  return left;
+}
 const READ_WINDOW_MS = 24 * 60 * 60 * 1000;
 const MIGRATION_FILE = /^supabase\/migrations\/[^/\u0000\n]+\.sql$/;
 const MARK = '🗄️';
@@ -128,7 +147,7 @@ export function checkedTopLevel(dir, io = {}) {
   try {
     if (typeof dir !== 'string' || !path.isAbsolute(dir) || dir.includes('\u0000')) return null;
     if (!lstatSync(dir).isDirectory()) return null;
-    const top = (io.git ?? git)(['rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: GIT_TIMEOUT_MS }).trim();
+    const top = (io.git ?? git)(['rev-parse', '--show-toplevel'], { cwd: dir, timeoutMs: gitTimeout() }).trim();
     if (top === dir) return dir;
     if ((io.platform ?? process.platform) !== 'win32') return null;
     const canon = (p) => (io.realpath ?? realpathSync.native)(path.resolve(p)).replaceAll('\\', '/').toLowerCase();
@@ -141,7 +160,7 @@ export function checkedTopLevel(dir, io = {}) {
 // owner/name of the checkout's origin remote, or null (the block then says `-`)
 export function repoOf(dir, io = {}) {
   try {
-    const url = (io.git ?? git)(['remote', 'get-url', 'origin'], { cwd: dir, timeoutMs: GIT_TIMEOUT_MS }).trim();
+    const url = (io.git ?? git)(['remote', 'get-url', 'origin'], { cwd: dir, timeoutMs: gitTimeout() }).trim();
     return parseRemote(url)?.slug ?? null;
   } catch {
     return null;
@@ -152,8 +171,8 @@ export function repoOf(dir, io = {}) {
 export function blobAt(dir, head, file, io = {}) {
   try {
     const g = io.git ?? git;
-    g(['cat-file', '-e', `${head}:${file}`], { cwd: dir, timeoutMs: GIT_TIMEOUT_MS });
-    return g(['cat-file', 'blob', `${head}:${file}`], { cwd: dir, timeoutMs: GIT_TIMEOUT_MS });
+    g(['cat-file', '-e', `${head}:${file}`], { cwd: dir, timeoutMs: gitTimeout() });
+    return g(['cat-file', 'blob', `${head}:${file}`], { cwd: dir, timeoutMs: gitTimeout() });
   } catch {
     return null;
   }

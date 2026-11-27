@@ -1,10 +1,11 @@
 // #262 (live-database guard, Task 4): the decision for a Supabase MCP call on a live project, and the claim that spends the owner's go. Scratch home, real git, real transcripts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, rmSync, symlinkSync, writeFileSync } from 'node:fs';
+import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
+import { git as realGit } from '../pipeline/lib/git.mjs';
 import { execFileSync, spawn } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -26,10 +27,13 @@ const NOW = Date.parse('2026-11-17T12:00:00Z');
 const STATE = (home) => join(home, '.claude', 'pipeline-state');
 
 // one session: registry, repo, a transcript under the scratch home's config dir, the block shown, and the owner's go typed at `typedAt`
-async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL } = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'cp-live-db-guard-'));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
-  seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live' }, { ref: DEV, name: 'Scratch', repo: 'acme/widgets', kind: 'dev' }] });
+// `flag`: the owner switched auto-apply on for REF (the attempt history applies); `home`: a second session in a home that already exists (its registry is the first scene's).
+async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL, flag = false, home: shared = null } = {}) {
+  const home = shared ?? mkdtempSync(join(tmpdir(), 'cp-live-db-guard-'));
+  if (shared === null) {
+    t.after(() => rmSync(home, { recursive: true, force: true }));
+    seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', ...(flag ? { autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' } : {}) }, { ref: DEV, name: 'Scratch', repo: 'acme/widgets', kind: 'dev' }] });
+  }
   const repo = createTmpRepo();
   repo.git(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
   repo.write(FILE, SQL);
@@ -58,6 +62,15 @@ async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = S
 const apply = (s, over = {}, ctx = {}) => evaluateSupabaseMcp(`${TOOL}apply_migration`, { project_id: REF, name: NAME, query: SQL, ...over }, { ...s.ctx, ...ctx });
 const sql = (s, query, ctx = {}) => evaluateSupabaseMcp(`${TOOL}execute_sql`, { project_id: REF, query }, { ...s.ctx, ...ctx });
 const consumed = (s) => join(STATE(s.home), 'owner-go', 'live-db-consumed');
+const attempts = (s) => join(STATE(s.home), 'owner-go', 'live-db-attempts');
+// the history files of a migration: kind 'name' | 'sql', generation n (ids as the module derives them: first 32 hex of sha256(`<kind>|<ref>|<name or sql sha>`))
+const gfile = (s, kind, n, { name = NAME, sql: q = SQL } = {}) => join(attempts(s), `${kind}-${createHash('sha256').update(`${kind}|${REF}|${kind === 'name' ? name : sha256Of(q)}`).digest('hex').slice(0, 32)}-${n}.json`);
+const seedGen = (s, n, atMs, keys = ['name', 'sql']) => {
+  mkdirSync(attempts(s), { recursive: true });
+  for (const kind of keys) writeFileSync(gfile(s, kind, n), `${JSON.stringify({ v: 1, event: `seed${n}`, at: new Date(atMs).toISOString(), via: 'go' })}\n`);
+};
+const body = (file) => JSON.parse(readFileSync(file, 'utf8'));
+const markers = (s) => (existsSync(consumed(s)) ? readdirSync(consumed(s)) : []);
 
 test('a matching go allows the apply once; the second identical apply is spent', async (t) => {
   const s = await scene(t);
@@ -268,23 +281,25 @@ test('through the real guard entry: a call another rule denies leaves the go unc
 test('with the hook\'s real options (HOOK_CLOCK): a recorded go allows the apply once, no go denies (the go is judged by the epoch clock, not the process clock)', async (t) => {
   // Failure caught: the hooks passed a process-start clock as `now`, so every owner go looked years old and was refused (and pending clicks were settled as refused).
   const s = await scene(t, { typedAt: Date.now() - 60_000 });
-  const file = (query) => evaluateFileTool({ tool_name: `${TOOL}apply_migration`, tool_input: { project_id: REF, name: NAME, query }, cwd: s.repo.dir, session_id: s.session, transcript_path: s.transcript }, { home: s.home, env: {}, platform: process.platform, ...HOOK_CLOCK }).decision;
+  // (HOOK_CLOCK's origin is this process's start; the guard's time budget counts from it, and this test file outlives the 10 s cap, so the origin is taken at the test's own start: still an epoch time, still no injected `now`)
+  const CLOCK = { ...HOOK_CLOCK, wall0: Date.now() };
+  const file = (query) => evaluateFileTool({ tool_name: `${TOOL}apply_migration`, tool_input: { project_id: REF, name: NAME, query }, cwd: s.repo.dir, session_id: s.session, transcript_path: s.transcript }, { home: s.home, env: {}, platform: process.platform, ...CLOCK }).decision;
   assert.equal(file('drop table t'), 'deny', 'a call the go does not name is refused');
   assert.equal(file(SQL), 'allow', 'the go the owner typed allows the exact call');
   assert.equal(file(SQL), 'deny', 'and is spent');
 });
 
-test('two processes claiming the same go on one home: exactly one claims, the other sees it spent', async (t) => {
-  const s = await scene(t);
+// each child waits for the same wall-clock instant, then runs the full go claim once; -> the claims' statuses
+function claimInChildren(home, scenes, now = NOW - 120_000) {
   const guardUrl = new URL('../pipeline/hooks/lib/live-db-guard.mjs', import.meta.url).href;
-  const args = JSON.stringify({ home: s.home, sessionId: s.session, transcriptPath: s.transcript, op: 'migration', projectRef: REF, name: NAME, sqlSha256: sha256Of(SQL), at: Date.now() + 1500, now: NOW });
-  // each child waits for the same wall-clock instant, then claims once
+  const at = Date.now() + 1500;
   const child = `const { claimLiveDbGo } = await import(${JSON.stringify(guardUrl)});
 const a = JSON.parse(process.argv[1]);
 while (Date.now() < a.at) { /* start together */ }
 const r = claimLiveDbGo({ home: a.home, sessionId: a.sessionId, transcriptPath: a.transcriptPath, op: a.op, projectRef: a.projectRef, name: a.name, sqlSha256: a.sqlSha256, now: () => a.now });
 process.stdout.write(r.status);`;
-  const runChild = () => new Promise((resolve, reject) => {
+  const runChild = (s) => new Promise((resolve, reject) => {
+    const args = JSON.stringify({ home, sessionId: s.session, transcriptPath: s.transcript, op: 'migration', projectRef: REF, name: NAME, sqlSha256: sha256Of(SQL), at, now });
     const p = spawn(process.execPath, ['--input-type=module', '-e', child, args], { stdio: ['ignore', 'pipe', 'pipe'] });
     let out = '';
     let err = '';
@@ -293,7 +308,12 @@ process.stdout.write(r.status);`;
     p.on('error', reject);
     p.on('close', (code) => (code === 0 ? resolve(out) : reject(new Error(`child exit ${code}: ${err}`))));
   });
-  const outcomes = (await Promise.all([runChild(), runChild()])).sort();
+  return Promise.all(scenes.map(runChild));
+}
+
+test('two processes claiming the same go on one home: exactly one claims, the other sees it spent', async (t) => {
+  const s = await scene(t);
+  const outcomes = (await claimInChildren(s.home, [s, s], NOW)).sort();
   assert.deepEqual(outcomes, ['claimed', 'spent']);
   assert.equal(readdirSync(consumed(s)).length, 1);
 });
@@ -303,9 +323,10 @@ const OLD_OWNER_GO = 'bd202a3e';
 const haveOld = (() => { try { execFileSync('git', ['cat-file', '-e', `${OLD_OWNER_GO}^{commit}`], { cwd: fileURLToPath(new URL('..', import.meta.url)), stdio: 'ignore' }); return true; } catch { return false; } })();
 
 // (a shallow CI checkout does not hold that commit: only then is the test not run, and it says why)
-test('coexistence: the previous owner-go.mjs still reads a home that holds live-db go records and markers', { skip: haveOld ? false : `commit ${OLD_OWNER_GO} is not in this checkout (shallow clone)` }, async (t) => {
-  const s = await scene(t);
-  assert.equal(apply(s).decision, 'allow'); // a go record in owner-go/<session>.jsonl and a marker in live-db-consumed/
+test('coexistence: the previous owner-go.mjs still reads a home that holds live-db go records, markers and attempt history', { skip: haveOld ? false : `commit ${OLD_OWNER_GO} is not in this checkout (shallow clone)` }, async (t) => {
+  const s = await scene(t, { flag: true });
+  assert.equal(apply(s).decision, 'allow'); // a go record in owner-go/<session>.jsonl, a marker in live-db-consumed/ and the generation files of live-db-attempts/
+  assert.ok(readdirSync(attempts(s)).length === 2);
   assert.ok(readdirSync(consumed(s)).length === 1);
   // the old module with everything it imports, from git history, in its own folder
   const old = mkdtempSync(join(tmpdir(), 'cp-old-owner-go-'));
@@ -510,4 +531,170 @@ test('#687 units: no ctx keeps today\'s answers; a non-object input is never Sup
   s.put(join(s.root, 'real.json'), { mcpServers: { mine: SUPA_HTTP } });
   symlinkSync(join(s.root, 'real.json'), join(s.home, ACCOUNT_FILE));
   assert.equal(stateOf(activeBinding('mine', ctx), 'user'), 'unknown', 'symlink');
+});
+
+// ---- auto-apply, Task 2: the attempt history of a go-claimed migration on a project whose owner switched auto-apply on ----------------------------------------------------------
+
+test('switch off: a go apply reads and writes no history and refuses nothing new', async (t) => {
+  // Failure caught: the history rules leaking into a project without the flag (a broken or hostile history folder would then refuse every owner go).
+  const s = await scene(t);
+  mkdirSync(join(STATE(s.home), 'owner-go'), { recursive: true });
+  writeFileSync(attempts(s), 'not a folder');
+  assert.equal(apply(s).decision, 'allow');
+  assert.equal(readFileSync(attempts(s), 'utf8'), 'not a folder');
+});
+
+test('flag on: a go-claimed apply records generation 1 under its name and its SQL; a second go typed after it records generation 2', async (t) => {
+  // Failure caught: an allowed apply that leaves no durable record, so a later call cannot tell the migration was attempted.
+  const s = await scene(t, { flag: true });
+  assert.equal(apply(s).decision, 'allow');
+  const [n1, q1] = [body(gfile(s, 'name', 1)), body(gfile(s, 'sql', 1))];
+  assert.equal(n1.via, 'go');
+  assert.equal(n1.event, q1.event);
+  assert.equal(n1.pair, gfile(s, 'sql', 1).split('/').pop());
+  assert.equal(q1.pair, gfile(s, 'name', 1).split('/').pop());
+  assert.equal(n1.name, NAME);
+  assert.equal(n1.ref, REF);
+  const later = await scene(t, { flag: true, home: s.home, typedAt: NOW + 30_000 });
+  assert.equal(apply(later, {}, { now: () => NOW + 60_000 }).decision, 'allow');
+  assert.ok(existsSync(gfile(s, 'name', 2)) && existsSync(gfile(s, 'sql', 2)));
+  assert.notEqual(body(gfile(s, 'name', 2)).event, n1.event);
+});
+
+test('flag on: a failed attempt, then two gos in two sessions: only the first go applies', async (t) => {
+  // Failure caught: two sessions each holding a fresh go after one failed attempt both applying (a double apply).
+  const a = await scene(t, { flag: true, typedAt: NOW - 300_000 });
+  const b = await scene(t, { home: a.home, typedAt: NOW - 240_000 });
+  seedGen(a, 1, NOW - 600_000);
+  const clock = { now: () => NOW - 120_000 };
+  assert.equal(apply(a, {}, clock).decision, 'allow');
+  assert.equal(body(gfile(a, 'name', 2)).at, new Date(NOW - 120_000).toISOString());
+  const denied = apply(b, {}, clock);
+  assert.equal(denied.decision, 'deny');
+  assert.match(denied.reason, /after this go/);
+  assert.equal(markers(a).length, 1, 'the second go is not consumed');
+});
+
+test('flag on: an old go cannot apply after a later attempt; a go typed after it can; a go stamped in the future cannot retry', async (t) => {
+  // Failure caught: a go given before a failed attempt (or stamped ahead of the clock) applying again once the owner has not looked at the live state.
+  const old = await scene(t, { flag: true, typedAt: NOW - 60_000 });
+  seedGen(old, 1, NOW - 30_000);
+  assert.equal(apply(old).decision, 'deny');
+  assert.equal(markers(old).length, 0, 'the old go is not consumed');
+  const fresh = await scene(t, { home: old.home, typedAt: NOW - 10_000 });
+  assert.equal(apply(fresh).decision, 'allow');
+  const ahead = await scene(t, { flag: true, typedAt: NOW + 60_000 });
+  seedGen(ahead, 1, NOW - 30_000);
+  assert.equal(apply(ahead).decision, 'deny');
+  assert.equal(markers(ahead).length, 0);
+});
+
+test('flag on: an empty generation counts at its mtime; a gap, a folder, a symlink or an unreadable folder refuses naming the path', async (t) => {
+  // Failure caught: a half-written or tampered history read as "no attempt" (a retry allowed) instead of refusing.
+  const empty = await scene(t, { flag: true, typedAt: NOW - 60_000 });
+  mkdirSync(attempts(empty), { recursive: true });
+  writeFileSync(gfile(empty, 'name', 1), '');
+  utimesSync(gfile(empty, 'name', 1), new Date(NOW - 30_000), new Date(NOW - 30_000));
+  const recent = apply(empty);
+  assert.equal(recent.decision, 'deny');
+  assert.match(recent.reason, /after this go/);
+  const older = await scene(t, { flag: true, typedAt: NOW - 10_000 });
+  mkdirSync(attempts(older), { recursive: true });
+  writeFileSync(gfile(older, 'sql', 1), '{"v":1,"at":');
+  utimesSync(gfile(older, 'sql', 1), new Date(NOW - 30_000), new Date(NOW - 30_000));
+  assert.equal(apply(older).decision, 'allow', 'a partial file older than the go does not block it');
+  const gap = await scene(t, { flag: true });
+  seedGen(gap, 2, NOW - 90_000, ['name']);
+  const g = apply(gap);
+  assert.equal(g.decision, 'deny');
+  assert.ok(g.reason.includes(gfile(gap, 'name', 1)), g.reason);
+  const dir = await scene(t, { flag: true });
+  mkdirSync(gfile(dir, 'sql', 1), { recursive: true });
+  assert.ok(apply(dir).reason.includes(gfile(dir, 'sql', 1)));
+  const link = await scene(t, { flag: true });
+  mkdirSync(attempts(link), { recursive: true });
+  writeFileSync(join(link.home, 'target'), '{}');
+  symlinkSync(join(link.home, 'target'), gfile(link, 'name', 1));
+  assert.ok(apply(link).reason.includes(gfile(link, 'name', 1)));
+  const full = await scene(t, { flag: true });
+  seedGen(full, 1, NOW - 90_000);
+  for (let n = 2; n <= 65; n += 1) seedGen(full, n, NOW - 90_000, ['name']);
+  assert.ok(apply(full).reason.includes(gfile(full, 'name', 65)), 'generation 65 is more than the guard keeps');
+  const folderFile = await scene(t, { flag: true });
+  mkdirSync(join(STATE(folderFile.home), 'owner-go'), { recursive: true });
+  writeFileSync(attempts(folderFile), 'x');
+  assert.ok(apply(folderFile).reason.includes(attempts(folderFile)));
+  if (process.platform !== 'win32' && process.getuid?.() !== 0) {
+    const locked = await scene(t, { flag: true });
+    seedGen(locked, 1, NOW - 90_000);
+    chmodSync(attempts(locked), 0o000);
+    let r;
+    try { r = apply(locked); } finally { chmodSync(attempts(locked), 0o700); }
+    assert.equal(r.decision, 'deny');
+    assert.ok(r.reason.includes('live-db-attempts'), r.reason);
+    assert.equal(markers(locked).length, 0);
+  }
+});
+
+test('markers and folders are durable or the call is denied', async (t) => {
+  // Failure caught: an allow whose marker was only partly written or whose folder entry was never made durable (a crash then forgets the attempt).
+  for (const after of [0, 1]) {
+    const s = await scene(t, { flag: true });
+    // (a first call that writes 3 bytes of the consumed marker and then 0; or a first complete marker and a short history file)
+    const calls = { n: 0 };
+    const io = { writeSync: (fd, buf, off, len) => { calls.n += 1; if (calls.n <= after) return writeSync(fd, buf, off, len); return calls.n === after + 1 ? writeSync(fd, buf, off, Math.min(3, len)) : 0; } };
+    assert.equal(apply(s, {}, { io }).decision, 'deny', `short write after ${after}`);
+    assert.equal(apply(s).decision, 'deny', 'the leftover marker is spent');
+  }
+  const eio = await scene(t, { flag: true });
+  const opened = { eio: (p, flags, mode) => { if (flags === 0 && String(p).endsWith('live-db-attempts')) throw Object.assign(new Error('eio'), { code: 'EIO' }); return openSync(p, flags, mode); } };
+  assert.equal(apply(eio, {}, { io: { openSync: opened.eio } }).decision, 'deny', 'folder cannot be opened for its fsync');
+  const first = await scene(t, { flag: true });
+  mkdirSync(consumed(first), { recursive: true }); // (so only the history folder is created by the call)
+  const paths = new Map();
+  const io = {
+    openSync: (p, flags, mode) => { const fd = openSync(p, flags, mode); paths.set(fd, String(p)); return fd; },
+    fsyncSync: (fd) => { if (paths.get(fd)?.endsWith(`${join('pipeline-state', 'owner-go')}`)) throw Object.assign(new Error('eio'), { code: 'EIO' }); },
+    closeSync: (fd) => { paths.delete(fd); closeSync(fd); },
+  };
+  assert.equal(apply(first, {}, { io }).decision, 'deny', 'the new history folder could not be made durable in its parent');
+});
+
+test('out of time: a go whose git reads find no time left is unverified (deny), never an allow; a scan of pending clicks stops when time runs out; too little time after verification does not burn the go', async (t) => {
+  // Failure caught: a slow git or a folder of thousands of pending clicks carrying the hook past its 15 s host timeout (Claude Code then ALLOWS the call), or a slow call consuming the go and then refusing.
+  const s = await scene(t, { flag: true });
+  let spawns = 0;
+  const counting = { git: (args, opts) => { spawns += 1; return realGit(args, opts); } };
+  const r = apply(s, {}, { leftMs: () => 0, io: counting });
+  assert.equal(r.decision, 'deny');
+  assert.equal(spawns, 0, 'no git process was started');
+  assert.equal(markers(s).length, 0);
+  // 500 pending click pointers of other sessions: the scan stops after the time is gone
+  const asks = join(STATE(s.home), 'owner-go', 'asks');
+  mkdirSync(asks, { recursive: true });
+  for (let i = 0; i < 500; i += 1) writeFileSync(join(asks, `ask-${i.toString(16).padStart(12, '0')}.${i.toString(16).padStart(16, '0')}.pending`), '{}');
+  let asked = 0;
+  const dying = apply(s, {}, { leftMs: () => (++asked <= 10 ? 5000 : 0) });
+  assert.equal(dying.decision, 'deny');
+  assert.ok(asked < 50, `${asked} time checks: the scan did not read every file`);
+  assert.equal(markers(s).length, 0);
+  rmSync(asks, { recursive: true, force: true });
+  // verification done, 400 ms left: the go is not consumed
+  let gits = 0;
+  const slow = apply(s, {}, { leftMs: () => (gits >= 4 ? 400 : 5000), io: { git: (args, opts) => { gits += 1; return realGit(args, opts); } } });
+  assert.equal(slow.decision, 'deny');
+  assert.match(slow.reason, /try the call again/);
+  assert.equal(markers(s).length, 0);
+  assert.equal(apply(s).decision, 'allow', 'with time, the same go still works');
+});
+
+test('two gos of the same migration in two sessions after one failed attempt: exactly one allow (two processes)', async (t) => {
+  // Failure caught: two sessions racing on fresh gos after a failed attempt both getting the allow.
+  const a = await scene(t, { flag: true, typedAt: NOW - 300_000 });
+  const b = await scene(t, { home: a.home, typedAt: NOW - 240_000 });
+  seedGen(a, 1, NOW - 600_000);
+  const outcomes = (await claimInChildren(a.home, [a, b])).sort();
+  assert.deepEqual(outcomes, ['claimed', 'spent']);
+  assert.ok(existsSync(gfile(a, 'name', 2)) && existsSync(gfile(a, 'sql', 2)));
+  assert.ok(!existsSync(gfile(a, 'name', 3)));
 });

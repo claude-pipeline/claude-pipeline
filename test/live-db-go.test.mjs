@@ -251,6 +251,8 @@ test('guard: running or importing live-db-go.mjs by hand is refused at every che
     `node --input-type=module <<< "import '${LIB}'"`,
     `echo "import '${LIB}'" | node --input-type=module`,
     `node ./pipeline/hooks/lib/live-db-go.mjs`,
+    `node ${LIB.replace('live-db-go', 'live-db-auto')}`, // (the attempt-history writer: run by hand it would write markers in the protected tree)
+    `node -e "import('${LIB.replace('live-db-go', 'live-db-auto')}')"`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
   for (const cmd of [`cat ${LIB}`, 'node ~/.claude/pipeline/bin/pipeline.mjs live-db catalog tables public', 'git add pipeline/hooks/lib/live-db-go.mjs']) assert.equal(bash(cmd), 'allow', cmd);
 });
