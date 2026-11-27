@@ -305,7 +305,6 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
   // One notion of a usable token count for the has-usage check and the sums: a non-negative safe integer (a fraction, negative, NaN, Infinity, huge or non-number is missing).
   const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
   const byId = new Map();
-  let anon = 0;
   for (const raw of String(text).split('\n')) {
     if (!raw.trim()) continue;
     let e;
@@ -321,7 +320,7 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
     const cc0 = isPlainObject(u.cache_creation) ? u.cache_creation : {};
     const counts = [u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].filter(isCount);
     if (counts.length === 0) continue;
-    byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model, positive: counts.some((v) => v > 0) });
+    byId.set(e.message.id ?? Symbol('id-less'), { u, model: e.message.model, positive: counts.some((v) => v > 0) });
   }
   for (const [id, m] of byId) if (!m.positive) byId.delete(id);
   // usd: each message at its own model's list price; unpricedMessages: messages the price table cannot price

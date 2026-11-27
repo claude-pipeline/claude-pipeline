@@ -797,3 +797,13 @@ test('P cost --from-transcript: the last line of a message id is its snapshot: p
   assert.equal(second.json.skipped, undefined);
   assert.deepEqual([second.json.cost.total.calls, second.json.cost.total.input, second.json.cost.total.output], [1, 10, 5]);
 });
+
+// Issue #820 (round 6): id-less messages were keyed `anon-N`, the same namespace as real ids, so an id-less line could overwrite (and, all-zero, delete) a real message whose id was `anon-0`.
+test('P cost --from-transcript: an id-less line never replaces a message whose id looks like a generated key', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'anon-0', usage: { input_tokens: 10, output_tokens: 5 } } })}\n${JSON.stringify({ message: { usage: { input_tokens: 0, output_tokens: 0 } } })}\n`);
+  const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--from-transcript', '.review/t.jsonl']);
+  assertExit(r, 0);
+  assert.equal(r.json.skipped, undefined);
+  assert.deepEqual([r.json.cost.total.calls, r.json.cost.total.input, r.json.cost.total.output], [1, 10, 5]);
+});
