@@ -14,6 +14,7 @@ import { OWNER_ENTRY, linesOf } from './helpers/owner-go.mjs';
 import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { buildBlock, liveDbGoOutcome, sha256Of } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { LIVE_DB_CONSUMED_REL, claimLiveDbGo, evaluateSupabaseMcp, isSupabaseTool } from '../pipeline/hooks/lib/live-db-guard.mjs';
+import { readDbRefs } from '../pipeline/hooks/lib/db-refs.mjs';
 import { buildCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
 import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
 import { HOOK_CLOCK } from '../pipeline/hooks/lib/script-candidates.mjs';
@@ -709,7 +710,7 @@ const isoAt = (ms) => new Date(ms).toISOString();
 const fileList = (nodes, next = null) => ({ pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes });
 const prNode = (over = {}) => ({ number: 42, merged: true, baseRefName: 'main', baseRepository: { nameWithOwner: 'acme/widgets' }, mergeCommit: { oid: COMMIT }, files: fileList([{ path: FILE, changeType: 'ADDED' }]), ...over });
 // GitHub's answer for an eligible file: on main, identical text, one history node (PR 42's merge commit, an hour old), the PR ADDED the file
-const ghBase = ({ name = NAME, text = SQL } = {}) => ({ data: { repository: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main', target: { oid: HEAD_SHA, file: { object: { text, isBinary: false, isTruncated: false } }, history: { nodes: [{ oid: COMMIT, committedDate: isoAt(NOW - 3_600_000), associatedPullRequests: { nodes: [prNode({ files: fileList([{ path: `supabase/migrations/${name}.sql`, changeType: 'ADDED' }]) })] } }] } } } } } });
+const ghBase = ({ name = NAME, text = SQL, head = HEAD_SHA } = {}) => ({ data: { repository: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main', target: { oid: head, file: { object: { text, isBinary: false, isTruncated: false } }, history: { nodes: [{ oid: COMMIT, committedDate: isoAt(NOW - 3_600_000), associatedPullRequests: { nodes: [prNode({ files: fileList([{ path: `supabase/migrations/${name}.sql`, changeType: 'ADDED' }]) })] } }] } } } } } });
 const tip = (a) => a.data.repository.defaultBranchRef.target;
 const firstCommit = (a) => tip(a).history.nodes[0];
 const firstPr = (a) => firstCommit(a).associatedPullRequests.nodes[0];
@@ -1151,12 +1152,17 @@ test('through the real hook entry: GitHub that never answers, even with 5,000 pe
 
 const MARKED = `-- pipeline: apply-after-deploy\n${SQL}`;
 const OTHER_SHA = 'c'.repeat(40);
-const DEPLOY_REG = { deployEnv: 'Production', deployBot: 'vercel', deploySince: isoAt(NOW - 7_200_000), deployClock: 'github', deployProof: 'two-phase' };
+const DEPLOY_REG = { deployEnv: 'Production', deployBot: 'vercel' };
+// the cutoff-era shapes of unreleased #907 commits (N3): 7ac5c1d3 (deployClock 'pending') and 39e28449 (the finished two-phase registration with its staging key)
+const LEGACY_REGS = {
+  'deployClock pending': { ...DEPLOY_REG, deploySince: isoAt(NOW - 7_200_000), deployClock: 'pending' },
+  'two-phase proof with deployPending': { ...DEPLOY_REG, deploySince: isoAt(NOW - 7_200_000), deployClock: 'github', deployProof: 'two-phase', deployPending: { env: 'Production', bot: 'vercel', since: isoAt(NOW - 7_200_000) } },
+};
 const bot = (login = 'vercel') => ({ __typename: 'Bot', login });
 const dnode = (over = {}) => ({ commitOid: COMMIT, createdAt: isoAt(NOW - 3_100_000), environment: 'Production', originalEnvironment: 'Production', latestEnvironment: 'Production', state: 'ACTIVE', creator: bot(), latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot() }, ...over });
 const withStatus = (over) => dnode({ latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot(), ...over } });
 // GitHub's answer to the deploy query
-const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {}, head = HEAD_SHA, branchName = 'main' } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, defaultBranchRef: head === null ? null : { name: branchName, target: { oid: head } }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
+const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {}, head = COMMIT, branchName = 'main' } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, defaultBranchRef: head === null ? null : { name: branchName, target: { oid: head } }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
 const argOf = (args, key) => args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
 const queryOf = (call) => argOf(call.args, 'query');
 
@@ -1164,7 +1170,7 @@ const queryOf = (call) => argOf(call.args, 'query');
 async function deployScene(t, { registration = DEPLOY_REG, ...opts } = {}) {
   const s = await autoScene(t, { deploy: registration, ...opts });
   s.deploy = () => deployAnswer();
-  s.answer = () => ghBase({ text: MARKED });
+  s.answer = () => ghBase({ text: MARKED, head: COMMIT });
   s.respond = (args) => {
     const q = queryOf({ args });
     if (q.includes('latestCompletedDeployment')) return { stdout: JSON.stringify(argOf(args, 'env') === 'Production' && argOf(args, 'num') === '42' ? s.deploy() : deployAnswer({ envName: null, newest: null })) };
@@ -1195,26 +1201,67 @@ test('after-deploy: a marked file whose newest and latest completed Production d
   assert.equal('afterDeploy' in body(gfile(plain, 'name', 1)), false);
 });
 
-test('after-deploy: a registration an earlier revision stamped with the owner\'s clock (no deployClock) is not trusted: nothing is asked or claimed, the owner is told to register again', async (t) => {
-  // Failure caught: an old registration whose cut-off came from a slow local clock still letting a PR merged before the real registration apply with no go.
-  const { deployClock, deployProof, ...old } = DEPLOY_REG;
-  const s = await deployScene(t, { registration: old });
-  const r = applyMarked(s);
-  assert.equal(r.decision, 'deny');
-  assert.match(r.reason, /earlier version of the pipeline.*after-deploy on/);
-  assert.equal(s.calls.length, 0);
-  assert.deepEqual(hist(s), []);
+test('after-deploy N3: an entry with cutoff-era keys keeps the registry valid and another ref readable, claims nothing, stays unregistered after a label set and a server add, and a fresh after-deploy on registers only that ref', async (t) => {
+  // Failure caught: an unreleased #907 registration invalidating the registry, still letting a marked file apply (with no cutoff to compare), or an unrelated owner write turning it into a live registration.
+  const other = { ref: 'zyxwvutsrq9876543210', name: 'Other', repo: 'acme/other', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' };
+  for (const [shape, keys] of Object.entries(LEGACY_REGS)) {
+    const s = await deployScene(t, { registration: keys, refs: [other] });
+    const read = readDbRefs(s.home);
+    assert.equal(read.ok, true, shape);
+    assert.deepEqual([read.refs.find((e) => e.ref === other.ref).name, read.refs[0].deployEnv, read.refs[0].deployLegacy], ['Other', null, true], shape);
+    const r = applyMarked(s);
+    assert.equal(r.decision, 'deny', shape);
+    assert.match(r.reason, /after-deploy on/, shape);
+    assert.equal(s.calls.length, 0, `${shape}: GitHub asked nothing`);
+    assert.deepEqual(hist(s), [], shape);
+    // a label-only set and a server add rewrite the registry: the legacy keys go, nothing becomes registered
+    assert.equal(runOwnerCli(s.home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'acme/widgets']).exitCode, 0, shape);
+    assert.equal(runOwnerCli(s.home, ['server', 'add', 'mine']).exitCode, 0, shape);
+    assert.equal(applyMarked(s).decision, 'deny', `${shape}: still not registered after unrelated writes`);
+    assert.equal(s.calls.length, 0, shape);
+    assert.deepEqual(hist(s), [], shape);
+    // only the fresh registration writes a pair, and only for the ref given
+    assert.equal(runOwnerCli(s.home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']).exitCode, 0, shape);
+    assert.deepEqual(Object.fromEntries(readDbRefs(s.home).refs.map((e) => [e.ref, e.deployEnv])), { [REF]: 'Production', [other.ref]: null }, shape);
+    assert.equal(applyMarked(s).decision, 'allow', `${shape}: the fresh registration works`);
+  }
 });
 
-test('after-deploy: a registration with deployClock github but no two-phase proof (a backdated entry of an earlier revision) is not trusted: nothing is asked or claimed', async (t) => {
-  // Failure caught: an entry published by an earlier revision that checked GitHub's time only before its write, so a stall could backdate it, still letting a marked file apply.
-  const { deployProof, ...old } = DEPLOY_REG;
-  const s = await deployScene(t, { registration: old });
+test('after-deploy D1: a marked file whose merge is live when the owner switches after-deploy on (real owner CLI) applies with no click: the check is made at apply time', async (t) => {
+  // Failure caught: eligibility frozen at switch-on (a time cutoff or a snapshot) refusing the merge that is live at that moment, or one still deploying then.
+  const s = await deployScene(t, { registration: null });
+  assert.equal(applyMarked(s).decision, 'deny', 'before the registration the click stays');
+  assert.equal(runOwnerCli(s.home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']).exitCode, 0);
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.ok(existsSync(gfile(s, 'name', 1, { sql: MARKED })));
+});
+
+test('after-deploy N1: a later commit on the default branch gives the file the click, with its own final wording and no deploy query, even when the deploy proof would pass', async (t) => {
+  // Failure caught: a redeploy or rollback of an older merge, or a merge made after the file's own, still qualifying; and the refusal telling the caller to call again when waiting cannot help.
+  const s = await deployScene(t);
+  s.answer = () => ghBase({ text: MARKED, head: HEAD_SHA });
+  s.deploy = () => deployAnswer({ head: HEAD_SHA });
   const r = applyMarked(s);
   assert.equal(r.decision, 'deny');
-  assert.match(r.reason, /earlier version of the pipeline.*after-deploy on/);
-  assert.equal(s.calls.length, 0);
+  assert.match(r.reason, /a later commit is on the default branch: this file takes the owner's go/);
+  assert.doesNotMatch(r.reason, /call again/);
+  assert.equal(s.calls.length, 1, 'the deploy query is never made');
   assert.deepEqual(hist(s), []);
+  assert.equal(markers(s).length, 0);
+});
+
+test('after-deploy N2: a PR merged before auto-apply was switched on keeps the click even when the commit that added the file is dated after it', async (t) => {
+  // Failure caught: a merge older than the switch (its commit re-dated, e.g. by a rebase merge) applying with no go because only the commit date was compared with autoSince.
+  const s = await deployScene(t);
+  s.deploy = () => deployAnswer({ pr: { mergedAt: '2026-10-30T00:00:00Z' } });
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /merged before auto-apply was switched on/);
+  assert.equal(s.calls.length, 2);
+  assert.deepEqual(hist(s), []);
+  const ok = await deployScene(t);
+  ok.deploy = () => deployAnswer({ pr: { mergedAt: '2026-11-01T00:00:00Z' } });
+  assert.equal(applyMarked(ok).decision, 'allow', 'merged at the switch time is not before it');
 });
 
 test('after-deploy: a marked file of an entry without the registration is refused with GitHub asked nothing (the owner\'s click stays)', async (t) => {
@@ -1228,7 +1275,7 @@ test('after-deploy: a marked file of an entry without the registration is refuse
 });
 
 test('after-deploy: anything GitHub shows other than the one trusted, successful deploy of the merge commit is refused with a plain reason, nothing claimed, no go burnt', async (t) => {
-  // Failure caught: a forged, stale, rolled-back or half-finished deploy counting as live (a marked migration applied before the code that needs it, or after it was rolled back), and a registration reaching back to earlier merges.
+  // Failure caught: a forged, stale, rolled-back or half-finished deploy counting as live (a marked migration applied before the code that needs it, or after it was rolled back).
   const other = { commitOid: OTHER_SHA };
   const cases = [
     ['no deployment at all', { live: null, newest: null }, /no deployment in "Production" yet/],
@@ -1251,7 +1298,6 @@ test('after-deploy: anything GitHub shows other than the one trusted, successful
     ['another repository answered', { repoName: 'evil/widgets' }, /evil\/widgets instead of acme\/widgets/],
     ['another pull request', { pr: { number: 43 } }, /does not show the pull request as merged/],
     ['merged at another commit', { pr: { mergeCommit: { oid: OTHER_SHA } } }, /does not show the pull request as merged/],
-    ['merged before the registration, though the commit is dated after it', { pr: { mergedAt: isoAt(NOW - 9_000_000) } }, /before the after-deploy registration/],
     ['the default branch moved since the file was read', { head: OTHER_SHA }, /default branch moved during the check/],
     ['no default branch in the answer', { head: null }, /default branch moved during the check/],
     ['another branch made the default at the same commit (the PR\'s base no longer matches)', { branchName: 'release' }, /default branch moved during the check/],
@@ -1267,10 +1313,6 @@ test('after-deploy: anything GitHub shows other than the one trusted, successful
     assert.equal(markers(s).length, 0, what);
     assert.deepEqual(hist(s), [], `${what}: nothing claimed`);
   }
-  // the reverse ordering of the merge time and the commit date is allowed: merged after the registration, the commit dated before it
-  const late = await deployScene(t, { registration: { ...DEPLOY_REG, deploySince: isoAt(NOW - 3_550_000) } });
-  late.deploy = () => deployAnswer({ pr: { mergedAt: isoAt(NOW - 3_550_000 + 6 * 60_000) } });
-  assert.equal(applyMarked(late).decision, 'allow', 'the cut-off is the merge time, not the commit date');
   // a hand-written registry with the bot github-actions is invalid: every Supabase write is refused, GitHub is asked nothing
   const forged = await deployScene(t, { registration: { ...DEPLOY_REG, deployBot: 'github-actions' } });
   assert.equal(applyMarked(forged).decision, 'deny');
@@ -1280,7 +1322,7 @@ test('after-deploy: anything GitHub shows other than the one trusted, successful
 test('after-deploy: the deploy query is the last GitHub read, after a second page of the PR\'s files', async (t) => {
   // Failure caught: the proof read before the file pages, so a rollback GitHub shows while the pages are read goes unseen.
   const s = await deployScene(t);
-  s.answer = () => { const a = ghBase({ text: MARKED }); firstPr(a).files = fileList([{ path: 'README.md', changeType: 'MODIFIED' }], 'cursor-1'); return a; };
+  s.answer = () => { const a = ghBase({ text: MARKED, head: COMMIT }); firstPr(a).files = fileList([{ path: 'README.md', changeType: 'MODIFIED' }], 'cursor-1'); return a; };
   s.page = () => ({ data: { repository: { pullRequest: { files: fileList([{ path: FILE, changeType: 'ADDED' }]) } } } });
   assert.equal(applyMarked(s).decision, 'allow');
   assert.deepEqual(s.calls.map((c) => (queryOf(c).includes('latestCompletedDeployment') ? 'deploy' : queryOf(c).includes('after:$after') ? 'page' : 'file')), ['file', 'page', 'deploy']);
@@ -1326,20 +1368,6 @@ test('after-deploy: the final registry check and the claim run under the registr
   const own = tryAcquire('db-refs', { dir: join(STATE(plain.home), 'locks') });
   assert.equal(apply(plain).decision, 'allow');
   release(own.lock);
-});
-
-test('after-deploy: a merge within the clock-skew margin after the registration keeps the click; one after the margin applies', async (t) => {
-  // Failure caught: an owner machine whose clock is minutes slow stamping the registration early, so a PR merged just before the owner registered is applied with no go.
-  const since = NOW - 7_200_000;
-  const inside = await deployScene(t);
-  inside.deploy = () => deployAnswer({ pr: { mergedAt: isoAt(since + 60_000) } });
-  const r = applyMarked(inside);
-  assert.equal(r.decision, 'deny');
-  assert.match(r.reason, /before the after-deploy registration/);
-  assert.deepEqual(hist(inside), []);
-  const outside = await deployScene(t);
-  outside.deploy = () => deployAnswer({ pr: { mergedAt: isoAt(since + 6 * 60_000) } });
-  assert.equal(applyMarked(outside).decision, 'allow');
 });
 
 test('after-deploy: denied before the deploy finished, the same call after GitHub shows success applies (no attempt was spent)', async (t) => {

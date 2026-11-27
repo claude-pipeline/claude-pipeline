@@ -376,7 +376,7 @@ function deployProof({ entry, pr, commit, committed, head, branchName, owner, re
   const mergedAt = typeof p.mergedAt === 'string' && ISO_RE.test(p.mergedAt) ? Date.parse(p.mergedAt) : NaN;
   if (!Number.isFinite(mergedAt)) return no('the pull request has no readable merge time');
   // N2: the merge time is GitHub's own zoned time; a PR merged before auto-apply was switched on keeps the owner's go even when the commit that added the file is dated later
-  if (!(mergedAt >= Date.parse(entry.autoSince))) return no('the pull request was merged before auto-apply was switched on for this project, so it keeps the owner\'s go');
+  if (!(mergedAt >= Date.parse(entry.autoSince))) return { stop: notEligible('the pull request was merged before auto-apply was switched on for this project: this file takes the owner\'s go') };
   if (!isObj(repo.environment) || repo.environment.name !== e) return no(`GitHub shows no deployment environment named "${e}"`);
   const newest = Array.isArray(repo.deployments?.nodes) && repo.deployments.nodes.length === 1 ? repo.deployments.nodes[0] : null;
   const live = repo.environment.latestCompletedDeployment;
