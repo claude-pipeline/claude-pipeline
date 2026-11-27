@@ -529,7 +529,7 @@ const fakeGithubClock = (t, date) => {
   return { PIPELINE_GH: `node "${script}"` };
 };
 
-test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for github-actions[bot] and a malformed env; [bot] is stripped; deploySince is GitHub's time every time, and gh failing refuses; off, auto-migrations off, a repo change and --dev clear all three keys, a label-only set keeps them', async (t) => {
+test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for github-actions[bot] and a malformed env; [bot] is stripped; deploySince is the GitHub clock every time, and gh failing refuses; off, auto-migrations off, a repo change and --dev clear all three keys, a label-only set keeps them', async (t) => {
   // Failure caught: an agent registering a deployer for itself, a workflow-created deployment counting as production, a registration reaching back to earlier merges, or the trust surviving a change of repo.
   const home = scratchHome(t);
   seedRegistry(home, { refs: [LIVE(ON), LIVE({ ref: REF2, repo: 'acme/other' })] });
