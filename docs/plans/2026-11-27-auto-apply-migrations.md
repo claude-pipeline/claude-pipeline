@@ -10,6 +10,11 @@ or not (R2-3); `auto-migrations on` imports the earlier go applies of that proje
 switch-off projects keep today's behaviour exactly (R2 P2); the log groups markers into events (R2 P2); the after-deploy workflow shares
 the checks and binds the presented file to the merge (R2 P2); a merged result without a sha is recovered or stops (R2 P2).
 Revision 2 had fixed R1 (7 × P1). The after-deploy files keep the go (owner, 11-27); the deploy-checked variant is idea #882.
+**Revision 3.1 (2026-11-27)** after the one Fable plan pass (no double allow found; 1 × P1, 2 × P2, 5 × P3): the git deadline is set
+once at the choke point in `live-db-go.mjs`, covering every route to `verifyBlock` (F-P1); generations are probed in full so a hole is
+seen (F-P2a); auto also refuses a consumed go of this name or SQL, which covers a rollback or a go landing during the import (F-P2b);
+the time check comes before the go is consumed; a click's go time is its dialog's issue time; the PR's base repository must be the
+entry's repo; auto needs the commit after the switch-on time; `env` reaches the guard.
 
 **Goal:** a migration file that a merged PR added to the registered repo's default branch is applied to that repo's live Supabase
 project with no owner go, when the owner switched auto-apply on for that project.
@@ -48,14 +53,18 @@ owner's go first, then auto, inside one time budget; a read-only `live-db auto-l
 - GitHub: `gh api --hostname github.com graphql …` always; the answer's `repository.nameWithOwner` equals the entry's `repo`
   case-insensitively; an answer with an `errors` key is a failure even with `data`.
 - Time: `leftMs()` = what is left of the hook's wall cap (`wallLeftMs` of the evaluation budget, `script-candidates.mjs`; with
-  `HOOK_CLOCK` it counts from the hook process start). Every child process on the decision path (the go path's git reads, including
-  those under click settling, and every gh call) gets `timeoutMs = min(own, leftMs())` and is not started under 1 ms (the
-  `boundedTimeout` pattern, `git-wiring.mjs:15`); a gh call is not started under `AUTO_MIN_START_MS = 1500`; file scans (pending clicks,
+  `HOOK_CLOCK` it counts from the hook process start). Every child process on the decision path gets `timeoutMs = min(own,
+  leftMs())` and is not started under 1 ms (the `boundedTimeout` pattern, `git-wiring.mjs:15`): the git reads through ONE choke point,
+  a module-level deadline in `live-db-go.mjs` that `checkedTopLevel`, `repoOf` and `blobAt` obey and that `evaluateSupabaseMcp` sets
+  for the whole decision (`withGitDeadline(leftMs, fn)`, cleared in `finally`), so every route to `verifyBlock` is covered (direct,
+  `settlePendingClicks` → `settleOne` → `readAsk` → `installedParts`, `clickProvenance` → `readAsk` / `bindAnswer`); the gh calls by
+  their own argument; a gh call is not started under `AUTO_MIN_START_MS = 1500`; file scans (pending clicks,
   generations) check `leftMs()` between entries; the final claim is not started under `AUTO_MIN_CLAIM_MS = 500`. Out of time ⇒ deny
   "try the call again". A stalled local filesystem call (a hung fsync) is the one blocking step not bounded: residual (spec).
 - History (only for a ref with the flag): `~/.claude/pipeline-state/owner-go/live-db-attempts/`, generation files
   `name-<id>-<n>.json` (id = first 32 hex of sha256(`name|${ref}|${name}`)) and `sql-<id>-<n>.json` (sha256(`sql|${ref}|${sqlSha256}`)),
-  `n` = 1, 2, … contiguous, at most `MAX_GENERATIONS = 64` per key (more = unreadable history). The go's consumed marker stays in
+  `n` = 1, 2, … contiguous, at most `MAX_GENERATIONS = 64` per key. Probing always `lstat`s `1 … MAX_GENERATIONS + 1` (no directory
+  search): `n` = the highest present; a hole below it, or `MAX_GENERATIONS + 1` present, = unreadable history. The go's consumed marker stays in
   `live-db-consumed/` with its id unchanged.
 - Durability: exclusive create (`O_EXCL|O_NOFOLLOW`), every byte written (loop on `writeSync`'s count; a 0-byte write = error), fsync
   file, close, fsync folder; a folder the writer creates is fsynced in its parent too (POSIX: any fsync error = error; win32: opening a
@@ -90,8 +99,9 @@ owner's go first, then auto, inside one time budget; a read-only `live-db auto-l
 - Test: `test/db-refs.test.mjs`
 
 **Interfaces:**
-- Produces: `readDbRefs(home)` entries are `{ ref, name, repo, kind, autoMigrations }`, `autoMigrations` always a boolean (false when
-  absent). `writeDbRefs` writes the key only on entries where it is true.
+- Produces: `readDbRefs(home)` entries are `{ ref, name, repo, kind, autoMigrations, autoSince }`, `autoMigrations` always a boolean
+  (false when absent), `autoSince` the ISO time `on` last set it (null when off). `writeDbRefs` writes both keys only on entries where
+  the flag is true; a true flag without a valid `autoSince` (strict ISO with a zone) is invalid.
 - Produces: `autoEntry(ref, state) -> { entry } | { entry: null, reason }`: the entry when it is live, has a repo, `autoMigrations ===
   true`, and no OTHER entry with `autoMigrations === true` has the same repo (case-insensitive); else `reason` ('off' |
   'ambiguous: <other ref> has the same repo').
@@ -103,7 +113,8 @@ owner's go first, then auto, inside one time budget; a read-only `live-db auto-l
   an unreadable consumed marker or record file refuses `on` naming it. With `unmatched` non-empty and no `--accept-unmatched`, `on`
   refuses (exit 2) with the list and why ("if one of these was a migration whose file was changed in its PR after the go, auto-apply
   would apply the new version too: compare the times with your merged PRs, then run again with --accept-unmatched"). Then it creates the
-  history folder durably and sets the flag. `note`: "auto-apply trusts every PR merged into <repo>'s default branch on github.com:
+  history folder durably and sets the flag with `autoSince` = now (only files merged after it are auto-applied: a file merged earlier,
+  maybe applied elsewhere, keeps the go). The output says to run `on` again after any rollback of the pipeline install. `note`: "auto-apply trusts every PR merged into <repo>'s default branch on github.com:
   migrations there must need your merge (a hard stop on supabase/migrations/**)". `off` clears the flag and keeps the history.
 
 - [ ] **Step 1: Write the failing tests** in `test/db-refs.test.mjs` (owner runs through `runOwnerCli`, seeds through `seedRegistry`):
@@ -121,7 +132,8 @@ owner's go first, then auto, inside one time budget; a read-only `live-db auto-l
     the switch, of a file later changed under the same name, is not auto-applied again)*
   - `set keeps auto-migrations for a label-only edit; a new repo or --dev clears it` — `on`; `set` same ref, same repo, new name ⇒
     true; `set` with `--repo other/x` ⇒ false; `on` again, `set --dev` ⇒ false. *(a repo reassignment does not carry the trust)*
-  - `readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry or one without repo, is invalid`.
+  - `readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry, one without repo or one without a valid
+    autoSince, is invalid`.
   - `autoEntry: two enabled entries with the same repo (hand-written registry) answer ambiguous for both`. *(the wrong database)*
   - Update the existing exact `show` expectation (`test/db-refs.test.mjs:41`) to carry `autoMigrations: false`.
   - In the existing `guard: an agent line running pipeline db-refs set|remove|server is refused` test add
@@ -142,9 +154,10 @@ owner's go first, then auto, inside one time budget; a read-only `live-db auto-l
   Task 3 adds the auto check)
 - Modify: `pipeline/hooks/lib/live-db-guard.mjs` (`takeMarker` replaced by `claimGoMarker`; `claimLiveDbGo` generation rules on a
   flagged ref and bounded git; `evaluateSupabaseMcp` takes `ctx.leftMs`; `LIVE_DB_CONSUMED_REL` re-exported from the new module)
-- Modify: `pipeline/hooks/lib/owner-go-click.mjs` (`settlePendingClicks` and `bindAnswer` take an optional `{ leftMs, io }` and pass
-  the bounded `io` to `verifyBlock`; the pending scan checks `leftMs()` between files and stops with a `no-time` problem)
-- Modify: `pipeline/hooks/lib/files-policy.mjs` (`OWNER_GO_LIBS` gains `live-db-auto`; `evaluateMcp` passes `leftMs`)
+- Modify: `pipeline/hooks/lib/live-db-go.mjs` (`withGitDeadline`: the module-level git deadline `checkedTopLevel`, `repoOf`, `blobAt` obey)
+- Modify: `pipeline/hooks/lib/owner-go-click.mjs` (`settlePendingClicks` takes an optional `leftMs`: the pending scan checks it
+  between files and stops with a `no-time` problem; its git reads are bounded by the choke point)
+- Modify: `pipeline/hooks/lib/files-policy.mjs` (`OWNER_GO_LIBS` gains `live-db-auto`; `evaluateMcp` passes `leftMs` and `env`)
 - Test: `test/live-db-guard.test.mjs`, `test/guard-files.test.mjs`
 
 **Interfaces (all in `live-db-auto.mjs`; nothing else is exported):**
@@ -156,9 +169,9 @@ owner's go first, then auto, inside one time budget; a read-only `live-db auto-l
 - `claimGoMarker({ home, session, promptId, click, op, projectRef, name, sqlSha256, now, io }) -> 'claimed' | 'spent' | 'error'`: the old
   `takeMarker` (same id derivation; the body gains `name`).
 - `history({ home, ref, name, sqlSha256, leftMs, io }) -> { status: 'ok', name: { n, at }, sql: { n, at } } | { status: 'error', path,
-  reason } | { status: 'no-time' }`: for each key, `lstat` `-1`, `-2`, … until ENOENT (ENOENT on the folder = `n: 0`); `n` = the last
-  generation, `at` = the LATEST time over all its generations (a body's finite ISO `at`, else the file's mtime: empty, unparsable,
-  partial); a folder, a symlink, a read error, a gap, or more than `MAX_GENERATIONS` = error.
+  reason } | { status: 'no-time' }`: for each key, `lstat` `-1 … -(MAX_GENERATIONS + 1)` (ENOENT on the folder = `n: 0`); `n` = the
+  highest present, `at` = the LATEST time over all its generations (a body's finite ISO `at`, else the file's mtime: empty, unparsable,
+  partial); a folder, a symlink, a read error, a hole below `n`, or generation `MAX_GENERATIONS + 1` = error.
 - `claimNext({ home, via, session, now, facts, seen, leftMs, io }) -> { status: 'claimed', event } | { status: 'spent', path } | { status:
   'error' | 'no-time', reason }`: validates `via` ('auto' | 'go'), `facts.ref` (`REF_RE`), `facts.sqlSha256` (64 hex), `facts.name` (a
   string); builds the body itself (`v`, `event` = 16 random hex, `pair` = the partner file, `at`, `via`, session, the facts); creates
@@ -172,17 +185,20 @@ owner's go first, then auto, inside one time budget; a read-only `live-db auto-l
 - `readAttemptLog({ home, sinceMs, io }) -> { events, unreadable }` (Task 4; best-effort parsing lives only here).
 
 **`claimLiveDbGo` change** (op `migration` AND the ref's raw flag true; everything else unchanged): for each verified, unexpired record
-with go time `goAt`: (a) `history` — error ⇒ return `{ status: 'error', reason: 'the attempt history <path> cannot be read …' }`,
+with go time `goAt` (typed: the prompt entry's time; click: the dialog's issue time, `ask.issuedAt` or the field the ask file
+carries, never the answer time, so a dialog shown before an attempt and answered after it does not count as later): (a) `history` — error ⇒ return `{ status: 'error', reason: 'the attempt history <path> cannot be read …' }`,
 no-time ⇒ deny "try the call again"; (b) when either key has `n > 0`: the go is not used (skip as spent, nothing consumed) if
 `max(name.at, sql.at) >= goAt` ("an attempt at this migration (this name or this exact SQL) was recorded at <time>, after this go:
 check the live state read-only, then ask for a new go") or `goAt > now()` (a go stamped ahead of the clock cannot be ordered after an
-attempt); (c) `claimGoMarker` as today; (d) `claimNext({ via: 'go', seen })` — spent ⇒ return spent ("another session attempted it
-meanwhile; this go is used"), error/no-time ⇒ deny. Every git read under `verifyBlock`, direct or through `settlePendingClicks` →
-`bindAnswer`, gets an `io.git` that clamps `timeoutMs` to `leftMs()` and throws under 1 ms (caught there: the record is unverified, a
-deny). The builder greps every callee of `claimLiveDbGo` for other child processes and bounds them the same way.
+attempt); (b2) under `AUTO_MIN_CLAIM_MS` left ⇒ deny "try the call again" with the go NOT consumed; (c) `claimGoMarker` as today;
+(d) `claimNext({ via: 'go', seen })` — spent ⇒ return spent ("another session attempted it meanwhile; this go is used"), error ⇒ deny.
+The git deadline: `evaluateSupabaseMcp` runs its whole decision inside `withGitDeadline(ctx.leftMs, …)` (no `leftMs` = no deadline,
+today's per-call 5 s), so every git read under `verifyBlock`, by any route, is clamped and throws under 1 ms (caught there: the record
+is unverified, a deny). The builder greps every callee of `claimLiveDbGo` for other child processes (`spawnSync`, `run(`, `git(`,
+`gh(`) and bounds them the same way.
 
-**`evaluateMcp` change** (`files-policy.mjs:930`): `const budget = opts._budget ?? newEvalBudget(opts.now, opts.cpu, opts.wall0)` and
-`leftMs: () => wallLeftMs(budget)` in the `evaluateSupabaseMcp` ctx.
+**`evaluateMcp` change** (`files-policy.mjs:930`): `const budget = opts._budget ?? newEvalBudget(opts.now, opts.cpu, opts.wall0)`;
+the `evaluateSupabaseMcp` ctx gains `leftMs: () => wallLeftMs(budget)` and `env` (`opts.env ?? process.env`).
 
 - [ ] **Step 1: Write the failing tests** in `test/live-db-guard.test.mjs` (existing `scene` helper; `seedRegistry` for the flag):
   - `switch off: a go apply reads and writes no history and refuses nothing new` — no flag, the history folder replaced by a FILE:
@@ -202,8 +218,12 @@ deny). The builder greps every callee of `claimLiveDbGo` for other child process
     opening the history folder ⇒ deny; the history folder missing and `fsyncSync` failing on its parent ⇒ deny. The existing
     consumed-marker fault tests stay unchanged. *(R1-6 short write; R2-5 first-use folder)*
   - `out of time: a go whose git reads, or whose pending-click settling, find no time left is unverified (deny), never an allow` —
-    `ctx.leftMs: () => 0` with a valid typed go ⇒ deny, go not consumed; 500 pending click files of other sessions in `asks/` with a
-    `leftMs` that runs out after 10 reads ⇒ deny, not every file read. *(R2-2: unbounded local work before the decision)*
+    `ctx.leftMs: () => 0` with a valid typed go, and with a valid CLICK go (its ask pending and settled through `readAsk`), ⇒ deny, go
+    not consumed, ZERO git spawns (count them through the `io.git` seam or a PATH shim); 500 pending click files of other sessions in
+    `asks/` with a `leftMs` that runs out after 10 reads ⇒ deny, not every file read; `leftMs` at 400 ms after verification ⇒ deny,
+    the go not consumed. *(R2-2, F-P1: every route to verifyBlock; F-P3: slowness must not burn the go)*
+  - `flag on: a click dialog issued before an attempt and answered after it is not a later go` — ask issued at `NOW - 120_000`,
+    generation 1 at `NOW - 90_000`, answer at `NOW - 60_000` ⇒ deny. *(F-P3: stale dialog)*
   - Two processes (extend the existing two-process test): `two gos of the same migration in two sessions after one failed attempt:
     exactly one allow` (children run the full go claim; both see generation 1). *(R2-1 concurrent)*
   - Coexistence: in the existing previous-owner-go test (flag on), assert `live-db-attempts/` exists after the apply and the old
@@ -232,16 +252,23 @@ deny). The builder greps every callee of `claimLiveDbGo` for other child process
 
 Check order (stop at the first failure; `reason` is one plain sentence):
 1. `AFTER_DEPLOY_RE` ⇒ not eligible ("marked apply-after-deploy: it takes the owner's go after the deploy"). 2. `STEM_RE.test(name)`.
-3. `sqlCharProblem(query) === null`. 4. `history`: error ⇒ error; either key `n > 0` ⇒ spent (with the latest time). 5. `leftMs() >=
-AUTO_MIN_START_MS` else no-time. 6. The GraphQL call and the answer rules (Global Constraints), paging PR files while `hasNextPage`
-and time is left (at most 30 pages). 7. `claimNext({ via: 'auto', seen })` (both keys at generation 1).
+3. `sqlCharProblem(query) === null`. 4. `history`: error ⇒ error; either key `n > 0` ⇒ spent (with the latest time); then every
+`live-db-consumed/*.json` (checking `leftMs()` between entries): a body with `op: 'migration'`, `projectRef` = ref and (`sqlSha256` =
+sha256(query) or `name` = name) ⇒ spent (a go consumed by a guard that wrote no history: a rollback to the previous release, or a go
+that landed while `on` imported); ENOENT on the folder = none; an unreadable folder or entry, or an empty or unparsable body ⇒ error
+naming the file. 5. `leftMs() >=
+AUTO_MIN_START_MS` else no-time. 6. The GraphQL call and the answer rules (Global Constraints), plus: the PR's `baseRepository.
+nameWithOwner` equals the entry's repo (case-insensitive: a fork's history can associate the parent's PR), and `committedDate >=
+entry.autoSince`; paging PR files while `hasNextPage` and time is left (at most 30 pages). 7. `claimNext({ via: 'auto', seen })`
+(both keys at generation 1).
 
 GraphQL (shape verified 2026-11-27 against eaglewatch-ph/eaglewatch #2582: one history node = the PR's `mergeCommit`, `ADDED`):
 ```graphql
 query($o:String!,$n:String!,$p:String!){ repository(owner:$o,name:$n){ nameWithOwner defaultBranchRef { name target { ... on Commit {
   oid file(path:$p){ object { ... on Blob { text isBinary isTruncated } } }
   history(path:$p, first:2){ nodes { oid committedDate associatedPullRequests(first:5){ nodes { number merged baseRefName
-    mergeCommit { oid } files(first:100){ pageInfo { hasNextPage endCursor } nodes { path changeType } } } } } } } } } } }
+    baseRepository { nameWithOwner } mergeCommit { oid }
+    files(first:100){ pageInfo { hasNextPage endCursor } nodes { path changeType } } } } } } } } } } }
 ```
 Page: `repository(owner:$o,name:$n){ pullRequest(number:$num){ files(first:100, after:$after){ pageInfo { hasNextPage endCursor }
 nodes { path changeType } } } }` (`-F num=<n>`). Args: `['api', '--hostname', 'github.com', 'graphql', '-f', 'query=…', '-f', 'o=…',
@@ -290,6 +317,11 @@ then ask for the owner's go"; `no-time` ⇒ "not enough time was left to check: 
     attempted/ (the `sql-*` history). *(R1-1: two names)*
   - `auto: an imported earlier go apply (generation via go-import) blocks it` — seed `name-*-1` only, then `sql-*-1` only ⇒ deny both
     times, 0 gh calls. *(R2-4 in the guard)*
+  - `auto: a go consumed with no history (a rollback, a go during the import) blocks it; an unreadable consumed marker refuses` —
+    a consumed marker with this ref and sha (old body, no name), then one with this name and other SQL ⇒ deny, 0 gh calls; an empty
+    one ⇒ deny naming it. *(F-P2b)*
+  - `auto: a file merged before the switch-on time, or a PR from another repository, needs the go` — `committedDate` 1 min before
+    `autoSince`; `baseRepository.nameWithOwner: 'fork/widgets'` ⇒ deny. *(F-P3: switch-on moment; fork association)*
   - `auto: two enabled entries with the same repo: auto is off for both and GitHub is asked nothing`. *(R1 P2: the wrong database)*
   - `the module exports only fixed-destination claims; hostile names stay inside their folders` — the export list equals the final
     surface (Tasks 2 + 3); `claimNext` with name `../../db-refs` and `claimGoMarker` with promptId `../../x` create only hashed files in
@@ -299,8 +331,9 @@ then ask for the owner's go"; `no-time` ⇒ "not enough time was left to check: 
   - `through the real hook entry: GitHub that never answers, and a populated pending-click folder, are a deny within the host timeout`
     — spawn `pipeline/hooks/guard-files.mjs` (the `spawnHook` pattern of `test/guard-deny-log.test.mjs:195`) with `HOME` = the scratch
     home, the flag on, no go: (1) `PIPELINE_GH` = `node <scratch>/slow-gh.mjs` (sleeps 30 s) ⇒ deny in under 14 s, reason says GitHub
-    did not answer in time; (2) 5,000 pending click files of other sessions + the slow gh ⇒ deny in under 14 s. *(R1-2/R2-2 end to end:
-    a killed hook counts as an allow)*
+    did not answer in time; (2) 5,000 pending click files of other sessions + the slow gh ⇒ deny in under 14 s; (3) a pending live-db
+    click of this session and a `git` PATH shim that sleeps 30 s ⇒ deny in under 14 s. *(R1-2/R2-2/F-P1 end to end: a killed hook
+    counts as an allow)*
 - [ ] **Step 2: Run** `node --test test/live-db-guard.test.mjs` → the new tests FAIL; the existing PASS.
 - [ ] **Step 3: Implement** `autoApply` per the check order; export `sqlCharProblem` from `live-db-go.mjs` (empty, U+FFFD, CR/NUL,
   `HIDING_CHARS`) and have `migrationSqlProblem` call it first; wire `evaluateSupabaseMcp`.

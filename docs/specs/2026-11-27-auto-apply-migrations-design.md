@@ -4,8 +4,11 @@ Status: design, owner approach pick 2026-11-27 ("After the merge only"), approve
 plan review R1 (7 × P1) hardened the claim, the time budget, the GitHub proof and the marker files; the owner chose (11-27) that a
 migration marked `-- pipeline: apply-after-deploy` keeps the go (one click after the deploy; the deploy-checked variant is idea #882).
 **Revision 3 (11-27)** after the Codex recheck: a generation history (every allowed apply advances it), the time budget through click
-settling, the marker found anywhere, `on` imports the earlier go applies, durable folders, switch-off unchanged. Sections 1–5 below
-are Revision 3; where the plan is more detailed, the plan governs.
+settling, the marker found anywhere, `on` imports the earlier go applies, durable folders, switch-off unchanged. **Revision 3.1**
+after the Fable plan pass (no double allow found): one git deadline at the choke point covering every route to the go check; full
+generation probing; auto also refuses a consumed go of this name or SQL (a rollback); a click's go time is its dialog's issue time;
+the PR's base repository must match; only files merged after the switch-on time auto-apply. Sections 1–5 below are Revision 3; where
+the plan is more detailed (Revision 3.1), the plan governs.
 Plan: `docs/plans/2026-11-27-auto-apply-migrations.md`.
 
 ## Why
