@@ -92,7 +92,11 @@ export const run = guarded(async (argv, ctx) => {
     let usd = num('usd');
     let byPrice = {};
     let complete = false;
-    if (values.usd === undefined) {
+    // plan-codex is tokens only: its USD is never derived from --model or a transcript, only an explicit --usd sets it.
+    const tokensOnly = normaliseRole(role) === 'plan-codex';
+    if (values.usd === undefined && tokensOnly) {
+      usd = 0;
+    } else if (values.usd === undefined) {
       const ownPriced = ownTokens && values.model !== undefined ? priceMessage(values.model, own) : null;
       usd = fromFile.usd + (ownPriced?.usd ?? 0);
       // Buckets hold the tokens the table priced (a transcript's, and hand tokens given with --model); hand tokens without a model

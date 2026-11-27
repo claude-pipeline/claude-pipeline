@@ -724,3 +724,35 @@ test('a trip-wire stop is the existing outcome blocked with detail process-revie
   assert.equal(decoded.status, 'ok');
   assert.equal(decoded.record.outcome, 'blocked');
 });
+
+// Issue #820 (round 1): a message whose usage is `{}` counted as one usage-bearing message, so the first --retry booking of a not-yet-filled transcript wrote a transcript key + a retry and the real booking later made 2 calls and 2 retries.
+test('P cost --from-transcript: a transcript whose only usage is {} is empty (skipped); explicit zero token fields still count as a real call', () => {
+  const s = scenario();
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: {} } })}\n`);
+  const args = ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl'];
+  const first = costCli(s, args);
+  assertExit(first, 0);
+  assert.equal(first.json.skipped, 'empty-transcript');
+  assert.equal(first.json.recorded, false);
+  s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  const second = costCli(s, args);
+  assertExit(second, 0);
+  assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries], [1, 1]);
+  const zero = scenario();
+  zero.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 0, output_tokens: 0 } } })}\n`);
+  const z = costCli(zero, ['--phase', 'review', '--role', 'judge', '--from-transcript', '.review/t.jsonl']);
+  assertExit(z, 0);
+  assert.equal(z.json.skipped, undefined);
+  assert.equal(z.json.cost.total.calls, 1);
+});
+
+// Issue #501 (round 1): the CLI promises plan-codex is tokens only unless --usd is given, but --model priced the tokens and added a Sonnet charge to the PR total.
+test('P cost --role plan-codex --model sonnet: tokens only, no USD and no price bucket; an explicit --usd still sets the amount', () => {
+  const r = costCli(scenario(), ['--phase', 'plan', '--role', 'plan-codex', '--input', '1000000', '--output', '1000000', '--model', 'sonnet']);
+  assertExit(r, 0);
+  assert.deepEqual([r.json.cost.byRole['plan-codex'].input, r.json.cost.byRole['plan-codex'].usd, r.json.cost.total.usd], [1000000, 0, 0]);
+  assert.equal(r.json.bucketed, false);
+  const usd = costCli(scenario(), ['--phase', 'plan', '--role', 'plan-codex', '--input', '1000', '--model', 'sonnet', '--usd', '0.5']);
+  assertExit(usd, 0);
+  assert.equal(usd.json.cost.byRole['plan-codex'].usd, 0.5);
+});
