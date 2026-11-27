@@ -112,14 +112,14 @@ test('merge --ask: an allowlisted build issues the ask; another build or an unkn
     if (AI_AGENT === undefined) delete env.AI_AGENT;
     return mergeRun(mergeArgs('--ask'), { ...mergeCtx(s, home), env });
   };
-  for (const build of ['claude-code_2-1-322_agent', 'claude-code_2-1-323_agent']) {
+  for (const build of ['claude-code_2-1-322_agent', 'claude-code_2-1-323_agent', 'claude-code_2-1-332_agent']) {
     const r = await askedAs(newHome(), build);
     assert.match(r.output.ask?.askId ?? '', /^ask-[0-9a-f]{12}$/, build);
   }
   const other = newHome();
   const o = await askedAs(other, 'claude-code_2-1-330_agent');
   assert.equal(o.output.ask, null);
-  assert.equal(o.output.askSkipped, 'build 2.1.330 not allowlisted for clicks (verified builds: 2.1.322, 2.1.323; the owner types instead)');
+  assert.equal(o.output.askSkipped, 'build 2.1.330 not allowlisted for clicks (verified builds: 2.1.322, 2.1.323, 2.1.332; the owner types instead)');
   assert.deepEqual(asks(other), []);
   for (const agent of [undefined, 'something-else']) {
     const unknown = newHome();
