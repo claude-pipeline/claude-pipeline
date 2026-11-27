@@ -646,3 +646,12 @@ test('#903 B: on Windows the runner runs the text with cmd: a spelling only cmd 
   const w = filesGuard(line, {}, { platform: 'win32' });
   assert.equal(w.decision, 'deny', 'win32: the text is cmd text, which the guard cannot read exactly');
 });
+test('#903 everyday runner lines stay allowed by both guards (a setting that is not call / script_shell, a command word, an info flag, data on stdin)', () => {
+  const t = { 'src/index.js': 'x' };
+  for (const cmd of ['npx prettier --check .', 'npm_config_yes=true npx prettier .', 'npm_config_registry=https://r.example npx prettier .', 'NODE_OPTIONS=--max-old-space-size=4096 npx vitest run', 'npx --version', 'npm exec --help',
+    'npx -y create-thing app', 'echo hi | npx prettier --stdin-filepath x.js', 'pnpm exec prettier .', 'npx playwright test -c /abs/x.config.ts',
+    // the shapes a looser reading of "unknown option" would have refused (a command word is there, so stdin is data)
+    'cat src/index.js | npx --no-install prettier --stdin-filepath x.js', 'git log --merges -1 --pretty=%B | npx --no-install commitlint', 'npx --loglevel error tool < src/index.js', 'npm exec --offline tool < src/index.js',
+    'echo hi | timeout 30 npx prettier .', 'echo hi | env FOO=1 npx prettier --stdin-filepath x.js', 'echo hi | xargs npx prettier', 'echo hi | npx --foo hi there']) ok(cmd, t);
+  ok(`npx -q tool <<'EOF'\nconst a = []; a.${PUSH}(1);\nEOF`, t);
+});
