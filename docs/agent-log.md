@@ -347,3 +347,4 @@ full record.
 - 2026-11-27 · #872 · Owner-go: a queued "merge" is refused with its real reason; no click ask on an unverified build (#740, #713) · risk high · rounds 3 · arbiter 3 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 544 runs (212 high)
 - 2026-11-27 · #875 · CI shard timings: a nested test run no longer wipes them; weights take only complete runs; baseline script · risk high · rounds 5 · arbiter 4 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 546 runs (211 high)
 - 2026-11-27 · #877 · Fix-scope counts only the PR's own change after a conflicted base merge (#742) · risk high · rounds 2 · arbiter 1 · blocked · Codex 7d: 550 runs (214 high)
+- 2026-11-27 · #879 · P cost: an empty-transcript booking books nothing (no double count); a plan phase for plan reviews (#820, #501) · risk high · rounds 1 · arbiter 0 · blocked · Codex 7d: 550 runs (213 high)
