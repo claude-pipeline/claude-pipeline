@@ -13,7 +13,7 @@ import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { buildBlock, liveDbGoOutcome, sha256Of } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { LIVE_DB_CONSUMED_REL, claimLiveDbGo, evaluateSupabaseMcp, isSupabaseTool } from '../pipeline/hooks/lib/live-db-guard.mjs';
 import { buildCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
-import { evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
+import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
 import { HOOK_CLOCK } from '../pipeline/hooks/lib/script-candidates.mjs';
 
 const REF = 'abcdefghij0123456789';
@@ -141,6 +141,20 @@ test('catalog templates need no go; other SQL does; unknown targets, untrusted s
   for (const n of ['merge_branch', 'deploy_edge_function', 'run_notebook', 'pause_project']) assert.equal(evaluateSupabaseMcp(`${TOOL}${n}`, { project_id: REF }, s.ctx).decision, 'deny', n);
   assert.equal(evaluateSupabaseMcp(`${TOOL}query_logs`, { project_id: REF }, s.ctx).decision, 'allow');
   assert.equal(evaluateSupabaseMcp('mcp__supabase__apply_migration', { project_id: REF, name: NAME, query: SQL }, s.ctx).decision, 'allow', 'the bare `supabase` server is trusted too');
+});
+
+// #701 / #746: the refusal of a plain read points at the read-only CLI form, and the guard itself allows that form (file and inline)
+test('an execute_sql refusal for a read hints a db query command the Bash guard allows', async (t) => {
+  const s = await scene(t);
+  const query = 'select count(*) from public.t';
+  const d = sql(s, query);
+  assert.equal(d.decision, 'deny');
+  const m = d.reason.match(new RegExp(`\`(supabase db query --read-only --remote=${REF} -f <file\\.sql>)\``));
+  assert.ok(m, d.reason);
+  const opts = { home: s.home, env: {}, platform: 'linux', realpath: (p) => p, existsSync: () => false, cwd: '/repo' };
+  const fileForm = m[1].replace('<file.sql>', '/tmp/q.sql');
+  const inlineForm = m[1].replace('-f <file.sql>', `"${query}"`);
+  for (const line of [fileForm, inlineForm]) assert.equal(evaluateBashForFiles(line, opts).decision, 'allow', line);
 });
 
 test('dev refs are exempt only on a server the owner listed', async (t) => {
