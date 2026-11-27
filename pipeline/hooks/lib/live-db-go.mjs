@@ -110,6 +110,27 @@ function displayLines(sql) {
   return lines;
 }
 
+// ---- #811: which migration names apply_migration may carry ------------------------------------------------------------------------------
+
+// The CLI's own filename rule (`MigrationList.local`: `^([0-9]+)_(.*)\.sql$`; an EMPTY suffix like `0261_.sql` is still version 0261) decides what `supabase db push` reads as a version. `stem`: the name of an
+// apply_migration call (no `.sql`). kind: `timestamp` = exactly 14 digits whose first 8 are a valid date YYYYMMDD (HHMMSS is not checked: EagleWatch uses it as a counter, `20260907240000_…`);
+// `numbered` = any other digit run (DRMed's `0261_x.sql`); `none` = no digit run then `_`. `version` keeps leading zeros as text. -> { kind, version, name }
+const DAYS = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+const validDate = (d) => {
+  const y = Number(d.slice(0, 4));
+  const m = Number(d.slice(4, 6));
+  const day = Number(d.slice(6, 8));
+  const leap = (y % 4 === 0 && y % 100 !== 0) || y % 400 === 0;
+  return y >= 1 && m >= 1 && m <= 12 && day >= 1 && day <= (m === 2 && leap ? 29 : DAYS[m - 1]);
+};
+export function migrationVersionOf(basename, { stem = false } = {}) {
+  const m = (stem ? /^([0-9]+)_(.*)$/s : /^([0-9]+)_(.*)\.sql$/s).exec(String(basename ?? ''));
+  if (!m) return { kind: 'none', version: null, name: null };
+  return { kind: m[1].length === 14 && validDate(m[1]) ? 'timestamp' : 'numbered', version: m[1], name: m[2] };
+}
+// the refusal text for a numbered migration (present, verifyBlock, the guard): `what` names the file or the migration
+export const numberedMigrationReason = (what) => `${what} is a numbered migration: \`apply_migration\` would record a timestamp version and break \`supabase db push\`. The owner runs \`supabase db push\` by hand.`;
+
 // ---- the block --------------------------------------------------------------------------------------------------------------------
 
 export function statementsLine(sql) {
@@ -227,6 +248,7 @@ export function verifyBlock(replyText, { home = accountHome(), io = {} } = {}) {
   if ((repoRaw === '-' ? null : repoRaw) !== repo) return fail('the repo in the binding line is not the checkout\'s origin');
   if (op === 'migration') {
     if (dir === null || headRaw === '-' || !MIGRATION_FILE.test(fileRaw)) return fail('a migration block needs a dir, a full head commit and a supabase/migrations/*.sql file');
+    if (migrationVersionOf(path.posix.basename(fileRaw)).kind === 'numbered') return fail(numberedMigrationReason(fileRaw));
     head = headRaw;
     file = fileRaw;
     name = path.posix.basename(file, '.sql');
@@ -268,7 +290,7 @@ export function liveDbGoOutcome(input, { home = accountHome(), now = Date.now, i
     if (queuedAnswer(input)) return { reason: 'the owner typed it while the agent was still working' };
     const prompt = String(input.prompt);
     if (prompt.length > GO_PROMPT_MAX) return { reason: 'the prompt is too long for a go' };
-    const reply = lastReply(transcript, { prompt, skipSynthetic: true }).text;
+    const reply = lastReply(transcript, { prompt, skipSynthetic: true, liveDb: true }).text;
     const v = verifyBlock(reply, { home, io });
     if (!v.ok) return { reason: v.reason };
     const f = v.fields;

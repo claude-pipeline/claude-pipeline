@@ -12,8 +12,8 @@ import { OWNER_ENTRY, linesOf, runHook } from './helpers/owner-go.mjs';
 import { run } from '../pipeline/commands/live-db.mjs';
 import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
-import { buildBlock, canonicalDataSql, checkedTopLevel, summaryProblem, migrationSqlProblem, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
-import { queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
+import { buildBlock, canonicalDataSql, checkedTopLevel, summaryProblem, migrationSqlProblem, migrationVersionOf, liveDbGoOutcome, liveDbRecords, parseGo, sha256Of, recordLiveDbGo } from '../pipeline/hooks/lib/live-db-go.mjs';
+import { lastReply, queuedNudge } from '../pipeline/hooks/lib/owner-go.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { matchCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
 
@@ -234,6 +234,94 @@ test('the real hook script records the go and prints one line; a go it cannot re
   const bad = runHook(t, { entries, prompt: 'go migration other' });
   assert.equal(bad.record, null);
   assert.match(bad.stdout, /NOT recorded: the typed "other" is not/);
+});
+
+// ---- #741: the typed go reads a turn the harness started ----------------------------------------------------------------------
+
+const NOTICE = { origin: { kind: 'task-notification' }, promptSource: 'system', entrypoint: 'cli' };
+const notice = (over = {}) => ({ type: 'user', message: { content: '<task-notification>background job finished</task-notification>' }, ...NOTICE, ...over });
+const textOf = (text) => ({ type: 'assistant', message: { content: [{ type: 'text', text }] } });
+const toolUse = (id, name, input, over = {}) => ({ type: 'assistant', message: { content: [{ type: 'tool_use', id, name, input }] }, ...over });
+const toolResult = (id, content, over = {}) => ({ type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: id, content }] }, ...over });
+// the owner's turn, `middle`, then the owner's typed `prompt`; the outcome of the recorder, and the transcript for a reader
+function goAfter(w, t, prompt, middle) {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-live-db-go-n-'));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const transcript = join(dir, 'projects', '-repo', 't.jsonl');
+  mkdirSync(join(dir, 'projects', '-repo'), { recursive: true });
+  const promptId = `pid-${randomUUID()}`;
+  writeFileSync(transcript, linesOf([
+    { type: 'user', message: { content: 'start the job' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
+    textOf('Started it.'),
+    ...middle,
+    { type: 'user', message: { content: prompt }, promptId, ...OWNER_ENTRY },
+  ]));
+  const input = { hook_event_name: 'UserPromptSubmit', session_id: w.session, transcript_path: transcript, cwd: w.repo.dir, prompt, prompt_id: promptId };
+  return { out: liveDbGoOutcome(input, { home: w.home }), transcript, input };
+}
+const otherSql = 'update t set a = 2 where id = 7';
+const goData = (sql) => `go data ${sha256Of(sql).slice(0, 12)}`;
+
+test('B1b: owner prompt P2 shows block A as text while the still-open visible turn P1 shows block B only in a tool result after it: neither go records', async (t) => {
+  // Failure caught: another visible turn printed a second block in a tool box after the reply, and the typed-go reader still took block A as the last thing the owner was shown.
+  const w = world(t);
+  await setup(w);
+  const shownB = JSON.stringify({ ok: true, block: dataBlock(w, { sql: otherSql }).join('\n') });
+  const middle = [
+    { type: 'user', message: { content: 'status?' }, promptId: 'pid-p1', uuid: 'u-p1', ...OWNER_ENTRY },
+    { type: 'user', message: { content: 'ok' }, promptId: 'pid-ok', ...OWNER_ENTRY }, textOf(dataBlock(w).join('\n')),
+    toolUse('tu2', 'Bash', { command: 'node x present' }, { parentUuid: 'u-p1', uuid: 'u-tu2' }), toolResult('tu2', shownB, { parentUuid: 'u-tu2' }),
+  ];
+  assert.equal(goAfter(w, t, goData(dataSql), middle).out?.record, undefined, 'a go for A');
+  assert.equal(goAfter(w, t, goData(otherSql), middle).out?.record, undefined, 'a go for B');
+});
+
+test('R4-B1: the owner turn shows data block A, a tool-only task notice then shows the same SQL for another project in a tool result: the typed go records nothing', async (t) => {
+  // Failure caught: a visible notice turn with no text and no ruling words left the earlier owner-turn block selected, so `go data <sha12>` (same SQL hash for both projects) was recorded for project A.
+  const w = world(t);
+  await setup(w);
+  const shownB = JSON.stringify({ ok: true, block: dataBlock(w, { ref: 'qqqqqqqqqqqqqqqqqqqq', label: 'Other prod' }).join('\n') });
+  const middle = [textOf(dataBlock(w).join('\n')), notice(), toolUse('tu9', 'Bash', { command: 'node x present' }), toolResult('tu9', shownB)];
+  assert.equal(goAfter(w, t, goData(dataSql), middle).out?.record, undefined);
+});
+
+test('a block shown only in a turn a task notice started is no reply: the typed go is refused (it must be shown again in the owner\'s own turn, #916)', async (t) => {
+  // Failure caught: the typed go recorded against a block a notice turn printed, which the owner may never have read.
+  const w = world(t);
+  await setup(w);
+  const { out, transcript } = goAfter(w, t, goData(dataSql), [notice(), textOf(dataBlock(w).join('\n'))]);
+  assert.equal(out?.record, undefined);
+  assert.deepEqual(lastReply(transcript, { prompt: goData(dataSql), skipSynthetic: true }), { text: '', promoted: false });
+});
+
+// ---- #811: a numbered migration is never presented, verified or applied through apply_migration ---------------------------------------------------------------------------
+
+test('migrationVersionOf: a version is a timestamp only when it is 14 digits starting with a valid date; every other digit run is numbered, an empty suffix too', () => {
+  // Failure caught: DRMed's 0261_x.sql read as a timestamp (or EagleWatch's counter-style 20260907240000_x.sql read as numbered and refused), so apply_migration recorded the wrong version or a real file was blocked.
+  const kind = (n, o) => migrationVersionOf(n, o).kind;
+  for (const n of ['20261117000000_add_col.sql', '20260907240000_x.sql', '20260513006000_x.sql', '20240229000000_leap.sql']) assert.equal(kind(n), 'timestamp', n);
+  for (const n of ['0261_x.sql', '0261_.sql', '2026111700000_x.sql', '202611170000000_x.sql', '20261332000000_x.sql', '00000000000001_x.sql', '20230229000000_not_leap.sql']) assert.equal(kind(n), 'numbered', n);
+  for (const n of ['abc.sql', 'add_col.sql', '_x.sql', '0261.sql']) assert.equal(kind(n), 'none', n);
+  assert.equal(migrationVersionOf('0261_x.sql').version, '0261');
+  assert.equal(kind('0261_', { stem: true }), 'numbered');
+  assert.equal(kind('20261117000000_add_col', { stem: true }), 'timestamp');
+  assert.equal(kind('add_col', { stem: true }), 'none');
+});
+
+test('#811: present refuses a numbered migration (also with an empty suffix) with reason numbered-migration, and an old block for one fails verification', async (t) => {
+  // Failure caught: a numbered file presented, clicked or typed, then applied by apply_migration under a generated timestamp version, leaving 0261 pending and breaking every later db push.
+  for (const stem of ['0261_x', '0261_']) {
+    const file = `supabase/migrations/${stem}.sql`;
+    const w = world(t, { file });
+    await setup(w);
+    const r = await run(['present', '--op', 'migration', '--pr', '5', '--file', file, '--project', REF, '--summary', 'adds c'], { ...w.ownerCtx, cwd: w.repo.dir, gh: { prView: () => ({ headRefOid: w.head }) } });
+    assert.equal(r.exitCode, 1, stem);
+    assert.equal(r.output.reason, 'numbered-migration');
+    assert.match(r.output.message, /numbered migration.*The owner runs `supabase db push` by hand/s);
+    const old = say(w, t, `go migration ${stem}`, migBlock(w, { name: stem, file }));
+    assert.equal(old.record, undefined, `an old block for ${stem}`);
+    assert.match(old.reason, /numbered migration/);
+  }
 });
 
 // ---- the guard keeps the recorder out of an agent's hands ----------------------------------------------------------------------------

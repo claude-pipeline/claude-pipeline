@@ -1,8 +1,23 @@
 // Why (#261): the PostToolUse half of hooks/owner-go.mjs, kept here so a test can hand it a home and a recorder (the hook script itself always runs, takes the account's real home
 // and exits 0). One AskUserQuestion hook input -> the one line the agent is told, or null (nothing printed). Never throws.
 import { recordClick } from './owner-go-click.mjs';
+import { replyBeforeToolUse } from './owner-go.mjs';
 
 const HEAD = '[claude-pipeline owner-go]';
+
+// #741 (B1b): a live-database click is claimed only when the reply right before its dialog ends with the block (live-db-guard.mjs). The guard says why it refuses only when Claude calls the Supabase write; this says it
+// at the click, so the agent presents again at once instead of failing at the write. Only the reply rules that need no block rebuild are checked here (no text, a progress note only, a hidden turn, another turn's block);
+// silent when the dialog's tool_use entry is not in the transcript yet (no false refusal before the write lands) and for every click that is not a live-database one. null | the line.
+function liveDbDialogRefusal(input, result) {
+  if (result?.pending?.kind !== 'live-db' && result?.recorded?.kind !== 'live-db-go') return null;
+  let shown;
+  try { shown = replyBeforeToolUse(String(input?.transcript_path ?? ''), input?.tool_use_id); } catch { return null; }
+  if (shown.reason === undefined || shown.missing === true) return null;
+  // a pending click does not say which label the owner chose (the answer is not in the transcript yet), so the recovery is conditional on an approval; a recorded click is a Yes
+  const again = 'run live-db present again, end the reply with its block as text (the last thing before the dialog) and show the dialog again, or ask the owner to type the go';
+  if (result?.pending) return `${HEAD} the owner's click on the live-database dialog is received, and if it approves the guard will not accept it: ${shown.reason}. Nothing is applied. If the owner chose to apply, ${again}; if they chose not to, stop: nothing is applied`;
+  return `${HEAD} the owner's click on the live-database dialog will not be accepted: ${shown.reason}. Nothing is applied; ${again}`;
+}
 
 // Why (#472): on Claude Code 2.1.323 the answer's transcript entry is written after the PostToolUse hooks return, so the click is only kept PENDING here (recordClick `{ pending }`) and is verified by
 // the consumer that looks for it (`P merge --owner-go` and the others settle first, in the same turn). The line says exactly that: the click is RECEIVED, it is verified when used, and which command to
@@ -85,7 +100,8 @@ export async function dialogHookCheck({ home, input }, load = () => import('./di
 export async function clickHookLine(input, { record = recordClick, check = dialogHookCheck, ...opts } = {}) {
   try {
     if (input?.hook_event_name !== 'PostToolUse' || input.tool_name !== 'AskUserQuestion') return null;
-    return clickLine(await record(input, { ...opts, hookCheck: check }));
+    const result = await record(input, { ...opts, hookCheck: check });
+    return liveDbDialogRefusal(input, result) ?? clickLine(result);
   } catch {
     return null;
   }

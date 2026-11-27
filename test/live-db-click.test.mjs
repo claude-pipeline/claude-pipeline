@@ -17,6 +17,7 @@ import { buildBlock, sha256Of } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { claimLiveDbGo, evaluateSupabaseMcp } from '../pipeline/hooks/lib/live-db-guard.mjs';
 import { asksDir, clickProvenance, liveDbAsk, issueAsk, matchesInstalledDialog, readAsk, recordClick } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { readRecords } from '../pipeline/hooks/lib/owner-go.mjs';
+import { clickHookLine } from '../pipeline/hooks/lib/owner-go-click-hook.mjs';
 
 const realGitPath = '/usr/bin/git';
 const REF = 'abcdefghij0123456789';
@@ -33,9 +34,11 @@ const text = (es) => `${es.map((e) => JSON.stringify(e)).join('\n')}\n`;
 
 // One world: registry, a repo with the migration, the block `present` prints, the issued ask and a 2.1.323 transcript (prompt + tool_use; the answer's entry is appended by w.flush()).
 // `rebase`: shift every fixture timestamp so the answer lands seconds before the real clock (for a test that spawns the real hook, which reads Date.now()).
-// `reply`: the assistant texts printed before the dialog, one transcript entry each, or a function (block, dir) -> texts (default: the block `present` printed, pasted last).
+// `reply`: the entries printed before the dialog, or a function (block, dir) -> items (default: the block `present` printed, pasted last). An item is a text (an assistant entry), `{ blocks }` (an assistant entry with
+// these content blocks), `{ result }` (a tool_result user entry) or `{ prompt }` (another owner prompt); `own: false` keeps it out of the dialog's own chain, `uuid` / `parent` set its place in the chain.
+// `promptOver`: fields written over the fixture's prompt entry (its provenance).
 const dir0 = (repo) => repo.dir;
-async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null, flag = false, rebase = false } = {}) {
+async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null, flag = false, rebase = false, promptOver = null } = {}) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'cp-live-db-click-')));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   mkdirSync(join(home, '.claude'), { recursive: true });
@@ -66,9 +69,24 @@ async function world(t, { op = 'migration', answer = null, flush = false, modelA
   result.message.content[0].content = `Your questions have been answered: "${dialog.question}"="${chosen}". You can now continue with these answers in mind.`;
   mkdirSync(join(home, '.claude-t', 'projects', '-repo'), { recursive: true });
   const file = join(home, '.claude-t', 'projects', '-repo', `${use.sessionId}.jsonl`);
-  const said = (typeof reply === 'function' ? reply(block, dir0(repo)) : reply ?? [block]).map((txt, i) => ({ ...structuredClone(use), uuid: `11111111-0000-4000-8000-00000000000${i}`, message: { role: 'assistant', content: [{ type: 'text', text: txt }] }, timestamp: new Date(Date.parse(use.timestamp) - 5000 + i).toISOString() }));
-  said.forEach((e, i) => { e.parentUuid = i === 0 ? prompt.uuid : said[i - 1].uuid; });
-  use.parentUuid = said.length ? said[said.length - 1].uuid : prompt.uuid;
+  if (promptOver !== null) Object.assign(prompt, promptOver);
+  let ownPrev = prompt.uuid; // the last entry of the dialog's own chain
+  let prev = prompt.uuid;
+  const said = (typeof reply === 'function' ? reply(block, dir0(repo)) : reply ?? [block]).map((it, i) => {
+    const item = typeof it === 'string' ? { blocks: [{ type: 'text', text: it }] } : it;
+    const uuid = item.uuid ?? `11111111-0000-4000-8000-00000000000${i}`;
+    const timestamp = new Date(Date.parse(use.timestamp) - 5000 + i).toISOString();
+    const parentUuid = item.parent ?? (item.own === false ? prev : ownPrev);
+    const e = item.result !== undefined
+      ? { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `toolu_fix${i}`, content: item.result }] }, uuid, parentUuid, timestamp, sessionId: use.sessionId }
+      : item.prompt !== undefined
+        ? { type: 'user', message: { role: 'user', content: item.prompt }, promptId: `pid-fix${i}`, uuid, parentUuid, timestamp, origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli', sessionId: use.sessionId }
+        : { ...structuredClone(use), uuid, parentUuid, timestamp, message: { role: 'assistant', content: item.blocks } };
+    if (item.own !== false) ownPrev = uuid;
+    prev = uuid;
+    return e;
+  });
+  use.parentUuid = ownPrev;
   writeFileSync(file, text(flush ? [prompt, ...said, use, result] : [prompt, ...said, use]));
   const answeredAt = Date.parse(result.timestamp);
   const w = {
@@ -156,6 +174,13 @@ test('2.1.323 write order: the click is pending at the hook, the claim says unve
   assert.equal(w.claim().status, 'claimed', 'the claim settled the pending click first');
   assert.equal(w.records().length, 1);
   assert.equal(w.claim().status, 'spent');
+  // B1b: the click-time check names no refusal for a valid reply (a tool result earlier in the turn, then the block as text), nor while the dialog's tool_use entry is not in the transcript yet
+  const valid = await world(t, { reply: (b) => [{ blocks: [{ type: 'tool_use', id: 'toolu_present', name: 'Bash', input: { command: 'present' } }] }, { result: JSON.stringify({ ok: true, block: b }) }, b] });
+  const asLine = (x) => clickHookLine(x.input, { home: x.home, now: () => x.t, sleep: noSleep, pollMs: 0, check: OK });
+  assert.match(await asLine(valid), /the owner's click is received and is verified when it is used/);
+  const unwritten = await world(t, { reply: [{ blocks: [{ type: 'thinking', thinking: 'a note', signature: 'x' }] }] });
+  writeFileSync(unwritten.file, text([fixture()[0]])); // the transcript before the dialog's entry landed
+  assert.match(await asLine(unwritten), /the owner's click is received and is verified when it is used/, 'silent, never a false refusal before the write lands');
 });
 
 test('declining records nothing; a dialog the model prefilled with answers is refused; a click is spent once (the ask itself)', async (t) => {
@@ -335,4 +360,80 @@ test('through the real hook entry: a pending click of this session and a git tha
   assert.ok(existsSync(argvLog), 'the settling route reached a git read');
   assert.match(readFileSync(argvLog, 'utf8').split('\n')[0], /rev-parse --show-toplevel$/, 'the hung call is the first git read of the block verification');
   assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
+});
+
+// ---- #741 (B1b): the reply right before the dialog -------------------------------------------------------------------------------------------------------------------------
+
+const present = (b) => [{ blocks: [{ type: 'tool_use', id: 'toolu_present', name: 'Bash', input: { command: 'node pipeline.mjs live-db present --ask' } }] }, { result: JSON.stringify({ ok: true, block: b }) }];
+const progress = { blocks: [{ type: 'thinking', thinking: 'Showing the block now', signature: 'sig' }] };
+
+test('B1b: a dialog whose message holds only a progress note is refused with that reason at the click and at the claim', async (t) => {
+  // Failure caught (transcripts 3ba22acc, 9f16c301): Claude Code recorded only a narration `thinking` block before AskUserQuestion; the click was refused later with "a different block" and the agent could not tell why.
+  const w = await world(t, { flush: true, reply: [progress] });
+  const line = await clickHookLine(w.input, { home: w.home, now: () => w.t, sleep: noSleep, pollMs: 0, check: OK });
+  assert.match(line, /will not be accepted: no reply text before the dialog \(Claude Code recorded only a progress note\)/);
+  const c = w.claim();
+  assert.equal(c.status, 'unverified');
+  assert.match(c.reason, /no reply text before the dialog \(Claude Code recorded only a progress note\)/);
+  assert.equal(w.apply().decision, 'deny');
+});
+
+test('R1-B7: a PENDING click (the label is not known yet) on a dialog with no reply text tells the agent to recover only if the owner chose to apply, and to stop otherwise', async (t) => {
+  // Failure caught: the pending click line told the agent unconditionally to show the dialog again, so after the owner's "Not yet" the agent asked for the same approval at once.
+  const w = await world(t, { reply: [progress] });
+  const line = await clickHookLine(w.input, { home: w.home, now: () => w.t, sleep: noSleep, pollMs: 0, check: OK });
+  assert.match(line, /no reply text before the dialog \(Claude Code recorded only a progress note\)/);
+  assert.match(line, /If the owner chose to apply, run live-db present again/);
+  assert.match(line, /if they chose not to, stop: nothing is applied/);
+});
+
+test('B1b: an older valid block, a tool result, then a progress-note-only dialog is refused; present, a tool result, then the block as text and the dialog is claimed', async (t) => {
+  // Failure caught: the block printed earlier in the turn (before another tool call) counted as the reply right before the dialog, so a click bound to text the owner was no longer shown last.
+  const old = await world(t, { flush: true, reply: (b) => [b, ...present(b), progress] });
+  assert.ok((await old.hook()).recorded);
+  const c = old.claim();
+  assert.equal(c.status, 'unverified');
+  assert.match(c.reason, /no reply text before the dialog/);
+  const ok = await world(t, { flush: true, reply: (b) => [...present(b), b] });
+  assert.ok((await ok.hook()).recorded);
+  assert.equal(ok.claim().status, 'claimed');
+});
+
+test('B1b: a dialog whose turn chains to a headless (sdk) prompt is refused as a turn the owner does not see', async (t) => {
+  // Failure caught: a `claude -p --resume` process writing the block and the dialog into the owner's transcript, where the owner sees neither, and a click answer being bound to it.
+  const w = await world(t, { flush: true, promptOver: { promptSource: 'sdk', entrypoint: 'sdk-cli', origin: { kind: 'sdk' } } });
+  await w.hook();
+  const c = w.claim();
+  assert.notEqual(c.status, 'claimed');
+  const line = await clickHookLine(w.input, { home: w.home, now: () => w.t, sleep: noSleep, pollMs: 0, check: OK });
+  assert.match(line ?? '', /not one the owner sees/);
+});
+
+test('R1-B5: the first half of block A, another visible turn showing block B, then the rest of block A and the dialog: the pieces are not joined, the click is not claimed', async (t) => {
+  // Failure caught: the reader skipped other turns' entries while joining the reply's text pieces and looked for an interleaved block only after the LAST piece, so A's two halves around B passed as the block the owner last saw.
+  const w = await world(t, {
+    flush: true,
+    reply: (b, dir) => {
+      const lines = b.split('\n');
+      return [lines.slice(0, 5).join('\n'), { prompt: 'status?', own: false, uuid: 'u-p1' }, { blocks: [{ type: 'tool_use', id: 'toolu_other', name: 'Bash', input: { command: 'present' } }], own: false, uuid: 'u-tu', parent: 'u-p1' },
+        { result: JSON.stringify({ ok: true, block: buildBlock({ op: 'data', ref: REF, label: LABEL, repo: 'acme/widgets', dir, sql: 'update t set a = 2 where id = 7', summary: 'fix' }).join('\n') }), own: false, parent: 'u-tu' },
+        lines.slice(5).join('\n')];
+    },
+  });
+  await w.hook();
+  assert.equal(w.claim().status, 'unverified');
+  assert.equal(w.apply().decision, 'deny');
+});
+
+test('B1b: reply A, then another visible turn shows block B only in a tool result, then the dialog for A: refused', async (t) => {
+  // Failure caught: an interleaved visible turn printed a different block in a tool box after the reply, so the owner clicked a dialog for A while last looking at B.
+  const w = await world(t, {
+    flush: true,
+    reply: (b, dir) => [b, { prompt: 'status?', own: false, uuid: 'u-p1' }, { blocks: [{ type: 'tool_use', id: 'toolu_other', name: 'Bash', input: { command: 'present' } }], own: false, uuid: 'u-tu', parent: 'u-p1' },
+      { result: JSON.stringify({ ok: true, block: buildBlock({ op: 'data', ref: REF, label: LABEL, repo: 'acme/widgets', dir, sql: 'update t set a = 2 where id = 7', summary: 'fix' }).join('\n') }), own: false, parent: 'u-tu' }],
+  });
+  await w.hook();
+  const c = w.claim();
+  assert.equal(c.status, 'unverified');
+  assert.match(c.reason, /another turn showed a live-database block between the reply and the dialog/);
 });

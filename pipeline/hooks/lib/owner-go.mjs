@@ -453,6 +453,14 @@ const toolUseText = (input) => {
   return over ? null : out.join('\n');
 };
 const inputSurfacesAsk = (input) => { const text = toolUseText(input); return text === null || surfacesAsk(text); };
+
+// #741 (B1b): what the live-database readers (the typed go's recorder and claim, and the click claim) add to the ruling reader's rules: a tool block of another visible turn that shows a block counts as shown.
+// A tool input or result that shows a live-database block, its binding or apply line, or a go word: what the owner may have answered instead of the block in the reply text (a stale-ask detector, like surfacesAsk).
+const LIVE_SURFACED = /Live-DB (?:migration|data) · project |🗄️ Apply to LIVE |go (?:migration|data) /iu;
+export const liveDbSurfaced = (text) => LIVE_SURFACED.test(String(text ?? ''));
+const liveInputSurfaces = (input) => { const text = toolUseText(input); return text === null || liveDbSurfaced(text); };
+const liveResultSurfaces = (b) => b?.type === 'tool_result' && liveDbSurfaced(toolResultText(b.content));
+const blockSurfaces = (b) => (b?.type === 'tool_use' && liveInputSurfaces(b.input)) || liveResultSurfaces(b);
 // #189 (owner decision, plan docs/plans/2026-11-06-followups-185-188-ruling-compaction.md section 3): a context compaction is transparent. Claude Code writes the summary of the
 // earlier conversation as a `user` entry (string content, no promptSource / origin) after a `compact_boundary`; it is a prompt entry to isPromptEntry and of source 'unknown', so
 // it used to open a new, empty reply slot between an ask and the owner's answer, and the ask was lost. Such an entry is skipped by every reader: it opens no slot, adds no text and
@@ -554,10 +562,12 @@ function originsOf(entries) {
   return { origin, parent };
 }
 
-export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false } = {}) {
-  return replyOf(tailEntries(transcriptPath, tailBytes).entries, { prompt, skipSynthetic });
+// #741 (B1b) `liveDb` (the live-database readers only; the ruling reader and every other caller are unchanged): a tool input or result of any OTHER visible turn that shows a live-database block, its binding or apply
+// line or a go word counts as shown (liveDbSurfaced), so a later request of the selected turn is stale.
+export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, prompt, skipSynthetic = false, liveDb = false } = {}) {
+  return replyOf(tailEntries(transcriptPath, tailBytes).entries, { prompt, skipSynthetic, liveDb });
 }
-function replyOf(entries, { prompt, skipSynthetic = false } = {}) {
+function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}) {
   const { origin, parent } = originsOf(entries);
   const verdicts = new Map(); // memoised hidden(i), shared by every chain walk (#246)
   const hidden = (i) => invisibleNote(entries, parent, i, verdicts);
@@ -581,7 +591,7 @@ function replyOf(entries, { prompt, skipSynthetic = false } = {}) {
         const text = e.type === 'assistant' && content.some((b) => b?.type === 'text' && typeof b.text === 'string' && showsText(b.text));
         if (text) t.textPos = i;
         // #241: what the owner can read is the text AND a tool block that surfaces an ask (the detectors the ruling reader uses below)
-        if (text || content.some((b) => (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) || (b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content))))) t.shownPos = i;
+        if (text || content.some((b) => (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) || (b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content))) || (liveDb && blockSurfaces(b)))) t.shownPos = i;
       }
     }
   });
@@ -603,12 +613,12 @@ function replyOf(entries, { prompt, skipSynthetic = false } = {}) {
     let anything = false;
     for (const e of t.content) {
       if (e.type === 'user') {
-        if (e.message.content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { surfacedAfterText = true; anything = true; }
+        if (e.message.content.some((b) => b?.type === 'tool_result' && (surfacesAsk(toolResultText(b.content)) || (liveDb && blockSurfaces(b))))) { surfacedAfterText = true; anything = true; }
         continue;
       }
       for (const b of e.message.content) {
         if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { text += `${b.text}\n`; surfacedAfterText = false; anything = true; }
-        else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
+        else if (b?.type === 'tool_use' && (inputSurfacesAsk(b.input) || (liveDb && blockSurfaces(b)))) { surfacedAfterText = true; anything = true; }
       }
     }
     const visible = visibleSynthetic(t.e) && !hidden(t.pos); // (#246: a system turn written under an invisible one is on nobody's screen)
@@ -647,41 +657,60 @@ export function replyBefore(transcriptPath, promptId, { tailBytes = REPLY_BEFORE
   entries.forEach((e, i) => { if (isPromptEntry(e) && e.promptId === promptId) at.push(i); });
   if (at.length === 0) return { reason: 'the owner\'s prompt is not in the transcript window' };
   if (at.length > 1) return { reason: 'two prompt entries carry that prompt id' };
-  return { text: replyOf(entries.slice(0, at[0] + 1), { prompt: promptTextOf(entries[at[0]]), skipSynthetic: true }).text };
+  return { text: replyOf(entries.slice(0, at[0] + 1), { prompt: promptTextOf(entries[at[0]]), skipSynthetic: true, liveDb: true }).text };
 }
 
 // #262 (R6-F1): what the owner could read right BEFORE an AskUserQuestion call: the assistant text of the call's own turn (the entries that chain to the same prompt as the tool_use entry, in transcript
 // order, plus the text blocks of the tool_use entry itself that come before the tool_use block). The live-database click claim requires it to end with the block the dialog carries, as the typed
 // go does. A text another turn printed between that text and the call (an interleaved process the owner may have seen) is a refusal, never skipped. { text } | { reason }.
+// #741 (B1b): only the text AFTER the turn's last tool_result before the dialog counts (an older block earlier in the turn is not what the owner was last shown); the dialog's turn must be one the owner sees
+// (the typed reader's own test: invisibleNote, ancestry fails closed); another visible turn's tool input or result that shows a live-database block between the reply and the dialog is a refusal too; and no text at
+// all says so, naming the case where Claude Code recorded only a progress note (a `thinking` block). `missing`: the call is not in the transcript (yet): a caller that checks early stays silent then.
 export function replyBeforeToolUse(transcriptPath, toolUseId, { tailBytes = REPLY_BEFORE_TAIL_BYTES } = {}) {
   if (typeof toolUseId !== 'string' || toolUseId === '') return { reason: 'the click has no tool use id' };
   const entries = tailEntries(transcriptPath, tailBytes).entries;
   const blocksOf = (e) => (Array.isArray(e?.message?.content) ? e.message.content : []);
   const at = [];
   entries.forEach((e, i) => { if (e?.type === 'assistant' && blocksOf(e).some((b) => b?.type === 'tool_use' && b.id === toolUseId)) at.push(i); });
-  if (at.length === 0) return { reason: 'the AskUserQuestion call is not in the transcript window' };
+  if (at.length === 0) return { reason: 'the AskUserQuestion call is not in the transcript window', missing: true };
   if (at.length > 1) return { reason: 'two entries carry that tool use id' };
-  const { origin } = originsOf(entries);
+  const { origin, parent } = originsOf(entries);
   const useAt = at[0];
   if (origin[useAt] < 0) return { reason: 'the AskUserQuestion call does not chain to a prompt in the transcript window' };
+  const verdicts = new Map();
+  if (invisibleNote(entries, parent, origin[useAt], verdicts)) return { reason: 'the dialog\'s turn is not one the owner sees (a headless or hidden turn, or one whose origin cannot be resolved)' };
   const textOf = (e, until = Infinity) => {
     let t = '';
     for (const b of blocksOf(e).slice(0, until)) if (b?.type === 'text' && typeof b.text === 'string') t += `${b.text}\n`;
     return t;
   };
+  let resultAt = origin[useAt]; // the turn's last tool_result before the dialog: what came before it is not the reply
+  for (let i = origin[useAt] + 1; i < useAt; i++) if (entries[i]?.type === 'user' && origin[i] === origin[useAt] && blocksOf(entries[i]).some((b) => b?.type === 'tool_result')) resultAt = i;
   let text = '';
   let lastTextAt = -1;
-  for (let i = origin[useAt] + 1; i <= useAt; i++) {
+  let progressNote = false;
+  for (let i = resultAt + 1; i <= useAt; i++) {
     const e = entries[i];
-    if (e?.type !== 'assistant' || origin[i] !== origin[useAt]) continue;
+    if (origin[i] !== origin[useAt]) {
+      // R1-B5: another turn's text, or a live-database block it showed, inside the window: what was printed before it is not what the owner was last shown, so the pieces on either side are never joined
+      const visible = origin[i] < 0 || !invisibleNote(entries, parent, origin[i], verdicts);
+      if ((e?.type === 'assistant' && showsText(textOf(e))) || (visible && blocksOf(e).some(blockSurfaces))) { text = ''; lastTextAt = -1; }
+      continue;
+    }
+    if (e?.type !== 'assistant') continue;
     const t = i === useAt ? textOf(e, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : textOf(e);
     if (showsText(t)) lastTextAt = i;
+    if (blocksOf(e).some((b) => b?.type === 'thinking' || b?.type === 'redacted_thinking')) progressNote = true;
     text += t;
   }
   for (let i = Math.max(lastTextAt, origin[useAt]) + 1; i < useAt; i++) {
     const e = entries[i];
-    if (e?.type === 'assistant' && origin[i] !== origin[useAt] && showsText(textOf(e))) return { reason: 'another turn printed text between the reply and the dialog' };
+    if (origin[i] === origin[useAt]) continue;
+    if (e?.type === 'assistant' && showsText(textOf(e))) return { reason: 'another turn printed text between the reply and the dialog' };
+    const visible = origin[i] < 0 || !invisibleNote(entries, parent, origin[i], verdicts); // (an entry that chains to no prompt fails closed: it counts)
+    if (visible && blocksOf(e).some(blockSurfaces)) return { reason: 'another turn showed a live-database block between the reply and the dialog' };
   }
+  if (!showsText(text)) return { reason: progressNote ? 'no reply text before the dialog (Claude Code recorded only a progress note)' : 'no reply text before the dialog' };
   return { text };
 }
 
