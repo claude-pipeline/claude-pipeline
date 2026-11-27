@@ -274,9 +274,16 @@ test('three nested scripts that each assign four names twice and loop over eight
   assertRefusedByReadingCap('bash F1.sh', fakeFs(PROJ, chain(true, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')));
 });
 test('a chain with a few readings is still allowed', () => {
-  assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2))).decision, 'allow'); // (two names twice, two words: 8 readings a level)
-  assert.equal(files('bash F1.sh', fakeFs(PROJ, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8'))).decision, 'allow'); // (once-assigned names: only the 8 words of each level)
-  assert.equal(git('bash F1.sh', fakeFs(GIT_ROOT, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8'))).decision, 'allow');
+  // (a virtual clock too: the real 5 s deadline was reached by a loaded runner, ~6 s, and the allowed chain was refused as "took too long"; here only the reading cap can refuse it)
+  const allowed = (run) => {
+    const clock = virtualClock();
+    const r = run(clock.now);
+    assert.equal(r.decision, 'allow', r.reason);
+    assert.ok(clock.elapsed() < EVAL_DEADLINE_MS / 2, `${clock.calls()} clock readings (${clock.elapsed()} virtual ms of the ${EVAL_DEADLINE_MS} ms deadline)`);
+  };
+  allowed((now) => files('bash F1.sh', fakeFs(PROJ, chain(true, 2, 'w1 w2', 2)), { now })); // (two names twice, two words: 8 readings a level)
+  allowed((now) => files('bash F1.sh', fakeFs(PROJ, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now })); // (once-assigned names: only the 8 words of each level)
+  allowed((now) => git('bash F1.sh', fakeFs(GIT_ROOT, chain(false, 3, 'w1 w2 w3 w4 w5 w6 w7 w8')), { now }));
 });
 test('loop words alone (names assigned once) also share the allowance across nested scripts', () => {
   const words = Array.from({ length: 20 }, (_, i) => `w${i + 1}`).join(' '); // (20 + 20^2 + 20^3 readings)
