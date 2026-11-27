@@ -375,7 +375,7 @@ function deployProof({ entry, pr, commit, committed, head, branchName, owner, re
   if (!isObj(p) || p.number !== pr.number || p.merged !== true || p.mergeCommit?.oid !== commit.oid) return no('GitHub does not show the pull request as merged at this commit');
   const mergedAt = typeof p.mergedAt === 'string' && ISO_RE.test(p.mergedAt) ? Date.parse(p.mergedAt) : NaN;
   if (!Number.isFinite(mergedAt)) return no('the pull request has no readable merge time');
-  // the registration time is GitHub's own clock (the Date of its answer when the owner registered); the margin covers the seconds between that answer and the registry write, and the rounding of both times to the second: a merge that close to it keeps the owner's go too
+  // the registration time is GitHub's own clock (the Date of its answer when the owner registered); the command writes it only when the answer is less than a minute old, so the margin covers that gap and the rounding of both times to the second: a merge that close to it keeps the owner's go too
   if (!(mergedAt >= Date.parse(entry.deploySince) + FUTURE_SKEW_MS)) return no(`the pull request was merged before the after-deploy registration of ${entry.deploySince} (or within ${FUTURE_SKEW_MS / 60000} minutes after it), so it keeps the owner's go`);
   if (!isObj(repo.environment) || repo.environment.name !== e) return no(`GitHub shows no deployment environment named "${e}"`);
   const newest = Array.isArray(repo.deployments?.nodes) && repo.deployments.nodes.length === 1 ? repo.deployments.nodes[0] : null;
@@ -431,7 +431,9 @@ export function autoApply({ home, entry, name, query, session, now, leftMs, env,
 function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) {
   // a marked file waits for the production deploy when the owner registered it (`pipeline db-refs after-deploy on`: all three keys); otherwise it keeps the owner's click after the deploy
   const marked = AFTER_DEPLOY_RE.test(query);
-  const registered = typeof entry.deployEnv === 'string' && typeof entry.deployBot === 'string' && typeof entry.deploySince === 'string';
+  const keyed = typeof entry.deployEnv === 'string' && typeof entry.deployBot === 'string' && typeof entry.deploySince === 'string';
+  const registered = keyed && entry.deployClock === 'github';
+  if (marked && keyed && !registered) return notEligible('the after-deploy registration was made by an earlier version of the pipeline, with this machine\'s clock: the owner runs `pipeline db-refs after-deploy on` again (GitHub\'s clock is used now); until then a marked file takes the owner\'s go');
   if (marked && !registered) return notEligible('the file is marked apply-after-deploy: it takes the owner\'s go after the deploy (the owner can register the production deploy with `pipeline db-refs after-deploy on`, and marked files then apply once GitHub shows it succeeded)');
   if (typeof name !== 'string' || !STEM_RE.test(name)) return notEligible('the migration name is not a plain file name');
   const charProblem = sqlCharProblem(query);
@@ -494,7 +496,7 @@ function autoCheck({ home, entry, name, query, session, now, leftMs, env, io }) 
       lock = takeRegistryLock({ home, leftMs, io });
       if (lock === null) return notEligible('the owner\'s db-refs command is changing the registry (or no time was left to wait for it): call again, or ask for the owner\'s go');
       const fresh = autoEntry(entry.ref, readDbRefs(home, io)).entry;
-      if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot || fresh.deploySince !== entry.deploySince) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
+      if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot || fresh.deploySince !== entry.deploySince || fresh.deployClock !== entry.deployClock) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
     }
     next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
   } finally {

@@ -1,5 +1,5 @@
 // #262 (live-database guard): the owner's registry of Supabase projects, `<home>/.claude/pipeline-state/db-refs.json`.
-// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev', autoMigrations?, autoSince?, deployEnv?, deployBot?, deploySince?}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
+// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev', autoMigrations?, autoSince?, deployEnv?, deployBot?, deploySince?, deployClock?}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
 // (`pipeline db-refs set|remove|server …`, commands/db-refs.mjs); the guard protects the file (files-policy.mjs PROTECTED_REL) and refuses the command to an agent.
 // Every hosted project counts as LIVE unless the owner declared it `dev` here. A project that is not listed is live too, so a MISSING file is the safe default
 // and needs no test of where the agent stands. A file that cannot be read or is not valid denies every Supabase write (no go can help) until the owner fixes it.
@@ -37,8 +37,10 @@ const validEntry = (e) => e && typeof e === 'object' && !Array.isArray(e)
   && (e.autoMigrations === undefined || typeof e.autoMigrations === 'boolean')
   && (e.autoMigrations !== true || (e.kind === 'live' && typeof e.repo === 'string' && isoZone(e.autoSince)))
   // the after-deploy registration: all three keys or none, only with the auto switch on; github-actions is no trusted deployer (an agent can make a workflow create a deployment for any commit). An older install ignores the keys.
-  && ((e.deployEnv === undefined && e.deployBot === undefined && e.deploySince === undefined)
-    || (e.autoMigrations === true && validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince)));
+  && ((e.deployEnv === undefined && e.deployBot === undefined && e.deploySince === undefined && e.deployClock === undefined)
+    || (e.autoMigrations === true && validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince)
+      // `github`: deploySince is GitHub's own clock (the command writes it so). A registration without it was made by an earlier revision (the owner's clock) and the guard does not trust it (live-db-auto.mjs).
+      && (e.deployClock === undefined || e.deployClock === 'github')));
 
 // { ok:true, refs, servers } | { ok:true, refs:[], servers:[], missing:true } | { ok:false, reason:'unreadable'|'invalid' }
 // `io.readFileSync` is the test seam.
@@ -57,7 +59,7 @@ export function readDbRefs(home, io = {}) {
   const servers = j.servers === undefined ? [] : j.servers;
   if (!Array.isArray(servers) || !servers.every((s) => typeof s === 'string' && SEGMENT_RE.test(s))) return { ok: false, reason: 'invalid' };
   if (!j.refs.every(validEntry) || new Set(j.refs.map((e) => e.ref)).size !== j.refs.length) return { ok: false, reason: 'invalid' };
-  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, autoMigrations: e.autoMigrations === true, autoSince: e.autoMigrations === true ? e.autoSince : null, deployEnv: e.deployEnv ?? null, deployBot: e.deployBot ?? null, deploySince: e.deploySince ?? null })), servers: [...servers] };
+  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, autoMigrations: e.autoMigrations === true, autoSince: e.autoMigrations === true ? e.autoSince : null, deployEnv: e.deployEnv ?? null, deployBot: e.deployBot ?? null, deploySince: e.deploySince ?? null, deployClock: e.deployClock ?? null })), servers: [...servers] };
 }
 
 // The entry auto-apply may use for `ref`: live, with a repo, the flag on, and no OTHER enabled entry with the same repo (case-insensitive: one unambiguous target per repo).
@@ -99,7 +101,7 @@ export function writeDbRefs(home, state) {
     if (e.autoMigrations === true && !isoZone(e.autoSince)) throw new Error(`entry ${e.ref} has auto-migrations on without a valid autoSince`);
     const deploy = e.autoMigrations === true && e.deployEnv != null && e.deployBot != null && e.deploySince != null;
     if (deploy && !(validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince))) throw new Error(`entry ${e.ref} has an invalid after-deploy registration`);
-    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}), ...(deploy ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince } : {}) };
+    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}), ...(deploy ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince, ...(e.deployClock === 'github' ? { deployClock: 'github' } : {}) } : {}) };
   });
   const body = `${JSON.stringify({ v: 1, refs, servers: state.servers ?? [] }, null, 2)}\n`;
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;

@@ -300,8 +300,8 @@ test('preflight: an invalid registry file is reported when the repo has supabase
 // ---- auto-apply (Task 1): the registry's autoMigrations flag -------------------------------------------------------------------------------------------------------------
 
 const ON = { autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' };
-const DEPLOY = { deployEnv: 'Production', deployBot: 'vercel', deploySince: '2026-11-28T01:00:00Z' };
-const NO_DEPLOY = { deployEnv: null, deployBot: null, deploySince: null };
+const DEPLOY = { deployEnv: 'Production', deployBot: 'vercel', deploySince: '2026-11-28T01:00:00Z', deployClock: 'github' };
+const NO_DEPLOY = { deployEnv: null, deployBot: null, deploySince: null, deployClock: null };
 const LIVE = (over = {}) => ({ ref: REF, name: 'EagleWatch live', repo: 'acme/widgets', kind: 'live', ...over });
 
 test('readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry, one without repo or one without a valid autoSince, is invalid', (t) => {
@@ -564,6 +564,18 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   const entry = readDbRefs(home).refs[0];
   assert.deepEqual([entry.deployEnv, entry.deployBot, entry.autoMigrations], ['Production', 'vercel', true]);
   assert.equal(entry.deploySince, '2026-11-20T10:00:00.000Z', 'deploySince is GitHub\'s time, not this machine\'s');
+  assert.equal(entry.deployClock, 'github');
+  // Failure caught: a terminal suspended between GitHub's answer and the write backdating the registration by minutes (the guard's 5-minute margin only covers a minute).
+  seedRegistry(home, { refs: [LIVE(ON)] });
+  const seeded = readFileSync(dbRefsFile(home), 'utf8');
+  const clock = [Date.parse('2026-11-20T10:00:00Z'), Date.parse('2026-11-20T10:01:01Z')];
+  const stale = await run(on, ownerCtx(home, { now: () => clock.shift(), gh: () => ({ code: 0, stdout: `HTTP/2.0 200 OK\r\nDate: ${GITHUB_DATE}\r\n\r\n{}`, stderr: '' }) }));
+  assert.equal(stale.exitCode, 1);
+  assert.equal(stale.output.error, 'github-time-stale');
+  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), seeded, 'nothing written after a stale answer');
+  seedRegistry(home, { refs: [LIVE(ON)] });
+  runOwnerCli(home, on, fakeGithubClock(t, GITHUB_DATE));
+  assert.equal(readDbRefs(home).refs[0].deployClock, 'github');
   const shown = (await run(['show'], ownerCtx(home))).output.refs[0];
   assert.deepEqual([shown.deployEnv, shown.deployBot, shown.deploySince], ['Production', 'vercel', entry.deploySince]);
   // a second on replaces both and moves the cut-off to now
@@ -573,7 +585,7 @@ test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for 
   assert.deepEqual([again.deployEnv, again.deployBot], ['Staging', 'vercel']);
   assert.notEqual(again.deploySince, DEPLOY.deploySince);
 
-  const absent = () => assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deployEnv|deployBot|deploySince/);
+  const absent = () => assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deployEnv|deployBot|deploySince|deployClock/);
   const kept = LIVE({ ...ON, ...DEPLOY });
   seedRegistry(home, { refs: [kept] });
   runOwnerCli(home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'ACME/widgets']);
