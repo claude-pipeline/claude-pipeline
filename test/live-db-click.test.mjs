@@ -32,9 +32,10 @@ const fixture = () => readFileSync(new URL('./fixtures/click/2.1.323/genuine-cli
 const text = (es) => `${es.map((e) => JSON.stringify(e)).join('\n')}\n`;
 
 // One world: registry, a repo with the migration, the block `present` prints, the issued ask and a 2.1.323 transcript (prompt + tool_use; the answer's entry is appended by w.flush()).
+// `rebase`: shift every fixture timestamp so the answer lands seconds before the real clock (for a test that spawns the real hook, which reads Date.now()).
 // `reply`: the assistant texts printed before the dialog, one transcript entry each, or a function (block, dir) -> texts (default: the block `present` printed, pasted last).
 const dir0 = (repo) => repo.dir;
-async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null, flag = false } = {}) {
+async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null, flag = false, rebase = false } = {}) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'cp-live-db-click-')));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   mkdirSync(join(home, '.claude'), { recursive: true });
@@ -50,6 +51,10 @@ async function world(t, { op = 'migration', answer = null, flush = false, modelA
   const arg = op === 'migration' ? NAME : sha256Of(dataSql).slice(0, 12);
   const parts = liveDbAsk({ repo: 'acme/widgets', pr: op === 'migration' ? 7 : null, block, op, arg, label: LABEL, ref: REF });
   const [prompt, use, result] = fixture();
+  if (rebase) {
+    const shift = Date.now() - 3000 - Date.parse(result.timestamp);
+    for (const e of [prompt, use, result]) e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
+  }
   const issuedAt = Date.parse(use.timestamp) - 10000;
   const issued = issueAsk({ ...parts, home, now: () => issuedAt });
   assert.ok(issued.askId, JSON.stringify(issued));
@@ -284,14 +289,8 @@ test('out of time in the middle of settling: the valid click stays pending (no .
   assert.equal(w.apply().decision, 'allow', 'with time left the same click settles and applies');
 });
 
-test('through the real hook entry: a pending click of this session and a git that never answers is a deny within the host timeout, with nothing consumed', async (t) => {
-  // Failure caught: the click-settling route (pending click -> ask file -> block rebuild with git) running past the hook's 15 s host timeout when git hangs; Claude Code then ALLOWS the call.
-  const w = await world(t, { flush: false, flag: true });
-  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
-  w.flush();
-  const shim = join(w.home, 'shim');
-  mkdirSync(shim);
-  writeFileSync(join(shim, 'git'), '#!/bin/sh\nsleep 30\n', { mode: 0o755 });
+// The hook entry as the host starts it: the real clock, the real PreToolUse input, a git shim first on PATH and a gh that never answers.
+function spawnHook(w, shim) {
   const slowGh = join(w.home, 'slow-gh.mjs');
   writeFileSync(slowGh, 'setTimeout(() => {}, 30000);\n');
   const env = { ...process.env, HOME: w.home, USERPROFILE: w.home, PATH: `${shim}${delimiter}${process.env.PATH}`, PIPELINE_GH: `${process.execPath} ${slowGh}` };
@@ -300,8 +299,40 @@ test('through the real hook entry: a pending click of this session and a git tha
   const input = { hook_event_name: 'PreToolUse', tool_name: `${TOOL}apply_migration`, tool_input: { project_id: REF, name: NAME, query: SQL }, session_id: w.session, transcript_path: w.file, cwd: w.repo.dir };
   const t0 = Date.now();
   const r = spawnSync(process.execPath, [fileURLToPath(new URL('../pipeline/hooks/guard-files.mjs', import.meta.url))], { input: JSON.stringify(input), encoding: 'utf8', env, timeout: 30_000 });
-  const ms = Date.now() - t0;
+  return { r, ms: Date.now() - t0 };
+}
+
+// Skipped on Windows: the two tests below put a POSIX sh git shim on PATH.
+test('through the real hook entry, control: with a responsive git the same pending click settles and the apply is allowed (the fixture reaches the settling route)', { skip: process.platform === 'win32' }, async (t) => {
+  // Failure caught: the hung-git test below passing for the wrong reason (an expired click, or a fixture the settling route never reaches), so a settling route that runs past the host timeout would go unseen.
+  const w = await world(t, { flush: false, flag: true, rebase: true });
+  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
+  w.flush();
+  const shim = join(w.home, 'shim');
+  mkdirSync(shim);
+  const marker = join(w.home, 'git-ran');
+  writeFileSync(join(shim, 'git'), `#!/bin/sh\ntouch '${marker}'\nexec ${realGitPath} "$@"\n`, { mode: 0o755 });
+  const { r } = spawnHook(w, shim);
+  assert.equal(r.status, 0, r.stderr);
+  assert.equal(r.stdout, '', 'an allow prints nothing (a deny prints its reason)');
+  assert.ok(existsSync(marker), 'the settling route ran a git read');
+  assert.equal(readdirSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')).length, 1, 'the click was consumed by the allow');
+});
+
+test('through the real hook entry: a pending click of this session and a git that never answers is a deny within the host timeout, with nothing consumed', { skip: process.platform === 'win32' }, async (t) => {
+  // Failure caught: the click-settling route (pending click -> ask file -> block rebuild with git) running past the hook's 15 s host timeout when git hangs; Claude Code then ALLOWS the call.
+  const w = await world(t, { flush: false, flag: true, rebase: true });
+  assert.equal((await w.hook()).pending?.askId, w.askId, 'the click is only a pending pointer');
+  w.flush();
+  const shim = join(w.home, 'shim');
+  mkdirSync(shim);
+  const argvLog = join(w.home, 'git-argv');
+  writeFileSync(join(shim, 'git'), `#!/bin/sh\necho "$@" >> '${argvLog}'\nsleep 30\n`, { mode: 0o755 });
+  const { r, ms } = spawnHook(w, shim);
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny', r.stdout);
   assert.ok(ms < 14_000, `${ms} ms`);
+  assert.ok(existsSync(argvLog), 'the settling route reached a git read');
+  assert.match(readFileSync(argvLog, 'utf8').split('\n')[0], /rev-parse --show-toplevel$/, 'the hung call is the first git read of the block verification');
   assert.equal(existsSync(join(w.home, '.claude', 'pipeline-state', 'owner-go', 'live-db-consumed')), false, 'nothing consumed');
 });
