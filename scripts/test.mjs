@@ -14,6 +14,8 @@
 // --list prints the files that would run (and the summary) and exits 0 without running them.
 // --shard I/N runs bin I of N (balanced by measured time, scripts/lib/test-weights.json, bytes for unmeasured files;
 // scripts/lib/shard.mjs); the Windows CI job uses 3 shards.
+// With CP_TEST_TIMES it also writes <path>.manifest (buildManifest in scripts/lib/file-times.mjs): the files THIS run was given, the shard label
+// and the size and hash of the full unsharded list; CI prints it next to the times so scripts/shard-weights.mjs can check a run's shards add up.
 // CP_TEST_TIMES=<path> also records each file's wall-clock time into <path> as { file: { spanMs } }
 // (scripts/lib/file-times-preload.mjs); CI prints it so scripts/shard-weights.mjs can refresh the weights.
 // The test files never see CP_TEST_TIMES: they get a private per-run scratch path in CP_TEST_TIMES_LINES instead, so a test that runs its own
@@ -26,7 +28,7 @@ import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MAX_SHARDS, parseShard, shardFiles, weigh } from './lib/shard.mjs';
 import { changedFiles, describeSelection, describeSelectionDetail, parseBudget, relatedTests } from './lib/related-tests.mjs';
 import { selectTestFiles } from './lib/select-tests.mjs';
-import { collectFileTimes } from './lib/file-times.mjs';
+import { buildManifest, collectFileTimes } from './lib/file-times.mjs';
 import { realRegistryFile, registryChange, snapshotRegistry } from './lib/registry-snapshot.mjs';
 
 const libDir = join(dirname(fileURLToPath(import.meta.url)), 'lib');
@@ -98,6 +100,7 @@ if (selected.missing.length > 0) {
 }
 let names = selected.names;
 if (related) names = addRelated(names, readdirSync(testDir).filter((f) => f.endsWith('.test.mjs')));
+const fullNames = names; // the unsharded list, for the CP_TEST_TIMES manifest
 if (shard) {
   names = shardFiles(names.map((name) => ({ name, size: statSync(join(testDir, name)).size })), shard.i, shard.n, loadWeights());
 }
@@ -131,6 +134,7 @@ delete env.CP_TEST_TIMES_LINES;
 const timesDir = timesOut ? mkdtempSync(join(tmpdir(), 'cp-times-run-')) : null;
 const linesFile = timesDir ? join(timesDir, 'lines.jsonl') : null;
 if (linesFile) env.CP_TEST_TIMES_LINES = linesFile;
+if (timesOut) writeFileSync(`${timesOut}.manifest`, JSON.stringify(buildManifest({ shard: shard ? `${shard.i}/${shard.n}` : null, files: names, full: fullNames })));
 // The suite must not touch the account's real Fable floor registry (tests use a scratch PIPELINE_MODEL_FLOOR_DIR): compare before and after.
 const registryBefore = snapshotRegistry();
 const r = spawnSync(process.execPath, [...nodeArgs, '--test', ...files], { stdio: 'inherit', env });

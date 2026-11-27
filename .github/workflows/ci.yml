@@ -179,7 +179,8 @@ jobs:
         run: node scripts/test.mjs --shard ${{ matrix.shard }}/3
         env:
           CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
-      # Per-file wall-clock times of this shard, between marker lines, for scripts/shard-weights.mjs to read from the job log.
+      # Per-file wall-clock times of this shard, and the manifest of the files it was given (shard label, its file list, size and hash of
+      # the full list), each between marker lines, for scripts/shard-weights.mjs to read from the job log.
       - name: File times (shard ${{ matrix.shard }}/3)
         if: always() && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
         env:
@@ -189,6 +190,10 @@ jobs:
           cat "$CP_TEST_TIMES" || true
           echo
           echo CP-FILE-TIMES-END
+          echo CP-FILE-MANIFEST-BEGIN
+          cat "$CP_TEST_TIMES.manifest" || true
+          echo
+          echo CP-FILE-MANIFEST-END
       # The installer round trip is one script, not a shard of the suite: it runs once, in shard 3.
       - name: Installer round trip (Node 24)
         if: matrix.shard == 3 && (github.event_name != 'push' || steps.tested.outputs.run != 'false')

@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { shardFiles } from '../scripts/lib/shard.mjs';
-import { collectFileTimes, extractTimes, medianWeights, MARK_BEGIN, MARK_END } from '../scripts/lib/file-times.mjs';
+import { collectFileTimes, extractTimes, fileListHash, medianWeights, MARK_BEGIN, MARK_END } from '../scripts/lib/file-times.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const runner = join(root, 'scripts', 'test.mjs');
@@ -177,7 +177,7 @@ test('collectFileTimes: one entry per file by base name (Windows and POSIX paths
   assert.deepEqual(t, { 'one.test.mjs': { spanMs: 1234 }, 'two.test.mjs': { spanMs: 90 } });
 });
 
-test('scripts/test.mjs with CP_TEST_TIMES writes { file: { spanMs } } for the files it ran, then removes its scratch file', () => {
+test('scripts/test.mjs with CP_TEST_TIMES writes { file: { spanMs } } and a manifest for the files it ran, then removes its scratch file', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cp-times-'));
   try {
     const out = join(dir, 'times.json');
@@ -186,7 +186,9 @@ test('scripts/test.mjs with CP_TEST_TIMES writes { file: { spanMs } } for the fi
     const t = JSON.parse(readFileSync(out, 'utf8'));
     assert.deepEqual(Object.keys(t), ['glob.test.mjs']);
     assert.ok(t['glob.test.mjs'].spanMs > 0);
-    assert.deepEqual(readdirSync(dir), ['times.json'], 'the .jsonl scratch file is gone');
+    assert.deepEqual(readdirSync(dir).sort(), ['times.json', 'times.json.manifest'], 'the lines scratch file is gone');
+    // the manifest names this run's files, no shard, and the full list (here the same single file)
+    assert.deepEqual(JSON.parse(readFileSync(`${out}.manifest`, 'utf8')), { shard: null, files: ['glob.test.mjs'], fullCount: 1, fullHash: fileListHash(['glob.test.mjs']) });
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
