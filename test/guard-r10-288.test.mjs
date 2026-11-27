@@ -11,7 +11,7 @@ import assert from 'node:assert/strict';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
-import { cpuTime, cpuTimed, assertLinear } from './helpers/timing.mjs';
+import { cpuTime, bestOf, assertLinear } from './helpers/timing.mjs';
 
 const HOME = '/home/u';
 const BASE = { home: HOME, env: {}, platform: 'linux', cwd: HOME, realpath: (p) => p, existsSync: () => false, readText: () => null };
@@ -48,7 +48,10 @@ describe('R10-B1: keyword words are checked with a running flag', () => {
     const small = 22500;
     const large = 90000;
     const opts = { ratio: 8, factor: 4 };
-    assertLinear(() => cpuTime(() => simpleCommands(line(small))), () => cpuTime(() => simpleCommands(line(large))), { label: 'simpleCommands', ...opts });
+    // The bare parser does 90,000 words in ~20 ms (6 ms at a quarter): a Windows CPU tick is ~15 ms, so one parse per sample read 15 ms -> 47 ms on a linear scan (#725). A sample is therefore a batch
+    // of EQUAL work: 32 parses of 5,625 words against 2 of 90,000 (16x the words, 1/16 the runs: linear 1x, quadratic 16x; ratio 4 is 4x from each), each batch ~50 ms, far above a tick.
+    const batch = (words, times) => { const text = line(words); return () => cpuTime(() => { for (let i = 0; i < times; i++) simpleCommands(text); }); };
+    assertLinear(batch(5625, 32), batch(90000, 2), { label: 'simpleCommands (equal-work batches)', ratio: 4, factor: 1 });
     assertLinear(() => cpuTime(() => run(line(small))), () => cpuTime(() => run(line(large))), { label: 'evaluateBashForFiles', ...opts });
   });
   test('#288 R10 B1: keyword prefix reading is unchanged (plainSeq)', () => {
@@ -122,19 +125,19 @@ describe('R10-F1/F2: quoted heredocs and plain lines are unchanged', () => {
 describe('R10: heredoc joining is linear', () => {
   test('#288 R10: a 200 kB body of backslash-ended lines (unquoted)', () => {
     const line = 'cat <<EOF\n' + 'aaaaaaaa\\\n'.repeat(20000) + 'EOF\nfind . -delete';
-    const r = cpuTimed(() => run(line));
-    assert.equal(r.r.decision, 'deny');
-    assert.ok(r.ms < 1000, `took ${r.ms} ms`);
+    assert.equal(run(line).decision, 'deny');
+    const ms = bestOf(3, () => cpuTime(() => run(line))); // (best of 3: noise only adds time; a quadratic join is slow on every run)
+    assert.ok(ms < 1000, `took ${ms} ms`);
   });
   test('#288 R10: a 200 kB body of lone-backslash lines and a <<- with tab runs', () => {
-    const a = cpuTimed(() => simpleCommands('cat <<EOF\n' + '\\\n'.repeat(100000) + 'EOF\n'));
-    assert.ok(a.ms < 1000, `took ${a.ms} ms`);
-    const b = cpuTimed(() => simpleCommands('cat <<-EOF\n' + '\t'.repeat(50000) + '\\\n' + '\t'.repeat(50000) + '\\\nEOF\n'));
-    assert.ok(b.ms < 1000, `took ${b.ms} ms`);
+    const a = bestOf(3, () => cpuTime(() => simpleCommands('cat <<EOF\n' + '\\\n'.repeat(100000) + 'EOF\n')));
+    assert.ok(a < 1000, `took ${a} ms`);
+    const b = bestOf(3, () => cpuTime(() => simpleCommands('cat <<-EOF\n' + '\t'.repeat(50000) + '\\\n' + '\t'.repeat(50000) + '\\\nEOF\n')));
+    assert.ok(b < 1000, `took ${b} ms`);
   });
   test('#288 R10: 100,000 heredoc-looking lines with no terminator', () => {
-    const r = cpuTimed(() => simpleCommands('cat <<EOF\n' + 'EO\\\n'.repeat(50000)));
-    assert.ok(r.ms < 1500, `took ${r.ms} ms`);
+    const ms = bestOf(3, () => cpuTime(() => simpleCommands('cat <<EOF\n' + 'EO\\\n'.repeat(50000))));
+    assert.ok(ms < 1500, `took ${ms} ms`);
   });
 });
 
