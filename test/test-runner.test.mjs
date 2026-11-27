@@ -9,7 +9,7 @@ import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { shardFiles } from '../scripts/lib/shard.mjs';
-import { collectFileTimes, extractTimes, fileListHash, medianWeights, MARK_BEGIN, MARK_END } from '../scripts/lib/file-times.mjs';
+import { buildManifest, collectFileTimes, extractManifest, extractTimes, fileListHash, medianWeights, validateRun, MANIFEST_BEGIN, MANIFEST_END, MARK_BEGIN, MARK_END } from '../scripts/lib/file-times.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const runner = join(root, 'scripts', 'test.mjs');
@@ -252,6 +252,69 @@ test('scripts/shard-weights.mjs: no run id, or a non-numeric one, is a usage err
     assert.match(r.stderr, /usage/);
   }
   assert.equal(readFileSync(file, 'utf8'), before);
+});
+
+// One CI run of three Windows shards over six files, as shard-weights.mjs hands it to validateRun (times and manifest as parsed from each job log).
+const fullList = ['a.test.mjs', 'b.test.mjs', 'c.test.mjs', 'd.test.mjs', 'e.test.mjs', 'f.test.mjs'];
+const wjob = (i, files, over = {}) => ({
+  name: `test (windows ${i}/3)`, conclusion: 'success',
+  times: Object.fromEntries(files.map((f) => [f, { spanMs: 1000 }])),
+  manifest: buildManifest({ shard: `${i}/3`, files, full: fullList }),
+  ...over,
+});
+const wholeRun = () => [wjob(1, ['a.test.mjs', 'd.test.mjs']), wjob(2, ['b.test.mjs', 'e.test.mjs']), wjob(3, ['c.test.mjs', 'f.test.mjs'])];
+
+test('extractManifest: reads the manifest block of a job log, and the times block is not mistaken for it', () => {
+  const m = buildManifest({ shard: '2/3', files: ['b.test.mjs', 'a.test.mjs'], full: fullList });
+  const log = [`2026-11-04T10:00:00.0Z ${MARK_BEGIN}`, '2026-11-04T10:00:00.1Z {"a.test.mjs":{"spanMs":5}}', `2026-11-04T10:00:00.2Z ${MARK_END}`,
+    `2026-11-04T10:00:00.3Z ${MANIFEST_BEGIN}`, `2026-11-04T10:00:00.4Z ${JSON.stringify(m)}`, `2026-11-04T10:00:00.5Z ${MANIFEST_END}`].join('\r\n');
+  assert.deepEqual(extractManifest(log), { shard: '2/3', files: ['a.test.mjs', 'b.test.mjs'], fullCount: 6, fullHash: fileListHash(fullList) });
+  assert.deepEqual(extractTimes(log), { 'a.test.mjs': { spanMs: 5 } });
+  assert.equal(extractManifest('no markers here'), null);
+});
+
+// The failure: scripts/shard-weights.mjs merged whatever blocks it found, so a run with a missing, failed or half-measured shard
+// overwrote test-weights.json with a handful of entries and every later shard was balanced by (almost) bytes again.
+test('a partial timing sample overwrites weights: validateRun takes a whole run and rejects every partial one', () => {
+  const ok = validateRun(wholeRun());
+  assert.equal(ok.ok, true);
+  assert.deepEqual(Object.keys(ok.times), ['a.test.mjs', 'd.test.mjs', 'b.test.mjs', 'e.test.mjs', 'c.test.mjs', 'f.test.mjs']);
+
+  const reject = (jobs, why) => {
+    const v = validateRun(jobs);
+    assert.equal(v.ok, false, why);
+    assert.match(v.reason, new RegExp(why), JSON.stringify(v));
+  };
+  reject(wholeRun().slice(0, 2), 'shard 3/3 is missing'); // a whole job absent
+  reject([...wholeRun(), wjob(2, ['b.test.mjs', 'e.test.mjs'])], 'shard 2/3 appears more than once'); // duplicate shard index
+  reject(wholeRun().map((j, k) => (k === 1 ? { ...j, conclusion: 'failure' } : j)), 'concluded "failure"'); // failed job
+  reject(wholeRun().map((j, k) => (k === 2 ? { ...j, conclusion: null } : j)), 'concluded null');
+  for (const bad of [0, NaN, -5, undefined]) { // invalid span for a listed file
+    const jobs = wholeRun();
+    jobs[0].times['d.test.mjs'] = bad === undefined ? {} : { spanMs: bad };
+    reject(jobs, 'd.test.mjs has no valid spanMs');
+  }
+  const noTimes = wholeRun();
+  noTimes[1].times = null;
+  reject(noTimes, 'b.test.mjs has no valid spanMs');
+  const noManifest = wholeRun();
+  noManifest[2].manifest = null;
+  reject(noManifest, 'has no manifest');
+  reject([wjob(1, []), wjob(2, []), { ...wjob(3, []), name: 'test (windows 3/4)' }], 'disagree on the shard count');
+  reject([], 'no Windows shard jobs');
+  // manifests of different lists, overlapping shards, a shard that lost files
+  const other = wholeRun();
+  other[1].manifest = buildManifest({ shard: '2/3', files: ['b.test.mjs', 'e.test.mjs'], full: [...fullList, 'g.test.mjs'] });
+  reject(other, 'disagree on the full file list');
+  const overlap = wholeRun();
+  overlap[1] = wjob(2, ['b.test.mjs', 'a.test.mjs']);
+  reject(overlap, 'a.test.mjs is listed by more than one shard');
+  const short = wholeRun();
+  short[2] = wjob(3, ['c.test.mjs']);
+  reject(short, 'the shards list 5 files, the full list has 6');
+  const wrongLabel = wholeRun();
+  wrongLabel[0].manifest = buildManifest({ shard: '3/3', files: ['a.test.mjs', 'd.test.mjs'], full: fullList });
+  reject(wrongLabel, 'manifest says shard "3/3"');
 });
 
 // ---- name selection ------------------------------------------------------------------------------------------------

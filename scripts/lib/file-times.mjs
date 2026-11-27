@@ -59,6 +59,54 @@ export const extractTimes = (logText) => extractBlock(logText, MARK_BEGIN, MARK_
 // The manifest (buildManifest) that CI printed between the CP-FILE-MANIFEST marker lines, or null.
 export const extractManifest = (logText) => extractBlock(logText, MANIFEST_BEGIN, MANIFEST_END);
 
+// One CI run's Windows shard jobs -> { ok: true, times } (the union of the shards' { file: { spanMs } }) or { ok: false, reason }.
+// jobs: [{ name: 'test (windows I/N)', conclusion, times, manifest }] (times and manifest as the job log printed them, null when absent).
+// A run is accepted only whole: every job concluded success; the jobs cover each index 1..N exactly once with one N; each has a
+// manifest naming its own shard; the manifests agree on the full list (size and hash), are disjoint and add up to its size; and every
+// listed file has a finite positive spanMs in its job's times. Any other run would put a partial sample into the weights.
+export function validateRun(jobs) {
+  const fail = (reason) => ({ ok: false, reason });
+  const parsed = [];
+  for (const j of jobs) {
+    const m = /^test \(windows (\d+)\/(\d+)\)$/.exec(j?.name ?? '');
+    if (m) parsed.push({ ...j, index: Number(m[1]), total: Number(m[2]) });
+  }
+  if (parsed.length === 0) return fail('no Windows shard jobs');
+  const total = parsed[0].total;
+  if (parsed.some((j) => j.total !== total)) return fail('the Windows shard jobs disagree on the shard count');
+  if (!(total >= 1)) return fail('the shard count is not positive');
+  const seen = new Set();
+  for (const j of parsed) {
+    if (seen.has(j.index)) return fail(`shard ${j.index}/${total} appears more than once`);
+    seen.add(j.index);
+    if (j.index < 1 || j.index > total) return fail(`shard ${j.index}/${total} is out of range`);
+  }
+  for (let i = 1; i <= total; i++) if (!seen.has(i)) return fail(`shard ${i}/${total} is missing`);
+  for (const j of parsed) {
+    if (j.conclusion !== 'success') return fail(`"${j.name}" concluded ${JSON.stringify(j.conclusion ?? null)}, not success`);
+  }
+  const union = new Set();
+  const times = {};
+  let full = null;
+  for (const j of parsed) {
+    const m = j.manifest;
+    if (!m || !Array.isArray(m.files) || !Number.isInteger(m.fullCount) || typeof m.fullHash !== 'string') return fail(`"${j.name}" has no manifest`);
+    if (m.shard !== `${j.index}/${total}`) return fail(`"${j.name}" manifest says shard ${JSON.stringify(m.shard)}`);
+    if (full === null) full = { count: m.fullCount, hash: m.fullHash };
+    else if (full.count !== m.fullCount || full.hash !== m.fullHash) return fail('the shard manifests disagree on the full file list');
+    for (const f of m.files) {
+      if (typeof f !== 'string' || !f) return fail(`"${j.name}" manifest lists a bad file name`);
+      if (union.has(f)) return fail(`${f} is listed by more than one shard`);
+      union.add(f);
+      const ms = j.times?.[f]?.spanMs;
+      if (!validMs(ms)) return fail(`${f} has no valid spanMs in "${j.name}"`);
+      times[f] = { spanMs: ms };
+    }
+  }
+  if (union.size !== full.count) return fail(`the shards list ${union.size} files, the full list has ${full.count}`);
+  return { ok: true, times };
+}
+
 // [{ file: { spanMs } }, ...] (one per run) -> { file: median ms } for the files measured, rounded, sorted by name.
 export function medianWeights(runs) {
   const per = new Map();
