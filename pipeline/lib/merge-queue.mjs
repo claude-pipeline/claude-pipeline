@@ -1038,7 +1038,7 @@ export async function settleGuardStatuses({ gh, pr, head, slug = null, waitMs, p
     const live = found.runs.filter((run) => {
       if (run.status === 'queued') { if (!firstQueued.has(run.id)) firstQueued.set(run.id, at); } else startedRuns.add(run.id);
       if (run.id === ownRun) return false; // (its Publish step was its last status write; its later steps only touch pending rows)
-      return startedRuns.has(run.id) || at - firstQueued.get(run.id) < queuedCapMs;
+      return startedRuns.has(run.id) || (at < deadline && at - firstQueued.get(run.id) < queuedCapMs); // (at the deadline a queued-only run no longer holds the wait: the old rows are judged from a fresh sample)
     });
     if (live.length > 0) { clearAt = 0; why = `the guards' re-run has not finished: run ${live[0].id} is ${live[0].status}`; return 'wait'; }
     if (clearAt > 0 && sampleAt >= clearAt) return 'verdict';
@@ -1083,6 +1083,7 @@ export async function settleGuardStatuses({ gh, pr, head, slug = null, waitMs, p
     }
     const left = deadline - now();
     if (left <= 0) return [`${why} after ${Math.round(waitMs / 1000)} s: lifting the hold re-runs the guards; run again once they have finished`];
+    clearAt = 0; // (a clear lookup only licenses the immediate no-sleep sample after it)
     await sleep(Math.min(pollMs, left));
   }
 }

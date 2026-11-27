@@ -1209,3 +1209,17 @@ test('#866 settleGuardStatuses: the run whose rows already settled is not waited
   assert.deepEqual(r.out, []);
   assert.equal(r.waited, 0, 'no wait at all: B\'s one link is on every settled row');
 });
+
+test('#866 R1-B1 settleGuardStatuses: a queued-only run still inside its allowance at a short deadline is not waited past it; the old rows are judged from a fresh sample', async () => {
+  // waitMs (40 s) is below grace (30 s) + the 5-min queued cap: B stays queued, A stays green. Without the fix this is the timeout refusal and the hold goes back.
+  const r = await guardWorld({ checks: () => gRows('pass', 1), runs: () => [wfRun(2, 'queued')], over: { waitMs: 40_000 } });
+  assert.deepEqual(r.out, [], 'judged on A\'s rows, not the "has not finished" refusal');
+});
+
+test('#866 R1-B3 settleGuardStatuses: a clear lookup does not survive a pending poll: the verdict comes from a sample read after a NEW clear lookup', async () => {
+  // polls: 1 grace (A green), 2 sample (A green; lookup 1 clear), 3 pending (sleeps), 4 red rows of another run (lookup 2 clear), 5 green. Without the fix poll 4 is judged on lookup 1's clear.
+  const rowsAt = [null, gRows('pass', 1), gRows('pass', 1), gRows('pending', 3), redRows(3), gRows('pass', 3)];
+  const r = await guardWorld({ checks: (w) => rowsAt[w.polls], runs: () => [], over: { graceMs: 0 } });
+  assert.deepEqual(r.out, [], 'the red rows read before the new clear lookup were not judged');
+  assert.equal(r.w.polls, 5);
+});
