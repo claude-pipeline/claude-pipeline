@@ -526,3 +526,111 @@ test('t9 a package-manager line that writes a protected path or pushes directly 
     for (const cmd of gitLines) assert.equal(git(cmd, tree).decision, 'deny', `git: ${cmd}`);
   }
 });
+
+// ---- #903: a package runner runs shell text the guards never read (a setting, or stdin) -------------------------------------------------------------------------
+// A: `npm_config_call` hands `npx` the text it runs and `npm_config_script_shell` picks the program that runs it; both were allowed by the git guard (main: `npm_config_call='<push to main>' npx` ran the push).
+// B: a bare `npx` / `npm exec` (no command word, no -c text) starts npm's script shell, which reads its stdin: `echo '<push to main>' | npx` ran it with neither guard reading the text.
+const CALL_REASON = /`npm_config_call` on the line gives `npx` the shell text it runs/;
+const SHELL_REASON = /`npm_config_script_shell` on the line picks the program `npx` runs its text with/;
+const WS_REASON = /`npx -w` runs its stdin text in each workspace's directory/;
+// a line refused by both guards: `mk(payload)` builds it with the git guard's payload (G) and the files guard's (F); the reason must match, so an unrelated refusal cannot make the row pass
+const denyBoth = (mk, reason, tree = {}, o = {}) => {
+  const g = git(mk(BAD_GIT), treeFor(tree, BAD_GIT), o.git);
+  assert.equal(g.decision, 'deny', `git: ${mk(BAD_GIT)} -> allowed`);
+  assert.match(g.reason, reason, `git: ${mk(BAD_GIT)}`);
+  const f = filesGuard(mk(BAD_FILES), treeFor(tree, BAD_FILES), o.files);
+  assert.equal(f.decision, 'deny', `files: ${mk(BAD_FILES)} -> allowed`);
+  assert.match(f.reason, reason, `files: ${mk(BAD_FILES)}`);
+};
+// B rows: the line with `npx ...` must be judged exactly as the same line with `sh` (the control: `echo G | sh` is refused with its own reason)
+const sameAsShell = (mk, runner, tree = {}) => {
+  for (const [who, payload, run] of [['git', BAD_GIT, (c) => git(c, treeFor(tree, BAD_GIT))], ['files', BAD_FILES, (c) => filesGuard(c, treeFor(tree, BAD_FILES))]]) {
+    const control = run(mk(payload, 'sh'));
+    const got = run(mk(payload, runner));
+    assert.equal(control.decision, 'deny', `${who} control: ${mk(payload, 'sh')}`);
+    assert.equal(got.decision, 'deny', `${who}: ${mk(payload, runner)} -> allowed`);
+    assert.equal(got.reason, control.reason, `${who}: ${mk(payload, runner)}`);
+  }
+};
+
+test('#903 A: a setting that gives npx its shell text is refused by both guards, with the setting named', () => {
+  for (const mk of [(B) => `npm_config_call='${B}' npx`, (B) => `NPM_CONFIG_CALL='${B}' npx`, (B) => `Npm_Config_Call='${B}' npx`, (B) => `npm_config_call='${B}' npx --yes`,
+    (B) => `export npm_config_call='${B}'; npx`, (B) => `export npm_config_call='${B}' && npx`, (B) => `npm_config_call='${B}'; export npm_config_call; npx`, (B) => `env npm_config_call='${B}' npx`, (B) => `env 'npm_config_call=${B}' npx`,
+    (B) => `sudo npm_config_call='${B}' npx`, (B) => `declare -x npm_config_call='${B}'; npx`, (B) => `typeset -x npm_config_call='${B}'; npx`, (B) => `set -a; npm_config_call='${B}'; npx`,
+    (B) => `npm_config_call='${B}' npm exec`, (B) => `npm_config_call='${B}' npm x`, (B) => `npm_config_call='${B}' npm --silent exec`]) denyBoth(mk, CALL_REASON);
+  // a harmless value: no guarded text on the line can make these pass, only the rule itself refuses them
+  for (const mk of [() => `npm_config_call='echo hi' npx`, () => `npm_config_call='echo hi' bunx`, () => `npm_config_call='echo hi' npm --silent exec`]) denyBoth(mk, CALL_REASON);
+});
+test('#903 A: a setting that picks the program npx runs its text with is refused by both guards, also for a named command', () => {
+  for (const mk of [(B) => `npm_config_script_shell=/bin/bash npx git status`, () => `npm_config_script_shell=/bin/echo npx -c 'echo hi'`, (B) => `export npm_config_script_shell=/bin/bash; npx -c '${B}'`,
+    () => `NPM_CONFIG_SCRIPT_SHELL=python3 npx -c 'echo hi'`, () => `env npm_config_script_shell=/bin/bash npx hi`]) denyBoth(mk, SHELL_REASON);
+});
+
+test('#903 B: a bare npx / npm exec reads its stdin as shell text, exactly as sh would (both guards)', () => {
+  for (const runner of ['npx', 'npm exec', 'npm --silent exec', 'npx -y', 'npx --', 'npx -p pkg', 'npm exec --package x', 'npm exe', 'npx -c \'\'', 'npx --call=', 'timeout 30 npx', 'env FOO=1 npx', 'sudo npx']) {
+    sameAsShell((P, r) => `echo '${P}' | ${r}`, runner);
+  }
+  sameAsShell((P, r) => `${r} <<< '${P}'`, 'npx');
+  sameAsShell((P, r) => `${r} <<EOT\n${P}\nEOT`, 'npx');
+  // the text of the feed is read, not only the pipe: a protected path named after a feed from an unknown file is refused, the control `cat f | sh; echo <path>` decides
+  sameAsShell((P, r) => `cat f | ${r}; echo ~/${CL}/settings.json`, 'npx');
+  sameAsShell((P, r) => `cat f | ${r}; git ${PUSH} origin ${MAIN}`, 'npx');
+});
+test('#903 B: the package-script reading of npm exec stays, and a clean package is refused only through the feed', () => {
+  const t = root({ prepare: 'bad', postinstall: 'bad', test: 'bad', deploy: 'bad' });
+  for (const cmd of ['npm exec', 'npm x', 'echo hi | npm exec', 'echo hi | npm x']) {
+    const r = git(cmd, treeFor(t, BAD_GIT));
+    assert.equal(r.decision, 'deny', cmd);
+    assert.match(r.reason, /package(?:\.json)? script/, cmd);
+    assert.equal(filesGuard(cmd, treeFor(t, BAD_FILES)).decision, 'deny', `files: ${cmd}`);
+  }
+  const clean = root({ lint: 'ok' });
+  sameAsShell((P, r) => `echo '${P}' | ${r}`, 'npm exec', clean);
+  ok('echo hi | npm exec --help', clean);
+});
+test('#903 B: npm exits before it runs anything for an info flag or help (allowed); the same words as a value or negated are not info', () => {
+  for (const cmd of ['npx --version', 'npm exec --help', 'npm exec -H', 'npm help exec']) ok(`echo 'x' | ${cmd}`, {});
+  for (const P of ['--version', '--help']) ok(`echo 'x' | npx ${P}`, {});
+  for (const runner of ['npx --version=false', 'npx --prefix -v']) sameAsShell((P, r) => `echo '${P}' | ${r}`, runner);
+});
+test('#903 B: the text runs in the current directory (--prefix keeps it), once per workspace for -w (unknown directory), and in a child process', () => {
+  const tree = { 'package.json': { scripts: { lint: 'ok' } }, 'run.sh': 'echo hi', 'packages/a/run.sh': 'bad' };
+  const feed = `echo 'sh run.sh' | `;
+  const g = (cmd, tr) => git(cmd, treeFor(tr, BAD_GIT));
+  const f = (cmd, tr) => filesGuard(cmd, treeFor(tr, BAD_FILES));
+  for (const ws of ['-w packages/a', '--workspace=packages/a', '--workspaces']) {
+    const r = g(`${feed}npx ${ws}`, tree);
+    assert.equal(r.decision, 'deny', ws);
+    assert.match(r.reason, /cannot tell which directory this runs in/, ws);
+    const q = f(`${feed}npx ${ws}`, tree);
+    assert.equal(q.decision, 'deny', `files: ${ws}`);
+    assert.match(q.reason, WS_REASON, `files: ${ws}`);
+  }
+  assert.equal(g(`${feed}npx --prefix packages/a`, tree).decision, 'allow', 'git: the child runs in the current directory, whose run.sh is harmless');
+  assert.equal(f(`${feed}npx --prefix packages/a`, tree).decision, 'allow', 'files: the child runs in the current directory, whose run.sh is harmless');
+  const rootBad = { 'package.json': { scripts: { lint: 'ok' } }, 'run.sh': 'bad', 'packages/a/run.sh': 'echo hi' };
+  assert.equal(g(`${feed}npx --prefix packages/a`, rootBad).decision, 'deny', 'git: the guarded run.sh at the root');
+  assert.equal(f(`${feed}npx --prefix packages/a`, rootBad).decision, 'deny', 'files: the guarded run.sh at the root');
+  // a workspace option with a named command reads no stdin: unaffected
+  assert.equal(g(`${feed}npx -w packages/a prettier`, tree).decision, 'allow');
+  // child boundary: a `cd` in the fed text moves the child, not this shell (git ALLOWS: fails if the fed cd moved the parent); the root-guarded twin is still refused
+  const sub = { 'package.json': { scripts: { lint: 'ok' } }, 'run.sh': 'echo hi', 'sub/run.sh': 'bad' };
+  assert.equal(g(`npx <<< 'cd sub'; sh run.sh`, sub).decision, 'allow', 'a cd in the fed text does not move the parent');
+  assert.equal(f(`npx <<< 'cd sub'; sh run.sh`, sub).decision, f(`sh <<< 'cd sub'; sh run.sh`, sub).decision, 'files: as its `sh <<<` control');
+  assert.equal(g(`npx <<< 'cd sub'; sh run.sh`, { ...sub, 'run.sh': 'bad', 'sub/run.sh': 'echo hi' }).decision, 'deny', 'the root run.sh is the one the line runs');
+});
+test('#903 B: the fed text is looked up in node_modules/.bin like npx sh -c TEXT', () => {
+  const tree = { 'package.json': { scripts: { lint: 'ok' } }, 'node_modules/.bin/tool': 'bad' };
+  const g = git('echo tool | npx', treeFor({ ...tree, 'node_modules/.bin/tool': `#!/bin/sh\n${BAD_GIT}\n` }, BAD_GIT));
+  assert.equal(g.decision, 'deny');
+  assert.equal(g.reason, git('npx sh -c tool', treeFor({ ...tree, 'node_modules/.bin/tool': `#!/bin/sh\n${BAD_GIT}\n` }, BAD_GIT)).reason, 'the same reason as the -c text');
+  const f = filesGuard('echo tool | npx', treeFor({ ...tree, 'node_modules/.bin/tool': `#!/bin/sh\n${BAD_FILES}\n` }, BAD_FILES));
+  assert.equal(f.decision, 'deny');
+  assert.equal(f.reason, filesGuard('npx sh -c tool', treeFor({ ...tree, 'node_modules/.bin/tool': `#!/bin/sh\n${BAD_FILES}\n` }, BAD_FILES)).reason, 'the same reason as the -c text');
+});
+test('#903 B: on Windows the runner runs the text with cmd: a spelling only cmd reads is refused when the line mentions a protected path', () => {
+  const line = `echo 'cat ~/${CL}/settings.json' | npx`;
+  assert.equal(filesGuard(line, {}, { platform: 'linux' }).decision, 'allow', 'linux: sh reads it, a plain read of the file is fine');
+  const w = filesGuard(line, {}, { platform: 'win32' });
+  assert.equal(w.decision, 'deny', 'win32: the text is cmd text, which the guard cannot read exactly');
+});

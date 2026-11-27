@@ -1445,3 +1445,25 @@ test('#746 C2: scriptFileOf names the config of a bare `playwright test` as a pr
   // a config that cannot be named exactly
   for (const s of ['playwright test', 'playwright test -c', 'playwright test --config=', 'playwright test -cbad.ts', 'playwright test -xc bad.ts', 'playwright show-report -c a.ts', 'playwright -c a.ts test']) assert.equal(f(s), null, s);
 });
+
+// ---- #903 B: a bare package runner (no command word, no -c text) starts npm's script shell, which reads its stdin ---------------------------------------------------------
+// The mark `runnerStdin` ({ workspace, fed }, not enumerable) is on the runner command whose stdin is read as shell text. The failure it guards: `echo '<push to main>' | npx` was not read by either guard.
+test('#903 B: which package runner commands read their stdin as shell text', () => {
+  const mark = (line) => simpleCommands(line).find((c) => c.runnerStdin)?.runnerStdin ?? null;
+  for (const line of ['echo x | npx', 'echo x | npx -y', 'echo x | npx --', 'echo x | npx -p pkg', 'echo x | npm exec --package x', 'echo x | npm --silent exec', 'echo x | npm exec', 'echo x | npm x', 'echo x | npm exe',
+    'echo x | npx --foo bar', 'echo x | npx --foo', 'echo x | timeout 30 npx', 'echo x | env FOO=1 npx', 'echo x | sudo npx', "echo x | npx -c ''", 'echo x | npx --call=', 'echo x | npx --loglevel error', 'echo x | npx --prefix -v',
+    'echo x | npx --version=false', 'echo x | npx --no-version', 'echo x | npx --no-install', 'echo x | npx --yes --quiet', "npx <<< 'x'", 'npx < f', 'echo x | npx -w packages/a']) {
+    assert.ok(mark(line), `${line}: the runner's stdin is shell text`);
+  }
+  for (const line of ['echo x | npx --version', 'echo x | npx -v', 'echo x | npx --help', 'echo x | npx -h', 'echo x | npx -H', 'echo x | npx --usage', 'echo x | npx -?', 'echo x | npm exec --help', 'echo x | npm exec -H', 'echo x | npm help exec',
+    'echo x | npx prettier .', 'echo x | npx -y create-thing app', 'echo x | npx --no-install prettier --stdin-filepath x.js', 'echo x | npx --loglevel error tool', 'echo x | npx --foo hi there', "echo x | npx -c 'echo hi'",
+    'echo x | npm run lint', 'echo x | npm exec -- tool', 'echo x | npx --offline tool', 'echo x | xargs npx', 'echo x | npx playwright test -c /abs/x.ts', 'echo x | npm --version', 'echo x | npm ls', 'echo x | pnpm exec prettier .']) {
+    assert.equal(mark(line), null, `${line}: nothing is read as shell text`);
+  }
+  assert.deepEqual({ ...mark('echo x | npx -w packages/a') }, { workspace: true, fed: true });
+  for (const ws of ['npx --workspace=packages/a', 'npx -ws', 'npm exec --workspaces', 'npm exec -w a']) assert.equal(mark(`echo x | ${ws}`).workspace, true, ws);
+  assert.deepEqual({ ...mark('echo x | npx --prefix packages/a') }, { workspace: false, fed: true }, '--prefix keeps the current directory');
+  assert.deepEqual({ ...mark('npx -y') }, { workspace: false, fed: false }, 'nothing feeds it');
+  // the argv reading is kept as it is: `-w` is not in the unwrap's value-option list, so its value is still read as the command (more readings, never fewer)
+  assert.ok(argvs('echo x | npx -w packages/a').includes('packages/a'));
+});
