@@ -494,6 +494,9 @@ const DENIED = [
   `supabase db query --linked --read-only --db-url ${LOCAL} "x"`,
   'supabase db query --linked --read-only --remote "x"',
   'supabase db query --db-url "$A" --db-url "$B" --read-only "x"',
+  // #783: the incident's exact shape (absolute binary path, --remote=<live ref>, --yes, -f file) and its stdin form
+  `/opt/homebrew/bin/supabase db query --remote=${LIVE} --yes -f /tmp/x/dry.sql`,
+  `/opt/homebrew/bin/supabase db query --remote=${LIVE} --yes < /tmp/x/dry.sql`,
   'supabase db push --linked --read-only',
   'supabase db reset --linked --read-only',
   'supabase db push --remote',
