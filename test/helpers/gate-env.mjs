@@ -123,11 +123,11 @@ export function ghEntries(o) {
     { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJson: o.comments ?? [] },
     { match: '-X POST repos/acme/widgets/issues/12/comments', stdoutJson: { id: 501, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-501' } },
     { match: '-X PATCH repos/acme/widgets/issues/comments/', stdoutJson: { id: 501, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-501' } },
-    { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { labels: [], ...(o.baseOid ? { baseRefOid: o.baseOid } : {}), ...(o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } }) } },
+    { match: '^pr view 12 --json state,mergeCommit', stdoutJson: { labels: [], ...(o.baseOid ? { baseRefOid: o.baseOid } : {}), baseRefName: o.base ?? 'main', ...(o.mergeView ?? { state: 'MERGED', mergeCommit: { oid: MERGE_SHA } }) } },
     { match: '^pr merge 12 --disable-auto', code: o.disableAutoCode ?? 0 },
     // `autoMergeRequest`: what the look after a failed --disable-auto sees (null = never armed); absent = that read finds no answer (fails).
     ...('autoMergeRequest' in o ? [{ match: '^pr view 12 --json autoMergeRequest$', stdoutJson: { autoMergeRequest: o.autoMergeRequest } }] : []),
-    // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects.
+    // `behindBy`: how many base commits the PR head lacks (compare); 0 = up to date, which is what merge's update step expects. An up-to-date PR's compare names the PR's base commit (baseOid) as the base tip, because the --owner-go live check holds that tip against the scan (#625); a behind PR's names BASE_SHA unless `compareBase` says otherwise.
     // `update`: what PUT pulls/12/update-branch answers: accepted (default) | conflict | head-moved (the two 422s) | forbidden.
     UPDATE_REPLIES[o.update ?? 'accepted'],
     // `queueAware`: the commit the base's .claude/merge-queue-aware names (GitHub's contents API); absent = no such file (404). `queueAwareFile: 'error'` = GitHub cannot answer (502).
@@ -149,7 +149,7 @@ export function ghEntries(o) {
       : o.queueAwareIn === 'unknown'
       ? { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, code: 1, stderr: 'gh: Not Found (HTTP 404)' }
       : { match: `repos/acme/widgets/compare/${o.queueAware}\\.\\.\\.`, stdoutJson: { status: o.queueAwareIn === false ? 'diverged' : 'ahead', behind_by: 0, ahead_by: 1, base: BASE_SHA } }] : []),
-    { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: o.compareBase ?? BASE_SHA } },
+    { match: 'repos/acme/widgets/compare/', stdoutJson: { status: o.behindBy ? 'diverged' : 'ahead', behind_by: o.behindBy ?? 0, ahead_by: 1, base: o.compareBase ?? (o.behindBy ? BASE_SHA : (o.baseOid ?? BASE_SHA)) } },
     // `commitParents`: { <sha>: [parent shas] } for GET commits/<sha> (the update-branch result is bound to its parents).
     ...Object.entries(o.commitParents ?? {}).map(([commit, parents]) => ({ match: `commits/${commit} --jq`, stdoutJson: parents })),
     // GET pulls/12/files (the --owner-go cross-check of the scanned file list): [{ filename, previous_filename?, status }]

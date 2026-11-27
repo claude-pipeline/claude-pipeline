@@ -38,7 +38,7 @@ const CHAT = (extra = '') => `${ymlFor()}owner_approval: chat\n${extra}`;
 const baseEnv = (s) => ({ ...process.env, AI_AGENT: 'claude-code_2-1-323_agent', PIPELINE_MERGEABLE_PAUSE_MS: '1', PIPELINE_MACHINE_ID: 'click-ask-test', ...s.fake.env, ...s.env });
 // What GitHub says about the PR for the dry run (see merge-dry-run.test.mjs).
 const prView = (s) => ({ match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: { state: 'OPEN', headRefOid: s.head, baseRefName: 'main', isDraft: false, labels: [], mergeable: 'MERGEABLE', mergeStateStatus: 'CLEAN', baseRefOid: s.baseTip } });
-const script = (s, gh = {}) => [REPO, prView(s), ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: 'CLEAN', ...gh })];
+const script = (s, gh = {}) => [REPO, prView(s), ...ghEntries({ prHead: s.head, prFiles: s.prFiles, baseOid: s.baseTip, mergeStateStatus: 'CLEAN', ...gh })]; // (baseOid: an up-to-date PR's compare names its base commit as the tip)
 const mergeArgs = (...more) => ['--pr', String(PR), '--dry-run', '--owner-go', ...more];
 const mergeCtx = (s, home) => ({ cwd: s.repo.dir, env: baseEnv(s), home, managedPaths: [] });
 async function dry(s, { home, args = ['--ask'], gh } = {}) {

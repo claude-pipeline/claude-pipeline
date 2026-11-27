@@ -812,7 +812,7 @@ const prReply = (s, o = {}) => ({
 });
 const dryScript = (s, o = {}) => [
   { match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: prReply(s, o) },
-  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: o.merge ?? 'CLEAN', behindBy: o.behindBy }),
+  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, baseOid: s.baseTip, mergeStateStatus: o.merge ?? 'CLEAN', behindBy: o.behindBy }),
 ];
 const dry = (s, env = {}, args = []) => cli(['merge', '--pr', String(PR), '--dry-run', ...args], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, ...env } });
 const kinds = (r) => r.json.blockers.map((b) => b.kind);

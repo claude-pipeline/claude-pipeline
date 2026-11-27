@@ -36,7 +36,7 @@ const prReply = (s, o = {}) => ({
 const script = (s, o = {}) => [
   ...(o.before ?? []),
   { match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: prReply(s, o) },
-  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
+  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, baseOid: o.baseRefOid ?? s.baseTip, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
 ];
 
 // Every .review file with its bytes: a dry run changes none.
@@ -395,8 +395,9 @@ function mainMoves(s, file) {
   s.repo.git(['checkout', '-q', 'agent/feature']);
   return tip;
 }
+// GitHub's PR baseRefOid stays at the fork point (it does not follow main); only the compare API (behind_by, base tip) shows the PR is behind.
 const behindDry = (s, tip, o = {}) => {
-  s.fake.setScript(script(s, { baseRefOid: tip, behindBy: 1, gh: { compareBase: tip, ...o.gh }, ...o }));
+  s.fake.setScript(script(s, { baseRefOid: s.baseTip, behindBy: 1, ...o, gh: { compareBase: tip, ...o.gh } }));
   return dry(s, ['--owner-go']);
 };
 
@@ -407,7 +408,8 @@ test('dry run --owner-go, behind its base but disjoint: wouldMerge, `behind` set
   const d = behindDry(s, tip);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
-  assert.deepEqual(d.r.json.behind, { behindBy: 1, mergeBase: s.baseTip, baseRefOid: tip, mainFiles: 1, rule: 'disjoint' });
+  assert.deepEqual(d.r.json.behind, { behindBy: 1, mergeBase: s.baseTip, baseRefOid: s.baseTip, baseTip: tip, mainFiles: 1, rule: 'disjoint' });
+  assert.equal('behindRefusal' in d.r.json.ownerStep, false, 'an accepted PR carries no refusal note');
   assert.equal(d.r.json.ownerStep.kind, 'say-merge');
   assert.equal(d.r.json.ownerStep.behindNote, "behind main by 1 commit(s); main's 1 new file(s) touch none of this PR's files");
   assert.doesNotMatch(d.r.json.ownerStep.closing, /behind main/, 'the behind note is prose above the block, not part of it');
@@ -424,7 +426,7 @@ test('dry run --owner-go, behind its base: the behindNote names the branch origi
   s.repo.git(['symbolic-ref', 'refs/remotes/origin/HEAD', 'refs/remotes/origin/develop']); // pipeline.yml still says main
   // GitHub's default is develop too: a local default that is not GitHub's is refused (#430, #448), so the fixture must agree with it.
   const repoView = { match: '^repo view', stdoutJson: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'develop' }, url: 'https://github.com/acme/widgets' } };
-  s.fake.setScript(script(s, { before: [repoView], baseRefOid: tip, baseRefName: 'develop', behindBy: 1, gh: { compareBase: tip, base: 'develop' } }));
+  s.fake.setScript(script(s, { before: [repoView], baseRefOid: s.baseTip, baseRefName: 'develop', behindBy: 1, gh: { compareBase: tip, base: 'develop' } }));
   const d = dry(s, ['--owner-go']);
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.wouldMerge, true, JSON.stringify(d.r.json.blockers));
@@ -438,17 +440,18 @@ test('dry run --owner-go, up to date: behind is null and there is no behindNote'
   assertExit(d.r, 0, `${d.r.stderr}${d.r.stdout}`);
   assert.equal(d.r.json.behind, null);
   assert.equal('behindNote' in d.r.json.ownerStep, false);
+  assert.equal('behindRefusal' in d.r.json.ownerStep, false, 'an up-to-date PR carries no reason');
 });
 
-test('dry run --owner-go, behind: the compare API reporting a base tip other than the evaluated baseRefOid is still behind-base', () => {
+test('dry run --owner-go, behind: main\'s tip is not a local object -> behind-base naming the fetch (a dry run fetches nothing)', () => {
   const s = scenario({ yml: disjointYml(), report: null, state: null });
-  const tip = mainMoves(s, 'other.txt');
-  const d = behindDry(s, tip, { gh: { compareBase: 'e'.repeat(40) } });
+  mainMoves(s, 'other.txt');
+  const d = behindDry(s, 'e'.repeat(40));
   assertExit(d.r, 1);
   assert.equal(d.r.json.wouldMerge, false);
   const hit = d.r.json.blockers.find((b) => b.kind === 'behind-base');
   assert.ok(hit, JSON.stringify(d.r.json.blockers));
-  assert.match(hit.detail, /eeeeeeee is not the [0-9a-f]{8} that was checked/);
+  assert.match(hit.detail, /main's tip eeeeeeee is not in this repository: run `git fetch origin main`/);
 });
 
 test('dry run --owner-go, behind, but main changed a PR file or the base has not opted in: behind-base as before', () => {
@@ -477,6 +480,119 @@ test('dry run --owner-go, behind: mergeStateStatus BEHIND stays behind-base even
   assertExit(dirty.r, 1);
   const kinds = dirty.r.json.blockers.map((b) => b.kind);
   assert.ok(kinds.includes('conflicts') && kinds.includes('behind-base-unverified'), kinds.join());
+});
+
+// ---- #625: say why, and judge the tip that was checked ----------------------------------------------------------------------------------------
+// Each case asserts the exact behind-base entry and the ownerStep note: the reason of the check, never a bare "update the branch".
+
+const COMPARE = 'repos/acme/widgets/compare/';
+const cmpReply = (base, behindBy = 1) => ({ status: behindBy > 0 ? 'diverged' : 'ahead', behind_by: behindBy, ahead_by: 1, base });
+const tail = '; update the branch (P update-branch), re-verify and run final-gate again';
+const lacks = (tip) => `the PR head lacks 1 commit(s) of main (compare API; main's tip is ${tip.slice(0, 8)})`;
+const behindEntry = (r) => r.json.blockers.filter((b) => b.kind === 'behind-base');
+
+test('dry run --owner-go, behind and refused (main changed a PR file): the behind-base entry and ownerStep.behindRefusal carry the overlap reason', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const tip = mainMoves(s, 'src/app.js');
+  const d = behindDry(s, tip);
+  assertExit(d.r, 1);
+  const why = 'not accepted as behind-but-fresh-enough: main changed 1 file(s) this PR also touches (src/app.js)';
+  assert.deepEqual(behindEntry(d.r), [{ kind: 'behind-base', detail: `${lacks(tip)}; ${why}${tail}` }]);
+  assert.equal(d.r.json.ownerStep.behindRefusal, why);
+  assert.equal('behindNote' in d.r.json.ownerStep, false);
+  assert.doesNotMatch(d.r.json.ownerStep.closing, /behind|accepted/, 'the note is prose above the block, never part of it');
+});
+
+test('dry run --owner-go, behind in merge.behind_base: update mode: the reason says the rule was not evaluated (not a bare "update the branch")', () => {
+  const s = scenario({ yml: ymlFor(), report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  const d = behindDry(s, tip);
+  assertExit(d.r, 1);
+  const why = 'not evaluated: merge.behind_base is "update" in the base commit\'s .claude/pipeline.yml (set it to "disjoint" there to allow this)';
+  assert.deepEqual(behindEntry(d.r), [{ kind: 'behind-base', detail: `${lacks(tip)}; ${why}${tail}` }]);
+  assert.equal(d.r.json.ownerStep.behindRefusal, why);
+});
+
+test('dry run --owner-go, GitHub says BEHIND (early return): the blocker still carries the reason', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const tip = mainMoves(s, 'other.txt');
+  const d = behindDry(s, tip, { merge: 'BEHIND', gh: { mergeStateStatus: 'BEHIND' } });
+  assertExit(d.r, 1);
+  const why = 'not accepted as behind-but-fresh-enough: GitHub\'s mergeStateStatus is "BEHIND", not one of CLEAN|HAS_HOOKS|UNSTABLE|BLOCKED';
+  assert.deepEqual(behindEntry(d.r), [{ kind: 'behind-base', detail: `GitHub reports the PR is BEHIND its base (mergeStateStatus BEHIND); ${why}${tail}` }]);
+  assert.equal(d.r.json.ownerStep.behindRefusal, why);
+});
+
+test('dry run --owner-go, behind with a merge hold ahead: the "do NOT update the branch" rewrite keeps the reason', () => {
+  const s = scenario({ yml: holdYml().replace('  hold_command', '  behind_base: disjoint\n  hold_command'), baseFiles: holdFiles, report: null, state: null });
+  const tip = mainMoves(s, 'src/app.js');
+  s.fake.setScript(script(s, { baseRefOid: s.baseTip, behindBy: 1, gh: { compareBase: tip } }));
+  const d = dry(s, ['--owner-go'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) });
+  assertExit(d.r, 1);
+  const why = 'not accepted as behind-but-fresh-enough: main changed 1 file(s) this PR also touches (src/app.js)';
+  assert.deepEqual(behindEntry(d.r), [{ kind: 'behind-base', detail: `the PR is behind its base, but do NOT update the branch while another PR's merge hold is ahead (see the merge-hold blocker); ${why}` }]);
+  assert.equal(d.r.json.ownerStep.behindRefusal, why);
+  assert.ok(kinds(d.r).includes('merge-hold'));
+});
+
+test('dry run --owner-go, behind with a hold ahead and a stale GitHub base (the branch merged main in): no "update the branch" advice anywhere, the reason stays', () => {
+  const s = scenario({ yml: holdYml().replace('  hold_command', '  behind_base: disjoint\n  hold_command'), baseFiles: holdFiles, report: null, state: null });
+  s.repo.git(['checkout', '-q', 'main']);
+  s.repo.write('m.txt', 'm\n');
+  const m = s.repo.commit('main m');
+  s.repo.write('t.txt', 't\n');
+  const tip = s.repo.commit('main t');
+  s.repo.git(['checkout', '-q', 'agent/feature']);
+  s.repo.git(['merge', '-q', '--no-ff', '-m', 'merge main m', m]);
+  s.head = s.repo.git(['rev-parse', 'HEAD']).trim();
+  s.prFiles = s.repo.git(['diff', '-M', '--name-status', s.baseTip, s.head]).trim().split('\n').filter(Boolean).map((line) => {
+    const [status, a, b] = line.split('\t');
+    return b === undefined ? { filename: a, status } : { filename: b, previous_filename: a, status };
+  });
+  s.fake.setScript(script(s, { baseRefOid: s.baseTip, behindBy: 1, gh: { compareBase: tip } }));
+  const d = dry(s, ['--owner-go'], { FAKE_HOLD_CHECK_SEQ: seq(answer(PR, [blocker(1400)])) });
+  assertExit(d.r, 1);
+  assert.ok(kinds(d.r).includes('merge-hold') && kinds(d.r).includes('behind-base'), JSON.stringify(d.r.json.blockers));
+  const out = JSON.stringify(d.r.json).replace(/do NOT update the branch/g, '');
+  assert.doesNotMatch(out, /update the branch|P update-branch/i);
+  assert.match(d.r.json.ownerStep.behindRefusal, /predates the branch's own merge of main$/);
+});
+
+test('dry run --owner-go, main moved after the check: A refused then B -> the B entry says B was not evaluated and never carries A\'s reason', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const a = mainMoves(s, 'src/app.js');
+  const b = 'b'.repeat(40);
+  s.fake.setScript(script(s, { baseRefOid: s.baseTip, behindBy: 1, before: [{ match: COMPARE, stdoutJsonSeq: [cmpReply(a), cmpReply(b)] }] }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1);
+  const moved = `main's tip changed from ${a.slice(0, 8)} to bbbbbbbb after the check: bbbbbbbb was not evaluated`;
+  assert.deepEqual(behindEntry(d.r), [{ kind: 'behind-base', detail: `${moved}${tail}` }]);
+  assert.equal(d.r.json.ownerStep.behindRefusal, moved);
+  assert.doesNotMatch(JSON.stringify(d.r.json.ownerStep), /src\/app\.js|also touches/, 'no A reason attributed to B');
+});
+
+test('dry run --owner-go, main moved after the check: A accepted then B -> blocker, and NO behindNote (an old acceptance is never shown for a new tip)', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const a = mainMoves(s, 'other.txt');
+  const b = 'b'.repeat(40);
+  s.fake.setScript(script(s, { baseRefOid: s.baseTip, behindBy: 1, before: [{ match: COMPARE, stdoutJsonSeq: [cmpReply(a), cmpReply(b)] }] }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1);
+  assert.equal(d.r.json.wouldMerge, false);
+  assert.equal(behindEntry(d.r).length, 1, JSON.stringify(d.r.json.blockers));
+  assert.match(behindEntry(d.r)[0].detail, /^main's tip changed from \w{8} to bbbbbbbb after the check: bbbbbbbb was not evaluated/);
+  assert.equal('behindNote' in d.r.json.ownerStep, false);
+  assert.equal(d.r.json.behind, null);
+});
+
+test('dry run --owner-go: the live compare failing leaves nothing evaluated -> behind-base-unverified, never an empty list (F4)', () => {
+  const s = scenario({ yml: disjointYml(), report: null, state: null });
+  const a = mainMoves(s, 'other.txt');
+  s.fake.setScript(script(s, { baseRefOid: s.baseTip, behindBy: 1, before: [{ match: COMPARE, stdoutJsonSeq: [{}, cmpReply(a)] }] }));
+  const d = dry(s, ['--owner-go']);
+  assertExit(d.r, 1);
+  assert.ok(kinds(d.r).includes('behind-base-unverified'), JSON.stringify(d.r.json.blockers));
+  assert.match(d.r.json.blockers.find((x) => x.kind === 'live-check').detail, /could not compare the head with its base/);
 });
 
 // ---- queue mode (GitHub merge queue): no catch-up, no merge hold; a PR already queued or merged is reported -------------------------------

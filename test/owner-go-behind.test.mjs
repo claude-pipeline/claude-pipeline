@@ -6,12 +6,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { randomUUID } from 'node:crypto';
 import { mergeRequest, ownerSays } from './helpers/owner-go.mjs';
-import { bump, cli, ghEntries, scenario, ymlFor, PR } from './helpers/gate-env.mjs';
+import { bump, cli, ghEntries, scenario, ymlFor, MERGE_SHA, PR } from './helpers/gate-env.mjs';
 import { ymlWith } from './helpers/ci-proof-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { behindFreshEnough, evaluateOwnerGo, READABLE_MERGE_STATES, waitBlockers, waitForMerge } from '../pipeline/lib/finalgate.mjs';
 import { loadConfig } from '../pipeline/lib/config.mjs';
 import { createGitHub } from '../pipeline/lib/github.mjs';
+import * as gate from '../pipeline/lib/finalgate.mjs';
 
 const goYml = (yml = ymlFor()) => yml.replace('{pr} {sha}', '{pr} --match-head-commit {sha}');
 // The base's config: opted in (or not) and optionally more merge keys. The merge section is the last one, right after wait_minutes.
@@ -31,8 +32,9 @@ function mainMoves(s, edit) {
   s.repo.git(['checkout', '-q', 'agent/feature']);
   return tip;
 }
-// The PR is behind: main moved to `tip`, GitHub says so and calls the PR CLEAN (or `mergeStateStatus`).
-const behindScript = (s, tip, o = {}) => s.fake.setScript(script(s, { baseOid: tip, mergeStateStatus: 'CLEAN', ...o }));
+// The PR is behind: main moved to `tip`. GitHub's PR `baseRefOid` stays at the fork point (it does not follow main: proven on a real open PR), so only the
+// compare API (behind_by, base tip) shows it. GitHub calls the PR CLEAN (or `mergeStateStatus`).
+const behindScript = (s, tip, o = {}) => s.fake.setScript(script(s, { baseOid: s.baseTip, behindBy: 1, compareBase: tip, mergeStateStatus: 'CLEAN', ...o }));
 const reasons = (r) => (r.json.reasons ?? []).join('\n');
 const refusedBehind = (r, s, pattern) => {
   assertExit(r, 1);
@@ -51,7 +53,7 @@ test('behind_base disjoint: main changed only files the PR does not touch -> own
   const r = goMerge(s);
   assertExit(r, 0);
   assert.equal(r.json.merged, true);
-  assert.deepEqual(r.json.behind, { behindBy: 1, mergeBase: s.baseTip, baseRefOid: tip, mainFiles: 2, rule: 'disjoint' });
+  assert.deepEqual(r.json.behind, { behindBy: 1, mergeBase: s.baseTip, baseRefOid: s.baseTip, baseTip: tip, mainFiles: 2, rule: 'disjoint' });
   assert.equal(s.mergeCalls().length, 1);
 });
 
@@ -248,7 +250,7 @@ test('behind_base disjoint: GitHub mergeable CONFLICTING / UNKNOWN is never acce
 const QUICK = { PIPELINE_MERGE_WAIT_MS: '1500', PIPELINE_MERGE_POLL_MS: '50' };
 // The poll (state,mergeCommit,labels,baseRefOid) says OPEN on base `baseRefOid`; so does the look after the abandon (state,mergeCommit).
 const pollOpen = (s, baseRefOid) => [
-  { match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid } },
+  { match: '^pr view 12 --json state,mergeCommit,labels,baseRefOid', stdoutJson: { state: 'OPEN', mergeCommit: null, labels: [], baseRefOid, baseRefName: 'main' } },
   { match: '^pr view 12 --json state,mergeCommit$', stdoutJson: { state: 'OPEN', mergeCommit: null } },
 ];
 
@@ -263,7 +265,7 @@ test('--owner-go (behind, accepted): GitHub\'s baseRefOid changing while the que
   assert.match(r.json.reason, /a blocker appeared while waiting: PR base is now eeeeeeee, the merge was evaluated on/);
   assert.match(r.json.reason, /auto-merge disabled/);
   assert.equal(r.json.autoMergeDisabled, true);
-  assert.equal(r.json.behind.baseRefOid, tip);
+  assert.equal(r.json.behind.baseTip, tip);
   assert.equal(s.mergeCalls().length, 1, 'the (queued) merge command ran');
   assert.ok(s.fake.lines().some((l) => /^pr merge 12 --disable-auto/.test(l)), s.fake.lines().join('\n'));
 });
@@ -369,4 +371,237 @@ test('owner-go evaluator on a behind PR: queue on => no behind-base problem; que
   const current = await evaluateOwnerGo({ root: s.repo.dir, config, pr: PR, gh: createGitHub({ cwd: s.repo.dir, env: s.fake.env }), env: {} });
   assert.ok(!current.failed.includes('queue-state'));
   assert.ok(!s.fake.calls().slice(calls).some((c) => c.argv[0] === 'api' && c.argv[1] === 'graphql'));
+});
+
+// ---- #625: GitHub's baseRefOid does not follow main, so behind-ness comes from the compare API (its base tip), not from baseRefOid ----------------------
+// Every fixture above keeps baseRefOid at the fork point (what GitHub really answers) and says "behind" through the compare reply only.
+
+const cmpReply = (base, behindBy = 1) => ({ status: behindBy > 0 ? 'diverged' : 'ahead', behind_by: behindBy, ahead_by: 1, base });
+const COMPARE = 'repos/acme/widgets/compare/';
+const A_PARENT = 'a'.repeat(40);
+const VIEW_OPEN = (s, extra = {}) => ({ state: 'OPEN', headRefOid: s.head, labels: [], isDraft: false, baseRefOid: s.baseTip, body: '', baseRefName: 'main', ...extra });
+const diffFiles = (s, base, head) => s.repo.git(['diff', '-M', '--name-status', base, head]).trim().split('\n').filter(Boolean).map((line) => {
+  const [status, a, b] = line.split('\t');
+  return b === undefined ? { filename: a, status } : { filename: b, previous_filename: a, status };
+});
+// main moves twice (M, then T = the tip); the PR branch merges M in, so its own merge base with T is M, not the fork point. -> { m, tip, head }
+function branchMergedMain(s) {
+  s.repo.git(['checkout', '-q', 'main']);
+  s.repo.write('m.txt', 'm\n');
+  const m = s.repo.commit('main m');
+  s.repo.write('t.txt', 't\n');
+  const tip = s.repo.commit('main t');
+  s.repo.git(['checkout', '-q', 'agent/feature']);
+  s.repo.git(['merge', '-q', '--no-ff', '-m', 'merge main m', m]);
+  return { m, tip, head: s.repo.git(['rev-parse', 'HEAD']).trim() };
+}
+
+test('#623: baseRefOid stays at the fork point while main moved one unrelated test file -> owner-go merges; behind.baseTip is main\'s tip (was: behind null, then a bare refusal)', (t) => {
+  const s = fresh();
+  const tip = mainMoves(s, (repo) => repo.write('test/other.test.js', 'x\n'));
+  behindScript(s, tip);
+  withRecord(t, s);
+  const r = goMerge(s);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal(r.json.behind.baseTip, tip);
+  assert.equal(r.json.behind.baseRefOid, s.baseTip, "baseRefOid keeps GitHub's PR field");
+  assert.equal(s.mergeCalls().length, 1);
+});
+
+test('compare API: main\'s tip is not a local object -> refused, the reason says to fetch it (a gate never fetches)', (t) => {
+  const s = fresh();
+  mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  behindScript(s, 'e'.repeat(40));
+  withRecord(t, s);
+  refusedBehind(goMerge(s), s, /main's tip eeeeeeee is not in this repository: run `git fetch origin main`/);
+});
+
+test('compare API: the PR\'s fork point against main\'s tip differs from the scanned one -> refused with the fork-point reason (the PR side and the main side must share one ancestor)', (t) => {
+  const s = fresh();
+  const { tip, head } = branchMergedMain(s);
+  s.repo.git(['checkout', '-q', 'main']);
+  s.repo.git(['checkout', '-q', '-b', 'side', s.baseTip]); // GitHub names a base commit that is on neither main's tip line nor the PR branch
+  s.repo.write('side.txt', 's\n');
+  const x = s.repo.commit('side');
+  s.repo.git(['checkout', '-q', 'agent/feature']);
+  behindScript(s, tip, { prHead: head, baseOid: x, prFiles: diffFiles(s, s.repo.git(['merge-base', x, head]).trim(), head) });
+  ownerSays(t, 'merge', mergeRequest(PR, head, 'none'));
+  const r = goMerge(s);
+  refusedBehind(r, s, /fork point against main's tip \(\w{8}\) differs from the scanned one \(\w{8}\)/);
+});
+
+test('F6: the branch merged main in but GitHub\'s baseRefOid still names the old fork point -> the reason says to push / update the branch so GitHub refreshes it', (t) => {
+  const s = fresh();
+  const { tip, head } = branchMergedMain(s);
+  behindScript(s, tip, { prHead: head, baseOid: s.baseTip, prFiles: diffFiles(s, s.baseTip, head) });
+  ownerSays(t, 'merge', mergeRequest(PR, head, 'none'));
+  refusedBehind(goMerge(s), s, /the PR's base on GitHub \(\w{8}\) predates the branch's own merge of main: push or update the branch \(P update-branch\) so GitHub refreshes it/);
+});
+
+// ---- main moves after the check ----------------------------------------------------------------------------------------------------
+
+test('main moves between the live check and the last look -> pre-merge refusal "moved since the check", no merge command', (t) => {
+  const s = fresh();
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  const moved = 'b'.repeat(40);
+  behindScript(s, tip, { extra: [{ match: COMPARE, stdoutJsonSeq: [cmpReply(tip), cmpReply(moved)] }] });
+  withRecord(t, s);
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.match(reasons(r), /main moved since the check \(\w{8} → bbbbbbbb\): scan again/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('the base retargeted to another branch at the same SHA before the last look -> refused', (t) => {
+  const s = fresh();
+  s.fake.setScript(script(s, { extra: [{ match: '^pr view 12 --json state,headRefOid,labels,isDraft', stdoutJson: VIEW_OPEN(s, { baseRefName: 'develop' }) }] }));
+  withRecord(t, s);
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.match(reasons(r), /the PR's base is now develop at \w{8}, the check was of main at \w{8}: scan again/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('main moves while the queued merge waits (baseRefOid unchanged, compare tip moved) -> auto-merge disabled, exit 1, not merged', (t) => {
+  const s = fresh();
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  const moved = 'b'.repeat(40);
+  behindScript(s, tip, { extra: [...pollOpen(s, s.baseTip), { match: COMPARE, stdoutJsonSeq: [cmpReply(tip), cmpReply(tip), cmpReply(moved)] }] });
+  withRecord(t, s);
+  const r = goMerge(s, QUICK);
+  assertExit(r, 1);
+  assert.equal(r.json.merged, false);
+  assert.match(r.json.reason, /a blocker appeared while waiting: main moved since the check/);
+  assert.equal(r.json.autoMergeDisabled, true);
+  assert.ok(s.fake.lines().some((l) => /^pr merge 12 --disable-auto/.test(l)));
+});
+
+// A squash is named in the merge command: only then is a single parent that is not the evaluated tip read as movement of main (a rebase puts PR commits there).
+const squashed = () => ({ yml: disjointYml().replace('--match-head-commit {sha}', '--squash --match-head-commit {sha}') });
+
+test('main moves during the wait but the cancellation re-read says MERGED -> the merged outcome is kept, with baseMoved from the merge commit\'s parent', (t) => {
+  const s = fresh(squashed());
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  const moved = 'b'.repeat(40);
+  behindScript(s, tip, { commitParents: { [MERGE_SHA]: [A_PARENT] }, extra: [pollOpen(s, s.baseTip)[0], { match: COMPARE, stdoutJsonSeq: [cmpReply(tip), cmpReply(tip), cmpReply(moved)] }] });
+  withRecord(t, s);
+  const r = goMerge(s, QUICK);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.match(r.json.note, /merged while auto-merge was being disabled/);
+  assert.deepEqual(r.json.baseMoved, { from: tip, to: A_PARENT });
+  assert.match(r.json.warning, /main's tip moved from \w{8} to aaaaaaaa/);
+});
+
+test('F3: a clean squash merge (first parent = the evaluated tip) reports no baseMoved; a first parent other than the evaluated tip does', (t) => {
+  const clean = fresh();
+  const tipA = mainMoves(clean, (repo) => repo.write('other.txt', 'x\n'));
+  behindScript(clean, tipA, { commitParents: { [MERGE_SHA]: [tipA] } });
+  withRecord(t, clean);
+  const a = goMerge(clean);
+  assertExit(a, 0);
+  assert.equal('baseMoved' in a.json, false, JSON.stringify(a.json));
+
+  const moved = fresh(squashed());
+  const tipB = mainMoves(moved, (repo) => repo.write('other.txt', 'x\n'));
+  behindScript(moved, tipB, { commitParents: { [MERGE_SHA]: [A_PARENT] } });
+  withRecord(t, moved);
+  const b = goMerge(moved);
+  assertExit(b, 0);
+  assert.equal(b.json.merged, true, 'a merge that happened stays a success');
+  assert.deepEqual(b.json.baseMoved, { from: tipB, to: A_PARENT });
+});
+
+test('F3/B5: a merge command that names no squash (a wrapper may rebase) cannot call a one-parent merge commit movement of main: baseNote, no baseMoved', (t) => {
+  const s = fresh();
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  behindScript(s, tip, { commitParents: { [MERGE_SHA]: [A_PARENT] } });
+  withRecord(t, s);
+  const r = goMerge(s);
+  assertExit(r, 0);
+  assert.equal(r.json.merged, true);
+  assert.equal('baseMoved' in r.json, false, JSON.stringify(r.json));
+  assert.match(r.json.baseNote, /names no squash method/);
+});
+
+test('B1: GitHub\'s baseRefOid names the old fork point while main advanced to a commit the branch already holds (compare: NOT behind) -> refused, the scan is of another range than the tip', (t) => {
+  const s = fresh();
+  const { m, head } = branchMergedMain(s);
+  behindScript(s, m, { behindBy: 0, prHead: head, baseOid: s.baseTip, prFiles: diffFiles(s, s.baseTip, head) });
+  ownerSays(t, 'merge', mergeRequest(PR, head, 'none'));
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.match(reasons(r), /pr-open: the base branch's tip does not match the scanned range: the PR's base on GitHub \(\w{8}\) predates the branch's own merge of main/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('baseMovedAfterMerge: a rebase merge says the base was not checked (no baseMoved); an unreadable merge commit is a note, never a throw', async () => {
+  const evaluated = { branch: 'main', tip: 'c'.repeat(40), behind: true, accepted: true, reason: null };
+  const gh = (parents) => ({ commitParents: () => { if (parents instanceof Error) throw parents; return parents; } });
+  const rebase = await gate.baseMovedAfterMerge({ gh: gh([A_PARENT]), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 --rebase --auto' });
+  assert.deepEqual(Object.keys(rebase), ['baseNote']);
+  const alias = await gate.baseMovedAfterMerge({ gh: gh([A_PARENT]), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 -r --auto' });
+  assert.deepEqual(Object.keys(alias), ['baseNote'], 'the -r alias is a rebase merge too');
+  assert.ok('baseMoved' in await gate.baseMovedAfterMerge({ gh: gh([A_PARENT]), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 --squash' }));
+  assert.match(rebase.baseNote, /not checked after a rebase merge/);
+  const unreadable = await gate.baseMovedAfterMerge({ gh: gh(new Error('HTTP 502')), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 --squash' });
+  assert.deepEqual(Object.keys(unreadable), ['baseNote']);
+  assert.match(unreadable.baseNote, /could not read/);
+  assert.deepEqual(await gate.baseMovedAfterMerge({ gh: gh(['c'.repeat(40), A_PARENT]), mergeSha: MERGE_SHA, evaluated, command: 'gh pr merge 1 --merge' }), {}, 'a merge commit: the first parent is main\'s tip');
+});
+
+// ---- the queue decision is passed, not re-read -----------------------------------------------------------------------------------------
+
+test('direct route: a second merge-queue read that answers "queue" cannot waive the behind rule (the queue decision is the first read)', (t) => {
+  const s = scenario({ yml: goYml(), report: null, state: null, change: unique() }); // the base does not opt in: only a queue could lift the refusal
+  const tip = mainMoves(s, (repo) => repo.write('other.txt', 'x\n'));
+  const queueReply = (on) => ({ data: { repository: { pullRequest: { id: 'PR_node12', state: 'OPEN', headRefOid: s.head, isMergeQueueEnabled: on, mergeCommit: null, mergeQueueEntry: null } } } });
+  behindScript(s, tip, { extra: [{ match: 'QueueState', stdoutJsonSeq: [queueReply(false), queueReply(true)] }] });
+  withRecord(t, s);
+  refusedBehind(goMerge(s), s, /merge\.behind_base is "update"/);
+});
+
+// ---- fail closed: a missing observation is a refusal, never "not behind" -------------------------------------------------------------------
+
+test('F1: ownerGoBaseProblem refuses a non-queue live result with no evaluated tip or branch; queue mode needs none', () => {
+  const base = 'a'.repeat(40);
+  const evaluated = { branch: 'main', tip: 'b'.repeat(40), behind: false, accepted: null, reason: null };
+  assert.equal(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated }), null);
+  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: null }), /tip was not recorded/);
+  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: { ...evaluated, tip: 'main' } }), /tip was not recorded/);
+  assert.match(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: { ...evaluated, branch: '' } }), /tip was not recorded/);
+  assert.equal(gate.ownerGoBaseProblem({ baseRefOid: base, evaluated: null }, { queueMode: true }), null);
+  assert.match(gate.ownerGoBaseProblem({ baseRefOid: null, evaluated }), /baseRefOid/);
+});
+
+test('F2: the compare failing in the live check refuses the real merge (pr-open), never "not behind"', (t) => {
+  const s = fresh();
+  s.fake.setScript(script(s, { extra: [{ match: COMPARE, code: 1, stderr: 'gh: Server Error (HTTP 502)' }] }));
+  withRecord(t, s);
+  const r = goMerge(s);
+  assertExit(r, 1);
+  assert.match(reasons(r), /pr-open: .*could not compare the head with its base/);
+  assert.deepEqual(s.mergeCalls(), []);
+});
+
+test('F2: preMergeProblems / waitBlockers with a tip to hold: an unreadable compare is a problem; without one nothing is read (the gated route and the queue)', async () => {
+  const evaluated = { branch: 'main', tip: 'c'.repeat(40), behind: false, accepted: null, reason: null };
+  const view = { state: 'OPEN', headRefOid: 'h'.repeat(40), labels: [], isDraft: false, baseRefName: 'main', body: '' };
+  const down = { prView: () => view, listIssues: () => [], compare: () => { throw new Error('HTTP 502'); } };
+  const steady = { ...down, compare: () => ({ behindBy: 0, aheadBy: 1, status: 'ahead', baseSha: evaluated.tip }) };
+  const asked = [];
+  const quiet = { prView: (_pr, fields) => { asked.push(fields); return view; }, listIssues: () => [], compare: () => { throw new Error('must not be read'); } };
+  const look = (gh, extra = {}) => gate.preMergeProblems({ gh, pr: 1, head: view.headRefOid, ...extra });
+  assert.match((await look(down, { evaluated })).join(), /could not re-read main's tip/);
+  assert.deepEqual(await look(steady, { evaluated }), []);
+  assert.deepEqual(await look(quiet), [], 'no tip given: no compare, today\'s behaviour');
+  assert.ok(!asked[0].includes('baseRefName'));
+
+  const blockers = (gh) => gate.waitBlockers(gh, { evaluated, head: view.headRefOid });
+  assert.deepEqual(blockers(steady).fields, ['baseRefName']);
+  assert.match((await blockers(down)(view)).join(), /could not re-read main's tip/);
+  assert.deepEqual(await blockers(steady)(view), []);
+  assert.deepEqual(gate.waitBlockers(quiet).fields, []);
+  assert.deepEqual(await gate.waitBlockers(quiet)(view), []);
 });
