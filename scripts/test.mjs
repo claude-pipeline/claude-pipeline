@@ -16,6 +16,8 @@
 // scripts/lib/shard.mjs); the Windows CI job uses 3 shards.
 // CP_TEST_TIMES=<path> also records each file's wall-clock time into <path> as { file: { spanMs } }
 // (scripts/lib/file-times-preload.mjs); CI prints it so scripts/shard-weights.mjs can refresh the weights.
+// The test files never see CP_TEST_TIMES: they get a private per-run scratch path in CP_TEST_TIMES_LINES instead, so a test that runs its own
+// scripts/test.mjs (test/test-runner.test.mjs does) cannot delete or overwrite the outer run's timing files.
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
@@ -123,7 +125,12 @@ const env = {
 };
 const timesOut = process.env.CP_TEST_TIMES;
 const nodeArgs = timesOut ? ['--import', pathToFileURL(join(libDir, 'file-times-preload.mjs')).href] : [];
-if (timesOut) rmSync(`${timesOut}.jsonl`, { force: true });
+// Children get the private lines path (or none): never CP_TEST_TIMES itself, and never a path inherited from an outer runner.
+delete env.CP_TEST_TIMES;
+delete env.CP_TEST_TIMES_LINES;
+const timesDir = timesOut ? mkdtempSync(join(tmpdir(), 'cp-times-run-')) : null;
+const linesFile = timesDir ? join(timesDir, 'lines.jsonl') : null;
+if (linesFile) env.CP_TEST_TIMES_LINES = linesFile;
 // The suite must not touch the account's real Fable floor registry (tests use a scratch PIPELINE_MODEL_FLOOR_DIR): compare before and after.
 const registryBefore = snapshotRegistry();
 const r = spawnSync(process.execPath, [...nodeArgs, '--test', ...files], { stdio: 'inherit', env });
@@ -132,8 +139,8 @@ const registryProblem = registryChange(registryBefore, snapshotRegistry(), realR
 if (registryProblem) console.error(`FAIL: ${registryProblem}`);
 if (timesOut) {
   let lines = [];
-  try { lines = readFileSync(`${timesOut}.jsonl`, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* none recorded */ }
+  try { lines = readFileSync(linesFile, 'utf8').split('\n').filter(Boolean).map((l) => JSON.parse(l)); } catch { /* none recorded */ }
   writeFileSync(timesOut, JSON.stringify(collectFileTimes(lines)));
-  rmSync(`${timesOut}.jsonl`, { force: true });
+  rmSync(timesDir, { recursive: true, force: true });
 }
 process.exit(registryProblem ? 1 : (r.status ?? 1));

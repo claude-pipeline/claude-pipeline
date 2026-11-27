@@ -14,10 +14,13 @@ import { collectFileTimes, extractTimes, medianWeights, MARK_BEGIN, MARK_END } f
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 const runner = join(root, 'scripts', 'test.mjs');
 // A nested `node --test` inside a test must not think it is a child of the outer run (it would speak the child protocol).
+// It also must not inherit the timing variables of a CI shard (a nested scripts/test.mjs would overwrite the shard's times file): a test that wants them passes its own in `extra`.
 const nestedEnv = (extra = {}) => {
-  const env = { ...process.env, ...extra };
+  const env = { ...process.env };
   delete env.NODE_TEST_CONTEXT;
-  return env;
+  delete env.CP_TEST_TIMES;
+  delete env.CP_TEST_TIMES_LINES;
+  return { ...env, ...extra };
 };
 const preload = join(root, 'scripts', 'lib', 'file-times-preload.mjs');
 
@@ -139,10 +142,10 @@ test('file-times preload: each file of a two-file run gets its own wall-clock sp
     const out = join(dir, 'times.json');
     const fx = (n) => join(root, 'test', 'fixtures', 'file-times', n);
     const r = spawnSync(process.execPath, ['--test', '--import', pathToFileURL(preload).href, fx('slow.mjs'), fx('quick.mjs')], {
-      encoding: 'utf8', env: nestedEnv({ CP_TEST_TIMES: out }),
+      encoding: 'utf8', env: nestedEnv({ CP_TEST_TIMES_LINES: out }),
     });
     assert.equal(r.status, 0, r.stdout + r.stderr);
-    const lines = readFileSync(`${out}.jsonl`, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
+    const lines = readFileSync(out, 'utf8').trim().split('\n').map((l) => JSON.parse(l));
     const times = collectFileTimes(lines);
     assert.deepEqual(Object.keys(times).sort(), ['quick.mjs', 'slow.mjs']);
     // 300 setup + 200 + 100 + 50 after-hook = 650 ms of work in slow.mjs; the quick file is not given the slow file's time
@@ -154,11 +157,10 @@ test('file-times preload: each file of a two-file run gets its own wall-clock sp
   }
 });
 
-test('file-times preload does nothing unless CP_TEST_TIMES is set', () => {
+test('file-times preload does nothing unless CP_TEST_TIMES_LINES is set', () => {
   const dir = mkdtempSync(join(tmpdir(), 'cp-times-'));
   try {
-    const env = nestedEnv();
-    delete env.CP_TEST_TIMES;
+    const env = nestedEnv({ CP_TEST_TIMES: join(dir, 'times.json') }); // the caller's CP_TEST_TIMES alone is not enough
     const r = spawnSync(process.execPath, ['--test', '--import', pathToFileURL(preload).href, join(root, 'test', 'fixtures', 'file-times', 'quick.mjs')], { encoding: 'utf8', env, cwd: dir });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     assert.deepEqual(readdirSync(dir), [], 'no file written');
@@ -185,6 +187,23 @@ test('scripts/test.mjs with CP_TEST_TIMES writes { file: { spanMs } } for the fi
     assert.deepEqual(Object.keys(t), ['glob.test.mjs']);
     assert.ok(t['glob.test.mjs'].spanMs > 0);
     assert.deepEqual(readdirSync(dir), ['times.json'], 'the .jsonl scratch file is gone');
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// A test file that runs its own scripts/test.mjs (this very file does) inherits what the outer runner gave it. If that included the shard's
+// CP_TEST_TIMES, the nested runner deleted and overwrote the shard's timing files and the weights refresh saw a handful of entries.
+test('a nested runner probe wipes the shard\'s timing file', () => {
+  const dir = mkdtempSync(join(tmpdir(), 'cp-times-'));
+  try {
+    const out = join(dir, 'times.json');
+    const r = spawnSync(process.execPath, [runner, 'glob.test.mjs', 'runner-env-probe.test.mjs'], {
+      encoding: 'utf8', env: nestedEnv({ CP_TEST_TIMES: out, CP_PROBE_NEST: '1' }),
+    });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    // glob.test.mjs finished long before the probe started its nested runner; its entry must survive that
+    assert.deepEqual(Object.keys(JSON.parse(readFileSync(out, 'utf8'))), ['glob.test.mjs', 'runner-env-probe.test.mjs']);
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
