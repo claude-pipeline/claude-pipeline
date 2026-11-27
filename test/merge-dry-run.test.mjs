@@ -36,7 +36,7 @@ const prReply = (s, o = {}) => ({
 const script = (s, o = {}) => [
   ...(o.before ?? []),
   { match: '^pr view 12 --json state,headRefOid.*baseRefOid', stdoutJson: prReply(s, o) },
-  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
+  ...ghEntries({ prHead: s.head, prFiles: s.prFiles, baseOid: o.baseRefOid ?? s.baseTip, mergeStateStatus: o.merge ?? 'CLEAN', labels: o.labels, behindBy: o.behindBy, ...o.gh }),
 ];
 
 // Every .review file with its bytes: a dry run changes none.
