@@ -1,5 +1,5 @@
 // #262 (live-database guard): the owner's registry of Supabase projects, `<home>/.claude/pipeline-state/db-refs.json`.
-// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev', autoMigrations?, autoSince?}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
+// Shape { v:1, refs:[{ref, name, repo, kind:'live'|'dev', autoMigrations?, autoSince?, deployEnv?, deployBot?, deploySince?}], servers:[<MCP server segment>…] }. Written ONLY by the owner, from their own terminal
 // (`pipeline db-refs set|remove|server …`, commands/db-refs.mjs); the guard protects the file (files-policy.mjs PROTECTED_REL) and refuses the command to an agent.
 // Every hosted project counts as LIVE unless the owner declared it `dev` here. A project that is not listed is live too, so a MISSING file is the safe default
 // and needs no test of where the agent stands. A file that cannot be read or is not valid denies every Supabase write (no go can help) until the owner fixes it.
@@ -18,6 +18,12 @@ const REPO_RE = /^[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+$/;
 const NAME_MAX = 120;
 // a strict ISO time with a zone (the time `auto-migrations on` set the flag)
 export const ISO_ZONE_RE = /^\d{4}-\d\d-\d\dT\d\d:\d\d:\d\d(\.\d+)?(Z|[+-]\d\d:\d\d)$/;
+// the owner's registration of which GitHub deployment means "production" (#882): the environment name (exact, case-sensitive; Vercel's own is "Production – <project>" with an en dash)
+// and the bot login of the GitHub App that makes those deployments, without the [bot] suffix
+export const DEPLOY_ENV_MAX = 100;
+export const DEPLOY_BOT_RE = /^[a-z0-9][a-z0-9-]{0,38}$/;
+export const validDeployEnv = (v) => typeof v === 'string' && v.length >= 1 && v.length <= DEPLOY_ENV_MAX && !/[\u0000-\u001f\u007f-\u009f\u2028\u2029]/.test(v);
+export const validDeployBot = (v) => typeof v === 'string' && DEPLOY_BOT_RE.test(v) && v !== 'github-actions';
 const isoZone = (v) => typeof v === 'string' && ISO_ZONE_RE.test(v) && Number.isFinite(Date.parse(v));
 
 export const dbRefsFile = (home) => path.join(home, ...DB_REFS_REL.split('/'));
@@ -29,7 +35,10 @@ const validEntry = (e) => e && typeof e === 'object' && !Array.isArray(e)
   && (e.kind === 'live' || e.kind === 'dev')
   // the owner's auto-apply switch: absent or a boolean; true only on a live entry with a repo and the time it was set. An older install reads a newer file by ignoring the keys it does not know.
   && (e.autoMigrations === undefined || typeof e.autoMigrations === 'boolean')
-  && (e.autoMigrations !== true || (e.kind === 'live' && typeof e.repo === 'string' && isoZone(e.autoSince)));
+  && (e.autoMigrations !== true || (e.kind === 'live' && typeof e.repo === 'string' && isoZone(e.autoSince)))
+  // the after-deploy registration: all three keys or none, only with the auto switch on; github-actions is no trusted deployer (an agent can make a workflow create a deployment for any commit). An older install ignores the keys.
+  && ((e.deployEnv === undefined && e.deployBot === undefined && e.deploySince === undefined)
+    || (e.autoMigrations === true && validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince)));
 
 // { ok:true, refs, servers } | { ok:true, refs:[], servers:[], missing:true } | { ok:false, reason:'unreadable'|'invalid' }
 // `io.readFileSync` is the test seam.
@@ -48,7 +57,7 @@ export function readDbRefs(home, io = {}) {
   const servers = j.servers === undefined ? [] : j.servers;
   if (!Array.isArray(servers) || !servers.every((s) => typeof s === 'string' && SEGMENT_RE.test(s))) return { ok: false, reason: 'invalid' };
   if (!j.refs.every(validEntry) || new Set(j.refs.map((e) => e.ref)).size !== j.refs.length) return { ok: false, reason: 'invalid' };
-  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, autoMigrations: e.autoMigrations === true, autoSince: e.autoMigrations === true ? e.autoSince : null })), servers: [...servers] };
+  return { ok: true, refs: j.refs.map((e) => ({ ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, autoMigrations: e.autoMigrations === true, autoSince: e.autoMigrations === true ? e.autoSince : null, deployEnv: e.deployEnv ?? null, deployBot: e.deployBot ?? null, deploySince: e.deploySince ?? null })), servers: [...servers] };
 }
 
 // The entry auto-apply may use for `ref`: live, with a repo, the flag on, and no OTHER enabled entry with the same repo (case-insensitive: one unambiguous target per repo).
@@ -88,7 +97,9 @@ export function writeDbRefs(home, state) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   const refs = state.refs.map((e) => {
     if (e.autoMigrations === true && !isoZone(e.autoSince)) throw new Error(`entry ${e.ref} has auto-migrations on without a valid autoSince`);
-    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}) };
+    const deploy = e.autoMigrations === true && e.deployEnv != null && e.deployBot != null && e.deploySince != null;
+    if (deploy && !(validDeployEnv(e.deployEnv) && validDeployBot(e.deployBot) && isoZone(e.deploySince))) throw new Error(`entry ${e.ref} has an invalid after-deploy registration`);
+    return { ref: e.ref, name: e.name, repo: e.repo ?? null, kind: e.kind, ...(e.autoMigrations === true ? { autoMigrations: true, autoSince: e.autoSince } : {}), ...(deploy ? { deployEnv: e.deployEnv, deployBot: e.deployBot, deploySince: e.deploySince } : {}) };
   });
   const body = `${JSON.stringify({ v: 1, refs, servers: state.servers ?? [] }, null, 2)}\n`;
   const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
