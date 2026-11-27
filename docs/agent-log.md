@@ -362,3 +362,4 @@ full record.
 - 2026-11-27 · #895 · Implementers run quick verify as a managed job and hand back once (#745) · risk low · rounds 3 · arbiter 0 · awaiting-owner-merge · Codex 7d: 601 runs (232 high)
 - 2026-11-27 · #883 · Auto-apply merged migrations to the live database when the owner switched it on · risk high · rounds 7 · arbiter 7 (fix-verify 2) · substitute 3 · awaiting-owner-merge · Codex 7d: 611 runs (237 high)
 - 2026-11-27 · #883 · Auto-apply merged migrations to the live database when the owner switched it on · risk high · rounds 7 · arbiter 7 (fix-verify 2) · substitute 3 · merged · Codex 7d: 625 runs (244 high)
+- 2026-11-27 · #899 · Tests: timing flakes under load read work, not the clock (#725, #893) · risk low · rounds 3 · arbiter 0 · awaiting-owner-merge · Codex 7d: 642 runs (251 high)
