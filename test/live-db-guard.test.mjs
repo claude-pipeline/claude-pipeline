@@ -18,6 +18,7 @@ import { readDbRefs } from '../pipeline/hooks/lib/db-refs.mjs';
 import { buildCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
 import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
 import { HOOK_CLOCK } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { run as runLiveDb } from '../pipeline/commands/live-db.mjs';
 
 const REF = 'abcdefghij0123456789';
 const DEV = 'zyxwvutsrq9876543210';
@@ -30,7 +31,10 @@ const STATE = (home) => join(home, '.claude', 'pipeline-state');
 
 // one session: registry, repo, a transcript under the scratch home's config dir, the block shown, and the owner's go typed at `typedAt`
 // `flag`: the owner switched auto-apply on for REF (the attempt history applies); `home`: a second session in a home that already exists (its registry is the first scene's).
-async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL, flag = false, home: shared = null } = {}) {
+// `middle`: (block) -> the transcript entries between the owner's first prompt and the typed go (default: the reply that shows the block)
+async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = SQL, flag = false, home: shared = null, middle = null, name: mName = NAME, record = true } = {}) {
+  const FILE = `supabase/migrations/${mName}.sql`; // (shadows the module's: the migration this scene shows)
+  const NAME = mName;
   const home = shared ?? mkdtempSync(join(tmpdir(), 'cp-live-db-guard-'));
   if (shared === null) {
     t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -51,13 +55,13 @@ async function scene(t, { typedAt = NOW - 60_000, op = 'migration', shownSql = S
   const promptId = `pid-${randomUUID()}`;
   const entries = [
     { type: 'user', message: { content: 'apply' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY, timestamp: new Date(typedAt - 5000).toISOString() },
-    { type: 'assistant', message: { content: [{ type: 'text', text: block }] } },
+    ...(middle === null ? [{ type: 'assistant', message: { content: [{ type: 'text', text: block }] } }] : middle(block)),
     { type: 'user', message: { content: prompt }, promptId, ...OWNER_ENTRY, timestamp: new Date(typedAt).toISOString() },
   ];
   writeFileSync(transcript, linesOf(entries));
   const input = { hook_event_name: 'UserPromptSubmit', session_id: session, transcript_path: transcript, cwd: repo.dir, prompt, prompt_id: promptId };
   const out = liveDbGoOutcome(input, { home, now: () => typedAt });
-  assert.ok(out?.record, JSON.stringify(out));
+  if (record) assert.ok(out?.record, JSON.stringify(out));
   const ctx = { home, sessionId: session, transcriptPath: transcript, now: () => NOW };
   return { home, repo, head, session, transcript, input, ctx, dataSql, entries };
 }
@@ -128,6 +132,18 @@ test('forgeries: made-up go text on a genuine prompt id, a prompt that is not th
   const shown = buildBlock({ op: 'migration', ref: REF, label: 'EagleWatch prod', name: NAME, file: FILE, head: other.head, repo: 'acme/widgets', dir: other.repo.dir, sql: SQL.replace('c int', 'd int'), summary: 'x' }).join('\n');
   writeFileSync(other.transcript, linesOf(other.entries.map((e, i) => (i === 1 ? { ...e, message: { content: [{ type: 'text', text: shown }] } } : e))));
   assert.equal(apply(other).decision, 'deny');
+});
+
+test('R4-B1: a tool-only task notice that shows the same SQL for another project after the owner\'s block leaves the recorded go unclaimable', async (t) => {
+  // Failure caught: the claim kept the earlier owner-turn block selected because the notice turn had no text or ruling words, so the go recorded for project A spent an execute_sql for the stale ask.
+  const s = await scene(t, { op: 'data' });
+  const shownB = JSON.stringify({ ok: true, block: buildBlock({ op: 'data', ref: 'qqqqqqqqqqqqqqqqqqqq', label: 'Other prod', repo: 'acme/widgets', dir: s.repo.dir, sql: s.dataSql, summary: 'fix' }).join('\n') });
+  const [owner, shownA, go] = s.entries;
+  const notice = { type: 'user', message: { content: '<task-notification>background job finished</task-notification>' }, origin: { kind: 'task-notification' }, promptSource: 'system', entrypoint: 'cli' };
+  const tool = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu9', name: 'Bash', input: { command: 'node x present' } }] } };
+  const result = { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu9', content: shownB }] } };
+  writeFileSync(s.transcript, linesOf([owner, shownA, notice, tool, result, go]));
+  assert.equal(sql(s, s.dataSql).decision, 'deny');
 });
 
 test('data: `go data` allows one execute_sql of exactly the fenced SQL; a different statement or whitespace is refused', async (t) => {
@@ -1440,4 +1456,91 @@ test('after-deploy: the unmarked file sends the same file query as before and no
   const dq = queryOf(call);
   assert.deepEqual([argOf(call.args, 'env'), argOf(call.args, 'num'), argOf(call.args, 'o'), argOf(call.args, 'n')], ['Production', '42', 'acme', 'widgets']);
   for (const piece of ['latestCompletedDeployment', 'first:1', 'direction:DESC', 'field:CREATED_AT', 'environments:[$env]', 'creator { __typename login }', 'latestStatus { state createdAt creator { __typename login } }', 'commitOid', 'originalEnvironment', 'latestEnvironment', 'state', 'mergedAt', 'mergeCommit { oid }', 'nameWithOwner', 'defaultBranchRef { name target { oid } }']) assert.ok(dq.includes(piece), piece);
+});
+
+// ---- #741 (B2): a refusal that names the bytes ------------------------------------------------------------------------------------------------------------------------
+
+test('B2: an execute_sql query that differs from the approved SQL only by a final newline, a BOM or trailing whitespace is refused naming the bytes, the go unspent', async (t) => {
+  // Failure caught: the model sent the file's text with its final newline; the refusal showed only two hashes ("one byte different"), so it asked the owner again instead of resending the exact SQL.
+  const s = await scene(t, { op: 'data' });
+  const n = Buffer.byteLength(s.dataSql, 'utf8');
+  const nl = sql(s, `${s.dataSql}\n`);
+  assert.equal(nl.decision, 'deny');
+  assert.match(nl.reason, new RegExp(`only by a final newline \\(${n + 1} bytes sent, ${n} approved\\)`));
+  assert.match(sql(s, `\uFEFF${s.dataSql}`).reason, new RegExp(`only by a leading BOM \\(${n + 3} bytes sent, ${n} approved\\)`));
+  assert.match(sql(s, `${s.dataSql}  \n\n`).reason, /only by trailing whitespace/);
+  assert.doesNotMatch(sql(s, s.dataSql.replace('7', '8')).reason, /only by/, 'different SQL gets no hint');
+  assert.equal(markers(s).length, 0, 'no go was spent');
+  assert.equal(sql(s, s.dataSql).decision, 'allow', 'the exact SQL still claims the go');
+});
+
+test('R1-B6: an unmatched execute_sql with a huge interior whitespace run is refused at once and without a byte hint', async (t) => {
+  // Failure caught: the byte-mismatch diagnostic ran a trailing-whitespace regex over the caller's whole query before any size limit; on a long interior run that is quadratic, and a hook that outlives its host timeout is an allow.
+  const s = await scene(t, { op: 'data' });
+  const t0 = Date.now();
+  const r = sql(s, `${s.dataSql}${' '.repeat(150_000)}x`);
+  const ms = Date.now() - t0;
+  assert.equal(r.decision, 'deny');
+  assert.doesNotMatch(r.reason, /only by/);
+  assert.ok(ms < 1500, `${ms} ms`);
+});
+
+test('R1-B8: an execute_sql call with no session id never gets a byte hint from another session\'s approval', async (t) => {
+  // Failure caught: with the session id missing the diagnostic read every session's approvals, so the refusal said "differs only by a final newline" about an approval that belongs to another session.
+  const s = await scene(t, { op: 'data' });
+  assert.match(sql(s, `${s.dataSql}\n`).reason, /only by a final newline/, 'this session\'s own approval is still named');
+  for (const sessionId of [undefined, null, '']) {
+    const r = sql(s, `${s.dataSql}\n`, { sessionId });
+    assert.equal(r.decision, 'deny');
+    assert.doesNotMatch(r.reason, /only by/, String(sessionId));
+  }
+});
+
+test('B2: a --sql-file that ends with a newline gives present.sql (no newline) and sqlBytes in UTF-8 bytes, and that sql claims on the first try', async (t) => {
+  // Failure caught: the hash covering the file's bytes while present printed the canonical text, so the first execute_sql with the file text was refused; and sqlBytes counting characters for multibyte SQL.
+  const s = await scene(t, { op: 'data' });
+  const ctx = { home: s.home, cwd: s.repo.dir, env: {} };
+  writeFileSync(join(s.repo.dir, 'fix.sql'), `${s.dataSql}\n`);
+  const r = (await runLiveDb(['present', '--op', 'data', '--project', REF, '--sql-file', 'fix.sql', '--summary', 'fix'], ctx)).output;
+  assert.equal(r.sql, s.dataSql);
+  assert.equal(r.sqlBytes, Buffer.byteLength(s.dataSql, 'utf8'));
+  assert.equal(sql(s, r.sql).decision, 'allow', 'present.sql claims on the first try');
+  writeFileSync(join(s.repo.dir, 'multi.sql'), "update t set n = 'é✓' where id = 7\n");
+  const m = (await runLiveDb(['present', '--op', 'data', '--project', REF, '--sql-file', 'multi.sql', '--summary', 'fix'], ctx)).output;
+  assert.equal(m.sqlBytes, Buffer.byteLength(m.sql, 'utf8'));
+  assert.notEqual(m.sqlBytes, m.sql.length);
+});
+
+// ---- #811: apply_migration with a numbered name is refused before any go is read, spent or auto-applied ---------------------------------------------------------------------
+
+test('#811: apply_migration with a numbered name (0261_x, or the empty suffix 0261_) is refused on a live project with the by-hand message, whatever go there is, and no go is spent', async (t) => {
+  // Failure caught: a numbered migration applied through apply_migration (recorded under a generated timestamp version, 0261 left pending), or a go burnt on a call that could never be right.
+  for (const name of ['0261_x', '0261_']) {
+    const s = await scene(t, { name, record: false });
+    const r = apply(s, { name });
+    assert.equal(r.decision, 'deny', name);
+    assert.match(r.reason, /is a numbered migration.*The owner runs `supabase db push` by hand/s, name);
+    assert.equal(markers(s).length, 0, 'no go consumed');
+  }
+});
+
+test('#811: the auto-apply path cannot apply a merged numbered file either, and asks GitHub nothing', async (t) => {
+  // Failure caught: #883's auto mode applying a merged 0261_x.sql with no go at all.
+  for (const name of ['0261_x', '0261_']) {
+    const s = await autoScene(t);
+    s.tweak(() => {}, { name });
+    const r = apply(s, { name });
+    assert.equal(r.decision, 'deny', name);
+    assert.match(r.reason, /is a numbered migration/);
+    assert.equal(s.calls.length, 0, 'GitHub was not asked');
+    assert.deepEqual(hist(s), []);
+  }
+});
+
+test('#811 allow side: a timestamp migration with a go still applies; a listed dev server takes a numbered name', async (t) => {
+  // Failure caught: the refusal reaching timestamp names, or the dev early allow blocked for a numbered migration (a dev database applies it as before).
+  const s = await scene(t);
+  assert.equal(apply(s).decision, 'allow');
+  runOwnerCli(s.home, ['server', 'add', 'mine']);
+  assert.equal(evaluateSupabaseMcp('mcp__mine__apply_migration', { project_id: DEV, name: '0261_x', query: SQL }, s.ctx).decision, 'allow');
 });

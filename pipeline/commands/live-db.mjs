@@ -15,17 +15,17 @@ import { CATALOG_TEMPLATES, GUC_NAMES, buildCatalogQuery } from '../hooks/lib/li
 import { readDbRefs } from '../hooks/lib/db-refs.mjs';
 import { liveDbAsk } from '../hooks/lib/owner-go-click.mjs';
 import { readAttemptLog } from '../hooks/lib/live-db-auto.mjs';
-import { blobAt, buildBlock, canonicalDataSql, liveLabel, migrationSqlProblem, repoOf, sha256Of, summaryProblem } from '../hooks/lib/live-db-go.mjs';
+import { blobAt, buildBlock, canonicalDataSql, liveLabel, migrationSqlProblem, migrationVersionOf, numberedMigrationReason, repoOf, sha256Of, summaryProblem } from '../hooks/lib/live-db-go.mjs';
 
 export const meta = {
   summary: 'live-database guard: build the block the owner is shown before a live Supabase change (present), print the catalog look-up SQL that needs no go (catalog), list the recorded migration attempts (auto-log)',
   usage: [
     'pipeline live-db present --op migration --pr <N> --file supabase/migrations/<f>.sql --project <ref> --summary "<one line>"',
-    '  -> {ok, block, sqlSha256, name} : refuses unless the working-tree file equals HEAD:<file>, HEAD is the PR head on GitHub, the bytes are valid (UTF-8, no CR/NUL, no fence line, at most 300 lines) and the project is live.',
+    '  -> {ok, block, sqlSha256, name} : refuses a numbered migration (`0261_x.sql`: anything but a 14-digit date-time version; reason numbered-migration: the owner runs `supabase db push` by hand, no go can be asked for it) and refuses unless the working-tree file equals HEAD:<file>, HEAD is the PR head on GitHub, the bytes are valid (UTF-8, no CR/NUL, no fence line, at most 300 lines) and the project is live.',
     '     End your reply with `block` (its last line is the ask) and wait for the owner to type `go migration <name>`; then call apply_migration with name = <name> and query = the file text, unchanged.',
     '  -> --ask (click-to-approve): also {ask: {askId, questions}}: a choice question (Yes, apply <name> | Not yet) whose text is the title and then exactly `block`, written as an ask file (one-time use, expires after 24 h); after the block, pass `ask.questions` to AskUserQuestion verbatim and the owner-go hook records a human click on Yes as the same go the typed `go migration <name>` records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | Claude Code build unknown or not allowlisted for clicks | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued): the owner types the go as before',
     'pipeline live-db present --op data --project <ref> --sql-file <path> --summary "<one line>"',
-    '  -> {ok, block, sqlSha256, sql} : the SQL is canonicalised (BOM and trailing whitespace stripped; CR, NUL, a fence line, a line with trailing spaces, over 60 lines or 4000 characters are refused: make it a migration). Pass `sql` verbatim as execute_sql query; the owner types `go data <sha12>`.',
+    '  -> {ok, block, sqlSha256, sql, sqlBytes} : the SQL is canonicalised (BOM and trailing whitespace stripped; CR, NUL, a fence line, a line with trailing spaces, over 60 lines or 4000 characters are refused: make it a migration). Pass `sql` verbatim as execute_sql query; the owner types `go data <sha12>`.',
     '  -> --ask on a data fix: the same dialog (Yes, run <sha12> | Not yet), when the checkout has an origin remote; otherwise ask: null and askSkipped.',
     `pipeline live-db catalog <kind> [args…]   -> {ok, sql} : the only execute_sql text a live project takes without a go; pass sql verbatim. kinds: ${Object.entries(CATALOG_TEMPLATES).map(([k, t]) => [k, ...t.args.map((a) => `<${a}>`)].join(' ')).join(' · ')}`,
     'pipeline live-db auto-log [--days N]   -> {ok, events: [{at, via (auto | go | go-import), outcome, ref, label, name, file, pr, commit, repo, session, generation, afterDeploy, deployEnv, deployedAt}], unreadable: [path]} : the migration attempts recorded on this machine for projects whose owner switched auto-apply on, newest first, the last N days (default 30). Read-only; runs anywhere. outcome `attempted` = both of its records exist: the call was allowed, or it was denied after the second record was written (making it durable failed, time ran out, a consumed-go record could not be read, or a go was consumed meanwhile), so it counts as an attempt and the live state is checked (attempted, not necessarily applied: the session\'s effect check says whether it applied), `reserved` = only one of its two records exists (a lost race or a failed write: nothing was allowed), `imported` = a go the owner\'s auto-migrations switch-on imported (nothing was allowed by it).',
@@ -101,7 +101,7 @@ export async function run(argv, ctx = {}) {
     const block = buildBlock({ op, ref: values.project, label, repo, dir, sql: canon.sql, summary: values.summary });
     const sha = sha256Of(canon.sql);
     const parts = repo === null ? null : liveDbAsk({ repo, block: block.join('\n'), op, arg: sha.slice(0, 12), label, ref: values.project });
-    return { exitCode: EXIT.OK, output: { ok: true, block: block.join('\n'), sqlSha256: sha, sql: canon.sql, label, ...await asked(parts, 'the block names no repository (no origin remote here), so a click cannot be bound: the owner types the go') } };
+    return { exitCode: EXIT.OK, output: { ok: true, block: block.join('\n'), sqlSha256: sha, sql: canon.sql, sqlBytes: Buffer.byteLength(canon.sql, 'utf8'), label, ...await asked(parts, 'the block names no repository (no origin remote here), so a click cannot be bound: the owner types the go') } };
   }
 
   // migration
@@ -110,6 +110,7 @@ export async function run(argv, ctx = {}) {
   if (!Number.isInteger(pr) || pr < 1) throw new UsageError('--pr must be a pull request number');
   const file = values.file.replaceAll('\\', '/');
   if (!/^supabase\/migrations\/[^/]+\.sql$/.test(file)) throw new UsageError('--file must be supabase/migrations/<name>.sql, relative to the repository root');
+  if (migrationVersionOf(path.posix.basename(file)).kind === 'numbered') return FAIL(numberedMigrationReason(file), { reason: 'numbered-migration' });
   let head;
   try { head = git(['rev-parse', '--verify', 'HEAD'], { cwd: dir }).trim(); } catch { return FAIL('cannot read HEAD'); }
   const committed = blobAt(dir, head, file);
