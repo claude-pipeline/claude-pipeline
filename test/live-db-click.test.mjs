@@ -329,6 +329,7 @@ test('through the real hook entry: a pending click of this session and a git tha
   const argvLog = join(w.home, 'git-argv');
   writeFileSync(join(shim, 'git'), `#!/bin/sh\necho "$@" >> '${argvLog}'\nsleep 30\n`, { mode: 0o755 });
   const { r, ms } = spawnHook(w, shim);
+  assert.equal(r.status, 0, r.stderr);
   assert.equal(JSON.parse(r.stdout).hookSpecificOutput.permissionDecision, 'deny', r.stdout);
   assert.ok(ms < 14_000, `${ms} ms`);
   assert.ok(existsSync(argvLog), 'the settling route reached a git read');
