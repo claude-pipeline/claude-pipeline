@@ -1,7 +1,7 @@
 // Child process for test/helpers/db-refs-owner.mjs: one `pipeline db-refs` call run as the owner would run it (own terminal), against an EXPLICIT disposable home.
 // argv[2] = JSON { home, args }. Prints { exitCode, output } as JSON. It refuses to run when `home` is not under the OS temp folder, so a mistake in a test
 // can never write the account's real registry (this entry deliberately does not go through bin/pipeline.mjs, which passes no `home`).
-import { existsSync, realpathSync, writeFileSync } from 'node:fs';
+import { existsSync, lstatSync, realpathSync, writeFileSync } from 'node:fs';
 import { dbRefsFile } from '../../pipeline/hooks/lib/db-refs.mjs';
 import { tmpdir } from 'node:os';
 import { dirname, resolve, sep } from 'node:path';
@@ -26,6 +26,17 @@ if (real === null || real === tmp || !real.startsWith(tmp + sep)) {
 }
 // `during` (a test of a registry change made by a second terminal while the command works): the registry file is overwritten with this body the first time the command asks for the time
 let fired = false;
-const now = () => { if (during !== null && !fired) { fired = true; writeFileSync(dbRefsFile(home), `${JSON.stringify(during, null, 2)}\n`); } return Date.now(); };
+// (never through a symlink: the write cannot leave the test home)
+const now = () => {
+  if (during !== null && !fired) {
+    fired = true;
+    const file = dbRefsFile(home);
+    let linked = false;
+    try { linked = lstatSync(file).isSymbolicLink(); } catch { /* absent: the write creates it */ }
+    if (linked) throw new Error(`db-refs-owner-child: refusing to write through the symlink ${file}`);
+    writeFileSync(file, `${JSON.stringify(during, null, 2)}\n`);
+  }
+  return Date.now();
+};
 const r = await run(args, during === null ? { home } : { home, now });
 process.stdout.write(JSON.stringify({ exitCode: r.exitCode, output: r.output }));
