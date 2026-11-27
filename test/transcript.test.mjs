@@ -137,6 +137,16 @@ test('meta recording the pinned model on a default launch is not an override; an
   );
 });
 
+// An explicit expectMetaModel means the caller asked for exactly that override; a default launch recording a
+// different in-family model must not slip through the default-launch exemption.
+test('an explicit expectMetaModel is compared exactly even on a default launch', () => {
+  const meta = (model) => JSON.stringify({ agentType: 'arbiter', description: 'd', launchedWithDefaults: true, model });
+  const refused = prove('fable-ok', { metaText: meta('claude-fable-5-2'), expectMetaModel: 'claude-fable-5-1' });
+  assert.equal(refused.ok, false);
+  assert.deepEqual(refused.errors, ['per-call model override present: claude-fable-5-2']);
+  assert.deepEqual(prove('fable-ok', { metaText: meta('claude-fable-5-2'), expectMetaModel: 'claude-fable-5-2' }).errors, []);
+});
+
 // ---------- proveModel: fail-closed edge shapes ----------
 
 test('unparseable, non-object, or missing meta fails closed', () => {
