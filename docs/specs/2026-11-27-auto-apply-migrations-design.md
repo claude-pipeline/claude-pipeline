@@ -3,6 +3,9 @@
 Status: design, owner approach pick 2026-11-27 ("After the merge only"), approved as written 11-27. **Revision 2 (11-27):** the Codex
 plan review R1 (7 × P1) hardened the claim, the time budget, the GitHub proof and the marker files; the owner chose (11-27) that a
 migration marked `-- pipeline: apply-after-deploy` keeps the go (one click after the deploy; the deploy-checked variant is idea #882).
+**Revision 3 (11-27)** after the Codex recheck: a generation history (every allowed apply advances it), the time budget through click
+settling, the marker found anywhere, `on` imports the earlier go applies, durable folders, switch-off unchanged. Sections 1–5 below
+are Revision 3; where the plan is more detailed, the plan governs.
 Plan: `docs/plans/2026-11-27-auto-apply-migrations.md`.
 
 ## Why
@@ -85,22 +88,28 @@ said: "go with auto apply already do it now disregard the pause". For a migratio
   `supabase/migrations/**`). `show` prints the flag.
 - `set` on an existing ref keeps the flag only when it stays live with the same repo (a label-only edit); a changed repo or `--dev`
   clears it.
-- Default off: nothing changes until the owner runs it. Rollout default: on ONE machine (the Mac), so markers, which are per machine,
+- `on` first IMPORTS the project's earlier go applies on this machine into the history (section 2): every consumed migration go of
+  that ref whose go record is still there gives its name and SQL; one whose record is gone gives its SQL only and is listed, and `on`
+  refuses until the owner re-runs it with `--accept-unmatched` (such an apply, of a file later changed in its PR under the same name,
+  would not be recognised). It then creates the history folder durably and sets the flag. `off` keeps the history.
+- Default off, and off means today's behaviour exactly: for a ref without the flag the guard reads and writes no history and asks
+  GitHub nothing. Rollout default: on ONE machine (the Mac), so markers, which are per machine,
   are on the machine that applies.
 
-### 2. The attempt record (both paths)
+### 2. The attempt history (flagged projects, both paths)
 
-- Two exclusive-create markers per apply in `~/.claude/pipeline-state/owner-go/live-db-attempts/` (inside the protected `owner-go`
-  tree): `name-<id>.json`, id = first 32 hex of sha256(`name|<ref>|<name>`), and `sql-<id>.json`, id = first 32 hex of
-  sha256(`sql|<ref>|<sha256 of the query>`). Same body in both: time, `via` (`auto` | `go`), session, ref, label, name, file, sha256, and
-  for `auto` the GitHub facts (repo, branch, head, commit, commit date, PR).
-- Lookups are by exact filename, never a search: missing folder or file = none; a regular file = an attempt at its recorded time, or at
-  its mtime when the body has no valid time (empty, unparsable, a partial write); anything else (a folder, a symlink, a read error) = the history
-  is unreadable, which disables auto-apply and refuses the go path for that call, naming the path.
-- Written completely (every `writeSync` byte counted), fsynced, closed, the folder fsynced (POSIX; Windows cannot fsync a folder and
-  relies on NTFS metadata journaling: documented) before the allow.
-- The consumed go markers written before this change (`live-db-consumed/`, no name) are scanned once per auto check for a migration
-  marker of this ref with this sha256: an unreadable folder, entry or body disables auto-apply (fail closed; the reason names the file).
+- Per migration two keys, each a GENERATION sequence of exclusive-create files in
+  `~/.claude/pipeline-state/owner-go/live-db-attempts/` (inside the protected `owner-go` tree): `name-<id>-<n>.json`, id = first 32
+  hex of sha256(`name|<ref>|<name>`), and `sql-<id>-<n>.json`, id = first 32 hex of sha256(`sql|<ref>|<sha256 of the query>`),
+  `n` = 1, 2, … Every allowed apply (auto or go) creates the NEXT generation of BOTH keys; an existing one means another call got there
+  first (the repo's ticket pattern, `claimGrantMarkers`). The body: time, `via` (`auto` | `go` | `go-import`), an event id, the partner
+  file, session, ref, label, name, file, sha256, and for `auto` the GitHub facts (repo, branch, head, commit, commit date, PR). A lone
+  file (its partner missing) is a reservation from a lost race or a failed write: it counts as an attempt.
+- Lookups probe exact filenames (`-1`, `-2`, … until missing), never a search: a missing folder = no history; a key's time is the
+  latest over its generations (a body's time, else the file's mtime: empty, unparsable, a partial write); a folder, a symlink, a read
+  error, a gap or more than 64 generations = the history is unreadable, which refuses the call, naming the path.
+- Written completely (every `writeSync` byte counted), fsynced, closed, the folder fsynced, and a folder the writer creates fsynced in
+  its parent (POSIX; Windows cannot fsync a folder and relies on NTFS metadata journaling: documented) before the allow.
 - One private writer in the new module; it exports only fixed-destination claims that derive the folder, the id and the body
   themselves (an attempt claim, the go's consumed marker), so no caller can create the registry or any other protected file through
   it. Every marker it can create only ever withholds an allow.
@@ -108,23 +117,26 @@ said: "go with auto apply already do it now disregard the pause". For a migratio
 ### 3. The guard (`apply_migration` only)
 
 Inside `evaluateSupabaseMcp`, after every existing check (registry readable, well-formed project id, trusted server, not dev, a query
-and a name). One time budget for the call: what is left of the hook's wall cap (`leftMs`), passed through every blocking step (the go
-path's git reads and the GitHub calls); a step that cannot start in time is not run and the call is denied ("try again").
+and a name). One time budget for the call: what is left of the hook's wall cap (`leftMs`), passed through every child process on the
+decision path (the go path's git reads, including those under click settling, and the GitHub calls) and checked between the entries
+of every scan; a step that cannot start in time is not run and the call is denied ("try again").
 
-**The go first** (local, fast when no go is recorded). For each verified, unexpired go record:
-1. If an attempt marker for this name or this SQL is at or after the go's own time, the go is not used (it is older than the attempt:
-   a retry needs a go given after it, after a read-only check of the live state).
-2. Consume the go (its existing exclusive marker), then create the two attempt markers (`via: go`). A marker that already exists is
-   fine when its time is before the go's; one at or after it means another session attempted meanwhile: deny. A write failure: deny.
+**The go first** (local, fast when no go is recorded). On a flagged project, for each verified, unexpired go record:
+1. If the history has any attempt for this name or this SQL at or after the go's own time, or the go is stamped ahead of the clock,
+   the go is not used (a retry needs a go given after the latest attempt, after a read-only check of the live state).
+2. Consume the go (its existing exclusive marker), then create the next generation of both keys (`via: go`). Either one already there
+   means another session attempted meanwhile: deny (the go is used). A write failure: deny.
 3. Allow.
+On a project without the flag the go path is today's, unchanged.
 
 **Then auto**, only when no go was claimed, the call's ref has `autoMigrations: true` and no other enabled entry has the same repo.
 Local checks first (no network until they pass):
-1. The query has no line `-- pipeline: apply-after-deploy` (anywhere, any case): those keep the go.
+1. The query has no `pipeline: apply-after-deploy` anywhere (any case, after a BOM, indented, in any comment; detection only, the
+   bytes stay exact): those keep the go.
 2. `name` is a plain file stem (`^[A-Za-z0-9][A-Za-z0-9_.-]{0,199}$`); the file is `supabase/migrations/<name>.sql`.
 3. The query passes the character rules of the typed go (not empty, valid UTF-8, no CR or NUL, no control or bidirectional-text
    characters) but NOT its display rules (300-line cap, fence lines): nobody has to read it on screen.
-4. No attempt marker for this name or this SQL; no legacy consumed migration marker for this ref and SQL.
+4. No history for this name or this SQL (any generation, imported ones included).
 
 Then ONE GitHub GraphQL call, `gh api --hostname github.com graphql` (pinned host), timeout min(6 s, time left): the repository's
 `nameWithOwner`, default branch and head, the file at that head, the commits on that branch that touched the path (at most two), and
@@ -134,11 +146,13 @@ for that commit its associated PRs (merged, base, merge commit, files with chang
 7. Exactly ONE commit on the branch touched the path, committed (strict ISO time with a zone) at most 7 days ago and not past the
    future skew.
 8. That commit is the `mergeCommit` of a PR that is `merged`, whose base is the default branch, and whose files list the path as
-   `ADDED` (a rename, a direct push, a merge-commit or rebase merge, a delete and re-add are not eligible). A PR with more than 100
+   `ADDED` (this is the whole provenance predicate: a squash or one-commit rebase merge passes; a merge commit, a rebase in which
+   another commit touched the path, a rename, a direct push, a delete and re-add do not). A PR with more than 100
    files is paged while time is left; not found = not eligible.
 9. Any GitHub failure (no `gh`, non-zero exit, timeout, bad JSON, no such repo or branch) = not eligible.
 
-Claim: create the two attempt markers (`via: auto`); either one already there = already attempted. Both created: allow.
+Claim (only with at least 0.5 s left): create generation 1 of both keys (`via: auto`); either one already there = already
+attempted. Both created: allow.
 
 Outcomes:
 - A failed or interrupted auto-apply is never retried automatically; the next attempt needs the owner's go given after the attempt,
@@ -147,8 +161,9 @@ Outcomes:
 
 ### 4. What the owner can see
 
-- The markers are the record. `pipeline live-db auto-log [--days N]` (read-only, runs anywhere) lists ATTEMPTS (auto and go), newest
-  first, and any unreadable record (which is what disables auto-apply). "Applied" is only what the session's effect check confirms.
+- The history is the record. `pipeline live-db auto-log [--days N]` (read-only, runs anywhere) lists one line per event, newest
+  first: `attempted` (both files: an allowed call, auto or go) or `reserved` (one file: nothing was allowed), and any unreadable record
+  (which is what refuses calls). "Applied" is only what the session's effect check confirms.
 - The session reports each apply in plain English (section 5).
 
 ### 5. The review skill (`skills/review/reference/owner-merge.md` "Live-database go", `ready-and-handoff.md`, `docs/cli.md`)
@@ -157,15 +172,16 @@ Outcomes:
   say in plain English above the closing lines that merging also applies them to that project right after the merge, naming any marked
   apply-after-deploy (they wait for the deploy and one click). A file marked after-deploy that sorts BEFORE an unmarked one is fixed
   (renumbered) before the merge request.
-- **After the merge:** only on the merge job's `merged: true` (its `mergeSha`) or `error: hold-recovery` with `prMerged: true` (the
-  merge commit from `gh pr view N --json mergeCommit`). A merge reported under a veto (the queue's "merged while it was being dequeued
+- **After the merge:** only on a non-vetoed merged outcome with a full merge sha: the merge job's `mergeSha`, else (also for
+  `error: hold-recovery` with `prMerged: true`) `gh pr view N --json state,mergeCommit`; no sha ⇒ stop and tell the owner. A merge reported under a veto (the queue's "merged while it was being dequeued
   for a stop condition", or the sweep's report) applies nothing: tell the owner, then the go path on their word. The files are those
   `git diff --name-status <mergeSha>^ <mergeSha> -- supabase/migrations/` lists as added, in filename order, read with
   `git show <mergeSha>:<file>` after `git fetch origin <mergeSha>` (never `origin/main`: the default branch may have another name).
-  For each file:
+  Every file goes through steps 2–5; step 4 differs for a marked file:
   1. Marked apply-after-deploy: stop the automatic sequence here; wait for the production deployment of `mergeSha` (the repo's
-     production watch, at most `deploy_timeout_minutes`; a failed or rolled-back deploy, or a timeout: tell the owner, apply nothing);
-     then the go path for that file; then carry on with the next files.
+     production watch, at most `deploy_timeout_minutes`; a failed or rolled-back deploy, or a timeout: tell the owner, apply nothing).
+     Its step 4 is the go path, run in the PR's worktree (kept until every marked file is applied) at the PR head, after checking that
+     the file there equals the merge-sha bytes exactly (different ⇒ stop). Then carry on with the next files.
   2. State the expected effect (every object the file creates or changes; for a policy: its roles, command and predicate, and the
      table's RLS state).
   3. Is it already live? A read-only check of that effect. Live ⇒ skip it and say so.
@@ -197,7 +213,11 @@ entry is a deny within the host timeout; `execute_sql` keeps the go; the switch'
 
 - Deliberate subversion (a replaced `gh` or `git` binary, an edited gh config, a script that writes or deletes protected files
   directly) is outside the threat model, as for the guard's existing reads: a tripwire, not a boundary.
-- Markers are per machine: with the switch on two machines, each could attempt once. Mitigation: switch on one machine; the skill's
+- A stalled local filesystem call (a hung fsync or read) is the one blocking step the time budget cannot bound; it would stall the
+  host's own writes too. Considered and not taken: running the decision in a worker thread with a watchdog.
+- Ordering a retry go after an attempt uses the machine's wall clock: a backward clock step larger than the gap between an attempt
+  and an older go could admit that go once (a go stamped ahead of the clock is refused).
+- History is per machine: with the switch on two machines, each could attempt once. Mitigation: switch on one machine; the skill's
   "is it live?" check.
 - A migration the owner applied outside the guard (`!` in a terminal) leaves no marker: the skill's "is it live?" check covers it.
 - A failed apply after the merge leaves the new code live without its schema until fixed (the owner's accepted trade-off).
