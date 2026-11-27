@@ -861,3 +861,15 @@ test('#897: the same chain under a headless turn, or with any other turnOrigin o
     }
   }
 });
+
+// R1-B1 (#898). Failure caught: an entry with only turnOrigin "human" and NO string parentUuid (a real `!` stdout entry always chains to its <bash-input> entry) was a plain note that
+// invisibleNote judged visible on its own fields, so a request chained under it bound the owner's next typed "merge" / "extra round" / ruling.
+test('#898 R1-B1: a turnOrigin-human stdout-shaped entry with a null or missing parentUuid is not a visible note: the request chained under it stays muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    for (const [name, parentless] of [['missing parentUuid', { parentUuid: undefined }], ['null parentUuid', { parentUuid: null }]]) {
+      const o = prompt('ship it');
+      const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', BASH_STDOUT), ...parentless };
+      assert.equal(run(kind, [o, of(o, said('working')), out, of(out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});

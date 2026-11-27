@@ -316,9 +316,11 @@ const visibleSynthetic = (e) => entrySource(e) === 'synthetic' && e.promptSource
 // #897: the one exception is the `<bash-stdout>` entry of an owner `!` command: Claude Code now writes turnOrigin "human" (with turnPromptId / turnPosition) on it, and none of promptSource / origin
 // (the `<bash-input>` entry before it carries no turnOrigin at all). turnOrigin "human" alone, entrypoint cli or unset, is a plain note: it walks its parentUuid chain like any other, so under an
 // invisible headless turn it stays invisible (R5-F1 / #246) and the turns chained through it under the owner's turn are no longer muted. Any other turnOrigin value stays fail-closed.
+// R1-B1 (#898): a real stdout entry always has a string parentUuid (its `<bash-input>` entry), and invisibleNote leaves a note with no parentUuid to its own fields (visible), so the exception needs one:
+// a turnOrigin-human entry with a null or missing parentUuid has no chain to place it and stays unplaced provenance (invisible).
 const isSet = (v) => v !== undefined && v !== null;
 const unplacedProvenance = (e) => isSet(e.promptSource) || isSet(e.origin) || isSet(e.turnOrigin) || (isSet(e.entrypoint) && e.entrypoint !== 'cli');
-const bangStdout = (e) => e.turnOrigin === 'human' && !isSet(e.promptSource) && !isSet(e.origin) && (!isSet(e.entrypoint) || e.entrypoint === 'cli');
+const bangStdout = (e) => e.turnOrigin === 'human' && typeof e.parentUuid === 'string' && !isSet(e.promptSource) && !isSet(e.origin) && (!isSet(e.entrypoint) || e.entrypoint === 'cli');
 // What the turn / note classification below uses: unplacedProvenance without the `!` stdout shape. (promptEntryOf's #418 twin check keeps the strict one, so a forged twin of the owner's prompt written with turnOrigin human still reads as two.)
 const unplacedTurnProvenance = (e) => unplacedProvenance(e) && !bangStdout(e);
 // #253, NOT SUPPORTED: a pre-provenance transcript (Claude Code older than 2.1.258: no prompt carries promptSource, origin, entrypoint or turnOrigin) has nothing to say who wrote a prompt, so
