@@ -16,6 +16,7 @@ import { LIVE_DB_CONSUMED_REL, claimLiveDbGo, evaluateSupabaseMcp, isSupabaseToo
 import { buildCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
 import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
 import { HOOK_CLOCK } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { run as runLiveDb } from '../pipeline/commands/live-db.mjs';
 
 const REF = 'abcdefghij0123456789';
 const DEV = 'zyxwvutsrq9876543210';
@@ -1200,4 +1201,35 @@ test('B1a (claim): a notice turn that re-presents the owner\'s migration name wi
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /the block changed in a turn you did not start/);
   assert.equal(markers(s).length, 0);
+});
+
+// ---- #741 (B2): a refusal that names the bytes ------------------------------------------------------------------------------------------------------------------------
+
+test('B2: an execute_sql query that differs from the approved SQL only by a final newline, a BOM or trailing whitespace is refused naming the bytes, the go unspent', async (t) => {
+  // Failure caught: the model sent the file's text with its final newline; the refusal showed only two hashes ("one byte different"), so it asked the owner again instead of resending the exact SQL.
+  const s = await scene(t, { op: 'data' });
+  const n = Buffer.byteLength(s.dataSql, 'utf8');
+  const nl = sql(s, `${s.dataSql}\n`);
+  assert.equal(nl.decision, 'deny');
+  assert.match(nl.reason, new RegExp(`only by a final newline \\(${n + 1} bytes sent, ${n} approved\\)`));
+  assert.match(sql(s, `\uFEFF${s.dataSql}`).reason, new RegExp(`only by a leading BOM \\(${n + 3} bytes sent, ${n} approved\\)`));
+  assert.match(sql(s, `${s.dataSql}  \n\n`).reason, /only by trailing whitespace/);
+  assert.doesNotMatch(sql(s, s.dataSql.replace('7', '8')).reason, /only by/, 'different SQL gets no hint');
+  assert.equal(markers(s).length, 0, 'no go was spent');
+  assert.equal(sql(s, s.dataSql).decision, 'allow', 'the exact SQL still claims the go');
+});
+
+test('B2: a --sql-file that ends with a newline gives present.sql (no newline) and sqlBytes in UTF-8 bytes, and that sql claims on the first try', async (t) => {
+  // Failure caught: the hash covering the file's bytes while present printed the canonical text, so the first execute_sql with the file text was refused; and sqlBytes counting characters for multibyte SQL.
+  const s = await scene(t, { op: 'data' });
+  const ctx = { home: s.home, cwd: s.repo.dir, env: {} };
+  writeFileSync(join(s.repo.dir, 'fix.sql'), `${s.dataSql}\n`);
+  const r = (await runLiveDb(['present', '--op', 'data', '--project', REF, '--sql-file', 'fix.sql', '--summary', 'fix'], ctx)).output;
+  assert.equal(r.sql, s.dataSql);
+  assert.equal(r.sqlBytes, Buffer.byteLength(s.dataSql, 'utf8'));
+  assert.equal(sql(s, r.sql).decision, 'allow', 'present.sql claims on the first try');
+  writeFileSync(join(s.repo.dir, 'multi.sql'), "update t set n = 'é✓' where id = 7\n");
+  const m = (await runLiveDb(['present', '--op', 'data', '--project', REF, '--sql-file', 'multi.sql', '--summary', 'fix'], ctx)).output;
+  assert.equal(m.sqlBytes, Buffer.byteLength(m.sql, 'utf8'));
+  assert.notEqual(m.sqlBytes, m.sql.length);
 });

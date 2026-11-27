@@ -10,7 +10,7 @@ import { autoEntry, isDevRef, readDbRefs, targetOf } from './db-refs.mjs';
 import { commandName } from './shell-parse.mjs';
 import { matchCatalogQuery } from './live-db-catalog.mjs';
 import { activeBinding, identify } from './mcp-servers.mjs';
-import { LIVE_DB_MAX_AGE_MS, liveDbRecords, parseGo, sha256Of, swappedBlockReason, verifyBlock, withGitDeadline } from './live-db-go.mjs';
+import { LIVE_DB_MAX_AGE_MS, canonicalDataSql, liveDbRecords, parseGo, sha256Of, swappedBlockReason, verifyBlock, withGitDeadline } from './live-db-go.mjs';
 import { AUTO_MIN_CLAIM_MS, autoApply, claimGoMarker, claimNext, history } from './live-db-auto.mjs';
 
 export { LIVE_DB_CONSUMED_REL } from './live-db-auto.mjs';
@@ -197,6 +197,19 @@ function flaggedEntry(home, ref) {
 const presentHint = (op, ref) => (op === 'migration'
   ? `${CLI} live-db present --op migration --pr <N> --file supabase/migrations/<file>.sql --project ${ref} --summary "…"`
   : `${CLI} live-db present --op data --sql-file <file> --project ${ref} --summary "…"`);
+// #741 (B2): an execute_sql query that does not hash to a go, but whose canonical form (what `present` hashes: BOM and trailing whitespace stripped) does hash to one of this session's, differs only by bytes the model added.
+// Says which, with both byte counts. The hash comparison itself stays exact: this only explains the refusal. -> '' | a sentence.
+function exactBytesHint(query, { home, sessionId, projectRef, now }) {
+  const canon = canonicalDataSql(query);
+  if (canon.problem || canon.sql === query) return '';
+  const want = sha256Of(canon.sql);
+  if (!liveDbRecords({ home, session: sessionId, now }).some((r) => r.op === 'data' && r.projectRef === projectRef && r.sqlSha256 === want)) return '';
+  const bom = query.startsWith('\uFEFF');
+  const rest = bom ? query.slice(1) : query;
+  const tail = rest.slice(rest.replace(/\s+$/, '').length);
+  const what = [bom ? 'a leading BOM' : null, tail === '\n' ? 'a final newline' : tail !== '' ? 'trailing whitespace' : null].filter(Boolean).join(' and ');
+  return ` The query differs from the SQL the owner approved only by ${what} (${Buffer.byteLength(query, 'utf8')} bytes sent, ${Buffer.byteLength(canon.sql, 'utf8')} approved): pass \`sql\` exactly as \`live-db present\` printed it, with no BOM and no final newline; the go is not used.`;
+}
 const show = (query) => `sha256 ${sha256Of(query)} over ${Buffer.byteLength(query, 'utf8')} bytes`;
 
 // -> { decision, reason }. `ctx`: { home, sessionId, transcriptPath, now, io, leftMs, env }. `leftMs` is what is left of the hook's time budget: the whole decision runs inside it (every git read under the go's
@@ -238,10 +251,11 @@ function decide(tool, ti, ctx) {
         autoNote = ` Auto-apply did not apply: ${a.reason}.`;
       }
     }
+    const exact = op === 'data' && c.status === 'none' ? exactBytesHint(query, { home, sessionId: ctx.sessionId, projectRef: target.ref, now: ctx.now ?? Date.now }) : '';
     const lookup = name === 'execute_sql' ? ` If the SQL only reads (a SELECT, an EXPLAIN, a count), do not ask the owner: write it to a file and run \`supabase db query --read-only --remote=${target.ref} -f <file.sql>\` (a file, so the shell cannot change the SQL), which the guard allows. For a schema look-up use \`${CLI} live-db catalog <kind> …\` and pass its sql verbatim.` : '';
     const ask = `Run \`${presentHint(op, target.ref)} --ask\`, end the reply with its block, then call AskUserQuestion with its ask.questions verbatim (when ask is null, wait for the owner's typed go instead).`;
     const after = c.status === 'spent' || c.status === 'error' ? ' A used go is never reused: check the live state read-only (list_migrations or a catalog query) before asking for a new one.' : '';
-    return deny(`${name} on ${where} needs the owner's go for exactly this query (${show(query)}${op === 'migration' ? `, name ${migName}` : ''}): ${c.reason}.${autoNote}${lookup} ${ask}${after}`);
+    return deny(`${name} on ${where} needs the owner's go for exactly this query (${show(query)}${op === 'migration' ? `, name ${migName}` : ''}): ${c.reason}.${exact}${autoNote}${lookup} ${ask}${after}`);
   }
   return deny(`${name} is not allowed on the live database ${where}; the owner does this in the dashboard`);
 }
