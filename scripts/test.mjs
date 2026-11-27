@@ -13,7 +13,7 @@
 // CP_RELATED_CHANGED (test-only): a newline-separated list of repo-relative paths used INSTEAD OF git's changed files.
 // --list prints the files that would run (and the summary) and exits 0 without running them.
 // --shard I/N runs bin I of N (balanced by measured time, scripts/lib/test-weights.json, bytes for unmeasured files;
-// scripts/lib/shard.mjs); the Windows CI job uses 3 shards.
+// scripts/lib/shard.mjs); the Windows CI job uses 7 shards, each Ubuntu Node job 2.
 // With CP_TEST_TIMES it also writes <path>.manifest (buildManifest in scripts/lib/file-times.mjs): the files THIS run was given, the shard label
 // and the size and hash of the full unsharded list; CI prints it next to the times so scripts/shard-weights.mjs can check a run's shards add up.
 // CP_TEST_TIMES=<path> also records each file's wall-clock time into <path> as { file: { spanMs } }

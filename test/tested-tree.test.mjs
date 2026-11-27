@@ -49,7 +49,7 @@ function gh(tree, over = {}, extra = []) {
     entry(`^api repos/${REPO}/actions/workflows/ci\\.yml/runs\\?head_sha=${HEAD}&event=pull_request`, 'runs'),
     entry(`^api repos/${REPO}/actions/runs/${RUN_ID}/jobs\\?filter=all`, 'jobs'),
     entry(`^api repos/${REPO}/actions/workflows/ci\\.yml/runs\\?head_sha=${SHA}&event=merge_group&per_page=100$`, 'mgRuns'),
-    entry(`^api repos/${REPO}/actions/runs/${MG_RUN_ID}/jobs\\?filter=all&per_page=100$`, 'mgJobs'),
+    entry(`^api repos/${REPO}/actions/runs/${MG_RUN_ID}/jobs\\?filter=all&per_page=100&page=1$`, 'mgJobs'),
   ];
 }
 
@@ -93,7 +93,7 @@ test('a rerun that went green counts: only a later attempt of the job succeeded'
 // The draft flow (ci.draft_while_iterating): the PR head's draft-era run concluded skipped (every job skipped); the run after ready_for_review is the real one.
 test('a draft-era run whose jobs were all skipped never counts as green; the ready-era run on the same head does', async () => {
   const DRAFT_RUN = 554;
-  const draftJobs = { match: `^api repos/${REPO}/actions/runs/${DRAFT_RUN}/jobs\\?filter=all`, stdoutJson: { jobs: [{ name: 'test (windows 1/3)', conclusion: 'skipped' }, { name: JOB, conclusion: 'skipped' }, { name: 'test (windows)', conclusion: 'skipped' }] } };
+  const draftJobs = { match: `^api repos/${REPO}/actions/runs/${DRAFT_RUN}/jobs\\?filter=all`, stdoutJson: { jobs: [{ name: 'test (windows 1/7)', conclusion: 'skipped' }, { name: JOB, conclusion: 'skipped' }, { name: 'test (windows)', conclusion: 'skipped' }] } };
   const draftRun = { id: DRAFT_RUN, status: 'completed', conclusion: 'skipped' };
   const readyRun = { id: RUN_ID, status: 'completed', conclusion: 'success' };
   const both = await decide({ over: { runs: { stdoutJson: { workflow_runs: [readyRun, draftRun] } } }, extra: [draftJobs] });
@@ -192,6 +192,28 @@ test('a queue merge is not re-run: a green merge_group run on the pushed sha ski
   assert.doesNotMatch(r.stdout, /RUN: /);
 });
 
+// Failure caught: the jobs listing is read as one page of 100. A run with many attempts (14 jobs each) lists the later attempts on page 2,
+// the passed job is not found there, and every push to main re-runs the whole suite instead of skipping it.
+test('a passed job that only appears on page 2 of a run jobs listing is found (PR evidence and merge_group evidence)', async () => {
+  const filler = (n) => Array.from({ length: n }, (_, k) => ({ name: `test (windows ${(k % 7) + 1}/7)`, conclusion: 'failure' }));
+  const page = (m, n, jobs) => ({ match: `${m}&per_page=100&page=${n}$`, stdoutJson: { jobs } });
+  const prJobs = (extraPages) => [page(`^api repos/${REPO}/actions/runs/${RUN_ID}/jobs\\?filter=all`, 1, filler(100)), ...extraPages];
+  const onPage2 = await decide({ extra: prJobs([page(`^api repos/${REPO}/actions/runs/${RUN_ID}/jobs\\?filter=all`, 2, [...filler(5), { name: JOB, conclusion: 'success' }])]) });
+  assert.equal(onPage2.output, 'run=false', onPage2.stdout);
+  assert.match(onPage2.stdout, new RegExp(`evidence: run ${RUN_ID} .* job "test \\(ubuntu\\)" concluded success on PR head`));
+  // a full last page ends the walk (page 3 is empty), and a job on no page still means run
+  const none = await decide({ extra: prJobs([
+    page(`^api repos/${REPO}/actions/runs/${RUN_ID}/jobs\\?filter=all`, 2, filler(100)),
+    page(`^api repos/${REPO}/actions/runs/${RUN_ID}/jobs\\?filter=all`, 3, []),
+  ]) });
+  assert.equal(none.output, 'run=true', none.stdout);
+  // the merge queue's run lists its jobs the same way
+  const mgJobs = (n, jobs) => page(`^api repos/${REPO}/actions/runs/${MG_RUN_ID}/jobs\\?filter=all`, n, jobs);
+  const mg = await decide({ over: mgRuns(mgRun()), extra: [mgJobs(1, filler(100)), mgJobs(2, [{ name: JOB, conclusion: 'success' }])], headTree: NO_PR_EVIDENCE });
+  assert.equal(mg.output, 'run=false', mg.stdout);
+  assert.match(mg.stdout, /evidence: run 777 .* in the merge_group run/);
+});
+
 test('a merge_group run that proves nothing is not used: another sha, failed, cancelled, in progress, wrong event, or from a fork -> run', async () => {
   const cases = {
     'different sha': mgRun({ head_sha: 'e'.repeat(40) }),
@@ -213,8 +235,8 @@ test('a merge_group run that proves nothing is not used: another sha, failed, ca
 
 test('a green merge_group run without this job green (only another shard passed, or the job is missing) is not used -> run', async () => {
   for (const jobs of [
-    [{ name: 'test (windows 1/3)', conclusion: 'success' }],
-    [{ name: JOB, conclusion: 'failure' }, { name: 'test (windows 1/3)', conclusion: 'success' }],
+    [{ name: 'test (windows 1/7)', conclusion: 'success' }],
+    [{ name: JOB, conclusion: 'failure' }, { name: 'test (windows 1/7)', conclusion: 'success' }],
     [{ name: JOB, conclusion: 'skipped' }],
     [],
   ]) {
@@ -271,34 +293,30 @@ test('the test jobs open with the skip step, push only, naming their own job (ea
     assert.ok(steps.slice(0, at).some((s) => s.includes('actions/checkout@')), 'the script comes from the checkout');
     const gated = "github.event_name != 'push' || steps.tested.outputs.run != 'false'";
     for (const after of steps.slice(at + 1)) {
-      // The one exception: the shard job's installer round trip runs in shard 3 only, and keeps the skip gate too.
-      const shard3Only = after.includes('installer-round-trip.sh') && block.startsWith('test-windows-shard:');
+      // The one exception: the installer round trip runs on one shard row only (which row is pinned against the expanded matrix in
+      // ci-workflow.test.mjs), and keeps the skip gate too.
+      const installerShard = after.includes('installer-round-trip.sh') && /^ {8}if: matrix\.shard == \d+ && /m.exec(after)?.[0];
       // ...and the file-times print (Windows shards and Ubuntu Node jobs) runs even after a red Tests step (always()), so a failing job still reports its times.
       const fileTimes = after.includes('CP-FILE-TIMES-BEGIN');
-      const want = shard3Only ? `if: matrix.shard == 3 && (${gated})` : fileTimes ? `if: always() && (${gated})` : `if: ${gated}`;
+      const want = installerShard ? `${installerShard.trimStart()}(${gated})` : fileTimes ? `if: always() && (${gated})` : `if: ${gated}`;
       assert.ok(after.split('\n').some((l) => l.trim() === want), `${after.split('\n')[0]}: expected "${want}"`);
     }
   }
 });
 
-test('the Windows shard job: JOB_NAME is the per-shard name, shards run `--shard I/3`, the installer runs in shard 3 only', () => {
-  const block = blockOf('windows-shard');
-  assert.match(block, /^ {4}name: test \(windows \$\{\{ matrix\.shard \}\}\/3\)$/m);
-  assert.match(block, /JOB_NAME: test \(windows \$\{\{ matrix\.shard \}\}\/3\)$/m);
-  assert.match(block, /run: node scripts\/test\.mjs --shard \$\{\{ matrix\.shard \}\}\/3$/m);
-  const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
-  assert.equal(installer.length, 1);
-  assert.match(installer[0], /if: matrix\.shard == 3 && \(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\)/);
-});
-
-test('the Ubuntu Node job: JOB_NAME is the per-Node-version name, the suite and the installer run for every Node version', () => {
-  const block = blockOf('ubuntu-node');
-  assert.match(block, /^ {4}name: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
-  assert.match(block, /JOB_NAME: test \(ubuntu node \$\{\{ matrix\.node \}\}\)$/m);
-  assert.match(block, /run: node scripts\/test\.mjs$/m);
-  const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
-  assert.equal(installer.length, 1);
-  assert.match(installer[0], /^ {8}if: github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'$/m);
+// Failure caught: a matrix job whose display name and JOB_NAME drift apart (checked per expanded row in ci-workflow.test.mjs) or whose
+// installer round trip loses the push-skip gate (it would run after a skipped suite, or on a push the PR run already covered).
+test('each matrix job: JOB_NAME is its own name, its shard row is in the name, and the installer keeps the skip gate', () => {
+  for (const id of ['windows-shard', 'ubuntu-node']) {
+    const block = blockOf(id);
+    const name = block.match(/^ {4}name: (.+)$/m)[1].trim();
+    assert.match(name, /\$\{\{ matrix\.shard \}\}/, `${id}: the shard is in the name, or every row would share one check name`);
+    assert.match(block, new RegExp(`^ +JOB_NAME: ${name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}$`, 'm'));
+    assert.match(block, /run: node scripts\/test\.mjs --shard \$\{\{ matrix\.shard \}\}\/\d+$/m);
+    const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
+    assert.equal(installer.length, 1);
+    assert.match(installer[0], /if: matrix\.shard == \d+ && \(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\)/);
+  }
 });
 
 test('the aggregate test (ubuntu) job has no skip step and always evaluates the Node jobs result', () => {

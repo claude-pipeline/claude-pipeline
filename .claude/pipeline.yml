@@ -21,13 +21,13 @@ verify:
   screenshots: .verify/screenshots
   expected_steps: [tests]
   # The gate may take GitHub's "test (ubuntu)" run on the exact head as proof for `tests` instead of a full local run, so a
-  # busy Mac (several sessions' suites at once) no longer blocks a merge. "test (ubuntu)" is the aggregate of the two Node jobs
-  # ("test (ubuntu node 20)" and "test (ubuntu node 24)"): green only when both passed, and a pull_request run never skips steps. A PR that touches the CI setup, this file or the
+  # busy Mac (several sessions' suites at once) no longer blocks a merge. "test (ubuntu)" is the aggregate of the four Ubuntu jobs
+  # (Node 20 and 24, two shards each: "test (ubuntu node 20 1/2)" .. "test (ubuntu node 24 2/2)"): green only when all four passed, and a pull_request run never skips steps. A PR that touches the CI setup, this file or the
   # verify scripts still runs the tests on the Mac. "test (windows)" stays a required check of its own.
   deferrable_steps: [tests]
   ci_proof:
     tests: { workflow: .github/workflows/ci.yml, job: "test (ubuntu)", event: pull_request }
-  ci_proof_wait_minutes: 45      # the two ubuntu Node jobs run in parallel, each ~12-25 min + queue, each capped at 45 (the job timeout); past this the Mac runs the tests
+  ci_proof_wait_minutes: 45      # the four ubuntu jobs (two Node versions x two shards) run in parallel, each ~12-25 min + queue, each capped at 45 (the job timeout); past this the Mac runs the tests
 
 ci:
   required_checks: ["test (ubuntu)", "test (windows)"]
