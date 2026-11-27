@@ -34,7 +34,7 @@ import { readRepoMoves, sameRepo } from './repo-moves.mjs';
 
 // The Claude Code builds whose click transcripts were recorded and checked. Each build needs its fixture set under test/fixtures/click/<build>/, recorded by scripts/click-spike.mjs (the tests
 // run the whole matrix for every build listed here). Installed (protected) code, never pipeline.yml: a repo may switch clicks OFF, never widen this.
-export const CLICK_BUILDS = Object.freeze(['2.1.322', '2.1.323']);
+export const CLICK_BUILDS = Object.freeze(['2.1.322', '2.1.323', '2.1.332']);
 export const HUMAN_DECISION = Object.freeze({ decision: 'accept', source: 'user_temporary', grantScope: 'once', reasonCode: 'unknown' });
 // owner-go.mjs <-> this file import each other (ownedBy calls clickProvenance), so nothing here may read an owner-go.mjs binding while the module loads: the literal is pinned to
 // OWNER_GO_REL + '/asks' by a test.
