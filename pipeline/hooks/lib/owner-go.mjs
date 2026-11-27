@@ -349,23 +349,28 @@ const invisibleTurn = (e) => {
 // a compact_boundary / hidden summary by logicalParentUuid, and a resumed session continues the SAME chain through its SessionStart attachments (probed on 2.1.3xx transcripts), so both reach
 // the typed prompt behind them. An entry with no parentUuid at all (not even null) leaves its own fields to decide, as an unplaced note does. The walk keeps a visited set and `memo` (index ->
 // verdict, shared across the calls of one lastReply), so n chained notes cost O(n), not O(n^2).
+// R2-B1 (#898): a chain that passes through a `!` stdout entry (bangStdout: it carries turnOrigin) must end at a known turn, never at the parentless fallback: the memo keeps { hidden, bare } (bare: the
+// verdict is visible only because the walk ended at an entry with no parentUuid), and every entry of a walk from the stdout entry down to it is hidden when its end is bare. The bare note itself (an ancestor) keeps its verdict.
 function invisibleNote(entries, parent, first, memo = new Map()) {
   const path = [];
   const seen = new Set();
   let verdict;
+  let bare = false;
   for (let i = first; verdict === undefined; ) {
-    if (memo.has(i)) { verdict = memo.get(i); break; }
+    if (memo.has(i)) { ({ hidden: verdict, bare } = memo.get(i)); break; }
     const e = entries[i];
     path.push(i);
     seen.add(i);
     if (invisibleTurn(e)) verdict = true;
     else if (!unplacedNote(e) && !visibleSynthetic(e)) verdict = false; // the owner's prompt, or a plain boundary of its own: its own fields said so
-    else if (typeof e.parentUuid !== 'string') verdict = false;
+    else if (typeof e.parentUuid !== 'string') { verdict = false; bare = true; }
     else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
     else i = parent[i];
   }
-  for (const i of path) memo.set(i, verdict);
-  return verdict;
+  let cut = -1; // the deepest `!` stdout entry on the path: it and everything chained through it is hidden when the walk ended bare
+  if (bare) path.forEach((i, k) => { if (bangStdout(entries[i])) cut = k; });
+  path.forEach((i, k) => memo.set(i, k <= cut ? { hidden: true, bare: false } : { hidden: verdict, bare }));
+  return cut >= 0 ? true : verdict;
 }
 
 // The parsed entries of the transcript's last `tailBytes` (a cut first line dropped) and whether the read reached the file's start (#191 A3, F7: callers read `.entries`);

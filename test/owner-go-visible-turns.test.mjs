@@ -873,3 +873,16 @@ test('#898 R1-B1: a turnOrigin-human stdout-shaped entry with a null or missing 
     }
   }
 });
+
+// R2-B1 (#898). Failure caught: the stdout entry has a string parentUuid, but the `<bash-input>` note it points to is itself parentless: the walk ended VISIBLE at the parentless fallback (and the
+// input note's own 'visible' verdict was already in the memo, being earlier in the file), so a request chained under that stdout entry, which carries turnOrigin, bound with no chain to any known turn.
+test('#898 R2-B1: a turnOrigin-human stdout entry under a parentless `<bash-input>` note chains to no known turn: the request under it stays muted', () => {
+  for (const kind of Object.keys(KINDS)) {
+    for (const [name, parentless] of [['input note with missing parentUuid', { parentUuid: undefined }], ['input note with null parentUuid', { parentUuid: null }]]) {
+      const o = prompt('ship it');
+      const input = { ...prompt('<bash-input> sh ~/x.sh</bash-input>', { entrypoint: 'cli', userType: 'external' }), ...parentless };
+      const out = { ...prompt('<bash-stdout>ok</bash-stdout><bash-stderr></bash-stderr>', BASH_STDOUT), parentUuid: input.uuid };
+      assert.equal(run(kind, [o, of(o, said('working')), input, out, of(out, said(KINDS[kind].ask)), prompt(KINDS[kind].answer)]), false, `${kind}: ${name}`);
+    }
+  }
+});
