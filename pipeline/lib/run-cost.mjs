@@ -302,6 +302,8 @@ export const listPriceUsd = (model, t, opts) => priceMessage(model, t, opts).usd
 // no model of their own (a message's own model always wins). `byPrice` ("<model id>|<tier>|<speed>" -> token sums and a message count)
 // holds every dimension the price depends on, so a later table can re-price the run exactly; `cacheWrite` stays the 5 m + 1 h total.
 export function usageFromTranscript(text, { defaultModel } = {}) {
+  // One notion of a usable token count for the has-usage check and the sums: a non-negative safe integer (a fraction, negative, NaN, Infinity, huge or non-number is missing).
+  const isCount = (v) => Number.isSafeInteger(v) && v >= 0;
   const byId = new Map();
   let anon = 0;
   for (const raw of String(text).split('\n')) {
@@ -314,14 +316,14 @@ export function usageFromTranscript(text, { defaultModel } = {}) {
     }
     const u = e?.message?.usage;
     if (!isPlainObject(u)) continue;
-    // A usage object with no token count field at all (`{}`) is not a usage-bearing message; explicit zeros are (a real call that spent nothing); a negative or non-numeric count is treated as missing.
+    // A usage object with no token count field at all (`{}`) is not a usage-bearing message; explicit zeros are (a real call that spent nothing); any other count is treated as missing.
     const cc0 = isPlainObject(u.cache_creation) ? u.cache_creation : {};
-    if (![u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].some((v) => Number.isFinite(v) && v >= 0)) continue;
+    if (![u.input_tokens, u.output_tokens, u.cache_read_input_tokens, u.cache_creation_input_tokens, cc0.ephemeral_5m_input_tokens, cc0.ephemeral_1h_input_tokens].some(isCount)) continue;
     byId.set(e.message.id ?? `anon-${anon++}`, { u, model: e.message.model });
   }
   // usd: each message at its own model's list price; unpricedMessages: messages the price table cannot price
   const sum = { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, messages: byId.size, unpricedMessages: 0, byPrice: {} };
-  const n = (v) => (Number.isFinite(v) && v > 0 ? Math.floor(v) : 0);
+  const n = (v) => (isCount(v) ? v : 0);
   for (const { u, model } of byId.values()) {
     const cc = isPlainObject(u.cache_creation) ? u.cache_creation : {};
     const total = n(u.cache_creation_input_tokens);

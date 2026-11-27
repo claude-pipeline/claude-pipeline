@@ -770,3 +770,14 @@ test('P cost --from-transcript: a transcript whose only usage is negative counts
   assertExit(second, 0);
   assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries], [1, 1]);
 });
+
+// Issue #820 (round 3): a fractional or otherwise non-integer count (`input_tokens: 0.5`) passed the has-usage check but was floored to 0 afterwards, so the first --retry booking wrote an entry + a retry and the real booking later made 2 calls and 2 retries.
+test('P cost --from-transcript: a transcript whose only usage is a fraction, NaN-like or unsafe number counts as empty (skipped)', () => {
+  for (const bad of [0.5, 1e300, 'abc', null]) {
+    const s = scenario();
+    s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: bad } } })}\n`);
+    const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--retry', '--from-transcript', '.review/t.jsonl']);
+    assertExit(r, 0);
+    assert.equal(r.json.skipped, 'empty-transcript', `input_tokens ${JSON.stringify(bad)}`);
+  }
+});
