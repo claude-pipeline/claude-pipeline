@@ -600,12 +600,12 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
     let anything = false;
     for (const e of t.content) {
       if (e.type === 'user') {
-        if (e.message.content.some((b) => b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content)))) { surfacedAfterText = true; anything = true; }
+        if (e.message.content.some((b) => b?.type === 'tool_result' && (surfacesAsk(toolResultText(b.content)) || (liveDb && blockSurfaces(b))))) { surfacedAfterText = true; anything = true; }
         continue;
       }
       for (const b of e.message.content) {
         if (b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) { text += `${b.text}\n`; surfacedAfterText = false; anything = true; }
-        else if (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) { surfacedAfterText = true; anything = true; }
+        else if (b?.type === 'tool_use' && (inputSurfacesAsk(b.input) || (liveDb && blockSurfaces(b)))) { surfacedAfterText = true; anything = true; }
       }
     }
     const visible = visibleSynthetic(t.e) && !hidden(t.pos); // (#246: a system turn written under an invisible one is on nobody's screen)

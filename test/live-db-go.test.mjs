@@ -276,6 +276,15 @@ test('B1b: owner prompt P2 shows block A as text while the still-open visible tu
   assert.equal(goAfter(w, t, goData(otherSql), middle).out?.record, undefined, 'a go for B');
 });
 
+test('R4-B1: the owner turn shows data block A, a tool-only task notice then shows the same SQL for another project in a tool result: the typed go records nothing', async (t) => {
+  // Failure caught: a visible notice turn with no text and no ruling words left the earlier owner-turn block selected, so `go data <sha12>` (same SQL hash for both projects) was recorded for project A.
+  const w = world(t);
+  await setup(w);
+  const shownB = JSON.stringify({ ok: true, block: dataBlock(w, { ref: 'qqqqqqqqqqqqqqqqqqqq', label: 'Other prod' }).join('\n') });
+  const middle = [textOf(dataBlock(w).join('\n')), notice(), toolUse('tu9', 'Bash', { command: 'node x present' }), toolResult('tu9', shownB)];
+  assert.equal(goAfter(w, t, goData(dataSql), middle).out?.record, undefined);
+});
+
 test('a block shown only in a turn a task notice started is no reply: the typed go is refused (it must be shown again in the owner\'s own turn, #916)', async (t) => {
   // Failure caught: the typed go recorded against a block a notice turn printed, which the owner may never have read.
   const w = world(t);

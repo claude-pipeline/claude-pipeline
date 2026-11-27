@@ -132,6 +132,18 @@ test('forgeries: made-up go text on a genuine prompt id, a prompt that is not th
   assert.equal(apply(other).decision, 'deny');
 });
 
+test('R4-B1: a tool-only task notice that shows the same SQL for another project after the owner\'s block leaves the recorded go unclaimable', async (t) => {
+  // Failure caught: the claim kept the earlier owner-turn block selected because the notice turn had no text or ruling words, so the go recorded for project A spent an execute_sql for the stale ask.
+  const s = await scene(t, { op: 'data' });
+  const shownB = JSON.stringify({ ok: true, block: buildBlock({ op: 'data', ref: 'qqqqqqqqqqqqqqqqqqqq', label: 'Other prod', repo: 'acme/widgets', dir: s.repo.dir, sql: s.dataSql, summary: 'fix' }).join('\n') });
+  const [owner, shownA, go] = s.entries;
+  const notice = { type: 'user', message: { content: '<task-notification>background job finished</task-notification>' }, origin: { kind: 'task-notification' }, promptSource: 'system', entrypoint: 'cli' };
+  const tool = { type: 'assistant', message: { content: [{ type: 'tool_use', id: 'tu9', name: 'Bash', input: { command: 'node x present' } }] } };
+  const result = { type: 'user', message: { content: [{ type: 'tool_result', tool_use_id: 'tu9', content: shownB }] } };
+  writeFileSync(s.transcript, linesOf([owner, shownA, notice, tool, result, go]));
+  assert.equal(sql(s, s.dataSql).decision, 'deny');
+});
+
 test('data: `go data` allows one execute_sql of exactly the fenced SQL; a different statement or whitespace is refused', async (t) => {
   const s = await scene(t, { op: 'data' });
   assert.equal(sql(s, `${s.dataSql}\n`).decision, 'deny');
