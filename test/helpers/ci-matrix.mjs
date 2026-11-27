@@ -7,6 +7,7 @@ export function expandJob(job) {
   const matrix = job.strategy?.matrix ?? {};
   let combos = [{}];
   for (const key of Object.keys(matrix)) {
+    assert.ok(key !== 'include' && key !== 'exclude', `matrix.${key} changes which rows GitHub runs; this expander does not model it`);
     assert.ok(Array.isArray(matrix[key]), `matrix.${key} is a list`);
     combos = combos.flatMap((combo) => matrix[key].map((value) => ({ ...combo, [key]: value })));
   }

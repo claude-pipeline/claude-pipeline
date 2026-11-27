@@ -52,6 +52,14 @@ test('job names are unique and no matrix row is named like a required check', ()
   for (const required of config.ci.required_checks) assert.ok(!expandedNames(shardJob).includes(required) && !expandedNames(nodeJob).includes(required), required);
 });
 
+// Failure caught: an `exclude`/`include` matrix key makes GitHub drop or add a row the expander would still run (or miss), so the aggregate
+// stays green over a shard that never ran.
+test('the matrix expander refuses include and exclude keys instead of misreading them as a dimension', () => {
+  for (const key of ['include', 'exclude']) {
+    assert.throws(() => expandJob({ strategy: { matrix: { shard: [1, 2], [key]: [{ shard: 2 }] } } }), new RegExp(`matrix\\.${key}`));
+  }
+});
+
 // Failure caught: a matrix row renamed (or a second matrix key added) without its push-skip JOB_NAME following. tested-tree.mjs looks the job
 // up by that exact name in the PR run, finds none, and every push to main re-runs the suite (or the skip silently never applies).
 test('each expanded row display name equals its push-skip JOB_NAME', () => {
