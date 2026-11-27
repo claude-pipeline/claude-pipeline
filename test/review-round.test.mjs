@@ -1,5 +1,5 @@
 // The shared round-recording module (pipeline/lib/review-round.mjs), called directly: the refusals and the record that `P codex-review`
-// and any other reviewer's command both go through. The CLI-level behaviour is pinned by cli-review.test.mjs; this file proves the rules
+// and any other reviewer's command both go through. The CLI-level behaviour is pinned by cli-review-part*.test.mjs; this file proves the rules
 // live in the module (a reviewer that is not Codex gets them by calling it) against a real throwaway git repo and a scripted fake gh.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
