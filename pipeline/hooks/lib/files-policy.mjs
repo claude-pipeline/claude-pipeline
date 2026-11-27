@@ -5224,7 +5224,10 @@ function evaluateBashForFilesFrame(command, opts) {
   if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
   // (#269 R13-F1, R13-F2; owner decision 2026-11-12: text-level refusals, on top of the parser-based checks)
   if (closeBracketFollowedByWord(raw)) return deny('a word follows a closing ]] on a line with a [[ (zsh\'s short `if [[ … ]] cmd` form, `<->` number patterns, a redirect): the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`. The check reads quoted text and heredoc bodies too: put such text in a file written with the Write tool (`git commit -F FILE`, `gh … --body-file FILE`)');
-  if (loopNameRefused(cmds) || loopNameRefusedText(raw, cmds)) return deny('a loop variable that is a positional parameter, argv, or a subscripted name cannot be followed by the guard; use a plain name');
+  const LOOP_NAME_REASON = 'a loop variable that is a positional parameter, argv, or a subscripted name cannot be followed by the guard; use a plain name';
+  if (loopNameRefused(cmds)) return deny(LOOP_NAME_REASON);
+  // (#746 A': the text pass also reads quoted SQL whose line starts with `select`; the refusal stays, it says how to pass such text)
+  if (loopNameRefusedText(raw, cmds)) return deny(`${LOOP_NAME_REASON}. If this is SQL or other text inside quotes whose line starts with select / for / foreach, pass it from a file instead (e.g. -f query.sql).`);
   // prose flags: what a commit message, PR body or test name says is not a reference (the values come out of every scan)
   const prose = new Map(cmds.map((c) => [c, proseWords(c.argv)]));
   const proseValues = [...prose.values()].flatMap((p) => p.values);
@@ -5262,7 +5265,9 @@ function evaluateBashForFilesFrame(command, opts) {
         if (HOOK_SURFACE_TEXT.test(text)) return deny(`an inline program names a file that can declare hooks, and what it does to it cannot be checked (${HOOKS_MSG})`);
       }
       if (!hooksWord) continue;
-      const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || (c.argv.length > 0 && !isReadOnly(c, ctx));
+      // (#746 B: the system grep, with no wrapper in front, discarding into /dev/null writes nothing: that redirect is no write. Any other redirect, `2>&1`, a bare / relative / repo `grep` and a wrapped one keep the rule)
+      const discards = (r) => (c.argv[0] === '/usr/bin/grep' || c.argv[0] === '/bin/grep') && c.wrapped !== true && ['>', '>>', '>|', '&>', '&>>'].includes(r.op) && r.target === '/dev/null';
+      const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !discards(r)) || (c.argv.length > 0 && !isReadOnly(c, ctx));
       if (writes && [...c.argv, ...(c.redirects ?? []).map((r) => r.target ?? ''), rawOfCmd(c)].some((w) => HOOK_SURFACE_TEXT.test(String(w)))) {
         return deny(`the command writes a file that can declare hooks and mentions hooks (${HOOKS_MSG})`);
       }
