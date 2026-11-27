@@ -2205,3 +2205,22 @@ test('#746 C2: the config named by `playwright test -c / --config` is judged lik
   assert.equal(bash.decision, 'deny');
   assert.match(bash.reason, /guarded command/);
 });
+
+// Review R1-B1..B4. Failure caught: a Playwright config holding a force push to main is not read when it is named as a directory (`--config=e2e` loads e2e/playwright.config.ts), as `--config="$CFG"`,
+// next to a quoted filter with a wildcard (`--grep 'login.*'`), or as the last of several config options (the last one runs); the harmless twins stay allowed.
+test('#746 C2 review: a directory, a variable, a wildcard filter and the last of several config options are all judged', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const evil = `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`;
+  const fine = "import { defineConfig } from '@playwright/test';\nexport default defineConfig({});\n";
+  const o = withFiles({ 'e2e/playwright.config.ts': evil, 'fine/playwright.config.ts': fine, 'bad.config.ts': evil, 'ok.config.ts': fine });
+  for (const line of [
+    'npx playwright test --config=e2e', 'npx playwright test --config e2e/', 'playwright test -c e2e',
+    'CFG=bad.config.ts; npx playwright test --config="$CFG"', 'CFG=bad.config.ts; playwright test --config=$CFG',
+    "npx playwright test --config=bad.config.ts --grep 'login.*'", "playwright test --grep 'login.*' -c bad.config.ts",
+    'npx playwright test --config=ok.config.ts --config=bad.config.ts', 'playwright test --config=bad.config.ts --config=ok.config.ts',
+  ]) assert.equal(evaluate(line, o).decision, 'deny', line);
+  for (const line of ['npx playwright test --config=fine', 'CFG=ok.config.ts; npx playwright test --config="$CFG"', "npx playwright test --config=ok.config.ts --grep 'login.*'", 'npx playwright test --config=ok.config.ts --config=fine']) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'allow', `${line} -> ${v.reason}`);
+  }
+});

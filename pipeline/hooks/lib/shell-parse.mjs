@@ -527,27 +527,32 @@ function unwrapPackageRunner(argv, fromIndex) {
   }
   return rest(argv, skipOpts(argv, fromIndex, 'p', ['--package', '--prefix', '--workspace', '--registry', '--cache']));
 }
-// `playwright test` options: its config is the ONE word `-c FILE`, `--config FILE` or `--config=FILE`. Any other word that is a config option or could be one (a second one, a cluster holding c, an attached
-// `-cFILE`, an expanded word that may hold one) gives null: Playwright uses the LAST config, so the first one read is not the one that runs. Returns { file, at } (at: the index of the FILE word), or null.
+// `playwright test` options: its config is the word `-c FILE`, `--config FILE` or `--config=FILE`. A word that is a config option or could be one but cannot be named (a cluster holding c, an attached `-cFILE`, a
+// config option with no file) gives null. Playwright uses the LAST config, so `loose` marks a line whose config is not exactly one literal file (several config options, or another word that expands: it may hold one,
+// and a quoted `'login.*'` filter looks the same once dequoted): every literal file is then a candidate. Returns { file, files, loose }, or null.
 function playwrightConfigOf(words) {
-  let hit = -1;
+  const used = new Set();
+  const files = [];
   for (let i = 0; i < words.length; i++) {
-    if (words[i] === '--config' || words[i].startsWith('--config=') || /^-[^-]*c/.test(words[i])) {
-      if (hit >= 0) return null;
-      hit = i;
-    }
+    const w = words[i];
+    if (!(w === '--config' || w.startsWith('--config=') || /^-[^-]*c/.test(w))) continue;
+    let file;
+    if (w === '-c' || w === '--config') { used.add(i + 1); file = words[i + 1]; } else if (w.startsWith('--config=')) file = w.slice('--config='.length); else return null;
+    if (file === undefined || file === '') return null;
+    used.add(i);
+    files.push(file);
   }
-  if (hit < 0) return null;
-  const w = words[hit];
-  let at = hit;
-  let file;
-  if (w === '-c' || w === '--config') { at = hit + 1; file = words[at]; } else if (w.startsWith('--config=')) file = w.slice('--config='.length); else return null;
-  if (file === undefined || file === '') return null;
-  return words.some((x, i) => i !== hit && i !== at && hasExpansion(x)) ? null : { file, at };
+  if (!files.length) return null;
+  return { file: files[files.length - 1], files, loose: files.length > 1 || words.some((x, i) => !used.has(i) && hasExpansion(x)) };
 }
+// Playwright loads a config DIRECTORY's own file, in this order (the guard judges every one that exists)
+const PLAYWRIGHT_CONFIG_NAMES = ['ts', 'js', 'mts', 'mjs', 'cts', 'cjs'].map((e) => `playwright.config.${e}`);
 // (#746 C1) `npx playwright test -c FILE`: npm 11's npx stops reading its own flags at the first word that is not one (`playwright`), so `-c` there is Playwright's config. Only the bare word `npx`, exactly `playwright test`
-// and one config option; `trust` is false when the line can make `npx` or PATH something else (see rebindsRunner). Every other shape keeps the -c / --call reading
-const unwrapNpx = (argv, trust) => (trust && argv[0] === 'npx' && argv[1] === 'playwright' && argv[2] === 'test' && playwrightConfigOf(argv.slice(3)) ? rest(argv, 1) : unwrapPackageRunner(argv, 1));
+// and one literal config option; `trust` is false when the line can make `npx` or PATH something else (see rebindsRunner). Every other shape keeps the -c / --call reading
+const unwrapNpx = (argv, trust) => {
+  const cfg = trust && argv[0] === 'npx' && argv[1] === 'playwright' && argv[2] === 'test' ? playwrightConfigOf(argv.slice(3)) : null;
+  return cfg && !cfg.loose ? rest(argv, 1) : unwrapPackageRunner(argv, 1);
+};
 const runnerAt = (subs) => (argv) => (subs.includes(argv[1]) ? unwrapPackageRunner(argv, 2) : null);
 
 const WRAPPERS = {
@@ -1041,7 +1046,8 @@ function scriptFileOfArgv(argv) {
   // (#746 C2) `playwright test -c FILE` / `--config FILE` / `--config=FILE`: node runs the config, so it is judged like `node FILE`. Only the bare word `playwright` (a path or `=playwright` is a program of its own: today's record below)
   if (argv[0] === 'playwright' && argv[1] === 'test') {
     const cfg = playwrightConfigOf(argv.slice(2));
-    if (cfg) return hasExpansion(cfg.file) ? { kind: 'interp', file: cfg.file, ambiguous: true, words: argv.slice(1), needExt: false } : { kind: 'interp', file: cfg.file };
+    // every config word is a candidate, and so is the config file inside each (Playwright loads a directory's own); `--config=$C` is a word that holds the option too, so the value itself is named (R1-B1..B4)
+    if (cfg) return { kind: 'interp', file: cfg.file, ambiguous: true, words: [...(cfg.loose ? argv.slice(1) : []), ...cfg.files, ...cfg.files.flatMap((f) => PLAYWRIGHT_CONFIG_NAMES.map((n) => `${f.replace(/\/+$/, '')}/${n}`))], needExt: false };
   }
   if (SHELLS.has(name)) {
     const r = shellInvocation(argv);
