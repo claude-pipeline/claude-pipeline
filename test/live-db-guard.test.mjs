@@ -143,7 +143,7 @@ test('catalog templates need no go; other SQL does; unknown targets, untrusted s
   assert.equal(evaluateSupabaseMcp('mcp__supabase__apply_migration', { project_id: REF, name: NAME, query: SQL }, s.ctx).decision, 'allow', 'the bare `supabase` server is trusted too');
 });
 
-// #701 / #746: the refusal of a plain read points at the read-only CLI form, and the guard itself allows that form (file and inline)
+// #701 / #746: the refusal of a plain read points at the read-only CLI form, and the guard itself allows that form (file only: an inline form lets the shell rewrite the SQL)
 test('an execute_sql refusal for a read hints a db query command the Bash guard allows', async (t) => {
   const s = await scene(t);
   const query = 'select count(*) from public.t';
@@ -153,8 +153,8 @@ test('an execute_sql refusal for a read hints a db query command the Bash guard 
   assert.ok(m, d.reason);
   const opts = { home: s.home, env: {}, platform: 'linux', realpath: (p) => p, existsSync: () => false, cwd: '/repo' };
   const fileForm = m[1].replace('<file.sql>', '/tmp/q.sql');
-  const inlineForm = m[1].replace('-f <file.sql>', `"${query}"`);
-  for (const line of [fileForm, inlineForm]) assert.equal(evaluateBashForFiles(line, opts).decision, 'allow', line);
+  assert.equal(evaluateBashForFiles(fileForm, opts).decision, 'allow', fileForm);
+  assert.doesNotMatch(d.reason, /inline/, 'no inline form: the shell expands $ and backticks inside double quotes');
 });
 
 test('dev refs are exempt only on a server the owner listed', async (t) => {
