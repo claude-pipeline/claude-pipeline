@@ -430,7 +430,7 @@ test('chat repo with clicks on: a running build outside CLICK_BUILDS adds the cl
   const on = (build) => runPreflight({ cwd: repo.dir, env: world([], { env: build ? { AI_AGENT: `claude-code_${build.replaceAll('.', '-')}_agent` } : {} }).env });
   const off = await on('2.1.999');
   assert.equal(clickWarnings(off).length, 1);
-  assert.match(clickWarnings(off)[0], /^clicks off on this build \(2\.1\.999\) \[verified builds: .*2\.1\.323.*\]: run scripts\/click-spike\.mjs from your terminal/);
+  assert.match(clickWarnings(off)[0], /^clicks off on this build \(2\.1\.999\) \[verified builds: .*2\.1\.323.*\]: the owner types the closing words meanwhile; to verify the build, run `node scripts\/click-spike\.mjs` in their own terminal \(not inside Claude Code\) from a claude-pipeline source checkout/);
   assert.equal(off.canMerge, true, 'a warning never changes canMerge');
   assert.deepEqual(clickWarnings(await on(CLICK_BUILDS[0])), [], 'an allowlisted build keeps clicks on');
   assert.deepEqual(clickWarnings(await on(null)), [], 'an unknown build never warns');

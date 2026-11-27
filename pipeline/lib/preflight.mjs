@@ -148,7 +148,7 @@ export async function runPreflight({ cwd, env = process.env, gh = createGitHub({
   // #714: a Claude Code update moves the running build out of CLICK_BUILDS and the recorder then refuses every click, so the owner's one-click answers go off without a word. Same config
   // reasons as clickGate (click-ask.mjs); an unknown build says nothing.
   if (config.ok && cfg && clickConfigRefusal(cfg) === null && claudeCode.running !== null && !CLICK_BUILDS.includes(claudeCode.running)) {
-    warnings.push(`clicks off on this build (${claudeCode.running}) [verified builds: ${CLICK_BUILDS.join(', ')}]: run scripts/click-spike.mjs from your terminal`);
+    warnings.push(`clicks off on this build (${claudeCode.running}) [verified builds: ${CLICK_BUILDS.join(', ')}]: the owner types the closing words meanwhile; to verify the build, run \`node scripts/click-spike.mjs\` in their own terminal (not inside Claude Code) from a claude-pipeline source checkout`);
   }
 
   // #161: the guard refuses a script an agent runs when the script's text spells the config-root path (even in a comment) and writes. The rule stays strict (no
