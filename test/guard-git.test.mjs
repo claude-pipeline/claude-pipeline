@@ -2175,3 +2175,33 @@ test('a push with many $ words: the mixes are bounded by the evaluation deadline
   assert.equal(probe.decision, 'deny');
   assert.ok(calls <= 2 && clock <= 1000, `${calls} lookups, ${clock} ms of injected time`);
 });
+
+// ---- #746 C2: the config of `playwright test` is a program node runs ----------------------------------------------------------------
+// Failure caught: a Playwright config holding a force push to main is allowed today under `npx playwright test -c F` and `--config=F` (the config is never read), and
+// the harmless config of a real project stays allowed.
+test('#746 C2: the config named by `playwright test -c / --config` is judged like `node FILE`', () => {
+  const bad = ['gi' + 't', 'pu' + 'sh', '--for' + 'ce', 'orig' + 'in', 'ma' + 'in'].join(' ');
+  const files = {
+    'bad.config.ts': `import { execSync } from 'node:child_process';\nexecSync('${bad}');\nexport default {};\n`,
+    'ok.config.ts': "import { defineConfig, devices } from '@playwright/test';\nexport default defineConfig({ projects: [{ name: 'p', use: { ...devices['Pixel 7'] } }] });\n",
+    'ok.sh': 'echo hi\n',
+  };
+  const o = withFiles(files);
+  for (const line of ['npx playwright test -c bad.config.ts', 'npx playwright test --config bad.config.ts', 'npx playwright test --config=bad.config.ts', 'playwright test -c bad.config.ts', 'playwright test --config=bad.config.ts --workers 2']) {
+    const v = evaluate(line, o);
+    assert.equal(v.decision, 'deny', line);
+    assert.match(v.reason, /the program .*bad\.config\.ts contains a guarded command/, line);
+  }
+  for (const line of ['npx playwright test -c ok.config.ts', 'npx playwright test --config ok.config.ts', 'npx playwright test --config=ok.config.ts', 'playwright test -c ok.config.ts']) assert.equal(evaluate(line, o).decision, 'allow', line);
+  // the bare word only: a fake `playwright` script stays judged as the program it is (the exec of that path), whatever else the line says
+  const fake = withFiles({ 'bin/playwright': `${bad}\n`, 'ok.ts': 'export default {};\n' });
+  for (const line of ['./bin/playwright test -c ok.ts', './bin/playwright test --config=ok.ts', 'PATH=./bin:$PATH; =playwright test -c ok.ts']) {
+    const v = evaluate(line, fake);
+    assert.equal(v.decision, 'deny', line);
+  }
+  // npx's own -c / --call is still shell text, judged as such
+  for (const line of [`npx -c '${bad}'`, `npx --call='${bad}'`, `npx -y playwright test -c '${bad}'`, `npx playwright@1 test -c '${bad}'`, `npm exec foo -c '${bad}'`]) assert.equal(evaluate(line, o).decision, 'deny', line);
+  const bash = evaluate(`npx bash -c '${bad}'`, o);
+  assert.equal(bash.decision, 'deny');
+  assert.match(bash.reason, /guarded command/);
+});
