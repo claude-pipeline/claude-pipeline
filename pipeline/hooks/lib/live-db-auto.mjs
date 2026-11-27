@@ -605,14 +605,14 @@ export function readAttemptLog({ home, sinceMs = 0, io = {} }) {
     const at = isoOf(body.at) ?? mtime;
     const ev = events.get(body.event) ?? { files: new Set(), first: null };
     ev.files.add(m[1]);
-    const row = { at, atIso: new Date(at).toISOString(), via: String(body.via ?? ''), ref: body.ref ?? null, label: body.label ?? null, name: body.name ?? null, file: body.file ?? null, pr: body.pr ?? null, commit: body.commit ?? null, repo: body.repo ?? null, session: body.session ?? null, generation: Number(m[3]), afterDeploy: body.afterDeploy === true ? true : null, deployEnv: typeof body.deployEnv === 'string' ? body.deployEnv : null };
+    const row = { at, atIso: new Date(at).toISOString(), via: String(body.via ?? ''), ref: body.ref ?? null, label: body.label ?? null, name: body.name ?? null, file: body.file ?? null, pr: body.pr ?? null, commit: body.commit ?? null, repo: body.repo ?? null, session: body.session ?? null, generation: Number(m[3]), afterDeploy: body.afterDeploy === true ? true : null, deployEnv: typeof body.deployEnv === 'string' ? body.deployEnv : null, deployedAt: typeof body.deployedAt === 'string' ? body.deployedAt : null };
     if (ev.first === null || (m[1] === 'name' && ev.first.key !== 'name')) ev.first = { key: m[1], row };
     events.set(body.event, ev);
   }
   for (const ev of events.values()) {
     const { row } = ev.first;
     if (row.at < sinceMs) continue;
-    out.events.push({ at: row.atIso, via: row.via, outcome: row.via === 'go-import' ? 'imported' : ev.files.size === 2 ? 'attempted' : 'reserved', ref: row.ref, label: row.label, name: row.name, file: row.file, pr: row.pr, commit: row.commit, repo: row.repo, session: row.session, generation: row.generation, afterDeploy: row.afterDeploy, deployEnv: row.deployEnv, _ms: row.at });
+    out.events.push({ at: row.atIso, via: row.via, outcome: row.via === 'go-import' ? 'imported' : ev.files.size === 2 ? 'attempted' : 'reserved', ref: row.ref, label: row.label, name: row.name, file: row.file, pr: row.pr, commit: row.commit, repo: row.repo, session: row.session, generation: row.generation, afterDeploy: row.afterDeploy, deployEnv: row.deployEnv, deployedAt: row.deployedAt, _ms: row.at });
   }
   out.events.sort((a, b) => b._ms - a._ms);
   for (const e of out.events) delete e._ms;
