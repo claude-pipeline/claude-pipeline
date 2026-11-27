@@ -1359,6 +1359,30 @@ test('after-deploy: an MCP server the owner removes while GitHub is asked claims
   assert.equal(via(kept).decision, 'allow');
 });
 
+test('auto-apply of an unmarked file: a server removed, or auto-migrations switched off, while GitHub is asked claims nothing', async (t) => {
+  // Failure caught: the owner's `db-refs server remove` or `auto-migrations off` finishing during the GitHub read, and the unmarked migration still being applied with no go (the final registry check ran only for marked files).
+  const entry = { ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' };
+  const via = (s) => evaluateSupabaseMcp('mcp__mine__apply_migration', { project_id: REF, name: NAME, query: SQL }, s.ctx);
+  const cases = [
+    ['server remove', { refs: [entry], servers: [] }, /removed the MCP server/],
+    ['auto-migrations off', { refs: [{ ...entry, autoMigrations: undefined, autoSince: undefined }], servers: ['mine'] }, /changed the auto-apply settings/],
+    ['off then on (a later autoSince)', { refs: [{ ...entry, autoSince: '2026-11-20T00:00:00Z' }], servers: ['mine'] }, /changed the auto-apply settings/],
+  ];
+  for (const [what, after, reason] of cases) {
+    const s = await autoScene(t);
+    seedRegistry(s.home, { refs: [entry], servers: ['mine'] });
+    s.answer = () => { seedRegistry(s.home, after); return ghBase(); };
+    const r = via(s);
+    assert.equal(r.decision, 'deny', what);
+    assert.match(r.reason, reason, what);
+    assert.deepEqual(hist(s), [], `${what}: nothing claimed`);
+    assert.equal(markers(s).length, 0, what);
+  }
+  const kept = await autoScene(t);
+  seedRegistry(kept.home, { refs: [entry], servers: ['mine'] });
+  assert.equal(via(kept).decision, 'allow', 'nothing changed: applies');
+});
+
 test('after-deploy: the final registry check and the claim run under the registry lock the owner\'s db-refs writes take, released after; a lock the owner holds past the wait claims nothing', async (t) => {
   // Failure caught: the owner's `after-deploy off` finishing between the hook's last registry read and its claim, and the migration still being allowed.
   const s = await deployScene(t);
@@ -1379,12 +1403,15 @@ test('after-deploy: the final registry check and the claim run under the registr
   assert.deepEqual(hist(busy), []);
   release(owner.lock);
   assert.equal(applyMarked(busy).decision, 'allow');
-  // an unmarked file never touches the lock
+  // an unmarked file takes the same lock (every auto-apply claim re-reads the registry under it)
   const plain = await deployScene(t);
   plain.answer = () => ghBase();
+  plain.ctx.io.registryLockWaitMs = 100;
   const own = tryAcquire('db-refs', { dir: join(STATE(plain.home), 'locks') });
-  assert.equal(apply(plain).decision, 'allow');
+  assert.equal(apply(plain).decision, 'deny');
+  assert.deepEqual(hist(plain), []);
   release(own.lock);
+  assert.equal(apply(plain).decision, 'allow');
 });
 
 test('after-deploy: denied before the deploy finished, the same call after GitHub shows success applies (no attempt was spent)', async (t) => {

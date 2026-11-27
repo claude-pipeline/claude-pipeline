@@ -487,19 +487,21 @@ function autoCheck({ home, entry, server, name, query, session, now, leftMs, env
     proven = proof.facts;
   }
   const facts = { ref: entry.ref, name, sqlSha256, label: entry.name, file, repo: entry.repo, pr: pr.number, commit: commit.oid, head: typeof branch.target.oid === 'string' ? branch.target.oid : null, ...proven };
-  // A marked file: the owner can switch the registration off, or remove the MCP server the call came through, while GitHub was asked or just before the claim. The registry is read again under the registry lock the owner's db-refs writes take, and the lock is held until the claim is made,
-  // so an `off` that finished earlier is seen and a later one waits (no GitHub call is made under the lock).
+  // Every claim: the owner can switch auto-apply off (or change the repo, declare the project dev, remove it), remove the MCP server the call came through, or for a marked file change the after-deploy registration, while GitHub was asked or just before the claim.
+  // The registry is read again under the registry lock the owner's db-refs writes take, and the lock is held until the claim is made, so a change that finished earlier is seen and a later one waits (no GitHub call is made under the lock).
   let lock = null;
   let next;
   try {
-    if (marked) {
-      lock = takeRegistryLock({ home, leftMs, io });
-      if (lock === null) return notEligible('the owner\'s db-refs command is changing the registry (or no time was left to wait for it): call again, or ask for the owner\'s go');
-      const freshState = readDbRefs(home, io);
-      if (!trustedServer(server, freshState)) return notEligible('the owner removed the MCP server this call came through from the trusted list during the check: call again, or ask for the owner\'s go');
-      const fresh = autoEntry(entry.ref, freshState).entry;
-      if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince || fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
+    lock = takeRegistryLock({ home, leftMs, io });
+    if (lock === null) {
+      if (typeof leftMs === 'function' && !(leftMs() > AUTO_MIN_CLAIM_MS)) return NO_TIME;
+      return notEligible('the owner\'s db-refs command is changing the registry (or no time was left to wait for it): call again, or ask for the owner\'s go');
     }
+    const freshState = readDbRefs(home, io);
+    if (!trustedServer(server, freshState)) return notEligible('the owner removed the MCP server this call came through from the trusted list during the check: call again, or ask for the owner\'s go');
+    const fresh = autoEntry(entry.ref, freshState).entry;
+    if (!fresh || fresh.repo !== entry.repo || fresh.autoSince !== entry.autoSince) return notEligible('the owner changed the auto-apply settings of this project during the check: call again, or ask for the owner\'s go');
+    if (marked && (fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot)) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
     next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
   } finally {
     if (lock !== null) { try { release(lock); } catch { /* a failed release must not turn an allow into a throw; the lock goes stale with this process */ } }
