@@ -19,7 +19,7 @@ import { hashBranch, regressionOnlyFor } from '../lib/risk.mjs';
 import { matchAny } from '../lib/glob.mjs';
 import { GhError, runShellAsync } from '../lib/proc.mjs';
 import { findSubagentTranscript, proveModel, extractJsonBlock } from '../lib/transcript.mjs';
-import { STATE_VERSION_CAP_LOW, STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
+import { STATE_VERSION_CAP_LOW, STATE_VERSION_CLAUDE, STATE_VERSION_DEFERRAL, STATE_VERSION_SUBSTITUTE, lowerCapTo, maxRiskOf, saveState, updateItems, withStateVersion } from '../lib/state.mjs';
 import { askSummary, issuedRoundVariant, longReviewOf, processReviewSummary, recommendedWords, roundsFrom } from '../lib/round-ask.mjs';
 import { postMaxApply, fixRoundFiles, fixRoundScope, mergeInIneligible } from '../lib/fix-verify.mjs';
 import { baseConfigAt } from '../lib/config.mjs';
@@ -1045,7 +1045,7 @@ async function roundRequest(rest, ctx) {
   if (config.owner_approval !== 'chat') return refuse('an extra review round is granted only with owner_approval: chat in pipeline.yml; in label mode the agent parks');
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => withStateLock(root, ctx, () => {
-    const state = requireState(root);
+    const state = lowerCapTo(requireState(root), config.review?.max_rounds);
     if (state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     const { slug, host } = gh.repo();
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded grant names a repository on github.com`);
@@ -1179,7 +1179,7 @@ async function deferFixes(rest, ctx) {
 
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => withStateLock(root, ctx, () => {
-    const state = requireState(root);
+    const state = lowerCapTo(requireState(root), config.review?.max_rounds);
     if (state.pr !== pr) return refuse(`the review state is for PR #${state.pr}, not #${pr}`);
     // The deferral is recorded after comparing the content hash with the reviewed one: under an untrusted anchor that hash is measured from the PR-editable default_branch (#456).
     const noAnchor = untrustedAnchorRefusal(root, config, 'the tree cannot be proven back at the reviewed content: nothing was deferred');
@@ -1299,7 +1299,7 @@ async function capDefer(rest, ctx) {
   const { config } = await requireConfig(root);
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => withStateLock(root, ctx, () => {
-    const state = requireState(root);
+    const state = lowerCapTo(requireState(root), config.review?.max_rounds);
     if (state.pr !== pr) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'identity-mismatch', message: `the review state is for PR #${state.pr}, not #${pr}` } };
     if (!state.rounds.some((r) => r.n === n)) return { exitCode: EXIT.FAILED, output: { ok: false, error: 'identity-mismatch', message: `round ${n} is not recorded in the review state` } };
     // What the state holds (also after a rerun, when the deferral was saved earlier): the ids, and the rounds whose issue is still to file.

@@ -503,7 +503,7 @@ async function outcome(rest, ctx) {
   const { values } = parseCommandArgs(rest, { repo: { type: 'string' } }, { allowPositionals: false });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  const state = requireState(root);
+  const state = lowerCapTo(requireState(root), config.review?.max_rounds); // one cap for the decision and the report (#923)
   // Best effort: a stale origin/<trusted default branch> (after update-branch + a plain pull) only makes coverage look invalid; offline keeps the cached ref.
   refreshBaseRef(root, config);
   const hash = currentContentHash(root, config);
@@ -513,7 +513,7 @@ async function outcome(rest, ctx) {
   const grants = config.owner_approval === 'chat'
     ? (k) => ownerGrantedRounds({ repo: state.repo, pr: state.pr, k, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }))
     : undefined;
-  const result = roundOutcome({ ...lowerCapTo(state, config.review?.max_rounds), currentContentHash: hash }, { grants, head });
+  const result = roundOutcome({ ...state, currentContentHash: hash }, { grants, head });
   // A whole-PR round is owed: it starts at the PR's merge base (the default branch; codex-review judges a PR into another branch itself).
   const owed = wholePrOwed(state);
   let forkPoint = null;
