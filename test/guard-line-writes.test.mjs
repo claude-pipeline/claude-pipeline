@@ -2227,7 +2227,7 @@ test('#950: a function in a sourced file that a backgrounder runs still sees the
   };
   for (const s of ['co4.sh', 'co5.sh']) denyBoth(`bash ${s}; cp f.sh n.sh`, spec);
 });
-// (the files policy only: the git policy refuses a shopt / setopt / hash / enable in a called script for another reason, it no longer knows the directory)
+// (checked on the files policy only: the git policy refuses a shopt / setopt / hash / enable in a called script for another reason, it no longer knows the directory)
 test('#950: a shell option (shopt / setopt / hash / enable) in a called script schedules no work; a trap still does', () => {
   const opt = { ...SPEC, 'n.sh': 'ok', 'setup.sh': 'shopt -s expand_aliases\nbash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"', 'setup4.sh': 'setopt nullglob\nbash n.sh\nlaunchctl kickstart -k x', 'setup5.sh': 'hash -r\nenable -n kill\nbash n.sh\nlaunchctl kickstart -k x' };
   for (const s of ['setup.sh', 'setup4.sh', 'setup5.sh']) assert.equal(run(`bash ${s}; cp f.sh n.sh`, opt).files.r.decision, 'allow', s);
