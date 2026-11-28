@@ -478,6 +478,8 @@ function unwrapTaskset(argv) {
 }
 
 // script -c 'string' [file]  (util-linux)  /  script [-q] file cmd...  (BSD, macOS)
+// (#990) util-linux also reads `script [options] [file] -- command...`: the words after the `--` are the command, where the BSD reading above takes the first of them for the typescript file
+// (`script -- git push origin main` judged a command named `push`). Both readings are judged: the util-linux one is an `alts` child (see unwrapEnv), the only one when the BSD one has no command left.
 function unwrapScript(argv) {
   for (let i = 1; i < argv.length; i++) {
     const t = argv[i];
@@ -485,7 +487,12 @@ function unwrapScript(argv) {
     if (t.startsWith('--command=')) return shellCmd(t.slice('--command='.length));
     if (/^-[A-Za-z]*c$/.test(t)) return argv[i + 1] === undefined ? null : shellCmd(argv[i + 1]);
   }
-  return rest(argv, skipOpts(argv, 1, 't') + 1); // + the typescript file
+  const out = rest(argv, skipOpts(argv, 1, 't') + 1); // + the typescript file
+  const afterDashes = scriptCommandAfterDashes(argv);
+  if (afterDashes === null) return out;
+  if (out === null) return { argv: afterDashes, env: {} };
+  Object.defineProperty(out, 'alts', { value: [afterDashes], enumerable: false });
+  return out;
 }
 
 // screen [opts] cmd args  /  screen -X stuff 'string'
@@ -597,6 +604,161 @@ const WRAPPERS = {
   caffeinate: plain('tw'),
   busybox: plain(),
 };
+// ---- #902: the files a wrapper itself writes (its log, timing report, lock file) -----------------------------------------------------------------------------------
+// The parser unwraps a wrapper and judges only the command inside it, so a file the wrapper opens for itself was never judged: `script -q <protected file> ls` is `ls` to the guards. Each wrapper's output words are recorded as
+// `cmd.wrapperOuts` ([{ target, wrapper, chdir, dyn?, tty?, pty? }], not enumerable and NOT in `cmd.redirects`: git-policy reads `redirects` in ~28 places that must keep their verdicts). A target is a word, judged by the guards
+// like the target of a `>`: we cannot tell BSD from util-linux `script` by name, so every reading's candidates are listed (more readings, never fewer). `chdir` is the directory change that came BEFORE the wrapper (its own -C
+// applies after): the log lands where the wrapper starts. `dyn`: a name only known at run time (screen's `screenlog.%n`). `tty`: written only when stdout is a terminal (nohup.out); `pty`: a pty-giving wrapper stood before it.
+// Platform facts (macOS, 11-28): `script -q F -- cmd` fails on macOS but still creates F; stock macOS `screen` has no -Logfile; `/usr/bin/time` has no --output / -f; `nohup` writes nohup.out only under a pty.
+
+// util-linux `script [options] [file] [-- command [argument...]]`: getopt_long with permutation. The long options are its own (an unambiguous prefix is read as the option); 0: no value, 1: a value that is no file,
+// 2: a file the wrapper writes, 3: an optional attached file. `ops`: the operands before a `--` (the words after it are the COMMAND, never operands), `logs`: every file option's value, `dash`: where the `--` stands (-1: none).
+const SCRIPT_UL_LONG = { append: 0, command: 1, echo: 1, return: 0, flush: 0, force: 0, 'log-io': 2, 'log-in': 2, 'log-out': 2, 'log-timing': 2, 'logging-format': 1, 'output-limit': 1, quiet: 0, timing: 3, version: 0, help: 0 };
+function scriptUtilLinux(argv) {
+  const ops = [];
+  const logs = [];
+  let dash = -1;
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t.length < 2 || t[0] !== '-') { ops.push(t); continue; }
+    if (t === '--') { dash = i; break; }
+    if (t[1] === '-') {
+      const eq = t.indexOf('=');
+      const name = eq < 0 ? t.slice(2) : t.slice(2, eq);
+      const kinds = Object.hasOwn(SCRIPT_UL_LONG, name) ? [SCRIPT_UL_LONG[name]] : Object.keys(SCRIPT_UL_LONG).filter((n) => n.startsWith(name)).map((n) => SCRIPT_UL_LONG[n]);
+      if (kinds.includes(3) && eq >= 0) logs.push(t.slice(eq + 1));
+      if (kinds.some((k) => k === 1 || k === 2)) {
+        const v = eq >= 0 ? t.slice(eq + 1) : argv[++i];
+        if (kinds.includes(2) && v !== undefined) logs.push(v);
+      }
+      continue;
+    }
+    for (let k = 1; k < t.length; k++) {
+      const c = t[k];
+      if ('cEmo'.includes(c)) { if (k === t.length - 1) i++; break; }
+      if ('OIBT'.includes(c)) { const v = k === t.length - 1 ? argv[++i] : t.slice(k + 1); if (v !== undefined) logs.push(v); break; }
+      if (c === 't') { if (k < t.length - 1) logs.push(t.slice(k + 1)); break; }
+    }
+  }
+  return { ops, logs, dash };
+}
+function scriptOutputs(argv) {
+  const out = [];
+  { // BSD / macOS: script [-adeFkpqr] [-t time] [-T fmt] [file [command ...]]: the first word that is no option is the file, every later word is the child's (its own -c or input file is never an output)
+    let i = 1;
+    while (i < argv.length) {
+      const t = argv[i];
+      if (t === '--') { i++; break; }
+      if (t.length < 2 || t[0] !== '-') break;
+      let step = 1;
+      for (let k = 1; k < t.length; k++) if (t[k] === 't' || t[k] === 'T') { if (k === t.length - 1) step = 2; break; }
+      i += step;
+    }
+    if (i >= argv.length) out.push('typescript');
+    else { out.push(argv[i]); while (hasExpansion(argv[i]) && i + 1 < argv.length) { i++; out.push(argv[i]); } } // (a run-time word may expand to an option or to nothing: the word after it may be the file)
+  }
+  { // util-linux: its file options are outputs whatever stands around them; the operand (or the default name `typescript`) only when at most one is left (it refuses more: nothing is written)
+    const ul = scriptUtilLinux(argv);
+    out.push(...ul.logs);
+    if (ul.ops.length <= 1) out.push(ul.ops[0] ?? 'typescript');
+  }
+  return out;
+}
+// the util-linux reading of `script [options] [file] -- command...` as a command of its own (#990): the words after the `--` run, when at most one operand stands before it
+function scriptCommandAfterDashes(argv) {
+  const ul = scriptUtilLinux(argv);
+  return ul.dash >= 0 && ul.ops.length <= 1 && ul.dash + 1 < argv.length ? argv.slice(ul.dash + 1) : null;
+}
+const TIME_LONG_NOVAL = ['append', 'portability', 'verbose', 'quiet', 'help', 'version'];
+function timeOutputs(argv) {
+  const out = [];
+  for (let i = 1; i < argv.length; i++) {
+    const t = argv[i];
+    if (t === '--') break;
+    const dyn = hasExpansion(t);
+    if (t.length < 2 || t[0] !== '-') {
+      if (!dyn) break;
+      if (argv[i + 1] !== undefined) out.push(argv[i + 1]); // (a run-time word may be an option that takes the next word)
+      continue;
+    }
+    if (t[1] === '-') {
+      const eq = t.indexOf('=');
+      const name = eq < 0 ? t.slice(2) : t.slice(2, eq);
+      if (name !== '' && 'output'.startsWith(name)) { const v = eq >= 0 ? t.slice(eq + 1) : argv[++i]; if (v !== undefined) out.push(v); }
+      else if (name !== '' && 'format'.startsWith(name)) { if (eq < 0) i++; }
+      else if (TIME_LONG_NOVAL.some((n) => n.startsWith(name))) { /* no value */ }
+      else if (eq < 0 && argv[i + 1] !== undefined) out.push(argv[i + 1]); // (an option not known: it may take the next word)
+    } else {
+      for (let k = 1; k < t.length; k++) { // (getopt, left to right: `f` and `o` each take the rest of the word, else the next; only `o`'s value is a file, so `-fo X` is a format "o")
+        if (t[k] === 'o') { const v = k === t.length - 1 ? argv[++i] : t.slice(k + 1); if (v !== undefined) out.push(v); break; }
+        if (t[k] === 'f') { if (k === t.length - 1) i++; break; }
+      }
+    }
+    if (dyn && argv[i + 1] !== undefined) out.push(argv[i + 1]);
+  }
+  return out;
+}
+function flockOutputs(argv) {
+  let i = 1;
+  const scan = () => { // (unwrapFlock's own walk)
+    while (i < argv.length) {
+      const t = argv[i];
+      if (t === '--') { i++; return null; }
+      if (t.length < 2 || t[0] !== '-') return null;
+      if (t === '--command') { const s = argv[i + 1] ?? ''; i += 2; return s; }
+      if (t.startsWith('--command=')) { i++; return t.slice('--command='.length); }
+      if (t[1] === '-') { i += !t.includes('=') && ['--timeout', '--wait', '--conflict-exit-code'].includes(t) ? 2 : 1; continue; }
+      let step = 1;
+      let script = null;
+      for (let k = 1; k < t.length; k++) {
+        if (t[k] === 'c' && k === t.length - 1) { script = argv[i + 1] ?? ''; step = 2; break; }
+        if ('wE'.includes(t[k])) { if (k === t.length - 1) step = 2; break; }
+      }
+      i += step;
+      if (script !== null) return script;
+    }
+    return null;
+  };
+  if (scan() !== null) return argv.slice(i).filter((w) => !(w.length > 1 && w[0] === '-')); // form B: flock [opts] -c STR FILE
+  return i < argv.length ? [argv[i]] : []; // form A: flock [opts] FILE CMD... / flock [opts] FILE -c STR
+}
+function screenOutputs(argv, childAt) {
+  const out = [];
+  let logging = false;
+  for (let i = 1; i < childAt; i++) {
+    const t = argv[i];
+    if (/^-logfile$/i.test(t)) { if (argv[i + 1] !== undefined) out.push(argv[i + 1]); i++; continue; }
+    if (/^-[A-Za-z]*L[A-Za-z]*$/.test(t)) logging = true;
+  }
+  if (logging && !out.length) out.push({ dyn: 'screenlog.*' }); // (screenlog.%n: a name only known at run time, in the command's directory)
+  return out;
+}
+// Every wrapper has an answer: a function (its output words), 'none' (it writes no file of its own) or 'shell' (its text becomes `sh -c`, which the shell-hand rule reads). A test walks WRAPPER_NAMES.
+export const WRAPPER_OUTPUTS = {
+  script: scriptOutputs, time: timeOutputs, flock: flockOutputs, screen: screenOutputs, nohup: () => [{ tty: 'nohup.out' }],
+  env: 'none', unbuffer: 'none', taskset: 'none', 'sandbox-exec': 'none', ssh: 'shell', parallel: 'shell', wsl: 'none', npx: 'none', bunx: 'none', pnpx: 'none', npm: 'none', pnpm: 'none', yarn: 'none',
+  command: 'none', builtin: 'none', noglob: 'none', nocorrect: 'none', '-': 'none', exec: 'none', setsid: 'none', nice: 'none', ionice: 'none', stdbuf: 'none', timeout: 'none', xargs: 'none',
+  sudo: 'none', doas: 'none', su: 'shell', arch: 'none', caffeinate: 'none', busybox: 'none',
+};
+// the candidate output words of the wrapper argv[0] (a string, or { dyn } / { tty } for a name known only at run time / written only under a terminal); childAt: where the child command starts in argv
+export function wrapperOutputs(argv, childAt = argv.length) {
+  const f = WRAPPER_OUTPUTS[base(argv[0] ?? '')];
+  if (typeof f !== 'function') return [];
+  const seen = new Set();
+  return f(argv, childAt).filter((w) => { const k = typeof w === 'string' ? w : JSON.stringify(w); if (seen.has(k) || (typeof w === 'string' && w === '')) return false; seen.add(k); return true; });
+}
+export const MAX_WRAPPER_OUTS = 16;
+export const REFUSED_WRAPPER_OUTS = "the command's wrappers name more than 16 possible output files (logs, timing or lock files), too many to check; split the command up";
+// The wrapper outputs of a command that count as writes. nohup.out is written only when stdout is a terminal: it is dropped when the command's stdout is provably not one (a write redirect of stdout, or the command is
+// not the last stage of a pipe), unless a pty-giving wrapper (script, screen, unbuffer, ssh) stood before the nohup: the redirect is then that wrapper's own and nohup still sees the pty.
+export function wrapperTargetsOf(c, next) {
+  const outs = c?.wrapperOuts;
+  if (!outs || !outs.length) return [];
+  if (!outs.some((o) => o.tty && !o.pty)) return outs;
+  const piped = typeof next?.sep === 'string' && next.sep.startsWith('|');
+  const redirected = (c.redirects ?? []).some((r) => ['>', '>>', '&>', '&>>', '>|', '>&'].includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && typeof r.target === 'string' && !/^&(?:\d+|-)$/.test(r.target));
+  return piped || redirected ? outs.filter((o) => !o.tty || o.pty) : outs;
+}
 export const WRAPPER_NAMES = Object.keys(WRAPPERS); // (the names the parser unwraps; the #904 tests walk them)
 
 // #903 B: a bare npm runner (`npx`, `npm exec`: no command word, no -c text) starts npm's script shell, which reads its stdin as shell text. Is this argv one, and does it run once per workspace?
@@ -3780,12 +3942,22 @@ class Parser {
     // extCd (T2): a `time`, `command` or `builtin` stood in front. Whether it ran the command as the shell's own builtin or as an external program differs by shell and spelling (dash has no `time` keyword, zsh's `command cd` runs /usr/bin/cd,
     // bash's `time` after an assignment is a program), so a `cd` behind it may or may not have moved THIS shell: git-policy leaves the directory unknown. Not `spawn` (bash really moves), not truncated (`\time make` is everyday).
     let extCd = false;
+    const wrapperOuts = []; // (#902) the wrappers' own output files, see wrapperOutputs
+    let ptyGiven = false; // (a script / screen / unbuffer / ssh stood before this point: nohup's stdout may be its pty)
     const pathRuns = []; // (#904) every path-run program this command was read through BY NAME ({ rec, chdir }): the by-name reading drops the word before any record names the file
     for (let guard = 0; guard < 32 && a.length; guard++) {
       if (base(a[0]) === 'xargs' || base(a[0]) === 'parallel') fanRuns = true;
       if (runnerIn === null && !fan) runnerIn = bareRunner(a); // (not behind an xargs / parallel: the pipe is that program's stdin, not the runner's)
       const un = unwrap(a, this.ctx.runnerPlain);
       if (!un) break;
+      { // (#902) the wrapper's own output words, with the directory as it is BEFORE this wrapper's own -C (where the wrapper starts: `env -C D script -q x.log ls` writes D/x.log, `script -q x.log env -C D ls` writes ./x.log)
+        const tail = un.argv.length <= a.length && un.argv.every((w, k) => w === a[a.length - un.argv.length + k]) ? a.length - un.argv.length : a.length;
+        for (const w of wrapperOutputs(a, tail)) {
+          const ent = typeof w === 'string' ? { target: w, wrapper: base(a[0]), chdir } : { target: w.dyn ?? w.tty, wrapper: base(a[0]), chdir, ...(w.dyn !== undefined ? { dyn: true } : {}), ...(w.tty !== undefined ? { tty: true, pty: ptyGiven } : {}) };
+          if (!wrapperOuts.some((o) => o.target === ent.target && o.chdir === ent.chdir && o.tty === ent.tty)) wrapperOuts.push(ent);
+        }
+        if (['script', 'screen', 'unbuffer', 'ssh'].includes(base(a[0]))) ptyGiven = true;
+      }
       { const pr = pathRunRecord(a); if (pr) pathRuns.push({ rec: pr, chdir }); } // (#904: chdir as it is BEFORE this wrapper's own -C applies: where the wrapper itself is looked up)
       wrapped = true;
       if (base(a[0]) === 'time' || base(a[0]) === 'command' || base(a[0]) === 'builtin') extCd = true; // (`builtin`: dash has none, "not found": the cd never runs and the line goes on in the old directory)
@@ -3837,6 +4009,10 @@ class Parser {
     if (cmd && seg.typed) Object.defineProperty(cmd, 'typed', { value: seg.typed, enumerable: false });
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
     if (cmd && pathRuns.length) Object.defineProperty(cmd, 'pathRuns', { value: pathRuns, enumerable: false });
+    if (cmd && wrapperOuts.length) { // (#902: more distinct output files than the guards resolve one by one: refused, with its own reason)
+      if (wrapperOuts.length > MAX_WRAPPER_OUTS) { this.ctx.refused ??= REFUSED_WRAPPER_OUTS; this.ctx.truncated = true; }
+      Object.defineProperty(cmd, 'wrapperOuts', { value: wrapperOuts, enumerable: false });
+    }
     if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
     if (cmd && wrapped) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
     if (cmd && extCd) Object.defineProperty(cmd, 'extCd', { value: true, enumerable: false });

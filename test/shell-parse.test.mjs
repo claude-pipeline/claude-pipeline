@@ -1503,9 +1503,11 @@ const outsOf = (line) => simpleCommands(line).flatMap((c) => (c.wrapperOuts ?? [
 
 test('#902: script records its log file: the BSD file operand, the util-linux log options, the default name; a child\'s own -c or input file is no output', () => {
   assert.deepEqual(outsOf('script -q /tmp/x.log ls'), ['/tmp/x.log']);
-  for (const opts of ['-a', '-qa', '-F', '-t 0', '-T fmt', '-Tfmt', '-k -r -d -e -p']) assert.deepEqual(outsOf(`script ${opts} /tmp/x.log ls`), ['/tmp/x.log'], opts);
+  for (const opts of ['-a', '-qa', '-F', '-t 0', '-k -r -d -e -p']) assert.deepEqual(outsOf(`script ${opts} /tmp/x.log ls`), ['/tmp/x.log'], opts);
+  // `-T` is BSD's format and util-linux's timing file: the guard cannot tell which, so both words are candidates
+  for (const opts of ['-T fmt']) assert.deepEqual(outsOf(`script ${opts} /tmp/x.log ls`), ['/tmp/x.log', 'fmt'], opts);
   assert.deepEqual(outsOf('script -q /dev/null grep -c x /tmp/in'), ['/dev/null'], 'a BSD child\'s own -c and input file are the child\'s');
-  assert.deepEqual(outsOf('script -q -- /tmp/x.log ls'), ['/tmp/x.log']);
+  assert.deepEqual(outsOf('script -q -- /tmp/x.log ls'), ['/tmp/x.log', 'typescript'], 'BSD: the file after the --; util-linux: the command after it, the default name for the log');
   // util-linux: the log options are outputs wherever they stand, and whatever stands after `--` (R4-4: the words after `--` are the command, not operands)
   for (const line of ['script -q --log-out=/tmp/l -- env ls', 'script -q -O/tmp/l -- env ls', 'script -q -O /tmp/l -- env ls', 'script --log-in=/tmp/l -- time ls', 'script -B /tmp/l -- nice ls', 'script --log-o /tmp/l -c ls', 'script -c ls --log-timing=/tmp/l']) {
     assert.ok(outsOf(line).includes('/tmp/l'), line);
