@@ -104,8 +104,10 @@ export function gatherRoundStatus({ root, config, state, pr, gh, warnings }) {
   let cost = null;
   try {
     const found = readSummaryComment(gh, pr);
-    cost = found.status === 'ok' ? costFrom(found.record, rounds.reviewed, state) : null;
-    if (cost === null) warnings.push(found.status === 'ok' ? 'the run record holds no booked cost yet' : `no usable run record on the PR (${found.status}): cost not shown`);
+    // The booked cost is the run record's cost section plus the append-only cost bookings (`P cost`), which exist on a PR whose record is absent too.
+    const eff = found.effectiveCost;
+    cost = eff.unavailable === undefined && eff.any ? costFrom({ cost: eff.cost }, rounds.reviewed, state) : null;
+    if (cost === null) warnings.push(eff.unavailable !== undefined ? `the booked cost is unavailable: ${asciiLine(eff.unavailable, 120)}` : found.status === 'ok' ? 'the run record holds no booked cost yet' : `no usable run record on the PR (${found.status}): cost not shown`);
   } catch (err) {
     warnings.push(`the booked cost could not be read (${asciiLine(err?.message, 120)})`);
   }

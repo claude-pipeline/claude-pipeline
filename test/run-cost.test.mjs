@@ -15,7 +15,7 @@ import {
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
 } from '../pipeline/lib/run-record.mjs';
-import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { summaryFromComments, writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { transcriptUsage } from '../pipeline/commands/cost.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
 
@@ -208,33 +208,34 @@ test('list prices: each transcript message at its own model, unknown models add 
 
 // ---- the CLI -------------------------------------------------------------------------------------------------------
 
-const PATCH_77 = { match: '-X PATCH repos/acme/widgets/issues/comments/77', stdoutJson: { id: 77, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-77' } };
+// The fake gh REMEMBERS the PR's comments (what a post or an edit wrote is what the next listing shows): `P cost` posts a comment per booking and reads the PR back, so a test runs the
+// real sequence of writers. `stateful` swaps the scenario's scripted gh for it (`comments`: what the PR already holds); `costCli` does so on first use.
+const stateful = (s, comments = []) => {
+  s.fake = createCommentsGh(ghEntries({ prHead: s.head, extra: [{ match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }), { comments });
+  return s;
+};
+const ensureStateful = (s) => (typeof s.fake.comments === 'function' ? s : stateful(s));
 function existing(record, sections = '') {
   let body = '';
   writeSummaryComment({ viewer: () => 'me', listComments: () => [], upsertComment: (n, m, b) => { body = b; return { id: 77, url: 'u', action: 'created' }; } }, PR, { record, sections });
   return { id: 77, user: { login: 'me' }, body, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-77' };
 }
-const withComment = (s, comment, extra = []) => s.fake.setScript(ghEntries({ prHead: s.head, comments: comment ? [comment] : [], extra: [PATCH_77, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }, ...extra] }));
+// The PR already holds this summary comment (and nothing else): a fresh stateful gh.
+const withComment = (s, comment) => stateful(s, comment ? [comment] : []);
+// What the PR's comments say now: the summary read the way every reader reads it (the record's cost section plus the bookings, replayed) and the record itself.
+const summaryNow = (s) => summaryFromComments(s.fake.comments(), 'me');
 const written = (s) => {
-  const w = s.fake.calls().filter((c) => c.argv[0] === 'api' && c.argv.includes('-X') && /issues\/(?:\d+\/comments|comments\/\d+)$/.test(c.argv.at(-3)));
-  return decodeRecord(JSON.parse(w.at(-1).stdin).body).record;
+  const sum = summaryNow(s);
+  assert.equal(sum.effectiveCost.unavailable, undefined, 'the cost replays');
+  return { cost: sum.effectiveCost.any ? sum.effectiveCost.cost : undefined, record: sum.record };
 };
-const costCli = (s, args, env = {}) => cli(['cost', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, ...env } });
-
-// A fake gh that REMEMBERS the PR's comments (what a post or an edit wrote is what the next listing shows), so two writers can be interleaved.
-const stateful = (s, comments = []) => {
-  s.fake = createCommentsGh(ghEntries({ prHead: s.head, extra: [{ match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }), { comments });
-  return s;
-};
-// The PR total as the comments hold it now.
-const liveCost = (s) => {
-  const mine = s.fake.comments().filter((c) => c.body.startsWith(MARKERS.summary));
-  return decodeRecord(mine.at(-1).body).record.cost;
-};
+// The posted bookings (the comments P cost wrote), oldest first.
+const bookingComments = (s) => s.fake.comments().filter((c) => c.body.startsWith('<!-- claude-pipeline:event:cost-booking:'));
+const costCli = (s, args, env = {}) => cli(['cost', '--pr', String(PR), ...args], { dir: ensureStateful(s).repo.dir, fake: s.fake, env: { ...s.env, ...env } });
 
 // Issue #958: the run record is one editable comment and GitHub has no conditional edit, so a writer that read before another one wrote put its own total back and the other booking dropped out of the PR total.
 test('P cost: a booking survives a record write that read the PR before it (interleaved writers, #958)', () => {
-  const s = stateful(scenario());
+  const s = scenario();
   const book = (usd) => costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '10', '--usd', String(usd)]);
   const a = book(1);
   assertExit(a, 0);
@@ -248,7 +249,7 @@ test('P cost: a booking survives a record write that read the PR before it (inte
   const c = book(4);
   assertExit(c, 0);
   assert.deepEqual([a.json.call.usd, b.json.call.usd, c.json.call.usd], [1, 2, 4], 'each call reports its own figure');
-  assert.deepEqual([liveCost(s).total.usd, liveCost(s).total.calls], [7, 3], 'all three bookings are in the total');
+  assert.deepEqual([written(s).cost.total.usd, written(s).cost.total.calls], [7, 3], 'all three bookings are in the total');
 });
 
 test('P cost: books an entry into a fresh record, then adds to it', () => {
@@ -258,8 +259,6 @@ test('P cost: books an entry into a fresh record, then adds to it', () => {
   assert.equal(r.json.recorded, true);
   assert.equal(r.json.cost.total.usd, 0.4);
   assert.deepEqual(r.json.cost.sessions, ['sess-1']);
-  const first = written(s);
-  withComment(s, existing(first));
   const r2 = costCli(s, ['--phase', 'review', '--role', 'wizard', '--input', '1', '--usd', '0.1', '--retry']);
   assertExit(r2, 0);
   assert.deepEqual([r2.json.cost.total.input, r2.json.cost.total.usd, r2.json.cost.retries], [101, 0.5, 1]);
@@ -369,7 +368,6 @@ test('P cost --from-transcript: booking a continued agent\'s transcript again bo
   s.repo.write('.review/agent-a1.jsonl', msg('m1', 10));
   const first = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
   assertExit(first, 0);
-  withComment(s, existing(written(s)));
   s.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5));
   const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl', '--output', '1']);
   assertExit(second, 0);
@@ -380,21 +378,16 @@ test('P cost --from-transcript: booking a continued agent\'s transcript again bo
   assert.deepEqual([t.input, t.output, t.cacheRead, t.cacheWrite, t.calls], [15, 31, 45, 60, 2], 'the whole transcript once, plus the hand output');
   assert.equal(t.usd, (() => { const sc = scenario(); sc.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5)); return costCli(sc, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']).json.cost.total.usd; })(), 'USD too');
   // a third booking with nothing new adds no tokens
-  withComment(s, existing(written(s)));
   const third = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
   assert.deepEqual([third.json.cost.total.input, third.json.cost.total.output], [15, 31]);
 });
 
-// R1-B1 / R2-B1 (#939): a booking that lands between this call's first look at the record and its write used to be erased by the write (A $2 under B $3 left $2) while the report said the total was right.
-// The record is now built on the writer's fresh read, so the total keeps both and `call` is this call's own amount. Two DIFFERENT amounts: identical ones hide an overwrite.
+// R1-B1 / R2-B1 (#939, #958): a booking next to another one used to be erased by the other's write (A $2 under B $3 left $2) while the report said the total was right.
+// Each booking is its own comment now, so the total keeps both and `call` is this call's own amount. Two DIFFERENT amounts: identical ones hide an overwrite.
 test('P cost: a booking that landed before this call\'s write stays in the total, and call is this call\'s own amount', () => {
   const s = scenario();
   const other = costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '20', '--usd', '2']); // the booking the other run made
   assertExit(other, 0);
-  const booked = existing(written(s));
-  // The fake counts matching calls over the whole log (the run above included), so the listing sequence is padded past them.
-  const earlier = s.fake.calls().filter((c) => /issues\/12\/comments --paginate/.test(c.argv.join(' '))).length;
-  s.fake.setScript(ghEntries({ prHead: s.head, extra: [PATCH_77, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }, { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [...Array(earlier).fill([]), [booked]] }] }));
   const mine = costCli(s, ['--phase', 'review', '--role', 'judge', '--input', '30', '--usd', '3']);
   assertExit(mine, 0);
   assert.equal(mine.json.recorded, true);
@@ -411,9 +404,6 @@ test('P cost: a transcript another booking took in the meantime books nothing ag
   const args = ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-r1.jsonl'];
   const first = costCli(s, args);
   assertExit(first, 0);
-  const booked = existing(written(s));
-  const earlier = s.fake.calls().filter((c) => /issues\/12\/comments --paginate/.test(c.argv.join(' '))).length;
-  s.fake.setScript(ghEntries({ prHead: s.head, extra: [PATCH_77, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }, { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [...Array(earlier).fill([]), [booked]] }] }));
   const again = costCli(s, args);
   assertExit(again, 0);
   assert.equal(first.json.call.input, 10);
@@ -441,11 +431,9 @@ test('P cost --from-transcript: same-named transcripts from different folders bo
   s.repo.write('.review/b/transcript.jsonl', one(50));
   const first = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/a/transcript.jsonl']);
   assertExit(first, 0);
-  withComment(s, existing(written(s)));
   const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/b/transcript.jsonl']);
   assertExit(second, 0);
   assert.equal(second.json.cost.total.input, 150, 'both transcripts booked in full');
-  withComment(s, existing(written(s)));
   const again = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/b/transcript.jsonl']);
   assert.equal(again.json.cost.total.input, 150, 'the same file again books nothing new');
   assert.doesNotMatch(JSON.stringify(written(s).cost.transcripts), /\.review|\/Users|\/tmp/, 'no folder path in the ledger');
@@ -739,7 +727,6 @@ test('byPrice round trip: P cost --from-transcript -> run record comment -> P su
   const stored = written(s).cost;
   assert.deepEqual(stored.byPrice['claude-fable-5-2|std|std'], { input: 1000, output: 200, cacheRead: 0, cacheWrite5m: 100, cacheWrite1h: 200, messages: 1 });
   assert.equal(stored.byPrice['claude-haiku-5-5|>100k|std'].input, 200000);
-  withComment(s, existing(written(s)));
   const sum = summary(s, []);
   assertExit(sum, 0);
   assert.deepEqual(sum.json.cost.byPrice, stored.byPrice);
@@ -761,7 +748,6 @@ test('byPrice: a hand entry is not bucketed; --model hand tokens are; --usd over
   const m = costCli(s, ['--phase', 'build', '--role', 'judge', '--input', '1000000', '--cache-write', '10', '--model', 'sonnet']);
   assert.equal(m.json.bucketed, true);
   assert.deepEqual(m.json.cost.byPrice['sonnet|std|std'], { input: 1e6, output: 0, cacheRead: 0, cacheWrite5m: 10, cacheWrite1h: 0, messages: 1 });
-  withComment(s, existing(written(s)));
   const m2 = costCli(s, ['--phase', 'review', '--role', 'judge', '--input', '5', '--model', 'sonnet']);
   assert.equal(m2.json.cost.byPrice['sonnet|std|std'].input, 1e6 + 5);
   assert.deepEqual(m2.json.cost.priceTables, { '2026-11-03': 2 });

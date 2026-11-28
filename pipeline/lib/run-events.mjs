@@ -2,9 +2,10 @@
 // began, the incident it opened, and that a run was taken over from an earlier session: `run-resumed`, which the merge gate reads beside the run record). Each event is its OWN PR comment, created once and never edited, so no later writer
 // can erase it. Only comments the viewer wrote that START with an event marker count; a quoted marker is not an event.
 import { line } from './render.mjs';
+import { applyCostPatch, emptyCost } from './run-cost.mjs';
 import { packJson, unpackJson } from './run-record.mjs';
 
-export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used', 'hold-lifted', 'hold-lift-deleted', 'hold-lift-aborted', 'run-resumed']);
+export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used', 'hold-lifted', 'hold-lift-deleted', 'hold-lift-aborted', 'run-resumed', 'cost-booking']);
 
 const EVENT_ID = /^[A-Za-z0-9._-]{1,64}$/;
 const EVENT_START = /^<!-- claude-pipeline:event:([a-z-]+):([A-Za-z0-9._-]{1,64}) -->/;
@@ -38,6 +39,48 @@ export function parseEvent(body) {
   } catch {
     return { kind, id, sentence, data: null, dataStatus: 'invalid' };
   }
+}
+
+// ---- cost bookings (`P cost`): one never-edited comment per booking; the PR's cost is the replay of them (run-cost.mjs#effectiveCost) ----------------------------------
+
+// Why `data` (a cost-booking event's payload: `P cost`'s cost patch {entry?, transcript?, retries?, sessions?} plus the booking's own `id`) is no booking, or null when it is one. The one
+// shape check is a dry run through the replay's own arithmetic, so a payload that passes here can never fail later in a replay. Never carries `guardBlocks` or a top-level `hold` (hold.mjs reads any event with a string `hold`).
+export function costBookingProblem(data, id) {
+  if (data === null || typeof data !== 'object' || Array.isArray(data)) return 'the payload is not an object';
+  if (typeof data.id !== 'string' || !EVENT_ID.test(data.id)) return 'the payload has no usable id';
+  if (id !== undefined && data.id !== id) return 'the payload id is not the comment id';
+  if ('hold' in data) return 'the payload carries a hold';
+  try {
+    applyCostPatch(emptyCost(), data, { evict: false });
+  } catch (err) {
+    return String(err?.message ?? err).slice(0, 120);
+  }
+  return null;
+}
+
+// The bookings among a PR's comments: the viewer's own comments that START with the cost-booking marker (another author's comment, or a quoted marker, is ignored and never corrupt), deduplicated by
+// booking id (the lowest comment id wins), in GitHub comment-id order. -> { bookings: [{ id, commentId, data }], corrupt: [reason] }: `corrupt` lists the viewer's own bookings that cannot be used (unreadable
+// payload); the replay then reports the cost as unavailable instead of a wrong total. Never throws.
+export function readCostBookings({ comments, viewer }) {
+  const bookings = [];
+  const corrupt = [];
+  const seen = new Set();
+  const mine = (Array.isArray(comments) ? comments : [])
+    .filter((c) => c?.user?.login === viewer && typeof c.body === 'string')
+    .sort((a, b) => Number(a.id) - Number(b.id));
+  for (const c of mine) {
+    const ev = parseEvent(c.body);
+    if (ev?.kind !== 'cost-booking') continue;
+    if (seen.has(ev.id)) continue;
+    const problem = ev.dataStatus === 'ok' ? costBookingProblem(ev.data, ev.id) : `the payload is ${ev.dataStatus}`;
+    if (problem !== null) {
+      corrupt.push(`comment ${c.id}: ${problem}`);
+      continue;
+    }
+    seen.add(ev.id);
+    bookings.push({ id: ev.id, commentId: c.id, data: ev.data });
+  }
+  return { bookings, corrupt };
 }
 
 // Always a new comment: this never calls upsertComment, so a second event can never rewrite a first one.

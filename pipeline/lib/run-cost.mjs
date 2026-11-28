@@ -171,6 +171,33 @@ export function applyCostPatch(cost, patchCost, { evict = true } = {}) {
   return next;
 }
 
+// ---- the cost of a PR as the append-only bookings say it ------------------------------------------------------------
+
+// What the PR's cost is NOW: the legacy base (the cost section of the run record, written by an older CLI or by the summary / checkpoint writers; absent => nothing) with every
+// booking (`bookings`: [{ id, data }] in GitHub comment-id order, `data` a cost patch) applied on top through applyCostPatch, the arithmetic the record path uses, so a replay
+// equals what the old read-modify-write would have totalled when nothing raced. `evict: false`: the replay is never written back, so no transcript may fall out of its ledger.
+// -> { cost, contributions: Map<id, {usd, input, output, cacheRead, cacheWrite}> (what each booking added to the total), any (a base cost or at least one booking exists) }
+//    or { unavailable: <reason> } when the record is unreadable (`baseStatus` invalid | unsupported), a booking of the viewer's is corrupt (`corrupt`: the reasons) or the replay fails.
+// Never throws: a display must not be able to stop a command.
+export function effectiveCost({ base, baseStatus = 'ok', bookings = [], corrupt = [] }) {
+  if (baseStatus === 'invalid' || baseStatus === 'unsupported') return { unavailable: `the run record is ${baseStatus}` };
+  if (corrupt.length > 0) return { unavailable: `a cost booking could not be read (${corrupt[0]})` };
+  try {
+    if (base !== undefined && base !== null && costShapeProblem(base)) return { unavailable: 'the run record has a cost section nothing can read' };
+    let cost = isPlainObject(base) ? structuredClone(base) : emptyCost();
+    const contributions = new Map();
+    for (const { id, data } of bookings) {
+      const was = cost.total;
+      cost = applyCostPatch(cost, data, { evict: false });
+      const d = (k) => (Number(cost.total[k]) || 0) - (Number(was?.[k]) || 0);
+      contributions.set(id, { usd: Math.round(d('usd') * 1e6) / 1e6, input: d('input'), output: d('output'), cacheRead: d('cacheRead'), cacheWrite: d('cacheWrite') });
+    }
+    return { cost, contributions, any: isPlainObject(base) || bookings.length > 0 };
+  } catch (err) {
+    return { unavailable: `the cost bookings could not be added up (${String(err?.message ?? err).slice(0, 120)})` };
+  }
+}
+
 // `bySession` ({sessionId: denies}, at most MAX_SESSIONS of them, the last ones kept) replaces the per-session counts; left out, they stay.
 export function setGuardBlocks(cost, n, bySession) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());

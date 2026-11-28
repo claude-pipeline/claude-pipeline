@@ -66,10 +66,11 @@ function followupsOf(state) {
 // Where the guard hooks' deny log is (tests and odd installs point PIPELINE_GUARD_LOG_FILE at another file).
 const guardLogPath = (ctx) => ctx.guardLogFile ?? ctx.env?.PIPELINE_GUARD_LOG_FILE ?? guardLogFile();
 
-// How many commands the guards denied to this run's sessions: the ones the record already knows plus --session. No
-// session known, or no log file (the guards have not written one yet): nothing is counted and the old count stays.
-function guardBlocksFor(record, extraSessions, ctx) {
-  const sessions = [...new Set([...(record?.cost?.sessions ?? []), ...extraSessions])];
+// How many commands the guards denied to this run's sessions: the ones the run already knows (the record's, and the ones `P cost --session` booked: `summary.effectiveCost`) plus --session.
+// No session known, or no log file (the guards have not written one yet): nothing is counted and the old count stays.
+function guardBlocksFor(summary, extraSessions, ctx) {
+  const known = summary.effectiveCost?.unavailable === undefined ? summary.effectiveCost?.cost?.sessions : summary.record?.cost?.sessions;
+  const sessions = [...new Set([...(known ?? []), ...extraSessions])];
   if (!sessions.length) return { blocks: undefined, bySession: undefined, warnings: [] };
   const log = readGuardLog(guardLogPath(ctx), sessions);
   if (!log.present) return { blocks: undefined, bySession: undefined, warnings: [] };
@@ -127,7 +128,7 @@ export const run = guarded(async (argv, ctx) => {
     // The run record rides in the same comment: keep the one a checkpoint wrote, set how the run ended.
     const existing = readSummaryComment(gh, pr);
     if (existing.status === 'unsupported') throw new UsageError('the summary comment carries a run record from a newer pipeline version: update the pipeline CLI first');
-    const guard = guardBlocksFor(existing.status === 'ok' ? existing.record : null, values.session ?? [], ctx);
+    const guard = guardBlocksFor(existing, values.session ?? [], ctx);
     const { record, warnings } = recordForOutcome(existing.status === 'ok' ? existing.record : null, {
       repo: gh.repo().slug, pr, branch: view.headRefName, baseRef: view.baseRefName, head: view.headRefOid,
       outcome, detail, agentLogLine, host: hostname(), now: Date.now(), sessions: values.session, guardBlocks: guard.blocks, guardBySession: guard.bySession,
@@ -135,7 +136,7 @@ export const run = guarded(async (argv, ctx) => {
     warnings.push(...guard.warnings, ...ciUsage.warnings);
     const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing, retry: true });
     for (const w of posted.warnings) if (!warnings.includes(w)) warnings.push(w);
-    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: costReport(posted.record.cost), codexUsage: usage, ...(testsAddedLine === undefined ? {} : { testsAdded: testsAddedLine }), warnings };
+    const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: posted.effectiveCost?.any ? costReport(posted.effectiveCost.cost) : null, codexUsage: usage, ...(testsAddedLine === undefined ? {} : { testsAdded: testsAddedLine }), warnings };
     if (ciUsage.field) output.pushedWhileReady = ciUsage.field;
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.
     if (outcome === 'merged') output.pendingLogLine = buildAgentLogLine({ state, pr, title, outcome: DEFAULT_OUTCOME }) + usageText;

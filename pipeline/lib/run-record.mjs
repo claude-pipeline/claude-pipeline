@@ -342,7 +342,9 @@ export function recordForOutcome(existing, { repo, pr, branch, baseRef, head, ou
 
 // ---- the status block (what a person sees at the top of the summary comment) ------------------
 
-export function renderStatusBlock(record) {
+// `cost` (an effectiveCost result) is the cost to show instead of the record's own cost section: the summary comment shows the record's legacy cost plus the append-only bookings. Unreadable bookings
+// show as one line saying so, never an error: a display must not make a write fail.
+export function renderStatusBlock(record, { cost } = {}) {
   const r = record;
   const head = r.head ? `\`${line(String(r.head).slice(0, 7)).replace(/`/g, "'")}\`` : '—';
   const done = (r.tasks ?? []).filter((t) => t.done === true).length;
@@ -358,7 +360,9 @@ export function renderStatusBlock(record) {
   ];
   if (f) out.push(`- **In flight:** ${line(f.kind)} on ${line(f.host)} since ${line(f.startedAt)}${f.maxMinutes ? ` (max ${line(f.maxMinutes)} min)` : ''}`);
   for (const p of Array.isArray(r.proofs) ? r.proofs : []) out.push(`- ${proofLine(p)}`);
-  out.push(...costLines(r.cost));
+  if (cost === undefined) out.push(...costLines(r.cost));
+  else if (cost.unavailable !== undefined) out.push(`- cost unavailable: ${line(cost.unavailable, 200)}`);
+  else out.push(...costLines(cost.cost));
   if (r.detail) out.push(`- **Detail:** ${line(r.detail, LIMITS.text)}`);
   out.push(
     `- **Host:** ${r.heartbeat?.host ? line(r.heartbeat.host) : '—'} · **Heartbeat:** ${r.heartbeat?.at ? line(r.heartbeat.at) : '—'}`,

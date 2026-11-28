@@ -5,6 +5,8 @@ import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { MAX_PAGES, PAGE, pages } from '../lib/gh-pages.mjs';
 import { decodeRecord } from '../lib/run-record.mjs';
+import { effectiveCost } from '../lib/run-cost.mjs';
+import { readCostBookings } from '../lib/run-events.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
 import { aggregate, analysePr, isReadableState, renderTable } from '../lib/round-stats.mjs';
 import { MARKERS } from '../lib/render.mjs';
@@ -53,6 +55,7 @@ async function rounds(rest, ctx) {
           const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record or state may be missing or old`));
           let record = null;
           let state = null;
+          let recordUnreadable = false;
           const slugLower = slug.toLowerCase();
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
           for (const c of comments) {
@@ -70,7 +73,10 @@ async function rounds(rest, ctx) {
               if (r.status === 'ok') {
                 if (r.record.pr === number && String(r.record.repo ?? '').toLowerCase() === slugLower) record = r.record;
                 else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
-              } else if (r.status === 'invalid' || r.status === 'unsupported') skip('a run record', `: unreadable (${r.status})`);
+              } else if (r.status === 'invalid' || r.status === 'unsupported') {
+                recordUnreadable = true;
+                skip('a run record', `: unreadable (${r.status})`);
+              }
             }
             if (isState) {
               const decoded = decodeFromComment(c.body);
@@ -79,7 +85,11 @@ async function rounds(rest, ctx) {
               else skip('a review state', ': unreadable');
             }
           }
-          const p = analysePr({ repo: slug, pr: number, state, record });
+          // The cost is this PR's own record's cost section plus the cost bookings of THIS listing (this slug's comments of this PR: another repo's PR of the same number never mixes in). A record bound
+          // to another PR was skipped above and brings no cost; an unreadable record, or an unreadable booking of ours, leaves the cost out (usd null).
+          const eff = effectiveCost({ base: record?.cost, baseStatus: record === null && recordUnreadable ? 'invalid' : 'ok', ...readCostBookings({ comments, viewer: me }) });
+          const cost = eff.unavailable !== undefined || !eff.any ? null : eff.cost;
+          const p = analysePr({ repo: slug, pr: number, state, record, cost });
           if (p === null) withoutState += 1;
           else analysed.push(p);
         } catch (err) {
