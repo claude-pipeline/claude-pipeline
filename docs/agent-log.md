@@ -389,3 +389,4 @@ full record.
 - 2026-11-28 · #954 · Ruling dialogs can recommend any ruling, incl. BLOCKING items and Reject (#944) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · awaiting-owner-merge · Codex 7d: 911 runs (368 high)
 - 2026-11-28 · #978 · P cost refuses an empty --from-transcript; regression test for cost after a repo move (#821, #707) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 916 runs (368 high)
 - 2026-11-28 · #979 · agent-log publish can no longer hang forever on a stuck local git step; psql guard test no longer flaky under load (#964 #952) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 917 runs (369 high)
+- 2026-11-28 · #985 · Live-database approval: a click counts when Claude Code shrank the reply to a progress note; quoted or wrapped typed go accepted (#983, #681) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · awaiting-owner-merge · Codex 7d: 964 runs (389 high)
