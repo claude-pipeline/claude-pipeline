@@ -863,12 +863,20 @@ const grantedRetained = (state) => (state?.rounds ?? []).filter((r) => countsTow
 
 // The counted ordinal (1-based) the automatic extra round took, or null. It is the counted round at max + 1 that no owner grant admitted:
 // recorded `admission: 'auto-extra'`, or (a state written before admission was recorded) no admission and no ownerGrant.
+// A state whose rounds ran under a higher review.max_rounds than `configuredMax` (#923): the higher cap (the highest of the recorded capLoweredFrom and the
+// stored maxRounds that is an integer above the configured one, within the config range 1..5), else null. Both fields come from the state being checked, so
+// neither is believed outside that range. Such a round with no admission field was an ordinary round, not the automatic extra.
+export function higherCapOf(state, configuredMax) {
+  const above = [state?.capLoweredFrom, state?.maxRounds].filter((v) => Number.isInteger(v) && v > configuredMax && v <= 5);
+  return above.length === 0 ? null : Math.max(...above);
+}
 export function autoExtraOrdinal(state) {
   const max = state?.maxRounds;
   if (!Number.isFinite(max)) return null;
   const r = (state?.rounds ?? []).filter(countsTowardCap)[max];
   if (r === undefined || (r.ownerGrant !== undefined && r.ownerGrant.past !== true)) return null;
-  return r.admission === 'auto-extra' || r.admission === undefined ? max + 1 : null;
+  if (r.admission === 'auto-extra') return max + 1;
+  return r.admission === undefined && higherCapOf(state, max) === null ? max + 1 : null;
 }
 
 // The rounds whose new accepts still wait for a round that reviews their fixes: from the end back through the rounds that

@@ -45,7 +45,7 @@ import {
   routeFileFor, saveSecondAttempts,
 } from '../lib/second-review-substitute.mjs';
 import { establishBaseline, pastRoundHistoryProblem, publishTriage, readPublished } from '../lib/review-publish.mjs';
-import { pastRoundsNeedingApproval } from '../lib/owner-grants.mjs';
+import { pastApprovalFirst, pastRoundsNeedingApproval } from '../lib/owner-grants.mjs';
 
 export const meta = {
   summary: 'apply the judge triage, settle disputed bugs with test results, close the light lane, ask for and record owner rulings made in chat, record Claude\'s own rulings, run the blind Codex second review',
@@ -1054,6 +1054,11 @@ async function roundRequest(rest, ctx) {
     const k = reviewedRoundCount(state) + 1;
     const grants = (ordinal) => ownerGrantedRounds({ repo: slug, pr, k: ordinal, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }));
     const { admission } = roundAdmission(state, n, { head, grants });
+    // The same prerequisite as codex-review's round-cap check (review-round.mjs#checkCap): no forward grant is asked for, or reported as ready, while a round that ran under a higher cap still needs the owner's past approval.
+    if (admission === null || admission === 'owner') {
+      const first = pastApprovalFirst(state, { maxRounds: config.review?.max_rounds, repo: slug, pr, round: n });
+      if (first !== null) return refuse(first);
+    }
     if (admission !== null) {
       return refuse(admission === 'owner'
         ? `round ${k} is already granted for this head: run codex-review --round ${n}`

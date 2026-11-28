@@ -1640,6 +1640,10 @@ test('lowerCapTo: a state stored under a higher cap admits round 4 only as the a
   assert.equal(lowerCapTo(same, 3), same, 'equal: unchanged');
   assert.equal(lowerCapTo(stateOf([], { maxRounds: null }), 3).maxRounds, null, 'a missing cap is left for the verifier to refuse');
   assert.equal(lowerCapTo(old, undefined).maxRounds, 4, 'no configured cap: unchanged');
+  // R2-B3: three legacy rounds (no admission) under cap 3: the third was the automatic extra under cap 2 only when the state never ran under 3
+  const legacy = (max) => stateOf([round(1, []), round(2, []), round(3, [])], { maxRounds: max });
+  assert.equal(autoExtraOrdinal(legacy(2)), 3, 'control: a state created under cap 2');
+  assert.equal(autoExtraOrdinal(lowerCapTo(legacy(3), 2)), null, 'ran under cap 3: round 3 was ordinary');
 });
 
 test('checkCap: a state that ran under cap 3 (now 2) with a counted round 3 and no past approval refuses a new round before any owner grant is used, and names round-request --past (#923)', () => {
@@ -1651,6 +1655,10 @@ test('checkCap: a state that ran under cap 3 (now 2) with a counted round 3 and 
   // a state that never ran under a higher cap keeps the ordinary refusal; so does label mode (no past approval exists there)
   assert.throws(() => checkCap(c(), { ...stored, maxRounds: 2 }, {}), (e) => /would pass review\.max_rounds \(2\)/.test(e.output.message));
   assert.throws(() => checkCap(c({ config: { owner_approval: 'label', review: { max_rounds: 2 } } }), stored, {}), (e) => /would pass review\.max_rounds \(2\)/.test(e.output.message));
+  // R2-F1: a PR that never ran under a higher cap, with an old owner grant on round 4 whose record is gone here, is not blocked by this prerequisite (the gate re-approves it)
+  const gone = { grantId: 'a'.repeat(16), k: 4, quote: 'extra round', ownerTs: '2026-11-01T00:00:00.000Z' };
+  const never = { maxRounds: 2, rounds: [...rounds.map((r, i) => ({ ...r, admission: i === 2 ? 'auto-extra' : 'normal' })), { n: 4, fromHead: 'b'.repeat(40), toHead: 'c'.repeat(40), contentHashAtToHead: 'c4', items: [], admission: 'owner', ownerGrant: gone }, { n: 5, fromHead: 'c'.repeat(40), toHead: 'd'.repeat(40), contentHashAtToHead: 'c5', items: [], admission: 'owner', ownerGrant: { ...gone, k: 5 } }] };
+  assert.throws(() => checkCap(c({ round: 6 }), never, {}), (e) => !/higher limit/.test(e.output.message) && /would pass review\.max_rounds \(2\)/.test(e.output.message));
 });
 
 test('roundCapProblem owner grant: an open grant allows exactly the next counted round, never a baseOnly/resolutionOnly one', () => {

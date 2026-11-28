@@ -81,6 +81,28 @@ test('pastRoundsNeedingApproval: the plan\'s rules, n != k, exclusions, last rou
   assert.deepEqual(pastRoundsNeedingApproval(bad, bad, ctx).map((x) => x.n), [5]);
 });
 
+test('pastRoundsNeedingApproval: a state that ran under a higher cap qualifies only the rounds that cap could hold, and a migrated round whose record is gone qualifies again (#923)', () => {
+  // failure caught: a grant-less round 5 of a cap-3 state (round 5 needed an owner grant under both caps) approved through the migration exception while it is the newest round
+  const ran = (ns, max = 2, from = 3, extra = {}) => ({ ...build('acme/widgets', ns.map((n) => ({ n, admission: 'normal', ...(extra[n] ?? {}) }))), maxRounds: max, capLoweredFrom: from });
+  const ctx = { maxRounds: 2, repo: 'acme/widgets', pr: 7 };
+  const five = ran([1, 2, 3, 4, 5]);
+  assert.deepEqual(pastRoundsNeedingApproval(five, five, ctx).map((x) => x.n), [3], 'normal only up to the old cap (3)');
+  const auto = ran([1, 2, 3, 4, 5], 2, 3, { 4: { admission: 'auto-extra' } });
+  assert.deepEqual(pastRoundsNeedingApproval(auto, auto, ctx).map((x) => x.n), [3, 4], 'auto-extra up to the old cap + 1');
+  // the recorded higher cap must exceed the configured one and stay in the config range
+  for (const bogus of [3, 99, null, '3']) {
+    const s = ran([1, 2, 3], 2, bogus);
+    assert.deepEqual(pastRoundsNeedingApproval(s, s, bogus === 3 ? { ...ctx, maxRounds: 3 } : ctx).map((x) => x.n), [], `capLoweredFrom ${JSON.stringify(bogus)}`);
+  }
+  // R2-B2: the owner approved round 3 after it ran (admission owner, a past grant); its record is gone: offered again, even as the newest round
+  const gone = { grantId: 'a'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const migrated = ran([1, 2, 3], 2, 3, { 3: { admission: 'owner', ownerGrant: gone } });
+  assert.deepEqual(pastRoundsNeedingApproval(migrated, migrated, ctx).map((x) => x.n), [3]);
+  // control: the same round in a state that never ran under a higher cap is skipped as before (k = max + 1, no later round)
+  const never = { ...migrated, capLoweredFrom: undefined };
+  assert.deepEqual(pastRoundsNeedingApproval(never, never, ctx), []);
+});
+
 test('verifyOwnerGrants: the refusal for a qualifying round names the remedy; others keep their text; never throws', () => {
   const s = build('acme/widgets');
   const r = verifyOwnerGrants(s, { repo: 'acme/widgets', pr: 7, maxRounds: 1 });
