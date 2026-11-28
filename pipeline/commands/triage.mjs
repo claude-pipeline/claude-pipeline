@@ -30,7 +30,7 @@ import { RULING_HEAD_BOUND_VARIANTS, RULING_VARIANT_LEGACY, clickNotes, followUp
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRulingGap, ownerRulingRecords, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, BUCKETS, CONFIDENCES, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, needsHumanCause, ownerRulingRefusal, RULING_WHY, rulingRecommendationRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, MALFUNCTION_CAUSES, markLightLane, needsHumanCause, ownerRulingRefusal, RERUN, RULING_WHY, rulingRecommendationRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
@@ -1035,12 +1035,15 @@ async function rulingRequest(rest, ctx) {
     const notes = items.filter((i) => isDeferrableAccept(i) || isOwnerDeferral(i)).map((i) => deferNote(i));
     // May the recommendation be shown? Refused => the neutral legacy dialog and the reason, never a retry (exit 0).
     const refusedRaw = values.recommend === undefined ? null : recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: values.why });
-    // minor-later claims "the pipeline rates it low": when that is what refused it, name the code that makes no such claim, but only when fix-separately would itself be shown for the whole batch (#956: a serious open accepted fix, a contrary second review or a contradicted scope refuse it too, so the neutral dialog is the way; a malfunction wait is re-run, not asked, so its reason is passed on without the neutral-dialog advice).
+    // minor-later claims "the pipeline rates it low": when that is what refused it, name the code that makes no such claim, but only when fix-separately would itself be shown for the whole batch (#956: a serious open accepted fix, a contrary second review or a contradicted scope refuse it too, so the neutral dialog is the way; an item waiting on a malfunction is re-run, not asked, so it is judged from the batch itself (the probe stops at the first refused item and may not reach it) and the advice is the re-run, never the neutral dialog).
     const severityRefused = refusedRaw !== null && values.why === 'minor-later' && / is not low severity \(/.test(refusedRaw);
-    const fixSeparately = severityRefused ? recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: 'fix-separately' }) : null;
-    const refused = !severityRefused ? refusedRaw : fixSeparately === null
-      ? `${refusedRaw}; if Claude's own research rates it worth fixing but not in this PR, recommend follow-up with --why fix-separately`
-      : `${refusedRaw}; fix-separately is refused too (${fixSeparately})${/ malfunction: /.test(fixSeparately) ? '' : ': run ruling-request with no --recommend (the owner can still click Follow-up all)'}`;
+    const malfunctions = severityRefused ? items.filter((i) => i.final?.needsHuman === true && MALFUNCTION_CAUSES.includes(needsHumanCause(i))) : [];
+    const fixSeparately = severityRefused && malfunctions.length === 0 ? recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: 'fix-separately' }) : null;
+    const refused = !severityRefused ? refusedRaw : malfunctions.length > 0
+      ? `${refusedRaw}; ${malfunctions.map((i) => `${i.id} (${needsHumanCause(i)})`).join(', ')} wait${malfunctions.length === 1 ? 's' : ''} because of a malfunction, so no bulk ruling is asked for them: ${RERUN}`
+      : fixSeparately === null
+        ? `${refusedRaw}; if Claude's own research rates it worth fixing but not in this PR, recommend follow-up with --why fix-separately`
+        : `${refusedRaw}; fix-separately is refused too (${fixSeparately}): run ruling-request with no --recommend (the owner can still click Follow-up all)`;
     const shown = values.recommend !== undefined && refused === null;
     const dialogVariant = shown ? rulingVariantFor(values.recommend, values.why) ?? RULING_VARIANT_LEGACY : RULING_VARIANT_LEGACY;
     const recommendFields = { recommend: shown ? values.recommend : null, why: shown ? values.why : null, dialogVariant, ...(refused === null ? {} : { recommendRefused: refused }) };

@@ -585,8 +585,17 @@ test('triage ruling-request --recommend reject|fix-separately: refused for an im
   // failure caught (#956 review R3): a model-proof malfunction wait told "run the neutral dialog" instead of "re-run the judge/arbiter" (the owner would be asked about an item a re-run clears)
   const malfunction = triageWorld(CHAT(), { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed: ruling not provably from Fable' } });
   const malfunctionRefused = (await askRec(malfunction, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
-  assert.match(malfunctionRefused, /not low severity.*model-proof malfunction: re-run the judge\/arbiter/);
+  assert.match(malfunctionRefused, /not low severity.*R1-B1 \(model-proof\) waits because of a malfunction.*re-run the judge\/arbiter/);
   assert.doesNotMatch(malfunctionRefused, /no --recommend/);
+  // failure caught (#956 review R4): the fix-separately probe stops at the FIRST refused item (a serious open accepted fix), so a malfunction wait behind it was sent to the owner again
+  const both = triageWorld(CHAT(), { final: DEFERRABLE });
+  const bothFile = join(both.repo.dir, '.review', 'state.json');
+  const bothState = JSON.parse(readFileSync(bothFile, 'utf8'));
+  Object.assign(bothState.rounds[0].items[1], { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed: ruling not provably from Fable' } });
+  writeFileSync(bothFile, JSON.stringify(bothState));
+  const bothRefused = (await triage(both, newHome(), 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1,R1-S3', '--ask', '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
+  assert.match(bothRefused, /R1-S3 \(model-proof\) waits because of a malfunction.*re-run the judge\/arbiter/);
+  assert.doesNotMatch(bothRefused, /no --recommend/);
 });
 
 test('triage ruling-request --recommend: an unreadable reviewed diff refuses minor-later only; reject and fix-separately judge no severity and need no diff', async () => {

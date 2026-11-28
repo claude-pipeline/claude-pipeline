@@ -498,7 +498,7 @@ const claudeFinalIsAccept = (item) => isProtectedFinal(item) && item.final.decis
 const claudeDismissal = (item) => isClaudeRuled(item) && item.final.decision !== 'ACCEPT' && item.final.needsHuman !== true;
 // A final the writers may still reopen (a second review, a Claude ruling): one waiting for a human, or a Claude dismissal. Anything else is settled.
 export const finalIsReopenable = (item) => item.final?.needsHuman === true || claudeDismissal(item);
-const RERUN = 're-run the judge/arbiter (\`arbiter needed\`) so it answers again, or rule ACCEPT';
+export const RERUN ='re-run the judge/arbiter (\`arbiter needed\`) so it answers again, or rule ACCEPT';
 
 // Why a second review (Codex) may not be run for this item, or null. Not for what is settled, built, already reviewed, or a malfunction.
 export function secondReviewRefusal(item) {
