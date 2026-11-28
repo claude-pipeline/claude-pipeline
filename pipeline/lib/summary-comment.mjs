@@ -1,6 +1,7 @@
 // The ONE writer of the PR's summary comment: marker + status block + summary sections + record marker.
 // `P summary`, `P comment --kind summary` and `P checkpoint` all go through it, so whichever part the caller does not
 // supply (the run record, or the summary sections) is kept from the comment already on the PR instead of being lost.
+import { readRepoMoves, sameRepo } from '../hooks/lib/repo-moves.mjs';
 import { MARKERS } from './render.mjs';
 import { effectiveCost } from './run-cost.mjs';
 import { readCostBookings } from './run-events.mjs';
@@ -20,11 +21,13 @@ export function sectionsOf(body) {
 
 // The newest summary comment the viewer wrote that STARTS with the marker: the same one upsertComment edits.
 // -> {status: ok|absent|legacy|unsupported|invalid, record?, sections, url, id, costBookings, effectiveCost}
-// `summaryFromComments(comments, viewerLogin, pr)` works on a comment list the caller already holds.
+// `summaryFromComments(comments, viewerLogin, pr, { repo, moves })` works on a comment list the caller already holds. `repo` (the PR's slug; left out: only the PR number is checked) binds the record's cost base
+// to this repository too: a summary copied from another repository's PR of the same number is no base (stats does the same), unless the owner's repo-moves record says it is the same repository renamed or
+// transferred (sameRepo, judged from the record's last heartbeat; `moves` is read from the owner's file only when the names differ).
 // `effectiveCost` is the PR's cost as the append-only cost bookings (`P cost`, one comment each) say it on top of the record's own cost section, a SIBLING of `record` (also when there is no
 // summary comment yet): the record keeps only the legacy base, so the two are never added twice. -> run-cost.mjs#effectiveCost ({ cost, contributions, any } or { unavailable }).
 // `costBookings` is what it was built from (readCostBookings), for a writer that replays the same bookings over a different base (costOver).
-export function summaryFromComments(comments, viewerLogin, pr) {
+export function summaryFromComments(comments, viewerLogin, pr, { repo, moves } = {}) {
   const costBookings = readCostBookings({ comments, viewer: viewerLogin });
   const mine = comments
     .filter((c) => typeof c.body === 'string' && c.body.startsWith(MARKERS.summary) && c.user?.login === viewerLogin)
@@ -32,8 +35,10 @@ export function summaryFromComments(comments, viewerLogin, pr) {
   const found = mine.at(-1);
   if (!found) return { status: 'absent', sections: '', url: null, id: null, costBookings, effectiveCost: effectiveCost({ baseStatus: 'absent', ...costBookings }) };
   const decoded = decodeRecord(found.body);
-  // A record bound to another PR (a summary copied over by hand) is no base: stats and every record writer drop it, so its cost must not show here either.
-  const base = decoded.status === 'ok' && decoded.record.pr === pr ? decoded.record.cost : undefined;
+  // A record bound to another PR or repository (a summary copied over by hand) is no base: stats and every record writer drop it, so its cost must not show here either.
+  const ours = decoded.status === 'ok' && decoded.record.pr === pr && (repo === undefined || String(decoded.record.repo ?? '').toLowerCase() === String(repo).toLowerCase()
+    || sameRepo({ recorded: decoded.record.repo, recordedAt: decoded.record.heartbeat?.at, current: repo, moves: moves ?? readRepoMoves().moves }));
+  const base = ours ? decoded.record.cost : undefined;
   return { ...decoded, sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id, costBookings, effectiveCost: effectiveCost({ base, baseStatus: decoded.status, ...costBookings }) };
 }
 
@@ -42,7 +47,7 @@ export const costOver = (summary, base) => effectiveCost({ base, baseStatus: 'ok
 
 export function readSummaryComment(gh, pr) {
   const me = gh.viewer(); // asked first: without a viewer there is nothing to match, so the comments are not even read
-  return summaryFromComments(gh.listComments(pr), me, pr);
+  return summaryFromComments(gh.listComments(pr), me, pr, { repo: typeof gh.repo === 'function' ? gh.repo().slug : undefined });
 }
 
 // `record` / `sections` left undefined are kept from the existing comment; pass `existing` (a readSummaryComment result)

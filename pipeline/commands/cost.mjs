@@ -180,7 +180,7 @@ export const run = guarded(async (argv, ctx) => {
     let listError = null;
     try {
       const me = gh.viewer();
-      found = summaryFromComments(gh.listComments(pr), me, pr);
+      found = summaryFromComments(gh.listComments(pr), me, pr, { repo: gh.repo().slug });
     } catch (err) {
       listError = err;
     }

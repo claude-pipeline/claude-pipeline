@@ -207,6 +207,21 @@ test('list prices: each transcript message at its own model, unknown models add 
   assert.equal(modelFamily('Claude-Sonnet-5-5[1m]'), 'sonnet');
 });
 
+// PR numbers are repository-local: a summary copied from repo A's PR #12 onto repo B's PR #12 must not add A's spend to B's total (stats rounds already drops it); a repo the owner recorded as
+// moved (rename / transfer) is the same repository, so its summary still counts.
+test('R2-B2 summaryFromComments: a record of another repository is no cost base, a moved repository is (#958)', () => {
+  const booking = { id: 9, user: { login: 'me' }, body: renderEvent('cost-booking', 'b-1', 'Cost booked.', { id: 'b-1', entry: entry({ usd: 2 }) }) };
+  const withBase = (repo) => existing({ ...rec(), repo, heartbeat: { host: 'h', at: '2026-11-01T00:00:00.000Z' }, cost: addCostEntry(emptyCost(), entry({ usd: 40 })) });
+  const usd = (repo, opts) => summaryFromComments([withBase(repo), booking], 'me', PR, opts).effectiveCost.cost.total.usd;
+  const here = { repo: 'acme/widgets', moves: [] };
+  assert.equal(usd('acme/widgets', here), 42, 'this repository: counted');
+  assert.equal(usd('ACME/Widgets', here), 42, 'the name is compared without case');
+  assert.equal(usd('other/widgets', here), 2, 'another repository, same PR number: only the booking');
+  const moved = { repo: 'acme/widgets', moves: [{ from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 }] };
+  assert.equal(usd('old/widgets', moved), 42, 'renamed after the record was written: still this PR');
+  assert.equal(usd('other/widgets', moved), 2, 'a move of some other name does not link it');
+});
+
 // ---- the CLI -------------------------------------------------------------------------------------------------------
 
 // The fake gh REMEMBERS the PR's comments (what a post or an edit wrote is what the next listing shows): `P cost` posts a comment per booking and reads the PR back, so a test runs the
