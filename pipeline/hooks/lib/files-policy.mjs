@@ -25,7 +25,7 @@ import { evaluateSupabaseMcp, findLiveDbCli, serverSegment, supabaseMatch } from
 import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, WRAPPER_NAMES, SHELLS, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, rememberExpansions, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -5023,10 +5023,12 @@ const STEERABLE = /^(?:node|nodejs|deno|bun|bunx|tsx|ts-node|python\d*(?:\.\d+)*
 // runner) is named as plainly as the literal path is: the `$` there does not make the command a code runner (the install script's `"$BIN/helper" version` after a `launchctl` line was refused). Quoted,
 // so it cannot split into words. Any other `$` or backtick in the command word may be the program itself.
 const QUOTED_VAR_PROGRAM = /^"\$(?:\{(\w+)\}|(\w+))(?:"(\/[^\s"'$`\\*?[{]+)?|(\/[^\s"'$`\\*?[{]+)")$/;
+// (by CLASS of name: a program that starts other programs -- a wrapper the parser unwraps, a shell, an interpreter, a steerable runner -- is read by the parser only under its literal name, so a name held in a variable hides what it runs)
+const startsPrograms = (n) => STEERABLE.test(n) || WRAPPER_CMDS.has(n) || WRAPPER_NAMES.includes(n) || SHELL_NAMES.has(n) || SHELLS.has(n) || INTERPRETERS.test(n) || INLINE_RUNNERS.test(n);
 function plainVarProgram(word, c, cmds, ctx) {
   const m = QUOTED_VAR_PROGRAM.exec(word);
   if (!m) return false;
-  if (m[3] !== undefined || m[4] !== undefined) return true; // (a literal tail: its file name is judged as written, by the checks on the command word)
+  if (m[3] !== undefined || m[4] !== undefined) return !startsPrograms(baseOf(m[3] ?? m[4])); // (a literal tail: its file name is judged as written, and is no program that starts others)
   const n = m[1] ?? m[2];
   // (the one assignment-only command of the frame that gives the name, and it surely ran before this use, at its level: not a prefix of another command, not after the use, not in a branch, loop, function or subshell)
   const sites = cmds.filter((x) => Object.hasOwn(x.env ?? {}, n));
@@ -5034,13 +5036,14 @@ function plainVarProgram(word, c, cmds, ctx) {
   const site = sites.length === 1 ? cmds.indexOf(sites[0]) : -1;
   const x = cmds[site];
   if (site < 0 || at < 0 || site >= at || x.argv.length || x.sep === '&&' || x.sep === '||' || x.sep === '|' || x.maybeBg === true || cmds[site + 1]?.sep === '|' || cmds[site + 1]?.sep === '&' || mayNotRun(cmds, flowStart(cmds), site)) return false;
-  // (every other place that binds the name is an assignment we see: read / for / export / declare ... name it bare in a command of the frame; `${N:=x}` / `${N::=x}` assign through the expansion)
+  // (a name the shell binds by itself or a special one, `$_` / REPLY / OPTARG / PATH ...; any other place that binds the name names it: read / for / export / declare ... bare in a command of the frame, `${N:=x}` / `${N::=x}` through the expansion)
+  if (SPECIAL_NAMES.has(n) || SPECIAL_FAMILIES.test(n) || cmds.some((y) => implicitBindsOf(y).includes(n))) return false;
   const bare = new RegExp(`(?<![\\w$])(?<!\\$\\{)${n}(?!\\w)`, 'g');
   const binds = cmds.reduce((k, y) => k + (String(y.raw ?? '').match(bare)?.length ?? 0), 0);
   if (binds !== 1 || cmds.some((y) => new RegExp(`\\$\\{${n}[^}]*=`).test(String(y.raw ?? '')))) return false;
   const v = String(x.env[n]);
   // (the program the name stands for is judged as the command word written out: the file name of a code runner is no plain program, nor is a runner given an inline program)
-  return /\/[^/\s$`\\*?[\]{}()'"~]+$/.test(v) && !STEERABLE.test(baseOf(v)) && !runsInlineCode({ ...c, argv: [v, ...c.argv.slice(1)] }, ctx);
+  return /\/[^/\s$`\\*?[\]{}()'"~]+$/.test(v) && !startsPrograms(baseOf(v)) && !runsInlineCode({ ...c, argv: [v, ...c.argv.slice(1)] }, ctx);
 }
 function steersWrites(ctx, abs) {
   const name = posix.basename(abs);

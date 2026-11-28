@@ -2286,3 +2286,12 @@ test('#965: "$DIR/tool" after then / do / if / ! is plain too; a wrapper in fron
   assert.equal(decide('BIN=/tmp/bin; launchctl list; "$BIN/setsid" $PROG x.js'), 'deny');
   assert.equal(decide('BIN=/tmp/bin; launchctl list; if true; then "$BIN/setsid" $PROG x.js; fi'), 'deny');
 });
+// R2-B1 / R2-F1 / R2-F2: the program a variable stands for is plain only by the CLASS of its name: not a wrapper, a shell, an interpreter or a steerable runner (the parser unwraps / reads those only by
+// the literal name), and not a name the shell binds by itself. Failure caught: `WRAP=/usr/bin/setsid; launchctl list; "$WRAP" node x.js`, `SH=/bin/bash; ...; "$SH" -c 'node x.js'` and
+// `_=/tmp/h/tool; ...; : node; "$_" -e 1` were certified as plain programs, so the unmodelled command before them was no longer taken to rewrite the startup file the program then runs.
+test('#965: a variable program that is a wrapper, a shell or an interpreter, or a name the shell binds by itself, is not plain', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['WRAP=/usr/bin/setsid; launchctl list; "$WRAP" node x.js', 'SH=/bin/bash; launchctl list; "$SH" -c \'node x.js\'', 'SH=/bin/bash; launchctl list; "$SH" setup.sh',
+    '_=/tmp/h/tool; launchctl list; : node; "$_" -e 1', 'REPLY=/tmp/h/tool; launchctl list; read <<< node; "$REPLY" -e 1']) assert.equal(decide(l), 'deny', l);
+  assert.equal(decide('N=/tmp/h/tool; launchctl list; "$N" version'), 'allow'); // twin: a plain program name
+});
