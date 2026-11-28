@@ -99,10 +99,9 @@ export function writeSummaryComment(gh, pr, { record, sections, existing, retry 
   const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
   const useSections = sections !== undefined ? sections : current.sections;
   const parts = [MARKERS.summary, ''];
-  // the status block agrees with a fresh read of the record written: one a reader finds unreadable (heldBack: base false) shows its cost unavailable, not its own cost section as the total
-  const unreadable = useRecord && cost === undefined
-    && heldBack({ status: 'ok', record: useRecord }, { pr, repo: typeof gh.repo === 'function' ? gh.repo().slug : undefined }).base === false;
-  const shownCost = useRecord ? (cost ?? costOver(current, unreadable ? false : useRecord.cost)) : undefined;
+  // a record read as cost-unavailable (heldBack) is still unavailable when it is rewritten as it was read, not recomputed from its own cost section
+  const rewritten = record === undefined && current.status === 'ok';
+  const shownCost = useRecord ? (cost ?? (rewritten && current.effectiveCost?.unavailable ? current.effectiveCost : costOver(current, useRecord.cost))) : undefined;
   if (useRecord) parts.push(renderStatusBlock(useRecord, { cost: shownCost }), '');
   if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
   if (useRecord) parts.push(encodeRecord(useRecord));
