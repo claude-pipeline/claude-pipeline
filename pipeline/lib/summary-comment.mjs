@@ -31,18 +31,15 @@ export function recordBelongs(record, { pr, repo, moves } = {}) {
 // What the record's cost is bound to: a record not provably this PR's (another repository, a rename not registered, an unreadable moves file) COUNTS for nothing, and the record this returns does not carry that cost as `cost` (the writers
 // adopt a record whose only mismatch is the repo and would then count it under the live name) but in `heldCost`, a LIST of balances { repo, at, cost }, each bound to the repository and the heartbeat time it was written under (never merged
 // with another: a balance keeps the binding it can be proven by), written back untouched and never counted. A balance provably ours later (the move registered, the file readable again) is merged back into `cost`, each on its own proof.
-// A legacy single `heldCost` object is read as a list of one; it is always written as a list. What cannot be read leaves every balance as stored and the cost unavailable (`base: false` reads as an unreadable cost section), never a throw:
-// a list element that is not an object, a balance provably ours whose cost has a bad shape (its repository is proven, so it cannot be set aside as someone else's), or cost sections that cannot be added up (a malformed byPrice).
+// A legacy single `heldCost` object is read as a list of one; it is always written as a list. A cost section that cannot be added up (a malformed byPrice) leaves every balance as stored and the cost unavailable (`base: false` reads as an unreadable cost section): never a throw.
 // -> { record?: the record to return in place of the decoded one, ours, base: the cost to count }
 export function heldBack(decoded, { pr, repo, moves }) {
   if (decoded.status !== 'ok') return { ours: false };
   const r = decoded.record;
   const ours = recordBelongs(r, { pr, repo, moves });
   const held = r.heldCost ? [r.heldCost].flat() : [];
-  if (ours && held.some((h) => !h || typeof h !== 'object' || Array.isArray(h))) return { ours, base: false };
-  const bound = ours ? held.filter((h) => recordBelongs({ pr: r.pr, repo: h.repo, heartbeat: { at: h.at } }, { pr, repo, moves })) : [];
-  if (bound.some((h) => costShapeProblem(h.cost))) return { ours, base: false };
-  const back = bound;
+  const provable = (h) => !costShapeProblem(h.cost) && recordBelongs({ pr: r.pr, repo: h.repo, heartbeat: { at: h.at } }, { pr, repo, moves });
+  const back = ours ? held.filter(provable) : [];
   if (back.length > 0) {
     try {
       const { heldCost, ...rest } = r;
@@ -99,9 +96,7 @@ export function writeSummaryComment(gh, pr, { record, sections, existing, retry 
   const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
   const useSections = sections !== undefined ? sections : current.sections;
   const parts = [MARKERS.summary, ''];
-  // a record read as cost-unavailable (heldBack) is still unavailable when it is rewritten as it was read, not recomputed from its own cost section
-  const rewritten = record === undefined && current.status === 'ok';
-  const shownCost = useRecord ? (cost ?? (rewritten && current.effectiveCost?.unavailable ? current.effectiveCost : costOver(current, useRecord.cost))) : undefined;
+  const shownCost = useRecord ? (cost ?? costOver(current, useRecord.cost)) : undefined;
   if (useRecord) parts.push(renderStatusBlock(useRecord, { cost: shownCost }), '');
   if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
   if (useRecord) parts.push(encodeRecord(useRecord));
