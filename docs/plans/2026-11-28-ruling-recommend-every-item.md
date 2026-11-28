@@ -73,7 +73,7 @@ FOLLOW-UP (no default: a missing code is a refusal, so an old caller cannot sile
    c. has a second review whose decision is ACCEPT (a contrary verdict: the owner may still rule on the neutral
       dialog, Claude does not recommend against it);
    d. (`fix-separately` only) waits because its "same on base" scope was contradicted by the PR diff (the final's
-      reason, `triage.mjs` ~196 / ~436: the pipeline has evidence it IS this PR's change, which the row would deny).
+      `scopeContradicted` marker, kept by both arbiter writers, `triage.mjs` ~196 / ~436, whatever reason the final shows: the pipeline has evidence it IS this PR's change, which the row would deny).
    No severity gate otherwise: BLOCKING, security and sensitive-path items waiting for a human may be recommended.
 5. Fail closed: an unknown decision, or a FOLLOW-UP code other than `minor-later` / `fix-separately` (including
    undefined or a reject code), is a refusal; an unknown code never falls into a weaker branch.
@@ -82,9 +82,9 @@ FOLLOW-UP (no default: a missing code is a refusal, so an old caller cannot sile
 Every ruling dialog's item summary row (`commands/triage.mjs` rulingRequest; unverified rows, the hook reads only the
 last line and the one recommendation row) gains fields, additively: `ID · bucket · category · title · file:line`, then
 the existing `deferNote` when it applies (kept: "ACCEPTED by …, NOT fixed; follow-up = defer the fix…"), then, only
-when `final.needsHuman === true`, ` · waits: <needsHumanCause>: <final.reason>`, and when a second review exists
-` · second review: <decision> (<confidence>)`. So a recommended dismissal of a `SUGGESTION` in `data-loss`, or of an
-item waiting for an unknown cause, shows why the pipeline escalated it. EVERY new field goes through `oneLine` (a
+when `final.needsHuman === true`, ` · waits: <needsHumanCause>` (the cause is one of a fixed list, never `final.reason` or any other stored free text: a test-security wait carries test output, which could pose as a second-review verdict in a dialog that may recommend Reject), and when a second review exists
+` · second review: <decision> (<confidence>)` (bucket, category, decision and confidence show only a known value, else `other` / `unknown`). So a recommended dismissal of a `SUGGESTION` in `data-loss`, or of an
+item waiting for an unknown cause, shows why the pipeline escalated it. Every stored field that remains goes through `oneLine` (a
 stored value with a newline would otherwise break the question's line structure and kill the click). The `notes`
 output is unchanged. (The question stays far below the ask-file size limit `issueAsk` enforces.)
 

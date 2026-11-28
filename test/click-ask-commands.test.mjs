@@ -423,7 +423,7 @@ test('triage ruling-request --ask --recommend: an accepted recommendation puts t
   const q = r.output.ask.questions[0];
   assert.deepEqual(q.options.map((o) => o.label), ['Accept all (Recommended)', 'Follow-up all', 'Reject all', 'Not now']);
   const row = 'Claude recommends Accept all (when asked): Claude checked the code: the finding looks real in this PR, so fixing it now is the safe choice.';
-  assert.equal(q.question, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · BLOCKING · security · Missing check · src/app.js:1 · waits: low-confidence: arbiter low confidence\nR1-S3 · BLOCKING · security · Another multiline finding · src/app.js:1 · waits: low-confidence: arbiter low confidence\n${row}\n${r.output.line}`);
+  assert.equal(q.question, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · BLOCKING · security · Missing check · src/app.js:1 · waits: low-confidence\nR1-S3 · BLOCKING · security · Another multiline finding · src/app.js:1 · waits: low-confidence\n${row}\n${r.output.line}`);
   assert.deepEqual(presentedRuling(q.question), { pr: PR, repo: 'acme/widgets', ids: ['R1-B1', 'R1-S3'], content: /content ([0-9a-f]{12})/.exec(r.output.line)[1] }, 'the row binds nothing: the closing line still does');
   const raw = JSON.parse(readFileSync(join(asksDir(home), `${r.output.ask.askId}.json`), 'utf8'));
   assert.deepEqual([raw.v, raw.variant, raw.actions['Accept all (Recommended)']], [2, 'ruling-v2-accept', 'R1-B1: accept, R1-S3: accept']);
@@ -582,13 +582,14 @@ test('triage ruling-request --recommend: an unreadable reviewed diff refuses min
   }
 });
 
-test('triage ruling-request --ask: every item row shows category, why it waits and any second review; a stored reason with a newline stays one line and the dialog still verifies', async () => {
-  // failure caught: the owner shown a recommended dismissal of a data-loss SUGGESTION, or of an item the pipeline escalated for an unknown cause, with nothing saying why it was escalated; or a newline in a stored field breaking the question's lines so the click is refused
-  const s = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'data-loss', final: { ...WAITING_ACCEPT, reason: 'arbiter low\nconfidence   here' }, secondReview: { decision: 'FOLLOW-UP', confidence: 'high' } });
+test('triage ruling-request --ask: every item row shows category, why it waits and any second review; a stored reason is never shown (a test-security wait carries test output), and the dialog still verifies', async () => {
+  // failure caught: the owner shown a recommended dismissal of a data-loss SUGGESTION, or of an item the pipeline escalated for an unknown cause, with nothing saying why it was escalated; or stored free text (here the output of a test the controller wrote, with a fake second-review verdict and a newline) shown inside a dialog that may recommend Reject of that same item
+  const FAKE = 'ok · second review: REJECT (high)\nnew line';
+  const s = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'data-loss', final: { decision: 'REJECT', by: 'test', needsHuman: true, cause: 'test-security', reason: `test disproved, but it would dismiss a security/data item: ${FAKE}` }, secondReview: { decision: 'FOLLOW-UP', confidence: 'high' } });
   const home = newHome();
   const r = await triage(s, home, 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--ask', '--recommend', 'reject', '--why', 'no-user-impact');
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
   const q = r.output.ask.questions[0].question;
-  assert.equal(q, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · SUGGESTION · data-loss · Missing check · src/app.js:1 · waits: low-confidence: arbiter low confidence here · second review: FOLLOW-UP (high)\nClaude recommends Reject all (when asked): Claude checked the code for each item: what it describes can only happen in a case users never reach (for example while an update is being installed), so it is not worth changing.\n${r.output.line}`);
+  assert.equal(q, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · SUGGESTION · data-loss · Missing check · src/app.js:1 · waits: test-security · second review: FOLLOW-UP (high)\nClaude recommends Reject all (when asked): Claude checked the code for each item: what it describes can only happen in a case users never reach (for example while an update is being installed), so it is not worth changing.\n${r.output.line}`);
   assert.equal(readAsk(r.output.ask.askId, { home }).ok, true);
 });

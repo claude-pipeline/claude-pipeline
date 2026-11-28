@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo, untrustedAnchorRefusal } from '../lib/cmd-common.mjs';
-import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
+import { CATEGORIES, SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { GitError, diffFiles, git, headSha, isAncestor, isClean, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { hashBranch, regressionOnlyFor } from '../lib/risk.mjs';
@@ -29,7 +29,7 @@ import { askFields, clickGate } from '../lib/click-ask.mjs';
 import { RULING_VARIANT_LEGACY, clickNotes, followUpClickState, roundAsk, rulingAsk, rulingVariantFor, rulingWhyRow } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRulingGap, ownerRulingRecords, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
-  applyClaudeRuling, applyJudge, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
+  applyClaudeRuling, applyJudge, BUCKETS, CONFIDENCES, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
   countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, needsHumanCause, ownerRulingRefusal, RULING_WHY, rulingRecommendationRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
@@ -954,11 +954,14 @@ const contentOfState = (state) => (ids) => {
   return items ? rulingContentDigest(items) : null;
 };
 
-// One item's row in the ruling question (unverified text: the hook reads only the last line and the one recommendation row). Every stored field goes through oneLine: a newline in one would break the question's line structure.
+// One item's row in the ruling question (unverified text: the hook reads only the last line and the one recommendation row). The waiting cause is fixed text (needsHumanCause is one of a fixed list), never
+// final.reason (a test-security wait carries test output, which could pose as a second-review verdict in a dialog that may recommend Reject); bucket, category and a second review's verdict show only a known value.
+// The rest goes through oneLine: a newline in a stored field would break the question's line structure.
+const known = (list, x, fallback) => (list.includes(x) ? x : fallback);
 function summaryRow(i) {
-  const waits = i.final?.needsHuman === true ? ` · waits: ${needsHumanCause(i)}: ${oneLine(i.final.reason)}` : '';
-  const second = i.secondReview !== null && typeof i.secondReview === 'object' ? ` · second review: ${oneLine(i.secondReview.decision)} (${oneLine(i.secondReview.confidence)})` : '';
-  return `${i.id} · ${i.bucket} · ${oneLine(i.category)} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}${waits}${second}`;
+  const waits = i.final?.needsHuman === true ? ` · waits: ${needsHumanCause(i)}` : '';
+  const second = i.secondReview !== null && typeof i.secondReview === 'object' ? ` · second review: ${known(DECISIONS, i.secondReview.decision, 'unknown')} (${known(CONFIDENCES, i.secondReview.confidence, 'unknown')})` : '';
+  return `${i.id} · ${known(BUCKETS, i.bucket, 'other')} · ${known(CATEGORIES, i.category, 'other')} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}${waits}${second}`;
 }
 const oneLine = (x) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
 const deferNote = (item, { id = true } = {}) => `${id ? `${item.id}: ` : ''}ACCEPTED by ${item.final?.ownerDeferral?.accepted ?? item.final?.by}, NOT fixed; follow-up = defer the fix to an issue; only when it is not a regression vs the default branch`;
