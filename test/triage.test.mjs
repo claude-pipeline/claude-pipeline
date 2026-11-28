@@ -43,6 +43,7 @@ import {
   rulingsDigest,
 } from '../pipeline/lib/triage.mjs';
 import { assignIds } from '../pipeline/lib/codex.mjs';
+import { lowerCapTo } from '../pipeline/lib/state.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
 
@@ -1622,6 +1623,22 @@ test('roundAdmission: normal, auto-extra, owner, uncounted - and why a round is 
   assert.match(none.problem, /only one extra round is allowed, and only when .* or an owner-granted round$/);
   const beyond = roundAdmission(stateOf([...upTo(3, [fixed(3)]), grantedRound(4)]), 5, { head: H40, grants: () => [] });
   assert.match(beyond.problem, /and its one extra round, or an owner-granted round$/);
+});
+
+test('lowerCapTo: a state stored under a higher cap admits round 4 only as the auto-extra once review.max_rounds is lowered to 3, and the cap is never raised (#923)', () => {
+  const asked = (state) => roundAdmission(state, 4, { head: H40, grants: () => [] });
+  const old = stateOf(upTo(3, [fixed(3)]), { maxRounds: 4 });
+  assert.equal(asked(old).admission, 'normal', 'the stale stored cap would admit round 4 as normal');
+  const lowered = lowerCapTo(old, 3);
+  assert.equal(lowered.maxRounds, 3);
+  assert.equal(asked(lowered).admission, 'auto-extra');
+  assert.equal(old.maxRounds, 4, 'the input is not mutated');
+  assert.equal(roundOutcome(lowerCapTo(stateOf(upTo(3, [fixed(3)], 'h-old'), { maxRounds: 4 }), 3)).extraRound, true, 'outcome uses the new limit too');
+  assert.equal(lowerCapTo(stateOf([], { maxRounds: 2 }), 3).maxRounds, 2, 'never raised');
+  const same = stateOf([], { maxRounds: 3 });
+  assert.equal(lowerCapTo(same, 3), same, 'equal: unchanged');
+  assert.equal(lowerCapTo(stateOf([], { maxRounds: null }), 3).maxRounds, null, 'a missing cap is left for the verifier to refuse');
+  assert.equal(lowerCapTo(old, undefined).maxRounds, 4, 'no configured cap: unchanged');
 });
 
 test('roundCapProblem owner grant: an open grant allows exactly the next counted round, never a baseOnly/resolutionOnly one', () => {

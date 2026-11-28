@@ -17,7 +17,7 @@ import { QueueUnreadable, queueModeFor } from '../lib/merge-queue.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { assessRisk, hashBranch, prBaseBranch, rateBranch, reviewLane, trustedDefaultBranch } from '../lib/risk.mjs';
 import { routeConfigFor } from '../lib/review-round.mjs';
-import { isSubstituteRound, loadState } from '../lib/state.mjs';
+import { isSubstituteRound, loadState, lowerCapTo } from '../lib/state.mjs';
 import { readReviewGate } from '../lib/model-floor.mjs';
 import { noteReviewed } from '../lib/codex-usage.mjs';
 import { fableBypassNote, fableBypassRounds, reviewEligibilityProblems, reviewValidFor, roundOutcome, rulingsDigest, staleFableReason, staleFableRounds, substituteDigest, substituteRefusal, substituteSummary } from '../lib/triage.mjs';
@@ -65,10 +65,10 @@ export const RECHECK_LABEL = 'pipeline-recheck';
 const LEVELS = ['low', 'medium', 'high'];
 
 // Why the review is not valid, in words a person can act on.
-function whyNot(state, hash) {
+function whyNot(state, hash, maxRounds) {
   if (!state) return 'no review state: the review has not run';
   if (state.rounds.length === 0) return 'no review round has run';
-  const o = roundOutcome({ ...state, currentContentHash: hash });
+  const o = roundOutcome({ ...lowerCapTo(state, maxRounds), currentContentHash: hash });
   if (o.fablePending.length > 0) return `the Fable review pass has not been proven for round ${o.fablePending.join(', ')}: run arbiter needed / apply`;
   if (o.pending.length > 0) return `items still waiting for a decision: ${o.pending.join(', ')}`;
   if (o.needsHuman.length > 0) return `items need a human: ${o.needsHuman.join(', ')}`;
@@ -258,7 +258,7 @@ export const run = guarded(async (argv, ctx) => {
       if (!state || !reviewValidFor(state, hash)) {
         const ex = state ? docsExemptFrom(state, { root, config, hash }) : null;
         if (!ex?.exempt) {
-          const why = whyNot(state, hash);
+          const why = whyNot(state, hash, config.review.max_rounds);
           const note = ex && !ex.off ? `; the docs-only exemption does not apply: ${ex.reason}` : '';
           // A stale origin/<branch> is the one cause a person cannot see: say that the ref could not be refreshed.
           const stale = !refresh.refreshed && refresh.usesRemoteRef && why.startsWith('no review round covers')

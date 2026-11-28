@@ -106,6 +106,15 @@ export function maxRiskOf(state) {
 }
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
+// The review.max_rounds in the config may be LOWERED after a state was created (the state copies it once, at creation): a stored cap above
+// the configured one is lowered to it, so admission and outcome use the new limit. Never raised; anything else is returned unchanged (#923).
+export function lowerCapTo(state, configuredMax) {
+  const stored = state?.maxRounds;
+  if (!Number.isInteger(configuredMax) || configuredMax < 1) return state;
+  if (!Number.isInteger(stored) || stored <= configuredMax) return state;
+  return { ...state, maxRounds: configuredMax };
+}
+
 export function emptyState({ repo, pr, branch, risk, lightLane = false, maxRounds = 3 }) {
   return {
     version: 1,

@@ -18,7 +18,7 @@ import { readReviewGate } from '../lib/model-floor.mjs';
 import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch, trustedDefaultBranch } from '../lib/risk.mjs';
-import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
+import { addRound, loadState, lowerCapTo, saveState, updateItems } from '../lib/state.mjs';
 import { DEFERRABLE_ACCEPT_BY, arbiterFailures, capLowItems, countsTowardCap, finalIsReopenable, isDeferrableAccept, isOwnerDeferral, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { newerFormatText, pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
@@ -513,7 +513,7 @@ async function outcome(rest, ctx) {
   const grants = config.owner_approval === 'chat'
     ? (k) => ownerGrantedRounds({ repo: state.repo, pr: state.pr, k, anyHead: true }).map((r) => ({ grantId: grantIdOf(r), head: r.head, quote: r.prompt }))
     : undefined;
-  const result = roundOutcome({ ...state, currentContentHash: hash }, { grants, head });
+  const result = roundOutcome({ ...lowerCapTo(state, config.review?.max_rounds), currentContentHash: hash }, { grants, head });
   // A whole-PR round is owed: it starts at the PR's merge base (the default branch; codex-review judges a PR into another branch itself).
   const owed = wholePrOwed(state);
   let forkPoint = null;

@@ -511,8 +511,12 @@ test('verifyOwnerGrants: the configured cap is authoritative - a state whose max
   assert.match(withCap.problems.join('; '), /round 3: .*past review\.max_rounds \(1\)/);
   const looser = granted(three, { max: 5 });
   const r = verify(looser, w, { maxRounds: 1 });
-  assert.equal(r.ok, false, 'a state that records a larger cap than the configured one fails closed');
-  assert.match(r.problems.join('; '), /maxRounds/);
+  assert.equal(r.ok, false, 'a state that records a larger cap is still judged against the configured one: round 3 is past it');
+  assert.match(r.problems.join('; '), /round 3: .*past review\.max_rounds \(1\)/);
+  assert.equal(verify(granted([{ admission: 'normal' }], { max: 5 }), w, { maxRounds: 1 }).ok, true, 'a larger stored cap is no problem by itself (#923)');
+  const nonInt = granted([{ admission: 'normal' }], { max: 5 });
+  nonInt.maxRounds = 2.5;
+  assert.match(verify(nonInt, w, { maxRounds: 3 }).problems.join('; '), /the cap cannot be trusted/);
   assert.equal(verify(granted(three, { max: 1 }), w, { maxRounds: 1 }).ok, false, 'matching caps: counted round 3 is past max+1 and needs a grant');
   const ok = granted([{ admission: 'normal' }, { admission: 'auto-extra' }], { max: 1 });
   assert.equal(verify(ok, w, { maxRounds: 1 }).ok, true, 'a genuine state under the same cap still passes');
@@ -601,13 +605,20 @@ test('final gate review: the configured review.max_rounds is the cap - a state w
   assert.match(r.detail, /past review\.max_rounds \(1\)/);
 });
 
-test('final gate review: a state whose maxRounds exceeds the configured review.max_rounds fails with "the cap cannot be trusted"', () => {
+test('final gate review: a state stored under a higher cap than the configured review.max_rounds is judged against the configured cap; a missing stored cap still cannot be trusted', () => {
   const w = ownerWorld();
-  const state = granted([{ admission: 'normal' }], { max: 3 });
-  const r = reviewOf(state, w, { config: { review: { max_rounds: 2 } } });
+  const cfg = { config: { review: { max_rounds: 2 } } };
+  const lowered = reviewOf(granted([{ admission: 'normal' }], { max: 3 }), w, cfg);
+  assert.equal(lowered.ok, true, 'a state created under max_rounds 3 passes after the config was lowered to 2 (#923)');
+  const past = reviewOf(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'normal' }], { max: 3 }), w, cfg);
+  assert.equal(past.ok, false, 'its 3rd round is past the NEW limit and admitted as normal');
+  assert.match(past.detail, /past review\.max_rounds \(2\)/);
+  const missing = granted([{ admission: 'normal' }], { max: 2 });
+  missing.maxRounds = null;
+  const r = reviewOf(missing, w, cfg);
   assert.equal(r.ok, false);
-  assert.match(r.detail, /the review state records maxRounds 3, not within the configured review\.max_rounds \(2\): the cap cannot be trusted/);
-  assert.equal(reviewOf(granted([{ admission: 'normal' }], { max: 2 }), w, { config: { review: { max_rounds: 2 } } }).ok, true, 'a matching cap passes');
+  assert.match(r.detail, /the review state records maxRounds null, not within the configured review\.max_rounds \(2\): the cap cannot be trusted/);
+  assert.equal(reviewOf(granted([{ admission: 'normal' }], { max: 2 }), w, cfg).ok, true, 'a matching cap passes');
 });
 
 test('final gate review: a forged grant, a round past max+1 with none, or a wrong admission fails review', () => {
