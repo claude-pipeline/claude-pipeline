@@ -1137,7 +1137,7 @@ function scriptFileOfArgv(argv) {
     return STDIN_FILES.has(file) ? null : { kind: 'interp', file };
   }
   // (a backslash is an ordinary file name character off Windows, so a path holding one is judged like any other)
-  { const pr = pathRunRecord(argv); if (pr) return pr; }
+  if (/[/]/.test(argv[0])) { const pr = pathRunRecord(argv); if (pr) return pr; } // (forward slash only, as before #904: a plain Windows path word is not read as a script file)
   // `=tool`: zsh runs the file `tool` resolves to on PATH (the candidates are its PATH directories, see script-candidates.mjs)
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
   if (/[$`]/.test(argv[0]) || EQUALS_WORD.test(argv[0])) return withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv);
@@ -3821,7 +3821,8 @@ class Parser {
     if (a.length) { // (#904: the final program, when a by-name branch of scriptFileOfArgv takes it before the path branch: a shell, an interpreter, `source`)
       const pr = pathRunRecord(a);
       const sf = pr ? scriptFileOfArgv(a) : null;
-      if (pr && !(sf && sf.kind === 'exec' && sf.file === a[0])) pathRuns.push({ rec: pr, chdir });
+      const byName = /[/]/.test(a[0]) || SHELLS.has(base(a[0])) || base(a[0]) === 'source' || INTERPRETER.test(base(a[0])); // (a plain Windows path word, `.\build.cmd`, is read as the file it is, not by name: no mark)
+      if (pr && byName && !(sf && sf.kind === 'exec' && sf.file === a[0])) pathRuns.push({ rec: pr, chdir });
     }
     let bashAlso = null;
     if (a.length && BASH_WORD.test(a[0])) {

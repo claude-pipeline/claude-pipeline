@@ -1603,8 +1603,8 @@ function pathRunRefusal(rec, dir, ctx) {
   if (/^\$\{?HOME\}?(?=\/|$)/.test(word)) word = ctx.home + word.replace(/^\$\{?HOME\}?/, '');
   if (DYNAMIC.test(word)) return null; // still only known at run time: as a plain `$X/tool`
   const home = word === '~' || word.startsWith('~/') ? ctx.home + word.slice(1) : word;
-  // (by its spelling: no lookup needed, so an unknown directory does not matter. The start of the word is a component boundary, `node_modules/.bin/x`; a `..` segment can leave the directory named, so such a word is looked up)
-  if (!home.split(/[\\/]/).includes('..') && isNodeModulesOrPipelineHome('/' + home)) return null;
+  // (by its spelling: no lookup needed, so an unknown directory does not matter. The spelling is read lexically normalised, so `../node_modules/.bin/x` and `node_modules/.bin/x` count and `./node_modules/../env` does not; a word holding a backslash gets no shortcut, the shell may strip escapes (`\.\.`) and its spelling cannot be trusted)
+  if (!home.includes('\\') && isNodeModulesOrPipelineHome('/' + path.posix.normalize(home))) return null;
   if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${word0} runs cannot be verified. Use an absolute path, or chain the cd with &&. (A virtualenv or other program after a cd the guard cannot follow: run it from a known directory or by its full path.)`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   checkDeadline(ctx.budget);
