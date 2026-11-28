@@ -103,9 +103,12 @@ export function createRunRecorder({ gh, pr, host = hostname(), now = () => Date.
   const warnings = [];
   const warn = (w) => { if (!warnings.includes(w)) warnings.push(w); };
   let view = null;
+  let previous = null;
   return {
     warnings,
     host,
+    // The record the last update() started from (before its patch); null until one ran. `P cost` diffs it against the new record to say what ITS call added.
+    get previous() { return previous; },
     // `initialStep`: the step a brand-new record starts at (an existing record keeps its own unless the patch sets it).
     update(patch, { initialStep = 'build' } = {}) {
       try {
@@ -114,6 +117,7 @@ export function createRunRecorder({ gh, pr, host = hostname(), now = () => Date.
         const repo = gh.repo().slug;
         const base = baseRecordFor(existing, { repo, pr, branch: view.headRefName, baseRef: view.baseRefName, step: initialStep, host, now: now(), head: view.headRefOid });
         base.warnings.forEach(warn);
+        previous = base.record;
         const record = applyCheckpoint(base.record, patch, { host, now: now() });
         const posted = writeRunRecord(gh, pr, { record, host, now: now() });
         posted.warnings.forEach(warn);

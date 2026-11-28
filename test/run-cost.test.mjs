@@ -233,6 +233,9 @@ test('P cost: books an entry into a fresh record, then adds to it', () => {
   assertExit(r2, 0);
   assert.deepEqual([r2.json.cost.total.input, r2.json.cost.total.usd, r2.json.cost.retries], [101, 0.5, 1]);
   assert.ok(r2.json.cost.byRole.other, 'unknown role -> other');
+  // `cost` is the PR total, `call` only this call: a reader of the second booking must not take 0.5 for its cost
+  assert.deepEqual(r.json.call, { usd: 0.4, input: 100, output: 50, cacheRead: 7, cacheWrite: 3, phase: 'build', role: 'implementer' });
+  assert.deepEqual(r2.json.call, { usd: 0.1, input: 1, output: 0, cacheRead: 0, cacheWrite: 0, phase: 'review', role: 'other' });
   assert.equal(written(s).cost.byPhase.review.input, 1);
 });
 
@@ -297,6 +300,7 @@ test('P cost --from-transcript: an empty transcript with no hand amounts books n
   assert.equal(first.json.ok, true);
   assert.equal(first.json.recorded, false);
   assert.equal(first.json.skipped, 'empty-transcript');
+  assert.equal(first.json.call, null, 'nothing booked: no call figure');
   assert.match(first.json.warnings.join('\n'), /nothing was booked; run this same command again in a few seconds/);
   assert.equal(s.fake.calls().length, before, 'no GitHub read or write when there is nothing to book');
   s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
@@ -304,6 +308,7 @@ test('P cost --from-transcript: an empty transcript with no hand amounts books n
   assertExit(second, 0);
   assert.equal(second.json.recorded, true);
   assert.equal(second.json.skipped, undefined);
+  assert.deepEqual([second.json.call.input, second.json.call.output, second.json.call.round], [10, 20, 1]);
   assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries, second.json.cost.byRound['1'].calls], [1, 1, 1]);
   assert.ok(written(s).cost.transcripts, 'the transcript key is booked only by the real booking');
 });
@@ -337,6 +342,9 @@ test('P cost --from-transcript: booking a continued agent\'s transcript again bo
   s.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5));
   const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl', '--output', '1']);
   assertExit(second, 0);
+  assert.deepEqual([first.json.call.input, first.json.call.output], [10, 20]);
+  assert.deepEqual([second.json.call.input, second.json.call.output, second.json.call.cacheRead, second.json.call.cacheWrite], [5, 11, 15, 20], 'call = what the transcript gained since (plus the hand output), not the whole transcript');
+  assert.ok(second.json.call.usd > 0 && second.json.call.usd < second.json.cost.total.usd, 'call usd is the gained part, the PR total is larger');
   const t = second.json.cost.total;
   assert.deepEqual([t.input, t.output, t.cacheRead, t.cacheWrite, t.calls], [15, 31, 45, 60, 2], 'the whole transcript once, plus the hand output');
   assert.equal(t.usd, (() => { const sc = scenario(); sc.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5)); return costCli(sc, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']).json.cost.total.usd; })(), 'USD too');
