@@ -606,11 +606,12 @@ test('triage ruling-request --ask --recommend reject: with clicks off a failed P
   assert.match(r.output.askSkipped, /owner_go\.click is off/);
 });
 
-test('triage ruling-request --ask --recommend reject: shown only when the PR head on GitHub is this checkout\'s HEAD or one of its ancestors; otherwise the neutral dialog with the reason', async () => {
+test('triage ruling-request --ask --recommend reject: shown only when the PR head on GitHub is this checkout\'s HEAD; otherwise the neutral dialog with the reason', async () => {
   // failure caught (R3-B1): a push from another checkout BEFORE the ask left the PR at code Claude never read, yet both heads were recorded as they were then, so the later click passed every comparison and recorded REJECT for that code
+  // failure caught (R4-B1): a Reject recommended on local commits the PR does not contain (unpushed, or the PR rewound to an ancestor after the fix), which the later click would record as already-handled
   const heads = (s) => { const g = (...a) => spawnSync('git', a, { cwd: s.repo.dir, encoding: 'utf8' }).stdout.trim(); return { head: g('rev-parse', 'HEAD'), parent: g('rev-parse', 'HEAD~1') }; };
   const world = (prHead) => { const s = triageWorld(CHAT(), { final: WAITING_ACCEPT }); s.fake.setScript([REPO, { match: '^pr view 12 --json headRefOid', stdoutJson: { headRefOid: prHead(heads(s)) } }]); return s; };
-  for (const [what, prHead, shown] of [['the PR head is HEAD', (h) => h.head, true], ['the PR head is an ancestor (local commits not pushed yet)', (h) => h.parent, true], ['the PR head is a commit this checkout does not have', () => 'f'.repeat(40), false]]) {
+  for (const [what, prHead, shown] of [['the PR head is HEAD', (h) => h.head, true], ['the PR head is an ancestor (local commits the PR does not contain)', (h) => h.parent, false], ['the PR head is a commit this checkout does not have', () => 'f'.repeat(40), false]]) {
     const r = await askRec(world(prHead), '--recommend', 'reject', '--why', 'already-handled');
     assert.equal(r.exitCode, 0, `${what}: ${JSON.stringify(r.output)}`);
     assert.equal(r.output.dialogVariant, shown ? 'ruling-v2-reject' : 'ruling-v1', what);
