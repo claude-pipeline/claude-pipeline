@@ -95,8 +95,9 @@ export function addCostEntry(cost, entry) {
 
 // A transcript already booked for this PR (an agent continued by SendMessage is booked after each leg): only what it gained since the last booking is new. `booking` = { key, usage }, usage the
 // transcript's WHOLE totals ({input, output, cacheRead, cacheWrite, usd, byPrice}); the ledger cost.transcripts[key] keeps what was booked. Returns { cost, entry } with the entry's amounts reduced by the
-// booked ones (never below 0; hand amounts the caller added on top stay) and the ledger set to the whole totals. The ledger keeps the last MAX_TRANSCRIPTS keys
-// (`evict: false`: all of them; a replay of every booking of a PR holds them in memory only, it is never written back, so nothing may fall out of it).
+// booked ones and the ledger set to the whole totals. The ledger is deducted from the TRANSCRIPT part only (booking.usage); what the entry holds beyond it is the hand amounts the caller added on top
+// (--input …), which always book in full (#980). The ledger keeps the last MAX_TRANSCRIPTS keys (`evict: false`: all of them; a replay of every booking of a PR holds them in memory only, it is
+// never written back, so nothing may fall out of it).
 const MAX_TRANSCRIPTS = 200;
 export function deductBookedTranscript(cost, entry, booking, { evict = true } = {}) {
   const key = String(booking?.key ?? '');
@@ -106,15 +107,19 @@ export function deductBookedTranscript(cost, entry, booking, { evict = true } = 
   const before = isPlainObject(ledger[key]) ? ledger[key] : null;
   const usage = booking.usage;
   const sub = (now, was) => Math.max(0, (Number(now) || 0) - (Number(was) || 0));
+  // New amount = the transcript's growth over the ledger + the hand amount (entry beyond the transcript's own usage, never below 0).
+  const grow = (now, was, whole) => sub(now, was) + sub(whole, now);
   const out = { ...entry };
   if (before) {
-    for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = sub(entry[k], before[k]);
-    out.usd = Math.round(sub(entry.usd, before.usd) * 1e6) / 1e6;
+    for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = grow(usage[k], before[k], entry[k]);
+    // capped at the entry's own USD: plan-codex books tokens only (entry.usd 0) while its transcript is still priced, and that price must not be charged on a re-booking.
+    out.usd = Math.round(Math.min(Number(entry.usd) || 0, grow(usage.usd, before.usd, entry.usd)) * 1e6) / 1e6;
     if (isPlainObject(entry.byPrice)) {
       out.byPrice = {};
       for (const [price, b] of Object.entries(entry.byPrice)) {
         const was = isPlainObject(before.byPrice?.[price]) ? before.byPrice[price] : {};
-        const d = Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'messages'].map((k) => [k, sub(b[k], was[k])]));
+        const own = isPlainObject(usage.byPrice?.[price]) ? usage.byPrice[price] : {};
+        const d = Object.fromEntries(['input', 'output', 'cacheRead', 'cacheWrite5m', 'cacheWrite1h', 'messages'].map((k) => [k, grow(own[k], was[k], b[k])]));
         if (d.messages > 0 || d.input + d.output + d.cacheRead + d.cacheWrite5m + d.cacheWrite1h > 0) out.byPrice[price] = d;
       }
     }

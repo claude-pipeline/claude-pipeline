@@ -6,7 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -22,6 +23,9 @@ import { ownerRules, rulingRequest } from './helpers/owner-go.mjs';
 import { ownerGoDir } from '../pipeline/hooks/lib/owner-go.mjs';
 import { applyClaudeRuling, settleSecondReview } from '../pipeline/lib/triage.mjs';
 import { buildSecondReviewPrompt } from '../pipeline/lib/codex.mjs';
+import { run as triageRun } from '../pipeline/commands/triage.mjs';
+import { asksDir, readAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { world as clickWorld } from './helpers/click-world.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const bin = join(here, '..', 'pipeline', 'bin', 'pipeline.mjs');
@@ -101,7 +105,7 @@ function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = 
     wait(id, cause = 'low-confidence', over = {}) {
       w.edit((s) => {
         const it = s.rounds.flatMap((r) => r.items).find((i) => i.id === id);
-        it.final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: cause === 'model-proof' ? 'model-proof failed: ruling not provably from Fable' : 'arbiter low confidence', ...(cause ? { cause } : {}) };
+        it.final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: cause === 'model-proof' ? 'model-proof failed: ruling not provably from Fable' : 'arbiter low confidence', ...(cause ? { cause } : {}), ...(['security-dismissal', 'low-confidence'].includes(cause) ? { scopeContradicted: false } : {}) }; // (the boolean every current writer stores on a security dismissal)
         Object.assign(it, over);
       });
     },
@@ -1067,7 +1071,7 @@ function typedFor(t, w, ids, quote, variant = undefined) {
   const record = ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
   if (variant !== undefined) {
     const file = join(ownerGoDir(), `${record.session}.jsonl`);
-    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: randomUUID(), toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
+    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: `ask-${randomUUID().replace(/-/g, '').slice(0, 12)}`, toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
   }
   return (id, decision) => w.cli(['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', 'owner confirmed', '--owner-quote', quote, '--pr', '7']);
 }
@@ -1141,14 +1145,14 @@ test('owner-ruling: a typed REJECT or ACCEPT of an arbiter ACCEPT is refused (th
 const recItem = (id, over = {}) => ({
   id, round: 1, bucket: 'SUGGESTION', category: 'docs', title: `t ${id}`, file: 'src/plain.js', line: 3, detail: 'd', codexReasoning: 'c', testable: false, fingerprint: `fp-${id}`,
   judge: null, test: { status: 'none', evidence: '' }, arbiter: null, implemented: false, followupIssue: null,
-  final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence' }, ...over,
+  final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence', scopeContradicted: false }, ...over,
 });
 const settledAccept = (id, over = {}) => recItem(id, { category: 'maintainability', final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'worth fixing' }, ...over });
 const recCtx = (items, over = {}) => ({
   state: { pr: 7, rounds: [{ n: 1, items }] }, config: { risk: { high_risk_paths: ['src/payroll/**'] }, review: { arbiter_always_paths: [] } },
   files: [{ oldPath: 'src/plain.js', newPath: 'src/plain.js', path: 'src/plain.js' }, { oldPath: 'src/payroll/pay.js', newPath: 'src/payroll/pay.js', path: 'src/payroll/pay.js' }], baseConfig: null, ...over,
 });
-const refusal = (items, decision, over = {}) => rulingRecommendationRefusal(items, decision, recCtx(items, over));
+const refusal = (items, decision, over = {}, code = decision === 'FOLLOW-UP' ? 'minor-later' : undefined) => rulingRecommendationRefusal(items, decision, recCtx(items, over), code);
 
 test('rulingRecommendationRefusal: the recommendation is refused for what the click could not record or what the pipeline treats as a critical dismissal', () => {
   // failure caught (each): Accept all recommended while the owner-ruling command would refuse it (#559); Follow-up recommended for a finding a second review would be owed
@@ -1170,7 +1174,8 @@ test('rulingRecommendationRefusal: the recommendation is refused for what the cl
   ];
   for (const [what, item, re] of risky) assert.match(refusal([item], 'FOLLOW-UP'), re, `follow-up on ${what}`);
   assert.match(refusal([recItem('R1-S10')], 'FOLLOW-UP', { files: null }), /reviewed diff is not known/, 'follow-up with an unknown diff');
-  assert.match(refusal([recItem('R1-S12')], 'REJECT'), /critical dismissal/, 'REJECT is never recommended');
+  assert.equal(refusal([recItem('R1-S12')], 'REJECT'), null, 'REJECT of an item waiting for a human may be recommended (#944; the rules for it are in the click-ask tests)');
+  assert.match(refusal([recItem('R1-S12')], 'DELETE'), /only "accept", "follow-up" and "reject"/, 'an unknown decision is refused');
   assert.match(refusal([], 'ACCEPT'), /no item/);
   // one bad item among good ones refuses the whole batch
   assert.match(refusal([recItem('R1-S13'), recItem('R1-S14', { category: 'security' })], 'FOLLOW-UP'), /R1-S14/);
@@ -1184,8 +1189,18 @@ test('rulingRecommendationRefusal: accept on needs-human items, and follow-up on
   assert.equal(refusal([settledAccept('R1-S3')], 'FOLLOW-UP'), null, 'a settled arbiter ACCEPT with no cause, maintainability, plain file');
   assert.equal(refusal([recItem('R1-S4')], 'FOLLOW-UP'), null, 'a low-confidence docs item');
   assert.equal(refusal([recItem('R1-S5'), settledAccept('R1-S6')], 'FOLLOW-UP'), null, 'both kinds in one batch');
-  assert.deepEqual(Object.keys(RULING_WHY), ['accept', 'follow-up']);
-  assert.deepEqual(Object.keys(RULING_WHY['follow-up']), ['minor-later'], 'no reject code, and no code claims more than rule 3 proves');
+  assert.deepEqual(Object.keys(RULING_WHY), ['accept', 'follow-up', 'reject']);
+  assert.deepEqual(Object.keys(RULING_WHY.accept), ['real-problem', 'unclear-safe']);
+  assert.deepEqual(Object.keys(RULING_WHY['follow-up']), ['minor-later', 'fix-separately'], 'only minor-later claims low severity; fix-separately is Claude\'s own rating');
+  assert.deepEqual(Object.keys(RULING_WHY.reject), ['not-a-bug', 'already-handled', 'no-user-impact']);
+});
+
+test('rulingRecommendationRefusal: a FOLLOW-UP with no code, a code of another decision or an unknown one is refused (no default that skips the severity rules)', () => {
+  // failure caught (#944): a caller that predates the code argument, or a typo, falling into the weaker fix-separately branch and recommending a follow-up of a BLOCKING item as "minor"
+  const blocking = [recItem('R1-B1', { bucket: 'BLOCKING', category: 'security' })];
+  for (const code of [undefined, 'not-a-bug', 'real-problem', 'Minor-Later', '', null, '__proto__']) assert.match(rulingRecommendationRefusal(blocking, 'FOLLOW-UP', recCtx(blocking), code), /needs one of the codes minor-later \| fix-separately/, String(code));
+  assert.equal(refusal(blocking, 'FOLLOW-UP', {}, 'fix-separately'), null, 'the same item with the code that makes no severity claim');
+  assert.match(refusal(blocking, 'FOLLOW-UP', {}, 'minor-later'), /not low severity/);
 });
 
 test('owner-ruling: a click on "Follow-up all (Recommended)" is checked again against today\'s severity; a typed answer or a click on another dialog is not', (t) => {
@@ -1323,4 +1338,324 @@ test('state show: a local owner deferral over a published arbiter ACCEPT is kept
   assert.equal(publishedState(w).rounds[0].items[0].final.ownerDeferral.accepted, 'arbiter');
   assert.equal(publishedState(w).version, 7);
   assert.equal(w.cli(['state', 'show', '--pr', '7']).json.source, 'local');
+});
+
+// ---- cp #944: a recommended Reject / a recommended follow-up of a BLOCKING item is a dialog the owner can CLICK ------------------------------------------------------------------------
+// The ask comes from the real `ruling-request --ask` (in process, with a temp account home as the click-ask tests do) and goes through the hook's recorder unchanged; then `owner-ruling` reads the click.
+const CLICK_BUILD = 'claude-code_2-1-323_agent';
+const mkHome = (t) => {
+  const home = realpathSync.native(mkdtempSync(join(tmpdir(), 'cp-944-')));
+  mkdirSync(join(home, '.claude'), { recursive: true });
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  return home;
+};
+const inProcess = (w, home) => {
+  const env = { ...process.env, ...w.fake.env, PIPELINE_CODEX: `node "${fakeCodex}"`, PIPELINE_LOCK_DIR: join(w.scratch, 'locks'), ...floorEnv(), AI_AGENT: CLICK_BUILD };
+  for (const k of ['PIPELINE_TEST_FORCE_ARBITER', 'PIPELINE_TEST_MODE', 'FAKE_CODEX_OUTPUT']) delete env[k];
+  return (args) => triageRun(args, { cwd: w.repo.dir, env, home, managedPaths: [] });
+};
+// What the arbiter leaves for a low-confidence judgement (the #2720 shape): an ACCEPT waiting for a human.
+const waitingAccept = (w, id, cause = 'low-confidence') => w.edit((s) => {
+  s.rounds.flatMap((r) => r.items).find((i) => i.id === id).final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, cause, reason: cause === 'security-dismissal' ? 'would dismiss a blocking security/data item' : 'arbiter low confidence', ...(['security-dismissal', 'low-confidence'].includes(cause) ? { scopeContradicted: false } : {}) }; // (the boolean every current writer stores on a security dismissal)
+});
+// Issue the ask for `ids` with a recommendation, click `label` on the dialog exactly as issued, and give back what the recorder wrote and a runner for `owner-ruling`.
+async function clickedRuling(t, w, { ids, recommend, why, label, tamper = null, extra = [] }) {
+  const home = mkHome(t);
+  const run = inProcess(w, home);
+  const asked = await run(['ruling-request', '--pr', '7', '--ids', ids.join(','), '--ask', '--recommend', recommend, '--why', why, ...extra]);
+  assert.equal(asked.exitCode, 0, JSON.stringify(asked.output));
+  const { ask } = asked.output;
+  assert.ok(ask?.askId, JSON.stringify(asked.output));
+  const file = readAsk(ask.askId, { home });
+  assert.equal(file.ok, true, 'the installed verifier reads what the command issued');
+  const cw = clickWorld(t, { issuedAsk: { home, askId: ask.askId, questions: ask.questions }, parts: { actions: file.ask.actions }, answer: label, tamper });
+  const clicked = await cw.click({ hookCheck: () => ({ ok: true, hookLayersSha256: file.ask.hookLayersSha256 }) });
+  const ownerRuling = (id, decision, quote) => run(['owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', 'owner confirmed', '--owner-quote', quote, '--pr', '7']);
+  return { asked, ask, file: file.ask, clicked, ownerRuling, cw, run, home };
+}
+const e2eWorld = (t, cause = 'low-confidence') => {
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  waitingAccept(w, 'R1-B1', cause);
+  return w;
+};
+
+test('#944 end to end: the click on "Reject all (Recommended)" of a BLOCKING waiting item is recorded and owner-ruling applies it as the typed "R1-B1: reject" would; an edited dialog records nothing', async (t) => {
+  // failure caught: the dialog could not be issued for Reject (usage error), so Claude edited a neutral one by hand and the owner's click was refused (dialog-differs) and they had to type the ruling
+  for (const cause of ['low-confidence', 'security-dismissal']) {
+    const w = e2eWorld(t, cause);
+    const c = await clickedRuling(t, w, { ids: ['R1-B1'], recommend: 'reject', why: 'not-a-bug', label: 'Reject all (Recommended)' });
+    assert.equal(c.asked.output.dialogVariant, 'ruling-v2-reject');
+    assert.deepEqual(c.ask.questions[0].options.map((o) => o.label), ['Reject all (Recommended)', 'Accept all', 'Follow-up all', 'Not now']);
+    assert.equal(c.clicked.recorded?.kind, 'ruling', JSON.stringify(c.clicked));
+    assert.equal(c.clicked.recorded.prompt, 'R1-B1: reject');
+    const r = await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+    assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+    const typed = w.item('R1-B1').final;
+    assert.deepEqual([typed.decision, typed.by, typed.needsHuman, typed.ownerQuote], ['REJECT', 'owner', false, 'R1-B1: reject'], cause);
+  }
+  // an edited dialog (the options reordered by hand) is refused by the recorder, nothing is recorded, owner-ruling finds no ruling and the item is untouched
+  const w = e2eWorld(t);
+  const before = w.stateText();
+  const e = await clickedRuling(t, w, { ids: ['R1-B1'], recommend: 'reject', why: 'not-a-bug', label: 'Reject all (Recommended)', tamper: (d) => ({ ...d, options: [...d.options].reverse() }) });
+  assert.equal(e.clicked.recorded ?? null, null, JSON.stringify(e.clicked));
+  assert.equal(e.clicked.refused, 'dialog-differs');
+  const denied = await e.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(denied.exitCode, 1);
+  assert.match(denied.output.reason, /no owner ruling is recorded/);
+  assert.equal(w.stateText(), before);
+});
+
+test('#944 end to end: the click on "Follow-up all (Recommended)" with fix-separately on a BLOCKING item is recorded and applied (the low-severity recheck belongs to minor-later only); an edited dialog records nothing', async (t) => {
+  // failure caught: a BLOCKING item could only get the minor-later row, whose click owner-ruling refuses as "no longer low severity", so the recommended button never worked
+  for (const cause of ['low-confidence', 'security-dismissal']) {
+    const w = e2eWorld(t, cause);
+    const c = await clickedRuling(t, w, { ids: ['R1-B1'], recommend: 'follow-up', why: 'fix-separately', label: 'Follow-up all (Recommended)' });
+    assert.equal(c.asked.output.dialogVariant, 'ruling-v2-follow-up-any');
+    assert.deepEqual(c.ask.questions[0].options.map((o) => o.label), ['Follow-up all (Recommended)', 'Accept all', 'Reject all', 'Not now']);
+    assert.equal(c.clicked.recorded?.prompt, 'R1-B1: follow-up', JSON.stringify(c.clicked));
+    const r = await c.ownerRuling('R1-B1', 'FOLLOW-UP', 'R1-B1: follow-up');
+    assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+    const final = w.item('R1-B1').final;
+    assert.deepEqual([final.decision, final.by, final.ownerQuote], ['FOLLOW-UP', 'owner', 'R1-B1: follow-up'], cause);
+  }
+  const w = e2eWorld(t);
+  const before = w.stateText();
+  const e = await clickedRuling(t, w, { ids: ['R1-B1'], recommend: 'follow-up', why: 'fix-separately', label: 'Follow-up all (Recommended)', tamper: (d) => ({ ...d, question: d.question.replace('Claude rates each item', 'Claude rates every item') }) });
+  assert.equal(e.clicked.recorded ?? null, null, JSON.stringify(e.clicked));
+  assert.equal(e.clicked.refused, 'dialog-differs');
+  assert.equal((await e.ownerRuling('R1-B1', 'FOLLOW-UP', 'R1-B1: follow-up')).exitCode, 1);
+  assert.equal(w.stateText(), before);
+});
+
+test('#944 drift: a click on the recommended Reject is checked again when applied (the item became implemented), a typed reject and a click on another option are not', async (t) => {
+  // failure caught: a recommended-Reject click recorded after the built fix landed (Reject would drop it), because only the ask was checked; or the recheck also refusing what the owner typed
+  const REJ = 'ruling-v2-reject';
+  const stale = e2eWorld(t);
+  const c = await clickedRuling(t, stale, { ids: ['R1-B1'], recommend: 'reject', why: 'not-a-bug', label: 'Reject all (Recommended)' });
+  assert.equal(c.clicked.recorded?.prompt, 'R1-B1: reject');
+  stale.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-B1').implemented = true; }); // still needsHuman, so the plain owner-ruling check passes; the dialog's claim no longer holds
+  const before = stale.stateText();
+  const denied = await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(denied.exitCode, 1, JSON.stringify(denied.output));
+  assert.match(denied.output.reason, /recommended Reject all.*no longer holds.*R1-B1 is already implemented.*ask again on the neutral dialog.*ruling-request --pr 7 --ids R1-B1 --ask/);
+  assert.equal(stale.stateText(), before, 'the state is byte-identical');
+  // the same words typed (no dialog) are the owner's own judgement: recorded
+  const typedW = e2eWorld(t);
+  const typed = typedFor(t, typedW, ['R1-B1'], 'R1-B1: reject');
+  typedW.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-B1').implemented = true; });
+  assertExit(typed('R1-B1', 'REJECT'), 0);
+  assert.equal(typedW.item('R1-B1').final.decision, 'REJECT');
+  // a click on the NON-recommended Accept all of a stale reject dialog says nothing about the claim (twin of the follow-up dialog's test)
+  const other = e2eWorld(t);
+  const accept = typedFor(t, other, ['R1-B1'], 'R1-B1: accept', REJ);
+  other.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-B1').implemented = true; });
+  assertExit(accept('R1-B1', 'ACCEPT'), 0);
+  assert.equal(other.item('R1-B1').final.decision, 'ACCEPT');
+  // the low-severity dialog's own refusal is unchanged (existing text, asserted above): here only that the any-severity follow-up dialog is rechecked by ITS rule (not low severity)
+  const any = e2eWorld(t);
+  const anyClick = typedFor(t, any, ['R1-B1'], 'R1-B1: follow-up', 'ruling-v2-follow-up-any');
+  assertExit(anyClick('R1-B1', 'FOLLOW-UP'), 0, 'a BLOCKING item is fine for fix-separately: no severity gate');
+  const anyStale = e2eWorld(t);
+  const anyStaleClick = typedFor(t, anyStale, ['R1-B1'], 'R1-B1: follow-up', 'ruling-v2-follow-up-any');
+  anyStale.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-B1').implemented = true; });
+  const anyDenied = anyStaleClick('R1-B1', 'FOLLOW-UP');
+  assertExit(anyDenied, 1, anyDenied.stdout);
+  assert.match(anyDenied.json.reason, /recommended Follow-up all.*Claude's check.*no longer holds.*R1-B1 is already implemented/);
+});
+
+test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling became a settled ACCEPT, and the one-id-at-a-time path still records the second id', async (t) => {
+  // failure caught: the whole-batch claim ("Claude checked each item") saved for an id whose sibling is no longer something Claude could dismiss
+  const mk = () => {
+    const w = dWorld(t);
+    assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+    waitingAccept(w, 'R1-B1');
+    w.wait('R1-S1');
+    return w;
+  };
+  const QUOTE = 'R1-B1: reject, R1-S1: reject';
+  const forced = mk();
+  const first = typedFor(t, forced, ['R1-B1', 'R1-S1'], QUOTE, 'ruling-v2-reject');
+  forced.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-S1').final = { decision: 'ACCEPT', by: 'claude', needsHuman: false, reason: 'Claude accepted it', claude: { ruledAt: '2026-11-28T00:00:00.000Z', cause: 'low-confidence', critical: false } }; });
+  const before = forced.stateText();
+  const denied = first('R1-B1', 'REJECT');
+  assertExit(denied, 1, denied.stdout);
+  assert.match(denied.json.reason, /no longer holds.*R1-S1 is not waiting for a human decision/);
+  assert.equal(forced.stateText(), before);
+  const seq = mk();
+  const apply = typedFor(t, seq, ['R1-B1', 'R1-S1'], QUOTE, 'ruling-v2-reject');
+  assertExit(apply('R1-B1', 'REJECT'), 0);
+  assert.equal(seq.item('R1-B1').final.by, 'owner');
+  const second = apply('R1-S1', 'REJECT');
+  assertExit(second, 0, second.stdout + second.stderr);
+  assert.equal(seq.item('R1-S1').final.decision, 'REJECT');
+});
+
+test('#944 drift: the second id of a two-id reject click is recorded when the first was recorded with an equivalent spelling of the same answer', async (t) => {
+  // failure caught (R2-B3): the sibling filter compared the stored quote byte for byte while the record lookup ignores case and white space, so the already-ruled first id came back as "waiting" and refused the second id's click
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  waitingAccept(w, 'R1-B1');
+  w.wait('R1-S1');
+  const QUOTE = 'R1-B1: reject, R1-S1: reject';
+  const apply = typedFor(t, w, ['R1-B1', 'R1-S1'], QUOTE, 'ruling-v2-reject');
+  const upper = w.cli(['triage', 'owner-ruling', '--round', '1', '--id', 'R1-B1', '--decision', 'REJECT', '--reason', 'owner confirmed', '--owner-quote', QUOTE.toUpperCase(), '--pr', '7']);
+  assertExit(upper, 0, upper.stdout + upper.stderr);
+  const second = apply('R1-S1', 'REJECT');
+  assertExit(second, 0, second.stdout + second.stderr);
+  assert.equal(w.item('R1-S1').final.decision, 'REJECT');
+});
+
+test('#944 drift: an answer on a recommended Reject / fix-separately dialog is refused when the PR head moved since the dialog was issued; a click on another option and a typed answer still record', async (t) => {
+  // failure caught: Claude recommends Reject "already handled", a later commit removes that handling while the item still waits, and the old click still records REJECT on code Claude never checked
+  const moved = e2eWorld(t);
+  const c = await clickedRuling(t, moved, { ids: ['R1-B1'], recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' });
+  assert.match(c.file.head, /^[0-9a-f]{40}$/, 'the ask records the head it was issued at');
+  assert.equal(c.clicked.recorded?.prompt, 'R1-B1: reject');
+  moved.repo.commit('later change', { allowEmpty: true });
+  const before = moved.stateText();
+  const denied = await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(denied.exitCode, 1, JSON.stringify(denied.output));
+  assert.match(denied.output.reason, /recommended Reject all.*no longer holds.*head moved.*ask again/);
+  assert.equal(moved.stateText(), before, 'the state is byte-identical');
+  // the same for the any-severity follow-up dialog
+  const anyW = e2eWorld(t);
+  const any = await clickedRuling(t, anyW, { ids: ['R1-B1'], recommend: 'follow-up', why: 'fix-separately', label: 'Follow-up all (Recommended)' });
+  anyW.repo.commit('later change', { allowEmpty: true });
+  assert.equal((await any.ownerRuling('R1-B1', 'FOLLOW-UP', 'R1-B1: follow-up')).exitCode, 1);
+  // a click on the NON-recommended Accept says nothing about the code Claude checked
+  const other = e2eWorld(t);
+  const acc = await clickedRuling(t, other, { ids: ['R1-B1'], recommend: 'reject', why: 'already-handled', label: 'Accept all' });
+  other.repo.commit('later change', { allowEmpty: true });
+  assert.equal((await acc.ownerRuling('R1-B1', 'ACCEPT', 'R1-B1: accept')).exitCode, 0);
+  // the same words typed (no dialog) are the owner's own judgement
+  const typedW = e2eWorld(t);
+  const typed = typedFor(t, typedW, ['R1-B1'], 'R1-B1: reject');
+  typedW.repo.commit('later change', { allowEmpty: true });
+  assertExit(typed('R1-B1', 'REJECT'), 0);
+  // and the head unchanged: the click records (the control)
+  const fresh = e2eWorld(t);
+  const ok = await clickedRuling(t, fresh, { ids: ['R1-B1'], recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' });
+  assert.equal((await ok.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject')).exitCode, 0);
+});
+
+test('#944 drift: a recommended Reject click is refused when the PR head on GitHub moved or cannot be read, or the ask recorded no head to compare; unpushed local commits do not matter', async (t) => {
+  // failure caught (R5-B1): a pending ask recorded with head and prHead apart passed both unchanged-since comparisons; (R2-B1): a push from another checkout leaves this checkout's HEAD where it was, so the old Reject click was recorded for code Claude never read; (R2-B2): an ask with no recorded head skipped the comparison and recorded it too
+  const REJECT = { recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' };
+  const ghScript = (w) => { const file = w.fake.env.PIPELINE_FAKE_GH_SCRIPT; return { read: () => JSON.parse(readFileSync(file, 'utf8')), write: (entries) => writeFileSync(file, JSON.stringify(entries)) }; };
+  const setPrView = (w, over) => { const g = ghScript(w); g.write(g.read().map((e) => (e.match === '^pr view 7' ? { ...e, ...over } : e))); };
+  // the control: nothing moved, the click records (and the ask carries both heads)
+  const fresh = e2eWorld(t);
+  const ok = await clickedRuling(t, fresh, { ids: ['R1-B1'], ...REJECT });
+  assert.match(ok.file.prHead, /^[0-9a-f]{40}$/);
+  assert.equal((await ok.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject')).exitCode, 0);
+  // the PR head on GitHub moved while this checkout's HEAD did not (a push from another checkout)
+  const pushed = e2eWorld(t);
+  const p = await clickedRuling(t, pushed, { ids: ['R1-B1'], ...REJECT });
+  setPrView(pushed, { stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: 'f'.repeat(40) } });
+  const before = pushed.stateText();
+  const movedRemote = await p.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(movedRemote.exitCode, 1, JSON.stringify(movedRemote.output));
+  assert.match(movedRemote.output.reason, /the PR head on GitHub moved from .* since Claude recommended this.*ask again/);
+  assert.equal(pushed.stateText(), before, 'the state is byte-identical');
+  // the PR head cannot be read: refused, not skipped
+  const blind = e2eWorld(t);
+  const b = await clickedRuling(t, blind, { ids: ['R1-B1'], ...REJECT });
+  setPrView(blind, { stdoutJson: undefined, code: 1 });
+  const unread = await b.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(unread.exitCode, 1, JSON.stringify(unread.output));
+  assert.match(unread.output.reason, /the PR head on GitHub could not be read/);
+  // an ask with no recorded head (or no PR head on GitHub) is refused, even though nothing moved
+  for (const dropped of [['head', 'prHead'], ['prHead']]) {
+    const w = e2eWorld(t);
+    const c = await clickedRuling(t, w, { ids: ['R1-B1'], ...REJECT });
+    const file = join(asksDir(c.home), `${c.ask.askId}.json`);
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    for (const k of dropped) delete raw[k];
+    writeFileSync(file, JSON.stringify(raw));
+    assert.equal(readAsk(c.ask.askId, { home: c.home }).ok, true, 'the ask still reads (an older writer left no head)');
+    const denied = await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+    assert.equal(denied.exitCode, 1, JSON.stringify(denied.output));
+    assert.match(denied.output.reason, /recorded no PR head to compare with/);
+  }
+  // R5-B1: an ask whose two heads differ (issued by an earlier build that accepted an ancestor PR head) is refused even when both are unchanged since
+  const apart = e2eWorld(t);
+  const a = await clickedRuling(t, apart, { ids: ['R1-B1'], ...REJECT });
+  const other = 'e'.repeat(40);
+  const askFile = join(asksDir(a.home), `${a.ask.askId}.json`);
+  writeFileSync(askFile, JSON.stringify({ ...JSON.parse(readFileSync(askFile, 'utf8')), prHead: other }));
+  setPrView(apart, { stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: other } });
+  const split = await a.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(split.exitCode, 1, JSON.stringify(split.output));
+  assert.match(split.output.reason, /recorded different PR heads/);
+  // #977: an ask that does not carry the clean-checkout marker (issued by a build that did not check the working tree) has the same two equal heads as a good one, so it is refused too
+  const unmarked = e2eWorld(t);
+  const u = await clickedRuling(t, unmarked, { ids: ['R1-B1'], ...REJECT });
+  assert.equal(u.file.headClean, true, 'an ask issued from a clean checkout carries the marker');
+  const unmarkedFile = join(asksDir(u.home), `${u.ask.askId}.json`);
+  const rawUnmarked = JSON.parse(readFileSync(unmarkedFile, 'utf8'));
+  delete rawUnmarked.headClean;
+  writeFileSync(unmarkedFile, JSON.stringify(rawUnmarked));
+  assert.equal(readAsk(u.ask.askId, { home: u.home }).ok, true, 'the ask still reads');
+  const beforeUnmarked = unmarked.stateText();
+  const noMarker = await u.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(noMarker.exitCode, 1, JSON.stringify(noMarker.output));
+  assert.match(noMarker.output.reason, /did not check that the working tree was clean.*ask again/);
+  assert.equal(unmarked.stateText(), beforeUnmarked, 'the state is byte-identical');
+  // R1-B1: the ask file reads when the click is validated but not when the head is compared (an I/O error between the two reads): refused, not skipped. The fs binding is swapped (and synced to the named imports) to fail the LAST read of the ask file, counted on a control run.
+  const lstatOf = async (failAt, code = 'EIO') => {
+    const w = e2eWorld(t);
+    const c = await clickedRuling(t, w, { ids: ['R1-B1'], ...REJECT });
+    const real = fs.lstatSync;
+    let seen = 0;
+    fs.lstatSync = (p, ...rest) => { if (String(p).endsWith(`${c.ask.askId}.json`) && ++seen === failAt) throw Object.assign(new Error(code), { code }); return real(p, ...rest); };
+    syncBuiltinESMExports();
+    try { return { seen: () => seen, w, r: await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject') }; } finally { fs.lstatSync = real; syncBuiltinESMExports(); }
+  };
+  const control = await lstatOf(0);
+  assert.equal(control.r.exitCode, 0, JSON.stringify(control.r.output));
+  assert.ok(control.seen() >= 2, 'the ask file is read at least twice (the click check, then the head comparison)');
+  const flaky = await lstatOf(control.seen());
+  assert.equal(flaky.r.exitCode, 1, JSON.stringify(flaky.r.output));
+  assert.match(flaky.r.output.reason, /could not be read.*ask again/);
+  // R2-B1 (#977): the same read finding NO file (it vanished after the click was validated) is refused too, not skipped: the head comparison would be skipped with it
+  const vanished = await lstatOf(control.seen(), 'ENOENT');
+  assert.equal(vanished.r.exitCode, 1, JSON.stringify(vanished.r.output));
+  assert.match(vanished.r.output.reason, /could not be read.*ask again/);
+});
+
+test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {
+  // failure caught: the batch recheck dropped a sibling that no longer waits, so the click recorded REJECT for the first id although the dialog's "Claude checked each item" no longer qualified the batch
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  waitingAccept(w, 'R1-B1');
+  w.wait('R1-S1');
+  const first = typedFor(t, w, ['R1-B1', 'R1-S1'], 'R1-B1: reject, R1-S1: reject', 'ruling-v2-reject');
+  w.edit((s) => { const i = s.rounds[0].items.find((x) => x.id === 'R1-S1'); i.final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'worth fixing' }; i.implemented = true; });
+  const before = w.stateText();
+  const denied = first('R1-B1', 'REJECT');
+  assertExit(denied, 1, denied.stdout);
+  assert.match(denied.json.reason, /no longer holds.*R1-S1/);
+  // R2-F1: failure caught: the re-ask advice listing the built sibling too, so the neutral dialog asks the owner to rule on R1-S1, which owner-ruling refuses as needing no decision
+  assert.match(denied.json.reason, /ruling-request --pr 7 --ids R1-B1 --ask/);
+  assert.doesNotMatch(denied.json.reason, /--ids [^`]*R1-S1/);
+  assert.equal(w.stateText(), before);
+});
+
+test('#944 drift: several answers on one item: a stale recommended record with a neutral click of the same words is recorded; stale records on two recommended dialogs are refused', async (t) => {
+  // failure caught: the recheck refusing an answer a neutral dialog also carries (the owner's click on the plain dialog said nothing about a claim), or one stale record being enough to keep a ruling when every record claims
+  const mixed = e2eWorld(t);
+  typedFor(t, mixed, ['R1-B1'], 'R1-B1: reject', 'ruling-v2-reject');
+  const neutral = typedFor(t, mixed, ['R1-B1'], 'R1-B1: reject', 'ruling-v1');
+  mixed.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-B1').implemented = true; });
+  assertExit(neutral('R1-B1', 'REJECT'), 0);
+  const both = e2eWorld(t);
+  typedFor(t, both, ['R1-B1'], 'R1-B1: follow-up', 'ruling-v2-follow-up');
+  const last = typedFor(t, both, ['R1-B1'], 'R1-B1: follow-up', 'ruling-v2-follow-up-any');
+  both.edit((s) => { s.rounds[0].items.find((i) => i.id === 'R1-B1').implemented = true; });
+  const before = both.stateText();
+  const denied = last('R1-B1', 'FOLLOW-UP');
+  assertExit(denied, 1, denied.stdout);
+  assert.match(denied.json.reason, /no longer holds/);
+  assert.equal(both.stateText(), before);
 });

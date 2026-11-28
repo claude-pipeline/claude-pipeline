@@ -4,7 +4,7 @@ import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { MAX_PAGES, PAGE, pages } from '../lib/gh-pages.mjs';
-import { decodeRecord } from '../lib/run-record.mjs';
+import { adoptRecord, decodeRecord } from '../lib/run-record.mjs';
 import { effectiveCost } from '../lib/run-cost.mjs';
 import { readCostBookings } from '../lib/run-events.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
@@ -20,7 +20,7 @@ export const meta = {
     '     read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had',
     '     to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | deferred = its accepts were all deferred past the cap | nothing-accepted), blockingLoopPrs, capDeferredPrs, capDeferredItems, capDeferReopened, capLowNotDeferred, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,',
     '     countedRounds, pastCapRounds, usd, blockingLoop, capDeferredItems, capDeferReopened, capLowNotDeferred, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), reviewKind, resolutionIneligible, acceptedBlocking, capDeferred? (on the row of the last allowed round), admission?, previous?, found?}]}]. The cap-low numbers (review.cap_low_accepts) count over EVERY round of the state, one per item id and not a cached copy: capDeferredItems = accepts `triage cap-defer` turned into follow-ups unapplied, capDeferReopened = of those, tightened back to ACCEPT by Claude (the floor was wrong), capLowNotDeferred = 1 when the last allowed round\'s accepts were all low by this stats rule, nothing was deferred and an automatic extra round followed. --pr N limits it to those PRs (merged or not listed by date).',
-    '     Without --json the same numbers print as a plain-text table. Only the viewer\'s own comments count (the pipeline\'s comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR or repository, unreadable) is named in `warnings`. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
+    '     Without --json the same numbers print as a plain-text table. Only the viewer\'s own comments count (the pipeline\'s comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR, unreadable) is named in `warnings`; a run record of this PR that names another repository (the repo was renamed or moved) still counts, with a warning, when its branch is the live branch of the PR (one extra read of the PR); a pull request reached through two slugs counts once, with a warning. A PR is left out of the totals, with a warning (rerun), in two cases: several slugs are asked and its identity cannot be read, or its own run records name different repositories and the PR\'s repository cannot be read; a single moved record whose branch cannot be read is ignored with a warning (the PR counts without that record\'s cost). A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
     '     Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.',
   ].join('\n'),
 };
@@ -41,24 +41,44 @@ async function rounds(rest, ctx) {
     const repos = (values['repo-slug'] ?? []).length > 0 ? [...new Set(values['repo-slug'])] : [gh.repo().slug];
     const warnings = [];
     const analysed = [];
+    const seen = new Map();
     let withoutState = 0;
     for (const slug of repos) {
       let numbers;
-      if (only.length > 0) numbers = only;
+      if (only.length > 0) numbers = only.map((number) => ({ number }));
       else {
         // newest-updated first: stop once a whole page is older than the date (a merged PR was updated at its merge, so nothing later in the list merged since)
         const closed = pages(gh, `repos/${slug}/pulls?state=closed&sort=updated&direction=desc`, (l) => l.every((p) => String(p.updated_at ?? '') < since), () => warnings.push(`${slug}: the list of closed PRs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} PRs): merged PRs further back are missing, so the totals are short (use a later --since)`));
-        numbers = closed.filter((p) => typeof p.merged_at === 'string' && p.merged_at >= since).map((p) => p.number);
+        numbers = closed.filter((p) => typeof p.merged_at === 'string' && p.merged_at >= since).map((p) => ({ number: p.number, nodeId: p.node_id, baseRepo: p.base?.repo?.full_name }));
       }
-      for (const number of numbers) {
+      for (const { number, nodeId, baseRepo } of numbers) {
         try {
+          // The PR itself, read at most once and only when needed (a record naming another repository: its branch; two slugs: its identity). null = could not be read.
+          let pull;
+          const livePull = () => {
+            if (pull === undefined) {
+              try { pull = gh.api('GET', `repos/${slug}/pulls/${number}`) ?? null; } catch { pull = null; }
+            }
+            return pull;
+          };
+          // The repository the PR lives in now: the listing's base repo, else the PR read; undefined = unknown (then the slug asked is taken). Only looked up when several slugs are asked or a record names another repository.
+          const canonical = () => { const c = baseRepo ?? livePull()?.base?.repo?.full_name; return typeof c === 'string' && c !== '' ? c : undefined; };
           let cut = false;
           const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => { cut = true; warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record, state or cost bookings may be missing or old, so its cost is left out`); });
-          let record = null;
+          let record = null; // the record of THIS repository slug: it wins over an adopted one whatever the comment order
+          let adopted = null; // a record of the repository the PR moved from, adopted only when its branch is the live one: { record, from }
           let state = null;
           let recordUnreadable = false;
           const slugLower = slug.toLowerCase();
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
+          // "This repository" is the canonical one, resolved ONCE per PR and used for every record, so neither the order of two aliases nor the order of the comments can change the record picked. Looked up when several slugs are asked or an own record names another slug than the one asked.
+          const ownSlugs = comments.filter((c) => c?.user?.login === me && typeof c.body === 'string' && c.body.startsWith(MARKERS.summary)).map((c) => decodeRecord(c.body)).filter((r) => r.status === 'ok').map((r) => String(r.record.repo ?? '').toLowerCase());
+          const home = repos.length > 1 || ownSlugs.some((s) => s !== slugLower) ? canonical() : undefined;
+          // records naming different repositories cannot be told apart without the canonical one: no record is guessed, the PR is left out
+          if (home === undefined && new Set(ownSlugs).size > 1 && livePull() === null) {
+            warnings.push(`${slug}#${number}: left out: its run records name different repositories and the repository of the PR could not be read; rerun`);
+            continue;
+          }
           for (const c of comments) {
             if (typeof c?.body !== 'string') continue;
             const isState = c.body.startsWith(MARKERS.triage);
@@ -72,8 +92,17 @@ async function rounds(rest, ctx) {
             if (isRecord) {
               const r = decodeRecord(c.body);
               if (r.status === 'ok') {
-                if (r.record.pr === number && String(r.record.repo ?? '').toLowerCase() === slugLower) record = r.record;
-                else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
+                // The repo is the only mismatch ⇒ the PR was merged before a rename/transfer and this is still its own record (adoptRecord, #671); a slug that differs only in case is the same repository.
+                const recSlug = String(r.record.repo ?? '').toLowerCase();
+                const sameRepo = recSlug === (home ?? slug).toLowerCase();
+                // a record naming another repository is adopted only when its branch is the PR's live one (else a copied record of another PR with the same number would be taken)
+                const branch = sameRepo ? undefined : livePull()?.head?.ref;
+                const lookupFailed = !sameRepo && typeof branch !== 'string';
+                const bound = lookupFailed ? { record: null } : adoptRecord(r.record, { repo: sameRepo ? r.record.repo : (home ?? slug), pr: number, branch });
+                if (bound.record) {
+                  if (sameRepo) record = bound.record;
+                  else adopted = { record: bound.record, from: r.record.repo };
+                } else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, `: not this PR or repository${lookupFailed ? ' (its branch could not be read)' : ''}`);
               } else if (r.status === 'invalid' || r.status === 'unsupported') {
                 recordUnreadable = true;
                 skip('a run record', `: unreadable (${r.status})`);
@@ -86,15 +115,35 @@ async function rounds(rest, ctx) {
               else skip('a review state', ': unreadable');
             }
           }
-          // The cost is this PR's own record's cost section plus the cost bookings of THIS listing (this slug's comments of this PR: another repo's PR of the same number never mixes in). A record bound
-          // to another PR was skipped above and brings no cost; an unreadable record, or an unreadable booking of ours, leaves the cost out (usd null).
-          const eff = effectiveCost({ base: record?.cost, baseStatus: record === null && recordUnreadable ? 'invalid' : 'ok', ...readCostBookings({ comments, viewer: me }) });
+          // The same pull request reached through two slugs (a renamed repository, the old name redirects) counts once, with or without a review state: the listing's node id, or with --pr a lookup (only when several repositories are asked).
+          const identity = nodeId ?? (repos.length > 1 ? livePull()?.node_id : undefined);
+          const first = typeof identity === 'string' ? seen.get(identity) : undefined;
+          if (first !== undefined) {
+            warnings.push(`${slug}#${number}: the same pull request as ${first}: counted once`);
+            continue;
+          }
+          if (typeof identity === 'string') seen.set(identity, `${slug}#${number}`);
+          else if (repos.length > 1) {
+            // an unreadable identity cannot be told apart from the same PR under another slug: neither alias goes into the totals (never a silent double count)
+            warnings.push(`${slug}#${number}: left out: it could not be told apart from the same pull request under another repository name (it could not be read); rerun`);
+            continue;
+          }
+          const movedFrom = record === null && adopted !== null ? adopted.from : null;
+          const picked = record ?? adopted?.record ?? null;
+          // The cost is the picked record's cost section (this repository's own record, else one adopted from the repository the PR moved from) plus the cost bookings of THIS listing (this slug's
+          // comments of this PR: another repo's PR of the same number never mixes in). A record bound to another PR was skipped above and brings no cost; an unreadable record with no readable record of
+          // this repository, or an unreadable booking of ours, leaves the cost out (usd null).
+          const eff = effectiveCost({ base: picked?.cost, baseStatus: record === null && recordUnreadable ? 'invalid' : 'ok', ...readCostBookings({ comments, viewer: me }) });
           // A list cut by the page limit holds only some of the bookings: a partial total would be printed as the PR's cost, so the cost is left out (the cut is already a warning).
           if (eff.unavailable !== undefined) warnings.push(`${slug}#${number}: the booked cost is unavailable, so it is left out: ${asciiLine(eff.unavailable, 120)}`);
           const cost = cut || eff.unavailable !== undefined || !eff.any ? null : eff.cost;
-          const p = analysePr({ repo: slug, pr: number, state, record, cost });
+          const p = analysePr({ repo: slug, pr: number, state, record: picked, cost });
           if (p === null) withoutState += 1;
-          else analysed.push(p);
+          else {
+            analysed.push(p);
+            // only for the record finally selected, and only when the PR counts
+            if (movedFrom !== null) warnings.push(`${slug}#${number}: counted a run record bound to ${asciiLine(movedFrom, 80)} (the repo moved)`);
+          }
         } catch (err) {
           warnings.push(`${slug}#${number}: comments could not be read (${asciiLine(err?.message, 120)}): skipped`);
         }

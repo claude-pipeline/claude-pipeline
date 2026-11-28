@@ -136,7 +136,9 @@ export function roundAsk({ repo, pr, line, variant = ROUND_VARIANT_LEGACY }) {
 // The ruling dialog's fixed variant set (cp #771), the same pattern as ROUND_VARIANTS: a frozen table, each id immutable once shipped (a test pins the sha256 of each dialog), the ask file names its
 // variant and the verifier REBUILDS the dialog from this table. Unlike the round dialog the answer texts are built from the asked ids, so the table holds the option ORDER and which one carries
 // "(Recommended)"; the label, description and answer word of each option are fixed below. `ruling-v1` is the legacy dialog byte for byte (no variant key, v 1). The recommended option's answer is the
-// same text its plain label maps to, so a click records the same ruling either way. Reject is never recommended (no ruling-v2-reject).
+// same text its plain label maps to, so a click records the same ruling either way. Each v2 variant names the `codes` (RULING_WHY, of its own decision) whose recommendation row it may carry, so the verifier
+// checks the row per VARIANT: `ruling-v2-follow-up` is the one that claims "the pipeline rates it low" (minor-later), `ruling-v2-follow-up-any` has the same buttons but a row that makes no such claim
+// (owner-ruling rechecks low severity only for the first). A click on a recommended Reject records what a click on the same label of the neutral dialog (or the typed `ID: reject`) records (cp #944).
 const RULING_OPTIONS = Object.freeze({
   notNow: { label: 'Not now', word: null, description: () => 'Rule on nothing now. Nothing is recorded.' },
   accept: { label: 'Accept all', word: 'accept', description: (ids) => `Accept every item asked (${ids.join(', ')}).` },
@@ -144,9 +146,11 @@ const RULING_OPTIONS = Object.freeze({
   reject: { label: 'Reject all', word: 'reject', description: (ids) => `Reject every item asked (${ids.join(', ')}).` },
 });
 const RULING_VARIANTS = Object.freeze({
-  'ruling-v1': { order: ['notNow', 'accept', 'followUp', 'reject'], recommended: null },
-  'ruling-v2-accept': { order: ['accept', 'followUp', 'reject', 'notNow'], recommended: 'accept' },
-  'ruling-v2-follow-up': { order: ['followUp', 'accept', 'reject', 'notNow'], recommended: 'followUp' },
+  'ruling-v1': { order: ['notNow', 'accept', 'followUp', 'reject'], recommended: null, decision: null, codes: [] },
+  'ruling-v2-accept': { order: ['accept', 'followUp', 'reject', 'notNow'], recommended: 'accept', decision: 'accept', codes: ['real-problem', 'unclear-safe'] },
+  'ruling-v2-follow-up': { order: ['followUp', 'accept', 'reject', 'notNow'], recommended: 'followUp', decision: 'follow-up', codes: ['minor-later'] },
+  'ruling-v2-follow-up-any': { order: ['followUp', 'accept', 'reject', 'notNow'], recommended: 'followUp', decision: 'follow-up', codes: ['fix-separately'] },
+  'ruling-v2-reject': { order: ['reject', 'accept', 'followUp', 'notNow'], recommended: 'reject', decision: 'reject', codes: ['not-a-bug', 'already-handled', 'no-user-impact'] },
 });
 export const RULING_VARIANT_IDS = Object.freeze(Object.keys(RULING_VARIANTS));
 export const RULING_VARIANT_LEGACY = 'ruling-v1';
@@ -159,16 +163,30 @@ export const RULING_WHY = Object.freeze({
   }),
   'follow-up': Object.freeze({
     'minor-later': "Claude rates these as minor, and the pipeline's own severity check rates them low: fixing them in their own issue does not hold this PR.",
+    'fix-separately': "Claude rates each item worth fixing, but not in this PR (it was there before, or lies outside this change); its own issue keeps it tracked. This is Claude's rating, not the pipeline's severity check.",
+  }),
+  reject: Object.freeze({
+    'not-a-bug': 'Claude checked the code for each item: what it describes does not happen, so there is nothing to fix.',
+    'already-handled': 'Claude checked the code for each item: another part of the code already prevents what it describes, so a change here adds nothing.',
+    'no-user-impact': 'Claude checked the code for each item: what it describes can only happen in a case users never reach (for example while an update is being installed), so it is not worth changing.',
   }),
 });
-const RULING_DECISION_WORD = Object.freeze({ accept: 'Accept', 'follow-up': 'Follow-up' });
+// The dialogs whose recommendation rests on Claude's reading of the CODE (a recommended Reject or fix-separately): their ask file also records the heads it was issued at (`head`: the checkout's, `prHead`: the PR's on GitHub), so a click is not applied once either moved.
+export const RULING_HEAD_BOUND_VARIANTS = Object.freeze(['ruling-v2-follow-up-any', 'ruling-v2-reject']);
+const headOk = (a) => (!Object.hasOwn(a, 'head') && !Object.hasOwn(a, 'prHead')) || (a.kind === 'ruling' && RULING_HEAD_BOUND_VARIANTS.includes(a.variant) && ['head', 'prHead'].every((k) => !Object.hasOwn(a, k) || /^[0-9a-f]{40}$/.test(String(a[k]))) && (!Object.hasOwn(a, 'headClean') || a.headClean === true));
+const RULING_DECISION_WORD = Object.freeze({ accept: 'Accept', 'follow-up': 'Follow-up', reject: 'Reject' });
 const RECOMMENDS = 'Claude recommends ';
 // The recommendation row of the dialog's question (one line, before the binding last line; it binds nothing). Null for a decision / code that is not in the table.
 export function rulingWhyRow(decision, code) {
   const text = Object.hasOwn(RULING_WHY, decision) && Object.hasOwn(RULING_WHY[decision], code) ? RULING_WHY[decision][code] : null;
   return text === null ? null : `${RECOMMENDS}${RULING_DECISION_WORD[decision]} all (when asked): ${text}`;
 }
-const rulingVariantDecision = (variant) => (RULING_VARIANTS[variant].recommended === 'accept' ? 'accept' : RULING_VARIANTS[variant].recommended === 'followUp' ? 'follow-up' : null);
+const rulingVariantDecision = (variant) => RULING_VARIANTS[variant].decision;
+// The v2 dialog that carries the recommendation row (decision, code), or null for a pair not in the table: the CLI's only way to pick a variant.
+export function rulingVariantFor(decision, code) {
+  if (typeof decision !== 'string' || typeof code !== 'string') return null;
+  return Object.keys(RULING_VARIANTS).find((id) => RULING_VARIANTS[id].decision === decision && RULING_VARIANTS[id].codes.includes(code)) ?? null;
+}
 // `variant` omitted = the legacy dialog; an id outside the table (or any non-string) -> null. The parts of a legacy dialog carry no `variant` key, so an ask built from them is byte-identical to today's.
 export function rulingAsk({ repo, pr, ids, line, variant = RULING_VARIANT_LEGACY }) {
   if (typeof variant !== 'string' || !Object.hasOwn(RULING_VARIANTS, variant)) return null;
@@ -232,12 +250,12 @@ function installedParts(ask, home) {
     if (asked === null || asked.pr !== pr) return null;
     const variant = ask.variant ?? RULING_VARIANT_LEGACY;
     if (typeof variant !== 'string' || !Object.hasOwn(RULING_VARIANTS, variant)) return null;
-    // The recommendation row is installed text too (the question body comes from the file): a v2 ask carries exactly one, just before the binding last line, equal to a table row for the variant's
-    // decision; a v1 ask carries none.
+    // The recommendation row is installed text too (the question body comes from the file): a v2 ask carries exactly one, just before the binding last line, equal to the table row of one of THAT variant's
+    // codes; a v1 ask carries none.
     const lines = block.split('\n');
     const rows = lines.filter((l) => l.startsWith(RECOMMENDS));
     const decision = rulingVariantDecision(variant);
-    if (decision === null ? rows.length !== 0 : rows.length !== 1 || lines.at(-2) !== rows[0] || !Object.keys(RULING_WHY[decision]).some((code) => rulingWhyRow(decision, code) === rows[0])) return null;
+    if (decision === null ? rows.length !== 0 : rows.length !== 1 || lines.at(-2) !== rows[0] || !RULING_VARIANTS[variant].codes.some((code) => rulingWhyRow(decision, code) === rows[0])) return null;
     return rulingAsk({ repo: ask.repo, pr, ids: asked.ids, line: block, variant });
   }
   if (ask.kind === 'live-db') {
@@ -247,7 +265,7 @@ function installedParts(ask, home) {
     if (op === undefined) return null;
     const v = verifyBlock(block, { home });
     const f = v.fields;
-    if (!v.ok || f.op !== op || f.label !== label || f.ref !== ref || (op === 'migration' ? f.name : f.sqlSha256.slice(0, 12)) !== arg || repoKey(f.repo) !== ask.repo) return null;
+    if (!v.ok || v.leading !== 0 || f.op !== op || f.label !== label || f.ref !== ref || (op === 'migration' ? f.name : f.sqlSha256.slice(0, 12)) !== arg || repoKey(f.repo) !== ask.repo) return null;
     return liveDbAsk({ repo: ask.repo, pr, block, op, arg, label, ref });
   }
   const ready = /^🔀 Ready to merge (#\d{1,6}(?:, #\d{1,6}){1,3}) — say "merge"$/.exec(block.split('\n').at(-1));
@@ -322,7 +340,7 @@ const marked = (askId, ext, home) => { const f = askFile(askId, ext, home); try 
 
 // An ask file's version rule: `v: 1` with NO `variant` key (the legacy encoding; `variant: null` is invalid), or `v: 2` naming one of the v2 ids of its own kind (round-v2-* on a round ask, ruling-v2-* on a ruling ask).
 const variantOfKind = (kind, variant) => (kind === 'round' && ROUND_V2_IDS.includes(variant)) || (kind === 'ruling' && RULING_V2_IDS.includes(variant));
-const askVersionOk = (a) => isObj(a) && ((a.v === 1 && !Object.hasOwn(a, 'variant')) || (a.v === 2 && Object.hasOwn(a, 'variant') && variantOfKind(a.kind, a.variant)));
+const askVersionOk = (a) => isObj(a) && headOk(a) && ((a.v === 1 && !Object.hasOwn(a, 'variant')) || (a.v === 2 && Object.hasOwn(a, 'variant') && variantOfKind(a.kind, a.variant)));
 
 // The issued ask on disk, validated (its dialog and answer map must be the installed builders' own, R1-F4): { ok: true, ask } | { ok: false, reason: 'none' | 'invalid' }.
 export function readAsk(askId, { home = accountHome() } = {}) {
@@ -349,11 +367,12 @@ function readSpent(askId, home) {
 // Writes `asks/<askId>.json` and returns { askId, questions: [dialog] } (the dialog the agent passes to AskUserQuestion VERBATIM), or { error } when the dialog could not bind or be written. The question
 // text is `<title> (<askId>)` + blank line + `block`; before writing, the SAME binding cores the recorder uses are run on it with every option's answer, so an ask whose closing lines would bind
 // nothing (or another PR / repository than `prs` / `repo`) is never issued. An older ask of the same kind, repository and PRs that is neither spent nor superseded is marked superseded.
-export function issueAsk({ kind, repo, prs, header, title, block, options, actions, variant, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
+export function issueAsk({ kind, repo, prs, header, title, block, options, actions, variant, head, prHead, headClean, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
   try {
     const key = repoKey(repo);
     if (!KINDS.includes(kind) || key === null || !Array.isArray(prs) || (prs.length === 0 && kind !== 'live-db') || !prs.every(Number.isInteger) || typeof title !== 'string' || typeof block !== 'string' || !isObj(actions)) return { error: 'invalid' };
     if (variant !== undefined && !variantOfKind(kind, variant)) return { error: 'invalid' };
+    if ((head !== undefined || prHead !== undefined || headClean !== undefined) && !headOk({ kind, variant, ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }), ...(headClean === undefined ? {} : { headClean }) })) return { error: 'invalid' };
     // an action is a decline (null), the answer text a typed parser reads (a string) or a follow-up instruction (round asks only)
     if (!Object.values(actions).every((a) => a === null || typeof a === 'string' || (kind === 'round' && isInstruction(a)))) return { error: 'invalid-actions' };
     const labels = (options ?? []).map((o) => o?.label);
@@ -367,7 +386,7 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
     if (askId === null) return { error: 'no-id' };
     const dialog = canonicalDialog({ question: `${title} (${askId})\n\n${block}`, header: header ?? 'Merge', multiSelect, options });
     if (dialog === null) return { error: 'invalid-dialog' };
-    const ask = { v: variant === undefined ? 1 : 2, askId, kind, ...(variant === undefined ? {} : { variant }), repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
+    const ask = { v: variant === undefined ? 1 : 2, askId, kind, ...(variant === undefined ? {} : { variant }), ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }), ...(headClean === undefined ? {} : { headClean }), repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
     // every approving answer must bind exactly this repository and these PRs, or the ask is useless (a typo in the block, a closing line of another PR)
     for (const label of labels) {
       if (actions[label] === null || isInstruction(actions[label])) continue; // (a decline and an instruction bind nothing: neither can reach a record)
@@ -445,7 +464,7 @@ function bindAnswer(ask, text, question, home = accountHome()) {
     const go = parseGo(text);
     const cut = question.indexOf('\n\n');
     const v = go !== null && cut >= 0 ? verifyBlock(question.slice(cut + 2), { home }) : null;
-    if (!v?.ok) return { error: 'nothing-bound' };
+    if (!v?.ok || v.leading !== 0) return { error: 'nothing-bound' }; // (R1-B2: the question's body IS the block, no prose or other SQL before it)
     const f = v.fields;
     if (go.op !== f.op || go.arg !== (f.op === 'migration' ? f.name : f.sqlSha256.slice(0, 12))) return { error: 'nothing-bound' };
     if (repoKey(f.repo) !== ask.repo) return { error: 'other-pr-or-repo' };

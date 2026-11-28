@@ -6,7 +6,8 @@ import { mkdtempSync, writeFileSync, rmSync, realpathSync, readFileSync, cpSync 
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateGitCommand, VAR_BUILTINS, DIR_CHANGERS } from '../pipeline/hooks/lib/git-policy.mjs';
+import { WRAPPER_NAMES, SHELLS, INTERPRETER } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const HOOK = resolve(HERE, '../pipeline/hooks/guard-git.mjs');
@@ -42,6 +43,7 @@ function evaluate(command, o = {}) {
     },
     readText: o.readText ?? (() => null),
     pathExists: o.pathExists ?? (() => false),
+    ...(o.readHead && { readHead: o.readHead }), ...(o.readDir && { readDir: o.readDir }), ...(o.realpath && { realpath: o.realpath }), // (a fake file system's head / directory / link answers, when a test needs them)
   });
   return Object.assign(verdict, { calls });
 }
@@ -1619,6 +1621,149 @@ test('a program run by path is read: a shebang picks shell or program text; bina
   assert.equal(ev('./bin'), 'allow');
   assert.equal(ev('./node_modules/.bin/tool'), 'allow');
   assert.equal(ev('/usr/bin/true'), 'allow');
+});
+
+// ---- #904: a program run by path is judged by its name, never read as the file it is ---------------------------------------------------------------------------------
+// The failure: `./env foo` (and `bin/npx`, `./node x.mjs`, `./sh`, `./git`, `$HOME/bin/env`) was read by the base NAME of the word, so a text file planted under that name was never read: the guard allowed whatever it held.
+// The rule (owner, 11-28): a TEXT program run by path whose name the guard reads by name is refused, content not read. A binary, a node_modules / pipeline-home program, a missing file and a directory are not.
+const PUSH_G = ['git', 'pu' + 'sh', 'origin', 'ma' + 'in'].join(' ');
+const HARMLESS_TEXT = '#!/bin/sh\necho ok\n';
+const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+const namedLike = (word, name) => new RegExp(`the program \`${escRe(word)}\` is run by its path but named like the \`${escRe(name)}\` command, so the guard reads it as \`${escRe(name)}\` and never reads the file`);
+const INTERPS = ['node', 'nodejs', 'deno', 'bun', 'tsx', 'ts-node', 'python', 'python2.7', 'python3', 'python3.12', 'ruby', 'perl', 'php'];
+// one argument shape per name: a plain command word after it, except where the wrapper takes an operand first (`ssh HOST CMD`, `flock FILE CMD`, `taskset MASK CMD`), its own command text (`script`, `su`) or a subcommand (`npm exec CMD`)
+const ARGS_OF = { taskset: '5 foo', ssh: '5 foo', timeout: '5 foo', flock: '5 foo', script: '-c "echo hi"', su: '-c "echo hi"', npm: 'exec foo', pnpm: 'exec foo', yarn: 'exec foo' };
+const READ_BY_NAME = [...new Set([...WRAPPER_NAMES, ...SHELLS, ...INTERPS, 'source'])];
+
+test('#904: the interpreter names the tests walk are the parser\'s own', () => {
+  for (const n of INTERPS) assert.match(n, INTERPRETER, n);
+  assert.ok(READ_BY_NAME.length >= 60, `${READ_BY_NAME.length} names`);
+});
+
+test('#904: every wrapper, shell and interpreter the parser reads by name is refused when run by its path (a harmless text file under that name)', () => {
+  const missing = [];
+  for (const n of READ_BY_NAME) {
+    const r = evaluate(`./${n} ${ARGS_OF[n] ?? 'foo'}`, withFiles({ [n]: HARMLESS_TEXT }));
+    if (!(r.decision === 'deny' && namedLike(`./${n}`, n).test(r.reason))) missing.push(n);
+  }
+  assert.deepEqual(missing, [], 'names the guard still reads without reading the file');
+});
+
+test('#904: the spellings the name reading folds, behind other wrappers and in a pipe, are refused too (the file is read where the word names it)', () => {
+  const rows = [
+    ['./env foo', 'env', './env', 'env'], ['bin/npx foo', 'bin/npx', 'bin/npx', 'npx'], ['/work/repo/bin/nohup foo', 'bin/nohup', '/work/repo/bin/nohup', 'nohup'],
+    ['./timeout 5 foo', 'timeout', './timeout', 'timeout'], ['./sudo foo', 'sudo', './sudo', 'sudo'], ['./command foo', 'command', './command', 'command'], ['./builtin foo', 'builtin', './builtin', 'builtin'],
+    ['echo a | ./xargs foo', 'xargs', './xargs', 'xargs'], ['./npm exec foo', 'npm', './npm', 'npm'], ['./ENV foo', 'ENV', './ENV', 'env'], ['./env.exe foo', 'env.exe', './env.exe', 'env'],
+    ['./Node x.mjs', 'Node', './Node', 'node'], ['./node.cmd x.mjs', 'node.cmd', './node.cmd', 'node'], ['nohup ./env x', 'env', './env', 'env'], ['sudo ./time x', 'time', './time', 'time'],
+    ['env FOO=1 ./nohup x', 'nohup', './nohup', 'nohup'], ['echo hi | ./sh', 'sh', './sh', 'sh'], ['./bash -c "echo hi"', 'bash', './bash', 'bash'], ['./python3.12 x.py', 'python3.12', './python3.12', 'python3.12'],
+  ];
+  for (const [line, at, word, name] of rows) {
+    for (const text of [HARMLESS_TEXT, `#!/bin/sh\n${PUSH_G}\n`]) {
+      const v = evaluate(line, withFiles({ [at]: text }));
+      assert.equal(v.decision, 'deny', `${line} (${text.length} chars)`);
+      assert.match(v.reason, namedLike(word, name), line);
+    }
+  }
+});
+
+test('#904: ./git, ./gh, ./cd and the variable builtins run by path are looked up the same way (the command loop took them by name before any file reading)', () => {
+  const names = [...new Set([...VAR_BUILTINS, ...DIR_CHANGERS, 'git', 'gh', 'for'])];
+  for (const n of names) {
+    for (const args of ['status', 'pr list', 'sub', 'X=1', 'x in a b']) {
+      const v = evaluate(`./${n} ${args}`, withFiles({ [n]: HARMLESS_TEXT }));
+      assert.equal(v.decision, 'deny', `./${n} ${args}`);
+      assert.match(v.reason, namedLike(`./${n}`, n), `./${n} ${args}`);
+    }
+  }
+});
+
+test('#904: the directory the program is looked up in: where the wrapper starts, and after a wrapper\'s own change of directory', () => {
+  const at = (files, line) => evaluate(line, withFiles(files));
+  for (const line of ['./env -C /tmp x', './sudo -D sub x', './env -C sub x']) assert.match(at({ env: HARMLESS_TEXT, sudo: HARMLESS_TEXT }, line).reason ?? '', /is run by its path but named like/, line);
+  // `env -C sub ./git status` runs ./git in sub: that is the file looked up
+  const v = at({ 'sub/git': HARMLESS_TEXT }, 'env -C sub ./git status');
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, namedLike('./git', 'git'));
+  // control, as on main: a plain program run by path under `env -C sub` is looked up at the root only (a G-holding ./tool at the root is not the one that runs)
+  assert.equal(at({ tool: `#!/bin/sh\n${PUSH_G}\n` }, 'env -C sub ./tool').decision, 'allow');
+});
+
+test('#904: a path the guard can resolve is judged like the literal (`$HOME/bin/env`, `~/bin/env`, `D=bin; $D/env`); one it cannot keeps the parity of a plain `$X/tool`', () => {
+  const home = { '/home/u/bin/env': HARMLESS_TEXT };
+  for (const line of ['$HOME/bin/env foo', '${HOME}/bin/env foo', '~/bin/env foo']) {
+    const v = evaluate(line, withFiles(home));
+    assert.equal(v.decision, 'deny', line);
+    assert.match(v.reason, /is run by its path but named like the `env` command/, line);
+  }
+  for (const [line, f] of [['D=bin; $D/env foo', { 'bin/env': HARMLESS_TEXT }], ['D=bin; "$D"/node x.mjs', { 'bin/node': HARMLESS_TEXT }]]) {
+    const v = evaluate(line, withFiles(f));
+    assert.equal(v.decision, 'deny', line);
+    assert.match(v.reason, /is run by its path but named like the `(?:env|node)` command/, line);
+  }
+  // parity: `$PWD/tool` is not resolved today, so `$PWD/env` is not either
+  assert.equal(evaluate('$PWD/tool foo', withFiles({ tool: `#!/bin/sh\n${PUSH_G}\n` })).decision, 'allow');
+  assert.equal(evaluate('$PWD/env foo', withFiles({ env: HARMLESS_TEXT })).decision, 'allow');
+});
+
+test('#904: what counts as text: an empty file, a node shebang outside node_modules and a text file over the read cap are refused; the head decides', () => {
+  assert.match(evaluate('./env foo', withFiles({ env: '' })).reason ?? '', /named like the `env` command/, 'an empty file');
+  assert.match(evaluate('./npx foo', withFiles({ npx: '#!/usr/bin/env node\nconsole.log(1)\n' })).reason ?? '', /named like the `npx` command/, 'any text counts, whatever its shebang');
+  const big = { readText: () => null, pathExists: (p) => p === resolve('/work/repo/env'), readHead: () => '#!/usr/bin/env node\n// a generated bundle' };
+  assert.match(evaluate('./env foo', big).reason ?? '', /named like the `env` command/, 'over the cap');
+});
+
+test('#904: a program the line writes first is refused like the one on disk (`cp x.sh ./env && ./env foo`), and an unknown directory is not looked into when the spelling already says node_modules', () => {
+  for (const line of ['cp x.sh ./env && ./env foo', 'cp x.sh ./env; ./env foo', 'echo ok > ./env && ./env foo']) {
+    const v = evaluate(line, withFiles({ 'x.sh': `#!/bin/sh\n${PUSH_G}\n` }));
+    assert.equal(v.decision, 'deny', line);
+    assert.match(v.reason, namedLike('./env', 'env'), line);
+  }
+  // the unknown directory: a node_modules program is allowed without a lookup; any other program is refused as `./tool` is
+  for (const line of ['cd "$X" && ./node_modules/.bin/npx foo', 'cd "$X" && ./node_modules/.bin/node --version']) assert.equal(evaluate(line).decision, 'allow', line);
+  assert.match(evaluate('cd "$X" && ./env foo').reason, /cannot tell which directory/);
+  // the bare spelling (no leading dot) is the same program; a `..` segment may leave node_modules, so it gets no spelling shortcut
+  assert.equal(evaluate('cd "$X" && node_modules/.bin/node --version').decision, 'allow', 'node_modules at the start of the word');
+  assert.match(evaluate('cd "$X" && ./node_modules/../env foo').reason, /cannot tell which directory/);
+  assert.match(evaluate('./node_modules/../env foo', withFiles({ env: HARMLESS_TEXT })).reason ?? '', namedLike('./node_modules/../env', 'env'), 'a known directory: looked up, the text file is refused');
+  assert.match(evaluate('.\\env foo', withFiles({ '.\\env': HARMLESS_TEXT })).reason ?? '', namedLike('.\\env', 'env'), 'a Windows path word is a path');
+  // the parent directory before node_modules is no traversal out of it; an escaped `..` (the shell may strip the escapes) gets no spelling shortcut
+  assert.equal(evaluate('cd "$X" && ../node_modules/.bin/node --version').decision, 'allow', 'a leading ..');
+  assert.match(evaluate('cd "$X" && ./node_modules/\\.\\./env foo').reason ?? '', /cannot tell which directory/, 'an escaped ..');
+  assert.match(evaluate('cd "$X" && ./node_modules/../env foo').reason ?? '', /cannot tell which directory/, 'a plain ..');
+  assert.equal(evaluate('cd "$X" && \'.\\node_modules\\.bin\\node.cmd\' --version').decision, 'allow', 'a quoted Windows node_modules path');
+  assert.match(evaluate('cd "$X" && ./tool foo').reason, /cannot tell which directory/, 'the reference: a plain program');
+  // accepted refusal (owner 11-28): a virtualenv interpreter after a cd the guard cannot follow
+  assert.match(evaluate('cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m pytest').reason, /cannot tell which directory/);
+});
+
+test('#904: a plain Windows path program word keeps its verdict from before the change: not read as a script file, so a text file under it is no refusal (the failure: every Windows program word became a file the guard reads as a POSIX script)', () => {
+  assert.equal(evaluate('.\\build.cmd x', withFiles({ '.\\build.cmd': `#!/bin/sh\n${PUSH_G}\n` })).decision, 'allow');
+});
+
+// ---- #904 (allow side and regression controls): what the refusal must not touch --------------------------------------------------------------------------------------
+const BIN_FILE = 'MZ\u0000\u0000';
+test('#904: a binary, a node_modules program, a missing file, a directory and the system spellings keep their verdicts (no new refusal of an everyday program)', () => {
+  const ok = (line, files = {}, o = {}) => assert.equal(evaluate(line, { ...withFiles(files), ...o }).decision, 'allow', line);
+  ok('./node x.mjs', { node: BIN_FILE });
+  ok('.venv/bin/python x.py', { '.venv/bin/python': BIN_FILE });
+  ok('./node_modules/.bin/tsx x.ts', { 'node_modules/.bin/tsx': '#!/usr/bin/env node\nconsole.log(1)\n' });
+  // an nvm-style bin/npx: a link whose target is under node_modules (npm's own npx-cli.js)
+  ok('bin/npx prettier .', { 'bin/npx': '#!/usr/bin/env node\nrequire("../lib/cli.js")()\n' }, { realpath: (p) => (p === resolve('/work/repo', 'bin/npx') ? '/home/u/.nvm/versions/node/v20/lib/node_modules/npm/bin/npx-cli.js' : p) });
+  ok('./env x'); // missing
+  ok('./env x', { env: HARMLESS_TEXT }, { readDir: (p) => (p === resolve('/work/repo/env') ? [] : null) }); // a directory
+  for (const line of ['/usr/bin/env node x.mjs', "/bin/bash -c 'echo hi'", '/opt/homebrew/bin/timeout 5 ls', 'env FOO=1 ls', 'npx prettier .']) ok(line);
+  // the environment and startup words around a binary ./env change nothing: the same verdict as without the mark
+  ok('./env GH_REPO=o/other x', { env: BIN_FILE });
+  ok('BASH_ENV=evil.sh ./env x', { env: BIN_FILE });
+});
+
+test('#904: the by-name reading is kept in front of the refusal\'s reach: a guarded string behind a binary wrapper or a node_modules npx is still read by name', () => {
+  const v = evaluate(`bin/env sh -c '${PUSH_G}'`, withFiles({ 'bin/env': BIN_FILE }));
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /sh was given a string that contains a guarded command/);
+  const w = evaluate(`./node_modules/.bin/npx -c '${PUSH_G}'`, withFiles({ 'node_modules/.bin/npx': HARMLESS_TEXT }));
+  assert.equal(w.decision, 'deny');
+  assert.match(w.reason, /was given a string that contains a guarded command/);
 });
 
 test('string-running wrappers are unwrapped or scanned', () => {

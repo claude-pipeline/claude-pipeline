@@ -778,6 +778,53 @@ test('23c. when the rename keeps failing, release unlinks owner.json and removes
   }
 });
 
+// #924: a caller with a time limit (the live-db hook) passes an absolute deadline; a busy rename stops being retried once waiting again would end past it.
+// Failure caught: a reclaim / release on Windows spending the full 40 x 50 ms retry budget per filesystem call (about 2 s each) after the hook's one-second budget was already used, so the host times the hook out (which it treats as an allow).
+test('23d. a deadline stops the busy-rename retries early (reclaim and release); without one the whole retry budget is spent as before', (t) => {
+  const saved = { ..._tuning };
+  Object.assign(_tuning, { waitMs: 20, attempts: 40 }); // the production budget in 20 ms steps: 40 attempts = about 800 ms
+  try {
+    // reclaim of a stale lock: the busy error surfaces at the deadline
+    const dir = tmpDir();
+    staleLock(dir);
+    let calls = 0;
+    const m = t.mock.method(fs, 'renameSync', () => {
+      calls++;
+      throw errWith('EBUSY');
+    });
+    let started = Date.now();
+    assert.throws(() => tryAcquire('db', { dir, runId: 'fresh', deadline: started + 100 }), (e) => e.code === 'EBUSY');
+    assert.ok(calls <= 8 && Date.now() - started < 600, `gave up at the deadline (calls ${calls}, ${Date.now() - started} ms)`);
+    // an already-passed deadline: one attempt per operation (the lock's rename and the guard's release rename), no wait
+    calls = 0;
+    assert.throws(() => tryAcquire('db', { dir, runId: 'fresh', deadline: Date.now() - 1 }), (e) => e.code === 'EBUSY');
+    assert.equal(calls, 2);
+    // release: the rename retries stop at the deadline, then the unlink fallback frees the lock as it always did
+    m.mock.restore();
+    const held = tryAcquire('db', { dir: tmpDir() }).lock;
+    calls = 0;
+    t.mock.method(fs, 'renameSync', () => {
+      calls++;
+      throw errWith('EBUSY');
+    });
+    started = Date.now();
+    assert.equal(release(held, { deadline: started + 100 }), true);
+    assert.ok(calls <= 8 && Date.now() - started < 600, `release gave up at the deadline (calls ${calls}, ${Date.now() - started} ms)`);
+    // no deadline: the retry budget is spent in full (control)
+    t.mock.restoreAll();
+    const again = tryAcquire('db', { dir: tmpDir() }).lock;
+    calls = 0;
+    t.mock.method(fs, 'renameSync', () => {
+      calls++;
+      throw errWith('EBUSY');
+    });
+    assert.equal(release(again), true);
+    assert.equal(calls, 40, 'no deadline: every attempt is made');
+  } finally {
+    Object.assign(_tuning, saved);
+  }
+});
+
 test('24. owner.json unreadable for a reason other than "missing" is rethrown, never treated as reclaimable', (t) => {
   const dir = tmpDir();
   const lockPath = plantLock(dir, 'db', ownerRecord('db', { pid: deadPid(), runId: 'crashed' }), { ageMs: DAY });

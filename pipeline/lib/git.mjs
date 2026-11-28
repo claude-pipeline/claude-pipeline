@@ -17,6 +17,8 @@ import { MAX_BLOCKS, SearchCap, checkSelection, committedBlock, isMarkerLine, ma
 
 // Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
 export const NETWORK_TIMEOUT_MS = 120_000;
+// Upper bound for a local plumbing call that runs while a lock is held (hash-object, write-tree, rev-parse, ...): a stuck child must not hold the lock forever (#964).
+export const LOCAL_TIMEOUT_MS = 30_000;
 
 // `abnormal: true` = the child did not finish on its own (timed out, killed by a signal, or its output went past the buffer limit): its
 // `code` is not git's answer (a SIGKILLed git reports 1, git's own "no match"), so a catch that maps a code to an answer must test it.
@@ -729,7 +731,17 @@ export function currentBranch(o) {
   return ref === null ? 'HEAD' : ref.trim().replace(/^refs\/heads\//, '');
 }
 
-export const isClean = (o) => git(['status', '--porcelain=v1', '-uall'], o) === '';
+// With `ref`, HEAD must also BE that commit: HEAD and the cleanliness are read in ONE status call (`# branch.oid` plus any change or untracked
+// entry), so a reset to another commit and back around the check cannot pass (a status check alone does, when the staged changes equal that
+// commit's tree; and a separate `git diff <ref>` never lists untracked files).
+export function isClean(o, ref) {
+  if (ref === undefined) return git(['status', '--porcelain=v1', '-uall'], o) === '';
+  assertRef(ref, ['status', '--porcelain=v2', '--branch', ref]);
+  const lines = git(['status', '--porcelain=v2', '--branch', '-uall'], o).split('\n').filter((l) => l !== '');
+  if (!(lines.some((l) => l === `# branch.oid ${ref}`) && lines.every((l) => l.startsWith('# ')))) return false;
+  // R4-B1: one status call resolves HEAD twice, so a branch that moved during its scan can show `ref` with no entries for another tree: the index and the working tree are also compared with the fixed commit (exit 1 = differs; anything else throws)
+  return gitOrNull(['diff', '--quiet', ref, '--'], 1, o) !== null && gitOrNull(['diff', '--cached', '--quiet', ref, '--'], 1, o) !== null;
+}
 
 export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref, ['rev-parse', '--verify', ref])], o).trim();
 

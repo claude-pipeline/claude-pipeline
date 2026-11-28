@@ -406,9 +406,10 @@ function takeRegistryLock({ home, leftMs, io = {} }) {
   const wait = Math.min(io.registryLockWaitMs ?? REGISTRY_LOCK_WAIT_MS, typeof leftMs === 'function' ? leftMs() - AUTO_MIN_CLAIM_MS : Infinity);
   if (!(wait > 0)) return null;
   const started = performance.now();
+  const deadline = Date.now() + wait; // #924: a busy rename inside the lock helper stops retrying here too (it then throws: no lock, the same path as a lock that stayed held)
   for (;;) {
     try {
-      const r = tryAcquire('db-refs', { dir: path.join(stateDir, 'locks'), machineId: readMachineId({ stateDir }) });
+      const r = tryAcquire('db-refs', { dir: path.join(stateDir, 'locks'), machineId: readMachineId({ stateDir }), deadline });
       if (r.acquired) return r.lock;
     } catch {
       return null;
@@ -504,7 +505,8 @@ function autoCheck({ home, entry, server, name, query, session, now, leftMs, env
     if (marked && (fresh.deployEnv !== entry.deployEnv || fresh.deployBot !== entry.deployBot)) return notEligible('the owner changed the after-deploy registration during the check: call again, or ask for the owner\'s go');
     next = claimNext({ home, via: 'auto', session, now, facts, seen: h, leftMs, io });
   } finally {
-    if (lock !== null) { try { release(lock); } catch { /* a failed release must not turn an allow into a throw; the lock goes stale with this process */ } }
+    // #924: the release stops retrying a busy rename once the call's time is up (the call's own time, not the retry budget)
+    if (lock !== null) { try { release(lock, { deadline: typeof leftMs === 'function' ? Date.now() + leftMs() : undefined }); } catch { /* a failed release must not turn an allow into a throw; the lock goes stale with this process */ } }
   }
   if (next.status === 'claimed') {
     // The go path claims its marker and then re-reads the history; this side claims the generations and then re-reads the markers: in every interleaving one of the two sees the other.

@@ -35,6 +35,7 @@ const PARTS = {
   round: () => roundAsk({ repo: REPO, pr: 58, line: roundRequest(58, 4, GHEAD, REPO) }),
   ruling: () => rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1', 'R2-S3'], line: rulingRequest(58, ['R1-B1', 'R2-S3'], REPO, 'c0ffee000000') }),
   'ruling-v2': () => rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1', 'R2-S3'], line: rulingRequestWithRow(rulingWhyRow('accept', 'real-problem'), 58, ['R1-B1', 'R2-S3'], REPO, 'c0ffee000000'), variant: 'ruling-v2-accept' }),
+  'ruling-v2-reject': () => rulingAsk({ repo: REPO, pr: 58, ids: ['R1-B1', 'R2-S3'], line: rulingRequestWithRow(rulingWhyRow('reject', 'not-a-bug'), 58, ['R1-B1', 'R2-S3'], REPO, 'c0ffee000000'), variant: 'ruling-v2-reject' }),
   many: () => mergeManyAsk({ repo: REPO, entries: [58, 59].map((n) => ({ pr: n, lines: [`#${n} head ${HEAD.slice(0, 12)} · items ${ITEMS} · repo ${REPO}`] })), ready: '🔀 Ready to merge #58, #59 — say "merge"' }),
 };
 
@@ -151,6 +152,19 @@ test('a pending click on a v2 ruling ask names the quote of each deciding label 
   const q = { repo: REPO, pr: 58, quote: 'R1-B1: accept, R2-S3: accept', decision: 'ACCEPT', contentOf: () => 'c0ffee000000', home: w.home, now: w.now };
   assert.equal(ownerRuled({ ...q, id: 'R1-B1' }), true);
   assert.equal(ownerRuled({ ...q, id: 'R2-S3' }), true);
+});
+
+test('a pending click on a ruling-v2-reject ask names the quote of each deciding label (Reject all (Recommended) too) and settles through ownerRuled as a typed reject would', async (t) => {
+  // failure caught (#944): the pending path not knowing the reject variant, so a click on "Reject all (Recommended)" captured while the answer entry was still being written never settles into a ruling
+  const w = pw(t, { kind: 'ruling-v2-reject', answer: 'Reject all (Recommended)' });
+  const r = await w.hook();
+  assert.deepEqual(r.pending, { ...w.expectedPending, variant: 'ruling-v2-reject', quotes: { 'Reject all (Recommended)': 'R1-B1: reject, R2-S3: reject', 'Accept all': 'R1-B1: accept, R2-S3: accept', 'Follow-up all': 'R1-B1: follow-up, R2-S3: follow-up' } });
+  w.flush();
+  assert.equal(w.settle().outcomes[0]?.outcome, 'recorded');
+  const q = { repo: REPO, pr: 58, quote: 'R1-B1: reject, R2-S3: reject', decision: 'REJECT', contentOf: () => 'c0ffee000000', home: w.home, now: w.now };
+  assert.equal(ownerRuled({ ...q, id: 'R1-B1' }), true);
+  assert.equal(ownerRuled({ ...q, id: 'R2-S3' }), true);
+  assert.equal(ownerRuled({ ...q, id: 'R1-B1', decision: 'ACCEPT', quote: 'R1-B1: accept, R2-S3: accept' }), false, 'only the clicked answer is a ruling');
 });
 
 test('the immediate path stays: an entry already there is recorded at once, no pending file, no extra wait', async (t) => {

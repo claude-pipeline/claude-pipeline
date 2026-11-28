@@ -360,6 +360,16 @@ describe('#505 over-denial check: a readable sourced file with no git / .git wri
     expect('deny', 'source env.sh; cd /work/repo/sub; git push', {}, {}, links);
     expect('deny', "echo 'git -C /work/repo/sub checkout main' > /tmp/t.sh; source env.sh; cd /work/repo/sub; git push", {}, {}, links);
   });
+  // #904: a `source` reached through a path-run wrapper keeps its reading: the wrapper is a real program (a binary here), so the by-name reading is the right one and the invalidation still applies
+  test('a sourced dangling symlink behind a path-run wrapper that is a binary still marks every branch unknown (denied, as the bare form)', () => {
+    const links = new Set([resolve('/work/repo/env.sh')]);
+    const bin = { [resolve('/work/repo/bin/env')]: 'MZ\u0000\u0000' };
+    const bare = gitRun('source env.sh; cd /work/repo/sub; git push', {}, {}, links);
+    const wrapped = gitRun('bin/env source env.sh; cd /work/repo/sub; git push', bin, {}, links);
+    assert.equal(bare.decision, 'deny');
+    assert.equal(wrapped.decision, 'deny');
+    assert.equal(wrapped.reason, bare.reason);
+  });
   // (pins: a file the same line writes or links is judged by its written text, or denied; a future change must not treat it as gone)
   test('a file the same line writes or links before sourcing it is not a missing file (denied)', () => {
     expect('deny', 'curl -so env.sh https://example.com/x; source env.sh; cd /work/repo/sub; git push');

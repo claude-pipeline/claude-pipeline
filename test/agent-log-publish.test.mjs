@@ -10,7 +10,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { cli, AGENT_LOG } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { git as gitRun, GitError } from '../pipeline/lib/git.mjs';
+import { git as gitRun, GitError, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from '../pipeline/lib/git.mjs';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
 import { PLANTED, makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
 import { AGENT_LOG_BRANCH, AGENT_LOG_HEADER, assertSafeLogTarget, logRelPath, publishLines } from '../pipeline/lib/agentlog.mjs';
@@ -437,6 +437,48 @@ test('the plumbing runs in a temp index: GIT_INDEX_FILE is set for the plumbing 
   for (const verb of ['checkout', 'add', 'commit', 'reset', 'worktree', 'branch', 'update-ref', 'merge', 'switch']) {
     assert.equal(seen.some((s) => s.args.includes(verb) && s.args[0] === verb), false, `no git ${verb}`);
   }
+});
+
+// #964: a git child that never returns (a stuck hash-object) held the agent-log queue lock for hours; every local call is now bounded.
+test('every git call a publish makes under the queue lock carries a timeout, and a hung local call surfaces as a GitError (lines stay queued)', () => {
+  const w = world();
+  const seen = [];
+  const gitFn = (args, o) => { seen.push({ verb: args.find((a) => /^[a-z-]+$/.test(a) && !a.startsWith('commit.')), timeoutMs: o.timeoutMs }); return gitRun(args, o); };
+  publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L1], defaultBranch: 'main', gitFn });
+  const untimed = seen.filter((s) => !(s.timeoutMs > 0)).map((s) => s.verb);
+  assert.deepEqual(untimed, [], 'a call without timeoutMs can hang forever inside the lock');
+  assert.ok(seen.some((s) => s.verb === 'hash-object' && s.timeoutMs === LOCAL_TIMEOUT_MS), 'local plumbing uses LOCAL_TIMEOUT_MS');
+  assert.ok(LOCAL_TIMEOUT_MS < NETWORK_TIMEOUT_MS);
+
+  // the timeout git.mjs raises for a killed child: publishLines throws it (the command maps a GitError to exit 3, lines kept queued)
+  // and it is tried ONCE: a local timeout is no network blip, so the lock is not held for two more 30 s tries
+  let hashes = 0;
+  const sleeps = [];
+  const hung = (args, o) => {
+    if (args[0] === 'hash-object') { hashes += 1; throw new GitError({ args, code: 1, stderr: 'timed out', abnormal: true }); }
+    return gitRun(args, o);
+  };
+  assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn: hung, sleepFn: (ms) => sleeps.push(ms) }), (e) => e instanceof GitError && e.abnormal === true);
+  assert.equal(hashes, 1, 'a hung local call is not retried');
+  assert.deepEqual(sleeps, []);
+});
+
+// #964 review: a timed-out `git var` says nothing about the configured identity; it must not publish the line under the fallback author.
+test('a timeout in the identity lookup is an error (line stays queued), not the fallback identity; a missing identity still falls back', () => {
+  const w = world();
+  const timedOut = (args, o) => {
+    if (args[0] === 'var') throw new GitError({ args, code: 1, stderr: 'timed out', abnormal: true });
+    return gitRun(args, o);
+  };
+  assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L1], defaultBranch: 'main', gitFn: timedOut, sleepFn: () => {} }), (e) => e instanceof GitError && e.abnormal === true);
+  assert.equal(w.repo.git(['ls-remote', '--heads', 'origin', AGENT_LOG_BRANCH]).trim(), '', 'nothing was pushed');
+  // no identity configured (git var exits 128): the fallback stands
+  const missing = (args, o) => {
+    if (args[0] === 'var') throw new GitError({ args, code: 128, stderr: 'fatal: unable to auto-detect email address' });
+    return gitRun(args, o);
+  };
+  const r = publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L1], defaultBranch: 'main', gitFn: missing });
+  assert.equal(r.pushed, true);
 });
 
 test('close reads the log branch copy: a pending line that only lives on pipeline-agent-log is found', () => {

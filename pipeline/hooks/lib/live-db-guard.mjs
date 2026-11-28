@@ -74,6 +74,39 @@ export function supabaseMatch(tool, state, ti, ctx) {
 }
 export const isSupabaseTool = (tool, state, ti, ctx) => !!supabaseMatch(tool, state, ti, ctx);
 
+// The most screen rows of block the progress-note fallback accepts on the dialog alone: a dialog taller than a terminal screen may clip, and the owner must have read every line of the SQL (a longer block needs
+// the reply text or the typed go). Rows, not newlines (R2-B1: one 4000-character line is 50 rows in an 80-column terminal). A deliberate UPPER bound, whichever way the dialog wraps: each line counts the larger of
+// its hard-wrap rows and its greedy word-wrap rows (R3-F1), and a character outside printable ASCII counts 2 columns (wide glyphs, R3-B1), a tab 8; every whitespace column counts (R4-B2).
+const PROGRESS_NOTE_BLOCK_MAX_ROWS = 40;
+const PROGRESS_NOTE_COLUMNS = 80;
+const colsOf = (s) => { let n = 0; for (const ch of s) n += ch === '\t' ? 8 : ch >= ' ' && ch <= '~' ? 1 : 2; return n; };
+// R4: a 2-column glyph cannot straddle the last column, so where a line is split mid-token a row holds only W - 1 columns once the line has one (R4-B1). The word-wrap pass walks tokens made of a run of
+// whitespace plus the word after it, so leading, repeated, trailing and tab whitespace all count and travel with their word to the next row (R4-B2); a token wider than a row is split hard.
+const rowsOfLine = (line) => {
+  const W = PROGRESS_NOTE_COLUMNS;
+  const wide = [...line].some((ch) => ch !== '\t' && (ch < ' ' || ch > '~'));
+  const hardWidth = wide ? W - 1 : W;
+  const hard = Math.ceil(Math.max(1, colsOf(line)) / hardWidth);
+  // Two greedy models, the larger counts: the whitespace run travels with its word (a wrapper that keeps indentation at the start of the next row), or it stays on the row it ends and only the word moves.
+  const walk = (tokens) => {
+    let rows = 1;
+    let col = 0;
+    for (const token of tokens) {
+      const w = colsOf(token);
+      if (col > 0 && col + w > W) { rows += 1; col = 0; }
+      if (w > W) { const parts = Math.ceil(w / hardWidth); rows += parts - 1; col = w - (parts - 1) * hardWidth; } else col += w;
+    }
+    return rows;
+  };
+  // (R5-B1: and a third model that breaks only at ordinary spaces, so a Unicode space is never a break there)
+  return Math.max(hard, walk(line.match(/\s*\S+|\s+/gu) ?? []), walk(line.match(/\s+|\S+/gu) ?? []), walk(line.match(/ *[^ ]+| +/gu) ?? []));
+};
+const ODD_SPACE = /(?![ \n])[\s\p{Z}\p{Cc}\p{Cf}]/u;
+const renderedRows = (text) => {
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n');
+  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+  return lines.reduce((n, l) => n + rowsOfLine(l), 0);
+};
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });
 const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
@@ -112,7 +145,21 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
       if (clickProvenance(r, { home }) !== 'owner') { skip('unverified', 'the owner\'s click on the live-database dialog cannot be verified from the transcript: ask the owner to type the go instead'); continue; }
       if (r.transcript_path !== transcriptPath) { skip('unverified', 'the recorded click is from another transcript than this call\'s'); continue; }
       // R6-F1: as for the typed go, the owner must have been shown the whole block in the reply: the text right before the AskUserQuestion call ends with the block the dialog carries.
-      const shown = replyBeforeToolUse(transcriptPath, r.ask.toolUseId);
+      let shown = replyBeforeToolUse(transcriptPath, r.ask.toolUseId);
+      // #983: Claude Code sometimes records no text before the call, only a progress note (a `thinking` block). The owner then read the block in the dialog's own question (clickProvenance above proved the
+      // transcript's question is the ask file's), so that question's block, rebuilt by the same verifyBlock, stands in for the reply. Only this case: any other refusal reason stays.
+      if (shown.text === undefined && shown.progressNote === true) {
+        const asked = readAsk(r.ask.askId, { home });
+        const q = asked.ok ? String(asked.ask?.dialog?.question ?? '') : '';
+        const cut = q.indexOf('\n\n');
+        if (cut >= 0) {
+          const body = q.slice(cut + 2);
+          const dv = verifyBlock(body, { home, io });
+          // R1-B2: the body must BE the block (nothing before it); R1-F1: and short enough that the dialog shows it whole (longer ones need the reply text or the typed go)
+          // R5-B1: and only plain spaces and newlines as whitespace or control characters (tabs, NBSP, other Unicode spaces, zero-width marks wrap in terminal-specific ways the row estimate cannot bound)
+          shown = dv.ok && dv.leading === 0 && !ODD_SPACE.test(body) && renderedRows(body) <= PROGRESS_NOTE_BLOCK_MAX_ROWS ? { text: body } : { reason: `${shown.reason}; the dialog's own question is not a block of at most ${PROGRESS_NOTE_BLOCK_MAX_ROWS} screen rows (${PROGRESS_NOTE_COLUMNS} columns), with only plain spaces, and nothing else` };
+        }
+      }
       const sv = shown.text === undefined ? null : verifyBlock(shown.text, { home, io });
       const sf = sv?.fields;
       if (!sv?.ok || sf.op !== r.op || sf.ref !== r.projectRef || sf.sqlSha256 !== r.sqlSha256 || sf.head !== r.head || sf.file !== r.file || sf.repo !== r.repo || sf.name !== r.name) {

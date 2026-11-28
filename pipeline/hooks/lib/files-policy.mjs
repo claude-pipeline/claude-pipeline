@@ -25,7 +25,7 @@ import { evaluateSupabaseMcp, findLiveDbCli, serverSegment, supabaseMatch } from
 import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, WRAPPER_NAMES, SHELLS, NAME_DISPATCHED, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, rememberExpansions, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -4436,6 +4436,40 @@ function judgeSqlLines(sf, dirs, ctx, opts) {
 const inNodeModules = (abs, opts) => /\/node_modules\//.test(abs) && !(opts?._pkgDir && (abs === opts._pkgDir || abs.startsWith(`${opts._pkgDir}/`)));
 // R17: the directory part of the word a script was started with, as written (`./scripts/run.sh` -> `./scripts`), is a literal cd target (`.` / `..` / `/` `./` `../` prefixed)
 const selfDirLiteral = (w, cdpath) => { const i = w.lastIndexOf('/'); return i >= 0 && cdTargetLiteral(i === 0 ? '/' : w.slice(0, i), cdpath); };
+// (#904) see pathRunRefusal in git-policy.mjs: the same rule, the same reason. The word is looked up in every directory the command may start in (and each joined with the entry's own change of directory); the candidates are the
+// reading the files guard already has of a plain program run by path. Only a modelled write counts (ignoreUnmodelled), so an unrelated program earlier on the line refuses nothing new.
+function pathRunRefusal(entry, dirs, ctx, opts) {
+  const rec = entry.rec;
+  const e = expandRefs(rec.file, ctx);
+  if (/[$`*?[]/.test(e)) return null; // still only known at run time: as a plain `$X/tool`
+  const name = baseOf(rec.file);
+  const P = pathsFor();
+  let starts = dirs;
+  if (typeof entry.chdir === 'string') {
+    const cd = expandRefs(entry.chdir, ctx);
+    if (!/[$`]/.test(cd)) starts = unique([...dirs, ...dirs.map((d) => (isAbs(cd) ? P.normalize(cd) : P.join(d, cd)))]);
+  }
+  const refuse = () => deny(`the program \`${rec.file}\` is run by its path but named like the \`${name}\` command, so the guard reads it as \`${name}\` and never reads the file. Rename the script, or run it as \`sh ${rec.file}\` so the guard can read it.`);
+  const seen = new Set();
+  for (const d of isAbs(e) ? [''] : starts) {
+    checkDeadline(ctx.budget);
+    const abs = isAbs(e) ? P.normalize(e) : P.join(d, e);
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    if (ctx.trusted(abs) || inNodeModules(abs, opts)) continue;
+    if (writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true }) !== null) return refuse();
+    if (!ctx.api.existsSync(abs)) continue;
+    const real = realResolve(abs, ctx.api);
+    if (ctx.trusted(real) || /\/node_modules\//.test(real)) continue;
+    if (ctx.readDir(abs)) continue; // a directory cannot be run
+    let head = ctx.readHead(abs);
+    if (typeof head !== 'string') { const t = ctx.readText(abs); if (typeof t === 'string') head = t.slice(0, 512); }
+    if (typeof head !== 'string') continue; // exists but cannot be read: as a program run by path today
+    if (!head.startsWith('#!') && head.includes('\u0000')) continue; // a binary
+    return refuse();
+  }
+  return null;
+}
 // One existing script file (`abs`, found in directory `dir`).
 function judgeFoundScript(sf, abs, dir, ctx, opts) {
   if (ctx.trusted(abs) || ctx.trusted(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) return null;
@@ -4985,10 +5019,42 @@ function sourcedEffects(text, ctx, depth = 0, seenFiles = new Set(), rep = false
 // Why: an agent writes a file it wants through code it controls (`node -e`, `python -c`, a script an interpreter runs, npx / npm / make recipes) or names the file: on such a
 // line the real home's startup file is taken to be rewritable by any program the guard does not model, as for every other file (see sourcedTexts)
 const STEERABLE = /^(?:node|nodejs|deno|bun|bunx|tsx|ts-node|python\d*(?:\.\d+)*|pypy\d*|ruby|perl|php|lua|Rscript|osascript|npx|npm|pnpm|pnpx|yarn|make|gmake|just|task|go|cargo|java|dotnet|swift|xargs|parallel|env|sudo|doas|nohup|timeout|nice|time|command|builtin|exec|eval|source|\.)$/;
+// #965: a program named `"$DIR/tool"` / `"$DIR"/tool` (the variable is only its directory, the file name is literal) or `"$PROG"` (a name the frame sets once, to a path whose file name is literal and no code
+// runner) is named as plainly as the literal path is: the `$` there does not make the command a code runner (the install script's `"$BIN/helper" version` after a `launchctl` line was refused). Quoted,
+// so it cannot split into words. Any other `$` or backtick in the command word may be the program itself.
+const QUOTED_VAR_PROGRAM = /^"\$(?:\{(\w+)\}|(\w+))(?:"(\/[^\s"'$`\\*?[{]+)?|(\/[^\s"'$`\\*?[{]+)")$/;
+// (by CLASS of name: a program that starts other programs -- a wrapper the parser unwraps, a shell, a name interpretWords dispatches on (find, tmux, a SQL client ...), an interpreter that is no inline runner (runsInlineCode judges those), a steerable runner -- is read by the parser only under its literal name, so a name held in a variable hides what it runs)
+const startsPrograms = (n) => STEERABLE.test(n) || WRAPPER_CMDS.has(n) || WRAPPER_NAMES.includes(n) || SHELL_NAMES.has(n) || SHELLS.has(n) || NAME_DISPATCHED.has(n) || (INTERPRETERS.test(n) && !INLINE_RUNNERS.test(n));
+function plainVarProgram(word, c, cmds, ctx) {
+  const m = QUOTED_VAR_PROGRAM.exec(word);
+  if (!m) return false;
+  if (m[3] !== undefined || m[4] !== undefined) return !startsPrograms(baseOf(m[3] ?? m[4])); // (a literal tail: its file name is judged as written, and is no program that starts others)
+  const n = m[1] ?? m[2];
+  // (the one assignment-only command of the frame that gives the name, and it surely ran before this use, at its level: not a prefix of another command, not after the use, not in a branch, loop, function or subshell)
+  const sites = cmds.filter((x) => Object.hasOwn(x.env ?? {}, n));
+  const at = cmds.indexOf(c);
+  const site = sites.length === 1 ? cmds.indexOf(sites[0]) : -1;
+  const x = cmds[site];
+  if (site < 0 || at < 0 || site >= at || x.argv.length || x.sep === '&&' || x.sep === '||' || x.sep === '|' || x.maybeBg === true || cmds[site + 1]?.sep === '|' || cmds[site + 1]?.sep === '&' || mayNotRun(cmds, flowStart(cmds), site)) return false;
+  // (a name the shell binds by itself or a special one, `$_` / REPLY / OPTARG / PATH ...; any other place that binds the name names it: read / for / export / declare ... bare in a command of the frame, `${N:=x}` / `${N::=x}` through the expansion)
+  if (SPECIAL_NAMES.has(n) || SPECIAL_FAMILIES.test(n) || cmds.some((y) => implicitBindsOf(y).includes(n))) return false;
+  const bare = new RegExp(`(?<![\\w$])(?<!\\$\\{)${n}(?!\\w)`, 'g');
+  const binds = cmds.reduce((k, y) => k + (String(y.raw ?? '').match(bare)?.length ?? 0), 0);
+  if (binds !== 1 || cmds.some((y) => new RegExp(`\\$\\{${n}[^}]*=`).test(String(y.raw ?? '')))) return false;
+  const v = String(x.env[n]);
+  // (the program the name stands for is judged as the command word written out: the file name of a code runner is no plain program, nor is a runner given an inline program)
+  return /\/[^/\s$`\\*?[\]{}()'"~]+$/.test(v) && !startsPrograms(baseOf(v)) && !runsInlineCode({ ...c, argv: [v, ...c.argv.slice(1)] }, ctx);
+}
 function steersWrites(ctx, abs) {
   const name = posix.basename(abs);
   // (the command as written too: npx / env / sudo ... are unwrapped to what they run)
-  return ctx.frames.some((f) => (f.cmds ?? []).some((c) => STEERABLE.test(baseOf(c.argv[0] ?? '')) || STEERABLE.test(baseOf(((c.raw ?? '').trim().split(/\s+/).find((w) => !/^[A-Za-z_]\w*=/.test(w)) ?? '').replace(/^['"]|['"]$/g, ''))) || runsInlineCode(c, ctx) || (c.raw ?? '').includes(name) || /[$`]/.test(c.argv[0] ?? '')));
+  return ctx.frames.some((f) => (f.cmds ?? []).some((c) => {
+    // (the command word as written: the keywords a segment may start with (`then`, `do`, `if`, `!` ...) and the prefix assignments come before it, as in git-policy's headResolves)
+    const word = (c.raw ?? '').trim().split(/\s+/).find((w) => !/^[A-Za-z_]\w*=/.test(w) && !/^(?:do|then|else|elif|if|while|until|\{|\(|!)$/.test(w)) ?? '';
+    // (a program named by the variable is plain only where the word is the parsed command word itself: a wrapper the parser unwrapped is not)
+    const plain = word.replace(/"/g, '') === (c.argv[0] ?? '') && plainVarProgram(word, c, f.cmds, ctx);
+    return STEERABLE.test(baseOf(c.argv[0] ?? '')) || STEERABLE.test(baseOf(word.replace(/^['"]|['"]$/g, ''))) || runsInlineCode(c, ctx) || (c.raw ?? '').includes(name) || (/[$`]/.test(c.argv[0] ?? '') && !plain);
+  }));
 }
 
 // The texts of the files a sourced or startup record names (a candidate word is resolved like a script word). unknown: a file that cannot be read, is not
@@ -5552,6 +5618,10 @@ function evaluateBashForFilesFrame(command, opts) {
         if (v) return v;
         if (sf.kind === 'shell' && sourcesHere(c)) absorbSourced(sf, dirs, ctx, repeats(cmds, idx)); // (a sourced file runs in this shell: what it sets is the line's from here)
       }
+      for (const pr of c.pathRuns ?? []) { // (#904: a program run by path whose name the guard reads by name: refused, not read)
+        const v = pathRunRefusal(pr, sdirsNow(), ctx, withLineVars(opts, c));
+        if (v) return v;
+      }
       // #903 A: a setting that gives a package runner its shell text or its shell (before the package-script judgment, so a runner line gets this reason, not the generic mover one)
       if (isRunnerCommand(c, c.argv.map((w) => expandRefs(w, ctx)))) {
         const set = runnerShellSetting([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]);
@@ -5614,9 +5684,14 @@ function evaluateBashForFilesFrame(command, opts) {
   } else {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
     // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
-    for (const c of cmds) {
+    for (const [idx, c] of cmds.entries()) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
+      frame.i = idx; // (#904: a program an earlier command on the line writes is seen by the path-run lookup below)
       if (scriptFileOf(c.argv) || scriptFeedsOf(c).length || pmCall(c.argv)) return deny('scripts run scripts too deeply to check');
+      for (const pr of c.pathRuns ?? []) { // (#904: no content is read, so the refusal test is exact here: a text ./env is refused, a node_modules program is not)
+        const v = pathRunRefusal(pr, dirs, ctx, opts);
+        if (v) return v;
+      }
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup })) {
         if (!st.implicit) return deny('scripts run scripts too deeply to check');
         const v = judgeStartupFile(st);

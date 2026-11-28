@@ -2,9 +2,10 @@
 // cost / guard-block lines of `P summary`. The CLI tests run the real CLI against the scripted gh fake (gate-env).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createCommentsGh } from './helpers/fakegh-env.mjs';
@@ -385,6 +386,9 @@ test('P cost: refuses nothing-to-record and bad amounts with exit 2 and writes n
   assertExit(costCli(s, ['--phase', 'build', '--role', 'judge']), 2);
   assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', '--input', '-5']), 2);
   assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', '--usd', 'abc']), 2);
+  // an unset shell variable (#821 through the amount flags): an empty or blank amount is not 0
+  for (const flag of ['--usd', '--input', '--output', '--cache-read', '--cache-write']) for (const blank of ['', '  ']) assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', flag, blank]), 2);
+  assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', '--input', '5', '--usd', '']), 2);
   assert.equal(s.fake.calls().length, before);
 });
 
@@ -471,6 +475,19 @@ test('P cost --from-transcript: an empty transcript with --session still records
   assert.ok(r.json.warnings.some((w) => /no messages with usage found/.test(w)));
 });
 
+// Issue #821: an unset shell variable (--from-transcript "") counted as spent (!== undefined) but read no file (falsy), so a zero entry was booked with ok:true and exit 0.
+test('P cost --from-transcript: an empty or blank value is refused with exit 2 and nothing is booked (#821)', () => {
+  const s = scenario();
+  const before = s.fake.calls().length;
+  for (const blank of ['', '   ']) {
+    const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', blank]);
+    assertExit(r, 2);
+    assert.match(r.stderr + JSON.stringify(r.json ?? {}), /--from-transcript is empty/);
+  }
+  assertExit(costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '5', '--from-transcript', '']), 2); // a hand amount does not make the empty path acceptable
+  assert.equal(s.fake.calls().length, before, 'no GitHub read or write');
+});
+
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
 test('P cost --from-transcript: booking a continued agent\'s transcript again books only the new usage (total = the whole transcript once)', () => {
   const s = scenario();
@@ -507,6 +524,54 @@ test('P cost: a booking that landed before this call\'s write stays in the total
   assert.deepEqual(mine.json.warnings, []);
 });
 
+// #707: after the repo moved (ianjamila/claude-pipeline -> claude-pipeline/claude-pipeline) a round's bookings seemed to REPLACE the round's usd instead of adding (R11 showed $3.09 for 3 calls,
+// true about $8.22) and the pre-move total stayed under the old slug. #664 (#641) keeps a record whose only mismatch is the repo; this pins it end to end through the real CLI: the old record
+// was written by another host, holds a round with cost and a booked transcript, and four bookings under the live slug (two --usd, a new transcript, the pre-move transcript again) all ADD, and the pre-move transcript is not counted twice.
+test('P cost: a round\'s cost is added to, not replaced, by bookings made under a new repo slug (#707, #641)', () => {
+  const s = scenario();
+  const oldKey = `agent-old.jsonl-${createHash('sha256').update(resolve(s.repo.dir, '.review/agent-old.jsonl')).digest('hex').slice(0, 12)}`;
+  const old = (() => {
+    let r = { ...rec(), repo: 'ianjamila/claude-pipeline' };
+    r = applyCheckpoint(r, { step: 'review', head: s.head }, { host: 'old-mac', now: NOW });
+    const transcript = { key: oldKey, usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, usd: 0.3, byPrice: {} } };
+    r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'review', role: 'judge', round: 11, input: 10, output: 20, cacheRead: 0, cacheWrite: 0, usd: 0.3 }), transcript } }, { host: 'old-mac', now: NOW });
+    r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'build', role: 'implementer', usd: 29.26 - 0.3 }) } }, { host: 'old-mac', now: NOW });
+    r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'review', role: 'judge', round: 11, usd: 1.84 }) } }, { host: 'old-mac', now: NOW });
+    return r;
+  })();
+  assert.equal(old.repo, 'ianjamila/claude-pipeline');
+  assert.deepEqual([old.cost.total.usd, old.cost.byRound['11'].usd, old.cost.byRound['11'].calls], [31.1, 2.14, 2]);
+  withComment(s, existing(old));
+  s.repo.write('.review/agent-old.jsonl', `${JSON.stringify({ message: { id: 'm1', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  s.repo.write('.review/agent-new.jsonl', `${JSON.stringify({ message: { id: 'n1', usage: { input_tokens: 7, output_tokens: 9 } } })}\n`);
+  // [args, usd the call adds]: the new transcript has no price (no model), the pre-move one is already in the ledger, so both add 0 USD but each is still a call
+  const bookings = [
+    [['--usd', '1', '--input', '100'], 1],
+    [['--usd', '2.5', '--input', '100'], 2.5],
+    [['--from-transcript', '.review/agent-new.jsonl'], 0],
+    [['--from-transcript', '.review/agent-old.jsonl'], 0],
+  ];
+  let calls = 2;
+  let usd = 2.14;
+  let total = 31.1;
+  for (const [i, [extra, add]] of bookings.entries()) {
+    const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--round', '11', ...extra]);
+    assertExit(r, 0);
+    assert.equal(r.json.recorded, true);
+    calls += 1;
+    usd = Math.round((usd + add) * 100) / 100;
+    total = Math.round((total + add) * 100) / 100;
+    assert.deepEqual([r.json.cost.byRound['11'].calls, r.json.cost.byRound['11'].usd, r.json.cost.total.usd], [calls, usd, total], `booking ${i + 1}: round and PR total grew by this call`);
+    if (i === 3) assert.deepEqual([r.json.call.input, r.json.call.output], [0, 0], 'the pre-move transcript ledger survived the move: its 10 / 20 tokens are not booked again');
+    assert.equal(r.json.warnings.some((w) => /the repo moved/.test(w)), i === 0, i === 0 ? 'the move is reported once' : 'the record is already on the live slug');
+    withComment(s, existing(written(s)));
+  }
+  const final = written(s);
+  assert.equal(final.repo, 'acme/widgets');
+  assert.deepEqual([final.cost.byRound['11'].calls, final.cost.byRound['11'].usd, final.cost.total.usd, final.cost.total.calls], [6, 5.64, 34.6, 7]);
+  assert.deepEqual(Object.keys(final.cost.transcripts).sort().map((k) => k.slice(0, 9)), ['agent-new', 'agent-old'], 'the pre-move transcript key still matches under the new slug');
+});
+
 // R2-B1: the transcript dedupe runs on the base the patch is applied to, so a transcript the other booking already took books nothing again.
 test('P cost: a transcript another booking took in the meantime books nothing again (call is zero, total is the transcript once)', () => {
   const s = scenario();
@@ -531,6 +596,34 @@ test('deductBookedTranscript: a stale smaller snapshot does not lower the ledger
   const again = book(stale.cost, 200);
   assert.deepEqual([again.entry.input, again.entry.output, again.entry.cacheRead, again.entry.cacheWrite, again.entry.usd], [0, 0, 0, 0, 0], 'the larger snapshot again adds nothing');
   assert.equal(again.entry.byPrice.p1, undefined, 'price buckets add nothing either');
+});
+
+// #980: the ledger was deducted from the COMBINED entry (transcript + hand amounts), so a hand amount smaller than the ledger's lead over the snapshot was swallowed.
+test('deductBookedTranscript: a hand amount booked with an already-booked transcript still books; a plain re-booking books only the growth', () => {
+  const snap = (n) => ({ input: n, output: 0, cacheRead: 0, cacheWrite: 0, usd: n / 100, byPrice: { p1: { input: n, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 1 } } });
+  const first = deductBookedTranscript(emptyCost(), snap(150), { key: 'agent-a1.jsonl', usage: snap(150) });
+  // a later booking: transcript snapshot 100 (behind the ledger's 150), plus --input 10 hand tokens priced into the same bucket
+  const hand = { ...snap(100), input: 110, usd: 1.1, byPrice: { p1: { input: 110, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 2 } } };
+  const r = deductBookedTranscript(first.cost, hand, { key: 'agent-a1.jsonl', usage: snap(100) });
+  assert.equal(r.entry.input, 10, 'the hand tokens are booked, not swallowed by the ledger');
+  assert.equal(r.entry.usd, 0.1, 'the hand USD is booked');
+  assert.deepEqual([r.entry.byPrice.p1.input, r.entry.byPrice.p1.messages], [10, 1], 'the hand bucket share is booked');
+  const grown = deductBookedTranscript(first.cost, snap(200), { key: 'agent-a1.jsonl', usage: snap(200) });
+  assert.deepEqual([grown.entry.input, grown.entry.usd, grown.entry.byPrice.p1.input], [50, 0.5, 50], 'a re-booking with no hand amount books only the growth');
+});
+
+// #980 R1-B1: plan-codex is tokens only (entry.usd 0) but its priced transcript is still the booking usage, so the growth formula charged the transcript's USD growth on a re-booking.
+test('P cost --role plan-codex --from-transcript: re-booking a grown transcript without --usd books the new tokens and still $0', () => {
+  const s = scenario();
+  const line = (id) => JSON.stringify({ message: { id, model: 'claude-sonnet-5-5', usage: { input_tokens: 1000000, output_tokens: 0 } } });
+  const args = ['--phase', 'plan', '--role', 'plan-codex', '--from-transcript', '.review/pc.jsonl'];
+  s.repo.write('.review/pc.jsonl', `${line('m1')}\n`);
+  assertExit(costCli(s, args), 0);
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/pc.jsonl', `${line('m1')}\n${line('m2')}\n`);
+  const r = costCli(s, args);
+  assertExit(r, 0);
+  assert.deepEqual([r.json.cost.byRole['plan-codex'].input, r.json.cost.byRole['plan-codex'].usd, r.json.cost.total.usd], [2000000, 0, 0]);
 });
 
 // R1-B1 / R1-F2: the ledger key was the bare file name, so two different transcripts both called transcript.jsonl shared one entry (the second under-booked), and a name with a space or bracket made the booking fail.

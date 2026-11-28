@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingsBlock, rulingsDigest, rulingsInventory, sameOnBaseRows, validateRulings,
+  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingRecommendationRefusal, rulingsBlock, SCOPE_CONTRADICTED_REASON, rulingsDigest, rulingsInventory, sameOnBaseRows, validateRulings,
 } from '../pipeline/lib/triage.mjs';
 import { rulingsBlockDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 
@@ -231,4 +231,63 @@ test('roundOutcome is untouched by the filing: reachedMax / extraRound / newAcce
   const it = item({ bucket: 'SUGGESTION', category: 'design' });
   const [marked] = apply([it], [rule(it, { scope: undefined })]);
   assert.deepEqual(roundOutcome(stateOf([marked])), roundOutcome(stateOf([{ ...marked, followupIssue: 'https://github.com/a/b/issues/9' }])));
+});
+
+// R1-B1 (#954). Failure caught: a BLOCKING security finding on a line the PR adds, ruled "same on base", stores the generic blocking-security reason, so the dialog could recommend
+// "fix separately" (it was there before) against the pipeline's own evidence, at issue and when the click is applied. The contradiction is its own marker on the final, whatever the reason says.
+test('R1-B1 applyRulings / fableFindingItems: a contradicted same-on-base scope on a BLOCKING security item (both conditions true) refuses fix-separately, though not reject', () => {
+  const added = { globs: GLOBS, files: [entry('pipeline/hooks/a.mjs', { added: [{ line: 4, text: 'x' }] })] };
+  const it = item();
+  const [viaRuling] = apply([it], [rule(it)], { regression: added });
+  const [viaFinding] = findingItems([finding({ line: 4 })], { regression: added });
+  for (const [what, built] of [['applyRulings', viaRuling], ['fableFindingItems', viaFinding]]) {
+    assert.equal(built.final.reason.startsWith('would '), true, `${what}: the generic blocking-security reason is what the owner reads`);
+    const items = [built];
+    assert.match(rulingRecommendationRefusal(items, 'FOLLOW-UP', {}, 'fix-separately') ?? '', /contradicted its "same on base" scope/, `${what}: fix-separately refused`);
+    assert.equal(rulingRecommendationRefusal(items, 'REJECT', {}, undefined), null, `${what}: reject has no scope rule`);
+  }
+  // the control: an item that waits for the same security reason with the scope never contradicted may be recommended fix-separately
+  const plain = item();
+  const [uncontradicted] = apply([plain], [rule(plain, { scope: undefined })]);
+  assert.equal(rulingRecommendationRefusal([uncontradicted], 'FOLLOW-UP', {}, 'fix-separately'), null);
+});
+
+// Push security review (#954). Failure caught: a final written before the marker existed (installed old code, an in-flight PR) carries only the contradicted-scope reason text,
+// so the marker-only check failed open and a click could record "fix separately" for an item the pipeline had evidence was this PR's change.
+test('legacy final: the contradicted-scope reason with no scopeContradicted marker still refuses fix-separately', () => {
+  const plain = item();
+  const [uncontradicted] = apply([plain], [rule(plain, { scope: undefined })]);
+  const { scopeContradicted, ...rest } = uncontradicted.final;
+  const legacy = { ...uncontradicted, final: { ...rest, reason: SCOPE_CONTRADICTED_REASON } };
+  assert.equal(legacy.final.scopeContradicted, undefined);
+  assert.match(rulingRecommendationRefusal([legacy], 'FOLLOW-UP', {}, 'fix-separately') ?? '', /contradicted its "same on base" scope/);
+});
+
+// Round 2 (#954, R2-B4). Failure caught: the writer before the marker stored ONLY the generic security reason when a blocking security finding's same-on-base scope was also contradicted, so the reason-text
+// fallback missed it and "fix separately" was recommended for a line the PR itself adds. An arbiter security-dismissal final without a boolean marker is now unknown, and refused.
+test('old-writer final: a blocking-security arbiter final with the generic reason and no scopeContradicted marker refuses fix-separately; the writers\' own boolean false still passes', () => {
+  const plain = item();
+  const [written] = apply([plain], [rule(plain, { scope: undefined })]);
+  assert.equal(written.final.scopeContradicted, false, 'the writer stores the boolean even when the scope held');
+  const { scopeContradicted, ...rest } = written.final;
+  const old = { ...written, final: { ...rest, reason: 'would dismiss a blocking security/data item' } };
+  assert.match(rulingRecommendationRefusal([old], 'FOLLOW-UP', {}, 'fix-separately') ?? '', /before the scope check was recorded/);
+  assert.equal(rulingRecommendationRefusal([old], 'REJECT', {}, undefined), null, 'reject has no scope rule');
+  assert.equal(rulingRecommendationRefusal([written], 'FOLLOW-UP', {}, 'fix-separately'), null);
+});
+
+// Round 3 (#954, R3-F1). Failure caught: the released writer checked confidence first, so a low-confidence FOLLOW-UP whose same-on-base scope the diff contradicted was stored as plain
+// 'arbiter low confidence' with no trace; still waiting after the upgrade, it was recommended "fix separately" for a line the PR itself adds.
+test('old-writer final: a low-confidence arbiter final with no scopeContradicted marker refuses fix-separately; both current writers store the boolean', () => {
+  const plain = item();
+  const [written] = apply([plain], [rule(plain, { confidence: 'low' })]);
+  assert.equal(written.final.cause, 'low-confidence');
+  assert.equal(typeof written.final.scopeContradicted, 'boolean', 'applyRulings stores the boolean');
+  assert.equal(typeof findingItems([finding({ confidence: 'low' })])[0].final.scopeContradicted, 'boolean', 'fableFindingItems stores the boolean');
+  const { scopeContradicted, ...rest } = written.final;
+  const old = { ...written, final: rest };
+  assert.match(rulingRecommendationRefusal([old], 'FOLLOW-UP', {}, 'fix-separately') ?? '', /before the scope check was recorded/);
+  assert.equal(rulingRecommendationRefusal([old], 'REJECT', {}, undefined), null, 'reject has no scope rule');
+  const clean = { ...written, final: { ...rest, scopeContradicted: false } };
+  assert.equal(rulingRecommendationRefusal([clean], 'FOLLOW-UP', {}, 'fix-separately'), null);
 });

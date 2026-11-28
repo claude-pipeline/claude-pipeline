@@ -157,12 +157,12 @@ test('R1-B2 analysePr: an item deferred past the cap still counts as accepted fo
 test('R1-F2 stats rounds: only the viewer\'s own comments that start with the marker count, bound to the PR and repository; the others are ignored', () => {
   const forged = stateOf([round(1, [acc('F-1')]), round(2, [acc('F-2')]), round(3, [acc('F-3')])], 1);
   const otherPr = { ...state7, pr: 8 };
-  const otherRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
+  const otherPrRecord = emptyRecord({ repo: 'acme/widgets', pr: 8, branch: 'feat/x', baseRef: 'main' });
   const cases = {
     'someone else\'s comment': [{ id: 3, user: { login: 'mallory' }, body: triageBody(forged) }, { id: 4, user: { login: 'mallory' }, body: summaryBody({ ...cost7, total: { ...cost7.total, usd: 999 } }) }],
     'a quote that does not start with the marker': [mine(3, `> quoted\n${triageBody(forged)}`)],
     'a state of another PR': [mine(3, triageBody(otherPr))],
-    'a record of another repository': [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherRepo, cost: { ...cost7, total: { ...cost7.total, usd: 999 } } })}`)],
+    'a record of another PR': [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherPrRecord, cost: { ...cost7, total: { ...cost7.total, usd: 999 } } })}`)],
     'a state with a round whose number is not an integer': [mine(3, triageBody(stateOf([round('2\n\u001b[31mFAKE', [acc('F-1')])])))],
   };
   for (const [what, extra] of Object.entries(cases)) {
@@ -209,23 +209,131 @@ test('R2-F1 analysePr: the round before a past-limit round counts its NEW accept
   assert.equal(prevOf([acc('R1-S1')]), 'only-low-fixes');
 });
 
+const pull7 = { match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { number: 7, node_id: 'PR_node_7', head: { ref: 'feat/x' } } };
+
+// #671: a PR merged before a repo rename/transfer keeps the old slug in its run record; it is still the PR's own record (run-record.mjs adoptRecord), so its booked cost must count.
+test('#671 stats rounds: a run record naming the repo the PR moved from still counts (with a warning); another PR\'s record and a differently-cased slug behave as before', () => {
+  const rec = (repo, pr, usd, branch = 'feat/x') => mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr, branch, baseRef: 'main' }), cost: { ...cost7, total: { ...cost7.total, usd } } })}`);
+  const run = (comment, live = [pull7]) => statsCli([world[0], ...live, { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), comment] }], ['--json', '--pr', '7']);
+  const moved = run(rec('old/x', 7, 9));
+  assertExit(moved, 0, moved.stderr + moved.stdout);
+  assert.equal(moved.json.totals.usd, 9, 'the moved record\'s cost is counted');
+  assert.deepEqual(moved.json.warnings, ['acme/widgets#7: counted a run record bound to old/x (the repo moved)']);
+  const other = run(rec('old/x', 8, 999));
+  assert.equal(other.json.totals.usd, 0, 'a record of another PR is not counted');
+  assert.match(noteOf(other), /ignored a run record bound to old\/x#8: not this PR or repository/);
+  const cased = run(rec('Acme/Widgets', 7, 9));
+  assert.deepEqual([cased.json.totals.usd, cased.json.warnings], [9, []], 'a differently-cased slug is the same repository: counted, no warning');
+
+  // R1-B2: a copied record from another repository AND another branch is not this PR's; neither is one when the live branch cannot be read
+  const foreign = run(rec('old/x', 7, 99, 'feat/other'));
+  assert.equal(foreign.json.totals.usd, 0, 'a record of another repository and branch is not adopted');
+  assert.match(noteOf(foreign), /ignored a run record bound to old\/x#7: not this PR or repository/);
+  const blind = run(rec('old/x', 7, 9), []);
+  assert.equal(blind.json.totals.usd, 0, 'the live branch cannot be read: not adopted');
+  assert.match(noteOf(blind), /ignored a run record bound to old\/x#7: not this PR or repository \(its branch could not be read\)/);
+  // R1-B2: the exact-slug record wins over an adopted moved one, whichever comment comes first
+  const exactFirst = statsCli([world[0], pull7, { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), rec('acme/widgets', 7, 9), rec('old/x', 7, 99)] }], ['--json', '--pr', '7']);
+  assert.deepEqual([exactFirst.json.totals.usd, exactFirst.json.warnings], [9, []], 'exact record first, moved after: the exact one counts and no move is claimed');
+  const movedFirst = statsCli([world[0], pull7, { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), rec('old/x', 7, 99), rec('acme/widgets', 7, 9)] }], ['--json', '--pr', '7']);
+  assert.deepEqual([movedFirst.json.totals.usd, movedFirst.json.warnings], [9, []], 'moved record first, exact after: same result');
+});
+
+// R1-B3: passing the old and the new slug of one renamed repository lists the PR twice; it must count once (identity = the PR's node id).
+test('R1-B3 stats rounds: the same PR reached through two slugs (a renamed repository) counts once, with a warning naming the duplicate', () => {
+  const movedRecord = mine(1, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'old/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`);
+  const comments = (slug) => ({ match: `^api repos/${slug}/issues/7/comments`, stdoutJson: [movedRecord, mine(2, triageBody(state7))] });
+  const pullOf = (slug) => ({ match: `^api repos/${slug}/pulls/7$`, stdoutJson: { number: 7, node_id: 'PR_node_7', head: { ref: 'feat/x' } } });
+  const viaPr = statsCli([comments('acme/widgets'), comments('old/widgets'), pullOf('acme/widgets'), pullOf('old/widgets')], ['--json', '--repo-slug', 'acme/widgets', '--repo-slug', 'old/widgets', '--pr', '7']);
+  assertExit(viaPr, 0, viaPr.stderr + viaPr.stdout);
+  assert.deepEqual([viaPr.json.totals.prs, viaPr.json.totals.usd, viaPr.json.prs.length], [1, 9, 1]);
+  assert.match(noteOf(viaPr), /old\/widgets#7: the same pull request as acme\/widgets#7: counted once/);
+  const listed = (slug) => ({ match: `^api repos/${slug}/pulls\\?state=closed`, stdoutJson: [{ number: 7, node_id: 'PR_node_7', merged_at: '2026-11-10T10:00:00Z', updated_at: '2026-11-10T10:00:00Z' }] });
+  const viaList = statsCli([listed('acme/widgets'), listed('old/widgets'), comments('acme/widgets'), comments('old/widgets'), pullOf('acme/widgets'), pullOf('old/widgets')], ['--json', '--since', '2026-11-05', '--repo-slug', 'acme/widgets', '--repo-slug', 'old/widgets']);
+  assert.deepEqual([viaList.json.totals.prs, viaList.json.totals.usd], [1, 9]);
+});
+
+// R2-B3: the duplicate check runs before the state split, so a PR without a review state, listed under two slugs, is counted once in withoutState.
+test('R2-B3 stats rounds: a pull request without review state, listed under two slugs, is counted once in withoutState', () => {
+  const listed = (slug) => ({ match: `^api repos/${slug}/pulls\\?state=closed`, stdoutJson: [{ number: 7, node_id: 'PR_node_7', merged_at: '2026-11-10T10:00:00Z', updated_at: '2026-11-10T10:00:00Z' }] });
+  const bare = (slug) => ({ match: `^api repos/${slug}/issues/7/comments`, stdoutJson: [mine(1, 'hello')] });
+  const r = statsCli([listed('acme/widgets'), listed('old/widgets'), bare('acme/widgets'), bare('old/widgets')], ['--json', '--since', '2026-11-05', '--repo-slug', 'acme/widgets', '--repo-slug', 'old/widgets']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.withoutState, r.json.totals.prs], [1, 0]);
+  assert.match(noteOf(r), /old\/widgets#7: the same pull request as acme\/widgets#7: counted once/);
+});
+
+// R2-B2: with several slugs and --pr, a failed identity read must not double-count in silence.
+test('R2-B2/R3-B2 stats rounds: several slugs with --pr and an unreadable pull request identity: left out of the totals, and the warning says to rerun', () => {
+  const own = (slug) => ({ match: `^api repos/${slug}/issues/7/comments`, stdoutJson: [mine(1, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: slug, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`), mine(2, triageBody(state7))] });
+  const r = statsCli([own('acme/widgets'), own('old/widgets'), { match: '^api repos/acme/widgets/pulls/7$', code: 1, stderr: 'HTTP 502' }, { match: '^api repos/old/widgets/pulls/7$', code: 1, stderr: 'HTTP 502' }], ['--json', '--repo-slug', 'acme/widgets', '--repo-slug', 'old/widgets', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.totals.prs, r.json.prs.length, r.json.withoutState, r.json.totals.usd], [0, 0, 0, 0], 'neither alias can be told apart from the other: left out, never double counted');
+  assert.match(noteOf(r), /acme\/widgets#7: left out: it could not be told apart from the same pull request under another repository name \(it could not be read\); rerun/);
+  assert.match(noteOf(r), /old\/widgets#7: left out/);
+});
+
+// R2-B1: "this repository's own record" is judged against the PR's canonical repository (its base repo), not the slug asked first, so the order of the aliases cannot change the cost.
+test('R2-B1 stats rounds: two records on one PR (old slug $2, current slug $9) report the same cost in either alias order', () => {
+  const rec = (repo, usd) => mine(repo === 'old/widgets' ? 1 : 3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: { ...cost7, total: { ...cost7.total, usd } } })}`);
+  const comments = (slug) => ({ match: `^api repos/${slug}/issues/7/comments`, stdoutJson: [rec('old/widgets', 2), mine(2, triageBody(state7)), rec('acme/widgets', 9)] });
+  const pullOf = (slug) => ({ match: `^api repos/${slug}/pulls/7$`, stdoutJson: { number: 7, node_id: 'PR_node_7', head: { ref: 'feat/x' }, base: { repo: { full_name: 'acme/widgets' } } } });
+  const run = (order) => statsCli([comments('acme/widgets'), comments('old/widgets'), pullOf('acme/widgets'), pullOf('old/widgets')], ['--json', '--pr', '7', ...order.flatMap((s) => ['--repo-slug', s])]);
+  const oldFirst = run(['old/widgets', 'acme/widgets']);
+  const newFirst = run(['acme/widgets', 'old/widgets']);
+  assertExit(oldFirst, 0, oldFirst.stderr + oldFirst.stdout);
+  assert.deepEqual([oldFirst.json.totals.prs, oldFirst.json.totals.usd], [1, 9], 'old slug first: the record of the canonical repository wins');
+  assert.deepEqual([newFirst.json.totals.prs, newFirst.json.totals.usd], [1, 9], 'current slug first: same');
+});
+
+// R3-B1: with ONE slug asked (the old one), "this repository" is still the canonical one, so the comment order cannot decide between the old-slug and the current-slug record.
+test('R3-B1 stats rounds: only the old slug asked, records of the old and the current slug: the same cost in either comment order', () => {
+  const rec = (repo, usd) => mine(repo === 'old/widgets' ? 1 : 3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: { ...cost7, total: { ...cost7.total, usd } } })}`);
+  const pull = { match: '^api repos/old/widgets/pulls/7$', stdoutJson: { number: 7, node_id: 'PR_node_7', head: { ref: 'feat/x' }, base: { repo: { full_name: 'acme/widgets' } } } };
+  const run = (records) => statsCli([pull, { match: '^api repos/old/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), ...records] }], ['--json', '--pr', '7', '--repo-slug', 'old/widgets']);
+  const currentLast = run([rec('old/widgets', 2), rec('acme/widgets', 9)]);
+  const oldLast = run([rec('acme/widgets', 9), rec('old/widgets', 2)]);
+  assertExit(oldLast, 0, oldLast.stderr + oldLast.stdout);
+  assert.equal(currentLast.json.totals.usd, 9, 'the current-slug record comes last');
+  assert.equal(oldLast.json.totals.usd, 9, 'the old-slug record comes last: still the canonical repository\'s record');
+});
+
+// R4-W1: a listing that carries base.repo must not force the canonical lookup when every own record names the slug that was asked: such a record counts directly (no branch read).
+test('R4-W1 stats rounds: an old-slug listing whose records all name the asked slug counts them directly, with no pulls read', () => {
+  const listed = { match: '^api repos/old/widgets/pulls\\?state=closed', stdoutJson: [{ number: 7, node_id: 'PR_node_7', base: { repo: { full_name: 'acme/widgets' } }, merged_at: '2026-11-10T10:00:00Z', updated_at: '2026-11-10T10:00:00Z' }] };
+  const record = mine(1, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'old/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`);
+  const r = statsCli([listed, { match: '^api repos/old/widgets/issues/7/comments', stdoutJson: [record, mine(2, triageBody(state7))] }], ['--json', '--since', '2026-11-05', '--repo-slug', 'old/widgets']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.totals.prs, r.json.totals.usd, r.json.warnings], [1, 9, []]);
+  assert.equal(r.fake.lines().some((l) => /pulls\/7/.test(l)), false, 'no extra read of the PR');
+});
+
+// R4-W2: records naming different slugs need the canonical repository to pick one; when it cannot be read, no record is guessed and the PR is left out.
+test('R4-W2 stats rounds: one slug asked, records of two slugs, the canonical repository unreadable: the PR is left out with a rerun warning', () => {
+  const rec = (repo, usd) => mine(repo === 'old/widgets' ? 1 : 3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: { ...cost7, total: { ...cost7.total, usd } } })}`);
+  const r = statsCli([{ match: '^api repos/old/widgets/issues/7/comments', stdoutJson: [rec('old/widgets', 2), mine(2, triageBody(state7)), rec('acme/widgets', 9)] }, { match: '^api repos/old/widgets/pulls/7$', code: 1, stderr: 'HTTP 502' }], ['--json', '--pr', '7', '--repo-slug', 'old/widgets']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.totals.prs, r.json.prs.length, r.json.withoutState, r.json.totals.usd], [0, 0, 0, 0]);
+  assert.match(noteOf(r), /old\/widgets#7: left out: its run records name different repositories and the repository of the PR could not be read; rerun/);
+});
+
 const noteOf = (r) => r.json.warnings.join('\n');
 const onlyComments = (extra) => [world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, summaryBody(cost7)), mine(2, triageBody(state7)), ...extra] }];
 
 test('R2-F2 stats rounds: a pipeline comment that is skipped says why in the warnings (other author, other PR or repository, unreadable); an ordinary comment says nothing', () => {
-  const otherRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
+  const movedRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
   const cases = [
     ['a state by another author', [{ id: 3, user: { login: 'mallory' }, body: triageBody(state7) }], /widgets#7: ignored a review state comment by mallory: only the viewer's own comments count/],
     ['a record by another author', [{ id: 3, user: { login: 'mallory' }, body: summaryBody(cost7) }], /widgets#7: ignored a run record comment by mallory: only the viewer's own comments count/],
-    ['a record of another repository', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherRepo, cost: cost7 })}`)], /widgets#7: ignored a run record bound to acme\/other#7: not this PR or repository/],
+    ['a record of a repository the PR moved from', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...movedRepo, cost: cost7 })}`)], /acme\/widgets#7: counted a run record bound to acme\/other \(the repo moved\)/, 'no record of this repository (the exact one would win)'],
     ['a record of another PR', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 8, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`)], /widgets#7: ignored a run record bound to acme\/widgets#8: not this PR or repository/],
     ['a state of another PR', [mine(3, triageBody({ ...state7, pr: 8 }))], /widgets#7: ignored a review state bound to PR 8: not this PR/],
     ['a state with an unnumbered round', [mine(3, triageBody(stateOf([round('x', [])])))], /widgets#7: ignored a review state: unreadable/],
     ['a state that does not decode', [mine(3, `${MARKERS.triage}\n\nno state here`)], /widgets#7: ignored a review state: unreadable/],
     ['a record that does not decode', [mine(3, `${MARKERS.summary}\n\n<!-- claude-pipeline:record:AAAA -->`)], /widgets#7: ignored a run record: unreadable \(invalid\)/],
   ];
-  for (const [what, extra, want] of cases) {
-    const r = statsCli(onlyComments(extra), ['--json', '--pr', '7']);
+  for (const [what, extra, want, ownRecordless] of cases) {
+    const r = statsCli([...(ownRecordless ? [world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), ...extra] }] : onlyComments(extra)), pull7], ['--json', '--pr', '7']);
     assertExit(r, 0, r.stderr + r.stdout);
     if (want) assert.match(noteOf(r), want, what);
     assert.equal(r.json.warnings.length, 1, `${what}: ${noteOf(r)}`);
