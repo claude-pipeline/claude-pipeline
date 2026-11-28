@@ -355,6 +355,40 @@ test('summaryFromComments: a malformed byPrice in the held or the own cost leave
   }
 });
 
+// R6-B1..B3: a list element that is not a balance, a balance whose repository IS proven but whose cost cannot be read, and the summary rewrite after an unavailable read.
+test('summaryFromComments: a null held element, or a proven but unreadable held balance, never throws and leaves the cost unavailable (R6-B1, R6-B2, #958)', () => {
+  const usd = (n) => addCostEntry(emptyCost(), entry({ usd: n }));
+  const move = { from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
+  const heldAt = { repo: 'old/widgets', at: '2026-11-01T00:00:00.000Z' };
+  const cases = {
+    'null element': { heldCost: [null] },
+    'string element': { heldCost: ['x'] },
+    'proven balance with a malformed cost': { heldCost: [{ ...heldAt, cost: { ...usd(40), byPhase: null } }] },
+    'proven balance with no cost': { heldCost: [heldAt] },
+  };
+  for (const [what, over] of Object.entries(cases)) {
+    const comment = existing({ ...rec(), cost: usd(10), ...over });
+    let sum;
+    assert.doesNotThrow(() => { sum = summaryFromComments([comment], 'me', PR, { repo: 'acme/widgets', moves: [move] }); }, what);
+    assert.ok(sum.effectiveCost.unavailable, `${what}: cost unavailable, not the own $10 as a valid total`);
+    assert.equal(sum.record.cost.total.usd, 10, `${what}: own balance stored`);
+    assert.deepEqual(sum.record.heldCost, over.heldCost, `${what}: held list stored as it was`);
+  }
+});
+
+test('writeSummaryComment: a rewrite of a record whose cost read as unavailable keeps showing it unavailable (R6-B3, #958)', () => {
+  const usd = (n, extra = {}) => ({ ...addCostEntry(emptyCost(), entry({ usd: n })), ...extra });
+  const move = { from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
+  const comment = existing({ ...rec(), cost: usd(10), heldCost: { repo: 'old/widgets', at: '2026-11-01T00:00:00.000Z', cost: usd(40, { byPrice: { bad: {} } }) } });
+  const current = summaryFromComments([comment], 'me', PR, { repo: 'acme/widgets', moves: [move] });
+  assert.ok(current.effectiveCost.unavailable, 'the read says unavailable');
+  let body = '';
+  const gh = { updateComment: (id, m, b) => { body = b; return { id, url: 'u', action: 'updated' }; } };
+  const out = writeSummaryComment(gh, PR, { existing: current });
+  assert.ok(out.effectiveCost.unavailable, 'the rewrite reports it too');
+  assert.doesNotMatch(body.split('<!-- claude-pipeline:record')[0], /\$10/, 'and the status block does not show the own $10 as the total');
+});
+
 // R4-B1: a move lookup that fails (readRepoMoves answers { moves: [], error }) is "not proven" for counting, and a writer must not lose the cost for it either.
 test('summaryFromComments + writers: an unreadable repo-moves file neither counts nor loses a legacy cost (R4-B1, #958)', () => {
   const home = mkdtempSync(join(tmpdir(), 'moves-'));
