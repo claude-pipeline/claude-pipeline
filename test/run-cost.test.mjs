@@ -2,9 +2,10 @@
 // cost / guard-block lines of `P summary`. The CLI tests run the real CLI against the scripted gh fake (gate-env).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
@@ -371,6 +372,53 @@ test('P cost: a booking that landed before this call\'s write stays in the total
   assert.deepEqual([mine.json.call.usd, mine.json.call.input], [3, 30], 'call is this call\'s own amount, not the total');
   assert.deepEqual([written(s).cost.total.usd, written(s).cost.total.calls], [5, 2], 'and so does the written comment');
   assert.deepEqual(mine.json.warnings, []);
+});
+
+// #707: after the repo moved (ianjamila/claude-pipeline -> claude-pipeline/claude-pipeline) a round's bookings seemed to REPLACE the round's usd instead of adding (R11 showed $3.09 for 3 calls,
+// true about $8.22) and the pre-move total stayed under the old slug. #664 (#641) keeps a record whose only mismatch is the repo; this pins it end to end through the real CLI: the old record
+// was written by another host, holds a round with cost and a booked transcript, and four bookings under the live slug (two --usd, a new transcript, the pre-move transcript again) all ADD, and the pre-move transcript is not counted twice.
+test('P cost: a round\'s cost is added to, not replaced, by bookings made under a new repo slug (#707, #641)', () => {
+  const s = scenario();
+  const oldKey = `agent-old.jsonl-${createHash('sha256').update(resolve(s.repo.dir, '.review/agent-old.jsonl')).digest('hex').slice(0, 12)}`;
+  const old = (() => {
+    let r = { ...rec(), repo: 'ianjamila/claude-pipeline' };
+    r = applyCheckpoint(r, { step: 'review', head: s.head }, { host: 'old-mac', now: NOW });
+    const transcript = { key: oldKey, usage: { input: 10, output: 20, cacheRead: 0, cacheWrite: 0, usd: 0.3, byPrice: {} } };
+    r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'review', role: 'judge', round: 11, input: 10, output: 20, cacheRead: 0, cacheWrite: 0, usd: 0.3 }), transcript } }, { host: 'old-mac', now: NOW });
+    r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'build', role: 'implementer', usd: 29.26 - 0.3 }) } }, { host: 'old-mac', now: NOW });
+    r = applyCheckpoint(r, { cost: { entry: entry({ phase: 'review', role: 'judge', round: 11, usd: 1.84 }) } }, { host: 'old-mac', now: NOW });
+    return r;
+  })();
+  assert.equal(old.repo, 'ianjamila/claude-pipeline');
+  assert.deepEqual([old.cost.total.usd, old.cost.byRound['11'].usd, old.cost.byRound['11'].calls], [31.1, 2.14, 2]);
+  withComment(s, existing(old));
+  s.repo.write('.review/agent-old.jsonl', `${JSON.stringify({ message: { id: 'm1', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
+  s.repo.write('.review/agent-new.jsonl', `${JSON.stringify({ message: { id: 'n1', usage: { input_tokens: 7, output_tokens: 9 } } })}\n`);
+  // [args, usd the call adds]: the new transcript has no price (no model), the pre-move one is already in the ledger, so both add 0 USD but each is still a call
+  const bookings = [
+    [['--usd', '1', '--input', '100'], 1],
+    [['--usd', '2.5', '--input', '100'], 2.5],
+    [['--from-transcript', '.review/agent-new.jsonl'], 0],
+    [['--from-transcript', '.review/agent-old.jsonl'], 0],
+  ];
+  let calls = 2;
+  let usd = 2.14;
+  let total = 31.1;
+  for (const [i, [extra, add]] of bookings.entries()) {
+    const r = costCli(s, ['--phase', 'review', '--role', 'judge', '--round', '11', ...extra]);
+    assertExit(r, 0);
+    assert.equal(r.json.recorded, true);
+    calls += 1;
+    usd = Math.round((usd + add) * 100) / 100;
+    total = Math.round((total + add) * 100) / 100;
+    assert.deepEqual([r.json.cost.byRound['11'].calls, r.json.cost.byRound['11'].usd, r.json.cost.total.usd], [calls, usd, total], `booking ${i + 1}: round and PR total grew by this call`);
+    assert.equal(r.json.warnings.some((w) => /the repo moved/.test(w)), i === 0, i === 0 ? 'the move is reported once' : 'the record is already on the live slug');
+    withComment(s, existing(written(s)));
+  }
+  const final = written(s);
+  assert.equal(final.repo, 'acme/widgets');
+  assert.deepEqual([final.cost.byRound['11'].calls, final.cost.byRound['11'].usd, final.cost.total.usd, final.cost.total.calls], [6, 5.64, 34.6, 7]);
+  assert.deepEqual(Object.keys(final.cost.transcripts).sort().map((k) => k.slice(0, 9)), ['agent-new', 'agent-old'], 'the pre-move transcript key still matches under the new slug');
 });
 
 // R2-B1: the transcript dedupe runs on the base the patch is applied to, so a transcript the other booking already took books nothing again.
