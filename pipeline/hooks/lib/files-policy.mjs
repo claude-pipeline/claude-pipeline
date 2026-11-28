@@ -2539,6 +2539,9 @@ const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s
 // program with no `$` and no backtick in it (so no expansion can run) a `((` is none. Only those two spellings are rewritten: `$((`, `$[`, a lone `_`, `((` / let in shell code, a program word with an
 // unquoted part and every other match of ARITH_CONTEXT are read as written.
 const INLINE_NODE_WORD = /(?<=^|[;&|(\n]\s*)node(?:js)?\s+(?:-e|-p|--eval|--print)\s+(?:'([^']*)'|"((?:[^"\\$`]|\\[^$`])*)")(?=\s|$|[;&|)])/g;
+// #685: `ls -lt DIR` is an option cluster of ls, not the test operator `-lt`: a run of option words right after an ls word at command position (the same lookbehind as the node word above) has any bare operator word in it
+// renamed (`-lt` -> `-Xlt`). `[`, `[[`, `test` and every other head keep the operator gate; a run that does not end at a blank, `;`, `&`, `|`, `)` or the end of the line matches nothing.
+const LS_OPTION_RUN = /(?<=^|[;&|(\n]\s*)ls(?:\s+-[A-Za-z]+)+(?=\s|$|[;&|)])/g;
 function arithView(raw) {
   return raw.replace(INLINE_NODE_WORD, (all, single, double, at) => {
     const before = raw.slice(0, at);
@@ -2547,7 +2550,7 @@ function arithView(raw) {
     if (single !== undefined) return `${head}'${single.replace(/\((?=\()/g, '( ').replace(/(?<!\w)let(?=\s)/g, 'lXt')}'`;
     if (double.includes('\\')) return all;
     return `${head}"${double.replace(/\((?=\()/g, '( ')}"`;
-  });
+  }).replace(LS_OPTION_RUN, (all, at, whole) => (/['"#$\\`]|<</.test(whole.slice(0, at)) ? all : all.replace(/(\s-)(?=(?:eq|ne|lt|gt|le|ge)(?:\s|$))/g, '$1X')));
 }
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.

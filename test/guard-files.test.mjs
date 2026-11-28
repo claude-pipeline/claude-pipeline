@@ -2413,6 +2413,27 @@ test('items 5b/10: a ((, a let or a (x||[]) inside a quoted node -e program is n
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 
+// #685 (refused: `ls -lt ~/.codex/sessions/2026/11/20/`): the session-log folder IS protected on purpose (the weekly-usage figure is read from it), and a plain `ls -l` of it passes as read-only; the line was refused only because
+// the arithmetic gate read the `-lt` OPTION of ls as a numeric test operator. A run of option words right after an ls at command position is no test; a real `[ ... -lt ... ]` / `test ... -lt ...` on a protected line stays refused.
+// Failure caught: the owner cannot list the newest Codex session folder.
+test('#685: -lt as an ls option on a session-log path is no numeric test operator; a real [ -lt ], [[ -eq ]] or test -lt on a protected line stays refused', () => {
+  for (const cmd of [
+    'ls -lt ~/.codex/sessions/2026/11/20/',
+    'ls -lt ~/.codex/sessions/2026/11/20/ | head -5',
+    'cd /repo && ls -lt ~/.codex/sessions/2026/11/20/',
+    'ls -l -ge ~/.codex/sessions/',
+  ]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    'ls -lt ~/.codex/sessions/2026/11/20/; [ "$x" -lt 3 ]',
+    'ls -lt ~/.codex/sessions/2026/11/20/ && test $x -lt 3',
+    '[ "$x" -lt 3 ] && ls ~/.codex/sessions/',
+    '[[ $x -eq 3 ]] && ls -l ~/.codex/sessions/',
+    'ls -lt; [ 1 -lt 2 ]; ls ~/.codex/sessions/',
+    'echo ls -lt ~/.codex/sessions/ [ 1 -lt 2 ]',
+    '[ ls -lt 3 ]; cat ~/.codex/sessions/a',
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
 // Items 5b/10, quote desync (a live zsh exploit found by a probe): the gate's quote scan does not know ANSI-C `$'..\'..'` quoting, a backslash escape or `$"`, so a `$'\''` before a node -e word makes it read a `((x))` that
 // zsh really runs (with a planted `x`) as the inside of a quoted program, and rewrites it away. Failure caught: the line below is allowed and the planted `$(touch SENT)` runs.
 test('items 5b/10: an ANSI-C quote, a backslash or $" before a node -e word, and a backslash inside a double-quoted program, leave the arithmetic gate reading the line as written', () => {
