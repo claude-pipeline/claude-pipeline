@@ -59,7 +59,8 @@ export function writeSummaryComment(gh, pr, { record, sections, existing, retry 
   const useRecord = record !== undefined ? record : (current.status === 'ok' ? current.record : null);
   const useSections = sections !== undefined ? sections : current.sections;
   const parts = [MARKERS.summary, ''];
-  const shownCost = useRecord ? (cost ?? costOver(current, useRecord.cost)) : undefined;
+  // A record kept from the comment is shown with the reader's effectiveCost, which already leaves out the cost of a record bound to another PR (a summary copied over by hand).
+  const shownCost = useRecord ? (cost ?? (record === undefined ? current.effectiveCost : costOver(current, useRecord.cost))) : undefined;
   if (useRecord) parts.push(renderStatusBlock(useRecord, { cost: shownCost }), '');
   if (String(useSections).trim()) parts.push(String(useSections).trim(), '');
   if (useRecord) parts.push(encodeRecord(useRecord));

@@ -333,6 +333,17 @@ test('R1-B2 summaryFromComments: a record bound to another PR is no cost base (#
   assert.equal(summaryFromComments([existing({ ...rec(), cost: addCostEntry(emptyCost(), entry({ usd: 40 })) }), booking], 'me', PR).effectiveCost.cost.total.usd, 42, 'a record of this PR still counts');
 });
 
+// A sections-only write keeps the copied record (as before #958) but must show the reader's total, which leaves that record's $40 out: the status block would otherwise show another PR's cost.
+test('R8-B1 writeSummaryComment: a sections-only write of a summary copied from another PR does not show its cost (#958)', () => {
+  const other = existing({ ...rec(), pr: PR - 1, cost: addCostEntry(emptyCost(), entry({ usd: 40 })) });
+  const booking = { id: 9, user: { login: 'me' }, body: renderEvent('cost-booking', 'b-1', 'Cost booked.', { id: 'b-1', entry: entry({ usd: 2 }) }) };
+  let body = '';
+  const gh = { viewer: () => 'me', listComments: () => [other, booking], updateComment: (id, m, b) => { body = b; return { id, url: 'u', action: 'updated' }; } };
+  const r = writeSummaryComment(gh, PR, { sections: 'notes' });
+  assert.equal(r.effectiveCost.cost.total.usd, 2, 'only this PR\'s booking');
+  assert.doesNotMatch(body, /\$4[02]/, 'the status block does not show the other PR\'s $40');
+});
+
 // The summary puts a new session into the record's cost section; 20+ older sessions booked by P cost replay after it and must not push it out.
 test('R1-B8 effectiveCost: a session the record holds survives 20 older sessions booked after it (#958)', () => {
   const base = addSessions(emptyCost(), ['new']);
