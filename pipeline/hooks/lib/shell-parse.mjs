@@ -1092,7 +1092,7 @@ const ZSH_ALTERNATION = /(?<![$<>=(])\([^\s]*\|[^\s]*\)/;
 const withArgs = (sf, argv) => Object.defineProperty(sf, 'args', { value: argv.slice(1), enumerable: false });
 // (#904) a program run by path: the word holds a slash and is not a system bin. One predicate for the script-file record below and for the `pathRuns` mark, so the two never drift.
 export function pathRunRecord(argv) {
-  if (!argv.length || !/[/]/.test(argv[0]) || SYSTEM_BIN.test(argv[0])) return null;
+  if (!argv.length || !(/[/]/.test(argv[0]) || WIN_PATH_RE.test(argv[0])) || SYSTEM_BIN.test(argv[0])) return null; // (a Windows path word, `.\node.cmd`, is a path too: the parser keeps its backslashes, see winFix)
   // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
   return hasExpansion(argv[0]) ? withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv) : { kind: 'exec', file: argv[0] };
 }

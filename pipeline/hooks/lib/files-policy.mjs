@@ -5637,8 +5637,9 @@ function evaluateBashForFilesFrame(command, opts) {
   } else {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
     // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
-    for (const c of cmds) {
+    for (const [idx, c] of cmds.entries()) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
+      frame.i = idx; // (#904: a program an earlier command on the line writes is seen by the path-run lookup below)
       if (scriptFileOf(c.argv) || scriptFeedsOf(c).length || pmCall(c.argv)) return deny('scripts run scripts too deeply to check');
       for (const pr of c.pathRuns ?? []) { // (#904: no content is read, so the refusal test is exact here: a text ./env is refused, a node_modules program is not)
         const v = pathRunRefusal(pr, dirs, ctx, opts);
