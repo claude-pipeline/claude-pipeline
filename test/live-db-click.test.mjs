@@ -447,7 +447,10 @@ test('R1-F1: a block longer than the fallback bound is not claimed on a progress
     // R4-B1: a 2-column glyph cannot straddle column 80, so each of these lines is 3 rows, not 2
     ['a wide glyph at column 80', Array.from({ length: 13 }, () => `${'a'.repeat(79)}界${'a'.repeat(79)}`).join('\n')],
     // R4-B2: leading whitespace counts: 70 spaces then two 41-character words is 3 rows when word-wrapped, not 2
-    ['indented words', Array.from({ length: 13 }, () => `${' '.repeat(70)}${'a'.repeat(41)} ${'b'.repeat(41)}`).join('\n')]]) {
+    ['indented words', Array.from({ length: 13 }, () => `${' '.repeat(70)}${'a'.repeat(41)} ${'b'.repeat(41)}`).join('\n')],
+    // R5-B1: a no-break space is no break point for a wrapper that splits at ordinary spaces only; any whitespace or control character but a plain space and newline keeps the fallback closed
+    ['a no-break space', Array.from({ length: 41 }, () => `${'a'.repeat(20)} ${'b'.repeat(20)}`).join(' ')],
+    ['a tab in a short block', 'update t set a = 1,\tb = 2 where id = 7']]) {
     const x = await world(t, { op: 'data', flush: true, reply: [progress], dataText: sql });
     assert.ok((await x.hook()).recorded, what);
     const xc = x.claim();

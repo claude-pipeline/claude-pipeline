@@ -98,8 +98,10 @@ const rowsOfLine = (line) => {
     }
     return rows;
   };
-  return Math.max(hard, walk(line.match(/\s*\S+|\s+/gu) ?? []), walk(line.match(/\s+|\S+/gu) ?? []));
+  // (R5-B1: and a third model that breaks only at ordinary spaces, so a Unicode space is never a break there)
+  return Math.max(hard, walk(line.match(/\s*\S+|\s+/gu) ?? []), walk(line.match(/\s+|\S+/gu) ?? []), walk(line.match(/ *[^ ]+| +/gu) ?? []));
 };
+const ODD_SPACE = /(?![ \n])[\s\p{Z}\p{Cc}\p{Cf}]/u;
 const renderedRows = (text) => {
   const lines = String(text).replace(/\r\n/g, '\n').split('\n');
   while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
@@ -154,7 +156,8 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
           const body = q.slice(cut + 2);
           const dv = verifyBlock(body, { home, io });
           // R1-B2: the body must BE the block (nothing before it); R1-F1: and short enough that the dialog shows it whole (longer ones need the reply text or the typed go)
-          shown = dv.ok && dv.leading === 0 && renderedRows(body) <= PROGRESS_NOTE_BLOCK_MAX_ROWS ? { text: body } : { reason: `${shown.reason}; the dialog's own question is not a block of at most ${PROGRESS_NOTE_BLOCK_MAX_ROWS} screen rows (${PROGRESS_NOTE_COLUMNS} columns) and nothing else` };
+          // R5-B1: and only plain spaces and newlines as whitespace or control characters (tabs, NBSP, other Unicode spaces, zero-width marks wrap in terminal-specific ways the row estimate cannot bound)
+          shown = dv.ok && dv.leading === 0 && !ODD_SPACE.test(body) && renderedRows(body) <= PROGRESS_NOTE_BLOCK_MAX_ROWS ? { text: body } : { reason: `${shown.reason}; the dialog's own question is not a block of at most ${PROGRESS_NOTE_BLOCK_MAX_ROWS} screen rows (${PROGRESS_NOTE_COLUMNS} columns), with only plain spaces, and nothing else` };
         }
       }
       const sv = shown.text === undefined ? null : verifyBlock(shown.text, { home, io });
