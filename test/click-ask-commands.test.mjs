@@ -572,6 +572,15 @@ test('triage ruling-request --recommend reject|fix-separately: refused for an im
   const minorBlocking = (await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
   assert.doesNotMatch(minorBlocking, /recommend follow-up with --why fix-separately/);
   assert.match(minorBlocking, /no --recommend/);
+  // failure caught (#956 review R2): a low-severity open accepted fix next to a BLOCKING item waiting on low confidence: fix-separately IS shown for the batch, so the minor-later refusal must still name it
+  const mixed = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'docs', final: DEFERRABLE });
+  const mixedFile = join(mixed.repo.dir, '.review', 'state.json');
+  const mixedState = JSON.parse(readFileSync(mixedFile, 'utf8'));
+  Object.assign(mixedState.rounds[0].items[1], { bucket: 'BLOCKING', category: 'security', file: 'src/other.js', final: WAITING_ACCEPT });
+  writeFileSync(mixedFile, JSON.stringify(mixedState));
+  const mixedAsk = (why) => triage(mixed, newHome(), 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1,R1-S3', '--ask', '--recommend', 'follow-up', '--why', why);
+  assert.equal((await mixedAsk('fix-separately')).output.dialogVariant, 'ruling-v2-follow-up-any');
+  assert.match((await mixedAsk('minor-later')).output.recommendRefused, /not low severity.*recommend follow-up with --why fix-separately/);
   assert.match((await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused, /not low severity/);
 });
 
