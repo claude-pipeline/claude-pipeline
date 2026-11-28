@@ -5092,8 +5092,21 @@ let evalNesting = 0;
 export const evaluateBashForFiles = (command, opts = {}) => {
   const nested = evalNesting > 0;
   evalNesting++;
-  try { return evaluateBashForFilesChecked(command, nested && opts.shell !== 'bash' ? { ...opts, shell: 'bash' } : opts); } finally { evalNesting--; }
+  let verdict;
+  try { verdict = evaluateBashForFilesChecked(command, nested && opts.shell !== 'bash' ? { ...opts, shell: 'bash' } : opts); } finally { evalNesting--; }
+  return nested ? verdict : withCwdHint(verdict, opts);
 };
+// #874: wording only. When the session's own working folder (the hook's cwd, not a `cd` target and not merely a folder above a protected one) is inside a protected
+// pipeline folder, every refusal of a line traces back to that, and the reason alone ("<name> refers to a protected pipeline file ...") does not say so. The one
+// place that sees every verdict of the outermost call adds the cause and the fix; the decision and the original reason are untouched.
+function withCwdHint(verdict, opts) {
+  if (verdict?.decision !== 'deny') return verdict;
+  try {
+    const ctx = makeCtx(opts);
+    if (!ctx.hit(ctx.cwd)) return verdict;
+    return { ...verdict, reason: `${verdict.reason} (This session's working folder (${ctx.cwd}) is itself inside the protected pipeline folder, so most commands there are refused: run a Bash call that is only \`cd <your worktree>\` first, then retry.)` };
+  } catch { return verdict; }
+}
 // The same text judged again with other options (a cwd assumed, writes only): what the tool's shell reads is unchanged, so `opts.shell` stays as the caller has it (the outermost call's tool shell, or
 // 'bash' already inside a nested one). Every nested call this makes still goes through evaluateBashForFiles and is forced to Bash.
 function evaluateSameText(command, opts) {
