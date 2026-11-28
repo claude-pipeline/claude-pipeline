@@ -1272,9 +1272,12 @@ function visible(frame, at, idx, late = false) {
 // (`{ ...; } &`, a trailing `&`) sees all of its own later records.
 function seen(frames, fi, at, idx) {
   const f = frames[fi];
-  const late = fi === frames.length - 1 ? f.opaque === true : frames.slice(fi + 1).some((x) => x.bgWork);
+  const late = fi === frames.length - 1 ? lateIn(f, at) : frames.slice(fi + 1).some((x) => x.bgWork);
   return visible(f, at, idx, late);
 }
+// Does the command `at` of frame f see every later record of its own frame? When the frame is opaque, or `at` is the command that starts background work (launchctl, setsid, screen ...) or comes after it (#950:
+// a command BEFORE it cannot be reached by a job that is not started yet; `at < 0` is the call into the frame, judged as at the first one).
+const lateIn = (f, at) => f.opaque === true || (f.bgFrom !== Infinity && (at < 0 || at >= f.bgFrom));
 // The pipeline (first, last command index) that holds command i
 function groupOf(cmds, i) {
   let lo = i;
@@ -1289,7 +1292,7 @@ function placeOf(f, rec) {
   const c = f.cmds;
   const [lo, hi] = groupOf(c, rec.idx);
   return {
-    bg: rec.bg === true || f.opaque === true || c[hi + 1]?.sep === '&' || c[rec.idx]?.maybeBg === true, // (#529: a command of a `&>` span may run as a background job)
+    bg: rec.bg === true || f.opaque === true || rec.idx >= f.bgFrom || c[hi + 1]?.sep === '&' || c[rec.idx]?.maybeBg === true, // (#529: a command of a `&>` span may run as a background job)
     opt: rec.opt === true || c[lo]?.sep === '&&' || c[lo]?.sep === '||' || c[hi + 1]?.sep === '||' || inFlow(f.from, rec.idx),
   };
 }
@@ -1316,9 +1319,11 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   const loneIn = (t) => (t.match(/(?<![&|<>])&(?![&>])/g) ?? []).length;
   // (blanking only removes matches, so the text is read for syntax only when its raw count could make the frame opaque)
   const lone = typeof text === 'string' ? (loneIn(text) > seps ? loneIn(syntaxText(text, cmds)) : 0) : 0;
-  const opaque = lone > seps || cmds.some(startsBackground);
-  const bgWork = seps > 0 || opaque || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
-  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
+  const opaque = lone > seps;
+  const first = cmds.findIndex(startsBackground);
+  const bgFrom = first < 0 ? Infinity : first; // (#950: the first command that starts a job outliving it: from there on the order is unknown, before it nothing is)
+  const bgWork = seps > 0 || opaque || bgFrom !== Infinity || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
+  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgFrom, bgWork };
 }
 
 // The text the shell reads as command syntax, for the lone-`&` count (#919: a `&` in a comment, quotes or a quoted heredoc body is text, no background job).
@@ -1932,7 +1937,7 @@ export function writtenNamesIn(frames, dir) {
 // A fingerprint of the writes that count for the command being judged now, for memo keys that must not outlive a change of them: the actual
 // visible records (not their number), so two different write sets never share a cached verdict.
 export function writeSignature(frames) {
-  return JSON.stringify(frames.map((f, fi) => [f.opaque === true, f.recs.filter((r) => seen(frames, fi, f.i, r.idx)).map((r) => ({ ...r, placed: placeOf(f, r) }))]));
+  return JSON.stringify(frames.map((f, fi) => [lateIn(f, f.i), f.recs.filter((r) => seen(frames, fi, f.i, r.idx)).map((r) => ({ ...r, placed: placeOf(f, r) }))]));
 }
 // Is there a command we do not model before the one being judged? (any number of them make a missing script equally unknown)
 export const unmodelledBefore = (frames) => frames.some((f, fi) => [...f.unmodelled].some((x) => seen(frames, fi, f.i, x)));

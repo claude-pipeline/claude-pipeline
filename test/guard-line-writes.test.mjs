@@ -2165,3 +2165,19 @@ test('#919: a `&` in a comment, quotes or a quoted heredoc body does not make th
   allowBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh");
   denyBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh &");
 });
+
+// #950: a launchctl / setsid / tmux line starts a job that outlives the script. Failure caught: ONE such line anywhere made the whole script's order unknown, so a LATER write
+// (`cp f.sh n.sh`) counted for every EARLIER command (`bash n.sh` read as if the copy had run first) and the owner's harmless install script was refused. The order is unknown only
+// from the line that starts the job: a command before it cannot be reached by a job not yet started; the line itself and every command after it still see every later write.
+test('#950: a backgrounder (launchctl, setsid, tmux) leaves the commands BEFORE it in order; the line itself and the commands after it still see later writes', () => {
+  for (const bg of ['launchctl kickstart -k "gui/$(id -u)/x"', 'setsid sleep 1', "tmux new -d 'sleep 1'", 'screen -dm sleep 1']) {
+    allowBoth(`bash n.sh; ${bg}; cp f.sh n.sh`); // the script ran before the job was started and the copy came later
+    allowBoth(`bash n.sh\n${bg}\ncp f.sh n.sh\necho done`);
+    denyBoth(`${bg}; bash n.sh; cp f.sh n.sh`); // a job already running may be what runs it when the copy lands
+    denyBoth(`bash n.sh; ${bg}; bash n.sh; cp f.sh n.sh`);
+    denyBoth(`bash n.sh; ${bg}\nbash n.sh\necho x\ncp f.sh n.sh`);
+  }
+  denyBoth('bash n.sh; setsid -f bash n.sh; cp f.sh n.sh'); // the job's own command
+  denyBoth('bash bg3.sh; cp f.sh n.sh', { ...SPEC, 'bg3.sh': 'sleep 1; setsid -f bash n.sh' }); // a script that starts one: the outer later write is still seen
+  allowBoth('bash n.sh; cp f.sh n.sh'); // twin: no backgrounder
+});
