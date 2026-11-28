@@ -18,7 +18,7 @@ const FD_NAME_WORD = /^\{([A-Za-z_]\w*)(?:\[.*\])?\}$/s; // (s: a subscript may 
 // continuations are removed, as the shell removes them before it reads the word (`{a\<newline>['0']}>f`, R24-F1))
 const FD_SUB_RAW = /^\{[A-Za-z_]\w*\[.*\]\}$/s;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
-const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
+export const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 // the counter (ctx.ctl) each construct kind of ctlOpen raises: in a loop, a function body, an if / case branch
@@ -4223,6 +4223,8 @@ export function simpleCommands(str, opts) {
     try { parser?.drain(true); } catch { /* best effort */ }
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
+  // work: the characters this parse lexed in all (the budget MAX_WORK caps); a test reads it to prove a retry is charged without timing the run
+  Object.defineProperty(ctx.out, 'work', { value: ctx.work, enumerable: false });
   // refused: with `truncated`, the form the parser refuses to read (a ${ cmd; } or similar; #269 R17-F3), so the guard can name it; null otherwise
   Object.defineProperty(ctx.out, 'refused', { value: ctx.refused, enumerable: false });
   // undecidable: a heredoc whose end the shells read differently (see readHeredocs); truncated is set with it, so a caller that refuses a cut-short parse refuses this one too, and one that wants the cause can ask

@@ -5,7 +5,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { EventEmitter } from 'node:events';
 import { randomUUID } from 'node:crypto';
-import { spawn, spawnSync } from 'node:child_process';
+import { spawn } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, utimesSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -1044,7 +1044,9 @@ const takeLock = (pid = process.pid) => {
   assert.equal(got.acquired, true);
   return got.lock;
 };
-const deadPid = () => spawnSync(process.execPath, ['-e', '0']).pid; // (a finished child: its pid is gone)
+// A pid no process can have, so no run can find it live. NOT a finished child's pid: Windows hands a freed pid to the next process it starts (the CLI under test, or a helper of it),
+// and the lock then reads as held by a live run (#349). Not a multiple of 4 (Windows pids always are) and above any pid_max (Linux 4194304, macOS 99999): kill(pid, 0) says ESRCH everywhere.
+const deadPid = () => 2147483646;
 
 test('merge lock, Codex 3: a second run while a live process holds the lock is refused (merge-in-progress) and touches nothing (both routes)', async () => {
   const lock = takeLock();
