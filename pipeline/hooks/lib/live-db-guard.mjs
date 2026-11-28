@@ -74,8 +74,15 @@ export function supabaseMatch(tool, state, ti, ctx) {
 }
 export const isSupabaseTool = (tool, state, ti, ctx) => !!supabaseMatch(tool, state, ti, ctx);
 
-// The most lines of block the progress-note fallback accepts on the dialog alone: a dialog taller than a terminal screen may clip, and the owner must have read every line of the SQL (a longer block needs the reply text or the typed go).
-const PROGRESS_NOTE_BLOCK_MAX_LINES = 40;
+// The most screen rows of block the progress-note fallback accepts on the dialog alone: a dialog taller than a terminal screen may clip, and the owner must have read every line of the SQL (a longer block needs
+// the reply text or the typed go). Rows, not newlines: a line counts ceil(length / PROGRESS_NOTE_COLUMNS) rows (R2-B1: one 4000-character line is 50 rows in an 80-column terminal).
+const PROGRESS_NOTE_BLOCK_MAX_ROWS = 40;
+const PROGRESS_NOTE_COLUMNS = 80;
+const renderedRows = (text) => {
+  const lines = String(text).replace(/\r\n/g, '\n').split('\n');
+  while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
+  return lines.reduce((n, l) => n + Math.ceil(Math.max(1, [...l].length) / PROGRESS_NOTE_COLUMNS), 0);
+};
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });
 const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
@@ -125,7 +132,7 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
           const body = q.slice(cut + 2);
           const dv = verifyBlock(body, { home, io });
           // R1-B2: the body must BE the block (nothing before it); R1-F1: and short enough that the dialog shows it whole (longer ones need the reply text or the typed go)
-          shown = dv.ok && dv.leading === 0 && dv.blockLines <= PROGRESS_NOTE_BLOCK_MAX_LINES ? { text: body } : { reason: `${shown.reason}; the dialog's own question is not a block of at most ${PROGRESS_NOTE_BLOCK_MAX_LINES} lines and nothing else` };
+          shown = dv.ok && dv.leading === 0 && renderedRows(body) <= PROGRESS_NOTE_BLOCK_MAX_ROWS ? { text: body } : { reason: `${shown.reason}; the dialog's own question is not a block of at most ${PROGRESS_NOTE_BLOCK_MAX_ROWS} screen rows (${PROGRESS_NOTE_COLUMNS} columns) and nothing else` };
         }
       }
       const sv = shown.text === undefined ? null : verifyBlock(shown.text, { home, io });

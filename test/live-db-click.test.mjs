@@ -399,7 +399,9 @@ test('#983: a progress note stands in for the reply only when the question carri
 
 test('R1-B1: hidden reasoning is not a progress note: redacted_thinking, or a thinking block on an entry Claude Code does not mark as shown, leaves the click refused', async (t) => {
   // Failure caught: any thinking / redacted_thinking block letting a click through on the dialog's body alone, so a turn whose reasoning the owner never saw replaced the reply text.
-  for (const [what, note] of [['redacted_thinking', { blocks: [{ type: 'redacted_thinking', data: 'x' }] }], ['an unmarked thinking block', { blocks: progress.blocks }]]) {
+  for (const [what, note] of [['redacted_thinking', { blocks: [{ type: 'redacted_thinking', data: 'x' }] }], ['an unmarked thinking block', { blocks: progress.blocks }],
+    // R2-F1: ordinary hidden reasoning as Claude Code records it: empty `thinking`, thinkingDisplay "updates", no staysIfReplyIsCut
+    ['hidden reasoning with thinkingDisplay updates', { blocks: [{ type: 'thinking', thinking: '', signature: 'x' }], extra: { thinkingDisplay: 'updates', thinkingDurationMs: 3000, apiBlockIndex: 0 } }]]) {
     const w = await world(t, { flush: true, reply: [note] });
     assert.ok((await w.hook()).recorded, what);
     const c = w.claim();
@@ -426,10 +428,18 @@ test('R1-F1: a block longer than the fallback bound is not claimed on a progress
   assert.ok((await long.hook()).recorded);
   const c = long.claim();
   assert.equal(c.status, 'unverified');
-  assert.match(c.reason, /at most 40 lines/);
+  assert.match(c.reason, /at most 40 screen rows/);
   const shown = await world(t, { op: 'data', flush: true, dataText });
   assert.ok((await shown.hook()).recorded);
   assert.equal(shown.claim().status, 'claimed');
+  // R2-B1: few newlines but one very wide line (about 43 rows in an 80-column terminal) is just as tall
+  const wide = `update t set a = 1 where id = 7 and b in (${'1,'.repeat(1700)}1)`;
+  const tall = await world(t, { op: 'data', flush: true, reply: [progress], dataText: wide });
+  assert.ok(tall.block.split('\n').length < 40);
+  assert.ok((await tall.hook()).recorded);
+  const tc = tall.claim();
+  assert.equal(tc.status, 'unverified');
+  assert.match(tc.reason, /at most 40 screen rows/);
 });
 
 test('#983: a progress note followed by another turn\'s text before the dialog is still refused', async (t) => {
