@@ -3,7 +3,9 @@
 // fixture graph. Paths are repo-relative with "/" (path.posix) everywhere; input with "\" is normalised, so Windows works.
 //
 // A test file is related when
-//   tier 0  it is itself changed (always runs, whatever the budget);
+//   tier 0  it is itself changed (runs first, lightest first, while the changed files' summed estimate stays within the
+//           changed-file cap CP_QUICK_CHANGED_CAP_MS, default 600000; one that does not fit is "deferred to CI": quick does not
+//           run it and says so, the full suite in CI does (#686: one huge changed file made quick time out with no failing test));
 //   tier 1  a changed file is a direct dependency of it: it imports the file, or its source mentions the file's path;
 //   tier 2  a changed file is further away: reached through the imports and path mentions of the modules it depends on
 //           (a test that spawns pipeline/bin/pipeline.mjs depends on everything that entry imports; that is intended).
@@ -16,7 +18,8 @@
 // Ranking, best first: changed tests (tier 0), then every strong relation by tier, distance, weight and name, and only then
 // the weak ones in the same order, so a weak mention never outranks a strong relation of a later tier.
 //
-// Budget: related tests are added in that order while the summed estimated time stays within `budgetMs`; one that does not
+// Budget: related tests are added in that order while the summed estimated time stays within `budgetMs` (the changed files'
+// time counts against it too, so a changed file that fits its cap can leave no budget for the others); one that does not
 // fit is skipped and lighter ones after it may still fit. Weak ones also have a cap of their own (see weakBudgetOf), so a
 // change to a common root file cannot spend the whole budget on tests that only write a fixture of that name.
 import { posix } from 'node:path';
@@ -29,6 +32,8 @@ export const DEFAULT_BUDGET_MS = 90_000;
 // The most weak relations (a bare root-name mention) may use of the budget: DEFAULT_WEAK_BUDGET_MS, or the whole budget when
 // that is smaller (a custom CP_QUICK_RELATED_BUDGET_MS never gives weak ones more than the default share); `all` = no cap.
 export const DEFAULT_WEAK_BUDGET_MS = 15_000;
+// The most the changed test files (tier 0) may add up to in quick: CP_QUICK_CHANGED_CAP_MS (same format as the budget; `all` = no cap).
+export const DEFAULT_CHANGED_CAP_MS = 600_000;
 export const weakBudgetOf = (budgetMs) => (budgetMs === Infinity ? Infinity : Math.min(DEFAULT_WEAK_BUDGET_MS, budgetMs));
 
 const MODULE_RE = /\.(?:mjs|js|cjs)$/;
@@ -41,14 +46,24 @@ const IMPORT_RES = [
 
 export const toPosix = (p) => posix.normalize(String(p).replace(/\\/g, '/')).replace(/^\.\//, '');
 
-// CP_QUICK_RELATED_BUDGET_MS: unset/blank = default; `all` = no cap; 0 = no related tests; a positive number of ms.
+// A millisecond setting: unset/blank = default; `all` = no cap; a number of ms (0 allowed).
 // Anything else is a mistake, reported as { error } so the caller can print it and use the default.
-export function parseBudget(raw) {
+function parseMs(raw, envName, def) {
   const v = String(raw ?? '').trim();
-  if (v === '') return { budgetMs: DEFAULT_BUDGET_MS };
-  if (v.toLowerCase() === 'all') return { budgetMs: Infinity };
-  if (/^\d+$/.test(v)) return { budgetMs: Number(v) };
-  return { budgetMs: DEFAULT_BUDGET_MS, error: `CP_QUICK_RELATED_BUDGET_MS=${JSON.stringify(v)} is not a number of ms or "all"; using ${DEFAULT_BUDGET_MS}` };
+  if (v === '') return { ms: def };
+  if (v.toLowerCase() === 'all') return { ms: Infinity };
+  if (/^\d+$/.test(v)) return { ms: Number(v) };
+  return { ms: def, error: `${envName}=${JSON.stringify(v)} is not a number of ms or "all"; using ${def}` };
+}
+// CP_QUICK_RELATED_BUDGET_MS: 0 = no related tests.
+export function parseBudget(raw) {
+  const { ms, error } = parseMs(raw, 'CP_QUICK_RELATED_BUDGET_MS', DEFAULT_BUDGET_MS);
+  return error ? { budgetMs: ms, error } : { budgetMs: ms };
+}
+// CP_QUICK_CHANGED_CAP_MS: 0 = every changed test file is deferred to CI.
+export function parseChangedCap(raw) {
+  const { ms, error } = parseMs(raw, 'CP_QUICK_CHANGED_CAP_MS', DEFAULT_CHANGED_CAP_MS);
+  return error ? { changedCapMs: ms, error } : { changedCapMs: ms };
 }
 
 // The relative specifiers a module imports.
@@ -152,8 +167,9 @@ function distanceToChange(graph, test) {
 }
 
 // tests: test/ file names (the `.test.mjs` ones); `testDir` is where they live. weights: Map name -> estimated ms (every test).
-// exclude: names that run anyway (the fixed list). Returns { selected, skipped, estimatedMs }: each entry { name, tier, distance, weak, ms }.
-export function relatedTests({ tests, testDir = 'test', changed, files, read, weights, budgetMs, exclude = [] }) {
+// exclude: names that run anyway (the fixed list). Returns { selected, skipped, deferred, estimatedMs }: each entry { name, tier, distance, weak, ms };
+// deferred = changed test files that did not fit changedCapMs (not run in quick; CI runs them).
+export function relatedTests({ tests, testDir = 'test', changed, files, read, weights, budgetMs, changedCapMs = DEFAULT_CHANGED_CAP_MS, exclude = [] }) {
   const changedNorm = [...new Set(changed.map(toPosix).filter(Boolean))];
   const skip = new Set(exclude);
   const graph = makeGraph({ files, changed: changedNorm, read });
@@ -170,23 +186,33 @@ export function relatedTests({ tests, testDir = 'test', changed, files, read, we
   ranked.sort((a, b) => (a.tier !== 0) - (b.tier !== 0) || Number(a.weak) - Number(b.weak) || a.tier - b.tier || a.distance - b.distance || a.ms - b.ms || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
   const selected = [];
   const skipped = [];
+  const deferred = [];
   const weakCap = weakBudgetOf(budgetMs);
   let estimatedMs = 0;
   let weakMs = 0;
+  let changedMs = 0;
   for (const t of ranked) {
-    if (t.tier === 0 || (estimatedMs + t.ms <= budgetMs && (!t.weak || weakMs + t.ms <= weakCap))) {
+    if (t.tier === 0) {
+      // lightest first (the sort above), so as many changed files as possible fit; the rest wait for CI.
+      if (changedMs + t.ms <= changedCapMs) {
+        selected.push(t);
+        changedMs += t.ms;
+        estimatedMs += t.ms;
+      } else deferred.push(t);
+    } else if (estimatedMs + t.ms <= budgetMs && (!t.weak || weakMs + t.ms <= weakCap)) {
       selected.push(t);
       estimatedMs += t.ms;
       if (t.weak) weakMs += t.ms;
     } else skipped.push(t);
   }
-  return { selected, skipped, estimatedMs };
+  return { selected, skipped, deferred, estimatedMs };
 }
 
 // The one-line summary printed before the run (and so kept in .verify/logs/tests.log). It shows the estimated time the
-// selection used against the budget: changed test files always run and count too, so one heavy changed test can use the
-// whole budget, and the line must say so.
-export function describeSelection({ selected, skipped, changedCount, basis, budgetMs, estimatedMs = 0, listMax = 6 }) {
+// selection used against the budget: changed test files count too, so a heavy changed test (within its own cap) can use the
+// whole budget, and the line must say so. A changed test over the changed-file cap did NOT run: the line names it apart from
+// the ones skipped over budget.
+export function describeSelection({ selected, skipped, deferred = [], changedCount, basis, budgetMs, changedCapMs = DEFAULT_CHANGED_CAP_MS, estimatedMs = 0, listMax = 6 }) {
   const tiers = [0, 1, 2].map((t) => selected.filter((s) => s.tier === t).length);
   const nameOnly = selected.filter((s) => s.weak).length;
   const used = Math.round(estimatedMs);
@@ -197,18 +223,22 @@ export function describeSelection({ selected, skipped, changedCount, basis, budg
   const weakUsed = Math.round(selected.filter((s) => s.weak).reduce((sum, s) => sum + s.ms, 0));
   const weakNote = weakSkipped && budgetMs !== Infinity ? `, ${weakSkipped} of them name-only (name-only cap ${weakBudgetOf(budgetMs)} ms, ${weakUsed} used)` : '';
   const shown = names.slice(0, listMax).join(', ') + (names.length > listMax ? `, +${names.length - listMax} more` : '');
+  const deferredNames = deferred.map((s) => s.name);
+  const deferredShown = deferredNames.slice(0, listMax).join(', ') + (deferredNames.length > listMax ? `, +${deferredNames.length - listMax} more` : '');
+  const deferredNote = deferred.length ? `, ${deferred.length} changed deferred to CI over changed cap ${changedCapMs} ms (${deferredShown}; NOT run here)` : '';
   return `related tests: ${selected.length} selected (${tiers[0]} changed, ${tiers[1]} direct, ${tiers[2]} transitive; ${nameOnly} name-only), `
-    + `${skipped.length} skipped over budget${skipped.length ? ` (${shown})` : ''}${weakNote}; ${changedCount} changed files (${basis}); ${budget}`;
+    + `${skipped.length} skipped over budget${skipped.length ? ` (${shown})` : ''}${weakNote}${deferredNote}; ${changedCount} changed files (${basis}); ${budget}`;
 }
 
 // The full record of what a quick run covered, printed after the summary: every selected related file with its tier
 // (plus "name only" for a weak relation) and every file skipped over budget (a name-only one marked the same way), so a CI failure in a test quick passed can be
 // told apart (skipped vs never related) from the log alone. Each line ends with ')' so no line reads as a bare test-file name.
-export function describeSelectionDetail({ selected, skipped }) {
+export function describeSelectionDetail({ selected, skipped, deferred = [], changedCapMs = DEFAULT_CHANGED_CAP_MS }) {
   const tierName = ['changed', 'direct', 'transitive'];
   const lines = [];
   if (selected.length) lines.push(`related selected (${selected.length}): ${selected.map((s) => `${s.name} [${tierName[s.tier] ?? s.tier}${s.weak ? ', name only' : ''}]`).join(', ')} (end)`);
   if (skipped.length) lines.push(`related skipped over budget (${skipped.length}): ${skipped.map((s) => `${s.name}${s.weak ? ' [name only]' : ''}`).join(', ')} (end)`);
+  if (deferred.length) lines.push(`related changed deferred to CI, NOT run here, over changed cap ${changedCapMs} ms (${deferred.length}): ${deferred.map((s) => `${s.name} [est. ${s.ms} ms]`).join(', ')} (end)`);
   return lines;
 }
 

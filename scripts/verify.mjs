@@ -29,7 +29,8 @@ const PROJECT = 'claude-pipeline'; // must match `project:` in .claude/pipeline.
 // docs-facts, config, stacks-config, cli, test-runner, triage-claude (pins the state version) and repo-risk-config (pins the DEPTH1 names), all by exact
 // name; a name that matches no file exits 2) PLUS, with --related, the
 // test files related to what the branch changed (scripts/lib/related-tests.mjs: changed tests, tests that import or mention a
-// changed file; best first within CP_QUICK_RELATED_BUDGET_MS, default 90000, 0 = none, `all` = no cap). The first line of
+// changed file; best first within CP_QUICK_RELATED_BUDGET_MS, default 90000, 0 = none, `all` = no cap; changed tests within their own
+// cap CP_QUICK_CHANGED_CAP_MS, default 600000, a heavier one is deferred to CI and named in the log, #686). The first line of
 // .verify/logs/tests.log says how many were picked and skipped. About 4 s of CPU plus ~7 s for repo-risk-config with nothing related,
 // about a minute more with a lot. cli-triage-claude also pins the state version (its "newer format" test) but costs ~2 min of CPU, so it
 // stays CI-only.
