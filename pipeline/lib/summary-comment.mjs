@@ -20,11 +20,11 @@ export function sectionsOf(body) {
 
 // The newest summary comment the viewer wrote that STARTS with the marker: the same one upsertComment edits.
 // -> {status: ok|absent|legacy|unsupported|invalid, record?, sections, url, id, costBookings, effectiveCost}
-// `summaryFromComments` works on a comment list the caller already holds.
+// `summaryFromComments(comments, viewerLogin, pr)` works on a comment list the caller already holds.
 // `effectiveCost` is the PR's cost as the append-only cost bookings (`P cost`, one comment each) say it on top of the record's own cost section, a SIBLING of `record` (also when there is no
 // summary comment yet): the record keeps only the legacy base, so the two are never added twice. -> run-cost.mjs#effectiveCost ({ cost, contributions, any } or { unavailable }).
 // `costBookings` is what it was built from (readCostBookings), for a writer that replays the same bookings over a different base (costOver).
-export function summaryFromComments(comments, viewerLogin) {
+export function summaryFromComments(comments, viewerLogin, pr) {
   const costBookings = readCostBookings({ comments, viewer: viewerLogin });
   const mine = comments
     .filter((c) => typeof c.body === 'string' && c.body.startsWith(MARKERS.summary) && c.user?.login === viewerLogin)
@@ -32,7 +32,8 @@ export function summaryFromComments(comments, viewerLogin) {
   const found = mine.at(-1);
   if (!found) return { status: 'absent', sections: '', url: null, id: null, costBookings, effectiveCost: effectiveCost({ baseStatus: 'absent', ...costBookings }) };
   const decoded = decodeRecord(found.body);
-  const base = decoded.status === 'ok' ? decoded.record.cost : undefined;
+  // A record bound to another PR (a summary copied over by hand) is no base: stats and every record writer drop it, so its cost must not show here either.
+  const base = decoded.status === 'ok' && decoded.record.pr === pr ? decoded.record.cost : undefined;
   return { ...decoded, sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id, costBookings, effectiveCost: effectiveCost({ base, baseStatus: decoded.status, ...costBookings }) };
 }
 
@@ -41,7 +42,7 @@ export const costOver = (summary, base) => effectiveCost({ base, baseStatus: 'ok
 
 export function readSummaryComment(gh, pr) {
   const me = gh.viewer(); // asked first: without a viewer there is nothing to match, so the comments are not even read
-  return summaryFromComments(gh.listComments(pr), me);
+  return summaryFromComments(gh.listComments(pr), me, pr);
 }
 
 // `record` / `sections` left undefined are kept from the existing comment; pass `existing` (a readSummaryComment result)

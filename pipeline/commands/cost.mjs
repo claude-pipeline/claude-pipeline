@@ -152,7 +152,7 @@ export const run = guarded(async (argv, ctx) => {
   const data = { ...patch.cost, id };
   const problem = costBookingProblem(data);
   const sentence = patch.cost.entry
-    ? `Cost booked: ${patch.cost.entry.phase} / ${patch.cost.entry.role}${patch.cost.entry.round !== undefined ? `, round ${patch.cost.entry.round}` : ''}, $${patch.cost.entry.usd}. Never edited: the PR's cost adds these comments up.`
+    ? `Cost booked: ${patch.cost.entry.phase} / ${patch.cost.entry.role}${patch.cost.entry.round !== undefined ? `, round ${patch.cost.entry.round}` : ''}, ${patch.cost.transcript ? `transcript total so far $${patch.cost.entry.usd} (the PR's cost adds only what it gained since its last booking)` : `$${patch.cost.entry.usd}`}. Never edited: the PR's cost adds these comments up.`
     : "Cost booking: a retry or a session. Never edited: the PR's cost adds these comments up.";
   const recorded = !emptyTranscript;
 
@@ -180,7 +180,7 @@ export const run = guarded(async (argv, ctx) => {
     let listError = null;
     try {
       const me = gh.viewer();
-      found = summaryFromComments(gh.listComments(pr), me);
+      found = summaryFromComments(gh.listComments(pr), me, pr);
     } catch (err) {
       listError = err;
     }
