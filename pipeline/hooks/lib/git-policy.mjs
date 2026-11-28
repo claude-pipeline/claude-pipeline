@@ -3051,20 +3051,24 @@ function headResolves(c, cmds, ctx, out, text) {
   if (wordAt < 0 || !toks.slice(0, wordAt).every((t) => /^(?:[A-Za-z_][A-Za-z0-9_]*=\S*|do|then|else|elif|if|while|until|\{|\(|!|&&|\|\||time)$/.test(t))) return false;
   if (head.includes('/')) return true; // (a program by path is never a builtin)
   const at = cmds.indexOf(c);
-  const valuesOf = (k) => {
+  const valuesOf = (k, valueOk = (v) => HEAD_VALUE.test(v)) => {
     const o = out.find((x) => x.k === k);
     const site = cmds.findIndex((x) => !x.argv.length && Object.hasOwn(x.env ?? {}, k));
     if (o) {
       const vals = o.modes.map((m) => (m === 'set' ? (site >= 0 ? cmds[site].env[k] : null) : typeof m === 'object' && !m.expand ? m.val : null));
-      return vals.every((v) => typeof v === 'string' && HEAD_VALUE.test(v)) ? vals : null;
+      return vals.every((v) => typeof v === 'string' && valueOk(v)) ? vals : null;
     }
     if (ctx.unsureVars.has(k) || ctx.tainted.has(k) || SPECIAL_NAMES.test(k)) return null;
     if (site < 0) return Object.hasOwn(ctx.vars, k) && HEAD_VALUE.test(ctx.vars[k]) ? [ctx.vars[k]] : null; // (given by an earlier line)
     const mine = [...text.matchAll(varWordRe(k))].filter((m) => !/\$\{?$/.test(text.slice(Math.max(0, m.index - 2), m.index)));
     const x = cmds[site];
     if (mine.length !== 1 || text[mine[0].index + k.length] !== '=' || site > at || x.depth > 0 || ranInSubshell(cmds, site) || !Array.isArray(x.grp) || !Array.isArray(c.grp) || x.grp.some((id, j) => c.grp[j] !== id)) return null;
-    return HEAD_VALUE.test(x.env[k]) ? [x.env[k]] : null;
+    return valueOk(x.env[k]) ? [x.env[k]] : null;
   };
+  // #746 item 5: `"$NEW" version` with `NEW="$P/dir/tool"`: a quoted word is not split, and a value written with a `/` (plain text and names, as HEAD_IN) makes the word a path to a program, never a builtin or a
+  // function, whatever `$P` holds. (Unquoted it may split at a blank of `$P`, so it is not read here.)
+  const named = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/.exec(head);
+  if (named && toks[wordAt] === `"${head}"` && valuesOf(named[1] ?? named[2], (v) => HEAD_IN.test(v) && v.includes('/'))) return true;
   let words = [head];
   for (const k of new Set([...head.matchAll(/\$\{?([A-Za-z_][A-Za-z0-9_]*)/g)].map((m) => m[1]))) {
     const vals = valuesOf(k);

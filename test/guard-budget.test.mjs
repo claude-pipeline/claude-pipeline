@@ -637,7 +637,22 @@ test('#746 item 5: stays refused where the value may not split as the list says 
   assert.equal(setup(ok, 'zsh setup.sh /x/wt').decision, 'deny');
   assert.equal(git(ok.join('; '), gitFs({})).decision, 'deny'); // (a top-level line is zsh's: no split)
 });
+// #746 item 5 (a fourth cause the owner's script showed): `"$NEW" version | grep -q x` with NEW="$P/dir/tool" made every loop name AFTER it unreadable (the command word had to be plain text, and a value that holds
+// `$P` is not), so the first loop that used its variable in a command was refused as "assigned more than once". A quoted word whose one assignment holds a `/` is a program by path, never a builtin.
+test('#746 item 5: a command word `"$NEW"` whose value is a path built from another variable does not make the loops after it unreadable; any other value still does', () => {
+  const loop = 'for f in a b; do cp "m/$f" "b/$f.x"; done';
+  const base = ['P="$HOME/a/b"', 'NEW="$P/dir/tool"'];
+  assert.equal(setup([...base, '"$NEW" version | grep -q x', loop]).decision, 'allow');
+  assert.equal(setup([...base, '"${NEW}" version', loop]).decision, 'allow');
+  for (const script of [
+    [...base, '$NEW version', loop], // (unquoted: a $P with a blank splits it, and the first word may be a builtin)
+    ['P=read', 'NEW="$P"', '"$NEW" version', loop], // (no `/` in the value: it may name a builtin)
+    [...base, 'NEW="$P/other"', '"$NEW" version', loop], // (assigned twice)
+    [...base, 'if true; then NEW=read; fi', '"$NEW" version', loop],
+  ]) assert.equal(setup(script).decision, 'deny', script.join(' / '));
+});
 test('#746 item 5: SETS_BY_NAME (shared by both guards) skips a binder word inside a path or file name and still counts a real binder', () => {
   for (const t of ['X="/a/.local"', 'X="$HOME/.local/share/x"', 'X="$HOME/.declare"', 'cp m/handoff-read.js b', 'node ./x/read.js "a"', 'ls ~/export "a"']) assert.equal(SETS_BY_NAME.test(t), false, t);
-  for (const t of ['read IFS', 'read -r IFS < f', 'local IFS=,', 'g() { local IFS=,; }', 'declare IFS=,', 'declare "$N=,"', 'eval "$X"', 'x; read $N', 'typeset -x "I""FS=,"', 'export "$N=1"']) assert.equal(SETS_BY_NAME.test(t), true, t);
+  // (a name spelled out, `local IFS=,`, is caught by the plain IFS test of the callers; these are the binders of a name written without the letters IFS in a row)
+  for (const t of ['read $N', 'read -r "$N" < f', 'g() { local "$N=,"; }', 'declare "I""FS=,"', 'declare -n r="$X"', 'eval "$X"', 'x; read $N', 'typeset -x "I""FS=,"', 'export "$N=1"', 'x=1;local "$N"=2']) assert.equal(SETS_BY_NAME.test(t), true, t);
 });
