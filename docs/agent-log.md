@@ -386,3 +386,4 @@ full record.
 - 2026-11-28 · #967 · Two flaky tests made deterministic: guard work cap counted, not timed; fake dead run uses an impossible pid (#71 #349) · risk high · rounds 2 · arbiter 2 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 895 runs (361 high)
 - 2026-11-28 · #966 · Guard: a service-restart line no longer makes earlier lines' order unknown; repeated loop words charged once (#950, #951) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 907 runs (365 high)
 - 2026-11-28 · #968 · Guard: a script named like a tool and run by its path is refused, not read by its name (#904) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 907 runs (365 high)
+- 2026-11-28 · #954 · Ruling dialogs can recommend any ruling, incl. BLOCKING items and Reject (#944) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · awaiting-owner-merge · Codex 7d: 911 runs (368 high)
