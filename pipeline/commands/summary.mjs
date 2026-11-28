@@ -136,6 +136,7 @@ export const run = guarded(async (argv, ctx) => {
     warnings.push(...guard.warnings, ...ciUsage.warnings);
     const posted = writeRunRecord(gh, pr, { record, sections, firstRead: existing, retry: true });
     for (const w of posted.warnings) if (!warnings.includes(w)) warnings.push(w);
+    if (posted.effectiveCost?.unavailable !== undefined) warnings.push(`the booked cost is unavailable: ${posted.effectiveCost.unavailable}`);
     const output = { ok: true, url: posted.url, action: posted.action, agentLogLine, step: posted.record.step, cost: posted.effectiveCost?.any ? costReport(posted.effectiveCost.cost) : null, codexUsage: usage, ...(testsAddedLine === undefined ? {} : { testsAdded: testsAddedLine }), warnings };
     if (ciUsage.field) output.pushedWhileReady = ciUsage.field;
     // A merged run under `production.watch: workflow` logs the line `agent-log close` later resolves from the CI smoke result.

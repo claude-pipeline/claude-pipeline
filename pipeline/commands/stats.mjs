@@ -52,7 +52,8 @@ async function rounds(rest, ctx) {
       }
       for (const number of numbers) {
         try {
-          const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record or state may be missing or old`));
+          let cut = false;
+          const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => { cut = true; warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record, state or cost bookings may be missing or old, so its cost is left out`); });
           let record = null;
           let state = null;
           let recordUnreadable = false;
@@ -88,7 +89,9 @@ async function rounds(rest, ctx) {
           // The cost is this PR's own record's cost section plus the cost bookings of THIS listing (this slug's comments of this PR: another repo's PR of the same number never mixes in). A record bound
           // to another PR was skipped above and brings no cost; an unreadable record, or an unreadable booking of ours, leaves the cost out (usd null).
           const eff = effectiveCost({ base: record?.cost, baseStatus: record === null && recordUnreadable ? 'invalid' : 'ok', ...readCostBookings({ comments, viewer: me }) });
-          const cost = eff.unavailable !== undefined || !eff.any ? null : eff.cost;
+          // A list cut by the page limit holds only some of the bookings: a partial total would be printed as the PR's cost, so the cost is left out (the cut is already a warning).
+          if (eff.unavailable !== undefined) warnings.push(`${slug}#${number}: the booked cost is unavailable, so it is left out: ${asciiLine(eff.unavailable, 120)}`);
+          const cost = cut || eff.unavailable !== undefined || !eff.any ? null : eff.cost;
           const p = analysePr({ repo: slug, pr: number, state, record, cost });
           if (p === null) withoutState += 1;
           else analysed.push(p);
