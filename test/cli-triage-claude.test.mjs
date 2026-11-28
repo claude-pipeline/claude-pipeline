@@ -1071,7 +1071,7 @@ function typedFor(t, w, ids, quote, variant = undefined) {
   const record = ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
   if (variant !== undefined) {
     const file = join(ownerGoDir(), `${record.session}.jsonl`);
-    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: randomUUID(), toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
+    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: `ask-${randomUUID().replace(/-/g, '').slice(0, 12)}`, toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
   }
   return (id, decision) => w.cli(['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', 'owner confirmed', '--owner-quote', quote, '--pr', '7']);
 }
