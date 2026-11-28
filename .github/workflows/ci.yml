@@ -94,6 +94,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # merge_group: the queue commit and its first parent (the base), so the reuse step reads the base locally, no fetch.
+          fetch-depth: ${{ github.event_name == 'merge_group' && 2 || 1 }}
 
       # Push to main only: skip this job when this exact commit passed it in the merge queue, or the exact tree passed it on the merged PR.
       - name: Already tested on the PR?
@@ -118,7 +120,10 @@ jobs:
           base="$RUNNER_TEMP/base"
           mkdir -p "$base"
           set -o pipefail
-          if git fetch --no-tags --depth=1 origin "$BASE_SHA" && git archive "$BASE_SHA" .github/scripts pipeline/lib | (cd "$base" && tar -x) && [ -f "$base/.github/scripts/queue-reuse.mjs" ]; then
+          if [ "$(git rev-parse -q --verify 'HEAD^1' 2>/dev/null)" != "$BASE_SHA" ]; then
+            echo "RUN: merge_group base $BASE_SHA is not the first parent of the queue commit (or the checkout lacks it)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git archive "$BASE_SHA" .github/scripts pipeline/lib | (cd "$base" && tar -x) && [ -f "$base/.github/scripts/queue-reuse.mjs" ]; then
             node "$base/.github/scripts/queue-reuse.mjs"
           else
             echo "RUN: base $BASE_SHA has no queue-reuse decider (or it could not be read)"
@@ -215,6 +220,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # merge_group: the queue commit and its first parent (the base), so the reuse step reads the base locally, no fetch.
+          fetch-depth: ${{ github.event_name == 'merge_group' && 2 || 1 }}
 
       # Push to main only: skip this job when this exact commit passed it in the merge queue, or the exact tree passed it on the merged PR.
       - name: Already tested on the PR?
@@ -239,7 +246,10 @@ jobs:
           base="$RUNNER_TEMP/base"
           mkdir -p "$base"
           set -o pipefail
-          if git fetch --no-tags --depth=1 origin "$BASE_SHA" && git archive "$BASE_SHA" .github/scripts pipeline/lib | (cd "$base" && tar -x) && [ -f "$base/.github/scripts/queue-reuse.mjs" ]; then
+          if [ "$(git rev-parse -q --verify 'HEAD^1' 2>/dev/null)" != "$BASE_SHA" ]; then
+            echo "RUN: merge_group base $BASE_SHA is not the first parent of the queue commit (or the checkout lacks it)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git archive "$BASE_SHA" .github/scripts pipeline/lib | (cd "$base" && tar -x) && [ -f "$base/.github/scripts/queue-reuse.mjs" ]; then
             node "$base/.github/scripts/queue-reuse.mjs"
           else
             echo "RUN: base $BASE_SHA has no queue-reuse decider (or it could not be read)"

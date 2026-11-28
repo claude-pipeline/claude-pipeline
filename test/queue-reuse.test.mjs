@@ -184,8 +184,18 @@ test('the latest attempt is the one read, and it must be green and its own', asy
 
 test('no PR run of this head from this repository for this PR -> run', async () => {
   await mustRun({ over: { runs: { stdoutJson: { total_count: 0, workflow_runs: [] } } } }, /RUN: no ci\.yml pull_request run of PR #7/);
-  await mustRun({ over: { runs: { stdoutJson: { total_count: 1, workflow_runs: [runOf({ head_repository: { full_name: 'fork/app' } })] } } } }, /RUN: no ci\.yml pull_request run of PR #7/);
-  await mustRun({ over: { runs: { stdoutJson: { total_count: 1, workflow_runs: [runOf({ pull_requests: [{ number: 99 }] })] } } } }, /RUN: no ci\.yml pull_request run of PR #7/);
+  await mustRun({ over: { runs: { stdoutJson: { total_count: 1, workflow_runs: [runOf({ head_repository: { full_name: 'fork/app' } })] } } } }, /RUN: the newest run 555 \(#5\) is not bound to PR #7 from acme\/app/);
+  await mustRun({ over: { runs: { stdoutJson: { total_count: 1, workflow_runs: [runOf({ pull_requests: [{ number: 99 }] })] } } } }, /RUN: the newest run 555 \(#5\) is not bound to PR #7 from acme\/app/);
+});
+
+// Failure caught: the newest run (failed or still running) lists no pull request yet; filtering by PR before picking the newest
+// skipped over it to an older green run bound to PR 7, and the queue reused a result the newest run had already contradicted.
+test('a newer run with no pull_requests binding is still the newest: never skipped over to an older bound green run -> run', async () => {
+  for (const newer of [{ conclusion: 'failure' }, { status: 'in_progress', conclusion: null }, { conclusion: 'success' }]) {
+    const workflow_runs = [runOf(), runOf({ id: 556, run_number: 6, pull_requests: [], ...newer })];
+    const r = await mustRun({ over: { runs: { stdoutJson: { total_count: 2, workflow_runs } } } }, /RUN: the newest run 556 \(#6\) is /);
+    assert.ok(!r.calls.some((c) => c.includes(`/runs/${RUN_ID}/attempts/`)), 'the older green run is never read');
+  }
 });
 
 // Failure caught: no recorded merge commit means nothing says which tree the run tested; two entries mean it cannot be told which.
@@ -259,26 +269,30 @@ const reuseStep = (job) => job.steps.find((st) => st.id === 'reused');
 
 // Runs the real `run:` text of the step with bash in a clone whose origin has a base commit (with or without the decider) and a
 // queue commit whose own queue-reuse.mjs differs: which copy ran shows in the output.
-function runReuseStep({ baseHasDecider }) {
+function runReuseStep({ baseHasDecider, staleBase = false, depth = 2 }) {
   const origin = createTmpRepo();
   const decider = (name) => `import { appendFileSync } from 'node:fs';\nconsole.log('decider: ${name}');\nappendFileSync(process.env.GITHUB_OUTPUT, 'run=false\\n');\n`;
   origin.write('pipeline/lib/queue-members.mjs', '// base lib\n');
   origin.write('.github/scripts/tested-tree.mjs', '// push decider\n');
   if (baseHasDecider) origin.write('.github/scripts/queue-reuse.mjs', decider('BASE copy'));
+  const older = origin.commit('older than the base');
+  origin.write('c.txt', 'base\n');
   const base = origin.commit('base');
   origin.write('.github/scripts/queue-reuse.mjs', decider('PR copy (the queue checkout)'));
   const queue = origin.commit('queue commit with the PR changes');
   const dir = scratchDir();
   const clone = join(dir, 'checkout');
   const git = (args, cwd) => spawnSync('git', args, { cwd, encoding: 'utf8' });
-  assert.equal(git(['clone', '-q', origin.dir, clone], dir).status, 0);
+  // As actions/checkout does on merge_group (fetch-depth 2): the queue commit and its first parent, and no way back to origin.
+  assert.equal(git(['clone', '-q', ...(depth > 0 ? ['--depth', String(depth)] : []), `file://${origin.dir}`, clone], dir).status, 0);
   assert.equal(git(['checkout', '-q', queue], clone).status, 0);
+  assert.equal(git(['remote', 'remove', 'origin'], clone).status, 0);
   const temp = join(dir, 'runner temp');
   mkdirSync(temp);
   const out = join(dir, 'output');
   writeFileSync(out, '');
   const r = spawnSync('bash', ['-c', reuseStep(ci.jobs['test-ubuntu-node']).run], {
-    cwd: clone, encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: temp, GITHUB_OUTPUT: out, BASE_SHA: base },
+    cwd: clone, encoding: 'utf8', env: { ...process.env, RUNNER_TEMP: temp, GITHUB_OUTPUT: out, BASE_SHA: staleBase ? older : base },
   });
   return { ...r, output: readFileSync(out, 'utf8').trim() };
 }
@@ -298,6 +312,18 @@ test('a base without the decider -> run=true, and the PR\'s own copy is not used
   assert.equal(r.output, 'run=true');
   assert.match(r.stdout, /RUN: base [0-9a-f]{40} has no queue-reuse decider/);
   assert.doesNotMatch(r.stdout, /PR copy/);
+});
+
+// Failure caught: a base_sha that is not the queue commit's first parent (an older main commit, or a parent the checkout lacks)
+// would run a decider the queue commit was never built on; the step must answer run, not read it.
+test('merge_group base_sha that is not HEAD^1, or a checkout without the parent -> run=true with a reason, no decider run', () => {
+  for (const opts of [{ baseHasDecider: true, staleBase: true, depth: 0 }, { baseHasDecider: true, depth: 1 }]) {
+    const r = runReuseStep(opts);
+    assert.equal(r.status, 0, r.stderr);
+    assert.equal(r.output, 'run=true', JSON.stringify(opts));
+    assert.match(r.stdout, /RUN: merge_group base [0-9a-f]{40} is not the first parent of the queue commit/);
+    assert.doesNotMatch(r.stdout, /decider: /);
+  }
 });
 
 // ---- the wiring, for every expanded matrix row ----
@@ -327,12 +353,16 @@ test('every matrix row has the reuse step: merge_group only, soft-failing, its o
     assert.equal(reuse.env.SHARD, row.combo.shard === undefined ? undefined : String(row.combo.shard));
     // the decider that runs is the base copy, never a path of the checkout
     assert.match(reuse.run, /git archive "\$BASE_SHA" \.github\/scripts pipeline\/lib \| \(cd "\$base" && tar -x\)/);
+    assert.doesNotMatch(reuse.run, /git fetch/, `${row.name}: the base comes from the local checkout, no unauthenticated fetch`);
+    assert.match(reuse.run, /git rev-parse -q --verify 'HEAD\^1'.*!= "\$BASE_SHA"/, `${row.name}: base_sha must be HEAD^1`);
     assert.match(reuse.run, /node "\$base\/\.github\/scripts\/queue-reuse\.mjs"/);
     assert.match(reuse.run, /base="\$RUNNER_TEMP\/base"/);
     assert.doesNotMatch(reuse.run, /node \.github\/scripts|node \.\/\.github/, `${row.name}: never the checkout's copy`);
     // it precedes every step it gates, after the checkout that provides HEAD and git
     const at = row.steps.indexOf(reuse);
-    assert.ok(row.steps.slice(0, at).some((st) => String(st.uses).startsWith('actions/checkout@')), row.name);
+    const checkout = row.steps.slice(0, at).find((st) => String(st.uses).startsWith('actions/checkout@'));
+    assert.ok(checkout, row.name);
+    assert.equal(checkout.with['fetch-depth'], "${{ github.event_name == 'merge_group' && 2 || 1 }}", `${row.name}: the queue checkout holds the base commit`);
     assert.ok(row.steps.slice(at + 1).every((st) => !String(st.uses).startsWith('actions/checkout@')));
   }
 });
