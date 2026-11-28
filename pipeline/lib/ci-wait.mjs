@@ -46,7 +46,7 @@
 // They never decide `unverified` / `no-required-checks`: those speak about the policy sources alone.
 // A `passed` result on EVERY PR also reports `others: [{name, status, url}]`, the head's NON-required check runs / statuses that
 // are still running or red (path-triggered suites such as EW's SQL arms / Playwright), so a green required set never hides a pending
-// or failed one (#743). A running entry keeps the wait open until --timeout (then `passed` with the entry in `others`, do not hand
+// or failed one (#743); an unfinished workflow run of the head (`readers.headRuns`) counts as a running entry too (a `needs:`-gated job has no check run yet). A running entry keeps the wait open until --timeout (then `passed` with the entry in `others`, do not hand
 // off); a red one does not change the verdict. `options.waitOthers` (--wait-others) is kept for compatibility: waiting is the default.
 // `options.e2eLabel` (config ci.e2e_label) is accepted and no longer read: no label is needed for any of this.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
@@ -151,6 +151,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let readyAtMemo;
   let markerAtMemo; // ms of the newest review-complete marker of the head, or null; per poll, like readyAtMemo
   let runStartMemo = new Map(); // Actions run id -> ms the run started (number) | null (no readable start time, no reader, or not an Actions run) | undefined (the read threw: never normalise it to null); per poll, like markerAtMemo
+  let lastOthersSignature = null; // the running non-required checks last reported as progress
   let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
   let mergeRetried = false; // the one extra read of a mergeability GitHub had not computed yet
@@ -655,12 +656,28 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
     const others = await otherChecks(obs, identities);
+    // A `needs:`-gated job has no check run until its predecessor finishes: an unfinished workflow run of the head still counts as a running other (R1-B2; the same headRuns read as findHolder).
+    if (readers.headRuns) {
+      for (const w of await readers.headRuns(head)) {
+        if (w && ACTIVE_WORKFLOW_RUN.has(w.status)) others.push({ name: w.name ?? `workflow run ${w.id ?? '?'}`, status: w.status, url: w.html_url ?? null });
+      }
+    }
     const owedNote = notOwed.length > 0 ? { notOwed } : {};
     // The required checks are green but a non-required check of the head is still running: keep waiting for it until --timeout (a red or finished one ends the wait as `passed` with `others`).
-    if (others.some((o) => RUNNING_OTHER.has(o.status)) && elapsed() < timeoutMs) return null;
+    const running = others.filter((o) => RUNNING_OTHER.has(o.status));
+    const runningSignature = running.map((o) => `${o.name}=${o.status}`).join(', ');
+    if (runningSignature !== lastOthersSignature) {
+      lastOthersSignature = runningSignature;
+      if (running.length > 0) onProgress(`waiting for non-required: ${runningSignature}`);
+    }
+    if (running.length > 0 && elapsed() < timeoutMs) return null;
     await markStatusRuns(states, Date.parse(await getReadyAt(pr))); // a failed timeline read throws into the poll loop and is retried: the pass is dated against ready, never reported without readyAt / predatesReady
     if (others.length > 0) {
-      return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
+      const list = (xs) => xs.map((o) => `${o.name}=${o.status}`).join(', ');
+      const red = others.filter((o) => !RUNNING_OTHER.has(o.status));
+      // Only a running entry is waited for; a finished red one never turns green: it is named to the owner in the hand-off.
+      const advice = [...(running.length > 0 ? [`do not hand off before the running one(s) finish: ${list(running)}`] : []), ...(red.length > 0 ? [`report the red one(s) to the owner in the hand-off: ${list(red)}`] : [])].join('; ');
+      return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this PR are not green: ${list(others)}: ${advice}` });
     }
     return result(EXIT.OK, 'passed', { ...owedNote, others });
     };

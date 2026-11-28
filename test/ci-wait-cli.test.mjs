@@ -37,6 +37,8 @@ const base = (over = []) => [
   { match: '^api repos/acme/widgets/branches/main/protection$', stdoutJson: { required_status_checks: { contexts: ['ci', 'lint'], checks: [{ context: 'ci', app_id: 15368 }, { context: 'lint', app_id: -1 }] } } },
   { match: '^api repos/acme/widgets/rules/branches/main', stdout: '[]\n' },
   ...over,
+  // every pass also reads the head's workflow runs (an unfinished one counts as a running non-required check, #743)
+  { match: '/actions/runs\\?head_sha=', stdout: '[]\n' },
   // the readyAt timeline read of the passed verdict: no ready event (a PR created ready) dates ready by createdAt; a test's own /timeline entry in `over` wins (first match)
   { match: '/timeline', stdout: '[]\n' },
 ];
@@ -273,7 +275,7 @@ test('ci-wait: ci.merge_checks is waited on as well, and a still-running non-req
       ...(t >= 30_000 ? [run(2, 'Replay from zero', 'success')] : [{ ...run(2, 'Replay from zero', null), status: 'in_progress', conclusion: null }]),
       { ...run(3, 'Playwright suite', null), status: 'in_progress', conclusion: null },
     ],
-    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
+    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [], workflowRunsOfHead: () => [],
   };
   const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
   const r = await ciWait(['--pr', '5', '--timeout', '60'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
@@ -291,7 +293,7 @@ test('ci-wait (R1-B2): a pipeline.yml that exists but is invalid is a config err
     protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'ci', app_id: 15368 }] } } }),
     branchRules: () => [],
     checkRunsOf: () => [run(1, 'ci', 'success'), run(2, 'Replay from zero', 'failure')],
-    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
+    statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [], workflowRunsOfHead: () => [],
   };
   const go = (repo) => ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock: { now: () => 0, sleep: async () => {} }, onProgress: () => {} } });
   const bad = createTmpRepo();
