@@ -2200,3 +2200,16 @@ test('#950: a detached call site makes the later writes visible to the script it
   for (const l of ['setsid -f bash wrap.sh; cp f.sh n.sh', 'echo a; tmux new -d "bash wrap2.sh"; cp f.sh n.sh', 'launchctl kickstart -k x; bash wrap.sh; cp f.sh n.sh', 'bash setup2.sh; cp f.sh n.sh', 'bash setup3.sh; cp f.sh n.sh']) denyBoth(l, spec);
   for (const l of ['bash setup.sh; cp f.sh n.sh', 'bash wrap.sh; cp f.sh n.sh']) allowBoth(l, spec);
 });
+
+// R2-F1 (#950): a function body or a trap action runs when it is called, not where it is written. Failure caught: `bash co.sh; cp f.sh n.sh` with co.sh = `run() { bash n.sh; }` then `coproc run`
+// was allowed (the body was judged before the backgrounder, so the caller's later copy was not seen) though main refused it: the child outlives co.sh and may open n.sh after the copy.
+test('#950: a function or trap in a called script that a backgrounder runs still sees the caller\'s later writes', () => {
+  const spec = {
+    ...SPEC,
+    'co.sh': 'run() { bash n.sh; }\ncoproc run',
+    'co2.sh': 'run() { bash n.sh; }\nexport -f run; setsid -f bash -c run',
+    'co3.sh': "trap 'bash n.sh' EXIT\nlaunchctl kickstart -k x",
+  };
+  for (const s of ['co.sh', 'co2.sh', 'co3.sh']) denyBoth(`bash ${s}; cp f.sh n.sh`, spec);
+  allowBoth('bash setup.sh; cp f.sh n.sh', { ...SPEC, 'setup.sh': 'bash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"' }); // twin: no function, a foreground run first
+});
