@@ -18,9 +18,18 @@
 # Merge queue: the repo's default branch can use GitHub's merge queue, which builds a temporary commit (head + the queued PRs
 # ahead) on a gh-readonly-queue/... branch and waits for the required checks on it. `merge_group` (types: checks_requested) is the
 # trigger that runs this workflow there, so "test (ubuntu)" and "test (windows)" report on the queue commit. A merge_group event has
-# no pull_request payload, so every `github.event_name != 'pull_request' || ...` condition below is true for it: the full suite runs,
-# nothing is skipped as a draft, the aggregates report success or failure (never skipped), and the tested-tree step (push only) does
-# not run. Its concurrency group is its own queue ref, which no other run shares, and only pull_request runs ever cancel.
+# no pull_request payload, so every `github.event_name != 'pull_request' || ...` condition below is true for it: nothing is skipped
+# as a draft, the aggregates report success or failure (never skipped), and the tested-tree step (push only) does not run. Its
+# concurrency group is its own queue ref, which no other run shares, and only pull_request runs ever cancel.
+# The suite runs in full on the queue commit unless a job PROVES it already passed: each matrix job's "Already tested on the PR run?"
+# step (.github/scripts/queue-reuse.mjs, run from the BASE commit's copy, never the PR's own) answers run=false only when the queue
+# holds exactly this one PR, the diff over the base touches no workflow, test runner or proof code (PROOF_LOGIC in
+# queue-reuse.mjs: .github/**, the test runner and every pipeline module it or the decider imports, package files, .gitattributes), the newest pull_request run of
+# this workflow on the PR head (latest attempt, green) tested a merge commit (referenced_workflows: refs/pull/N/merge) whose tree
+# equals the queue commit's tree, and that attempt's same-named job and its test step (and the installer round trip on its
+# designated shard) succeeded. The job then still starts and reports success with its test steps skipped, so the aggregates are
+# unchanged. A batch, a moved merge ref (main advanced), a changed workflow, any API or git error: the suite runs. The first queue run
+# after this reuse lands has no decider in its base and runs in full.
 #
 # Every step runs under bash (Git Bash on Windows) so one script serves both runners. The
 # installer runs into a throwaway Claude home whose path contains a space, then --check must
@@ -37,7 +46,7 @@
 # Either makes the main run redundant, so a merge costs no second long run. If neither proves it (for instance the PR branch
 # was NOT up to date at a direct merge, so the trees differ), the job runs: that is the intended fail-open. Any API or git
 # error also means run. The job itself still starts and reports success (skipped steps), so the required check names are
-# unchanged. pull_request and merge_group runs never skip.
+# unchanged. pull_request runs never skip; a merge_group run skips only on the proof above.
 name: CI
 
 on:
@@ -52,7 +61,7 @@ on:
 
 permissions:
   contents: read
-  # actions + pull-requests: read-only, for the tested-tree skip step (finds the merged PR and its passed CI jobs).
+  # actions + pull-requests: read-only, for the tested-tree and queue-reuse skip steps (find the merged / queued PR and its passed CI jobs).
   actions: read
   pull-requests: read
 
@@ -85,6 +94,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # merge_group: the queue commit and its first parent (the base), so the reuse step reads the base locally, no fetch.
+          fetch-depth: ${{ github.event_name == 'merge_group' && 2 || 1 }}
 
       # Push to main only: skip this job when this exact commit passed it in the merge queue, or the exact tree passed it on the merged PR.
       - name: Already tested on the PR?
@@ -98,20 +109,52 @@ jobs:
           SHA: ${{ github.sha }}
           JOB_NAME: test (ubuntu node ${{ matrix.node }} ${{ matrix.shard }}/2)
 
+      # Merge queue only: skip the test steps when a pull_request run of this same job already passed on a byte-identical tree
+      # (.github/scripts/queue-reuse.mjs). The decision runs the BASE commit's copy of that script (never the PR's own, which the queue
+      # commit contains), extracted into $RUNNER_TEMP/base. A base without it, or any error, answers run.
+      - name: Already tested on the PR run?
+        id: reused
+        if: github.event_name == 'merge_group'
+        continue-on-error: true
+        run: |
+          base="$RUNNER_TEMP/base"
+          mkdir -p "$base"
+          set -o pipefail
+          if [ "$(git rev-parse -q --verify 'HEAD^1' 2>/dev/null)" != "$BASE_SHA" ]; then
+            echo "RUN: merge_group base $BASE_SHA is not the first parent of the queue commit (or the checkout lacks it)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git archive "$BASE_SHA" .github/scripts pipeline/lib | (cd "$base" && tar -x) && [ -f "$base/.github/scripts/queue-reuse.mjs" ]; then
+            node "$base/.github/scripts/queue-reuse.mjs"
+          else
+            echo "RUN: base $BASE_SHA has no queue-reuse decider (or it could not be read)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          JOB_NAME: test (ubuntu node ${{ matrix.node }} ${{ matrix.shard }}/2)
+          TEST_STEP: Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/2)
+          SHARD: ${{ matrix.shard }}
+          INSTALLER_STEP: Installer round trip (Node ${{ matrix.node }})
+          INSTALLER_SHARD: '2'
+
       - name: Node ${{ matrix.node }}
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
+        if: (github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false')
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: ${{ matrix.node }}
       # The Ubuntu jobs record and print per-file times and the manifest too, so a run can be measured; scripts/shard-weights.mjs reads
       # only the Windows shards for test-weights.json.
       - name: Tests (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/2)
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
+        if: (github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false')
         run: node scripts/test.mjs --shard ${{ matrix.shard }}/2
         env:
           CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
       - name: File times (Node ${{ matrix.node }}, shard ${{ matrix.shard }}/2)
-        if: always() && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
+        if: always() && ((github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false'))
         env:
           CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
         run: |
@@ -125,7 +168,7 @@ jobs:
           echo CP-FILE-MANIFEST-END
       # The installer round trip is one script, not a shard of the suite: it runs once per Node version, in shard 2.
       - name: Installer round trip (Node ${{ matrix.node }})
-        if: matrix.shard == 2 && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
+        if: matrix.shard == 2 && ((github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false'))
         run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home ${{ matrix.node }}"
 
   # The required check. always() makes it run (and report) even when a Node job failed or was cancelled; it is green only
@@ -177,6 +220,8 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
+          # merge_group: the queue commit and its first parent (the base), so the reuse step reads the base locally, no fetch.
+          fetch-depth: ${{ github.event_name == 'merge_group' && 2 || 1 }}
 
       # Push to main only: skip this job when this exact commit passed it in the merge queue, or the exact tree passed it on the merged PR.
       - name: Already tested on the PR?
@@ -190,20 +235,52 @@ jobs:
           SHA: ${{ github.sha }}
           JOB_NAME: test (windows ${{ matrix.shard }}/7)
 
+      # Merge queue only: skip the test steps when a pull_request run of this same job already passed on a byte-identical tree
+      # (.github/scripts/queue-reuse.mjs). The decision runs the BASE commit's copy of that script (never the PR's own, which the queue
+      # commit contains), extracted into $RUNNER_TEMP/base. A base without it, or any error, answers run.
+      - name: Already tested on the PR run?
+        id: reused
+        if: github.event_name == 'merge_group'
+        continue-on-error: true
+        run: |
+          base="$RUNNER_TEMP/base"
+          mkdir -p "$base"
+          set -o pipefail
+          if [ "$(git rev-parse -q --verify 'HEAD^1' 2>/dev/null)" != "$BASE_SHA" ]; then
+            echo "RUN: merge_group base $BASE_SHA is not the first parent of the queue commit (or the checkout lacks it)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          elif git archive "$BASE_SHA" .github/scripts pipeline/lib | (cd "$base" && tar -x) && [ -f "$base/.github/scripts/queue-reuse.mjs" ]; then
+            node "$base/.github/scripts/queue-reuse.mjs"
+          else
+            echo "RUN: base $BASE_SHA has no queue-reuse decider (or it could not be read)"
+            echo "run=true" >> "$GITHUB_OUTPUT"
+          fi
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+          BASE_SHA: ${{ github.event.merge_group.base_sha }}
+          QUEUE_REF: ${{ github.event.merge_group.head_ref }}
+          JOB_NAME: test (windows ${{ matrix.shard }}/7)
+          TEST_STEP: Tests (Node 24, shard ${{ matrix.shard }}/7)
+          SHARD: ${{ matrix.shard }}
+          INSTALLER_STEP: Installer round trip (Node 24)
+          INSTALLER_SHARD: '7'
+
       - name: Node 24
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
+        if: (github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false')
         uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: 24
       - name: Tests (Node 24, shard ${{ matrix.shard }}/7)
-        if: github.event_name != 'push' || steps.tested.outputs.run != 'false'
+        if: (github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false')
         run: node scripts/test.mjs --shard ${{ matrix.shard }}/7
         env:
           CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
       # Per-file wall-clock times of this shard, and the manifest of the files it was given (shard label, its file list, size and hash of
       # the full list), each between marker lines, for scripts/shard-weights.mjs to read from the job log.
       - name: File times (shard ${{ matrix.shard }}/7)
-        if: always() && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
+        if: always() && ((github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false'))
         env:
           CP_TEST_TIMES: ${{ runner.temp }}/cp-file-times.json
         run: |
@@ -217,7 +294,7 @@ jobs:
           echo CP-FILE-MANIFEST-END
       # The installer round trip is one script, not a shard of the suite: it runs once, in shard 7.
       - name: Installer round trip (Node 24)
-        if: matrix.shard == 7 && (github.event_name != 'push' || steps.tested.outputs.run != 'false')
+        if: matrix.shard == 7 && ((github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false'))
         run: ./.github/scripts/installer-round-trip.sh "$RUNNER_TEMP/claude home 24"
 
   # The required check. always() makes it run (and report) even when a shard failed or was cancelled; it is green only
