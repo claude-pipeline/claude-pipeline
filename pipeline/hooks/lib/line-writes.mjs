@@ -1312,8 +1312,10 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   } : null;
   const w = writesOf(cmds, { readProgram });
   // Why: a `&` the commands do not show (a trailing one, `( ... ) &`, `{ ...; } &`) makes the whole frame's order unknown (opaque); bgWork: this frame starts something that may outlive it
-  const lone = typeof text === 'string' ? (syntaxText(text, cmds).match(/(?<![&|<>])&(?![&>])/g) ?? []).length : 0;
   const seps = cmds.filter((c) => c.sep === '&').length;
+  const loneIn = (t) => (t.match(/(?<![&|<>])&(?![&>])/g) ?? []).length;
+  // (blanking only removes matches, so the text is read for syntax only when its raw count could make the frame opaque)
+  const lone = typeof text === 'string' ? (loneIn(text) > seps ? loneIn(syntaxText(text, cmds)) : 0) : 0;
   const opaque = lone > seps || cmds.some(startsBackground);
   const bgWork = seps > 0 || opaque || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
   return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
@@ -1326,11 +1328,12 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
 const DATA_CMDS = new Set(['echo', 'printf', 'cat', 'true', 'false', ':']); // (print their words; they run nothing)
 // Can no command run the quoted text? Not when it is piped or captured (`echo 'x &' | sh`, `$(…)`), given to a command that may run its words or its heredoc (`bash -c`, `eval`, `for c in 'x &'`), or defined in a function.
 function quotedIsData(text, cmds) {
-  if (/<<<|<\(|\$\(|`/.test(text) || (cmds.fns instanceof Set && cmds.fns.size > 0) || cmds.some((c) => c.sep === '|')) return false;
+  if (/<<<|[<>=]\(|\$\(|`/.test(text) || (cmds.fns instanceof Set && cmds.fns.size > 0) || cmds.some((c) => c.sep === '|')) return false;
   return cmds.every((c) => DATA_CMDS.has(commandName(c.argv[0] ?? '')) || !(/<</.test(c.raw ?? '') || [...c.argv.slice(1), ...Object.values(c.env ?? {})].some((w) => String(w).includes('&'))));
 }
 function syntaxText(text, cmds) {
-  const bare = withoutComments(text, 5, null) ?? text; // (a comment is never run, whatever else the text holds)
+  const bare = withoutComments(text, 5, null); // (a comment is never run, whatever else the text holds)
+  if (bare === null) return text;
   if (!quotedIsData(bare, cmds)) return bare;
   let t = bare;
   if (/<</.test(t)) {
@@ -1338,7 +1341,7 @@ function syntaxText(text, cmds) {
     if (!Array.isArray(spans) || spans.some(([a, b, quoted]) => quoted !== true || !(a >= 0 && a <= b && b <= t.length))) return bare;
     t = quotedBodiesBlank(t, cmds);
   }
-  const lit = withoutLiteralText(t);
+  const lit = withoutLiteralText(t.replace(/#/g, '\u0001')); // (the comments are gone: a `#` left is a word's, as the lexer reads it (`Issue\ #42`), and must not start one here)
   return lit === null ? bare : expandedOnly(lit);
 }
 

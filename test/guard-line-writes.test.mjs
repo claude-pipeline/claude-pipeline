@@ -2152,4 +2152,15 @@ test('#919: a `&` in a comment, quotes or a quoted heredoc body does not make th
   denyBoth('cat <<X\n$(sleep 1 &)\nX\nbash n.sh; cp f.sh n.sh');
   // an apostrophe in an unquoted heredoc body must not pair with a later quote and blank the real `&` between them
   denyBoth("cat <<X\ndon't\nX\nbash n.sh; cp f.sh n.sh; (sleep 1) & echo 'x' &");
+  // R1-F1: quoted text fed to a shell through an output process substitution (`>(sh)`, zsh `=(…)`) can run, like a pipe
+  denyBoth("echo 'sleep 1 &' > >(sh)\nbash n.sh; cp f.sh n.sh");
+  denyBoth("echo 'sleep 1 &' > =(sh)\nbash n.sh; cp f.sh n.sh");
+  // R1-B1: a `#` inside a word (`Issue\\ #42`, a continued line, `${x/ #/}`) is no comment: the real trailing `&` after it still counts
+  denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh Issue\\ #42 &");
+  denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh a\\\n#b &");
+  denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh \"${x/ #/}\" &");
+  allowBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh Issue\\ #42");
+  // R1-B2: a comment between case arms is a comment: its `&` and apostrophe change nothing; a real `&` after it still counts
+  allowBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh");
+  denyBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh &");
 });
