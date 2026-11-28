@@ -113,6 +113,31 @@ test('#189 compaction (finding 3): a summary is skipped only when BOTH flags say
   }
 });
 
+// #905: a NON-owner plain boundary (a half-flagged summary of unknown source) is no known turn: with no parentUuid, or one that resolves to nothing, a request chained under it must not bind
+// (it would let a hand-written transcript entry stand in for the owner's turn). Failure caught: the walk ending "visible" at that boundary, so a bare "merge" / "extra round" / ruling answer binds.
+test('#905 a request chained under a parentless or unresolved half-flagged summary binds nothing (merge, extra round, ruling)', () => {
+  for (const [name, parentUuid] of [['no parentUuid at all', undefined], ['null parentUuid', null], ['parentUuid outside the window', 'u-nowhere']]) {
+    const half = summary(SUMMARY_TEXT, { isCompactSummary: false, parentUuid });
+    for (const present of [true, false]) {
+      assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [promptEntry('go'), said('Working.'), half, said(REQUEST)], { present }), { home: tmp(), now })), `merge: ${name} (present ${present})`);
+      assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [promptEntry('go'), said('Working.'), half, said(RASK)], { present }), { home: tmp(), now }), null, `extra round: ${name} (present ${present})`);
+      assert.equal(rule(tmp(), [promptEntry('go'), said('Working.'), half, said(ASK_REPLY)], 'R1-F1: accept', { present }), null, `ruling: ${name} (present ${present})`);
+    }
+  }
+});
+
+// #905 allow side: the walk still binds when it reaches a known turn. Failure caught: the fix failing closed on every non-owner boundary, so a request after a real compaction or under a summary chained to the owner's prompt stops binding.
+test('#905 a request after a real compaction and the owner\'s next typed prompt binds; so does one under a half-flagged summary chained to the owner\'s prompt', () => {
+  for (const present of [true, false]) {
+    const m = recordApproval(hookInput(tmp(), 'merge', [promptEntry('go'), said('Working.'), ...COMPACTION(), promptEntry('continue'), said(REQUEST)], { present }), { home: tmp(), now });
+    assert.deepEqual(m?.requests.map((q) => q.pr), [58], `after compaction (present ${present})`);
+    const go = { ...promptEntry('go'), uuid: 'u-owner-go' };
+    const half = summary(SUMMARY_TEXT, { isCompactSummary: false, parentUuid: 'u-owner-go' });
+    const chained = recordApproval(hookInput(tmp(), 'merge', [go, said('Working.'), half, said(REQUEST)], { present }), { home: tmp(), now });
+    assert.deepEqual(chained?.requests.map((q) => q.pr), [58], `chained summary (present ${present})`);
+  }
+});
+
 test('#189 compaction: the summary\'s text is never part of a reply, and compaction revives nothing', () => {
   const quoted = `${SUMMARY_TEXT}\nEarlier I asked:\n${ASK}`;
   for (const present of [true, false]) {

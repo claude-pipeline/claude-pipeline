@@ -351,6 +351,10 @@ const invisibleTurn = (e) => {
 // verdict, shared across the calls of one lastReply), so n chained notes cost O(n), not O(n^2).
 // R2-B1 / R3-B1 (#898): a chain that passes through a `!` stdout entry (bangStdout: it carries turnOrigin) must end at a known turn (the owner's typed prompt: entrySource 'owner'), never at the parentless fallback
 // or a plain boundary: the memo keeps { hidden, bare } (bare: the verdict is visible, but the walk did not end at an owner prompt), and every entry of a walk from the stdout entry down to it is hidden when its end is bare. The bare note itself (an ancestor) keeps its verdict.
+// #905: a NON-owner plain boundary (a prompt entry of unknown source that is no unplaced note: e.g. a half-flagged compaction summary, the #189 boundary) is no known turn either, so it no longer ends the walk visible
+// on its own fields: it walks its parentUuid chain like an unplaced note. A string parentUuid that resolves continues to the parent; no string parentUuid, a parent outside the window / unresolved, or a cycle is
+// hidden (fail closed). Only the owner's own prompt (entrySource 'owner') ends the walk as a known turn, so a request under a parentless half-flagged summary binds nothing; the #189 rule that such a summary stays a
+// boundary (a request ABOVE it never survives it) is unchanged.
 function invisibleNote(entries, parent, first, memo = new Map()) {
   const path = [];
   const seen = new Set();
@@ -362,8 +366,8 @@ function invisibleNote(entries, parent, first, memo = new Map()) {
     path.push(i);
     seen.add(i);
     if (invisibleTurn(e)) verdict = true;
-    else if (!unplacedNote(e) && !visibleSynthetic(e)) { verdict = false; bare = entrySource(e) !== 'owner'; } // the owner's prompt, or a plain boundary of its own: its own fields said so (R3-B1: only the owner's is a known turn)
-    else if (typeof e.parentUuid !== 'string') { verdict = false; bare = true; }
+    else if (entrySource(e) === 'owner') verdict = false; // the owner's own prompt: the one known turn (R3-B1)
+    else if (typeof e.parentUuid !== 'string') { if (unplacedNote(e) || visibleSynthetic(e)) { verdict = false; bare = true; } else verdict = true; } // no chain: only an unplaced note / visibleSynthetic turn keeps the legacy parentless rule; a plain boundary fails closed (#905)
     else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
     else i = parent[i];
   }
