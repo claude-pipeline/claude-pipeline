@@ -9,7 +9,8 @@ import { askSummary, costFrom } from '../pipeline/lib/round-ask.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { decodeRecord, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { roundWorld } from './helpers/round-world.mjs';
-import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { createCommentsGh } from './helpers/fakegh-env.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
 
 const entry = (o = {}) => ({ phase: 'review', role: 'judge', input: 100, output: 50, cacheRead: 10, cacheWrite: 5, usd: 0.25, ...o });
 const totals = (usd, calls = 1) => ({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd, calls });
@@ -80,18 +81,11 @@ test('askSummary: names the last round\'s cost when known, keeps the per-round a
 
 // ---- the CLI -------------------------------------------------------------------------------------------------------
 
-const PATCH_77 = { match: '-X PATCH repos/acme/widgets/issues/comments/77', stdoutJson: { id: 77, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-77' } };
-function existing(record) {
-  let body = '';
-  writeSummaryComment({ viewer: () => 'me', listComments: () => [], upsertComment: (n, m, b) => { body = b; return { id: 77, url: 'u', action: 'created' }; } }, PR, { record, sections: '' });
-  return { id: 77, user: { login: 'me' }, body, html_url: 'https://github.com/acme/widgets/pull/12#issuecomment-77' };
-}
-const withComment = (s, comment) => s.fake.setScript(ghEntries({ prHead: s.head, comments: comment ? [comment] : [], extra: [PATCH_77, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }));
-const written = (s) => {
-  const w = s.fake.calls().filter((c) => c.argv[0] === 'api' && c.argv.includes('-X') && /issues\/(?:\d+\/comments|comments\/\d+)$/.test(c.argv.at(-3)));
-  return decodeRecord(JSON.parse(w.at(-1).stdin).body).record;
+// The fake gh remembers the PR's comments: `P cost` posts one comment per booking and reads the PR back.
+const costCli = (s, args) => {
+  if (typeof s.fake.comments !== 'function') s.fake = createCommentsGh(ghEntries({ prHead: s.head, extra: [{ match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }));
+  return cli(['cost', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: s.env });
 };
-const costCli = (s, args) => cli(['cost', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: s.env });
 
 test('P cost --round R: the entry also lands in byRound[R] and adds up; without --round byRound does not appear', () => {
   const s = scenario();
@@ -99,11 +93,9 @@ test('P cost --round R: the entry also lands in byRound[R] and adds up; without 
   assertExit(r, 0);
   assert.equal(r.json.cost.byRound['2'].usd, 1.5);
   assert.equal(r.json.cost.total.usd, 1.5);
-  withComment(s, existing(written(s)));
   const r2 = costCli(s, ['--phase', 'review', '--role', 'implementer', '--usd', '0.5', '--round', '2']);
   assertExit(r2, 0);
   assert.deepEqual([r2.json.cost.byRound['2'].usd, r2.json.cost.byRound['2'].calls], [2, 2]);
-  withComment(s, existing(written(s)));
   const r3 = costCli(s, ['--phase', 'build', '--role', 'implementer', '--usd', '0.25']);
   assertExit(r3, 0);
   assert.deepEqual(Object.keys(r3.json.cost.byRound), ['2']);
@@ -132,4 +124,22 @@ test('round-request: with per-round bookings the summary names the last round\'s
   assert.deepEqual([r.json.cost.lastRound, r.json.cost.lastRoundUsd], [2, 9.5]);
   assert.match(r.json.summary, /Booked agent cost so far: \$23\.40, review \$18\.10 \(the last round \(2\) cost \$9\.50; about \$9\.05 per round\)\./);
   assert.equal(r.json.line, `🔁 Extra review round needed #7: round 3 · head ${h2.slice(0, 12)} · repo ${w.slug}`);
+});
+
+// The ask shows what the run cost: the record's own cost section (an older CLI's bookings) plus the booking comments of `P cost`, replayed, through the command entry.
+test('round-request: the booked cost is the record\'s legacy cost plus the cost-booking comments, and an unreadable booking says so instead of a wrong figure', (t) => {
+  const cost = { total: totals(23.4, 40), byPhase: { review: totals(18.1, 20) }, byRole: { arbiter: totals(6.2, 5) }, byRound: { '1': totals(8), '2': totals(9.5) }, retries: 0, guardBlocks: null, sessions: [] };
+  const body = `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), cost })}`;
+  const booking = { id: 78, user: { login: 'me' }, body: renderEvent('cost-booking', 'b-1', 'Cost booked.', { id: 'b-1', entry: { phase: 'review', role: 'judge', input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0.5, round: 2 } }) };
+  const w = roundWorld(t, { comments: [{ id: 77, user: { login: 'me' }, body }, booking] });
+  w.atCap();
+  const r = w.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.cost.bookedUsd, r.json.cost.lastRound, r.json.cost.lastRoundUsd], [23.9, 2, 10]);
+  const broken = roundWorld(t, { comments: [{ id: 77, user: { login: 'me' }, body }, { id: 78, user: { login: 'me' }, body: '<!-- claude-pipeline:event:cost-booking:x -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->' }] });
+  broken.atCap();
+  const r2 = broken.cli(['triage', 'round-request', '--pr', '7']);
+  assertExit(r2, 0, r2.stderr + r2.stdout);
+  assert.equal(r2.json.cost, null);
+  assert.match(r2.json.warnings.join('\n'), /booked cost is unavailable/);
 });

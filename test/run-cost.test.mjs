@@ -10,7 +10,7 @@ import { assertExit } from './helpers/assert-exit.mjs';
 import { createCommentsGh } from './helpers/fakegh-env.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
-  PHASES, PRICE_TABLE_DATE, ROLES, addCostEntry, deductBookedTranscript, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
+  PHASES, effectiveCost, PRICE_TABLE_DATE, ROLES, addCostEntry, deductBookedTranscript, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
@@ -250,6 +250,75 @@ test('P cost: a booking survives a record write that read the PR before it (inte
   assertExit(c, 0);
   assert.deepEqual([a.json.call.usd, b.json.call.usd, c.json.call.usd], [1, 2, 4], 'each call reports its own figure');
   assert.deepEqual([written(s).cost.total.usd, written(s).cost.total.calls], [7, 3], 'all three bookings are in the total');
+});
+
+const book1 = (s, extra = []) => costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '10', '--usd', '2', ...extra]);
+const checkpoint = (s) => cli(['checkpoint', '--pr', String(PR), '--step', 'review'], { dir: s.repo.dir, fake: s.fake, env: s.env });
+const summaryBody = (s) => s.fake.comments().filter((c) => c.body.startsWith(MARKERS.summary)).at(-1).body;
+
+// A record write that comes after a booking must show it once (the status block adds the bookings up) and must not copy it into the record it encodes (the next read would count it twice).
+test('P cost: a booking after the summary comment shows once in the block after any number of record writes, and the encoded record stays the legacy base (#958)', () => {
+  const s = scenario();
+  withComment(s, existing({ ...rec(), cost: addCostEntry(emptyCost(), entry({ usd: 1 })) }));
+  assertExit(book1(s), 0);
+  for (let i = 0; i < 2; i++) {
+    assertExit(checkpoint(s), 0);
+    assert.match(summaryBody(s), /\*\*Cost:\*\* \$3\.00 · in 110 /, 'legacy $1 plus the booking $2, once');
+    assert.equal(decodeRecord(summaryBody(s)).record.cost.total.usd, 1, 'the encoded record keeps only its own cost');
+  }
+  assert.equal(written(s).cost.total.usd, 3);
+});
+
+// merge.mjs refuses when recorder.update returns null: a booking nobody can read must show as a note, never fail the write.
+test('a record write still succeeds, and says so in the block, when a booking of ours cannot be read (#958)', () => {
+  const s = scenario();
+  assertExit(book1(s), 0);
+  s.fake.addComment({ body: '<!-- claude-pipeline:event:cost-booking:broken -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->' });
+  assertExit(checkpoint(s), 0);
+  assert.match(summaryBody(s), /cost unavailable: a cost booking could not be read/);
+});
+
+// The replay keeps every transcript's ledger (evict: false): the record's 200-key window would forget transcript A and book it in full again.
+test('effectiveCost: a transcript unchanged since its first booking books 0 even after 200 other transcripts (no eviction in a replay)', () => {
+  const usage = (n) => ({ input: n, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, byPrice: {} });
+  const booking = (id, key, n) => ({ id, data: { id, entry: entry({ input: n, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0 }), transcript: { key, usage: usage(n) } } });
+  const bookings = [booking('b-a1', 'a.jsonl', 10), ...Array.from({ length: 200 }, (_, i) => booking(`b-${i}`, `k${i}.jsonl`, 1)), booking('b-a2', 'a.jsonl', 10)];
+  const eff = effectiveCost({ bookings });
+  assert.equal(eff.contributions.get('b-a2').input, 0);
+  assert.equal(eff.cost.total.input, 210);
+});
+
+test('P cost: when the answer to the booking is not confirmed, the call is not booked twice and the warning names the booking id (#958)', () => {
+  const noList = scenario();
+  stateful(noList).fake.setFail({ list: true });
+  const a = book1(noList);
+  assertExit(a, 0);
+  assert.deepEqual([a.json.recorded, a.json.confirmed, a.json.call, a.json.cost], [true, false, null, null]);
+  assert.match(a.json.warnings.join('\n'), new RegExp(`booked \\(id ${a.json.id}\\).*do NOT book this call again`));
+  assert.equal(bookingComments(noList).length, 1, 'the booking is on the PR');
+  const lost = scenario();
+  stateful(lost).fake.setFail({ lostAnswer: true });
+  const b = book1(lost);
+  assertExit(b, 0);
+  assert.deepEqual([b.json.confirmed, b.json.cost.total.usd], [true, 2], 'the POST answer was lost but the listing finds the id: booked, not an error');
+  const notPosted = scenario();
+  stateful(notPosted).fake.setFail({ write: true });
+  const c = book1(notPosted);
+  assertExit(c, 1);
+  assert.equal(c.json.outcome, 'unknown');
+  assert.match(c.json.warnings.join('\n'), new RegExp(`look for id ${c.json.id} on the PR before booking again`));
+  const neither = scenario();
+  stateful(neither).fake.setFail({ write: true, list: true });
+  assert.equal(book1(neither).json.outcome, 'unknown');
+});
+
+test('P cost --pr <an issue, not a PR>: refused before anything is posted (#958)', () => {
+  const s = scenario();
+  const r = cli(['cost', '--pr', '99', '--phase', 'build', '--role', 'judge', '--usd', '1'], { dir: ensureStateful(s).repo.dir, fake: s.fake, env: s.env });
+  assertExit(r, 1);
+  assert.equal(r.json.recorded, false);
+  assert.equal(s.fake.comments().length, 0);
+  assert.ok(!s.fake.lines().some((l) => /-X POST/.test(l)));
 });
 
 test('P cost: books an entry into a fresh record, then adds to it', () => {

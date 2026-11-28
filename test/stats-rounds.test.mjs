@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { aggregate, analysePr, isReadableState, isSecurityItem, renderTable } from '../pipeline/lib/round-stats.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { encodeForComment } from '../pipeline/lib/state.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
@@ -303,4 +304,16 @@ test('analysePr: capLowNotDeferred is a PR whose last allowed round accepted onl
   const deferredPr = analysePr({ repo: 'a/b', pr: 3, state: stateOf([round(1, [capLow('R1-S1')])]), record: null });
   assert.deepEqual([ran.capLowNotDeferred, heavy.capLowNotDeferred, deferredPr.capLowNotDeferred], [true, false, false]);
   assert.equal(aggregate([ran, heavy, deferredPr]).capLowNotDeferred, 1);
+});
+
+// Two repositories each have a PR 7. The cost bookings are comments of the PR they were posted on: a stats run over both must price each PR from its own comment list.
+test('stats rounds: PR 7 of two repositories is priced from its own cost bookings, never the other\'s (#958)', () => {
+  const booking = (id, usd) => mine(3, renderEvent('cost-booking', id, 'Cost booked.', { id, entry: { phase: 'review', role: 'judge', input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd, round: 2 } }));
+  const r = statsCli([
+    { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), booking('w-1', 5)] },
+    { match: '^api repos/acme/other/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), booking('o-1', 12)] },
+    ...script([]),
+  ], ['--json', '--pr', '7', '--repo-slug', 'acme/widgets', '--repo-slug', 'acme/other']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.prs.map((p) => [p.repo, p.usd]).sort(), [['acme/other', 12], ['acme/widgets', 5]]);
 });
