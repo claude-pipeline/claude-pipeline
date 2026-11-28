@@ -15,7 +15,7 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { pathRunRecord, UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+import { pathRunRecord, UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, REFUSED_WRAPPER_OUTS, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
 export { VAR_BUILTINS, DIR_CHANGERS }; // (the names the command loop takes before any script-file reading: the #904 tests walk them)
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, runnerShellSetting, isRunnerCommand, runnerSettingReason, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
@@ -2325,6 +2325,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
       if (r) return r;
     }
   }
+  if (w.pieces && w.wrappers.length) return deny(`the script ${sf.file} is written by ${w.wrappers.map((n) => `\`${n}\``).join('/')}'s own log or output option earlier on the line; the guard cannot follow its content, so what it runs cannot be verified. Do not run a wrapper's log file as a script.`);
   if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be verified. Write the file out in one piece.`);
   // text the line itself wrote but we cannot compute exactly (printf %.4s, %b, an escape we cannot read, echo dialects) is agent-written, not data
   if (w.authored) return deny(`the script ${sf.file} is written by this line with text that cannot be worked out exactly (a printf / echo conversion or escape), so what it runs cannot be verified. Write the file out in plain text.`);
@@ -3374,7 +3375,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (`g''it push` after
   // 500 `true;` must not slip through on a word match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
-  if (cmds.truncated) return deny(cmds.refused ? `the command uses ${cmds.refused}, which the guard does not read. ${refusalAdvice(cmds.refused).replace(/^./, (c) => c.toUpperCase())}.` : 'command too complex to verify (the parser gave up). Split it into simpler commands.');
+  if (cmds.truncated) return deny(cmds.refused === REFUSED_WRAPPER_OUTS ? cmds.refused : cmds.refused ? `the command uses ${cmds.refused}, which the guard does not read. ${refusalAdvice(cmds.refused).replace(/^./, (c) => c.toUpperCase())}.` : 'command too complex to verify (the parser gave up). Split it into simpler commands.');
   if (cmds.dynamic && GUARDED_WORDS.test(str)) {
     return deny('the command that runs is only known at run time ($VAR / $(...) / piped into a shell) and the line mentions a guarded operation, so it cannot be verified. Rewrite: write the command out literally (`git push origin agent/x`, not `$G push` or `... | sh`); if the guarded words are only text (a commit message, a PR body), put that text in a file (`git commit -F msg.txt`, `gh pr create --body-file body.md`).');
   }
@@ -3495,6 +3496,7 @@ function evalString(str, startDir, ctx, level, child = false) {
   if (hazard || cmds.some((c) => c.argv.length > 1 && baseName(c.argv[0]) === 'export' && c.argv.slice(1).some((a) => /^-[a-zA-Z]*f/.test(a)))) ctx.budget.exitMayBeRedefined = true; // (on the shared budget: a startup file is judged on a copy of ctx, and its mark must reach the script)
   // the files this command list writes, for every script judged while it runs (see line-writes.mjs); `dirAt`: where each command runs
   const dirAt = new Map();
+  const startAt = new Map(); // (#902: where each command starts, before its own wrapper -C: a wrapper's log lands there)
   const altDirs = new Map(); // (#529: command index -> the directories its `&>` / `&>>` target and the redirects after it may ALSO be opened from: dash opens them in the directory before the span, see openSpans)
   const cdDirs = cdTargets(cmds, startDir, ctx);
   const frame = newWriteFrame(cmds, {
@@ -3517,6 +3519,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
     stamp: (idx) => (dirAt.has(idx) ? `S${dirAt.get(idx)}${(altDirs.get(idx) ?? []).map((a) => `|${a}`).join('')}` : ''), // (locate() answers differently once the command's directory is known)
     tick: () => checkDeadline(ctx.budget),
+    locateStart: (idx) => (dirAt.has(idx) ? [startAt.get(idx) ?? null] : [...cdDirs, null]), // (#902: a wrapper's own output file is placed from the directory its command starts in)
   });
   ctx.writeFrames.push(frame);
   const levels = trusted ? [] : null; // (the levels open at the command being walked, outermost first, see emit: up in shell-parse.mjs: { e: the level, dir: where this shell was when it opened, lost / state: a change in it that is certain })
@@ -3674,6 +3677,7 @@ function evalString(str, startDir, ctx, level, child = false) {
     const varsBefore = c.maybeBg === true && argv.length > 0 ? { vars: { ...ctx.vars }, unsure: new Set(ctx.unsureVars) } : null;
     frame.i = i;
     dirAt.set(i, dir);
+    startAt.set(i, c.chdir !== undefined ? chdirBase : dir);
     if (c.maybeBgEnds !== undefined && (c.redirects ?? []).some((r) => r.op === '&>' || r.op === '&>>')) { const alts = spans.filter((sp) => sp.end === i && sp.dir !== dir).map((sp) => sp.dir); if (alts.length) altDirs.set(i, alts); } // (#529: the span moved the directory: dash opens the target from where it was before)
     // (#352 R35-F2: the closer of a { } group is listed as a command of no words in it, after its last one: a redirection on it that can fail (`{ cd d; } < /missing`) fails the group before it runs, so what
     // the group changed is not handed on as certain when it ends (see the brace rule above))

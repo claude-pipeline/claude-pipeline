@@ -2445,7 +2445,7 @@ test('#902: the log lands where its wrapper starts: `env -C sub script -q n.sh` 
   const rows = [
     ['env -C sub script -q n.sh echo hi; bash sub/n.sh', 'deny'], ['env -C sub script -q n.sh echo hi; bash n.sh', 'allow'], ['env -C sub script -q x.log ls; bash ok.sh', 'allow'],
     ['script -q n.sh env -C sub echo hi; bash n.sh', 'deny'], ['script -q n.sh env -C sub echo hi; bash sub/n.sh', 'allow'], ['script -q x.log env -C sub ls; bash ok.sh', 'allow'],
-    ['env -C "$X" script -q n.sh echo hi; bash n.sh', 'deny'], ['env -C sub time -o n.sh ls; bash sub/n.sh', 'deny'], ['time -o n.sh env -C sub ls; bash n.sh', 'deny'],
+    [`env -C "$X" script -q n.sh echo ${PUSH_G}; bash n.sh`, 'deny'], ['env -C "$X" script -q x.log ls; bash ok.sh', 'allow'], ['env -C sub time -o n.sh ls; bash sub/n.sh', 'deny'], ['time -o n.sh env -C sub ls; bash n.sh', 'deny'],
   ];
   for (const [l, want] of rows) {
     const v = evaluate(l, both);
