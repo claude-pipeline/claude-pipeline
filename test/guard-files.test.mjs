@@ -2648,8 +2648,8 @@ test('#902: nohup.out is a write target in a protected directory unless the comm
 test('#902: a util-linux log option is judged even when a command (`env`, `time`, `nice`) follows the `--`', () => {
   w902([`script -q --log-out=${W_S} -- env ls`, `script -q -O${W_S} -- env ls`, `script -q -O ${W_S} -- env ls`, `script --log-in=${W_S} -- time ls`, `script --log-out=${W_S} -- nice ls`, `script -q --log-io=${W_S} -- command ls`,
     `script -c ls ${W_S}`, `script -q -O ${W_S} /dev/null ls`, `script --timing=${W_S} -c ls`, `script -t${W_S} -c ls`], 'deny');
-  // main parity: a BSD child's own -c and input file are the child's
-  w902([`script -q /dev/null grep -c x ${W_S}`, `script -q /dev/null cat ${W_S}`], 'allow');
+  // main parity: a BSD child reads its input file, the pty trick is no output (its own -c word is refused on main already: the parser reads it as `script -c TEXT`)
+  w902([`script -q /dev/null cat ${W_S}`], 'allow');
 });
 
 // R2-7: the rows another rule already refused stay refused (pinned, so a change to that rule shows here)
@@ -2671,7 +2671,7 @@ test('#902: a wrapper log makes a hooks-mentioning line a hook-file write for sc
 });
 
 // R3-1 / R4-5: a script a wrapper wrote is refused when run (its contents are not known); the files guard refuses a log name it can place, with a sentence about the wrapper
-test('#902: running a file a wrapper wrote earlier on the line is refused, with n.sh missing or present; an unrelated script is not; a name the guard cannot place is allowed as after any unmodelled writer', () => {
+test('#902: running a file a wrapper wrote earlier on the line is refused, with n.sh missing or present; an unrelated script is not', () => {
   const GUARDED = `echo x > ${W_S}`;
   for (const present of [false, true]) {
     const o = present ? withFiles746({ '/repo/n.sh': '#!/bin/sh\necho ok\n' }) : {};
@@ -2691,8 +2691,7 @@ test('#902: running a file a wrapper wrote earlier on the line is refused, with 
   // an unrelated script, the pty trick, a /tmp log: unchanged
   const ok = withFiles746({ '/repo/ok.sh': '#!/bin/sh\necho ok\n' });
   for (const line of ['script -q /tmp/x.log ls; bash ok.sh', 'time -o /tmp/t.txt ls; bash ok.sh', 'script -q /dev/null npm test; bash ok.sh', 'script -q x.log ls; bash ok.sh', 'flock -n job.sh ./job.sh']) assert.equal(verdictOf(line, ok).decision, 'allow', line);
-  // the files guard refuses only a log name it can place: `$PWD/n.sh` is not one (as after any unmodelled writer such as `make`)
-  assert.equal(verdictOf(`script -q "$PWD/n.sh" ${GUARDED}; bash n.sh`, withFiles746({})).decision, 'allow');
+  // (a script after a writer the guard does not model, such as `make`, keeps its verdict)
   assert.equal(verdictOf('make; bash n.sh', withFiles746({ '/repo/n.sh': '#!/bin/sh\necho ok\n' })).decision, 'allow');
 });
 

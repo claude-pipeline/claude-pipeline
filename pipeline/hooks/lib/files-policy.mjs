@@ -25,7 +25,7 @@ import { evaluateSupabaseMcp, findLiveDbCli, serverSegment, supabaseMatch } from
 import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
+import { wrapperTargetsOf, REFUSED_WRAPPER_OUTS, UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, rememberExpansions, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -790,7 +790,8 @@ function hookSurfaceBashReason(cmds, frame, ctx, io) {
   try {
     let total = 0;
     for (const [idx, c] of cmds.entries()) {
-      const redirects = (c.redirects ?? []).filter((r) => WRITE_OPS.has(r.op) && typeof r.target === 'string' && r.target !== '' && !FD_DUP.test(r.target) && r.target !== '/dev/null').map((r) => r.target);
+      // (#902: a wrapper's file lands in the directory its wrapper moved to first: both spellings are looked at)
+      const redirects = writeTargetsOf(c, cmds[idx + 1]).filter(fileTarget).flatMap((r) => (r.kind === 'wrapper' && typeof r.chdir === 'string' && !/^[/~]/.test(r.target) ? [r.target, `${r.chdir.replace(/\/+$/, '')}/${r.target}`] : [r.target]));
       const name = c.argv.length > 0 ? baseOf(c.argv[0]) : '';
       const writer = name !== '' && !NOT_WRITERS.has(name) && !isReadOnly(c, ctx);
       if (!writer && redirects.length === 0) continue;
@@ -809,6 +810,7 @@ function hookSurfaceBashReason(cmds, frame, ctx, io) {
       total += words.length;
       if (total > MAX_SURFACE_WORDS) return 'the command line has too many words to check for writes to a file that can declare hooks';
       for (const w of words) {
+        if (c.wrapperOuts !== undefined) checkDeadline(ctx.budget); // (#902: up to 16 wrapper files on one command are looked up one by one: the clock is read for each, never only per command)
         const e = frame.expand(w);
         if (e === null) {
           if (maybeSurface(w, { ci: ctx.ci, dirs: io.dirs, dot: ctx.dotGlob === true, surfaceDirs: ctx.surfaceDirs() })) unpinned.push(w);
@@ -1998,7 +2000,7 @@ function resolveGlobDir(full, ctx, wide) {
 // Could a command before `upto` change which paths exist (create, remove, rename, link: anything not read-only, a write redirect, a sourced file, a startup file)?
 function mayChangeListing(cmds, upto, ctx) {
   checkDeadline(ctx.budget); // (called for every command, and each call judges every earlier one: the shared deadline bounds the n^2)
-  return cmds.slice(0, upto).some((c) => (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) || Object.keys(c.env ?? {}).some((k) => /^(?:BASH_ENV|ENV|ZDOTDIR)$/.test(k))
+  return cmds.slice(0, upto).some((c, i) => writeTargetsOf(c, cmds[i + 1]).length > 0 || Object.keys(c.env ?? {}).some((k) => /^(?:BASH_ENV|ENV|ZDOTDIR)$/.test(k))
     || (c.argv.length > 0 && !CD_CMDS.has(baseOf(c.argv[0])) && !VAR_COMMANDS.has(baseOf(c.argv[0])) && (!isReadOnly(c, ctx) || ['source', '.', 'eval'].includes(baseOf(c.argv[0])))));
 }
 function resolveGlobCd(e, bases, ctx, cmds, idx) {
@@ -2395,7 +2397,7 @@ function modelledCd(t, cmds, idx, ctx) {
     if (ctx.env.TMPDIR && (ctx.hit(ctx.env.TMPDIR) || ctx.hitAncestor(ctx.env.TMPDIR))) return null;
     // (the directory is modelled as a leaf of an unknown place: a `..` write on the line may climb out of it to anywhere, so then the cd stays unknown)
     const UP = /(?:^|[\\/])\.\.(?:[\\/]|$)/;
-    if (cmds.some((c) => (c.redirects ?? []).some((q) => UP.test(q.target ?? '')) || c.argv.slice(1).some((a) => UP.test(a)))) return null;
+    if (cmds.some((c) => (c.redirects ?? []).some((q) => UP.test(q.target ?? '')) || (c.wrapperOuts ?? []).some((q) => UP.test(q.target ?? '')) || c.argv.slice(1).some((a) => UP.test(a)))) return null;
     return pathsFor().join('/tmp/.mktemp', sub(m[3]));
   }
   m = /^\$\{?TMPDIR\}?(\/[\w./-]*)?$/.exec(t); // (no default: \`${TMPDIR:-x}\` and an unset or empty TMPDIR are unknown)
@@ -2483,6 +2485,7 @@ function modelZshSelfDirs(cmds, raw, ctx) {
     // (a name that something on the script may rebind keeps its text: HERE="${0:A:h}" is not believed after `read HERE`)
     if (c.env) c.env = Object.fromEntries(Object.entries(c.env).map(([k, v]) => { const f = fix(v); return [k, f !== String(v) && mayRebind(k, cmds, raw) ? v : f]; }));
     if (c.redirects) for (const r of c.redirects) if (typeof r.target === 'string') r.target = fix(r.target);
+    if (c.wrapperOuts) for (const r of c.wrapperOuts) if (typeof r.target === 'string') r.target = fix(r.target); // (#902: the wrapper files are words of the line too)
     const sure = !(inFlow(from, i) || c.depth > 0 || c.sep === '&&' || c.sep === '||' || c.sep === '|' || c.maybeBg === true || cmds[i + 1]?.sep === '|' || cmds[i + 1]?.sep === '&'); // (#529: maybeBg: dash may have run it in a child)
     if (!c.argv.length && sure) for (const [k, v] of Object.entries(c.env ?? {})) if (counts.get(k) === 1 && PLAIN_ABS.test(v) && !mayRebind(k, cmds, raw)) known.set(k, v);
   }
@@ -2550,8 +2553,22 @@ function arithView(raw) {
   });
 }
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
+// #902: every file a command opens for writing: its write redirects, and the output files its wrappers open (the log of `script` / `screen`, `time -o`, the lock file of `flock`, a terminal's `nohup.out`: see wrapperOuts in
+// shell-parse.mjs, kept apart from `redirects` so that the readers of every redirect keep their view). ONE view for every question of the form "where does this command write", so that no reader judges one set and forgets the other.
+// `next`: the command after it (a `nohup.out` is dropped when stdout is piped). Not a write question, so not asked of this: input redirects, descriptor names, process substitutions and here-strings (they stay on `redirects`).
+function writeTargetsOf(c, next) {
+  const out = [];
+  for (const r of c.redirects ?? []) if (WRITE_OPS.has(r.op)) out.push({ kind: 'redirect', op: r.op, fd: r.fd, target: r.target });
+  for (const o of wrapperTargetsOf(c, next)) out.push({ kind: 'wrapper', op: '>>', target: o.target, wrapper: o.wrapper, chdir: o.chdir, dyn: o.dyn === true });
+  return out;
+}
+// does a write target name a file? A redirect that duplicates a descriptor (`>&2`) or discards (`/dev/null`) names none; a wrapper's file is a file name whatever it looks like (a quoted `&1` is a literal name), except the device
+const fileTarget = (r) => typeof r.target === 'string' && r.target !== '' && r.target !== '/dev/null' && (r.kind === 'wrapper' || !FD_DUP.test(r.target));
+// what a wrapper's own file is called in a refusal
+const WRAPPER_FILE = { time: 'output', nohup: 'output', flock: 'lock' };
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
 // (#618: a quote opens a word too: `env -S 'xargs rm'`, `rg --pre 'xargs rm'`, `git -c core.pager='xargs rm'` hand the quoted text to a shell)
+const LOG_WRAPPERS = new Set(['script', 'time', 'screen']); // (#902 R4-8: the wrappers whose own file the hooks-mention rule counts as a write)
 const FAN_OUT_RE = /(?:^|[\s;&|(`'"])(?:xargs|parallel)(?=\s|$)/;
 
 // #610 #617 #624: the ONLY quoted operands removed from a command's text before FAN_OUT_RE looks at it: values of options that are data, named exactly (a closed list), never a general "data head".
@@ -4626,6 +4643,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, opts, scanRaw) {
       if (r) return r;
     }
   }
+  if (w.pieces && w.wrappers.length) return deny(`the script ${sf.file} is written by ${w.wrappers.map((n) => `\`${n}\``).join('/')}'s own log or output option earlier on the line; the guard cannot follow its content, so what it runs cannot be checked; do not run a wrapper's log file as a script`);
   if (w.pieces) return deny(`the script ${sf.file} is built from pieces at run time (several writes on the line put its text together, and one of them cannot be read), so what it runs cannot be checked; write the file out in one piece`);
   if (w.authored) return deny(`the script ${sf.file} is written by this line with text that cannot be worked out exactly (a printf / echo conversion or escape), so what it runs cannot be checked; write the file out in plain text`);
   // an inline program that writes the script: judged by its own text (string concatenation joined)
@@ -5269,7 +5287,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Truncated means part of the line was never looked at, so nothing on it can be called harmless (500 `true;` then
   // `e''cho x > ~/.cl""aude/settings.json` must not slip through on a text match).
   if (cmds.undecidable) return deny(UNDECIDABLE_HEREDOC);
-  if (cmds.truncated) return deny(cmds.refused ? `the command line uses ${cmds.refused}, which the guard does not read; ${refusalAdvice(cmds.refused)}` : 'the command line is too complex to check (the parser gave up); split it into simpler commands');
+  if (cmds.truncated) return deny(cmds.refused === REFUSED_WRAPPER_OUTS ? cmds.refused : cmds.refused ? `the command line uses ${cmds.refused}, which the guard does not read; ${refusalAdvice(cmds.refused)}` : 'the command line is too complex to check (the parser gave up); split it into simpler commands');
   ctx.shadowed = shadowedCommands(cmds, ctx);
   ctx.heredocPlants = /<</.test(raw) && plantsInText(raw); // (R5-F3: a heredoc body is on no command; the line's text is judged for an assigning expansion, a quoted body included)
   if (closeBracketNotLast(cmds)) return deny('a command follows a closing ]] on the same piece (zsh\'s short `if [[ … ]] cmd` form), or ]] is an argument next to a [[: the guard cannot tell which ]] closes the test; write `[[ … ]] && cmd` or `if [[ … ]]; then cmd`');
@@ -5318,8 +5336,10 @@ function evaluateBashForFilesFrame(command, opts) {
       if (!hooksWord) continue;
       // (#746 B: the system grep, with no wrapper in front, discarding into /dev/null writes nothing: that redirect is no write. Any other redirect, `2>&1`, a bare / relative / repo `grep` and a wrapped one keep the rule)
       const discards = (r) => (c.argv[0] === '/usr/bin/grep' || c.argv[0] === '/bin/grep') && c.wrapped !== true && ['>', '>>', '>|', '&>', '&>>'].includes(r.op) && r.target === '/dev/null';
-      const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !discards(r)) || (c.argv.length > 0 && !isReadOnly(c, ctx));
-      if (writes && [...c.argv, ...(c.redirects ?? []).map((r) => r.target ?? ''), rawOfCmd(c)].some((w) => HOOK_SURFACE_TEXT.test(String(w)))) {
+      // (#902: the log of script / time / screen is a write as a redirect is; flock's lock file and a conditional nohup.out are left out: a line that only locks or backgrounds writes no hook file. The pty trick, `script -q /dev/null`, discards)
+      const logs = (c.wrapperOuts ?? []).filter((o) => LOG_WRAPPERS.has(o.wrapper) && o.target !== '/dev/null').map((o) => o.target);
+      const writes = (c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && !discards(r)) || logs.length > 0 || (c.argv.length > 0 && !isReadOnly(c, ctx));
+      if (writes && [...c.argv, ...(c.redirects ?? []).map((r) => r.target ?? ''), ...logs, rawOfCmd(c)].some((w) => HOOK_SURFACE_TEXT.test(String(w)))) {
         return deny(`the command writes a file that can declare hooks and mentions hooks (${HOOKS_MSG})`);
       }
     }
@@ -5356,6 +5376,7 @@ function evaluateBashForFilesFrame(command, opts) {
     real: (q) => realResolve(q, ctx.api),
     readText: (q) => ctx.readText(q), // (an awk program file is read to see what it writes)
     tick: () => checkDeadline(ctx.budget),
+    locateStart: () => dirs, // (#902: a wrapper's own file is judged in every directory the line may be in, as a redirect is)
   });
   ctx.frames.push(frame);
   {
@@ -5754,7 +5775,7 @@ function evaluateBashForFilesFrame(command, opts) {
     for (const [ci, c] of cmds.entries()) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
       const refs = (w) => [...String(w).matchAll(/\$\{?(\w+)/g)].some((x) => ctx.unknownVars.has(x[1]) || snaps[ci]?.unknownV.has(x[1]));
-      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && refs(r.target ?? '')) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
+      if (writeTargetsOf(c, cmds[ci + 1]).some((r) => refs(r.target ?? '') || (typeof r.chdir === 'string' && refs(r.chdir))) || (c.argv.length && !['export', 'declare', 'typeset', 'local', 'readonly'].includes(baseOf(c.argv[0])) && !isReadOnly(c, ctx) && (c.argv.some(refs) || Object.values(c.env ?? {}).some(refs)))) {
         return deny('the command writes through a variable whose value is only known at run time (a width or integer attribute, a loop word and another value on the line, or a binder such as `export $N=…` / `printf -v $N` / `${(P)N::=…}` whose name is only known at run time), so the file it reaches cannot be checked; write the path out');
       }
     }
@@ -5783,7 +5804,7 @@ function evaluateBashForFilesFrame(command, opts) {
       // (only the script a shell / interpreter / source runs is exempt: every other word of it can be a write target, `node w.mjs $D/x`, `bash -c 'echo x > $D/x'`)
       const script = scriptFileOf(c.argv)?.file;
       const operands = script === undefined ? c.argv : c.argv.filter((w, i) => w !== script || c.argv.indexOf(w) !== i);
-      if ((c.redirects ?? []).some((r) => WRITE_OPS.has(r.op) && changed(r.target ?? '')) || (writes && (operands.some(changed) || Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && taintedEnv(v))))) {
+      if (writeTargetsOf(c, cmds[ci + 1]).some((r) => changed(r.target ?? '') || (typeof r.chdir === 'string' && changed(r.chdir))) || (writes && (operands.some(changed) || Object.entries(c.env ?? {}).some(([k, v]) => !PATH_LISTS.has(k) && taintedEnv(v))))) {
         return deny('the command writes through a variable that a sourced file (or a binder whose name is only known at run time) may have changed, so the file it reaches cannot be checked; write the path out');
       }
     }
@@ -5800,14 +5821,13 @@ function evaluateBashForFilesFrame(command, opts) {
     const ups = (w) => (typeof w === 'string' ? braceExpand(expandRefs(w, ctx), ctx).split(/\s+/).map((x) => (x && !isAbs(toPosix(x)) && !/^~(?:\/|$)/.test(x) ? toPosix(x).split('/').filter((s) => s === '..').length : 0)) : [0]);
     let cdUps = 0;
     let writeUps = 0;
-    for (const c of cmds) {
+    for (const [ci, c] of cmds.entries()) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
-      for (const r of c.redirects ?? []) {
-        if (!WRITE_OPS.has(r.op)) continue;
+      for (const r of writeTargetsOf(c, cmds[ci + 1])) {
         writeUps = Math.max(writeUps, ...ups(r.target));
         // (a relative target that still holds a run-time part may climb as far as it likes)
         const e = expandRefs(r.target ?? '', ctx);
-        if (/[`$]/.test(e) && !isAbs(toPosix(e)) && !/^~(?:\/|$)/.test(e) && !FD_DUP.test(e)) return deny('the command redirects output to a relative path with a part only known at run time after a cd into a directory known only at run time, so the file it reaches cannot be checked; write the path out');
+        if (/[`$]/.test(e) && !isAbs(toPosix(e)) && !/^~(?:\/|$)/.test(e) && (r.kind === 'wrapper' || !FD_DUP.test(e))) return deny(r.kind === 'wrapper' ? `the command's wrapper (\`${r.wrapper}\`) writes a file at a relative path with a part only known at run time after a cd into a directory known only at run time, so the file it reaches cannot be checked; write the path out` : 'the command redirects output to a relative path with a part only known at run time after a cd into a directory known only at run time, so the file it reaches cannot be checked; write the path out');
       }
       if (!c.argv.length) continue;
       if (CD_CMDS.has(baseOf(c.argv[0]))) cdUps += Math.max(baseOf(c.argv[0]) === 'cd..' ? 1 : 0, ...c.argv.slice(1).flatMap(ups));
@@ -5844,18 +5864,61 @@ function evaluateBashForFilesFrame(command, opts) {
   // Output redirections write wherever they point, whatever the command: resolve every target (against the cwd and
   // every cd target, with ~ and variables expanded) and deny on a protected one. A symlink already pointing into
   // a protected root counts too.
-  for (const c of cmds) {
+  // (hoisted from below, where dirsOf uses it too: a wrapper's own `-C` leads somewhere the same way a cd target does)
+  const landings = (e, base) => { // (where the cd target leads from each directory of base; a '..' after a symlink also reads as the target's parent, see collectDirs)
+    const out = [];
+    for (const d of base) {
+      out.push(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e));
+      if (/(?:^|\/)\.\.(?:\/|$)/.test(e)) {
+        let cur = isAbs(e) ? '/' : d;
+        for (const seg of e.split('/')) {
+          if (seg === '' || seg === '.') continue;
+          cur = seg === '..' ? pathsFor().dirname(realResolve(cur, ctx.api)) : pathsFor().join(cur, seg);
+        }
+        out.push(cur);
+      }
+    }
+    const u = unique(out);
+    return u.length > 32 ? null : u;
+  };
+  // The directories a wrapper's own file may land in: those of the whole line, as a redirect's are; a literal `-C` of a wrapper that comes BEFORE it narrows them (`cd <protected> && env -C /tmp script -q x.log ls` writes /tmp/x.log).
+  // null: it cannot be told (a `-C "$X"`, two of them, `sudo -D`): a relative name is then refused.
+  const wrapperDirs = (o) => {
+    if (o.chdir === undefined) return dirs;
+    if (o.chdir === null) return null;
+    const e = expandRefs(o.chdir, ctx).replace(/\([^()]*\)$/, '');
+    if (!e || /[$`(){}\\]/.test(e) || (e.startsWith('~') && !isAbs(e))) return null;
+    return landings(e, dirs);
+  };
+  // one body for a redirect's target and a wrapper's own file; `verb` opens the refusal (their wording differs, not their rule)
+  const judgeWrite = (verb, target, tdirs, dyn) => {
+    const e = expandRefs(target, ctx);
+    // Why: a target built at run time (`echo settings.json`, an unset name) inside a protected directory can be any file there
+    if (((dyn || /[`$]/.test(e)) && tdirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) || (protectedAnywhere && LAST_WORD_RE.test(e))) return deny(`${verb} ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
+    const abs = isAbs(e) ? [pathsFor().normalize(e)] : tdirs.map((d) => pathsFor().join(d, e));
+    const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
+    if (m.rawHit(target, tdirs) || m.pathHit(target, tdirs, true) || viaLink) return deny(`${verb} ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+    return null;
+  };
+  for (const [ci, c] of cmds.entries()) {
     checkDeadline(ctx.budget); // (the evaluation deadline)
-    for (const r of c.redirects ?? []) {
-      if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || FD_DUP.test(r.target) || r.target === '/dev/null') continue;
+    for (const r of writeTargetsOf(c, cmds[ci + 1])) {
+      if (!fileTarget(r)) continue;
+      if (r.kind === 'wrapper') {
+        checkDeadline(ctx.budget); // (#902: each wrapper file is looked up on its own, up to 16 on a command: the clock is read per target)
+        const tdirs = wrapperDirs(r);
+        const verb = `\`${r.wrapper}\` writes its ${WRAPPER_FILE[r.wrapper] ?? 'log'} file to`;
+        for (const target of [r.target, ...braceExpand(expandRefs(r.target, ctx), ctx).split(/\s+/).filter((x) => x && x !== r.target)]) {
+          if (tdirs === null && !isAbs(toPosix(expandRefs(target, ctx))) && !/^~(?:\/|$)/.test(expandRefs(target, ctx))) return deny(`\`${r.wrapper}\` writes its ${WRAPPER_FILE[r.wrapper] ?? 'log'} file ${target} in a directory that cannot be told (a wrapper changed it), so the file it reaches cannot be checked; write the full path out`);
+          const hit = judgeWrite(verb, target, tdirs ?? dirs, r.dyn);
+          if (hit) return hit;
+        }
+        continue;
+      }
       // (a brace list is several targets: `> settings.{json,x}`; only `&N` / `&-` duplicate a descriptor, any other `&NAME` is the file NAME as well)
       for (const target of [r.target, ...(r.target.startsWith('&') ? [r.target.slice(1)] : []), ...braceExpand(expandRefs(r.target, ctx), ctx).split(/\s+/).filter((x) => x && x !== r.target)]) {
-      const e = expandRefs(target, ctx);
-      // Why: a target built at run time (`echo settings.json`, an unset name) inside a protected directory can be any file there
-      if ((/[`$]/.test(e) && dirs.some((d) => ctx.hit(d) || ctx.hitAncestor(d) || ctx.hitTree(d))) || (protectedAnywhere && LAST_WORD_RE.test(e))) return deny(`the command redirects output to ${target}, a name only known at run time, inside a protected pipeline directory, so the file it reaches cannot be checked; write the path out (${PROTECTED_MSG})`);
-      const abs = isAbs(e) ? [pathsFor().normalize(e)] : dirs.map((d) => pathsFor().join(d, e));
-      const viaLink = abs.some((p) => !/[*?[]/.test(p) && (ctx.hit(realResolve(p, ctx.api)) || ctx.hitInode(p)));
-      if (m.rawHit(target, dirs) || m.pathHit(target, dirs, true) || viaLink) return deny(`the command redirects output to ${target}, which is a protected pipeline file or the directory that holds it (${PROTECTED_MSG})`);
+        const hit = judgeWrite('the command redirects output to', target, dirs, false);
+        if (hit) return hit;
       }
     }
   }
@@ -5926,22 +5989,6 @@ function evaluateBashForFilesFrame(command, opts) {
   // at most (#373) a top-level subshell `( … )`, brace group `{ …; }` or `if CD; then …; [else …;] fi` of such a sequence, none inside another (`cmds.shape`, see simpleCommands: it is null for anything else). Any
   // `!`, coprocess, always block, function, loop, case, `elif`, nested construct, compound command, `[[`, command-less segment, cut-short parse or heredoc the parser and the shell may read differently turns the
   // narrowing off for the whole line: its commands are read against every directory of the line. (Rounds 5 to 8 listed what to refuse, and each found a construct not on the list.)
-  const landings = (e, base) => { // (where the cd target leads from each directory of base; a '..' after a symlink also reads as the target's parent, see collectDirs)
-    const out = [];
-    for (const d of base) {
-      out.push(isAbs(e) ? pathsFor().normalize(e) : pathsFor().join(d, e));
-      if (/(?:^|\/)\.\.(?:\/|$)/.test(e)) {
-        let cur = isAbs(e) ? '/' : d;
-        for (const seg of e.split('/')) {
-          if (seg === '' || seg === '.') continue;
-          cur = seg === '..' ? pathsFor().dirname(realResolve(cur, ctx.api)) : pathsFor().join(cur, seg);
-        }
-        out.push(cur);
-      }
-    }
-    const u = unique(out);
-    return u.length > 32 ? null : u;
-  };
   const cdTarget = (c) => { // the plain target of a `cd` whose destination is known now, else null
     // (#373: the segment of `if cd X` / `then cd X` / `{ cd X` starts with the keyword the parser read, `c.kwLead`; its text is no part of the command)
     const raw = c.kwLead === undefined ? c.raw : c.raw.startsWith(c.kwLead) ? c.raw.slice(c.kwLead.length) : null;
@@ -6289,7 +6336,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // (anc 'pipeline': a repo's .review folder does not count as a holder, see mentions)
   // T1.7 (b): `$_` is the last word of the previous command, a name only known at run time (`echo S; tee $_`, `cat TR; node x.mjs $_`): when the line names a protected file at all, a command that
   // uses it (as a word, a prefix value or a redirect target) may be using that file
-  const usesLast = (c) => protectedAnywhere && [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? '')].some((w) => LAST_WORD_RE.test(String(w)));
+  const usesLast = (c) => protectedAnywhere && [...c.argv, ...Object.values(c.env ?? {}), ...(c.redirects ?? []).map((r) => r.target ?? ''), ...(c.wrapperOuts ?? []).map((r) => r.target ?? '')].some((w) => LAST_WORD_RE.test(String(w)));
   const names = (c, anc = true) => insideRoot || usesLast(c)
     || m.rawHit(rawOfCmd(c), dirs) || winAncestor(c)
     || Object.values(c.env).some((v) => m.rawHit(v, dirs))
@@ -6353,7 +6400,7 @@ function evaluateBashForFilesFrame(command, opts) {
   // Item 5 (guard false refusals): `node -e / -p PROGRAM` that can only read is not judged as a command that may write (an ALLOWLIST, inlineNodeReadOnly). The command is exactly `node -e|-p PROGRAM`: no other option, argument, `--`, env-prefix
   // assignment, wrapper (env, command, npx ...: the raw text starts with node) or write redirect, no NODE_OPTIONS anywhere on the line. Anything else is judged as before.
   const readsInlineNode = (c) => /^node$/.test(c.argv[0] ?? '') && /^(?:-e|-p)$/.test(c.argv[1] ?? '') && c.argv.length === 3 && /^node\s/.test(c.raw.trimStart())
-    && !(c.redirects ?? []).some((r) => WRITE_OPS.has(r.op)) && Object.keys(c.env ?? {}).length === 0 && !/NODE_OPTIONS/.test(raw)
+    && writeTargetsOf(c).length === 0 && Object.keys(c.env ?? {}).length === 0 && !/NODE_OPTIONS/.test(raw)
     && !/\$['"]/.test(c.raw) // (an ANSI-C or locale word is decoded by the shell into text the raw word does not show)
     && !/\.claude|\.codex|CLAUDE_CONFIG_DIR/i.test(c.argv[2]) // (a program that names a config folder keeps the #128 rule: refused whatever it does)
     && inlineNodeReadOnly(c.argv[2]);
