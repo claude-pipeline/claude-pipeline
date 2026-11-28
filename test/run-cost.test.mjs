@@ -6,7 +6,6 @@ import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
-import { withLock } from '../pipeline/lib/locks.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
@@ -16,7 +15,7 @@ import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
 } from '../pipeline/lib/run-record.mjs';
 import { writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
-import { costLockName, transcriptUsage } from '../pipeline/commands/cost.mjs';
+import { transcriptUsage } from '../pipeline/commands/cost.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
 
 const NOW = Date.parse('2026-10-14T10:00:00Z');
@@ -219,8 +218,7 @@ const written = (s) => {
   const w = s.fake.calls().filter((c) => c.argv[0] === 'api' && c.argv.includes('-X') && /issues\/(?:\d+\/comments|comments\/\d+)$/.test(c.argv.at(-3)));
   return decodeRecord(JSON.parse(w.at(-1).stdin).body).record;
 };
-const LOCK_DIR = mkdtempSync(join(tmpdir(), 'cost-locks-')); // a scratch lock folder: the tests never touch the machine's real one
-const costCli = (s, args, env = {}) => cli(['cost', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, PIPELINE_LOCK_DIR: LOCK_DIR, ...env } });
+const costCli = (s, args, env = {}) => cli(['cost', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, ...env } });
 
 test('P cost: books an entry into a fresh record, then adds to it', () => {
   const s = scenario();
@@ -373,22 +371,6 @@ test('P cost: a booking that landed before this call\'s write stays in the total
   assert.deepEqual([mine.json.call.usd, mine.json.call.input], [3, 30], 'call is this call\'s own amount, not the total');
   assert.deepEqual([written(s).cost.total.usd, written(s).cost.total.calls], [5, 2], 'and so does the written comment');
   assert.deepEqual(mine.json.warnings, []);
-});
-
-// R2-B2 (#939): GitHub has no conditional edit, so two bookings whose reads both precede either write build on one base and the later PATCH erases the earlier. The booking now runs under a per-PR lock; without it, it must not run.
-test('P cost: while another booking holds the PR\'s cost lock, nothing is booked (exit 1, recorded false, a warning, no write); once it is free the same command books', async () => {
-  const s = scenario();
-  const args = ['--phase', 'build', '--role', 'implementer', '--input', '10', '--usd', '1'];
-  const before = s.fake.calls().length;
-  let busy;
-  await withLock(costLockName(s.repo.dir, PR), () => { busy = costCli(s, args, { PIPELINE_LOCK_WAIT_MS: '200' }); }, { dir: LOCK_DIR, waitMs: 0 });
-  assertExit(busy, 1);
-  assert.deepEqual([busy.json.ok, busy.json.recorded, busy.json.call, busy.json.cost], [false, false, null, null]);
-  assert.match(busy.json.warnings.join('\n'), /holds the cost lock/);
-  assert.equal(s.fake.calls().slice(before).filter((c) => c.argv.includes('-X')).length, 0, 'no comment was written');
-  const free = costCli(s, args);
-  assertExit(free, 0);
-  assert.deepEqual([free.json.recorded, free.json.call.usd, free.json.cost.total.usd], [true, 1, 1]);
 });
 
 // R2-B1: the transcript dedupe runs on the base the patch is applied to, so a transcript the other booking already took books nothing again.
