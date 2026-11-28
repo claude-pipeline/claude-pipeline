@@ -651,6 +651,25 @@ test('#746 item 5: a command word `"$NEW"` whose value is a path built from anot
     [...base, 'if true; then NEW=read; fi', '"$NEW" version', loop],
   ]) assert.equal(setup(script).decision, 'deny', script.join(' / '));
 });
+// #746 item 5, review round 1. R1-B3: a value the CALLER gave (`OP=eval bash setup.sh`) is no program path just because the word is quoted: eval is a builtin that binds names, and the loops after it were read as if it ran
+// nothing.
+test('#746 item 5: a quoted command word whose value the caller gave is a program path only when the value is a path', () => {
+  const loop = 'for f in a b; do cp "m/$f" "b/$f.x"; done';
+  assert.equal(setup(['"$OP" version', loop], 'OP=/usr/bin/tool bash setup.sh /x/wt').decision, 'allow'); // (the allowed twin: a path)
+  assert.equal(setup(['"$OP" \':\'', loop], 'OP=eval bash setup.sh /x/wt').decision, 'deny');
+});
+// R1-B4: bash splits a value only at space, tab and newline, so a U+00A0 at the end of a word is part of the file name, not blank: the guard must not judge `b` where bash runs `b<U+00A0>`.
+test('#746 item 5: a list word holding a character that is not a blank to bash is refused', () => {
+  assert.equal(setup(['FILES="a b\u00a0"', ITEM5_LOOP]).decision, 'deny', 'trailing U+00A0');
+  assert.equal(setup(['FILES="\u00a0a b"', ITEM5_LOOP]).decision, 'deny', 'leading U+00A0');
+});
+// R1-B5: a text judged clean for `bash f` (split words) is not clean for `zsh f` (no split) on the same line: the clean verdict was remembered without the shell's way of splitting, and a later run of the same text
+// by zsh was skipped as already judged.
+test('#746 item 5: a script written by the line and run by bash, then by zsh, is judged for each shell', () => {
+  const written = "echo 'FILES=\"a b\"; for f in $FILES; do cp \"m/$f\" \"b/$f.x\"; done' > w.sh";
+  assert.equal(git(`${written}; bash w.sh; sh w.sh`, gitFs({})).decision, 'allow', 'bash, sh'); // (the allowed twin)
+  assert.equal(git(`${written}; bash w.sh; sh w.sh; zsh w.sh`, gitFs({})).decision, 'deny', 'bash, sh, zsh');
+});
 test('#746 item 5: SETS_BY_NAME (shared by both guards) skips a binder word inside a path or file name and still counts a real binder', () => {
   for (const t of ['X="/a/.local"', 'X="$HOME/.local/share/x"', 'X="$HOME/.declare"', 'cp m/handoff-read.js b', 'node ./x/read.js "a"', 'ls ~/export "a"']) assert.equal(SETS_BY_NAME.test(t), false, t);
   // (a name spelled out, `local IFS=,`, is caught by the plain IFS test of the callers; these are the binders of a name written without the letters IFS in a row)

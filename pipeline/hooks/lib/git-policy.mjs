@@ -2302,7 +2302,7 @@ function judgeWrittenScript(w, sf, abs, dir, ctx, level) {
   const state = stateFingerprint(ctx, dir, level);
   const done = (ctx.budget.writtenOk ??= new Set());
   const once = (key, judge) => {
-    const k = `${sf.kind}\u0000${key}\u0000${state}`;
+    const k = `${sf.kind}\u0000${sf.splits === true}\u0000${key}\u0000${state}`; // (#746 item 5: a text judged with split words is not judged for a shell that does not split)
     if (done.has(k)) return null;
     const r = judge();
     if (!r) done.add(k);
@@ -3059,7 +3059,7 @@ function headResolves(c, cmds, ctx, out, text) {
       return vals.every((v) => typeof v === 'string' && valueOk(v)) ? vals : null;
     }
     if (ctx.unsureVars.has(k) || ctx.tainted.has(k) || SPECIAL_NAMES.test(k)) return null;
-    if (site < 0) return Object.hasOwn(ctx.vars, k) && HEAD_VALUE.test(ctx.vars[k]) ? [ctx.vars[k]] : null; // (given by an earlier line)
+    if (site < 0) return Object.hasOwn(ctx.vars, k) && HEAD_VALUE.test(ctx.vars[k]) && valueOk(ctx.vars[k]) ? [ctx.vars[k]] : null; // (given by an earlier line, or by the caller)
     const mine = [...text.matchAll(varWordRe(k))].filter((m) => !/\$\{?$/.test(text.slice(Math.max(0, m.index - 2), m.index)));
     const x = cmds[site];
     if (mine.length !== 1 || text[mine[0].index + k.length] !== '=' || site > at || x.depth > 0 || ranInSubshell(cmds, site) || !Array.isArray(x.grp) || !Array.isArray(c.grp) || x.grp.some((id, j) => c.grp[j] !== id)) return null;
@@ -3092,7 +3092,7 @@ function splitCountOf(w, cmds) {
   if (!k) return 0;
   const at = cmds.filter((c) => Object.hasOwn(c.env ?? {}, k));
   if (at.length !== 1 || at[0].argv.length) return 0;
-  const words = String(at[0].env[k]).trim().split(/[ \t\n]+/);
+  const words = String(at[0].env[k]).replace(/^[ \t\n]+|[ \t\n]+$/g, '').split(/[ \t\n]+/); // (only the blanks bash splits at: a U+00A0 stays in its word and SPLIT_WORD refuses it)
   return words.length > 1 && words.every((x) => SPLIT_WORD.test(x)) ? words.length : 0;
 }
 function onceAssignedNames(cmds, ctx, str) {
@@ -3287,7 +3287,7 @@ function loopWordAt(k, ctx) {
   const v = expandVars(pin.val, ctx);
   if (pin.split) {
     // #746 item 5: word i of the list's value; the value must be what the reading was made for (the same count, every word plain text)
-    const ws = v.includes('$') ? [] : v.trim().split(/[ \t\n]+/);
+    const ws = v.includes('$') ? [] : v.replace(/^[ \t\n]+|[ \t\n]+$/g, '').split(/[ \t\n]+/);
     if (ws.length !== pin.split.n || !ws.every((x) => SPLIT_WORD.test(x))) return deny(`$${k} takes a loop word built from a variable whose value is not known here (or is not plain text), so its value at run time cannot be verified. Rewrite: write the loop words out.`);
     ctx.vars[k] = ws[pin.split.i];
     return null;
