@@ -2213,3 +2213,23 @@ test('#950: a function or trap in a called script that a backgrounder runs still
   for (const s of ['co.sh', 'co2.sh', 'co3.sh']) denyBoth(`bash ${s}; cp f.sh n.sh`, spec);
   allowBoth('bash setup.sh; cp f.sh n.sh', { ...SPEC, 'setup.sh': 'bash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"' }); // twin: no function, a foreground run first
 });
+
+// R3-F1 (#950): the same hole one `source` away. Failure caught: `bash co4.sh; cp f.sh n.sh` with co4.sh = `. lib.sh\ncoproc run` and lib.sh = `run() { bash n.sh; }` was allowed (the function sits in the sourced
+// file's frame, the backgrounder in co4.sh's) though main refused it. R3-B1: a shell option schedules no work. Failure caught: `bash setup.sh; cp f.sh n.sh` was refused when setup.sh ran n.sh in the
+// foreground, then held a `shopt` line and a restart.
+test('#950: a function in a sourced file that a backgrounder runs still sees the caller\'s later writes', () => {
+  const spec = {
+    ...SPEC,
+    'co4.sh': '. lib.sh\ncoproc run',
+    'co5.sh': 'source lib2.sh\nexport -f run; setsid -f bash -c run',
+    'lib.sh': 'run() { bash n.sh; }',
+    'lib2.sh': 'run() { bash n.sh; }',
+  };
+  for (const s of ['co4.sh', 'co5.sh']) denyBoth(`bash ${s}; cp f.sh n.sh`, spec);
+});
+// (the files policy only: the git policy refuses a shopt / setopt / hash / enable in a called script for another reason, it no longer knows the directory)
+test('#950: a shell option (shopt / setopt / hash / enable) in a called script schedules no work; a trap still does', () => {
+  const opt = { ...SPEC, 'n.sh': 'ok', 'setup.sh': 'shopt -s expand_aliases\nbash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"', 'setup4.sh': 'setopt nullglob\nbash n.sh\nlaunchctl kickstart -k x', 'setup5.sh': 'hash -r\nenable -n kill\nbash n.sh\nlaunchctl kickstart -k x' };
+  for (const s of ['setup.sh', 'setup4.sh', 'setup5.sh']) assert.equal(run(`bash ${s}; cp f.sh n.sh`, opt).files.r.decision, 'allow', s);
+  assert.equal(run('bash tr.sh; cp f.sh n.sh', { ...SPEC, 'n.sh': 'ok', 'tr.sh': "shopt -s expand_aliases\ntrap 'bash n.sh' EXIT\nlaunchctl kickstart -k x" }).files.r.decision, 'deny'); // twin: a trap still defers
+});

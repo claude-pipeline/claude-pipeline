@@ -1243,6 +1243,7 @@ export function writesOf(cmds, io = {}) {
 // a script judged anywhere else on it.
 const FUNCTION_DEF = /(?:^|[\s;&|(){])(?:function\s+[^\s(){};&|<>]+|[A-Za-z_][\w.:-]*\s*\(\s*\))/;
 const DEFERRING = new Set(['trap', 'alias', 'eval', 'unalias', 'enable', 'hash', 'setopt', 'shopt', 'functions', 'autoload', 'precmd', 'preexec', 'command_not_found_handle']);
+const LATER_CODE = new Set(['trap', 'alias', 'eval', 'source', '.']);
 const hasDeferred = (cmds) => cmds.some((c) => FUNCTION_DEF.test(c.raw ?? '') || DEFERRING.has(commandName(c.argv[0] ?? '')));
 
 // Can the command at `idx` run before the command at `at`, or while it runs? Anything earlier on the line counts (even a conditional
@@ -1325,7 +1326,9 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   // (the parser's `bg`: a backgrounded and-or list or group) or a process substitution does (no mark of its own), or the frame holds a function / trap (its body runs when called, maybe by the job): that one counts from the start, as before)
   const early = first < 0 ? -1 : cmds.findIndex((c) => c.bg === true);
   const procSub = first >= 0 && (/[<>]\(/.test(typeof text === 'string' ? text : '') || cmds.some((c) => /[<>]\(/.test(c.raw ?? '')));
-  const bgFrom = first < 0 ? Infinity : (procSub || hasDeferred(cmds) || cmds.fns?.size > 0) ? 0 : early >= 0 ? Math.min(first, early) : first;
+  // (only a name that can really run code later counts here: a function, trap, alias or eval, or a sourced file that may define what the job runs; shopt / setopt / hash / enable schedule nothing: R3-B1, R3-F1)
+  const runsLater = procSub || cmds.fns?.size > 0 || cmds.some((c) => FUNCTION_DEF.test(c.raw ?? '') || LATER_CODE.has(commandName(c.argv[0] ?? '')));
+  const bgFrom = first < 0 ? Infinity : runsLater ? 0 : early >= 0 ? Math.min(first, early) : first;
   const bgWork = seps > 0 || opaque || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
   return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgFrom, bgWork };
 }
