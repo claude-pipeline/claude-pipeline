@@ -1587,6 +1587,20 @@ test('#944 drift: a recommended Reject click is refused when the PR head on GitH
   const split = await a.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
   assert.equal(split.exitCode, 1, JSON.stringify(split.output));
   assert.match(split.output.reason, /recorded different PR heads/);
+  // #977: an ask that does not carry the clean-checkout marker (issued by a build that did not check the working tree) has the same two equal heads as a good one, so it is refused too
+  const unmarked = e2eWorld(t);
+  const u = await clickedRuling(t, unmarked, { ids: ['R1-B1'], ...REJECT });
+  assert.equal(u.file.headClean, true, 'an ask issued from a clean checkout carries the marker');
+  const unmarkedFile = join(asksDir(u.home), `${u.ask.askId}.json`);
+  const rawUnmarked = JSON.parse(readFileSync(unmarkedFile, 'utf8'));
+  delete rawUnmarked.headClean;
+  writeFileSync(unmarkedFile, JSON.stringify(rawUnmarked));
+  assert.equal(readAsk(u.ask.askId, { home: u.home }).ok, true, 'the ask still reads');
+  const beforeUnmarked = unmarked.stateText();
+  const noMarker = await u.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(noMarker.exitCode, 1, JSON.stringify(noMarker.output));
+  assert.match(noMarker.output.reason, /did not check that the working tree was clean.*ask again/);
+  assert.equal(unmarked.stateText(), beforeUnmarked, 'the state is byte-identical');
 });
 
 test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {

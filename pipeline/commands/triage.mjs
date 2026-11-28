@@ -459,6 +459,8 @@ async function ownerRuling(rest, ctx) {
         if (issuedAt?.ok === true) {
           const { head: askedHead, prHead: askedPrHead } = issuedAt.ask;
           if (typeof askedHead !== 'string' || typeof askedPrHead !== 'string') moved = 'the ask recorded no PR head to compare with, so the code Claude checked cannot be told apart from the code now';
+          // #977: the heads alone cannot tell an ask issued from a dirty checkout (an earlier build did not check) from a good one; only the marker the clean-checkout check writes can
+          else if (issuedAt.ask.headClean !== true) moved = 'the ask was issued by a build that did not check that the working tree was clean, so the code Claude checked may not be the PR\'s code';
           // R5-B1: an ask issued by an earlier build that accepted an ancestor PR head recorded two heads that differ from each other; both can be unchanged since, yet the code Claude checked was never the PR's
           else if (askedHead !== askedPrHead) moved = 'the ask recorded different PR heads (this checkout and GitHub), so the code Claude checked was not the PR\'s code';
           else {
@@ -1051,7 +1053,7 @@ async function rulingRequest(rest, ctx) {
       const prHead = gh.prView(pr, ['headRefOid']).headRefOid;
       // R5-B2: HEAD equal to the PR head says nothing about files edited since: a dirty working tree is code the PR does not hold
       if (typeof prHead === 'string' && prHead === head && !isClean({ cwd: root })) headRefusal = 'the checkout has uncommitted changes, so the code Claude checked may not be the PR\'s code: commit and push, then recommend again';
-      else if (typeof prHead === 'string' && prHead === head) heads = { head, prHead };
+      else if (typeof prHead === 'string' && prHead === head) heads = { head, prHead, headClean: true }; // #977: the marker says the clean-checkout check above passed when this ask was issued (apply refuses an ask without it)
       else headRefusal = `the PR head on GitHub (${String(prHead).slice(0, 12)}) is not this checkout's HEAD (${head.slice(0, 12)}), so the code Claude checked may not be the PR's code: push or pull, then recommend again`;
     }
     const recommended = shown && headRefusal === null;
