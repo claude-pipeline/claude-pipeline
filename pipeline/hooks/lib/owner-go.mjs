@@ -647,8 +647,8 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
   // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
   // may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an older request is never revived by a later "merge": the agent shows it again.
   const newest = [...turns].reverse().find((t) => t.kind !== 'skip');
-  // R2-B1: only an OWNER-source entry can be the current submission (a hidden half-flagged summary whose text equals the answer is no prompt the owner typed, so the request above it stays unselected)
-  const current = newest?.kind === 'slot' && entrySource(newest.e) === 'owner' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
+  // R2-B1: a flagged summary (plainBoundary) is never the current submission, whatever its text: a hidden one whose text equals the answer must not hide the request above it. (A legacy typed prompt of unknown source still is one.)
+  const current = newest?.kind === 'slot' && !plainBoundary(newest.e) && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
   const candidates = current ? slots.filter((x) => x.turn !== newest) : slots;
   const last = candidates[candidates.length - 1]; // (none: only text before the window's first prompt, which has no known origin, A3)
   // R2-B1: assistant text of ANY other visible slot after the selected slot's last SHOWN entry was the last thing the owner was shown: the selected request is stale, exactly like a mute.
