@@ -95,9 +95,10 @@ export function addCostEntry(cost, entry) {
 
 // A transcript already booked for this PR (an agent continued by SendMessage is booked after each leg): only what it gained since the last booking is new. `booking` = { key, usage }, usage the
 // transcript's WHOLE totals ({input, output, cacheRead, cacheWrite, usd, byPrice}); the ledger cost.transcripts[key] keeps what was booked. Returns { cost, entry } with the entry's amounts reduced by the
-// booked ones (never below 0; hand amounts the caller added on top stay) and the ledger set to the whole totals. The ledger keeps the last MAX_TRANSCRIPTS keys.
+// booked ones (never below 0; hand amounts the caller added on top stay) and the ledger set to the whole totals. The ledger keeps the last MAX_TRANSCRIPTS keys
+// (`evict: false`: all of them; a replay of every booking of a PR holds them in memory only, it is never written back, so nothing may fall out of it).
 const MAX_TRANSCRIPTS = 200;
-export function deductBookedTranscript(cost, entry, booking) {
+export function deductBookedTranscript(cost, entry, booking, { evict = true } = {}) {
   const key = String(booking?.key ?? '');
   if (!/^[\w.-]{1,120}$/.test(key)) throw new Error('transcript key must be a plain file name');
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
@@ -133,7 +134,7 @@ export function deductBookedTranscript(cost, entry, booking) {
     input: hi(before?.input, usage.input), output: hi(before?.output, usage.output), cacheRead: hi(before?.cacheRead, usage.cacheRead), cacheWrite: hi(before?.cacheWrite, usage.cacheWrite),
     usd: hi(before?.usd, usage.usd), byPrice,
   };
-  for (const old of Object.keys(ledger).slice(0, Math.max(0, Object.keys(ledger).length - MAX_TRANSCRIPTS))) delete ledger[old];
+  if (evict) for (const old of Object.keys(ledger).slice(0, Math.max(0, Object.keys(ledger).length - MAX_TRANSCRIPTS))) delete ledger[old];
   next.transcripts = ledger;
   return { cost: next, entry: out };
 }
@@ -151,6 +152,22 @@ export function addSessions(cost, ids) {
 export function addRetries(cost, n = 1) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
   next.retries = (Number(next.retries) || 0) + amount(n, 'retries', { integer: true });
+  return next;
+}
+
+// The cost part of a run-record patch (everything but the guard-deny counts): { entry, transcript?, retries?, sessions? } applied to `cost` in this order. Returns a NEW cost
+// (the input is not touched; a patch with none of the parts returns `cost` as it is). The ONE place the arithmetic lives: the record path (applyCheckpoint) and the replay of
+// the append-only cost bookings (effectiveCost) both call it, so the two can never disagree. Throws, naming the field, on a malformed patch.
+export function applyCostPatch(cost, patchCost, { evict = true } = {}) {
+  if (!isPlainObject(patchCost)) throw new Error('cost must be an object');
+  let next = cost;
+  if (patchCost.entry !== undefined) {
+    let entry = patchCost.entry;
+    if (patchCost.transcript !== undefined) ({ cost: next, entry } = deductBookedTranscript(next, entry, patchCost.transcript, { evict }));
+    next = addCostEntry(next, entry);
+  }
+  if (patchCost.retries !== undefined) next = addRetries(next, patchCost.retries);
+  if (patchCost.sessions !== undefined) next = addSessions(next, patchCost.sessions);
   return next;
 }
 
