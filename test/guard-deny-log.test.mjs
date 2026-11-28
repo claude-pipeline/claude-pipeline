@@ -275,6 +275,18 @@ test('guard-files: a Bash deny writes one line (hook files), an allow and a file
   assert.equal(lines(home).length, 1);
 });
 
+// #874 (R1-B3): the working-folder hint puts the folder's path into the reason; the log must classify the unhinted refusal, not the folder name.
+test('guard-files: a refusal from a working folder named "plugin-dev" inside the protected folder still logs as protected, not plugin-cache', () => {
+  const home = freshHome();
+  const cwd = join(home, '.claude', 'pipeline', 'plugin-dev');
+  const r = spawnHook(HOOKS, 'guard-files.mjs', bashInput('pwd', cwd), home);
+  assert.equal(decisionOf(r), 'deny');
+  assert.match(reasonOf(r), /working folder \(.*plugin-dev\)/); // the user still sees the folder (the hint prints it with forward slashes, so no exact joined-path match)
+  const [entry, ...rest] = lines(home);
+  assert.equal(rest.length, 0);
+  assert.equal(entry.reason_code, 'protected');
+});
+
 test('both hooks: a FIFO at the log path still gets the deny out at once, and nothing is logged', { skip: !POSIX }, () => {
   const home = freshHome();
   mkdirSync(stateDir(home), { recursive: true });
