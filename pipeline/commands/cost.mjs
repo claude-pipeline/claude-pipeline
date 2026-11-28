@@ -9,7 +9,7 @@ import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '..
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { createRunRecorder } from '../lib/run-progress.mjs';
-import { LockTimeoutError, withLock } from '../lib/locks.mjs';
+import { LockLostError, LockTimeoutError, withLock } from '../lib/locks.mjs';
 import { repoLockKey } from '../lib/review-context.mjs';
 import { PRICE_TABLE_DATE, costReport, modelFamily, normalisePhase, normaliseRole, priceMessage, usageFromTranscript } from '../lib/run-cost.mjs';
 
@@ -163,11 +163,10 @@ export const run = guarded(async (argv, ctx) => {
     try {
       record = await withLock(costLockName(root, pr), () => { written = recorder.update(patch); return written; }, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs });
     } catch (err) {
-      if (!(err instanceof LockTimeoutError) && written !== null) {
-        // withLock failed AFTER the callback wrote the booking (the lock was lost, or its release threw EACCES/EIO...; recorder.update never throws, so written !== null means the write happened):
-        // report the booking, since failing here makes a re-run of an explicit --usd booking book twice
+      if (err instanceof LockLostError && written !== null) {
+        // the lock was taken over after the booking was written: the booking stands, so report it (a re-run would book an explicit --usd twice)
         record = written;
-        notes.push('this booking was written but the cost lock cleanup failed; do not run the command again, check the PR total with `P summary`');
+        notes.push('the cost lock was lost after this booking was written; the booking stands: do not run the command again, check the PR total with `P summary`');
       } else {
         if (!(err instanceof LockTimeoutError)) throw err;
         // never book without the lock: nothing was written, so re-running the same command is safe
