@@ -329,8 +329,9 @@ const unplacedTurnProvenance = (e) => unplacedProvenance(e) && !bangStdout(e);
 // (a hidden headless run is the case it would let through), and no machine here runs such a client. The readers do not exempt such a file; the owner is asked again after upgrading
 // (promptProvenance's legacy branch for a stored record predates this and is unchanged). Pinned by test/owner-go-visible-turns.test.mjs (#253).
 const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedTurnProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
-// #905: a non-owner PLAIN boundary: a prompt entry of unknown source that is neither an unplaced note nor an invisible turn (a half-flagged compaction summary, the #189 boundary).
-const plainBoundary = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedTurnProvenance(e) && !unplacedNote(e);
+// #905: a non-owner PLAIN boundary: a prompt entry of unknown source that is neither an unplaced note nor an invisible turn (a half-flagged compaction summary, the #189 boundary). R2-F1: whatever its
+// provenance fields (a set but unknown promptSource / turnOrigin does not make a flagged summary an invisible turn, the invisibleTurn exemption needs both flags undefined).
+const plainBoundary = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && (e.isCompactSummary !== undefined || e.isVisibleInTranscriptOnly !== undefined);
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
   const source = entrySource(e);
@@ -543,18 +544,22 @@ function originsOf(entries) {
   const twice = new Set(); // a uuid two entries claim: any chain through it is ambiguous
   entries.forEach((e, i) => { if (typeof e?.uuid === 'string') { if (at.has(e.uuid)) twice.add(e.uuid); else at.set(e.uuid, i); } });
   const memo = new Map(); // uuid -> origin found from there (-1: none)
-  const resolve = (first) => {
+  // R2-B2: the order rule holds at every hop: a parent must PRECEDE the entry that names it (a transcript never links forward), through non-prompt entries too; a forward link fails closed (-1).
+  const resolve = (first, child) => {
     const path = [];
     const seen = new Set();
     let id = first;
     let found = -1;
+    let from = child;
     while (typeof id === 'string') {
+      if (at.has(id) && at.get(id) >= from) break;
       if (memo.has(id)) { found = memo.get(id); break; }
       if (seen.has(id) || twice.has(id) || !at.has(id)) break;
       seen.add(id);
       path.push(id);
       const j = at.get(id);
       const n = entries[j];
+      from = j;
       if (isPrompt(n)) { found = j; break; }
       const compaction = isHiddenSummary(n) || (n?.type === 'system' && n.subtype === 'compact_boundary');
       id = typeof n?.parentUuid === 'string' ? n.parentUuid : compaction && typeof n?.logicalParentUuid === 'string' ? n.logicalParentUuid : null;
@@ -563,7 +568,7 @@ function originsOf(entries) {
     return found;
   };
   entries.forEach((e, i) => {
-    if (isPrompt(e)) { origin[i] = i; parent[i] = resolve(e?.parentUuid); } else origin[i] = resolve(e?.parentUuid);
+    if (isPrompt(e)) { origin[i] = i; parent[i] = resolve(e?.parentUuid, i); } else origin[i] = resolve(e?.parentUuid, i);
   });
   return { origin, parent };
 }
@@ -642,7 +647,8 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
   // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
   // may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an older request is never revived by a later "merge": the agent shows it again.
   const newest = [...turns].reverse().find((t) => t.kind !== 'skip');
-  const current = newest?.kind === 'slot' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
+  // R2-B1: only an OWNER-source entry can be the current submission (a hidden half-flagged summary whose text equals the answer is no prompt the owner typed, so the request above it stays unselected)
+  const current = newest?.kind === 'slot' && entrySource(newest.e) === 'owner' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
   const candidates = current ? slots.filter((x) => x.turn !== newest) : slots;
   const last = candidates[candidates.length - 1]; // (none: only text before the window's first prompt, which has no known origin, A3)
   // R2-B1: assistant text of ANY other visible slot after the selected slot's last SHOWN entry was the last thing the owner was shown: the selected request is stale, exactly like a mute.
