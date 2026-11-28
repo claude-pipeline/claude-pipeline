@@ -208,13 +208,17 @@ export function blobAt(dir, head, file, io = {}) {
 
 // ---- the shared rebuild ---------------------------------------------------------------------------------------------------------------
 
+const NO_BLOCK_REASON = 'the reply does not end with a live-database block';
+// What the typed go's reader says when it found no block (#916): the reply it reads is Claude's reply to the owner's OWN message; a block shown in a turn a background notice started is skipped.
+const NO_BLOCK_GO_REASON = `${NO_BLOCK_REASON}: only a block in Claude's reply to the owner's own message is read, and a block shown in a turn started by a background notice, a task notification or a subagent hand-back does not count, so present it again in the reply to the owner's next message`;
+
 // Reads the block at the END of a reply and rebuilds it. { ok:true, fields } | { ok:false, reason }. `fields`: op, ref, label, name, sqlSha256, head, file, repo, dir, summary, sql.
 // `home` is where the registry lives. `io.git` is a test seam.
 export function verifyBlock(replyText, { home = accountHome(), io = {} } = {}) {
   const fail = (reason) => ({ ok: false, reason });
   const lines = String(replyText ?? '').replace(/\r\n/g, '\n').split('\n');
   while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
-  if (lines.length < 9) return fail('the reply does not end with a live-database block');
+  if (lines.length < 9) return fail(NO_BLOCK_REASON);
   const n = lines.length;
   const bind = BINDING.exec(right(lines[n - 2]));
   if (!bind) return fail('the line before the closing line is not a Live-DB binding line');
@@ -292,7 +296,7 @@ export function liveDbGoOutcome(input, { home = accountHome(), now = Date.now, i
     if (prompt.length > GO_PROMPT_MAX) return { reason: 'the prompt is too long for a go' };
     const reply = lastReply(transcript, { prompt, skipSynthetic: true, liveDb: true }).text;
     const v = verifyBlock(reply, { home, io });
-    if (!v.ok) return { reason: v.reason };
+    if (!v.ok) return { reason: v.reason === NO_BLOCK_REASON ? NO_BLOCK_GO_REASON : v.reason };
     const f = v.fields;
     if (go.op !== f.op) return { reason: `the owner typed a ${go.op} go but the block asks for a ${f.op}` };
     const want = f.op === 'migration' ? f.name : f.sqlSha256.slice(0, 12);
