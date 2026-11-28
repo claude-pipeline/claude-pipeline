@@ -451,10 +451,23 @@ async function ownerRuling(rest, ctx) {
         // R2-B3: "this same answer" is judged as the owner-go record lookup judges it (white space collapsed, case ignored): an equivalent spelling of the answer, stored by an earlier call, is the same answer
         const same = (q) => String(q ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
         const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || !(i.final?.by === 'owner' && same(i.final?.ownerQuote) === same(ownerQuote)));
-        // R1-B2 (#954): a recommended Reject / fix-separately was Claude's reading of the code at the head the ask was issued at; a click is stale once the head moved (an ask with no head, or one that cannot be read, is not judged here)
+        // R1-B2 (#954): a recommended Reject / fix-separately was Claude's reading of the code at the head the ask was issued at; a click is stale once the head moved (an ask file that cannot be read is not judged here).
+        // R2-B2: a readable head-bound ask that recorded no head, or no PR head on GitHub, cannot be compared at all: refused, not skipped. R2-B1: the PR head on GitHub is compared too (a push from another checkout
+        // leaves this checkout's HEAD where it was), and one that cannot be read is refused; local commits not pushed yet do not matter, only a change since the ask.
         const issuedAt = RULING_HEAD_BOUND_VARIANTS.includes(r.ask.variant) ? readAsk(r.ask.askId, { home: ctx.home }) : null;
-        const nowHead = issuedAt?.ok === true && typeof issuedAt.ask.head === 'string' ? headSha({ cwd: root }) : null;
-        const moved = nowHead !== null && nowHead !== issuedAt.ask.head ? `the PR head moved from ${issuedAt.ask.head.slice(0, 12)} to ${nowHead.slice(0, 12)} since Claude recommended this, so the code it checked may have changed` : null;
+        let moved = null;
+        if (issuedAt?.ok === true) {
+          const { head: askedHead, prHead: askedPrHead } = issuedAt.ask;
+          if (typeof askedHead !== 'string' || typeof askedPrHead !== 'string') moved = 'the ask recorded no PR head to compare with, so the code Claude checked cannot be told apart from the code now';
+          else {
+            const nowHead = headSha({ cwd: root });
+            let nowPrHead = null;
+            try { nowPrHead = gh.prView(prNum, ['headRefOid']).headRefOid; } catch { /* unreadable: refused below */ }
+            if (nowHead !== askedHead) moved = `the PR head moved from ${askedHead.slice(0, 12)} to ${nowHead.slice(0, 12)} since Claude recommended this, so the code it checked may have changed`;
+            else if (typeof nowPrHead !== 'string') moved = 'the PR head on GitHub could not be read, so it cannot be confirmed that the code Claude checked is still the PR';
+            else if (nowPrHead !== askedPrHead) moved = `the PR head on GitHub moved from ${askedPrHead.slice(0, 12)} to ${nowPrHead.slice(0, 12)} since Claude recommended this, so the code it checked may have changed`;
+          }
+        }
         return { variant: r.ask.variant, waiting, stale: moved ?? recommendationRefusal({ root, config, state, items: waiting, recommend: claim.recommend, code: claim.code }) };
       });
       if (checks.every((c) => c.stale !== null)) {
@@ -1027,8 +1040,8 @@ async function rulingRequest(rest, ctx) {
     // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
     const block = [...items.map(summaryRow), ...(shown ? [rulingWhyRow(values.recommend, values.why)] : []), line].join('\n');
     const built = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: dialogVariant });
-    // a recommended Reject / fix-separately rests on Claude's reading of the code: the ask records the head it was issued at, and owner-ruling refuses the click once the head moved
-    const parts = built !== null && RULING_HEAD_BOUND_VARIANTS.includes(dialogVariant) ? { ...built, head: headSha({ cwd: root }) } : built;
+    // a recommended Reject / fix-separately rests on Claude's reading of the code: the ask records the head it was issued at (this checkout's HEAD and the PR's head on GitHub), and owner-ruling refuses the click once either moved or cannot be compared
+    const parts = built !== null && RULING_HEAD_BOUND_VARIANTS.includes(dialogVariant) ? { ...built, head: headSha({ cwd: root }), prHead: gh.prView(pr, ['headRefOid']).headRefOid } : built;
     return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
   }, pr));
 }

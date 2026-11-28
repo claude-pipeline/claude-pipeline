@@ -171,9 +171,9 @@ export const RULING_WHY = Object.freeze({
     'no-user-impact': 'Claude checked the code for each item: what it describes can only happen in a case users never reach (for example while an update is being installed), so it is not worth changing.',
   }),
 });
-// The dialogs whose recommendation rests on Claude's reading of the CODE (a recommended Reject or fix-separately): their ask file also records the PR head it was issued at (`head`), so a click is not applied once the head moved.
+// The dialogs whose recommendation rests on Claude's reading of the CODE (a recommended Reject or fix-separately): their ask file also records the heads it was issued at (`head`: the checkout's, `prHead`: the PR's on GitHub), so a click is not applied once either moved.
 export const RULING_HEAD_BOUND_VARIANTS = Object.freeze(['ruling-v2-follow-up-any', 'ruling-v2-reject']);
-const headOk = (a) => !Object.hasOwn(a, 'head') || (a.kind === 'ruling' && RULING_HEAD_BOUND_VARIANTS.includes(a.variant) && /^[0-9a-f]{40}$/.test(String(a.head)));
+const headOk = (a) => (!Object.hasOwn(a, 'head') && !Object.hasOwn(a, 'prHead')) || (a.kind === 'ruling' && RULING_HEAD_BOUND_VARIANTS.includes(a.variant) && ['head', 'prHead'].every((k) => !Object.hasOwn(a, k) || /^[0-9a-f]{40}$/.test(String(a[k]))));
 const RULING_DECISION_WORD = Object.freeze({ accept: 'Accept', 'follow-up': 'Follow-up', reject: 'Reject' });
 const RECOMMENDS = 'Claude recommends ';
 // The recommendation row of the dialog's question (one line, before the binding last line; it binds nothing). Null for a decision / code that is not in the table.
@@ -367,12 +367,12 @@ function readSpent(askId, home) {
 // Writes `asks/<askId>.json` and returns { askId, questions: [dialog] } (the dialog the agent passes to AskUserQuestion VERBATIM), or { error } when the dialog could not bind or be written. The question
 // text is `<title> (<askId>)` + blank line + `block`; before writing, the SAME binding cores the recorder uses are run on it with every option's answer, so an ask whose closing lines would bind
 // nothing (or another PR / repository than `prs` / `repo`) is never issued. An older ask of the same kind, repository and PRs that is neither spent nor superseded is marked superseded.
-export function issueAsk({ kind, repo, prs, header, title, block, options, actions, variant, head, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
+export function issueAsk({ kind, repo, prs, header, title, block, options, actions, variant, head, prHead, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
   try {
     const key = repoKey(repo);
     if (!KINDS.includes(kind) || key === null || !Array.isArray(prs) || (prs.length === 0 && kind !== 'live-db') || !prs.every(Number.isInteger) || typeof title !== 'string' || typeof block !== 'string' || !isObj(actions)) return { error: 'invalid' };
     if (variant !== undefined && !variantOfKind(kind, variant)) return { error: 'invalid' };
-    if (head !== undefined && !headOk({ kind, variant, head })) return { error: 'invalid' };
+    if ((head !== undefined || prHead !== undefined) && !headOk({ kind, variant, ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }) })) return { error: 'invalid' };
     // an action is a decline (null), the answer text a typed parser reads (a string) or a follow-up instruction (round asks only)
     if (!Object.values(actions).every((a) => a === null || typeof a === 'string' || (kind === 'round' && isInstruction(a)))) return { error: 'invalid-actions' };
     const labels = (options ?? []).map((o) => o?.label);
@@ -386,7 +386,7 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
     if (askId === null) return { error: 'no-id' };
     const dialog = canonicalDialog({ question: `${title} (${askId})\n\n${block}`, header: header ?? 'Merge', multiSelect, options });
     if (dialog === null) return { error: 'invalid-dialog' };
-    const ask = { v: variant === undefined ? 1 : 2, askId, kind, ...(variant === undefined ? {} : { variant }), ...(head === undefined ? {} : { head }), repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
+    const ask = { v: variant === undefined ? 1 : 2, askId, kind, ...(variant === undefined ? {} : { variant }), ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }), repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
     // every approving answer must bind exactly this repository and these PRs, or the ask is useless (a typo in the block, a closing line of another PR)
     for (const label of labels) {
       if (actions[label] === null || isInstruction(actions[label])) continue; // (a decline and an instruction bind nothing: neither can reach a record)

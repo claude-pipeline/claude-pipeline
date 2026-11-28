@@ -23,7 +23,7 @@ import { ownerGoDir } from '../pipeline/hooks/lib/owner-go.mjs';
 import { applyClaudeRuling, settleSecondReview } from '../pipeline/lib/triage.mjs';
 import { buildSecondReviewPrompt } from '../pipeline/lib/codex.mjs';
 import { run as triageRun } from '../pipeline/commands/triage.mjs';
-import { readAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
+import { asksDir, readAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { world as clickWorld } from './helpers/click-world.mjs';
 
 const here = dirname(fileURLToPath(import.meta.url));
@@ -1536,6 +1536,47 @@ test('#944 drift: an answer on a recommended Reject / fix-separately dialog is r
   const fresh = e2eWorld(t);
   const ok = await clickedRuling(t, fresh, { ids: ['R1-B1'], recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' });
   assert.equal((await ok.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject')).exitCode, 0);
+});
+
+test('#944 drift: a recommended Reject click is refused when the PR head on GitHub moved or cannot be read, or the ask recorded no head to compare; unpushed local commits do not matter', async (t) => {
+  // failure caught (R2-B1): a push from another checkout leaves this checkout's HEAD where it was, so the old Reject click was recorded for code Claude never read; (R2-B2): an ask with no recorded head skipped the comparison and recorded it too
+  const REJECT = { recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' };
+  const ghScript = (w) => { const file = w.fake.env.PIPELINE_FAKE_GH_SCRIPT; return { read: () => JSON.parse(readFileSync(file, 'utf8')), write: (entries) => writeFileSync(file, JSON.stringify(entries)) }; };
+  const setPrView = (w, over) => { const g = ghScript(w); g.write(g.read().map((e) => (e.match === '^pr view 7' ? { ...e, ...over } : e))); };
+  // the control: nothing moved, the click records (and the ask carries both heads)
+  const fresh = e2eWorld(t);
+  const ok = await clickedRuling(t, fresh, { ids: ['R1-B1'], ...REJECT });
+  assert.match(ok.file.prHead, /^[0-9a-f]{40}$/);
+  assert.equal((await ok.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject')).exitCode, 0);
+  // the PR head on GitHub moved while this checkout's HEAD did not (a push from another checkout)
+  const pushed = e2eWorld(t);
+  const p = await clickedRuling(t, pushed, { ids: ['R1-B1'], ...REJECT });
+  setPrView(pushed, { stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: 'f'.repeat(40) } });
+  const before = pushed.stateText();
+  const movedRemote = await p.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(movedRemote.exitCode, 1, JSON.stringify(movedRemote.output));
+  assert.match(movedRemote.output.reason, /the PR head on GitHub moved from .* since Claude recommended this.*ask again/);
+  assert.equal(pushed.stateText(), before, 'the state is byte-identical');
+  // the PR head cannot be read: refused, not skipped
+  const blind = e2eWorld(t);
+  const b = await clickedRuling(t, blind, { ids: ['R1-B1'], ...REJECT });
+  setPrView(blind, { stdoutJson: undefined, code: 1 });
+  const unread = await b.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(unread.exitCode, 1, JSON.stringify(unread.output));
+  assert.match(unread.output.reason, /the PR head on GitHub could not be read/);
+  // an ask with no recorded head (or no PR head on GitHub) is refused, even though nothing moved
+  for (const dropped of [['head', 'prHead'], ['prHead']]) {
+    const w = e2eWorld(t);
+    const c = await clickedRuling(t, w, { ids: ['R1-B1'], ...REJECT });
+    const file = join(asksDir(c.home), `${c.ask.askId}.json`);
+    const raw = JSON.parse(readFileSync(file, 'utf8'));
+    for (const k of dropped) delete raw[k];
+    writeFileSync(file, JSON.stringify(raw));
+    assert.equal(readAsk(c.ask.askId, { home: c.home }).ok, true, 'the ask still reads (an older writer left no head)');
+    const denied = await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+    assert.equal(denied.exitCode, 1, JSON.stringify(denied.output));
+    assert.match(denied.output.reason, /recorded no PR head to compare with/);
+  }
 });
 
 test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {
