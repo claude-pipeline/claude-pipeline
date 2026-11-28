@@ -17,7 +17,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
-import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
+import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, runnerShellSetting, isRunnerCommand, runnerSettingReason, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
@@ -3649,7 +3649,13 @@ function evalString(str, startDir, ctx, level, child = false) {
     let verdict = null;
     const judged0 = ctx.judgedTexts ?? 0;
     let sourceGone = false; // (#555: the file a `source` names is plainly spelled and does not exist, not even as a dangling link: nothing runs; #630)
-    if (VAR_BUILTINS.includes(name)) {
+    // (#903 A: a setting that gives a package runner its shell text or its shell; before the command-name switch, so a runner that was unwrapped to `git` / `gh` / `cd` is read too. The command's own env is a source as well: its prefix and an `env` / `sudo` wrapper's)
+    if (isRunnerCommand(c, argv.map((w) => expandVars(w, ctx)))) {
+      const set = runnerShellSetting([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted, ...Object.keys(c.env ?? {})]);
+      if (set) verdict = deny(runnerSettingReason(set));
+    }
+    if (verdict) { /* refused: returned below */ }
+    else if (VAR_BUILTINS.includes(name)) {
       const d = declAttrs(argv);
       for (const [k, v] of d.assigns) {
         // (a value that still holds a `$` is not worked out: the case change would apply to what it expands to)

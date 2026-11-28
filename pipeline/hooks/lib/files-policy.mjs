@@ -19,7 +19,7 @@
 import fs from 'node:fs';
 import { frontmatterHooksValue } from './frontmatter.mjs';
 import { SQL_UNKNOWN_VAR } from './sql-clients.mjs';
-import { pmCall, pmMoverName, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
+import { pmCall, pmMoverName, runnerShellSetting, isRunnerCommand, runnerSettingReason, packageScripts, defaultLexists, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames } from './package-scripts.mjs';
 import os from 'node:os';
 import { evaluateSupabaseMcp, findLiveDbCli, serverSegment, supabaseMatch } from './live-db-guard.mjs';
 import { readDbRefs } from './db-refs.mjs';
@@ -5536,6 +5536,17 @@ function evaluateBashForFilesFrame(command, opts) {
         }
         if (v) return v;
         if (sf.kind === 'shell' && sourcesHere(c)) absorbSourced(sf, dirs, ctx, repeats(cmds, idx)); // (a sourced file runs in this shell: what it sets is the line's from here)
+      }
+      // #903 A: a setting that gives a package runner its shell text or its shell (before the package-script judgment, so a runner line gets this reason, not the generic mover one)
+      if (isRunnerCommand(c, c.argv.map((w) => expandRefs(w, ctx)))) {
+        const set = runnerShellSetting([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]);
+        if (set) return deny(runnerSettingReason(set));
+      }
+      // #903 B: a bare runner's stdin text. With a workspace option npm runs it in each workspace's directory, which cannot be verified (git: the directory is unknown); on Windows it is run by cmd, whose spellings the sh reading
+      // does not cover (the parser has no platform: the feed is marked as run-time text here, like `ctx.dynamic` of any fed text the guard cannot read exactly)
+      if (c.runnerStdin) {
+        if (c.runnerStdin.workspace && c.runnerStdin.fed) return deny('package runner: `npx -w` runs its stdin text in each workspace\'s directory, which the guard cannot verify. Run the command in that directory without the workspace option.');
+        if (opts.platform === 'win32' && c.runnerStdin.fed) ctx.dynamic = true;
       }
       // #81 t9: `npm run NAME` and its kin run the text package.json holds for NAME
       {

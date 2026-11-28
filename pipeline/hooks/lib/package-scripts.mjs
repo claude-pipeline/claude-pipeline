@@ -99,7 +99,7 @@ const NO_SCRIPT = {
   pnpm: new Set(['list', 'ls', 'll', 'la', 'outdated', 'why', 'view', 'info', 'show', 'v', 'help', 'config', 'c', 'get', 'set', 'root', 'bin', 'store', 'whoami', 'audit', 'licenses', 'ping', 'search', 'doctor', 'env', 'setup', 'completion']),
   bun: new Set(['pm', 'upgrade', 'outdated', 'why', 'info', 'test', 'build', 'init', 'completions', 'repl']),
 };
-const EXEC_SUBS = new Set(['exec', 'x', 'dlx']);
+const EXEC_SUBS = new Set(['exec', 'x', 'exe', 'dlx']); // (`exe`: npm reads the unique abbreviation as exec)
 const DIR_OPTS = new Set(['--prefix', '-C', '--dir', '--cwd']);
 const WORKSPACE_OPT = /^(?:-w|-ws|--workspaces?|--filter|-F|--filter-prod|-r|--recursive|--include-workspace-root|--workspace-root)$/;
 // Configuration keys that change what runs a script (the shell, the node options, the directory ...). One list for both places npm reads them: a key in a .npmrc / .yarnrc / bunfig file (rcRefusal) and the command line
@@ -332,6 +332,15 @@ export function pmCall(allWords) {
 // (not NODE_OPTIONS, t11: it cannot move package.json or a configuration file, and the program it preloads is one the guards never judge anyway)
 const MOVER_NAME = /^(?:npm_|yarn_|pnpm_|bun_|berry_|corepack_|init_cwd$)/i;
 export const pmMoverName = (names) => { for (const n of names) if (MOVER_NAME.test(n)) return n; return null; };
+
+// #903 A: a package runner (npx, npm exec) takes its shell text from `npm_config_call` and the program that runs it from `npm_config_script_shell`: neither is read by the guards, so a line that binds one for a runner is refused.
+// Not the whole mover family: `npm_config_yes=true npx prettier .` stays allowed. `names`: the names the line binds (each policy's own sources); the first match is returned, or null.
+export const runnerShellSetting = (names) => { for (const n of names) if (/^npm_config_(?:call|script_shell)$/i.test(n)) return n; return null; };
+// Is this command a package runner's: the parser unwrapped it through one (`viaRunner`), its own name is `npx` / `bunx` / `pnpx` (a bare one is not unwrapped), or `pmCall` reads it as an exec / x / dlx call (manager options before the subcommand included)?
+export const isRunnerCommand = (c, argv) => c.viaRunner === true || ['npx', 'bunx', 'pnpx'].includes(baseName(argv[0] ?? '')) || EXEC_SUBS.has(pmCall(argv)?.sub);
+export const runnerSettingReason = (name) => (/call$/i.test(name)
+  ? 'package runner: `npm_config_call` on the line gives `npx` the shell text it runs, which the guard does not read from a setting. Pass the text as `npx -c \'…\'` instead.'
+  : 'package runner: `npm_config_script_shell` on the line picks the program `npx` runs its text with, which the guard does not follow. Remove the setting from the runner\'s environment.');
 
 // A name exported that is only known at run time (`export $N=x`) can be any of the variables above.
 export const NAME_AT_RUN_TIME = /(?:^|[;&|(\s])(?:export|declare|typeset|local|readonly)\s(?:[^;&|\n]*\s)?[^\s=;&|]*[$`][^\s=;&|]*(?=[\s=;&|]|$)/;
