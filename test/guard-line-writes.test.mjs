@@ -2126,3 +2126,42 @@ test('#529: a command with `&>` may run in the background: the writes after it m
   allowBoth('bash fg3.sh; cp f.sh n.sh', spec); // nested twin: BASE allow -> CANDIDATE allow
   allowBoth("echo '&>' ; bash fg3.sh; cp f.sh n.sh", spec); // quoted data: BASE allow -> CANDIDATE allow (no frame becomes opaque from text)
 });
+
+// #919: a lone `&` that is text (a comment, single or double quotes, a quoted heredoc body) is no background job. Failure caught: `# a & b` anywhere in a script made its whole
+// frame "opaque", so a LATER write counted for every earlier command (`bash n.sh; cp f.sh n.sh` read as if the copy ran first) and a harmless script was refused.
+test('#919: a `&` in a comment, quotes or a quoted heredoc body does not make the frame opaque; a `&` the shell reads still does', () => {
+  // text only: the script runs before the copy, as written
+  for (const t of ['# a & b\n', "echo 'a & b'\n", 'echo "a & b"\n', "cat <<'X'\na & b\nX\n"]) allowBoth(`${t}bash n.sh; cp f.sh n.sh`);
+  // the real thing keeps the order unknown
+  denyBoth('bash n.sh; cp f.sh n.sh &');
+  denyBoth('bash n.sh; cp f.sh n.sh; (sleep 1) &');
+  denyBoth('bash n.sh; cp f.sh n.sh; { sleep 1; } &');
+  // a comment is blanked whatever else the text holds; quoted text that a command may run (an argument, a pipe, a heredoc, a capture, a function) stays counted
+  allowBoth('# a & b\necho $(date)\nbash n.sh; cp f.sh n.sh');
+  denyBoth("bash -c 'sleep 1 &'\nbash n.sh; cp f.sh n.sh");
+  denyBoth("eval 'sleep 1 &'\nbash n.sh; cp f.sh n.sh");
+  denyBoth("for c in 'sleep 1 &'; do eval \"$c\"; done\nbash n.sh; cp f.sh n.sh");
+  denyBoth("echo 'sleep 1 &' | sh\nbash n.sh; cp f.sh n.sh");
+  denyBoth("sh <<'X'\nsleep 1 &\nX\nbash n.sh; cp f.sh n.sh");
+  denyBoth("x=$(echo 'sleep 1 &'); eval \"$x\"\nbash n.sh; cp f.sh n.sh");
+  denyBoth("f() { sh -c 'sleep 1 &'; }; f\nbash n.sh; cp f.sh n.sh");
+  // a `&` inside a substitution stays opaque, also inside double quotes, in backticks, and in an UNQUOTED heredoc
+  denyBoth('echo "$(sleep 1 &)"\nbash n.sh; cp f.sh n.sh');
+  denyBoth('echo "a & $(sleep 1 &)"\nbash n.sh; cp f.sh n.sh');
+  denyBoth('echo `sleep 1 &`\nbash n.sh; cp f.sh n.sh');
+  denyBoth('cat <<X\n$(sleep 1 &)\nX\nbash n.sh; cp f.sh n.sh');
+  // an apostrophe in an unquoted heredoc body must not pair with a later quote and blank the real `&` between them
+  denyBoth("cat <<X\ndon't\nX\nbash n.sh; cp f.sh n.sh; (sleep 1) & echo 'x' &");
+  // R1-F1: quoted text fed to a shell through an output process substitution (`>(sh)`, zsh `=(…)`) can run, like a pipe
+  denyBoth("echo 'sleep 1 &' > >(sh)\nbash n.sh; cp f.sh n.sh");
+  denyBoth("echo 'sleep 1 &' > =(sh)\nbash n.sh; cp f.sh n.sh");
+  allowBoth("files=(a b)\necho 'a & b'\nbash n.sh; cp f.sh n.sh"); // an array assignment is no process substitution
+  // R1-B1: a `#` inside a word (`Issue\\ #42`, a continued line, `${x/ #/}`) is no comment: the real trailing `&` after it still counts
+  denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh Issue\\ #42 &");
+  denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh a\\\n#b &");
+  denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh \"${x/ #/}\" &");
+  allowBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh Issue\\ #42");
+  // R1-B2: a comment between case arms is a comment: its `&` and apostrophe change nothing; a real `&` after it still counts
+  allowBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh");
+  denyBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh &");
+});

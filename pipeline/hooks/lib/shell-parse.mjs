@@ -1975,7 +1975,7 @@ function arithBodies(s, g, cmds) {
   return out;
 }
 // (Defence in depth for expansionText, which blanks a quoted body for the scans that read it: this one covers the zsh bare-subscript scan and the no-cmds fallback of the [[ scan)
-const quotedBodiesBlank = (s, cmds) => {
+export const quotedBodiesBlank = (s, cmds) => {
   if (!/<</.test(s)) return s;
   const spans = cmds?.heredocSpans;
   if (!Array.isArray(spans)) return s;
@@ -1988,7 +1988,7 @@ const quotedBodiesBlank = (s, cmds) => {
 };
 // The text the subscript, substring and append scans read: what the shell expands. Single-quoted strings, comments and (in double quotes) every word that is no expansion are blanked, so a
 // program text (`node -e "…a[i]=…; s+=…"`) is no assignment; a heredoc body is cut to its expansions (${…}, $[ ], $(( ))). Null from the scanner (`$'…'`, an open quote): the text as written.
-function expandedOnly(s) {
+export function expandedOnly(s) {
   let out = '';
   const blank = (x) => x.replace(/[^\n]/g, ' ');
   const closer = (i, open, close) => { // the end (after the closer) of a balanced `open … close` that starts at i, or the end of the text
@@ -3342,7 +3342,7 @@ class Parser {
       if (isSpace(c)) this.i++;
       else if (c === '\n') { this.nlCheck(); this.i++; if (this.hd.length) this.readHeredocs(); this.lineStart = this.i; } // (#269 R24-B1)
       else if (c === '\\' && s[this.i + 1] === '\n') this.i += 2;
-      else if (c === '#') { while (this.i < n && s[this.i] !== '\n') this.i++; }
+      else if (c === '#') { const from = this.i; while (this.i < n && s[this.i] !== '\n') this.i++; if (this.comments) this.comments.push([from, this.i]); }
       else break;
     }
   }
@@ -4184,7 +4184,7 @@ function newCtx(maxDepth, expired, bashState) {
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
 // read the whole text (a limit, an error): the caller keeps the text as it is.
-function withoutComments(src, maxDepth, expired) {
+export function withoutComments(src, maxDepth, expired) {
   const ctx = newCtx(Math.min(Math.max(maxDepth, 0), HARD_MAX_DEPTH), expired, null);
   ctx.muted = 1;
   const p = new Parser(ctx, src);
