@@ -1729,6 +1729,8 @@ test('#904: a program the line writes first is refused like the one on disk (`cp
   // the parent directory before node_modules is no traversal out of it; an escaped `..` (the shell may strip the escapes) gets no spelling shortcut
   assert.equal(evaluate('cd "$X" && ../node_modules/.bin/node --version').decision, 'allow', 'a leading ..');
   assert.match(evaluate('cd "$X" && ./node_modules/\\.\\./env foo').reason ?? '', /cannot tell which directory/, 'an escaped ..');
+  assert.match(evaluate('cd "$X" && ./node_modules/../env foo').reason ?? '', /cannot tell which directory/, 'a plain ..');
+  assert.equal(evaluate('cd "$X" && \'.\\node_modules\\.bin\\node.cmd\' --version').decision, 'allow', 'a quoted Windows node_modules path');
   assert.match(evaluate('cd "$X" && ./tool foo').reason, /cannot tell which directory/, 'the reference: a plain program');
   // accepted refusal (owner 11-28): a virtualenv interpreter after a cd the guard cannot follow
   assert.match(evaluate('cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m pytest').reason, /cannot tell which directory/);
