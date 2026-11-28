@@ -9,7 +9,7 @@ import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '..
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { createRunRecorder } from '../lib/run-progress.mjs';
-import { LockLostError, LockTimeoutError, withLock } from '../lib/locks.mjs';
+import { LockTimeoutError, withLock } from '../lib/locks.mjs';
 import { repoLockKey } from '../lib/review-context.mjs';
 import { PRICE_TABLE_DATE, costReport, modelFamily, normalisePhase, normaliseRole, priceMessage, usageFromTranscript } from '../lib/run-cost.mjs';
 
@@ -159,19 +159,12 @@ export const run = guarded(async (argv, ctx) => {
     const wait = Number(env.PIPELINE_LOCK_WAIT_MS);
     const waitMs = wait > 0 ? wait : COST_LOCK_WAIT_MS;
     let record;
-    let written = null;
     try {
-      record = await withLock(costLockName(root, pr), () => { written = recorder.update(patch); return written; }, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs });
+      record = await withLock(costLockName(root, pr), () => recorder.update(patch), { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs });
     } catch (err) {
-      if (err instanceof LockLostError && written !== null) {
-        // the lock was taken over after the booking was written: the booking stands, so report it (a re-run would book an explicit --usd twice)
-        record = written;
-        notes.push('the cost lock was lost after this booking was written; the booking stands: do not run the command again, check the PR total with `P summary`');
-      } else {
-        if (!(err instanceof LockTimeoutError)) throw err;
-        // never book without the lock: nothing was written, so re-running the same command is safe
-        return { exitCode: EXIT.FAILED, output: { ok: false, recorded: false, bucketed: false, call: null, cost: null, warnings: [...notes, `another booking for this PR holds the cost lock (waited ${waitMs} ms); nothing was booked: run this same command again`] } };
-      }
+      if (!(err instanceof LockTimeoutError)) throw err;
+      // never book without the lock: nothing was written, so re-running the same command is safe
+      return { exitCode: EXIT.FAILED, output: { ok: false, recorded: false, bucketed: false, call: null, cost: null, warnings: [...notes, `another booking for this PR holds the cost lock (waited ${waitMs} ms); nothing was booked: run this same command again`] } };
     }
     const ok = record !== null;
     return {
