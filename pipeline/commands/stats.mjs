@@ -47,9 +47,9 @@ async function rounds(rest, ctx) {
       else {
         // newest-updated first: stop once a whole page is older than the date (a merged PR was updated at its merge, so nothing later in the list merged since)
         const closed = pages(gh, `repos/${slug}/pulls?state=closed&sort=updated&direction=desc`, (l) => l.every((p) => String(p.updated_at ?? '') < since), () => warnings.push(`${slug}: the list of closed PRs was cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} PRs): merged PRs further back are missing, so the totals are short (use a later --since)`));
-        numbers = closed.filter((p) => typeof p.merged_at === 'string' && p.merged_at >= since).map((p) => ({ number: p.number, nodeId: p.node_id }));
+        numbers = closed.filter((p) => typeof p.merged_at === 'string' && p.merged_at >= since).map((p) => ({ number: p.number, nodeId: p.node_id, baseRepo: p.base?.repo?.full_name }));
       }
-      for (const { number, nodeId } of numbers) {
+      for (const { number, nodeId, baseRepo } of numbers) {
         try {
           // The PR itself, read at most once and only when needed (a record naming another repository: its branch; two slugs: its identity). null = could not be read.
           let pull;
@@ -59,6 +59,8 @@ async function rounds(rest, ctx) {
             }
             return pull;
           };
+          // The repository the PR lives in now: the listing's base repo, else the PR read; undefined = unknown (then the slug asked is taken). Only looked up when several slugs are asked or a record names another repository.
+          const canonical = () => { const c = baseRepo ?? livePull()?.base?.repo?.full_name; return typeof c === 'string' && c !== '' ? c : undefined; };
           const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record or state may be missing or old`));
           let record = null; // the record of THIS repository slug: it wins over an adopted one whatever the comment order
           let adopted = null; // a record of the repository the PR moved from, adopted only when its branch is the live one: { record, from }
@@ -79,11 +81,14 @@ async function rounds(rest, ctx) {
               const r = decodeRecord(c.body);
               if (r.status === 'ok') {
                 // The repo is the only mismatch ⇒ the PR was merged before a rename/transfer and this is still its own record (adoptRecord, #671); a slug that differs only in case is the same repository.
-                const sameRepo = String(r.record.repo ?? '').toLowerCase() === slugLower;
+                // "This repository" is the canonical one, not the slug asked first, so the order of two aliases cannot change the record picked.
+                const recSlug = String(r.record.repo ?? '').toLowerCase();
+                const home = repos.length > 1 || recSlug !== slugLower ? canonical() : undefined;
+                const sameRepo = recSlug === (home ?? slug).toLowerCase();
                 // a record naming another repository is adopted only when its branch is the PR's live one (else a copied record of another PR with the same number would be taken)
                 const branch = sameRepo ? undefined : livePull()?.head?.ref;
                 const lookupFailed = !sameRepo && typeof branch !== 'string';
-                const bound = lookupFailed ? { record: null } : adoptRecord(r.record, { repo: sameRepo ? r.record.repo : slug, pr: number, branch });
+                const bound = lookupFailed ? { record: null } : adoptRecord(r.record, { repo: sameRepo ? r.record.repo : (home ?? slug), pr: number, branch });
                 if (bound.record) {
                   if (sameRepo) record = bound.record;
                   else adopted = { record: bound.record, from: r.record.repo };
@@ -97,20 +102,22 @@ async function rounds(rest, ctx) {
               else skip('a review state', ': unreadable');
             }
           }
+          // The same pull request reached through two slugs (a renamed repository, the old name redirects) counts once, with or without a review state: the listing's node id, or with --pr a lookup (only when several repositories are asked).
+          const identity = nodeId ?? (repos.length > 1 ? livePull()?.node_id : undefined);
+          const first = typeof identity === 'string' ? seen.get(identity) : undefined;
+          if (first !== undefined) {
+            warnings.push(`${slug}#${number}: the same pull request as ${first}: counted once`);
+            continue;
+          }
+          if (typeof identity === 'string') seen.set(identity, `${slug}#${number}`);
+          else if (repos.length > 1) warnings.push(`${slug}#${number}: could not tell whether this pull request is also counted under another repository name (it could not be read): counted`);
           const movedFrom = record === null && adopted !== null ? adopted.from : null;
           const p = analysePr({ repo: slug, pr: number, state, record: record ?? adopted?.record ?? null });
           if (p === null) withoutState += 1;
           else {
-            // The same pull request reached through two slugs (a renamed repository, the old name redirects) counts once: the listing's node id, or with --pr a lookup (only when several repositories are asked).
-            const identity = nodeId ?? (repos.length > 1 ? livePull()?.node_id : undefined);
-            const first = typeof identity === 'string' ? seen.get(identity) : undefined;
-            if (first !== undefined) warnings.push(`${slug}#${number}: the same pull request as ${first}: counted once`);
-            else {
-              if (typeof identity === 'string') seen.set(identity, `${slug}#${number}`);
-              analysed.push(p);
-              // only for the record finally selected, and only when the PR counts
-              if (movedFrom !== null) warnings.push(`${slug}#${number}: counted a run record bound to ${asciiLine(movedFrom, 80)} (the repo moved)`);
-            }
+            analysed.push(p);
+            // only for the record finally selected, and only when the PR counts
+            if (movedFrom !== null) warnings.push(`${slug}#${number}: counted a run record bound to ${asciiLine(movedFrom, 80)} (the repo moved)`);
           }
         } catch (err) {
           warnings.push(`${slug}#${number}: comments could not be read (${asciiLine(err?.message, 120)}): skipped`);

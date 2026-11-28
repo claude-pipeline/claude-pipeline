@@ -252,6 +252,39 @@ test('R1-B3 stats rounds: the same PR reached through two slugs (a renamed repos
   assert.deepEqual([viaList.json.totals.prs, viaList.json.totals.usd], [1, 9]);
 });
 
+// R2-B3: the duplicate check runs before the state split, so a PR without a review state, listed under two slugs, is counted once in withoutState.
+test('R2-B3 stats rounds: a pull request without review state, listed under two slugs, is counted once in withoutState', () => {
+  const listed = (slug) => ({ match: `^api repos/${slug}/pulls\\?state=closed`, stdoutJson: [{ number: 7, node_id: 'PR_node_7', merged_at: '2026-11-10T10:00:00Z', updated_at: '2026-11-10T10:00:00Z' }] });
+  const bare = (slug) => ({ match: `^api repos/${slug}/issues/7/comments`, stdoutJson: [mine(1, 'hello')] });
+  const r = statsCli([listed('acme/widgets'), listed('old/widgets'), bare('acme/widgets'), bare('old/widgets')], ['--json', '--since', '2026-11-05', '--repo-slug', 'acme/widgets', '--repo-slug', 'old/widgets']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.withoutState, r.json.totals.prs], [1, 0]);
+  assert.match(noteOf(r), /old\/widgets#7: the same pull request as acme\/widgets#7: counted once/);
+});
+
+// R2-B2: with several slugs and --pr, a failed identity read must not double-count in silence.
+test('R2-B2 stats rounds: several slugs with --pr and an unreadable pull request identity: counted, and the warning says it may be a duplicate', () => {
+  const own = (slug) => ({ match: `^api repos/${slug}/issues/7/comments`, stdoutJson: [mine(1, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: slug, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`), mine(2, triageBody(state7))] });
+  const r = statsCli([own('acme/widgets'), own('old/widgets'), { match: '^api repos/acme/widgets/pulls/7$', code: 1, stderr: 'HTTP 502' }, { match: '^api repos/old/widgets/pulls/7$', code: 1, stderr: 'HTTP 502' }], ['--json', '--repo-slug', 'acme/widgets', '--repo-slug', 'old/widgets', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.totals.prs, 2, 'counted under both names, as the warning says');
+  assert.match(noteOf(r), /acme\/widgets#7: could not tell whether this pull request is also counted under another repository name \(it could not be read\): counted/);
+  assert.match(noteOf(r), /old\/widgets#7: could not tell/);
+});
+
+// R2-B1: "this repository's own record" is judged against the PR's canonical repository (its base repo), not the slug asked first, so the order of the aliases cannot change the cost.
+test('R2-B1 stats rounds: two records on one PR (old slug $2, current slug $9) report the same cost in either alias order', () => {
+  const rec = (repo, usd) => mine(repo === 'old/widgets' ? 1 : 3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: { ...cost7, total: { ...cost7.total, usd } } })}`);
+  const comments = (slug) => ({ match: `^api repos/${slug}/issues/7/comments`, stdoutJson: [rec('old/widgets', 2), mine(2, triageBody(state7)), rec('acme/widgets', 9)] });
+  const pullOf = (slug) => ({ match: `^api repos/${slug}/pulls/7$`, stdoutJson: { number: 7, node_id: 'PR_node_7', head: { ref: 'feat/x' }, base: { repo: { full_name: 'acme/widgets' } } } });
+  const run = (order) => statsCli([comments('acme/widgets'), comments('old/widgets'), pullOf('acme/widgets'), pullOf('old/widgets')], ['--json', '--pr', '7', ...order.flatMap((s) => ['--repo-slug', s])]);
+  const oldFirst = run(['old/widgets', 'acme/widgets']);
+  const newFirst = run(['acme/widgets', 'old/widgets']);
+  assertExit(oldFirst, 0, oldFirst.stderr + oldFirst.stdout);
+  assert.deepEqual([oldFirst.json.totals.prs, oldFirst.json.totals.usd], [1, 9], 'old slug first: the record of the canonical repository wins');
+  assert.deepEqual([newFirst.json.totals.prs, newFirst.json.totals.usd], [1, 9], 'current slug first: same');
+});
+
 const noteOf = (r) => r.json.warnings.join('\n');
 const onlyComments = (extra) => [world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, summaryBody(cost7)), mine(2, triageBody(state7)), ...extra] }];
 
