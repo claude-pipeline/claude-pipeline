@@ -665,8 +665,6 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
           others.push({ name: w.name ?? `workflow run ${w.id ?? '?'}`, status: w.status, url: w.html_url ?? null });
         }
       }
-      // The check runs were read before the workflow runs: a gated job created and finished in between is in neither list. With no run active any more, read the check runs once more (R2-B1; never a third pass).
-      if (!anyActiveRun && !confirmed) return decide(await reread(), true);
     }
     const owedNote = notOwed.length > 0 ? { notOwed } : {};
     // The required checks are green but a non-required check of the head is still running: keep waiting for it until --timeout (a red or finished one ends the wait as `passed` with `others`).
@@ -677,6 +675,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
       if (running.length > 0) onProgress(`waiting for non-required: ${runningSignature}`);
     }
     if (running.length > 0 && elapsed() < timeoutMs) return null;
+    // The check runs were read before the workflow runs: a gated job created and finished in between is in neither list. With no run active any more and the verdict about to be given, read the check runs once more (R2-B1; never a third pass, and not on a poll that keeps waiting, R3-F1).
+    if (readers.headRuns && !anyActiveRun && !confirmed) return decide(await reread(), true);
     await markStatusRuns(states, Date.parse(await getReadyAt(pr))); // a failed timeline read throws into the poll loop and is retried: the pass is dated against ready, never reported without readyAt / predatesReady
     if (others.length > 0) {
       const list = (xs) => xs.map((o) => `${o.name}=${o.status}`).join(', ');

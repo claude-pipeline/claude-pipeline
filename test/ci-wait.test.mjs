@@ -1649,10 +1649,12 @@ test('others (#743): an unlabelled PR with green required checks keeps waiting w
   assert.equal(r.output.verdict, 'passed');
   assert.deepEqual(r.output.others, []);
   assert.ok(s.elapsed() >= 100_000, 'it polled until the non-required check finished');
+  // Catches (R3-F1): the confirming re-read running on every poll while a non-Actions entry keeps the wait open (doubling the reads for up to an hour): 8 polls (0..105 s) + one re-read before the verdict.
+  assert.equal(s.reads.checkRuns, 9);
 });
 
 // Catches: a stuck optional check hanging the wait forever (the timeout still ends it, with the entry reported).
-test('others (#743): a non-required check still running at --timeout ends as passed with that entry in others and the do-not-hand-off message', async () => {
+test('others (#743): a non-required check still running at --timeout ends as passed with that entry in others and the restart-then-name-it message', async () => {
   const s = sim({ classic: present('A'), checkRuns: [cr('A', 'success', { id: 1 }), cr('SQL arms', null, { id: 2, html_url: 'https://github.example/runs/sql' })] }, { timeoutMs: 60_000 });
   const r = await s.run();
   assert.equal(r.output.verdict, 'passed');
