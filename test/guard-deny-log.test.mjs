@@ -281,7 +281,7 @@ test('guard-files: a refusal from a working folder named "plugin-dev" inside the
   const cwd = join(home, '.claude', 'pipeline', 'plugin-dev');
   const r = spawnHook(HOOKS, 'guard-files.mjs', bashInput('pwd', cwd), home);
   assert.equal(decisionOf(r), 'deny');
-  assert.ok(reasonOf(r).includes(`working folder (${cwd})`), reasonOf(r)); // the user still sees the folder
+  assert.match(reasonOf(r), /working folder \(.*plugin-dev\)/); // the user still sees the folder (the hint prints it with forward slashes, so no exact joined-path match)
   const [entry, ...rest] = lines(home);
   assert.equal(rest.length, 0);
   assert.equal(entry.reason_code, 'protected');
