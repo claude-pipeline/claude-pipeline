@@ -388,3 +388,4 @@ full record.
 - 2026-11-28 · #968 · Guard: a script named like a tool and run by its path is refused, not read by its name (#904) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 907 runs (365 high)
 - 2026-11-28 · #954 · Ruling dialogs can recommend any ruling, incl. BLOCKING items and Reject (#944) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · awaiting-owner-merge · Codex 7d: 911 runs (368 high)
 - 2026-11-28 · #978 · P cost refuses an empty --from-transcript; regression test for cost after a repo move (#821, #707) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 916 runs (368 high)
+- 2026-11-28 · #979 · agent-log publish can no longer hang forever on a stuck local git step; psql guard test no longer flaky under load (#964 #952) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 917 runs (369 high)
