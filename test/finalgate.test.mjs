@@ -11,11 +11,11 @@ import {
   isDocsOnly, isLogOnly, labelNames, labelsCheck, mergeTiming, readPrSettled, readReviewJson, reviewCheck, waitForMerge,
 } from '../pipeline/lib/finalgate.mjs';
 import { verifyOwnerGrants } from '../pipeline/lib/owner-grants.mjs';
-import { claimGrantMarkers, grantIdOf, ownerGoDir, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
+import { claimGrantMarkers, grantIdOf, ownerGoDir, recordPastRoundGrant, recordRoundGrant } from '../pipeline/hooks/lib/owner-go.mjs';
 import { asksDir, issueAsk, mergeAsk } from '../pipeline/hooks/lib/owner-go-click.mjs';
 import { OWNER_ENTRY, linesOf, mergeRequest } from './helpers/owner-go.mjs';
 import { assertOnlyFails, named, scenario } from './helpers/gate-env.mjs';
-import { addRound, emptyState, saveState } from '../pipeline/lib/state.mjs';
+import { addRound, emptyState, lowerCapTo, saveState } from '../pipeline/lib/state.mjs';
 import { writeReviewJson } from '../pipeline/lib/cmd-io.mjs';
 import {
   AGENT_LOG_HEADER, appendLines, assertSingleLine, buildAgentLogLine, countArbiterCalls, resolveLogPath,
@@ -394,23 +394,23 @@ const head = (c) => c.repeat(40);
 // the recorder writes the record, and (claim) codex-review's marker is created for `claimed` (default: the same head).
 function ownerWorld() {
   const home = mkdtempSync(join(tmpdir(), 'grant-home-'));
-  const grant = ({ k, at, pr = PR, repo = REPO, prompt = 'extra round', claim = true, claimed = at, claimK = k }) => {
+  const grant = ({ k, at, pr = PR, repo = REPO, prompt = 'extra round', claim = true, claimed = at, claimK = k, past = false }) => {
     const dir = mkdtempSync(join(tmpdir(), 'grant-tr-'));
     // #128: the record counts only while its prompt is the owner's in a transcript of the shape Claude Code gives it (helpers/owner-go.mjs); Codex #145 P1: in a root the guard protects,
     // here the temp account home's own config folder (the verify calls below pass the same home).
     mkdirSync(join(home, '.claude', 'projects', '-repo'), { recursive: true });
     const transcript = join(home, '.claude', 'projects', '-repo', `t-${randomUUID()}.jsonl`);
     const promptId = `pid-${randomUUID()}`;
-    const reply = `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${at.slice(0, 12)} · repo ${repo}`;
+    const reply = past ? `🔂 Approve past review round #${pr}: round ${k} · head ${at.slice(0, 12)} · repo ${repo}` : `Round ${k - 1} left items open.\n🔁 Extra review round needed #${pr}: round ${k} · head ${at.slice(0, 12)} · repo ${repo}`;
     writeFileSync(transcript, linesOf([
       { type: 'user', message: { content: 'go' }, promptId: `pid-${randomUUID()}`, ...OWNER_ENTRY },
       { type: 'assistant', message: { content: [{ type: 'text', text: reply }] } },
       { type: 'user', message: { content: prompt }, promptId, ...OWNER_ENTRY },
     ]));
-    const record = recordRoundGrant({ hook_event_name: 'UserPromptSubmit', session_id: `test-${randomUUID()}`, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId }, { home });
+    const record = (past ? recordPastRoundGrant : recordRoundGrant)({ hook_event_name: 'UserPromptSubmit', session_id: `test-${randomUUID()}`, transcript_path: transcript, cwd: dir, prompt, prompt_id: promptId }, { home });
     assert.ok(record, 'the recorder wrote the grant');
     if (claim) assert.equal(claimGrantMarkers([record], { repo, pr, k: claimK, head: claimed, checkout: dir }, { home }).ok, true);
-    return { record, ownerGrant: { grantId: grantIdOf(record), k, quote: record.prompt, ownerTs: record.ts } };
+    return { record, ownerGrant: { grantId: grantIdOf(record), k, quote: record.prompt, ownerTs: record.ts, ...(past ? { past: true } : {}) } };
   };
   return { home, grant };
 }
@@ -498,6 +498,27 @@ test('verifyOwnerGrants: a non-finite max_rounds skips the cap rules but still v
   const saved = JSON.parse(JSON.stringify(forged)); // Infinity is written as null
   assert.equal(saved.maxRounds, null);
   assert.match(verify(saved, w).problems.join(), CANNOT);
+});
+
+test('verifyOwnerGrants: a round at max+1 without an admission field ran as an ordinary round when the state ran under a higher cap, also after the lowered cap was saved; a past approval clears it (#923)', () => {
+  // failure caught: a legacy round 3 that was ordinary under cap 3 passes review-complete and the final gate as the automatic extra round once review.max_rounds is lowered to 2
+  const w = ownerWorld();
+  assert.equal(verify(granted([{}, {}, {}], { max: 2 }), w, { maxRounds: 2 }).ok, true, 'control: a state that never ran under a higher cap keeps the legacy automatic extra round');
+  const legacy = granted([{}, {}, {}], { max: 3 });
+  const refused = verify(legacy, w, { maxRounds: 2 });
+  assert.equal(refused.ok, false);
+  assert.match(refused.problems.join('; '), /round 3: .*ran as an ordinary round under a higher cap and carries no owner grant; .*round-request --pr \d+ --past.*past-round-grant/);
+  const saved = lowerCapTo(legacy, 2);
+  assert.deepEqual([saved.maxRounds, saved.capLoweredFrom], [2, 3]);
+  assert.equal(lowerCapTo(saved, 2).capLoweredFrom, 3, 'kept');
+  assert.equal(lowerCapTo({ ...saved, capLoweredFrom: 4 }, 2).capLoweredFrom, 4, 'the highest earlier cap is kept');
+  assert.equal(verify(saved, w, { maxRounds: 2 }).ok, false, 'the distinction survives the save that lowers the stored cap');
+  const approved = w.grant({ k: 3, at: head('1'), prompt: 'approve round', past: true });
+  const cleared = verify(granted([{}, {}, { ownerGrant: approved.ownerGrant }], { max: 3 }), w, { maxRounds: 2 });
+  assert.equal(cleared.ok, true, JSON.stringify(cleared));
+  assert.deepEqual(cleared.granted.map((x) => [x.n, x.k, x.past]), [[3, 3, true]]);
+  const normal = verify(granted([{ admission: 'normal' }, { admission: 'normal' }, { admission: 'normal' }], { max: 3 }), w, { maxRounds: 2 });
+  assert.match(normal.problems.join('; '), /round 3: .*past-round-grant/, 'a round admitted normal under the old cap names the same remedy');
 });
 
 test('verifyOwnerGrants: the configured cap is authoritative - a state whose maxRounds is null or larger cannot switch the cap rules off', () => {

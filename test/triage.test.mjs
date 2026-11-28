@@ -44,6 +44,7 @@ import {
 } from '../pipeline/lib/triage.mjs';
 import { assignIds } from '../pipeline/lib/codex.mjs';
 import { lowerCapTo } from '../pipeline/lib/state.mjs';
+import { checkCap } from '../pipeline/lib/review-round.mjs';
 
 // ---- fixtures -------------------------------------------------------------------------------
 
@@ -1639,6 +1640,17 @@ test('lowerCapTo: a state stored under a higher cap admits round 4 only as the a
   assert.equal(lowerCapTo(same, 3), same, 'equal: unchanged');
   assert.equal(lowerCapTo(stateOf([], { maxRounds: null }), 3).maxRounds, null, 'a missing cap is left for the verifier to refuse');
   assert.equal(lowerCapTo(old, undefined).maxRounds, 4, 'no configured cap: unchanged');
+});
+
+test('checkCap: a state that ran under cap 3 (now 2) with a counted round 3 and no past approval refuses a new round before any owner grant is used, and names round-request --past (#923)', () => {
+  // failure caught: codex-review admits and consumes an owner grant for round 4 while round 3 keeps failing the final gate with no remedy
+  const rounds = [1, 2, 3].map((n) => ({ n, fromHead: String(n - 1).repeat(40), toHead: String(n).repeat(40), contentHashAtToHead: `c${n}`, items: [], admission: 'normal' }));
+  const stored = { maxRounds: 3, rounds };
+  const c = (over = {}) => ({ config: { owner_approval: 'chat', review: { max_rounds: 2 } }, ghRepo: { host: 'example.com', slug: 'o/r' }, pr: 7, round: 4, head: H40, ...over });
+  assert.throws(() => checkCap(c(), stored, {}), (e) => e.output.error === 'round-cap' && /round 3 .*needs the owner's approval first.*round-request --pr 7 --past/.test(e.output.message));
+  // a state that never ran under a higher cap keeps the ordinary refusal; so does label mode (no past approval exists there)
+  assert.throws(() => checkCap(c(), { ...stored, maxRounds: 2 }, {}), (e) => /would pass review\.max_rounds \(2\)/.test(e.output.message));
+  assert.throws(() => checkCap(c({ config: { owner_approval: 'label', review: { max_rounds: 2 } } }), stored, {}), (e) => /would pass review\.max_rounds \(2\)/.test(e.output.message));
 });
 
 test('roundCapProblem owner grant: an open grant allows exactly the next counted round, never a baseOnly/resolutionOnly one', () => {

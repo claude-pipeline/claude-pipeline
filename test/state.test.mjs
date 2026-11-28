@@ -20,6 +20,7 @@ import {
   STATE_VERSION_CLICK_DIALOG,
   STATE_VERSION_CAP_LOW,
   STATE_VERSION_CONFLICT,
+  STATE_VERSION_CAP_LOWERED,
   stateNeedsConflictVersion,
   STATE_VERSION_POST_MAX,
   STATE_VERSION_OWNER_DEFERRAL,
@@ -31,6 +32,7 @@ import {
   maxRiskOf,
   stateNeedsOutOfModelVersion,
   requiredStateVersion,
+  lowerCapTo,
   withStateVersion,
 } from '../pipeline/lib/state.mjs';
 import { adoptPublishedGrants } from '../pipeline/lib/review-context.mjs';
@@ -525,7 +527,7 @@ test('state version 4 is what is SAVED and PUBLISHED: saveState and encodeForCom
     assert.equal(loadState(dir).version, 4);
     assert.equal(decodeFromComment(encodeForComment(stale)).version, 4);
     saveState(dir, { ...s, version: SUPPORTED_STATE_VERSION + 1 });
-    assert.throws(() => loadState(dir), /version 12.*supports.*11/);
+    assert.throws(() => loadState(dir), /version 13.*supports.*12/);
     assert.equal(decodeFromComment(encodeForComment({ ...s, version: SUPPORTED_STATE_VERSION + 1 })), null);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -583,7 +585,7 @@ test('N1/F4: stateNeedsOutOfModelVersion is true only when a final carries outOf
   assert.equal(stateNeedsOutOfModelVersion(marked), true);
   const bumped = withStateVersion(marked, STATE_VERSION_OUT_OF_MODEL);
   assert.equal(bumped.version, STATE_VERSION_OUT_OF_MODEL);
-  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CONFLICT);
+  assert.equal(SUPPORTED_STATE_VERSION, STATE_VERSION_CAP_LOWERED);
   assert.ok(STATE_VERSION_OUT_OF_MODEL > STATE_VERSION_SUBSTITUTE, 'above the substitute version an installation from before this change supports');
   assert.equal(stateNeedsOutOfModelVersion({ rounds: [{ items: [{ final: { outOfModel: '' } }] }] }), false, 'an empty marker is no marker');
   assert.equal(stateNeedsOutOfModelVersion(null), false);
@@ -728,6 +730,15 @@ test('conflict round (#423): version 11 ONLY when a round\'s review base is conf
   assert.equal(stateNeedsConflictVersion(null), false);
   assert.equal(decodeFromComment(encodeForComment({ ...conflict, version: 1 })).version, STATE_VERSION_CONFLICT, 'a writer that rebuilt the state from an old copy is lifted');
   assert.ok(STATE_VERSION_CONFLICT > STATE_VERSION_CAP_LOW);
+});
+
+test('cap lowered (#923): version 12 ONLY when lowerCapTo recorded capLoweredFrom; a CLI supporting 11 refuses it', () => {
+  const plain = emptyState({ repo: 'o/r', pr: 3, branch: 'b', risk: 'low', maxRounds: 4 });
+  assert.equal(requiredStateVersion(plain), 1);
+  const lowered = lowerCapTo(plain, 3);
+  assert.equal(requiredStateVersion(lowered), STATE_VERSION_CAP_LOWERED);
+  assert.equal(decodeFromComment(encodeForComment({ ...lowered, version: 1 })).version, STATE_VERSION_CAP_LOWERED, 'a writer that rebuilt the state from an old copy is lifted');
+  assert.ok(STATE_VERSION_CAP_LOWERED > STATE_VERSION_CONFLICT);
 });
 
 test('A2 (regression-only): version 9 ONLY when a final carries sameOnBase (also on a cached copy); version 9 wins over 7; a plain or owner-deferral-only state keeps its version; a CLI supporting 8 refuses 9', () => {

@@ -30,6 +30,7 @@ import { DEFAULTS, EFFORTS, EFFORT_LANES, baseConfigAt } from './config.mjs';
 import { addRound, emptyState, higherRisk, loadState, lowerCapTo, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
+import { pastRoundsNeedingApproval } from './owner-grants.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
 import { clickNotes } from '../hooks/lib/owner-go-click.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
@@ -158,6 +159,16 @@ const unconfirmedGrant = (c, st) => {
 // Returns the admission ('normal' | 'uncounted' | 'extraRound' | 'owner'); a refused round is exit 2 round-cap.
 export const checkCap = (c, st, flags, { already = false } = {}) => {
   const { admission, problem } = admit(c, st, flags);
+  // An owner's extra round is not admitted (and its grant not consumed) while an earlier round that ran under a higher cap still needs the owner's approval: that history would keep failing the gate (#923).
+  if (st && c.config.owner_approval === 'chat' && (problem || admission === 'owner')) {
+    const owed = pastRoundsNeedingApproval(st, st, { maxRounds: c.config.review.max_rounds, repo: c.ghRepo?.slug, pr: c.pr });
+    if (owed.length > 0) {
+      throw new Fail(EXIT.USAGE, {
+        ok: false, error: 'round-cap',
+        message: `round ${c.round} cannot start yet: round ${owed.map((o) => o.n).join(', ')} ran past review.max_rounds (${c.config.review.max_rounds}) under a higher limit and needs the owner's approval first: \`P triage round-request --pr ${c.pr} --past\`, show the closing line it prints, and once the owner has typed "approve round" run \`P state past-round-grant --pr ${c.pr} --round ${owed[0].n}\`; the owner's extra round is not used until then`,
+      });
+    }
+  }
   // resolutionIneligible: why the free (resolution-only) round was refused, when one was tried (it is computed before the cap).
   if (problem) {
     throw new Fail(EXIT.USAGE, {

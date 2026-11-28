@@ -21,6 +21,11 @@ import { countsTowardCap } from './triage.mjs';
 
 const FULL_SHA = /^[0-9a-f]{40}$/;
 
+// Did the state's rounds run under a higher review.max_rounds than the configured one (#923)? Its stored cap is above the configured one, or lowerCapTo
+// already saved the lowered cap and recorded the higher one (capLoweredFrom). Such a round past the configured cap was ordinary when it ran: the
+// automatic-extra inference for a round without an admission field does not hold, and it can be approved afterwards like any past round.
+export const ranUnderHigherCap = (state, maxRounds) => state?.capLoweredFrom !== undefined || (Number.isInteger(state?.maxRounds) && state.maxRounds > maxRounds);
+
 // Why verifyOwnerGrant said no (its `reason`), in plain words; the first check that failed is the one named.
 const WHY = {
   provenance: "the owner's words for this grant were not found as typed by the owner in this session's transcript on this machine (if this record predates transcript capture, it needs exactly one <config dir>/projects/*/<session>.jsonl in a Claude config folder under the home directory; none, or more than one, fails)",
@@ -44,12 +49,15 @@ const pastRemedy = (n, pr) => `approve it now: \`P triage round-request --pr ${p
 
 /**
  * The rounds the owner may approve AFTER they ran, as [{ n, k, toHead }] (oldest first). A round of `state` qualifies when ALL hold:
- *  - it counts toward the cap, with ordinal k > maxRounds + 1 (the automatic extra round, k = max + 1, never qualifies);
+ *  - it counts toward the cap, with ordinal k > maxRounds + 1 (the automatic extra round, k = max + 1, never qualifies), or, when the state ran under a
+ *    higher cap than the configured one (ranUnderHigherCap, #923), k > maxRounds;
  *  - the PUBLISHED state holds the very same round (n, toHead, contentHashAtToHead) and a LATER counted round (a forward grant turned into a fake
- *    round is always the newest one, so the newest round never qualifies);
- *  - and EITHER it carries no `ownerGrant` and no `admission` (it ran before grants were recorded), OR its `ownerGrant` no longer verifies because the
+ *    round is always the newest one, so the newest round never qualifies; a round that ran under a higher cap is the exception: it carries no grant, and
+ *    it is usually the newest one, which would otherwise leave it with no remedy);
+ *  - and EITHER it carries no `ownerGrant` and no `admission` (it ran before grants were recorded; for a state that ran under a higher cap also one admitted
+ *    'normal', or 'auto-extra' past max + 1: it was within the cap it ran under), OR its `ownerGrant` no longer verifies because the
  *    owner's record is gone or no longer the owner's (`no-record` / `provenance`: the transcripts are cleaned up), which the owner can approve again.
- * Not qualifying, so their refusals keep their text: k = max + 1 admitted `normal`, a round recorded `admission: 'owner'` without a grant, any other admission.
+ * Not qualifying, so their refusals keep their text: (a state that never ran under a higher cap) k = max + 1 admitted `normal`, a round recorded `admission: 'owner'` without a grant, any other admission.
  * `state` is the copy whose grants are checked (the local one; pass the published state as both to decide on what the PR holds). `maxRounds` is the
  * configured review.max_rounds (an integer >= 1; anything else returns []). `opts`: { repo, pr, home?, now? }. Never throws.
  */
@@ -59,16 +67,19 @@ export function pastRoundsNeedingApproval(state, published, { maxRounds, repo, p
     const mine = Array.isArray(state?.rounds) ? state.rounds : [];
     const theirs = Array.isArray(published?.rounds) ? published.rounds : [];
     const out = [];
+    const higher = ranUnderHigherCap(state, maxRounds);
     let k = 0;
     for (const r of mine) {
       if (!countsTowardCap(r)) continue;
       k += 1;
-      if (k <= maxRounds + 1 || !FULL_SHA.test(String(r.toHead))) continue;
+      // A grant-less round of a state that ran under a higher cap: ordinary (or extra) there, past the configured cap now.
+      const underHigher = higher && k > maxRounds && r.ownerGrant === undefined && (r.admission === undefined || r.admission === 'normal' || (r.admission === 'auto-extra' && k > maxRounds + 1));
+      if ((k <= maxRounds + 1 && !underHigher) || !FULL_SHA.test(String(r.toHead))) continue;
       const p = theirs.find((x) => x?.n === r.n);
       if (p === undefined || p.toHead !== r.toHead || p.contentHashAtToHead !== r.contentHashAtToHead) continue;
-      if (!theirs.some((x) => countsTowardCap(x) && x.n > r.n)) continue;
+      if (!underHigher && !theirs.some((x) => countsTowardCap(x) && x.n > r.n)) continue;
       if (r.ownerGrant === undefined) {
-        if (r.admission === undefined) out.push({ n: r.n, k, toHead: r.toHead });
+        if (r.admission === undefined || underHigher) out.push({ n: r.n, k, toHead: r.toHead });
         continue;
       }
       let v = { ok: false };
@@ -97,6 +108,7 @@ export function verifyOwnerGrants(state, { repo, pr, maxRounds, published, ...op
   if (configured && !(Number.isInteger(stateMax) && stateMax >= 1)) {
     problems.push(`the review state records maxRounds ${JSON.stringify(stateMax ?? null)}, not within the configured review.max_rounds (${maxRounds}): the cap cannot be trusted`);
   }
+  const higher = configured && ranUnderHigherCap(state, maxRounds); // the rounds ran under a higher cap than the configured one (#923)
   const granted = [];
   let qualifying;
   const pastRound = (n) => {
@@ -122,9 +134,10 @@ export function verifyOwnerGrants(state, { repo, pr, maxRounds, published, ...op
     if (r?.admission === 'owner') {
       problems.push(`round ${n}: recorded as admitted by an owner grant, but carries none`);
     } else if (counted && capped && k > max + 1) {
-      problems.push(`round ${n}: counted round ${k} is past review.max_rounds (${max}) and its automatic extra round, and carries no owner grant${pastRound(n) ? `; it ran before owner grants were recorded, so ${pastRemedy(n, pr)}` : ''}`);
-    } else if (counted && capped && k === max + 1 && r?.admission !== undefined && r.admission !== 'auto-extra') {
-      problems.push(`round ${n}: counted round ${k} is past review.max_rounds (${max}) but was not admitted as the automatic extra round and carries no owner grant`);
+      problems.push(`round ${n}: counted round ${k} is past review.max_rounds (${max}) and its automatic extra round, and carries no owner grant${pastRound(n) ? `; ${r?.admission === undefined ? 'it ran before owner grants were recorded' : 'it ran under a higher review.max_rounds'}, so ${pastRemedy(n, pr)}` : ''}`);
+    } else if (counted && capped && k === max + 1 && (r?.admission === undefined ? higher : r.admission !== 'auto-extra')) {
+      // Without an admission field the round is the automatic extra round only when the state never ran under a higher cap: otherwise it was an ordinary round (#923).
+      problems.push(`round ${n}: counted round ${k} is past review.max_rounds (${max}) but ${r?.admission === undefined ? 'ran as an ordinary round under a higher cap' : 'was not admitted as the automatic extra round'} and carries no owner grant${pastRound(n) ? `; ${pastRemedy(n, pr)}` : ''}`);
     }
   }
   return problems.length === 0 ? { ok: true, granted } : { ok: false, problems, granted };
