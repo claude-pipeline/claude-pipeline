@@ -1037,12 +1037,29 @@ async function rulingRequest(rest, ctx) {
     const dialogVariant = shown ? rulingVariantFor(values.recommend, values.why) ?? RULING_VARIANT_LEGACY : RULING_VARIANT_LEGACY;
     const recommendFields = { recommend: shown ? values.recommend : null, why: shown ? values.why : null, dialogVariant, ...(refused === null ? {} : { recommendRefused: refused }) };
     if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields } };
+    // R3-B2: the click gate first: with clicks off (or an unlisted build) no dialog is issued, so no head is needed and a failing PR lookup must not turn the typed line into an error.
+    const gate = clickGate({ config, root, ctx });
+    // A recommended Reject / fix-separately rests on Claude's reading of the code: the ask records the head it was issued at (this checkout's HEAD and the PR's head on GitHub), and owner-ruling refuses the click once
+    // either moved or cannot be compared. R3-B1: it is shown only when the PR head on GitHub is this checkout's HEAD or one of its ancestors (local commits not pushed yet are fine); a checkout that is behind or
+    // diverged (a push from another checkout, an update-branch) was not what Claude read, so the neutral dialog is issued instead.
+    let heads = null;
+    let headRefusal = null;
+    if (shown && gate.ok && RULING_HEAD_BOUND_VARIANTS.includes(dialogVariant)) {
+      const head = headSha({ cwd: root });
+      const prHead = gh.prView(pr, ['headRefOid']).headRefOid;
+      let covered = false;
+      try { covered = typeof prHead === 'string' && isAncestor(prHead, head, { cwd: root }); } catch { /* a PR head this checkout does not have: not covered */ }
+      if (covered) heads = { head, prHead };
+      else headRefusal = `the PR head on GitHub (${String(prHead).slice(0, 12)}) is not this checkout's HEAD (${head.slice(0, 12)}) or one of its ancestors, so the code Claude checked may not be the PR's code: pull or push, then recommend again`;
+    }
+    const recommended = shown && headRefusal === null;
+    const variantNow = recommended ? dialogVariant : RULING_VARIANT_LEGACY;
+    const fieldsNow = headRefusal === null ? recommendFields : { recommend: null, why: null, dialogVariant: RULING_VARIANT_LEGACY, recommendRefused: headRefusal };
     // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
-    const block = [...items.map(summaryRow), ...(shown ? [rulingWhyRow(values.recommend, values.why)] : []), line].join('\n');
-    const built = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: dialogVariant });
-    // a recommended Reject / fix-separately rests on Claude's reading of the code: the ask records the head it was issued at (this checkout's HEAD and the PR's head on GitHub), and owner-ruling refuses the click once either moved or cannot be compared
-    const parts = built !== null && RULING_HEAD_BOUND_VARIANTS.includes(dialogVariant) ? { ...built, head: headSha({ cwd: root }), prHead: gh.prView(pr, ['headRefOid']).headRefOid } : built;
-    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
+    const block = [...items.map(summaryRow), ...(recommended ? [rulingWhyRow(values.recommend, values.why)] : []), line].join('\n');
+    const built = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: variantNow });
+    const parts = built !== null && heads !== null ? { ...built, ...heads } : built;
+    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...fieldsNow, ...askFields({ gate, parts, ctx }) } };
   }, pr));
 }
 

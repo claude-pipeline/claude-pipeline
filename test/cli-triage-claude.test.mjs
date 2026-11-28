@@ -104,7 +104,7 @@ function world(t, { yml = CHAT_YML, slug = 'acme/widgets', comments = false } = 
     wait(id, cause = 'low-confidence', over = {}) {
       w.edit((s) => {
         const it = s.rounds.flatMap((r) => r.items).find((i) => i.id === id);
-        it.final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: cause === 'model-proof' ? 'model-proof failed: ruling not provably from Fable' : 'arbiter low confidence', ...(cause ? { cause } : {}), ...(cause === 'security-dismissal' ? { scopeContradicted: false } : {}) }; // (the boolean every current writer stores on a security dismissal)
+        it.final = { decision: 'REJECT', by: 'arbiter', needsHuman: true, reason: cause === 'model-proof' ? 'model-proof failed: ruling not provably from Fable' : 'arbiter low confidence', ...(cause ? { cause } : {}), ...(['security-dismissal', 'low-confidence'].includes(cause) ? { scopeContradicted: false } : {}) }; // (the boolean every current writer stores on a security dismissal)
         Object.assign(it, over);
       });
     },
@@ -1144,7 +1144,7 @@ test('owner-ruling: a typed REJECT or ACCEPT of an arbiter ACCEPT is refused (th
 const recItem = (id, over = {}) => ({
   id, round: 1, bucket: 'SUGGESTION', category: 'docs', title: `t ${id}`, file: 'src/plain.js', line: 3, detail: 'd', codexReasoning: 'c', testable: false, fingerprint: `fp-${id}`,
   judge: null, test: { status: 'none', evidence: '' }, arbiter: null, implemented: false, followupIssue: null,
-  final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence' }, ...over,
+  final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence', scopeContradicted: false }, ...over,
 });
 const settledAccept = (id, over = {}) => recItem(id, { category: 'maintainability', final: { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'worth fixing' }, ...over });
 const recCtx = (items, over = {}) => ({
@@ -1355,7 +1355,7 @@ const inProcess = (w, home) => {
 };
 // What the arbiter leaves for a low-confidence judgement (the #2720 shape): an ACCEPT waiting for a human.
 const waitingAccept = (w, id, cause = 'low-confidence') => w.edit((s) => {
-  s.rounds.flatMap((r) => r.items).find((i) => i.id === id).final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, cause, reason: cause === 'security-dismissal' ? 'would dismiss a blocking security/data item' : 'arbiter low confidence', ...(cause === 'security-dismissal' ? { scopeContradicted: false } : {}) }; // (the boolean every current writer stores on a security dismissal)
+  s.rounds.flatMap((r) => r.items).find((i) => i.id === id).final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, cause, reason: cause === 'security-dismissal' ? 'would dismiss a blocking security/data item' : 'arbiter low confidence', ...(['security-dismissal', 'low-confidence'].includes(cause) ? { scopeContradicted: false } : {}) }; // (the boolean every current writer stores on a security dismissal)
 });
 // Issue the ask for `ids` with a recommendation, click `label` on the dialog exactly as issued, and give back what the recorder wrote and a runner for `owner-ruling`.
 async function clickedRuling(t, w, { ids, recommend, why, label, tamper = null, extra = [] }) {

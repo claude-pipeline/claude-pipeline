@@ -191,8 +191,7 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
     // a same-on-base claim the whole-PR diff disproves (sob.waive false) waits for a human whatever the bucket or category (the arbiter files its own findings as SUGGESTION), and never stores the scope;
     // the contradiction is kept as its own marker (final.scopeContradicted), whatever reason the final shows
     const contradicted = f.scope === SAME_ON_BASE && sob !== null && sob.waive !== true;
-    const marker = contradicted ? { scopeContradicted: true } : {};
-    if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence', ...marker };
+    if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence', scopeContradicted: contradicted };
     else {
       const oom = f.scope === OUT_OF_MODEL && f.ruling === 'FOLLOW-UP' ? outOfModelOf(f, { models, files: diffFiles }) : null;
       const waived = oom?.waive === true || (sob?.waive === true && f.scope === SAME_ON_BASE);
@@ -412,7 +411,6 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
     // see fableFindingItems: a same-on-base claim the diff disproves parks for a human whatever the bucket or category, and is marked as such on the final
     const sob = r.ruling === 'FOLLOW-UP' || r.ruling === 'REJECT' ? sameOnBaseOf(item, regression ?? {}) : null;
     const contradicted = r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' && sob !== null && sob.waive !== true;
-    const marker = contradicted ? { scopeContradicted: true } : {};
     if (!proofOk) {
       // The ruling is not provably from Fable, so it must not steer the decision: fall back to the
       // judge's (a human decides anyway). With no judge on record the ruling is all there is.
@@ -433,7 +431,7 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
         cause: 'invalid-arbiter',
       };
     } else if (r.confidence === 'low') {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence', ...marker };
+      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence', scopeContradicted: contradicted };
     } else {
       const oom = r.scope === OUT_OF_MODEL && r.ruling === 'FOLLOW-UP' ? outOfModelOf(item, { models, files: diffFiles }) : null;
       const waived = oom?.waive === true || (sob?.waive === true && r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP');
@@ -750,9 +748,9 @@ export function rulingRecommendationRefusal(items, decision, ctx = {}, code = un
       if (item.secondReview?.decision === 'ACCEPT') return `${item.id}: the second review says ACCEPT, so Claude does not recommend dismissing it`;
       // R2-B4 (#954): the writer before the marker stored only the generic security reason when BOTH the blocking-security and the contradicted-scope conditions held, so an arbiter security-dismissal final
       // without a boolean marker cannot be told apart from a contradicted one: fail closed (every current writer stores the boolean, true or false)
-      const unmarked = waits && item.final.by === 'arbiter' && needsHumanCause(item) === 'security-dismissal' && typeof item.final.scopeContradicted !== 'boolean';
+      const unmarked = waits && item.final.by === 'arbiter' && ['security-dismissal', 'low-confidence'].includes(needsHumanCause(item)) && typeof item.final.scopeContradicted !== 'boolean'; // (R3-F1: the released writer checked confidence first, so a contradicted scope left no trace on a low-confidence final either)
       if (code === 'fix-separately' && waits && (item.final.scopeContradicted === true || item.final.reason === SCOPE_CONTRADICTED_REASON)) return `${item.id} waits because the PR diff contradicted its "same on base" scope (the pipeline has evidence it is this PR's change), which a follow-up row would deny`;
-      if (code === 'fix-separately' && unmarked) return `${item.id} waits as a security dismissal written before the scope check was recorded on it, so whether the PR diff contradicted its "same on base" scope is unknown, which a follow-up row would deny`;
+      if (code === 'fix-separately' && unmarked) return `${item.id} waits on an arbiter ruling written before the scope check was recorded on it, so whether the PR diff contradicted its "same on base" scope is unknown, which a follow-up row would deny`;
     }
     return null;
   }

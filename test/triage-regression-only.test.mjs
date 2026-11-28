@@ -275,3 +275,19 @@ test('old-writer final: a blocking-security arbiter final with the generic reaso
   assert.equal(rulingRecommendationRefusal([old], 'REJECT', {}, undefined), null, 'reject has no scope rule');
   assert.equal(rulingRecommendationRefusal([written], 'FOLLOW-UP', {}, 'fix-separately'), null);
 });
+
+// Round 3 (#954, R3-F1). Failure caught: the released writer checked confidence first, so a low-confidence FOLLOW-UP whose same-on-base scope the diff contradicted was stored as plain
+// 'arbiter low confidence' with no trace; still waiting after the upgrade, it was recommended "fix separately" for a line the PR itself adds.
+test('old-writer final: a low-confidence arbiter final with no scopeContradicted marker refuses fix-separately; both current writers store the boolean', () => {
+  const plain = item();
+  const [written] = apply([plain], [rule(plain, { confidence: 'low' })]);
+  assert.equal(written.final.cause, 'low-confidence');
+  assert.equal(typeof written.final.scopeContradicted, 'boolean', 'applyRulings stores the boolean');
+  assert.equal(typeof findingItems([finding({ confidence: 'low' })])[0].final.scopeContradicted, 'boolean', 'fableFindingItems stores the boolean');
+  const { scopeContradicted, ...rest } = written.final;
+  const old = { ...written, final: rest };
+  assert.match(rulingRecommendationRefusal([old], 'FOLLOW-UP', {}, 'fix-separately') ?? '', /before the scope check was recorded/);
+  assert.equal(rulingRecommendationRefusal([old], 'REJECT', {}, undefined), null, 'reject has no scope rule');
+  const clean = { ...written, final: { ...rest, scopeContradicted: false } };
+  assert.equal(rulingRecommendationRefusal([clean], 'FOLLOW-UP', {}, 'fix-separately'), null);
+});

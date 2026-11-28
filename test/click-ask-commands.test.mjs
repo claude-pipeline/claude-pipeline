@@ -2,6 +2,7 @@
 // (run(argv, ctx)) with a temp account home (ctx.home, the same seam `pipeline owner-go` has) so the asks, the dialog-hook list and the owner-go folder are never the developer's real ones.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { spawnSync } from 'node:child_process';
 import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -482,7 +483,7 @@ test('triage ruling-request --ask: label mode -> ask null (the typed line stays)
 });
 
 // ---- cp #944: a recommended Reject / a recommended follow-up that makes no severity claim ----------------------------------------------------------------------------------------------
-const WAITING_ACCEPT = { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence' }; // (the #2720 shape: an ACCEPT waiting for a human)
+const WAITING_ACCEPT = { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence', scopeContradicted: false }; // (the #2720 shape: an ACCEPT waiting for a human)
 const DEFERRABLE = { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'arbiter accepted it' };
 const askRec = (s, ...more) => triage(s, newHome(), 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--ask', ...more);
 const labelsOf = (r) => r.output.ask?.questions[0].options.map((o) => o.label);
@@ -592,4 +593,31 @@ test('triage ruling-request --ask: every item row shows category, why it waits a
   const q = r.output.ask.questions[0].question;
   assert.equal(q, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · SUGGESTION · data-loss · Missing check · src/app.js:1 · waits: test-security · second review: FOLLOW-UP (high)\nClaude recommends Reject all (when asked): Claude checked the code for each item: what it describes can only happen in a case users never reach (for example while an update is being installed), so it is not worth changing.\n${r.output.line}`);
   assert.equal(readAsk(r.output.ask.askId, { home }).ok, true);
+});
+
+test('triage ruling-request --ask --recommend reject: with clicks off a failed PR lookup still returns the typed line and askSkipped', async () => {
+  // failure caught (R3-B2): the PR head was read before the click gate was checked, so with owner_go.click off (no dialog, no head needed) a failing `gh pr view` became exit 3 and the owner got no line to type
+  const s = triageWorld(CHAT('owner_go:\n  click: off\n'), { final: WAITING_ACCEPT });
+  s.fake.setScript([REPO]); // (no `pr view`: the lookup fails)
+  const r = await askRec(s, '--recommend', 'reject', '--why', 'already-handled');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.match(r.output.line, /Owner ruling needed/);
+  assert.equal(r.output.ask, null);
+  assert.match(r.output.askSkipped, /owner_go\.click is off/);
+});
+
+test('triage ruling-request --ask --recommend reject: shown only when the PR head on GitHub is this checkout\'s HEAD or one of its ancestors; otherwise the neutral dialog with the reason', async () => {
+  // failure caught (R3-B1): a push from another checkout BEFORE the ask left the PR at code Claude never read, yet both heads were recorded as they were then, so the later click passed every comparison and recorded REJECT for that code
+  const heads = (s) => { const g = (...a) => spawnSync('git', a, { cwd: s.repo.dir, encoding: 'utf8' }).stdout.trim(); return { head: g('rev-parse', 'HEAD'), parent: g('rev-parse', 'HEAD~1') }; };
+  const world = (prHead) => { const s = triageWorld(CHAT(), { final: WAITING_ACCEPT }); s.fake.setScript([REPO, { match: '^pr view 12 --json headRefOid', stdoutJson: { headRefOid: prHead(heads(s)) } }]); return s; };
+  for (const [what, prHead, shown] of [['the PR head is HEAD', (h) => h.head, true], ['the PR head is an ancestor (local commits not pushed yet)', (h) => h.parent, true], ['the PR head is a commit this checkout does not have', () => 'f'.repeat(40), false]]) {
+    const r = await askRec(world(prHead), '--recommend', 'reject', '--why', 'already-handled');
+    assert.equal(r.exitCode, 0, `${what}: ${JSON.stringify(r.output)}`);
+    assert.equal(r.output.dialogVariant, shown ? 'ruling-v2-reject' : 'ruling-v1', what);
+    if (!shown) {
+      assert.equal(r.output.recommend, null);
+      assert.match(r.output.recommendRefused, /PR head on GitHub/, what);
+      assert.equal(typeof r.output.ask?.askId, 'string', 'the neutral dialog is still issued');
+    }
+  }
 });
