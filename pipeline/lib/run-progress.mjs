@@ -70,7 +70,7 @@ export function writeRunRecord(gh, pr, { record, sections, host = hostname(), no
     }
   }
   if (out.resumed && !skipResumedEvent && !(fresh.status === 'ok' && fresh.record.resumed)) postResumedEvent(gh, pr, out.resumed);
-  return { ...writeSummaryComment(gh, pr, { record: out, sections, existing: fresh, retry }), warnings };
+  return { ...writeSummaryComment(gh, pr, { record: out, sections, existing: fresh, retry }), warnings, fresh };
 }
 
 // The append-only evidence that this run was resumed: one new comment, never edited. Throws when it cannot be posted. The event id is built from
@@ -99,16 +99,21 @@ export function resumedRunState(gh, pr) {
 }
 
 // One recorder per command run. update(patch) never throws: it returns the new record, or null with a warning.
+// `raced` (after an update): the writer's fresh re-read held a different cost section than the read the record was built on, so another booking landed in between and
+// the new total is not `previous` + this patch: a caller must not diff the two to name its own amount.
+const costOf = (read) => (read?.status === 'ok' ? JSON.stringify(read.record.cost ?? null) : null);
 export function createRunRecorder({ gh, pr, host = hostname(), now = () => Date.now() }) {
   const warnings = [];
   const warn = (w) => { if (!warnings.includes(w)) warnings.push(w); };
   let view = null;
   let previous = null;
+  let raced = false;
   return {
     warnings,
     host,
     // The record the last update() started from (before its patch); null until one ran. `P cost` diffs it against the new record to say what ITS call added.
     get previous() { return previous; },
+    get raced() { return raced; },
     // `initialStep`: the step a brand-new record starts at (an existing record keeps its own unless the patch sets it).
     update(patch, { initialStep = 'build' } = {}) {
       try {
@@ -120,6 +125,7 @@ export function createRunRecorder({ gh, pr, host = hostname(), now = () => Date.
         previous = base.record;
         const record = applyCheckpoint(base.record, patch, { host, now: now() });
         const posted = writeRunRecord(gh, pr, { record, host, now: now() });
+        raced = costOf(existing) !== costOf(posted.fresh);
         posted.warnings.forEach(warn);
         return posted.record;
       } catch (err) {

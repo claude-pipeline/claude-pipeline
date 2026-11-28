@@ -354,6 +354,27 @@ test('P cost --from-transcript: booking a continued agent\'s transcript again bo
   assert.deepEqual([third.json.cost.total.input, third.json.cost.total.output], [15, 31]);
 });
 
+// R1-B1 (#939): two P cost runs on one transcript that overlap both read the same empty record; the later writer's re-read already holds the other's booking. Both used to report call.usd = the full amount against a PR total of one booking.
+test('P cost: a booking that landed between this call\'s read and its write is not reported as this call\'s full amount (call is null, with a warning)', () => {
+  const s = scenario();
+  s.repo.write('.review/agent-r1.jsonl', `${JSON.stringify({ message: { id: 'm1', model: 'claude-sonnet-4-5', usage: { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
+  const args = ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-r1.jsonl'];
+  const alone = costCli(s, args); // the booking the other run made, from the same transcript
+  assertExit(alone, 0);
+  const booked = existing(written(s));
+  // this run's first read sees no record; its writer's re-read (the second listing) sees the other run's booking. The fake counts matching calls over the whole log (the run above included), so the sequence is padded past them.
+  const earlier = s.fake.calls().filter((c) => /issues\/12\/comments --paginate/.test(c.argv.join(' '))).length;
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [PATCH_77, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }, { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [...Array(earlier).fill([]), [], [booked]] }] }));
+  const raced = costCli(s, args);
+  assertExit(raced, 0);
+  assert.equal(raced.json.recorded, true);
+  assert.equal(raced.json.call, null, 'its own amount cannot be proved: not the full transcript');
+  assert.match(raced.json.warnings.join('\n'), /another booking changed the record at the same time/);
+  assert.equal(raced.json.cost.total.input, 10, 'the PR total is the transcript once');
+  // the control: no concurrent booking still reports the call
+  assert.equal(alone.json.call.input, 10);
+});
+
 // R4-B1: two overlapping bookings of one growing transcript: the one that read the smaller snapshot finished last and lowered the ledger, so the next booking of the larger transcript re-booked the difference.
 test('deductBookedTranscript: a stale smaller snapshot does not lower the ledger, so the larger one booked again adds nothing', () => {
   const snap = (n) => ({ input: n, output: 2 * n, cacheRead: 3 * n, cacheWrite: 4 * n, usd: n / 100, byPrice: { p1: { input: n, output: 2 * n, cacheRead: 3 * n, cacheWrite5m: 4 * n, cacheWrite1h: 0, messages: n } } });
