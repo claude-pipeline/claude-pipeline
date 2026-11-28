@@ -262,3 +262,16 @@ test('legacy final: the contradicted-scope reason with no scopeContradicted mark
   assert.equal(legacy.final.scopeContradicted, undefined);
   assert.match(rulingRecommendationRefusal([legacy], 'FOLLOW-UP', {}, 'fix-separately') ?? '', /contradicted its "same on base" scope/);
 });
+
+// Round 2 (#954, R2-B4). Failure caught: the writer before the marker stored ONLY the generic security reason when a blocking security finding's same-on-base scope was also contradicted, so the reason-text
+// fallback missed it and "fix separately" was recommended for a line the PR itself adds. An arbiter security-dismissal final without a boolean marker is now unknown, and refused.
+test('old-writer final: a blocking-security arbiter final with the generic reason and no scopeContradicted marker refuses fix-separately; the writers\' own boolean false still passes', () => {
+  const plain = item();
+  const [written] = apply([plain], [rule(plain, { scope: undefined })]);
+  assert.equal(written.final.scopeContradicted, false, 'the writer stores the boolean even when the scope held');
+  const { scopeContradicted, ...rest } = written.final;
+  const old = { ...written, final: { ...rest, reason: 'would dismiss a blocking security/data item' } };
+  assert.match(rulingRecommendationRefusal([old], 'FOLLOW-UP', {}, 'fix-separately') ?? '', /before the scope check was recorded/);
+  assert.equal(rulingRecommendationRefusal([old], 'REJECT', {}, undefined), null, 'reject has no scope rule');
+  assert.equal(rulingRecommendationRefusal([written], 'FOLLOW-UP', {}, 'fix-separately'), null);
+});

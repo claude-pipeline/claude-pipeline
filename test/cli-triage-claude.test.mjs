@@ -1490,6 +1490,21 @@ test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling be
   assert.equal(seq.item('R1-S1').final.decision, 'REJECT');
 });
 
+test('#944 drift: the second id of a two-id reject click is recorded when the first was recorded with an equivalent spelling of the same answer', async (t) => {
+  // failure caught (R2-B3): the sibling filter compared the stored quote byte for byte while the record lookup ignores case and white space, so the already-ruled first id came back as "waiting" and refused the second id's click
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  waitingAccept(w, 'R1-B1');
+  w.wait('R1-S1');
+  const QUOTE = 'R1-B1: reject, R1-S1: reject';
+  const apply = typedFor(t, w, ['R1-B1', 'R1-S1'], QUOTE, 'ruling-v2-reject');
+  const upper = w.cli(['triage', 'owner-ruling', '--round', '1', '--id', 'R1-B1', '--decision', 'REJECT', '--reason', 'owner confirmed', '--owner-quote', QUOTE.toUpperCase(), '--pr', '7']);
+  assertExit(upper, 0, upper.stdout + upper.stderr);
+  const second = apply('R1-S1', 'REJECT');
+  assertExit(second, 0, second.stdout + second.stderr);
+  assert.equal(w.item('R1-S1').final.decision, 'REJECT');
+});
+
 test('#944 drift: an answer on a recommended Reject / fix-separately dialog is refused when the PR head moved since the dialog was issued; a click on another option and a typed answer still record', async (t) => {
   // failure caught: Claude recommends Reject "already handled", a later commit removes that handling while the item still waits, and the old click still records REJECT on code Claude never checked
   const moved = e2eWorld(t);
@@ -1535,6 +1550,9 @@ test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is
   const denied = first('R1-B1', 'REJECT');
   assertExit(denied, 1, denied.stdout);
   assert.match(denied.json.reason, /no longer holds.*R1-S1/);
+  // R2-F1: failure caught: the re-ask advice listing the built sibling too, so the neutral dialog asks the owner to rule on R1-S1, which owner-ruling refuses as needing no decision
+  assert.match(denied.json.reason, /ruling-request --pr 7 --ids R1-B1 --ask/);
+  assert.doesNotMatch(denied.json.reason, /--ids [^`]*R1-S1/);
   assert.equal(w.stateText(), before);
 });
 

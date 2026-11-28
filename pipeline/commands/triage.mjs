@@ -448,7 +448,9 @@ async function ownerRuling(rest, ctx) {
       const checks = answers.map((r) => {
         const claim = claimOf(r);
         // R1-B3 (#954): every asked sibling is rechecked except those this same answer already ruled; one in any other state (a built ACCEPT, a settled ruling) no longer qualifies the batch
-        const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || !(i.final?.by === 'owner' && i.final?.ownerQuote === ownerQuote));
+        // R2-B3: "this same answer" is judged as the owner-go record lookup judges it (white space collapsed, case ignored): an equivalent spelling of the answer, stored by an earlier call, is the same answer
+        const same = (q) => String(q ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || !(i.final?.by === 'owner' && same(i.final?.ownerQuote) === same(ownerQuote)));
         // R1-B2 (#954): a recommended Reject / fix-separately was Claude's reading of the code at the head the ask was issued at; a click is stale once the head moved (an ask with no head, or one that cannot be read, is not judged here)
         const issuedAt = RULING_HEAD_BOUND_VARIANTS.includes(r.ask.variant) ? readAsk(r.ask.askId, { home: ctx.home }) : null;
         const nowHead = issuedAt?.ok === true && typeof issuedAt.ask.head === 'string' ? headSha({ cwd: root }) : null;
@@ -458,7 +460,9 @@ async function ownerRuling(rest, ctx) {
       if (checks.every((c) => c.stale !== null)) {
         const { variant, waiting, stale } = checks[0];
         const names = waiting.map((i) => i.id).join(', ');
-        const again = `ask again on the neutral dialog: \`pipeline triage ruling-request --pr ${prNum} --ids ${waiting.map((i) => i.id).join(',')} --ask\` with no --recommend`;
+        // R2-F1: only the items an owner ruling could still record are offered again (the id being ruled always); the full list stays in the explanation above
+        const askable = waiting.filter((i) => i.id === id || ownerRulingRefusal(i, i.id, n, decision) === null).map((i) => i.id);
+        const again = `ask again on the neutral dialog: \`pipeline triage ruling-request --pr ${prNum} --ids ${askable.join(',')} --ask\` with no --recommend`;
         if (variant === 'ruling-v2-follow-up') return refuse(`the owner answered on the dialog that recommended Follow-up all, which said the pipeline rates ${names} low severity, but that no longer holds (${stale}), so the answer approves nothing; ${again}`);
         return refuse(`the owner answered on the dialog that recommended ${variant === 'ruling-v2-reject' ? 'Reject all' : 'Follow-up all'} for ${names}, which rested on Claude's check of those items, but that no longer holds (${stale}), so the answer approves nothing; ${again}`);
       }

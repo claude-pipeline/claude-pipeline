@@ -196,7 +196,7 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
     else {
       const oom = f.scope === OUT_OF_MODEL && f.ruling === 'FOLLOW-UP' ? outOfModelOf(f, { models, files: diffFiles }) : null;
       const waived = oom?.waive === true || (sob?.waive === true && f.scope === SAME_ON_BASE);
-      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : SCOPE_CONTRADICTED_REASON, cause: 'security-dismissal', ...marker };
+      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : SCOPE_CONTRADICTED_REASON, cause: 'security-dismissal', scopeContradicted: contradicted };
       else final = { ...final, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(f.scope === SAME_ON_BASE ? { scope: SAME_ON_BASE } : {}) }) };
     }
     const item = {
@@ -438,7 +438,7 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
       const oom = r.scope === OUT_OF_MODEL && r.ruling === 'FOLLOW-UP' ? outOfModelOf(item, { models, files: diffFiles }) : null;
       const waived = oom?.waive === true || (sob?.waive === true && r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP');
       if ((dismissesBlockingSecurity && !waived) || contradicted) {
-        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : SCOPE_CONTRADICTED_REASON, cause: 'security-dismissal', ...marker };
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : SCOPE_CONTRADICTED_REASON, cause: 'security-dismissal', scopeContradicted: contradicted };
       } else {
         next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' ? { scope: SAME_ON_BASE } : {}) }) };
       }
@@ -748,7 +748,11 @@ export function rulingRecommendationRefusal(items, decision, ctx = {}, code = un
       if (item.implemented === true) return `${item.id} is already implemented, so a recommendation to ${decision === 'REJECT' ? 'reject' : 'follow up'} (drop or move the built fix) would be wrong`;
       if (waits && MALFUNCTION_CAUSES.includes(needsHumanCause(item))) return `${item.id} waits because of a ${needsHumanCause(item)} malfunction: ${RERUN}`;
       if (item.secondReview?.decision === 'ACCEPT') return `${item.id}: the second review says ACCEPT, so Claude does not recommend dismissing it`;
+      // R2-B4 (#954): the writer before the marker stored only the generic security reason when BOTH the blocking-security and the contradicted-scope conditions held, so an arbiter security-dismissal final
+      // without a boolean marker cannot be told apart from a contradicted one: fail closed (every current writer stores the boolean, true or false)
+      const unmarked = waits && item.final.by === 'arbiter' && needsHumanCause(item) === 'security-dismissal' && typeof item.final.scopeContradicted !== 'boolean';
       if (code === 'fix-separately' && waits && (item.final.scopeContradicted === true || item.final.reason === SCOPE_CONTRADICTED_REASON)) return `${item.id} waits because the PR diff contradicted its "same on base" scope (the pipeline has evidence it is this PR's change), which a follow-up row would deny`;
+      if (code === 'fix-separately' && unmarked) return `${item.id} waits as a security dismissal written before the scope check was recorded on it, so whether the PR diff contradicted its "same on base" scope is unknown, which a follow-up row would deny`;
     }
     return null;
   }
