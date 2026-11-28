@@ -535,7 +535,7 @@ test('triage ruling-request --recommend: Reject of an open deferrable ACCEPT is 
   assert.deepEqual(asks(home), []);
 });
 
-test('triage ruling-request --recommend reject|fix-separately: refused for an implemented item, a settled Claude ACCEPT, a round-cap deferral, a second review that says ACCEPT, a malfunction wait; reject allowed (fix-separately refused) for a contradicted scope; the allowed twins', async () => {
+test('triage ruling-request --recommend reject|fix-separately: refused for an implemented item, a settled Claude ACCEPT, a round-cap deferral, a second review that says ACCEPT, a malfunction wait; reject allowed (fix-separately refused) for a contradicted scope; the allowed twins; a serious open deferrable ACCEPT refused fix-separately', async () => {
   // failure caught: Claude's own rating shown as a recommendation for something it must not dismiss (a built fix, a settled ACCEPT, a contrary second review, a malfunction a re-run would clear, a scope the pipeline's evidence contradicts), or refused for what it may
   const waiting = (cause, reason = 'arbiter low confidence') => ({ decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause, reason });
   const CONTRADICTED = 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)';
@@ -560,12 +560,42 @@ test('triage ruling-request --recommend reject|fix-separately: refused for an im
       assert.match(r.output.recommendRefused, re, `${what} / ${why}`);
     }
   }
-  // allowed twins: an open deferrable ACCEPT may get fix-separately AND minor-later (low severity); a BLOCKING one fix-separately (the owner-raised deferral); never reject
+  // allowed twins: an open LOW-severity deferrable ACCEPT may get fix-separately AND minor-later; a BLOCKING one gets neither (#956: the neutral dialog, the owner can still click Follow-up all); never reject
+  // failure caught (#956): Claude putting "Follow-up all (Recommended)" first on a serious (BLOCKING / security) accepted fix, so one click moves it out of the PR
   const low = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'docs', final: DEFERRABLE });
   for (const why of ['fix-separately', 'minor-later']) assert.equal((await askRec(low, '--recommend', 'follow-up', '--why', why)).output.dialogVariant, why === 'minor-later' ? 'ruling-v2-follow-up' : 'ruling-v2-follow-up-any', why);
   const blocking = triageWorld(CHAT(), { final: DEFERRABLE });
-  assert.equal((await askRec(blocking, '--recommend', 'follow-up', '--why', 'fix-separately')).output.dialogVariant, 'ruling-v2-follow-up-any');
+  const refusedAny = (await askRec(blocking, '--recommend', 'follow-up', '--why', 'fix-separately')).output;
+  assert.deepEqual([refusedAny.recommend, refusedAny.dialogVariant], [null, 'ruling-v1']);
+  assert.match(refusedAny.recommendRefused, /not low severity/);
+  // failure caught (#956 review): the minor-later refusal telling the controller to retry with fix-separately, which is refused for the same accepted fix
+  const minorBlocking = (await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
+  assert.doesNotMatch(minorBlocking, /recommend follow-up with --why fix-separately/);
+  assert.match(minorBlocking, /no --recommend/);
+  // failure caught (#956 review R2): a low-severity open accepted fix next to a BLOCKING item waiting on low confidence: fix-separately IS shown for the batch, so the minor-later refusal must still name it
+  const mixed = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'docs', final: DEFERRABLE });
+  const mixedFile = join(mixed.repo.dir, '.review', 'state.json');
+  const mixedState = JSON.parse(readFileSync(mixedFile, 'utf8'));
+  Object.assign(mixedState.rounds[0].items[1], { bucket: 'BLOCKING', category: 'security', file: 'src/other.js', final: WAITING_ACCEPT });
+  writeFileSync(mixedFile, JSON.stringify(mixedState));
+  const mixedAsk = (why) => triage(mixed, newHome(), 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1,R1-S3', '--ask', '--recommend', 'follow-up', '--why', why);
+  assert.equal((await mixedAsk('fix-separately')).output.dialogVariant, 'ruling-v2-follow-up-any');
+  assert.match((await mixedAsk('minor-later')).output.recommendRefused, /not low severity.*recommend follow-up with --why fix-separately/);
   assert.match((await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused, /not low severity/);
+  // failure caught (#956 review R3): a model-proof malfunction wait told "run the neutral dialog" instead of "re-run the judge/arbiter" (the owner would be asked about an item a re-run clears)
+  const malfunction = triageWorld(CHAT(), { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed: ruling not provably from Fable' } });
+  const malfunctionRefused = (await askRec(malfunction, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
+  assert.match(malfunctionRefused, /not low severity.*R1-B1 \(model-proof\) waits because of a malfunction.*re-run the judge\/arbiter/);
+  assert.doesNotMatch(malfunctionRefused, /no --recommend/);
+  // failure caught (#956 review R4): the fix-separately probe stops at the FIRST refused item (a serious open accepted fix), so a malfunction wait behind it was sent to the owner again
+  const both = triageWorld(CHAT(), { final: DEFERRABLE });
+  const bothFile = join(both.repo.dir, '.review', 'state.json');
+  const bothState = JSON.parse(readFileSync(bothFile, 'utf8'));
+  Object.assign(bothState.rounds[0].items[1], { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed: ruling not provably from Fable' } });
+  writeFileSync(bothFile, JSON.stringify(bothState));
+  const bothRefused = (await triage(both, newHome(), 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1,R1-S3', '--ask', '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
+  assert.match(bothRefused, /R1-S3 \(model-proof\) waits because of a malfunction.*re-run the judge\/arbiter/);
+  assert.doesNotMatch(bothRefused, /no --recommend/);
 });
 
 test('triage ruling-request --recommend: an unreadable reviewed diff refuses minor-later only; reject and fix-separately judge no severity and need no diff', async () => {
