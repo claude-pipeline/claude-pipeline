@@ -593,6 +593,31 @@ test('#951: a script of copy loops over long paths is allowed through evaluateGi
   assert.equal(files('bash inst.sh /x/wt', filesFs({ 'inst.sh': script(1020) })).decision, 'allow');
 });
 
+// ---- #902: the lookups of a wrapper's output files stop at the deadline ------------------------------------------------------------------------------------------
+// Why: one command can name up to 16 wrapper output files (`time -o a -o b …`) and the files guard resolves each one (an existence check per directory level). Without a deadline check per target the 16
+// lookups all run after the clock was gone, and a hook that runs past its timeout is ALLOWED by Claude Code. Two places resolve them: the hook-file discovery and the main target loop; each polls per target.
+// The row that tells the poll from no poll: one command with 16 outputs, the clock gone at the 20th lookup. With the poll no further lookup (a few at most, the rest of the target in hand); without it ~28 more.
+test('guard-files: with the clock gone part-way through 16 wrapper output files, no further file is looked up (fails closed with "took too long"); with the clock gone at the first, hook-file discovery stops too; on a clock that stands still every file is looked up', () => {
+  const line = `time ${Array.from({ length: 16 }, (_, i) => `-o /tmp/w/o${i}`).join(' ')} ls`;
+  const lookups = (clock, step) => {
+    const mine = (q) => String(q).startsWith('/tmp/w');
+    const tick = (fn) => (...a) => { if (mine(a[0])) { clock.calls++; clock.t += step; if (clock.atDeadline === null && clock.t > EVAL_DEADLINE_MS) clock.atDeadline = clock.calls; } return fn(...a); };
+    return { readText: () => null, pathExists: tick(() => false), readDir: () => null };
+  };
+  for (const [name, step, from] of [['at the 20th lookup', EVAL_DEADLINE_MS / 19.5, 20], ['at the first lookup', EVAL_DEADLINE_MS * 1.5, 1]]) {
+    const gone = { t: 0, calls: 0, atDeadline: null };
+    const r = files(line, lookups(gone, step), { now: () => gone.t, cpu: () => gone.t });
+    assert.equal(r.decision, 'deny', `${name}: ${r.decision}`);
+    assert.match(r.reason, /took too long|too busy/, name);
+    assert.equal(gone.atDeadline, from, `${name}: the clock passed the deadline at lookup ${gone.atDeadline}`);
+    assert.ok(gone.calls - gone.atDeadline <= 3, `${name}: ${gone.calls - gone.atDeadline} lookups after the deadline (${gone.calls} in all)`);
+  }
+  const still = { t: 5, calls: 0, atDeadline: null };
+  const fine = files(line, lookups(still, 0), { now: () => 5, cpu: () => 5 });
+  assert.equal(fine.decision, 'allow', `${fine.decision}: ${fine.reason}`);
+  assert.ok(still.calls >= 16, `${still.calls} lookups for 16 outputs`);
+});
+
 // #746 item 5: the owner's setup script (`FILES="a b"; for f in $FILES; do cp "$MOD/$f" "$B/$f.$SUF"; done`, run as `bash setup.sh /x/wt`) was refused from its first such loop. Failure caught:
 // (1) a loop over a variable that holds several words was "a loop word built from a variable whose value is not known here": nothing split the value, so a plain list kept in a variable could
 // not be written in a script; (2) a variable's value that merely CONTAINS the letters of a binder (`REM="$HOME/.local/share/x"`, `handoff-read.js`) made "IFS may be set" true for the whole script, so the

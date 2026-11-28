@@ -2234,6 +2234,30 @@ test('#950: a shell option (shopt / setopt / hash / enable) in a called script s
   assert.equal(run('bash tr.sh; cp f.sh n.sh', { ...SPEC, 'n.sh': 'ok', 'tr.sh': "shopt -s expand_aliases\ntrap 'bash n.sh' EXIT\nlaunchctl kickstart -k x" }).files.r.decision, 'deny'); // twin: a trap still defers
 });
 
+// ---- #902: a wrapper's own output file is a write the line makes: where it lands, and that it never replaces ------------------------------------------------------------------------------
+// The failure: `script -q n.sh …; bash n.sh` left n.sh "missing, runs nothing", and `env -C sub script -q n.sh …` was placed in the directory the CHILD ends up in. A wrapper's log lands in the directory its wrapper starts in
+// (the command's start directory, then any `-C` of an earlier wrapper), and it appends (the earlier content of the file stays a possibility).
+test('#902: writtenTo places a wrapper log from the directory the command starts in and then its own earlier -C; an unresolved -C may be any file; the earlier content is kept', () => {
+  const reaches = (line, target) => {
+    const cmds = simpleCommands(`${line}; bash x`);
+    const dirOf = (idx) => (typeof cmds[idx]?.chdir === 'string' ? posix.resolve('/w', cmds[idx].chdir) : '/w'); // (what the git guard's dirAt gives: the directory the command's CHILD runs in)
+    const frame = newWriteFrame(cmds, { expand: (w) => w, locate: (e, idx) => [posix.resolve(dirOf(idx), e)], isAbs: (q) => q.startsWith('/'), p: posix, locateStart: () => ['/w'] });
+    frame.i = cmds.length;
+    return writtenTo([frame], target, { exists: () => true, readText: () => 'old\n' });
+  };
+  assert.notEqual(reaches('env -C sub script -q x.log ls', '/w/sub/x.log'), null, 'the log lands in sub');
+  assert.equal(reaches('env -C sub script -q x.log ls', '/w/x.log'), null, 'and not in the start directory');
+  assert.notEqual(reaches('script -q x.log env -C sub ls', '/w/x.log'), null, 'the wrapper starts in the start directory');
+  assert.equal(reaches('script -q x.log env -C sub ls', '/w/sub/x.log'), null);
+  assert.notEqual(reaches('sudo -D sub time -o x.log ls', '/w/other.txt'), null, 'an unknown directory: it may be any file');
+  assert.equal(reaches('script -q x.log ls', '/w/other.txt'), null, 'a log is no write to any other file');
+  // append: an earlier echo into the file is still a possible content (never a certain replacement)
+  const w = reaches('echo keep > x.log; script -q -a x.log true', '/w/x.log');
+  assert.notEqual(w, null);
+  assert.equal(w.unknown, true, 'the wrapper may have put anything there');
+  assert.ok(w.texts.includes('keep'), 'and the earlier text is still a possible content');
+});
+
 // #965: a program run through a variable DIRECTORY after any command the guard does not model (launchctl, disown, setsid, tmux, at, bg ...). Failure caught: the owner's install script
 // (`launchctl kickstart ...`, then `"$BIN/tool" version`) was refused, "tool refers to a protected pipeline file ...": the `$` in the command word made the home startup file (~/.zshenv of the
 // shell a script would start under) count as rewritable by the unmodelled command before it, so every name on the line became unknown. The literal path was allowed all along.

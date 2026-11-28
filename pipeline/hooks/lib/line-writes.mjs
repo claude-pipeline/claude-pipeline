@@ -10,7 +10,7 @@
 // - A write counts for a command when it comes before it on the line (strictly: even a conditional or background one), runs in the same
 //   pipeline, races with a background job, or may repeat before it (a loop).
 // Pure: the policies supply how to expand a word and where a command runs (see newWriteFrame).
-import { commandName, withoutComments, withoutLiteralText, quotedBodiesBlank, expandedOnly } from './shell-parse.mjs';
+import { wrapperTargetsOf, commandName, withoutComments, withoutLiteralText, quotedBodiesBlank, expandedOnly } from './shell-parse.mjs';
 import { applySed, sedReadings, dynamic } from './sed-emulate.mjs';
 
 // ---- control flow -------------------------------------------------------------------------------------------
@@ -426,8 +426,15 @@ function stdoutItems(cmd) {
 }
 
 const FD_DUP = /^&(?:\d+|-)$/; // (>&2, >&-: the only duplications)
-function redirectRecords(cmd, idx) {
+function redirectRecords(cmd, idx, next) {
   const out = [];
+  // (#902) a wrapper's own output file (script log, time -o, screen log, nohup.out): the name is certain, the content is not. It appends, so it is never a certain replacement of what the line wrote before.
+  // `wrapper` names the writer for the refusal's wording; `wchdir` is where its wrapper had moved to BEFORE it started (see locateDest).
+  // flock only opens its lock file (empty when it creates it), it never writes content: no record (the files guard still refuses a protected lock file, from wrapperOuts)
+  for (const o of wrapperTargetsOf(cmd, next)) {
+    if (typeof o.target !== 'string' || !o.target || o.target === '/dev/null' || o.wrapper === 'flock') continue;
+    out.push({ idx, dest: o.target, items: UNKNOWN, append: true, wrapper: o.wrapper, ...(o.chdir !== undefined ? { wchdir: o.chdir } : {}) });
+  }
   for (const r of cmd.redirects ?? []) {
     if (!WRITE_OPS.has(r.op) || typeof r.target !== 'string' || !r.target || FD_DUP.test(r.target) || r.target === '/dev/null') continue;
     let items;
@@ -1141,6 +1148,21 @@ function locateWord(f, e, idx) {
   if (r === undefined) { r = f.locate(e, idx); if (f.located.size > 100_000) f.located.clear(); f.located.set(key, r); }
   return r;
 }
+// (#902) where a wrapper's output word lands: from the directory its command STARTS in (not the one its child ends in: `script -q x.log env -C sub ls` writes ./x.log), then the wrapper's own earlier -C
+// (`env -C sub script -q x.log ls` writes sub/x.log). null: it cannot be told (a run-time or doubled -C): the file may be any file
+function locateDest(f, e, rec) {
+  if (rec.wrapper === undefined || f.isAbs(e) || !f.locateStart) return locateWord(f, e, rec.idx);
+  if (rec.wchdir === null) return null;
+  let ce;
+  if (typeof rec.wchdir === 'string') { ce = expandWord(f, rec.wchdir); if (ce === null) return null; }
+  const out = [];
+  for (const d of f.locateStart(rec.idx)) {
+    const at = ce === undefined ? d : f.isAbs(ce) ? ce : d === null ? null : f.p.join(d, ce);
+    const q = at === null ? e : f.p.join(at, e);
+    if (!out.includes(q)) out.push(q);
+  }
+  return out;
+}
 function classifyWord(f, rec, w, e, t) {
   if (e === null) { t.dyn.push(w); return; }
   for (const d of locateWord(f, e, rec.idx)) {
@@ -1197,11 +1219,11 @@ export function writesOf(cmds, io = {}) {
   const gitCfg = cmds.some((c, idx) => {
     const n = commandName(c.argv[0] ?? '');
     if (n === 'git' && ['config', 'init', 'clone', 'remote', 'submodule'].includes(gitSub(c.argv.slice(1))) && !gitPure(c.argv.slice(1))) return true;
-    return [...redirectRecords(c, idx), ...(c.argv.length ? argRecords(c, n, idx, lineEnv, {}) ?? [] : [])].some((r) => r.dest === null || CFG_PATH.test(String(r.dest)));
+    return [...redirectRecords(c, idx, cmds[idx + 1]), ...(c.argv.length ? argRecords(c, n, idx, lineEnv, {}) ?? [] : [])].some((r) => r.dest === null || CFG_PATH.test(String(r.dest)));
   });
   io = { ...io, gitCfg };
   cmds.forEach((cmd, idx) => {
-    recs.push(...redirectRecords(cmd, idx));
+    recs.push(...redirectRecords(cmd, idx, cmds[idx + 1]));
     if (!cmd.argv.length) return;
     const name = commandName(cmd.argv[0]);
     const here = { readProgram: io.readProgram ? (word) => io.readProgram(word, idx) : null, gitCfg }; // (an awk program file is read where this command runs)
@@ -1304,7 +1326,7 @@ function placeOf(f, rec) {
 // - isAbs(path), p: the policy's path functions (node:path or node:path.posix), ci: compare names ignoring case
 // - real(path): the path with symlinks followed (a missing tail kept), or null when it cannot be told; omitted: paths are taken as written
 // - stamp(idx) (optional): changes whenever locate() would answer differently for the command at idx (the directory it runs in becomes known); tick() (optional): reads the evaluation's clock and throws when it is past its deadline
-export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driveRel = false, real = null, readText = null, text = null, stamp = null, tick = null }) {
+export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driveRel = false, real = null, readText = null, text = null, stamp = null, tick = null, locateStart = null }) {
   // an awk program file (-f FILE): the text of every place the word may name; null when it cannot be told (a run-time word, a file we cannot read, a place we do not know)
   const readProgram = readText ? (word, idx) => {
     const e = expand(word);
@@ -1330,7 +1352,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   const runsLater = procSub || cmds.fns?.size > 0 || cmds.some((c) => FUNCTION_DEF.test(c.raw ?? '') || LATER_CODE.has(commandName(c.argv[0] ?? '')));
   const bgFrom = first < 0 ? Infinity : runsLater ? 0 : early >= 0 ? Math.min(first, early) : first;
   const bgWork = seps > 0 || opaque || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
-  return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgFrom, bgWork };
+  return { locateStart, cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgFrom, bgWork };
 }
 
 // The text the shell reads as command syntax, for the lone-`&` count (#919: a `&` in a comment, quotes or a quoted heredoc body is text, no background job).
@@ -1449,7 +1471,9 @@ function match(f, rec, P) {
   // a target only known at run time may be any file its fixed parts allow (`/work/out-$n.txt` is not /work/cmp.mjs)
   if (e === null) return dynamicMayBe(f, rec.dest, P, rec.subtree === true) ? loose(rec.items) : null; // (a subtree: any file below the directory the word may name)
   const out = [];
-  for (const d of locateWord(f, e, rec.idx)) {
+  const places = locateDest(f, e, rec);
+  if (places === null) return loose(rec.items); // (a wrapper log whose directory cannot be told: it may be any file)
+  for (const d of places) {
     if (!f.isAbs(d)) { // the directory is unknown: compare the names
       out.loose = true;
       if (fold(f, p.basename(d)) === fold(f, p.basename(P))) out.push(...rec.items);
@@ -1768,7 +1792,7 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
     try { return writtenTo(copies, target, { exists, readText, ignoreUnmodelled, genericAsUnknown }); } finally { copies.forEach((c, i) => { if (c.unresolved && !frames[i].unresolved) frames[i].unresolved = true; }); }
   }
   if (!frames.length || !frames.some((f) => f.recs.length || f.unmodelled.size)) return null;
-  const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, genericAsUnknown, viaUnmodelled: false };
+  const st = { texts: new Set(), files: new Set(), scans: new Set(), programs: new Set(), authored: false, unknown: false, any: false, seen: new Set(), ignoreUnmodelled, genericAsUnknown, viaUnmodelled: false, wrappers: new Set() };
   const upto = frames.length - 1;
   collect(frames, upto, frames[upto].i, target, st, 0, exists);
   if (!st.any) return null;
@@ -1778,7 +1802,7 @@ export function writtenTo(frames, target, { exists, readText = () => null, ignor
   // Why: the unknown text of an in-place sed is the edit's own result: once every text it leaves is built (the program emulated for every text it may get) it is judged as a text, not as run-time content
   if (st.sedEdit && (built === null || io.pieces || io.sedRefused)) st.unknown = true;
   const joined = (built ?? []).filter((x) => !st.texts.has(x));
-  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, named: st.named === true, joined, pieces: io.pieces || st.cut === true };
+  return { texts: [...st.texts], files: [...st.files], scans: [...st.scans], programs: [...st.programs], authored: st.authored, unknown: st.unknown, viaUnmodelled: st.viaUnmodelled, named: st.named === true, joined, pieces: io.pieces || st.cut === true, wrappers: [...st.wrappers] };
 }
 
 // The links the line makes before the command: [alias, real, frame] for `ln -s REAL ALIAS` (and a hard link). A directory alias makes
@@ -1797,7 +1821,7 @@ function linkPairs(frames, upto, asOf) {
       pairs.any = true;
       const e = expandWord(f, rec.dest);
       if (e === null) continue;
-      for (const d of locateWord(f, e, rec.idx).filter((x) => f.isAbs(x))) {
+      for (const d of (locateDest(f, e, rec) ?? [e]).filter((x) => f.isAbs(x))) {
         for (const it of rec.items) {
           const se = it.file === undefined ? null : expandWord(f, it.file);
           if (se === null) continue;
@@ -1838,6 +1862,7 @@ function collect(frames, upto, asOf, P, st, depth, exists) {
   for (const h of hitsOn(frames, upto, asOf, P)) {
     if (h.rec.generic !== undefined && st.genericAsUnknown) { st.any = true; st.unknown = true; continue; } // (a program we do not model, handed words that may name the file: it may write the file, with content nobody knows -- its other words are not a source it copies from)
     if (h.loose && st.ignoreUnmodelled) continue; // (the real home's startup files: only the line's exact writes reach them, not a target known only at run time)
+    if (h.rec.wrapper !== undefined) st.wrappers.add(h.rec.wrapper); // (#902: the file is a wrapper's own log / timing / lock file: the refusal says so)
     if (!h.loose && !h.rec.subtree && h.items.some((it) => it.abs === undefined)) st.named = true; // (a write that names this very file, not one that may reach it: the target of a redirect, cp, mv, sed -i ..., not a tar x or a worktree add below a directory, nor a file some directory copy may carry in)
     absorb(frames, h.fi, h.f, h.rec, h.items, h.P, st, depth, exists);
     if (certainReplace(h) && !copyMayFail(frames, h, exists)) st.lastReplace = [h.fi, h.rec.idx]; // an exact write that replaces the file: what came before it no longer matters
@@ -1918,7 +1943,7 @@ export function writesUnderGit(f, idx) {
     if (rec.idx !== idx || rec.dest === null || rec.dest === undefined || rec.inline !== undefined) continue;
     const e = expandWord(f, rec.dest);
     if (e === null) continue;
-    if (locateWord(f, e, idx).some((d) => (f.ci ? UNDER_GIT_CI : UNDER_GIT).test(String(d).replace(/\\/g, '/')))) return true;
+    if ((locateDest(f, e, rec) ?? [e]).some((d) => (f.ci ? UNDER_GIT_CI : UNDER_GIT).test(String(d).replace(/\\/g, '/')))) return true;
   }
   return false;
 }
@@ -1931,7 +1956,7 @@ export function writtenNamesIn(frames, dir) {
       if (rec.dest === null || rec.inline !== undefined || !seen(frames, fi, f.i, rec.idx)) continue;
       const e = expandWord(f, rec.dest);
       if (e === null) continue;
-      for (const d of locateWord(f, e, rec.idx)) {
+      for (const d of (locateDest(f, e, rec) ?? [e])) {
         if (!f.isAbs(d)) continue;
         if (same(f, f.p.dirname(d), dir)) out.add(f.p.basename(d));
         if (rec.copy && same(f, d, dir)) for (const it of rec.items) { const se = expandWord(f, it.file ?? ''); if (se) out.add(nameOf(f, se)); }
@@ -1972,7 +1997,14 @@ export function exportRecords(f, idx, existing = []) {
       const more = key === 'file' && rec.link === 'sym' && d && !f.isAbs(expandWord(f, it.file) ?? '/') ? [f.p.resolve(f.p.dirname(d), expandWord(f, it.file))] : []; // a symlink's relative source is read from the link's directory
       return [...paths, ...more].map((p) => ({ [key]: p }));
     });
-    const dests = rec.dest === null ? [null] : (absOf(rec.dest, rec.idx) ?? [null]);
+    // (#902) a wrapper's dest is placed from the directory its command started in (locateDest); null (it cannot be told) leaves dest null: any file
+    const destOf = () => {
+      if (rec.wrapper === undefined) return absOf(rec.dest, rec.idx) ?? [null];
+      const e = expandWord(f, rec.dest);
+      if (e === null) return [null];
+      return (locateDest(f, e, rec) ?? [null]).filter((x) => x === null || f.isAbs(x));
+    };
+    const dests = rec.dest === null ? [null] : destOf();
     for (const d of dests.length ? dests : [null]) {
       const items = convert(rec.items, d);
       out.push({ ...rec, idx, bg: place.bg, opt: place.opt, dest: d, items, parts: rec.parts?.map((part) => convert(part, d)), ...(rec.generic ? { generic: rec.generic.flatMap((w) => { const ps = absOf(w, rec.idx); return ps && ps.length ? ps : [w]; }) } : {}) });
