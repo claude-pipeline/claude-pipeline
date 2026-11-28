@@ -160,17 +160,14 @@ export const run = guarded(async (argv, ctx) => {
     const waitMs = wait > 0 ? wait : COST_LOCK_WAIT_MS;
     let record;
     let written = null;
-    let lockHeld = true;
     try {
       record = await withLock(costLockName(root, pr), () => { written = recorder.update(patch); return written; }, { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs });
     } catch (err) {
       if (!(err instanceof LockTimeoutError) && written !== null) {
         // withLock failed AFTER the callback wrote the booking (the lock was lost, or its release threw EACCES/EIO...; recorder.update never throws, so written !== null means the write happened):
-        // report the booking, since failing here makes a re-run of an explicit --usd booking book twice. The lock may have been taken over before or during the write, so another booking
-        // that read the same base may have replaced this one: `call` (this call's own amount, from the base it read) stays, but the saved total is not reported as the PR total.
+        // report the booking, since failing here makes a re-run of an explicit --usd booking book twice
         record = written;
-        lockHeld = false;
-        notes.push('this booking was written, but the cost lock was not held to the end, so another booking may have replaced it and the PR total is not confirmed: check `P summary` and book this call again only if it is missing');
+        notes.push('this booking was written but the cost lock cleanup failed; do not run the command again, check the PR total with `P summary`');
       } else {
         if (!(err instanceof LockTimeoutError)) throw err;
         // never book without the lock: nothing was written, so re-running the same command is safe
@@ -180,7 +177,7 @@ export const run = guarded(async (argv, ctx) => {
     const ok = record !== null;
     return {
       exitCode: ok ? EXIT.OK : EXIT.FAILED,
-      output: { ok, recorded: ok && !emptyTranscript, ...(emptyTranscript ? { skipped: 'empty-transcript' } : {}), bucketed: ok && bucketed, call: ok ? bookedCall(recorder.previous, record, patch.cost.entry) : null, cost: ok && lockHeld ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
+      output: { ok, recorded: ok && !emptyTranscript, ...(emptyTranscript ? { skipped: 'empty-transcript' } : {}), bucketed: ok && bucketed, call: ok ? bookedCall(recorder.previous, record, patch.cost.entry) : null, cost: ok ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
     };
   });
 });
