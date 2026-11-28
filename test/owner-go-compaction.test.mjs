@@ -195,6 +195,45 @@ test('#905 a half-flagged summary whose parent is a LATER non-prompt entry of th
   }
 });
 
+// #905 round 3 (R3-S1): the order rule holds at EVERY hop, so the forward link sits on the SECOND hop here (summary -> A, A -> B, B -> owner prompt; both tool results precede the summary). Failure caught: resolve
+// no longer advancing `from` at each hop, so the chain is checked against the summary's own position only, reaches the owner's prompt and the request under the summary binds.
+test('#905 a half-flagged summary whose chain links forward on its second hop binds nothing (merge, extra round, ruling)', () => {
+  const go = { ...promptEntry('go'), uuid: 'u-owner-go' };
+  const a = { ...result('a.txt'), uuid: 'u-a', parentUuid: 'u-b' };
+  const b = { ...result('b.txt'), uuid: 'u-b', parentUuid: 'u-owner-go' };
+  const half = summary(SUMMARY_TEXT, { isCompactSummary: false, parentUuid: 'u-a' });
+  for (const present of [true, false]) {
+    assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [go, a, b, half, said(REQUEST)], { present }), { home: tmp(), now })), `merge (present ${present})`);
+    assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [go, a, b, half, said(RASK)], { present }), { home: tmp(), now }), null, `extra round (present ${present})`);
+    assert.equal(rule(tmp(), [go, a, b, half, said(ASK_REPLY)], 'R1-F1: accept', { present }), null, `ruling (present ${present})`);
+  }
+});
+
+// #905 round 3 (R3-B1): an entry whose chain links FORWARD stays unbindable (it is never a source of authority) but what it shows still counts as shown: the request before it is no longer the last thing the owner saw.
+// Failure caught: the forward-linked text being dropped as if it were never printed, so the older request (#58) is approved although a newer one (#59) was shown after it.
+test('#905 a forward-linked later request makes the earlier one stale: later turn, same turn, and a visible hand-back turn (merge, extra round, ruling)', () => {
+  const A = { ...promptEntry('go'), uuid: 'u-A' };
+  const B = { ...promptEntry('next'), uuid: 'u-B' };
+  const hb = { ...promptEntry(HANDBACK, PEER_META), uuid: 'u-hb' };
+  const fwd = (text) => ({ ...said(text), parentUuid: 'u-later', uuid: 'u-fwd' });
+  const later = (back) => ({ ...result('a.txt'), uuid: 'u-later', parentUuid: back });
+  const ASK59_MERGE = REQUEST.replace('#58', '#59');
+  const RASK59 = roundRequest(59, 4, GHEAD, REPO);
+  for (const present of [true, false]) {
+    const opts = { present };
+    // a later turn: [A, B, request #58 under B, forward text #59 -> a later tool result of A]
+    assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [A, B, said(REQUEST), fwd(ASK59_MERGE), later('u-A')], opts), { home: tmp(), now })), `merge, later turn (present ${present})`);
+    assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [A, B, said(RASK), fwd(RASK59), later('u-A')], opts), { home: tmp(), now }), null, `extra round, later turn (present ${present})`);
+    assert.equal(rule(tmp(), [A, B, said(ASK_REPLY), fwd(ASK59), later('u-A')], 'R1-F1: accept', opts), null, `ruling, later turn (present ${present})`);
+    // the same turn: [A, request #58, forward text #59 under A]
+    assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [A, said(REQUEST), fwd(ASK59_MERGE), later('u-A')], opts), { home: tmp(), now })), `merge, same turn (present ${present})`);
+    assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [A, said(RASK), fwd(RASK59), later('u-A')], opts), { home: tmp(), now }), null, `extra round, same turn (present ${present})`);
+    assert.equal(rule(tmp(), [A, said(ASK_REPLY), fwd(ASK59), later('u-A')], 'R1-F1: accept', opts), null, `ruling, same turn (present ${present})`);
+    // a visible synthetic hand-back turn that shows text through a forward link voids the ruling ask before it
+    assert.equal(rule(tmp(), [A, said(ASK_REPLY), hb, fwd('Worker is done.'), later('u-hb')], 'R1-F1: accept', opts), null, `ruling, hand-back turn (present ${present})`);
+  }
+});
+
 // #905 allow side: the walk still binds when it reaches a known turn. Failure caught: the fix failing closed on every non-owner boundary, so a request after a real compaction or under a summary chained to the owner's prompt stops binding.
 test('#905 a request after a real compaction and the owner\'s next typed prompt binds; so does one under a half-flagged summary chained to the owner\'s prompt', () => {
   for (const present of [true, false]) {
