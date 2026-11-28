@@ -171,22 +171,6 @@ export function applyCostPatch(cost, patchCost, { evict = true } = {}) {
   return next;
 }
 
-// Two cost sections of ONE PR added up (a legacy cost held back from a record, and what the record gathered meanwhile). Returns a NEW cost. The guard-block count is a figure of the guard log, not a sum: the newer one that is set wins.
-export function mergeCost(a, b) {
-  const sum = (x, y) => addTotals(x, { ...emptyTotals(), ...(isPlainObject(y) ? y : {}) });
-  let next = structuredClone({ ...emptyCost(), ...a });
-  next.total = sum(next.total, b.total);
-  for (const g of ['byPhase', 'byRole', 'byRound']) {
-    for (const [k, v] of Object.entries(isPlainObject(b[g]) ? b[g] : {})) next[g] = { ...next[g], [k]: sum(next[g]?.[k], v) };
-  }
-  if (isPlainObject(b.byPrice)) next.byPrice = mergeByPrice(next.byPrice, b.byPrice);
-  for (const [k, n] of Object.entries(isPlainObject(b.priceTables) ? b.priceTables : {})) next.priceTables = { ...next.priceTables, [k]: (Number(next.priceTables?.[k]) || 0) + (Number(n) || 0) };
-  next.transcripts = { ...next.transcripts, ...b.transcripts };
-  next = addRetries(addSessions(next, b.sessions ?? [], { evict: false }), Number(b.retries) || 0);
-  if (b.guardBlocks != null) Object.assign(next, { guardBlocks: b.guardBlocks, guardBySession: b.guardBySession ?? null });
-  return next;
-}
-
 // ---- the cost of a PR as the append-only bookings say it ------------------------------------------------------------
 
 // What the PR's cost is NOW: the legacy base (the cost section of the run record, written by an older CLI or by the summary / checkpoint writers; absent => nothing) with every

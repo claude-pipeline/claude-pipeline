@@ -3,7 +3,7 @@
 // supply (the run record, or the summary sections) is kept from the comment already on the PR instead of being lost.
 import { readRepoMoves, sameRepo } from '../hooks/lib/repo-moves.mjs';
 import { MARKERS } from './render.mjs';
-import { costShapeProblem, effectiveCost, mergeCost } from './run-cost.mjs';
+import { effectiveCost } from './run-cost.mjs';
 import { readCostBookings } from './run-events.mjs';
 import { STATUS_END, STATUS_START, decodeRecord, encodeRecord, renderStatusBlock } from './run-record.mjs';
 
@@ -28,26 +28,6 @@ export function recordBelongs(record, { pr, repo, moves } = {}) {
   return sameRepo({ recorded: record.repo, recordedAt: record.heartbeat?.at, current: repo, moves: moves ?? readRepoMoves().moves });
 }
 
-// What the record's cost is bound to: a record not provably this PR's (another repository, a rename not registered, an unreadable moves file) COUNTS for nothing, and the record this returns does not carry that cost as `cost` (the writers
-// adopt a record whose only mismatch is the repo and would then count it under the live name) but under `heldCost` { repo, at, cost }: the repository and the heartbeat time it was bound to, written back untouched and never counted.
-// When the held cost is provably ours later (the move registered, the file readable again), it is merged back into `cost`. -> { record?: the record to return in place of the decoded one, ours, base: the cost to count }
-function heldBack(decoded, { pr, repo, moves }) {
-  if (decoded.status !== 'ok') return { ours: false };
-  const r = decoded.record;
-  const ours = recordBelongs(r, { pr, repo, moves });
-  const held = r.heldCost;
-  const heldOurs = ours && held && !costShapeProblem(held.cost) && recordBelongs({ pr: r.pr, repo: held.repo, heartbeat: { at: held.at } }, { pr, repo, moves });
-  if (heldOurs) {
-    const { heldCost, ...rest } = r;
-    const cost = r.cost ? mergeCost(held.cost, r.cost) : held.cost;
-    return { record: { ...rest, cost }, ours, base: cost };
-  }
-  if (ours || (!r.cost && !held)) return { ours, base: ours ? r.cost : undefined };
-  const { cost, ...rest } = r;
-  const heldCost = held && cost ? { ...held, cost: mergeCost(held.cost, cost) } : (held ?? { repo: r.repo, at: r.heartbeat?.at, cost });
-  return { record: { ...rest, heldCost }, ours };
-}
-
 // The newest summary comment the viewer wrote that STARTS with the marker: the same one upsertComment edits.
 // -> {status: ok|absent|legacy|unsupported|invalid, record?, sections, url, id, costBookings, effectiveCost}
 // `summaryFromComments(comments, viewerLogin, pr, { repo, moves })` works on a comment list the caller already holds. `repo` (the PR's slug) binds the record's cost base to this repository too (recordBelongs):
@@ -63,8 +43,11 @@ export function summaryFromComments(comments, viewerLogin, pr, { repo, moves } =
   const found = mine.at(-1);
   if (!found) return { status: 'absent', sections: '', url: null, id: null, costBookings, effectiveCost: effectiveCost({ baseStatus: 'absent', ...costBookings }) };
   const decoded = decodeRecord(found.body);
-  const { record: held, ours, base } = heldBack(decoded, { pr, repo, moves });
-  return { ...decoded, ...(held ? { record: held } : {}), sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id, costBookings, effectiveCost: effectiveCost({ base, baseStatus: decoded.status, ...costBookings }) };
+  // A record bound to another PR or repository (a summary copied over by hand) is no base: its cost is neither counted here nor carried by the record this returns (the writers adopt a record whose only mismatch is the repo).
+  const ours = decoded.status === 'ok' && recordBelongs(decoded.record, { pr, repo, moves });
+  const base = ours ? decoded.record.cost : undefined;
+  const foreign = decoded.status === 'ok' && !ours ? { record: Object.fromEntries(Object.entries(decoded.record).filter(([k]) => k !== 'cost')) } : {};
+  return { ...decoded, ...foreign, sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id, costBookings, effectiveCost: effectiveCost({ base, baseStatus: decoded.status, ...costBookings }) };
 }
 
 // The cost to show for a record about to be written: `base` (that record's own cost section) with the bookings of a summary read (`summaryFromComments` result) on top.
