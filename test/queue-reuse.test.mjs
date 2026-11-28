@@ -275,7 +275,7 @@ test('the decider imports only files the step extracts from the base (.github/sc
 
 // Failure caught: the PR changed the workflow, the test runner or the proof code: the PR run's evidence was produced by that very code.
 test('the queue commit changes workflow, test runner or proof logic -> run (untouched files are fine)', async () => {
-  for (const file of ['.github/workflows/ci.yml', '.github/scripts/queue-reuse.mjs', 'scripts/test.mjs', 'scripts/verify.mjs', 'scripts/lib/shard.mjs', 'package.json', 'package-lock.json', '.gitattributes', ...importedByTestRunner]) {
+  for (const file of ['.github/workflows/ci.yml', '.github/scripts/queue-reuse.mjs', 'scripts/test.mjs', 'scripts/verify.mjs', 'scripts/lib/shard.mjs', 'package.json', 'package-lock.json', '.gitattributes', 'pipeline/lib/ci-proof.mjs' /* in neither import closure: named so dropping it from PROOF_LOGIC fails here */, ...importedByTestRunner]) {
     await mustRun({ touch: file }, new RegExp(`RUN: the queue commit changes proof logic \\(${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   }
   const unrelated = await decide({ touch: 'pipeline/lib/other.mjs' });
@@ -292,7 +292,11 @@ test('any API failure or garbled reply -> run, exit 0', async () => {
   assert.equal((await decide({ over: { pull: { stdout: 'not json' } } })).output, 'run=true');
   assert.equal((await decide({ over: { mergeCommit: { stdoutJson: {} } } })).output, 'run=true');
   assert.equal((await decide({ over: { runs: { stdoutJson: {} } } })).output, 'run=true');
-  assert.equal((await decide({ env: { TESTED_TREE_GH_ARGV: JSON.stringify(['no-such-gh-binary-xyz']) } })).output, 'run=true');
+  const noGh = await decide({ env: { TESTED_TREE_GH_ARGV: JSON.stringify(['no-such-gh-binary-xyz']) } });
+  assert.equal(noGh.output, 'run=true');
+  // Windows only: the decider's own resolver refuses a bare gh (no cwd search); elsewhere the failure is a plain spawn error.
+  // Not matched on a "RUN: " prefix, queue-members wraps the reason.
+  if (process.platform === 'win32') assert.match(noGh.stdout, /is not on PATH/);
 });
 
 test('missing inputs, a checkout that is not the queue commit, or a queue ref of another branch -> run', async () => {
