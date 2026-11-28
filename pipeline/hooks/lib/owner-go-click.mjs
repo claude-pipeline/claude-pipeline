@@ -136,7 +136,9 @@ export function roundAsk({ repo, pr, line, variant = ROUND_VARIANT_LEGACY }) {
 // The ruling dialog's fixed variant set (cp #771), the same pattern as ROUND_VARIANTS: a frozen table, each id immutable once shipped (a test pins the sha256 of each dialog), the ask file names its
 // variant and the verifier REBUILDS the dialog from this table. Unlike the round dialog the answer texts are built from the asked ids, so the table holds the option ORDER and which one carries
 // "(Recommended)"; the label, description and answer word of each option are fixed below. `ruling-v1` is the legacy dialog byte for byte (no variant key, v 1). The recommended option's answer is the
-// same text its plain label maps to, so a click records the same ruling either way. Reject is never recommended (no ruling-v2-reject).
+// same text its plain label maps to, so a click records the same ruling either way. Each v2 variant names the `codes` (RULING_WHY, of its own decision) whose recommendation row it may carry, so the verifier
+// checks the row per VARIANT: `ruling-v2-follow-up` is the one that claims "the pipeline rates it low" (minor-later), `ruling-v2-follow-up-any` has the same buttons but a row that makes no such claim
+// (owner-ruling rechecks low severity only for the first). A click on a recommended Reject records what a click on the same label of the neutral dialog (or the typed `ID: reject`) records (cp #944).
 const RULING_OPTIONS = Object.freeze({
   notNow: { label: 'Not now', word: null, description: () => 'Rule on nothing now. Nothing is recorded.' },
   accept: { label: 'Accept all', word: 'accept', description: (ids) => `Accept every item asked (${ids.join(', ')}).` },
@@ -144,9 +146,11 @@ const RULING_OPTIONS = Object.freeze({
   reject: { label: 'Reject all', word: 'reject', description: (ids) => `Reject every item asked (${ids.join(', ')}).` },
 });
 const RULING_VARIANTS = Object.freeze({
-  'ruling-v1': { order: ['notNow', 'accept', 'followUp', 'reject'], recommended: null },
-  'ruling-v2-accept': { order: ['accept', 'followUp', 'reject', 'notNow'], recommended: 'accept' },
-  'ruling-v2-follow-up': { order: ['followUp', 'accept', 'reject', 'notNow'], recommended: 'followUp' },
+  'ruling-v1': { order: ['notNow', 'accept', 'followUp', 'reject'], recommended: null, decision: null, codes: [] },
+  'ruling-v2-accept': { order: ['accept', 'followUp', 'reject', 'notNow'], recommended: 'accept', decision: 'accept', codes: ['real-problem', 'unclear-safe'] },
+  'ruling-v2-follow-up': { order: ['followUp', 'accept', 'reject', 'notNow'], recommended: 'followUp', decision: 'follow-up', codes: ['minor-later'] },
+  'ruling-v2-follow-up-any': { order: ['followUp', 'accept', 'reject', 'notNow'], recommended: 'followUp', decision: 'follow-up', codes: ['fix-separately'] },
+  'ruling-v2-reject': { order: ['reject', 'accept', 'followUp', 'notNow'], recommended: 'reject', decision: 'reject', codes: ['not-a-bug', 'already-handled', 'no-user-impact'] },
 });
 export const RULING_VARIANT_IDS = Object.freeze(Object.keys(RULING_VARIANTS));
 export const RULING_VARIANT_LEGACY = 'ruling-v1';
@@ -159,16 +163,27 @@ export const RULING_WHY = Object.freeze({
   }),
   'follow-up': Object.freeze({
     'minor-later': "Claude rates these as minor, and the pipeline's own severity check rates them low: fixing them in their own issue does not hold this PR.",
+    'fix-separately': "Claude rates each item worth fixing, but not in this PR (it was there before, or lies outside this change); its own issue keeps it tracked. This is Claude's rating, not the pipeline's severity check.",
+  }),
+  reject: Object.freeze({
+    'not-a-bug': 'Claude checked the code for each item: what it describes does not happen, so there is nothing to fix.',
+    'already-handled': 'Claude checked the code for each item: another part of the code already prevents what it describes, so a change here adds nothing.',
+    'no-user-impact': 'Claude checked the code for each item: what it describes can only happen in a case users never reach (for example while an update is being installed), so it is not worth changing.',
   }),
 });
-const RULING_DECISION_WORD = Object.freeze({ accept: 'Accept', 'follow-up': 'Follow-up' });
+const RULING_DECISION_WORD = Object.freeze({ accept: 'Accept', 'follow-up': 'Follow-up', reject: 'Reject' });
 const RECOMMENDS = 'Claude recommends ';
 // The recommendation row of the dialog's question (one line, before the binding last line; it binds nothing). Null for a decision / code that is not in the table.
 export function rulingWhyRow(decision, code) {
   const text = Object.hasOwn(RULING_WHY, decision) && Object.hasOwn(RULING_WHY[decision], code) ? RULING_WHY[decision][code] : null;
   return text === null ? null : `${RECOMMENDS}${RULING_DECISION_WORD[decision]} all (when asked): ${text}`;
 }
-const rulingVariantDecision = (variant) => (RULING_VARIANTS[variant].recommended === 'accept' ? 'accept' : RULING_VARIANTS[variant].recommended === 'followUp' ? 'follow-up' : null);
+const rulingVariantDecision = (variant) => RULING_VARIANTS[variant].decision;
+// The v2 dialog that carries the recommendation row (decision, code), or null for a pair not in the table: the CLI's only way to pick a variant.
+export function rulingVariantFor(decision, code) {
+  if (typeof decision !== 'string' || typeof code !== 'string') return null;
+  return Object.keys(RULING_VARIANTS).find((id) => RULING_VARIANTS[id].decision === decision && RULING_VARIANTS[id].codes.includes(code)) ?? null;
+}
 // `variant` omitted = the legacy dialog; an id outside the table (or any non-string) -> null. The parts of a legacy dialog carry no `variant` key, so an ask built from them is byte-identical to today's.
 export function rulingAsk({ repo, pr, ids, line, variant = RULING_VARIANT_LEGACY }) {
   if (typeof variant !== 'string' || !Object.hasOwn(RULING_VARIANTS, variant)) return null;
@@ -232,12 +247,12 @@ function installedParts(ask, home) {
     if (asked === null || asked.pr !== pr) return null;
     const variant = ask.variant ?? RULING_VARIANT_LEGACY;
     if (typeof variant !== 'string' || !Object.hasOwn(RULING_VARIANTS, variant)) return null;
-    // The recommendation row is installed text too (the question body comes from the file): a v2 ask carries exactly one, just before the binding last line, equal to a table row for the variant's
-    // decision; a v1 ask carries none.
+    // The recommendation row is installed text too (the question body comes from the file): a v2 ask carries exactly one, just before the binding last line, equal to the table row of one of THAT variant's
+    // codes; a v1 ask carries none.
     const lines = block.split('\n');
     const rows = lines.filter((l) => l.startsWith(RECOMMENDS));
     const decision = rulingVariantDecision(variant);
-    if (decision === null ? rows.length !== 0 : rows.length !== 1 || lines.at(-2) !== rows[0] || !Object.keys(RULING_WHY[decision]).some((code) => rulingWhyRow(decision, code) === rows[0])) return null;
+    if (decision === null ? rows.length !== 0 : rows.length !== 1 || lines.at(-2) !== rows[0] || !RULING_VARIANTS[variant].codes.some((code) => rulingWhyRow(decision, code) === rows[0])) return null;
     return rulingAsk({ repo: ask.repo, pr, ids: asked.ids, line: block, variant });
   }
   if (ask.kind === 'live-db') {
