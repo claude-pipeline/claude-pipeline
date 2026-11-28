@@ -582,6 +582,11 @@ test('triage ruling-request --recommend reject|fix-separately: refused for an im
   assert.equal((await mixedAsk('fix-separately')).output.dialogVariant, 'ruling-v2-follow-up-any');
   assert.match((await mixedAsk('minor-later')).output.recommendRefused, /not low severity.*recommend follow-up with --why fix-separately/);
   assert.match((await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused, /not low severity/);
+  // failure caught (#956 review R3): a model-proof malfunction wait told "run the neutral dialog" instead of "re-run the judge/arbiter" (the owner would be asked about an item a re-run clears)
+  const malfunction = triageWorld(CHAT(), { final: { decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause: 'model-proof', reason: 'model-proof failed: ruling not provably from Fable' } });
+  const malfunctionRefused = (await askRec(malfunction, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
+  assert.match(malfunctionRefused, /not low severity.*model-proof malfunction: re-run the judge\/arbiter/);
+  assert.doesNotMatch(malfunctionRefused, /no --recommend/);
 });
 
 test('triage ruling-request --recommend: an unreadable reviewed diff refuses minor-later only; reject and fix-separately judge no severity and need no diff', async () => {

@@ -1035,11 +1035,12 @@ async function rulingRequest(rest, ctx) {
     const notes = items.filter((i) => isDeferrableAccept(i) || isOwnerDeferral(i)).map((i) => deferNote(i));
     // May the recommendation be shown? Refused => the neutral legacy dialog and the reason, never a retry (exit 0).
     const refusedRaw = values.recommend === undefined ? null : recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: values.why });
-    // minor-later claims "the pipeline rates it low": when that is what refused it, name the code that makes no such claim, but only when fix-separately would itself be shown for the whole batch (#956: a serious open accepted fix, a contrary second review, a contradicted scope or a malfunction wait refuse it too, so the neutral dialog is the way).
+    // minor-later claims "the pipeline rates it low": when that is what refused it, name the code that makes no such claim, but only when fix-separately would itself be shown for the whole batch (#956: a serious open accepted fix, a contrary second review or a contradicted scope refuse it too, so the neutral dialog is the way; a malfunction wait is re-run, not asked, so its reason is passed on without the neutral-dialog advice).
     const severityRefused = refusedRaw !== null && values.why === 'minor-later' && / is not low severity \(/.test(refusedRaw);
-    const refused = !severityRefused ? refusedRaw : recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: 'fix-separately' }) === null
+    const fixSeparately = severityRefused ? recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: 'fix-separately' }) : null;
+    const refused = !severityRefused ? refusedRaw : fixSeparately === null
       ? `${refusedRaw}; if Claude's own research rates it worth fixing but not in this PR, recommend follow-up with --why fix-separately`
-      : `${refusedRaw}; fix-separately is refused for these items too: run ruling-request with no --recommend (the owner can still click Follow-up all)`;
+      : `${refusedRaw}; fix-separately is refused too (${fixSeparately})${/ malfunction: /.test(fixSeparately) ? '' : ': run ruling-request with no --recommend (the owner can still click Follow-up all)'}`;
     const shown = values.recommend !== undefined && refused === null;
     const dialogVariant = shown ? rulingVariantFor(values.recommend, values.why) ?? RULING_VARIANT_LEGACY : RULING_VARIANT_LEGACY;
     const recommendFields = { recommend: shown ? values.recommend : null, why: shown ? values.why : null, dialogVariant, ...(refused === null ? {} : { recommendRefused: refused }) };
