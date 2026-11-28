@@ -55,12 +55,14 @@ const stampResumed = ({ host, now, head }) => ({ at: new Date(now).toISOString()
 //  - `firstRead`: the caller's OWN earlier read of the comment, for a caller that builds its record without baseRecordFor (`P summary`, `P comment --kind summary`):
 //    when it was invalid the record is stamped here exactly as baseRecordFor would have, so a stale writer that PATCHed an ordinary record in between does not
 //    leave the run unmarked and without an event.
-// The fresh read also supplies the kept sections. `retry`: the summary write waits out a rate limit (the comment, summary and checkpoint commands opt in;
+// The fresh read also supplies the kept sections. `record` may be a function of that fresh read, returning the record to write: the recorder builds its record
+// there, on the comment as it is NOW, so a booking that landed since the caller's first look is kept, not erased.
+// `retry`: the summary write waits out a rate limit (the comment, summary and checkpoint commands opt in;
 // the run recorder never does, so merge, update-branch and cost never sleep).
 export function writeRunRecord(gh, pr, { record, sections, host = hostname(), now = Date.now(), skipResumedEvent = false, firstRead = null, retry = false }) {
   const fresh = readSummaryComment(gh, pr);
   if (fresh.status === 'unsupported') throw new Error(UNSUPPORTED);
-  let out = record;
+  let out = typeof record === 'function' ? record(fresh) : record;
   const warnings = [];
   if (!out.resumed) {
     if (fresh.status === 'ok' && fresh.record.resumed) out = { ...out, resumed: fresh.record.resumed };
@@ -99,33 +101,30 @@ export function resumedRunState(gh, pr) {
 }
 
 // One recorder per command run. update(patch) never throws: it returns the new record, or null with a warning.
-// `raced` (after an update): the writer's fresh re-read held a different cost section than the read the record was built on, so another booking landed in between and
-// the new total is not `previous` + this patch: a caller must not diff the two to name its own amount.
-const costOf = (read) => (read?.status === 'ok' ? JSON.stringify(read.record.cost ?? null) : null);
+// The record is built and the patch applied on the writer's fresh re-read (writeRunRecord), not on an earlier read: a booking that landed in between stays in the
+// total, and `previous` (the record the patch was applied to) is exactly the base the new total grew from.
 export function createRunRecorder({ gh, pr, host = hostname(), now = () => Date.now() }) {
   const warnings = [];
   const warn = (w) => { if (!warnings.includes(w)) warnings.push(w); };
   let view = null;
   let previous = null;
-  let raced = false;
   return {
     warnings,
     host,
-    // The record the last update() started from (before its patch); null until one ran. `P cost` diffs it against the new record to say what ITS call added.
+    // The record the last update() applied its patch to (before the patch); null until one ran. `P cost` diffs it against the new record to say what ITS call added.
     get previous() { return previous; },
-    get raced() { return raced; },
     // `initialStep`: the step a brand-new record starts at (an existing record keeps its own unless the patch sets it).
     update(patch, { initialStep = 'build' } = {}) {
       try {
-        const existing = readSummaryComment(gh, pr);
         view ??= gh.prView(pr, [...VIEW_FIELDS]);
         const repo = gh.repo().slug;
-        const base = baseRecordFor(existing, { repo, pr, branch: view.headRefName, baseRef: view.baseRefName, step: initialStep, host, now: now(), head: view.headRefOid });
-        base.warnings.forEach(warn);
-        previous = base.record;
-        const record = applyCheckpoint(base.record, patch, { host, now: now() });
-        const posted = writeRunRecord(gh, pr, { record, host, now: now() });
-        raced = costOf(existing) !== costOf(posted.fresh);
+        const build = (fresh) => {
+          const base = baseRecordFor(fresh, { repo, pr, branch: view.headRefName, baseRef: view.baseRefName, step: initialStep, host, now: now(), head: view.headRefOid });
+          base.warnings.forEach(warn);
+          previous = base.record;
+          return applyCheckpoint(base.record, patch, { host, now: now() });
+        };
+        const posted = writeRunRecord(gh, pr, { record: build, host, now: now() });
         posted.warnings.forEach(warn);
         return posted.record;
       } catch (err) {
