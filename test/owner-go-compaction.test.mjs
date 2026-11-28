@@ -231,6 +231,16 @@ test('#905 a forward-linked later request makes the earlier one stale: later tur
     assert.equal(rule(tmp(), [A, said(ASK_REPLY), fwd(ASK59), later('u-A')], 'R1-F1: accept', opts), null, `ruling, same turn (present ${present})`);
     // a visible synthetic hand-back turn that shows text through a forward link voids the ruling ask before it
     assert.equal(rule(tmp(), [A, said(ASK_REPLY), hb, fwd('Worker is done.'), later('u-hb')], 'R1-F1: accept', opts), null, `ruling, hand-back turn (present ${present})`);
+    // R4-S1: the forward-linked entry carries NO assistant text: a tool result (or a tool input) that surfaces the newer ask is shown just the same, so the older request is stale
+    const fwdResult = (text) => ({ ...result(text), parentUuid: 'u-later', uuid: 'u-fwd' });
+    const fwdUse = (text) => ({ ...use(text), parentUuid: 'u-later', uuid: 'u-fwd' });
+    assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [A, said(REQUEST), fwdResult(ASK59_MERGE), later('u-A')], opts), { home: tmp(), now })), `merge, forward tool result (present ${present})`);
+    assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [A, said(REQUEST), fwdUse(ASK59_MERGE), later('u-A')], opts), { home: tmp(), now })), `merge, forward tool input (present ${present})`);
+    assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [A, said(RASK), fwdResult(RASK59), later('u-A')], opts), { home: tmp(), now }), null, `extra round, forward tool result (present ${present})`);
+    assert.equal(rule(tmp(), [A, said(ASK_REPLY), fwdResult(ASK59), later('u-A')], 'R1-F1: accept', opts), null, `ruling, forward tool result (present ${present})`);
+    // allow companion: a forward-linked tool result that surfaces nothing leaves the request standing (stray detection must not void every request that has a forward-linked entry)
+    const quiet = recordApproval(hookInput(tmp(), 'merge', [A, said(REQUEST), fwdResult('a.txt'), later('u-A')], opts), { home: tmp(), now });
+    assert.deepEqual(quiet?.requests.map((q) => q.pr), [58], `merge, quiet forward tool result still binds (present ${present})`);
   }
 });
 
