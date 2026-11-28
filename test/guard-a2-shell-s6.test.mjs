@@ -99,11 +99,12 @@ test('case: nested patterns that fail after a substitution cannot multiply the w
   for (const b of builds) for (const k of [25, 60]) {
     let t = 'true';
     for (let j = 0; j < k; j++) t = b(t);
-    // Counted, not timed: the parse reports the characters it lexed (`work`), and every retry is charged to it, so a retry nobody charges leaves the budget unspent (no truncation,
-    // seconds of real work) and fails here on any machine. The budget is crossed by at most one scan, hence a small slack over MAX_WORK.
+    // Counted, not timed: the parse reports the characters it lexed (`work`), and every failed scan is charged to it. The default depth limit (5) cuts these texts short too, so `truncated` alone
+    // proves nothing about the charge: the budget must actually be spent (work > MAX_WORK, true for all six texts), or retries that nobody charges (seconds of real work, work ~ the text length) pass.
+    // The budget is crossed by at most one scan, hence the small slack over MAX_WORK.
     const r = simpleCommands(t);
-    assert.equal(r.truncated, true, `the budget cut the parse short (${k} levels)`);
-    assert.ok(r.work > 0 && r.work <= MAX_WORK + 100_000, `work stays within the budget (${k} levels): ${r.work} of ${MAX_WORK}`);
+    assert.equal(r.truncated, true, `the parse was cut short (${k} levels)`);
+    assert.ok(r.work > MAX_WORK && r.work <= MAX_WORK + 100_000, `the work budget was spent and not overrun (${k} levels): ${r.work} of ${MAX_WORK}`);
   }
 });
 
