@@ -119,7 +119,10 @@ export function lowerCapTo(state, configuredMax) {
   const stored = state?.maxRounds;
   if (!Number.isInteger(configuredMax) || configuredMax < 1) return state;
   if (!Number.isInteger(stored) || stored <= configuredMax) return state;
-  return { ...state, maxRounds: configuredMax, capLoweredFrom: Math.max(stored, Number.isInteger(state.capLoweredFrom) ? state.capLoweredFrom : 0) };
+  const from = state.capLoweredFrom;
+  // A recorded capLoweredFrom that is present but not an integer in 1..5 is corrupt: it stays as it is, so verifyOwnerGrants refuses it instead of it being replaced by a valid-looking value.
+  if (from !== undefined && !(Number.isInteger(from) && from >= 1 && from <= 5)) return { ...state, maxRounds: configuredMax };
+  return { ...state, maxRounds: configuredMax, capLoweredFrom: Math.max(stored, from ?? 0) };
 }
 
 export function emptyState({ repo, pr, branch, risk, lightLane = false, maxRounds = 3 }) {

@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { roundWorld } from './helpers/round-world.mjs';
 import { cleanupAtExit, ownerApprovesPast, ownerGrants, pastRoundRequest, roundRequest } from './helpers/owner-go.mjs';
-import { addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
+import { addRound, decodeFromComment, emptyState, lowerCapTo, saveState } from '../pipeline/lib/state.mjs';
 import { triageComment } from '../pipeline/lib/render.mjs';
 import { roundOutcome } from '../pipeline/lib/triage.mjs';
 import { readBaseline, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
@@ -471,4 +471,23 @@ test('state show: a copy AHEAD of the PR only in a round-level proof, while the 
   assertExit(pub, 0, pub.stderr + pub.stdout);
   const out = w.published();
   assert.deepEqual([out.rounds.find((r) => r.n === 2).modelProof, out.rounds.find((r) => r.n === 3).ownerGrant], [proof, grant], 'the PR holds the proof and the grant');
+});
+
+test('lowerCapTo: a present but malformed capLoweredFrom is kept as it is, so the verifier still refuses it; a valid one is kept (R4-B1)', () => {
+  // failure caught: lowering the cap again replaced a corrupt capLoweredFrom (null) with the stored cap, so verifyOwnerGrants passed a state whose recorded history was corrupt
+  const ctx = { repo: 'acme/widgets', pr: 7, maxRounds: 2 };
+  const base = build('acme/widgets', [1, 2].map((n) => ({ n, admission: n === 1 ? 'normal' : 'auto-extra' })));
+  for (const bogus of [null, '3', 0, 99]) {
+    const lowered = lowerCapTo({ ...base, maxRounds: 3, capLoweredFrom: bogus }, 2);
+    assert.equal(lowered.maxRounds, 2, `the cap is still lowered (${JSON.stringify(bogus)})`);
+    assert.equal(lowered.capLoweredFrom, bogus, `capLoweredFrom ${JSON.stringify(bogus)} stays as it was`);
+    const r = verifyOwnerGrants(lowered, ctx);
+    assert.equal(r.ok, false, `capLoweredFrom ${JSON.stringify(bogus)}`);
+    assert.match(r.problems.join('|'), /capLoweredFrom.*the cap cannot be trusted/);
+  }
+  // control: a valid recorded cap is kept (the highest one), a missing one is created, and the verifier passes
+  assert.equal(lowerCapTo({ ...base, maxRounds: 3, capLoweredFrom: 4 }, 2).capLoweredFrom, 4);
+  const fresh = lowerCapTo({ ...base, maxRounds: 3 }, 2);
+  assert.equal(fresh.capLoweredFrom, 3);
+  assert.equal(verifyOwnerGrants(fresh, ctx).ok, true);
 });
