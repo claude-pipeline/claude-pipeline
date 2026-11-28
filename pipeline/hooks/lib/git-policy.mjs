@@ -15,8 +15,9 @@
 import { existsSync, readFileSync, statSync, realpathSync } from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
+import { pathRunRecord, UNDECIDABLE_HEREDOC, plainExit, exitFollows, shapeAt, sourcePathSearch, commandName, simpleCommands, splitArgs, scriptFileOf, scriptFeedsOf, sqlShellEscapes, startupFilesOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, splicesOptions, spliceText, implicitBindsOf, ZSH_NAME_BINDERS, SHELL_SET_NAMES, withoutLiteralText, INDIRECT_EXPANSION, indirectExpansionOnLine, arithAssignedNames, envUnset, refusalAdvice } from './shell-parse.mjs';
 export { withoutLiteralText, INDIRECT_EXPANSION, SETS_BY_NAME };
+export { VAR_BUILTINS, DIR_CHANGERS }; // (the names the command loop takes before any script-file reading: the #904 tests walk them)
 import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmMoverName, runnerShellSetting, isRunnerCommand, runnerSettingReason, packageScripts, localBin, nameAtRunTimeIn, markPackageState, pkgOwnWrite, pkgMarkersFor, pmStartDirs, binIsProgram, binSite, binInterpreter, MAX_BIN_INTERPRETERS, lineNames, defaultLexists } from './package-scripts.mjs';
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
@@ -1590,6 +1591,40 @@ const isNodeModulesOrPipelineHome = (p) => /[\\/]node_modules[\\/]/.test(p) || /
 // it like the same text typed on the line. A shell script that exists but cannot be read is denied (what runs is
 // unknown); one that does not exist runs nothing. Programs run by path and interpreter files are only scanned when
 // readable (a binary, a huge generated file or a package under node_modules is not ours to judge).
+// (#904) A TEXT program run by path whose base name the guard reads by name (a wrapper, a shell, an interpreter, `source`; `git`, `gh`, `cd`, the variable builtins and `for` in the command loop) is refused, its
+// content not read: the by-name reading drops the word before any record names the file, and a file named like a command is itself the disguise. Not refused (the by-name reading is then the right one): a binary, a program
+// under node_modules (by its spelling or where it really is) or the pipeline home, a missing file, a directory, a file that cannot be read. A word the reader resolves to a literal (`$HOME/bin/env`, `D=bin; $D/env`) is that literal;
+// one it cannot resolve keeps the parity of a plain `$X/tool`. A file an earlier command on the line writes counts as text (what it will hold is not read).
+const PATH_RUN_SWITCH = new Set([...VAR_BUILTINS, 'for', 'cd', 'chdir', 'pushd', 'popd', 'git', 'gh']); // (the names the command loop takes before any file reading; DIR_CHANGERS is declared further down)
+function pathRunRefusal(rec, dir, ctx) {
+  const word0 = rec.file;
+  const name = baseName(word0);
+  let word = rec.ambiguous ? expandVars(word0, ctx) : word0;
+  if (/^\$\{?HOME\}?(?=\/|$)/.test(word)) word = ctx.home + word.replace(/^\$\{?HOME\}?/, '');
+  if (DYNAMIC.test(word)) return null; // still only known at run time: as a plain `$X/tool`
+  const home = word === '~' || word.startsWith('~/') ? ctx.home + word.slice(1) : word;
+  // (by its spelling: no lookup needed, so an unknown directory does not matter. The word is read lexically normalised, so `../node_modules/.bin/x` and `node_modules/.bin/x` count and `./node_modules/../env` does not.
+  // A word with backslashes has two readings: a Windows path (backslashes as separators, quoted) and the shell's (escapes stripped, `\.\.` is `..`). The first must name the directory; the second must not lose it to a `..`)
+  const spelled = (r) => isNodeModulesOrPipelineHome('/' + path.posix.normalize(r));
+  const asPath = home.replace(/\\/g, '/'), asShell = home.replace(/\\(.)/g, '$1');
+  if (spelled(asPath) && (!isNodeModulesOrPipelineHome('/' + asShell) || spelled(asShell))) return null;
+  if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${word0} runs cannot be verified. Use an absolute path, or chain the cd with &&. (A virtualenv or other program after a cd the guard cannot follow: run it from a known directory or by its full path.)`);
+  const abs = path.resolve(dir ?? ctx.cwd, home);
+  checkDeadline(ctx.budget);
+  if (isNodeModulesOrPipelineHome(abs)) return null;
+  const refuse = () => deny(`the program \`${word0}\` is run by its path but named like the \`${name}\` command, so the guard reads it as \`${name}\` and never reads the file. Rename the script, or run it as \`sh ${word0}\` so the guard can read it.`);
+  if (writtenTo(ctx.writeFrames, abs, { exists: ctx.pathExists, readText: ctx.readText, ignoreUnmodelled: true }) !== null) return refuse(); // (a modelled write of this file earlier on the line, as `cp x.sh ./tool && ./tool`)
+  if (!ctx.pathExists(abs)) return null; // missing: nothing runs
+  if (ctx.readDir(abs)) return null; // a directory cannot be run
+  let real = abs;
+  try { real = ctx.realpath(abs); } catch { /* as written */ }
+  if (isNodeModulesOrPipelineHome(real)) return null;
+  let head = ctx.readHead(abs);
+  if (typeof head !== 'string') { const t = ctx.readText(abs); if (typeof t === 'string') head = t.slice(0, 512); }
+  if (typeof head !== 'string') return null; // exists but cannot be read: as a program run by path today
+  if (!head.startsWith('#!') && head.includes('\u0000')) return null; // a binary
+  return refuse();
+}
 function checkScriptFile(sf, dir, ctx, level) {
   if (sf.kind === 'sqllines') return judgeSqlEscapes(sf.lines, sf, dir, ctx, level);
   if (sf.joined) return checkJoinedScripts(sf, dir, ctx, level);
@@ -3653,6 +3688,16 @@ function evalString(str, startDir, ctx, level, child = false) {
     if (isRunnerCommand(c, argv.map((w) => expandVars(w, ctx)))) {
       const set = runnerShellSetting([...Object.keys(ctx.vars), ...ctx.unsureVars, ...ctx.tainted, ...Object.keys(c.env ?? {})]);
       if (set) verdict = deny(runnerSettingReason(set));
+    }
+    if (!verdict) { // (#904: before the command-name switch below, which takes these names without reading a file)
+      const startDir = c.chdir !== undefined ? chdirBase : dir;
+      for (const e of c.pathRuns ?? []) {
+        checkDeadline(ctx.budget);
+        const d = e.chdir === undefined ? startDir : e.chdir === null || startDir === null ? null : joinDir(startDir, e.chdir, ctx);
+        verdict = pathRunRefusal(e.rec, d, ctx);
+        if (verdict) break;
+      }
+      if (!verdict && PATH_RUN_SWITCH.has(name)) { const pr = pathRunRecord(argv); if (pr) { checkDeadline(ctx.budget); verdict = pathRunRefusal(pr, dir, ctx); } }
     }
     if (verdict) { /* refused: returned below */ }
     else if (VAR_BUILTINS.includes(name)) {

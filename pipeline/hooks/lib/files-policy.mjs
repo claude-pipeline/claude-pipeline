@@ -4436,6 +4436,40 @@ function judgeSqlLines(sf, dirs, ctx, opts) {
 const inNodeModules = (abs, opts) => /\/node_modules\//.test(abs) && !(opts?._pkgDir && (abs === opts._pkgDir || abs.startsWith(`${opts._pkgDir}/`)));
 // R17: the directory part of the word a script was started with, as written (`./scripts/run.sh` -> `./scripts`), is a literal cd target (`.` / `..` / `/` `./` `../` prefixed)
 const selfDirLiteral = (w, cdpath) => { const i = w.lastIndexOf('/'); return i >= 0 && cdTargetLiteral(i === 0 ? '/' : w.slice(0, i), cdpath); };
+// (#904) see pathRunRefusal in git-policy.mjs: the same rule, the same reason. The word is looked up in every directory the command may start in (and each joined with the entry's own change of directory); the candidates are the
+// reading the files guard already has of a plain program run by path. Only a modelled write counts (ignoreUnmodelled), so an unrelated program earlier on the line refuses nothing new.
+function pathRunRefusal(entry, dirs, ctx, opts) {
+  const rec = entry.rec;
+  const e = expandRefs(rec.file, ctx);
+  if (/[$`*?[]/.test(e)) return null; // still only known at run time: as a plain `$X/tool`
+  const name = baseOf(rec.file);
+  const P = pathsFor();
+  let starts = dirs;
+  if (typeof entry.chdir === 'string') {
+    const cd = expandRefs(entry.chdir, ctx);
+    if (!/[$`]/.test(cd)) starts = unique([...dirs, ...dirs.map((d) => (isAbs(cd) ? P.normalize(cd) : P.join(d, cd)))]);
+  }
+  const refuse = () => deny(`the program \`${rec.file}\` is run by its path but named like the \`${name}\` command, so the guard reads it as \`${name}\` and never reads the file. Rename the script, or run it as \`sh ${rec.file}\` so the guard can read it.`);
+  const seen = new Set();
+  for (const d of isAbs(e) ? [''] : starts) {
+    checkDeadline(ctx.budget);
+    const abs = isAbs(e) ? P.normalize(e) : P.join(d, e);
+    if (seen.has(abs)) continue;
+    seen.add(abs);
+    if (ctx.trusted(abs) || inNodeModules(abs, opts)) continue;
+    if (writtenTo(ctx.frames, abs, { exists: (x) => ctx.api.existsSync(x), readText: ctx.readText, ignoreUnmodelled: true }) !== null) return refuse();
+    if (!ctx.api.existsSync(abs)) continue;
+    const real = realResolve(abs, ctx.api);
+    if (ctx.trusted(real) || /\/node_modules\//.test(real)) continue;
+    if (ctx.readDir(abs)) continue; // a directory cannot be run
+    let head = ctx.readHead(abs);
+    if (typeof head !== 'string') { const t = ctx.readText(abs); if (typeof t === 'string') head = t.slice(0, 512); }
+    if (typeof head !== 'string') continue; // exists but cannot be read: as a program run by path today
+    if (!head.startsWith('#!') && head.includes('\u0000')) continue; // a binary
+    return refuse();
+  }
+  return null;
+}
 // One existing script file (`abs`, found in directory `dir`).
 function judgeFoundScript(sf, abs, dir, ctx, opts) {
   if (ctx.trusted(abs) || ctx.trusted(realResolve(abs, ctx.api)) || inNodeModules(abs, opts)) return null;
@@ -5552,6 +5586,10 @@ function evaluateBashForFilesFrame(command, opts) {
         if (v) return v;
         if (sf.kind === 'shell' && sourcesHere(c)) absorbSourced(sf, dirs, ctx, repeats(cmds, idx)); // (a sourced file runs in this shell: what it sets is the line's from here)
       }
+      for (const pr of c.pathRuns ?? []) { // (#904: a program run by path whose name the guard reads by name: refused, not read)
+        const v = pathRunRefusal(pr, sdirsNow(), ctx, withLineVars(opts, c));
+        if (v) return v;
+      }
       // #903 A: a setting that gives a package runner its shell text or its shell (before the package-script judgment, so a runner line gets this reason, not the generic mover one)
       if (isRunnerCommand(c, c.argv.map((w) => expandRefs(w, ctx)))) {
         const set = runnerShellSetting([...Object.keys(ctx.vars), ...ctx.unknownVars, ...ctx.pickUnknown, ...Object.keys(c.env ?? {})]);
@@ -5614,9 +5652,14 @@ function evaluateBashForFilesFrame(command, opts) {
   } else {
     // at the depth limit nothing is followed any further: a named script, a fed file or a startup file the line names is refused; the
     // implicit one (the real home's, which no word names) is judged here, once per evaluation like at the top level
-    for (const c of cmds) {
+    for (const [idx, c] of cmds.entries()) {
       checkDeadline(ctx.budget); // (the evaluation deadline)
+      frame.i = idx; // (#904: a program an earlier command on the line writes is seen by the path-run lookup below)
       if (scriptFileOf(c.argv) || scriptFeedsOf(c).length || pmCall(c.argv)) return deny('scripts run scripts too deeply to check');
+      for (const pr of c.pathRuns ?? []) { // (#904: no content is read, so the refusal test is exact here: a text ./env is refused, a node_modules program is not)
+        const v = pathRunRefusal(pr, dirs, ctx, opts);
+        if (v) return v;
+      }
       for (const st of startupFilesOf(c, cmds, { env: startupEnv, inherited: inheritedStartup })) {
         if (!st.implicit) return deny('scripts run scripts too deeply to check');
         const v = judgeStartupFile(st);
