@@ -76,21 +76,29 @@ export const isSupabaseTool = (tool, state, ti, ctx) => !!supabaseMatch(tool, st
 
 // The most screen rows of block the progress-note fallback accepts on the dialog alone: a dialog taller than a terminal screen may clip, and the owner must have read every line of the SQL (a longer block needs
 // the reply text or the typed go). Rows, not newlines (R2-B1: one 4000-character line is 50 rows in an 80-column terminal). A deliberate UPPER bound, whichever way the dialog wraps: each line counts the larger of
-// its hard-wrap rows and its greedy word-wrap rows (R3-F1), and a character outside printable ASCII counts 2 columns (wide glyphs, R3-B1), a tab 8.
+// its hard-wrap rows and its greedy word-wrap rows (R3-F1), and a character outside printable ASCII counts 2 columns (wide glyphs, R3-B1), a tab 8; every whitespace column counts (R4-B2).
 const PROGRESS_NOTE_BLOCK_MAX_ROWS = 40;
 const PROGRESS_NOTE_COLUMNS = 80;
 const colsOf = (s) => { let n = 0; for (const ch of s) n += ch === '\t' ? 8 : ch >= ' ' && ch <= '~' ? 1 : 2; return n; };
+// R4: a 2-column glyph cannot straddle the last column, so where a line is split mid-token a row holds only W - 1 columns once the line has one (R4-B1). The word-wrap pass walks tokens made of a run of
+// whitespace plus the word after it, so leading, repeated, trailing and tab whitespace all count and travel with their word to the next row (R4-B2); a token wider than a row is split hard.
 const rowsOfLine = (line) => {
   const W = PROGRESS_NOTE_COLUMNS;
-  const hard = Math.ceil(Math.max(1, colsOf(line)) / W);
-  let rows = 1;
-  let col = 0;
-  for (const word of line.split(' ')) {
-    const w = colsOf(word);
-    if (col > 0 && col + 1 + w > W) { rows += 1; col = 0; } else if (col > 0) col += 1;
-    if (w > W) { rows += Math.ceil(w / W) - 1; col = ((w - 1) % W) + 1; } else col += w;
-  }
-  return Math.max(hard, rows);
+  const wide = [...line].some((ch) => ch !== '\t' && (ch < ' ' || ch > '~'));
+  const hardWidth = wide ? W - 1 : W;
+  const hard = Math.ceil(Math.max(1, colsOf(line)) / hardWidth);
+  // Two greedy models, the larger counts: the whitespace run travels with its word (a wrapper that keeps indentation at the start of the next row), or it stays on the row it ends and only the word moves.
+  const walk = (tokens) => {
+    let rows = 1;
+    let col = 0;
+    for (const token of tokens) {
+      const w = colsOf(token);
+      if (col > 0 && col + w > W) { rows += 1; col = 0; }
+      if (w > W) { const parts = Math.ceil(w / hardWidth); rows += parts - 1; col = w - (parts - 1) * hardWidth; } else col += w;
+    }
+    return rows;
+  };
+  return Math.max(hard, walk(line.match(/\s*\S+|\s+/gu) ?? []), walk(line.match(/\s+|\S+/gu) ?? []));
 };
 const renderedRows = (text) => {
   const lines = String(text).replace(/\r\n/g, '\n').split('\n');

@@ -443,7 +443,11 @@ test('R1-F1: a block longer than the fallback bound is not claimed on a progress
   assert.equal(tc.status, 'unverified');
   assert.match(tc.reason, /at most 40 screen rows/);
   // R3-B1 / R3-F1: a wide-glyph line (2 columns each) and a line of 44-character words (one per row once word-wrapped) are as tall as the dialog may render them, though a plain 80-column hard wrap says fewer rows
-  for (const [what, sql] of [['wide glyphs', `update t set n = '${'界'.repeat(1800)}'`], ['44-character words', Array.from({ length: 53 }, () => 'a'.repeat(44)).join(' ')]]) {
+  for (const [what, sql] of [['wide glyphs', `update t set n = '${'界'.repeat(1800)}'`], ['44-character words', Array.from({ length: 53 }, () => 'a'.repeat(44)).join(' ')],
+    // R4-B1: a 2-column glyph cannot straddle column 80, so each of these lines is 3 rows, not 2
+    ['a wide glyph at column 80', Array.from({ length: 13 }, () => `${'a'.repeat(79)}界${'a'.repeat(79)}`).join('\n')],
+    // R4-B2: leading whitespace counts: 70 spaces then two 41-character words is 3 rows when word-wrapped, not 2
+    ['indented words', Array.from({ length: 13 }, () => `${' '.repeat(70)}${'a'.repeat(41)} ${'b'.repeat(41)}`).join('\n')]]) {
     const x = await world(t, { op: 'data', flush: true, reply: [progress], dataText: sql });
     assert.ok((await x.hook()).recorded, what);
     const xc = x.claim();
