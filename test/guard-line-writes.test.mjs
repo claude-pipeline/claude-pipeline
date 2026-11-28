@@ -2136,6 +2136,15 @@ test('#919: a `&` in a comment, quotes or a quoted heredoc body does not make th
   denyBoth('bash n.sh; cp f.sh n.sh &');
   denyBoth('bash n.sh; cp f.sh n.sh; (sleep 1) &');
   denyBoth('bash n.sh; cp f.sh n.sh; { sleep 1; } &');
+  // a comment is blanked whatever else the text holds; quoted text that a command may run (an argument, a pipe, a heredoc, a capture, a function) stays counted
+  allowBoth('# a & b\necho $(date)\nbash n.sh; cp f.sh n.sh');
+  denyBoth("bash -c 'sleep 1 &'\nbash n.sh; cp f.sh n.sh");
+  denyBoth("eval 'sleep 1 &'\nbash n.sh; cp f.sh n.sh");
+  denyBoth("for c in 'sleep 1 &'; do eval \"$c\"; done\nbash n.sh; cp f.sh n.sh");
+  denyBoth("echo 'sleep 1 &' | sh\nbash n.sh; cp f.sh n.sh");
+  denyBoth("sh <<'X'\nsleep 1 &\nX\nbash n.sh; cp f.sh n.sh");
+  denyBoth("x=$(echo 'sleep 1 &'); eval \"$x\"\nbash n.sh; cp f.sh n.sh");
+  denyBoth("f() { sh -c 'sleep 1 &'; }; f\nbash n.sh; cp f.sh n.sh");
   // a `&` inside a substitution stays opaque, also inside double quotes, in backticks, and in an UNQUOTED heredoc
   denyBoth('echo "$(sleep 1 &)"\nbash n.sh; cp f.sh n.sh');
   denyBoth('echo "a & $(sleep 1 &)"\nbash n.sh; cp f.sh n.sh');

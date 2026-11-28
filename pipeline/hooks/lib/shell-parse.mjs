@@ -4184,7 +4184,7 @@ function newCtx(maxDepth, expired, bashState) {
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
 // read the whole text (a limit, an error): the caller keeps the text as it is.
-function withoutComments(src, maxDepth, expired) {
+export function withoutComments(src, maxDepth, expired) {
   const ctx = newCtx(Math.min(Math.max(maxDepth, 0), HARD_MAX_DEPTH), expired, null);
   ctx.muted = 1;
   const p = new Parser(ctx, src);

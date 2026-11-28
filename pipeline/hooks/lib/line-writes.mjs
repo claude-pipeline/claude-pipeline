@@ -10,7 +10,7 @@
 // - A write counts for a command when it comes before it on the line (strictly: even a conditional or background one), runs in the same
 //   pipeline, races with a background job, or may repeat before it (a loop).
 // Pure: the policies supply how to expand a word and where a command runs (see newWriteFrame).
-import { commandName, withoutLiteralText, quotedBodiesBlank, expandedOnly } from './shell-parse.mjs';
+import { commandName, withoutComments, withoutLiteralText, quotedBodiesBlank, expandedOnly } from './shell-parse.mjs';
 import { applySed, sedReadings, dynamic } from './sed-emulate.mjs';
 
 // ---- control flow -------------------------------------------------------------------------------------------
@@ -1320,18 +1320,26 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
 }
 
 // The text the shell reads as command syntax, for the lone-`&` count (#919: a `&` in a comment, quotes or a quoted heredoc body is text, no background job).
-// Fails closed to the text as written: any UNQUOTED heredoc (its body expands, and an apostrophe in it would shift the quote scan), heredoc spans that cannot be placed,
-// or a text the scanner gives up on (`$'…'`, an open quote). Double-quoted text is blanked only when no substitution (`$(`, a backtick) is in the text: inside one, a nested quote could end it early.
+// Quoted text can be code (`bash -c 'x &'`, `echo 'x &' | sh`, `eval "$v"`), so it is blanked only when no command can run it: see quotedIsData.
+// Fails closed to the text with only its comments blanked: an unquoted heredoc (its body expands, and an apostrophe in it would shift the quote scan), heredoc spans that cannot be placed,
+// or a text the scanner gives up on (`$'…'`, an open quote).
+const DATA_CMDS = new Set(['echo', 'printf', 'cat', 'true', 'false', ':']); // (print their words; they run nothing)
+// Can no command run the quoted text? Not when it is piped or captured (`echo 'x &' | sh`, `$(…)`), given to a command that may run its words or its heredoc (`bash -c`, `eval`, `for c in 'x &'`), or defined in a function.
+function quotedIsData(text, cmds) {
+  if (/<<<|<\(|\$\(|`/.test(text) || (cmds.fns instanceof Set && cmds.fns.size > 0) || cmds.some((c) => c.sep === '|')) return false;
+  return cmds.every((c) => DATA_CMDS.has(commandName(c.argv[0] ?? '')) || !(/<</.test(c.raw ?? '') || [...c.argv.slice(1), ...Object.values(c.env ?? {})].some((w) => String(w).includes('&'))));
+}
 function syntaxText(text, cmds) {
-  let t = text;
+  const bare = withoutComments(text, 5, null) ?? text; // (a comment is never run, whatever else the text holds)
+  if (!quotedIsData(bare, cmds)) return bare;
+  let t = bare;
   if (/<</.test(t)) {
     const spans = cmds.heredocSpans;
-    if (!Array.isArray(spans) || spans.some(([a, b, quoted]) => quoted !== true || !(a >= 0 && a <= b && b <= t.length))) return text;
+    if (!Array.isArray(spans) || spans.some(([a, b, quoted]) => quoted !== true || !(a >= 0 && a <= b && b <= t.length))) return bare;
     t = quotedBodiesBlank(t, cmds);
   }
   const lit = withoutLiteralText(t);
-  if (lit === null) return text;
-  return /\$\(|`/.test(lit) ? lit : expandedOnly(lit);
+  return lit === null ? bare : expandedOnly(lit);
 }
 
 // commands that start a job which outlives them (a `&` is read from the text)
