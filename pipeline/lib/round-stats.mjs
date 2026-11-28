@@ -49,10 +49,11 @@ const ineligibleOf = (r) => (typeof r.resolutionIneligible === 'string' && r.res
 export const isReadableState = (state, pr) => !!state && state.pr === pr && Array.isArray(state.rounds) && state.rounds.every((r) => Number.isInteger(r?.n));
 
 // One PR: { repo, pr, id, maxRounds, countedRounds, pastCapRounds, usd, blockingLoop, rounds: [one row per counted round] }, or null when it has no review state.
-export function analysePr({ repo, pr, state, record }) {
+// `cost`: the PR's booked cost (the record's cost section plus the append-only bookings: summary-comment.mjs#summaryFromComments), null when there is none or it is unavailable (no usd then); left out, the record's own.
+export function analysePr({ repo, pr, state, record, cost = record?.cost }) {
   if (!state || !Array.isArray(state.rounds)) return null;
   const max = Number.isFinite(state.maxRounds) ? state.maxRounds : null;
-  const byRound = record?.cost?.byRound && typeof record.cost.byRound === 'object' ? record.cost.byRound : {};
+  const byRound = cost?.byRound && typeof cost.byRound === 'object' ? cost.byRound : {};
   const capDeferred = capLowOf(state).length;
   const rows = [];
   let k = 0;
@@ -77,7 +78,7 @@ export function analysePr({ repo, pr, state, record }) {
     prev = r;
   }
   const blockingLoop = rows.some((row, i) => i > 0 && row.acceptedBlocking && rows[i - 1].acceptedBlocking);
-  const usd = Number.isFinite(record?.cost?.total?.usd) ? money(record.cost.total.usd) : null;
+  const usd = Number.isFinite(cost?.total?.usd) ? money(cost.total.usd) : null;
   // The cap round's new accepts were all low (the stats' own rule: no BLOCKING, no security item), nothing was deferred, and an automatic extra round followed: what `review.cap_low_accepts` would have saved.
   const capLowNotDeferred = capDeferred === 0 && rows.some((r) => r.pastCap && r.k === max + 1 && r.admission === 'auto-extra' && r.previous === 'only-low-fixes');
   return { repo, pr, id: `${String(repo).split('/').pop()}#${pr}`, maxRounds: max, countedRounds: rows.length, pastCapRounds: rows.filter((r) => r.pastCap).length, usd, blockingLoop, capDeferredItems: capDeferred, capDeferReopened: capLowReopenedOf(state), capLowNotDeferred, rounds: rows };

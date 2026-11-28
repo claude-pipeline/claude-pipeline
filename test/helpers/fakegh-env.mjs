@@ -101,6 +101,9 @@ export function createCommentsGh(entries, { me = 'me', comments = [] } = {}) {
     // The PR's comments right now, and a way to change what the fake does next (fail: { write, list, writeAfter }).
     comments: () => read().comments,
     setFail(fail) { writeFileSync(state, JSON.stringify({ ...read(), fail })); },
+    // A stale read: the listing answers `list` (a snapshot taken earlier) until unfreeze(), while writes land on the live comments.
+    freeze(list) { writeFileSync(state, JSON.stringify({ ...read(), frozen: list })); },
+    unfreeze() { const s = read(); delete s.frozen; writeFileSync(state, JSON.stringify(s)); },
     addComment(c) {
       const s = read();
       s.comments.push({ id: 5000 + s.comments.length, user: { login: s.me }, created_at: '2026-11-05T09:00:00Z', updated_at: '2026-11-05T09:00:00Z', ...c });

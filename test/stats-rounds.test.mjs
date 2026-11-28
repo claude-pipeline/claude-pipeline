@@ -7,6 +7,7 @@ import { fileURLToPath } from 'node:url';
 import { aggregate, analysePr, isReadableState, isSecurityItem, renderTable } from '../pipeline/lib/round-stats.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import { encodeForComment } from '../pipeline/lib/state.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
@@ -411,4 +412,37 @@ test('analysePr: capLowNotDeferred is a PR whose last allowed round accepted onl
   const deferredPr = analysePr({ repo: 'a/b', pr: 3, state: stateOf([round(1, [capLow('R1-S1')])]), record: null });
   assert.deepEqual([ran.capLowNotDeferred, heavy.capLowNotDeferred, deferredPr.capLowNotDeferred], [true, false, false]);
   assert.equal(aggregate([ran, heavy, deferredPr]).capLowNotDeferred, 1);
+});
+
+// Two repositories each have a PR 7. The cost bookings are comments of the PR they were posted on: a stats run over both must price each PR from its own comment list.
+test('stats rounds: PR 7 of two repositories is priced from its own cost bookings, never the other\'s (#958)', () => {
+  const booking = (id, usd) => mine(3, renderEvent('cost-booking', id, 'Cost booked.', { id, entry: { phase: 'review', role: 'judge', input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd, round: 2 } }));
+  const r = statsCli([
+    { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), booking('w-1', 5)] },
+    { match: '^api repos/acme/other/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), booking('o-1', 12)] },
+    // two different pull requests (two slugs ⇒ each PR's identity is read, so neither is mistaken for the other under a second name)
+    { match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { number: 7, node_id: 'PR_node_w7', head: { ref: 'feat/w' }, base: { repo: { full_name: 'acme/widgets' } } } },
+    { match: '^api repos/acme/other/pulls/7$', stdoutJson: { number: 7, node_id: 'PR_node_o7', head: { ref: 'feat/o' }, base: { repo: { full_name: 'acme/other' } } } },
+    ...script([]),
+  ], ['--json', '--pr', '7', '--repo-slug', 'acme/widgets', '--repo-slug', 'acme/other']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual(r.json.prs.map((p) => [p.repo, p.usd]).sort(), [['acme/other', 12], ['acme/widgets', 5]]);
+});
+
+const bookingOf = (n, id, usd) => mine(n, renderEvent('cost-booking', id, 'Cost booked.', { id, entry: { phase: 'review', role: 'judge', input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd, round: 2 } }));
+
+test('R1-B7 stats rounds: a PR whose bookings cannot be read has no cost and says why (#958)', () => {
+  const broken = mine(5, '<!-- claude-pipeline:event:cost-booking:broken -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->');
+  const r = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), bookingOf(3, 'w-1', 5), broken] }], ['--json', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.prs[0].usd, null);
+  assert.match(r.json.warnings.join('\n'), /widgets#7: .*cost.*could not be read/);
+});
+
+test('R1-B6 stats rounds: a comment list cut by the page limit leaves the PR cost out instead of printing a partial total (#958)', () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => mine(i + 1, i === 0 ? triageBody(state7) : i === 1 ? bookingOf(2, 'w-1', 2).body : 'noise'));
+  const r = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: page1 }], ['--json', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.prs[0].usd, null, 'the $2 seen is not the PR total');
+  assert.match(r.json.warnings.join('\n'), /widgets#7: the comments were cut after 30 pages/);
 });

@@ -5,6 +5,8 @@ import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { MAX_PAGES, PAGE, pages } from '../lib/gh-pages.mjs';
 import { adoptRecord, decodeRecord } from '../lib/run-record.mjs';
+import { effectiveCost } from '../lib/run-cost.mjs';
+import { readCostBookings } from '../lib/run-events.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
 import { aggregate, analysePr, isReadableState, renderTable } from '../lib/round-stats.mjs';
 import { MARKERS } from '../lib/render.mjs';
@@ -61,10 +63,12 @@ async function rounds(rest, ctx) {
           };
           // The repository the PR lives in now: the listing's base repo, else the PR read; undefined = unknown (then the slug asked is taken). Only looked up when several slugs are asked or a record names another repository.
           const canonical = () => { const c = baseRepo ?? livePull()?.base?.repo?.full_name; return typeof c === 'string' && c !== '' ? c : undefined; };
-          const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record or state may be missing or old`));
+          let cut = false;
+          const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => { cut = true; warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record, state or cost bookings may be missing or old, so its cost is left out`); });
           let record = null; // the record of THIS repository slug: it wins over an adopted one whatever the comment order
           let adopted = null; // a record of the repository the PR moved from, adopted only when its branch is the live one: { record, from }
           let state = null;
+          let recordUnreadable = false;
           const slugLower = slug.toLowerCase();
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
           // "This repository" is the canonical one, resolved ONCE per PR and used for every record, so neither the order of two aliases nor the order of the comments can change the record picked. Looked up when several slugs are asked or an own record names another slug than the one asked.
@@ -99,7 +103,10 @@ async function rounds(rest, ctx) {
                   if (sameRepo) record = bound.record;
                   else adopted = { record: bound.record, from: r.record.repo };
                 } else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, `: not this PR or repository${lookupFailed ? ' (its branch could not be read)' : ''}`);
-              } else if (r.status === 'invalid' || r.status === 'unsupported') skip('a run record', `: unreadable (${r.status})`);
+              } else if (r.status === 'invalid' || r.status === 'unsupported') {
+                recordUnreadable = true;
+                skip('a run record', `: unreadable (${r.status})`);
+              }
             }
             if (isState) {
               const decoded = decodeFromComment(c.body);
@@ -122,7 +129,15 @@ async function rounds(rest, ctx) {
             continue;
           }
           const movedFrom = record === null && adopted !== null ? adopted.from : null;
-          const p = analysePr({ repo: slug, pr: number, state, record: record ?? adopted?.record ?? null });
+          const picked = record ?? adopted?.record ?? null;
+          // The cost is the picked record's cost section (this repository's own record, else one adopted from the repository the PR moved from) plus the cost bookings of THIS listing (this slug's
+          // comments of this PR: another repo's PR of the same number never mixes in). A record bound to another PR was skipped above and brings no cost; an unreadable record with no readable record of
+          // this repository, or an unreadable booking of ours, leaves the cost out (usd null).
+          const eff = effectiveCost({ base: picked?.cost, baseStatus: record === null && recordUnreadable ? 'invalid' : 'ok', ...readCostBookings({ comments, viewer: me }) });
+          // A list cut by the page limit holds only some of the bookings: a partial total would be printed as the PR's cost, so the cost is left out (the cut is already a warning).
+          if (eff.unavailable !== undefined) warnings.push(`${slug}#${number}: the booked cost is unavailable, so it is left out: ${asciiLine(eff.unavailable, 120)}`);
+          const cost = cut || eff.unavailable !== undefined || !eff.any ? null : eff.cost;
+          const p = analysePr({ repo: slug, pr: number, state, record: picked, cost });
           if (p === null) withoutState += 1;
           else {
             analysed.push(p);

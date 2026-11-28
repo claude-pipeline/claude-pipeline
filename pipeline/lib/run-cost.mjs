@@ -95,9 +95,11 @@ export function addCostEntry(cost, entry) {
 
 // A transcript already booked for this PR (an agent continued by SendMessage is booked after each leg): only what it gained since the last booking is new. `booking` = { key, usage }, usage the
 // transcript's WHOLE totals ({input, output, cacheRead, cacheWrite, usd, byPrice}); the ledger cost.transcripts[key] keeps what was booked. Returns { cost, entry } with the entry's amounts reduced by the
-// booked ones and the ledger set to the whole totals. The ledger is deducted from the TRANSCRIPT part only (booking.usage); what the entry holds beyond it is the hand amounts the caller added on top (--input …), which always book in full (#980). The ledger keeps the last MAX_TRANSCRIPTS keys.
+// booked ones and the ledger set to the whole totals. The ledger is deducted from the TRANSCRIPT part only (booking.usage); what the entry holds beyond it is the hand amounts the caller added on top
+// (--input …), which always book in full (#980). The ledger keeps the last MAX_TRANSCRIPTS keys (`evict: false`: all of them; a replay of every booking of a PR holds them in memory only, it is
+// never written back, so nothing may fall out of it).
 const MAX_TRANSCRIPTS = 200;
-export function deductBookedTranscript(cost, entry, booking) {
+export function deductBookedTranscript(cost, entry, booking, { evict = true } = {}) {
   const key = String(booking?.key ?? '');
   if (!/^[\w.-]{1,120}$/.test(key)) throw new Error('transcript key must be a plain file name');
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
@@ -137,18 +139,18 @@ export function deductBookedTranscript(cost, entry, booking) {
     input: hi(before?.input, usage.input), output: hi(before?.output, usage.output), cacheRead: hi(before?.cacheRead, usage.cacheRead), cacheWrite: hi(before?.cacheWrite, usage.cacheWrite),
     usd: hi(before?.usd, usage.usd), byPrice,
   };
-  for (const old of Object.keys(ledger).slice(0, Math.max(0, Object.keys(ledger).length - MAX_TRANSCRIPTS))) delete ledger[old];
+  if (evict) for (const old of Object.keys(ledger).slice(0, Math.max(0, Object.keys(ledger).length - MAX_TRANSCRIPTS))) delete ledger[old];
   next.transcripts = ledger;
   return { cost: next, entry: out };
 }
 
-export function addSessions(cost, ids) {
+export function addSessions(cost, ids, { evict = true } = {}) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
   for (const id of ids ?? []) {
     if (!SESSION_RE.test(String(id))) throw new Error(`session id ${JSON.stringify(String(id).slice(0, 20))}… is not a plain id`);
     if (!next.sessions.includes(String(id))) next.sessions.push(String(id));
   }
-  next.sessions = next.sessions.slice(-MAX_SESSIONS);
+  if (evict) next.sessions = next.sessions.slice(-MAX_SESSIONS);
   return next;
 }
 
@@ -156,6 +158,53 @@ export function addRetries(cost, n = 1) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
   next.retries = (Number(next.retries) || 0) + amount(n, 'retries', { integer: true });
   return next;
+}
+
+// The cost part of a run-record patch (everything but the guard-deny counts): { entry, transcript?, retries?, sessions? } applied to `cost` in this order. Returns a NEW cost
+// (the input is not touched; a patch with none of the parts returns `cost` as it is). The ONE place the arithmetic lives: the record path (applyCheckpoint) and the replay of
+// the append-only cost bookings (effectiveCost) both call it, so the two can never disagree. Throws, naming the field, on a malformed patch.
+export function applyCostPatch(cost, patchCost, { evict = true } = {}) {
+  if (!isPlainObject(patchCost)) throw new Error('cost must be an object');
+  let next = cost;
+  if (patchCost.entry !== undefined) {
+    let entry = patchCost.entry;
+    if (patchCost.transcript !== undefined) ({ cost: next, entry } = deductBookedTranscript(next, entry, patchCost.transcript, { evict }));
+    next = addCostEntry(next, entry);
+  }
+  if (patchCost.retries !== undefined) next = addRetries(next, patchCost.retries);
+  if (patchCost.sessions !== undefined) next = addSessions(next, patchCost.sessions, { evict });
+  return next;
+}
+
+// ---- the cost of a PR as the append-only bookings say it ------------------------------------------------------------
+
+// What the PR's cost is NOW: the legacy base (the cost section of the run record, written by an older CLI or by the summary / checkpoint writers; absent => nothing) with every
+// booking (`bookings`: [{ id, data }] in GitHub comment-id order, `data` a cost patch) applied on top through applyCostPatch, the arithmetic the record path uses, so a replay
+// equals what the old read-modify-write would have totalled when nothing raced. `evict: false`: the replay is never written back, so no transcript may fall out of its ledger and no session out of the list.
+// -> { cost, contributions: Map<id, {usd, input, output, cacheRead, cacheWrite}> (what each booking added to the total), any (a base cost or at least one booking exists) }
+//    or { unavailable: <reason> } when the record is unreadable (`baseStatus` invalid | unsupported), a booking of the viewer's is corrupt (`corrupt`: the reasons) or the replay fails.
+// Never throws: a display must not be able to stop a command.
+export function effectiveCost({ base, baseStatus = 'ok', bookings = [], corrupt = [] }) {
+  if (baseStatus === 'invalid' || baseStatus === 'unsupported') return { unavailable: `the run record is ${baseStatus}` };
+  if (corrupt.length > 0) return { unavailable: `a cost booking could not be read (${corrupt[0]})` };
+  try {
+    if (base !== undefined && base !== null && costShapeProblem(base)) return { unavailable: 'the run record has a cost section nothing can read' };
+    let cost = isPlainObject(base) ? structuredClone(base) : emptyCost();
+    const contributions = new Map();
+    for (const { id, data } of bookings) {
+      const was = cost.total;
+      cost = applyCostPatch(cost, data, { evict: false });
+      const d = (k) => (Number(cost.total[k]) || 0) - (Number(was?.[k]) || 0);
+      contributions.set(id, { usd: Math.round(d('usd') * 1e6) / 1e6, input: d('input'), output: d('output'), cacheRead: d('cacheRead'), cacheWrite: d('cacheWrite') });
+    }
+    // The record's sessions and the booked ones carry no order against each other, so the replay (never written back) caps none of them: all stay, as `evict: false` keeps every transcript.
+    if (Array.isArray(base?.sessions)) cost = addSessions(cost, base.sessions, { evict: false });
+    const bad = costShapeProblem(cost);
+    if (bad) return { unavailable: `the cost bookings could not be added up (${bad})` };
+    return { cost, contributions, any: isPlainObject(base) || bookings.length > 0 };
+  } catch (err) {
+    return { unavailable: `the cost bookings could not be added up (${String(err?.message ?? err).slice(0, 120)})` };
+  }
 }
 
 // `bySession` ({sessionId: denies}, at most MAX_SESSIONS of them, the last ones kept) replaces the per-session counts; left out, they stay.

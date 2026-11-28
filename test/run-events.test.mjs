@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGitHub } from '../pipeline/lib/github.mjs';
-import { EVENT_KINDS, parseEvent, postEvent, readResumedEvidence, renderEvent } from '../pipeline/lib/run-events.mjs';
+import { EVENT_KINDS, costBookingProblem, parseEvent, postEvent, readCostBookings, readResumedEvidence, renderEvent } from '../pipeline/lib/run-events.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -89,4 +89,37 @@ test('readResumedEvidence: comments that cannot be read are reported as unreadab
   const e = readResumedEvidence(ghWith([], { fail: true }), 4);
   assert.equal(e.resumed, false);
   assert.match(e.unreadable, /the run-resumed events could not be read \(boom 502\)/);
+});
+
+// The PR cost is the replay of the viewer's own cost-booking comments: a forged one would add money to every status block, so only a comment of the viewer's that STARTS with the marker counts.
+test('readCostBookings: another author\'s booking and a quoted marker are ignored (never corrupt); a duplicate id counts once; an unreadable booking of the viewer\'s is reported', () => {
+  const data = (id, usd = 1) => ({ id, entry: { phase: 'build', role: 'judge', input: 1, output: 0, cacheRead: 0, cacheWrite: 0, usd } });
+  const body = (id, d = data(id)) => renderEvent('cost-booking', id, 'Cost booked.', d);
+  const c = (id, login, text) => ({ id, user: { login }, body: text });
+  const { bookings, corrupt } = readCostBookings({
+    viewer: 'me',
+    comments: [
+      c(5, 'me', body('b-2')),
+      c(1, 'me', body('b-1')),
+      c(2, 'mallory', body('b-forged', data('b-forged', 999))),
+      c(3, 'me', `> quoted\n${body('b-quoted')}`),
+      c(4, 'me', body('b-1')),
+      c(6, 'me', '<!-- claude-pipeline:event:cost-booking:b-bad -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->'),
+      c(7, 'me', body('b-sess', { id: 'b-sess', sessions: ['bad id with spaces'] })),
+    ],
+  });
+  assert.deepEqual(bookings.map((b) => [b.id, b.commentId]), [['b-1', 1], ['b-2', 5]], 'comment-id order, the duplicate dropped');
+  assert.equal(corrupt.length, 2);
+  assert.match(corrupt.join('\n'), /comment 6: the payload is invalid/);
+  assert.match(corrupt.join('\n'), /comment 7: .*session id/);
+});
+
+// The validator promises a payload that passes can never fail in a replay: a round the cost readers reject (ten digits) or an entry that is no object (counted as a zero-dollar call) must not pass.
+test('R1-B4 costBookingProblem: a round no reader accepts and an entry that is not an object are refused (#958)', () => {
+  const entry = { phase: 'build', role: 'judge', input: 1, output: 0, cacheRead: 0, cacheWrite: 0, usd: 1 };
+  assert.equal(costBookingProblem({ id: 'b-1', entry }), null);
+  assert.equal(costBookingProblem({ id: 'b-1', entry: { ...entry, round: 999_999_999 } }), null);
+  assert.notEqual(costBookingProblem({ id: 'b-1', entry: { ...entry, round: 1_000_000_000 } }), null);
+  assert.notEqual(costBookingProblem({ id: 'b-1', entry: null }), null);
+  assert.notEqual(costBookingProblem({ id: 'b-1', entry: 'x' }), null);
 });

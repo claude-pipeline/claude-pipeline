@@ -1,22 +1,26 @@
 // `pipeline cost --pr N --phase P --role R [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X]`: books
-// one spend (an agent dispatch, a review call) in the run record's cost section, so `P summary` can show tokens and USD
-// by phase and role. `--retry` counts a retry; `--session ID` names a Claude session of this run (its guard denies are
-// counted at `P summary`). Display only: like every run-record write, a failure is a warning, never a decision.
-import { createHash } from 'node:crypto';
+// one spend (an agent dispatch, a review call) as its OWN PR comment (a `cost-booking` event, never edited), so `P summary` can show tokens and USD
+// by phase and role. The PR's cost is the replay of those comments on top of the run record's own cost section (run-cost.mjs#effectiveCost): no
+// writer can overwrite another's booking, because nothing is ever edited. `--retry` counts a retry; `--session ID` names a Claude session of this run
+// (its guard denies are counted at `P summary`). Display only: a failure is a warning or an exit code, never a decision of the pipeline.
+import { createHash, randomUUID } from 'node:crypto';
 import { readFileSync, statSync } from 'node:fs';
 import { basename, resolve } from 'node:path';
 import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
-import { createGitHub, guardGh } from '../lib/github.mjs';
-import { createRunRecorder } from '../lib/run-progress.mjs';
+import { OutboundScanBlocked, createGitHub, guardGh } from '../lib/github.mjs';
+import { GhError } from '../lib/proc.mjs';
+import { VIEW_FIELDS } from '../lib/run-progress.mjs';
+import { costBookingProblem, postEvent } from '../lib/run-events.mjs';
+import { summaryFromComments } from '../lib/summary-comment.mjs';
 import { PRICE_TABLE_DATE, costReport, modelFamily, normalisePhase, normaliseRole, priceMessage, usageFromTranscript } from '../lib/run-cost.mjs';
 
 export const meta = {
-  summary: 'book tokens / USD / retries of one agent call in the run record (shown by `P summary`)',
+  summary: 'book tokens / USD / retries of one agent call as its own PR comment (the PR cost shown by `P summary` is their sum)',
   usage: [
     'pipeline cost --pr N --phase plan|build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|plan-review|plan-codex|verifier|controller|other',
     '              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]',
-    '  -> {ok, recorded, skipped?, call, cost, warnings}; `call` = what THIS call added to the record ({usd, input, output, cacheRead, cacheWrite, phase, role, round?}, after the transcript dedupe: a transcript booked before books only what it gained since, unless --usd is given: then every call books the full tokens and USD); null when nothing was booked (an empty-transcript skip, a retry/session-only call, a failed record). `cost` = the PR total so far (every call booked for the PR), never one call: read a call\'s own figure from `call`. Bookings are not locked: two bookings for one PR written at the same moment can overwrite each other (GitHub has no conditional edit, so the later write wins and the earlier booking drops out of `cost`; its own `call` output is still what it booked). Exit 1 when nothing was booked (the record could not be written), 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount, an empty --from-transcript), 3 GitHub unavailable',
+    '  -> {ok, recorded, skipped?, confirmed, id, call, cost, warnings}; `call` = what THIS call added to the PR total ({usd, input, output, cacheRead, cacheWrite, phase, role, round?}, after the transcript dedupe: a transcript booked before books only what it gained since, unless --usd is given: then every call books the full tokens and USD); null when nothing was booked (an empty-transcript skip, a retry/session-only call, an unconfirmed booking). `cost` = the PR total so far (every call booked for the PR), never one call: read a call\'s own figure from `call`. Each booking is its OWN PR comment (a `cost-booking` event, never edited) and the PR total is those comments added up on top of the run record\'s cost section, so two bookings at the same moment cannot overwrite each other; the summary comment\'s cost line is the total as of its last render (every record write re-renders it). `confirmed: false` (with `call` and `cost` null) = the booking was posted (`id`) but the total could not be read back: do NOT book that call again. Exit 1 when nothing was booked (the PR is not a PR, the outbound scan refused, the amounts are malformed) or when posting failed and the booking may or may not exist (`outcome: "unknown"` and the `id`: look for that id on the PR before booking again), 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount, an empty --from-transcript), 3 GitHub unavailable',
     '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped; a transcript with no usable messages gives a warning, and when no --input/--output/--cache-*/--usd came with it NOTHING is booked for that call (no entry, no retry; `recorded` false, `skipped: "empty-transcript"`; `--session` is still recorded): run the same command again in a few seconds);',
     '  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.',
     '  --phase plan books a plan review (before the PR exists, like build calls): --role plan-review (a Fable/Opus/Sonnet plan reviewer, priced from its transcript) or plan-codex (a hand-run Codex plan review: tokens only, no USD unless --usd); `P summary` shows plan ahead of build.',
@@ -54,16 +58,14 @@ export function transcriptUsage(file, root, defaultModel, { sleep = sleepSync, t
   return usageFromTranscript(readFileSync(abs, 'utf8'), { defaultModel });
 }
 
-// What this call added to the run record: the new total minus the total the update started from. That is the amount AFTER the transcript dedupe (the entry in the patch is the transcript's whole usage), so it can be less than the entry.
-export function bookedCall(before, after, entry) {
-  if (entry === undefined || !after?.cost?.total) return null;
-  const was = before?.cost?.total ?? {};
-  const d = (k) => (Number(after.cost.total[k]) || 0) - (Number(was[k]) || 0);
-  return {
-    usd: Math.round(d('usd') * 1e6) / 1e6, input: d('input'), output: d('output'), cacheRead: d('cacheRead'), cacheWrite: d('cacheWrite'),
-    phase: entry.phase, role: entry.role, ...(entry.round !== undefined ? { round: entry.round } : {}),
-  };
+// What this booking added to the total: its contribution to the replay (the total after it minus the total before it, in comment-id order: AFTER the transcript dedupe, so it can be less than the entry)
+// plus what the entry names. null for a retry / session-only booking.
+function callOf(entry, added) {
+  if (entry === undefined || added === undefined) return null;
+  return { ...added, phase: entry.phase, role: entry.role, ...(entry.round !== undefined ? { round: entry.round } : {}) };
 }
+
+const sayErr = (err) => String(err?.message ?? err).slice(0, 200);
 
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
@@ -147,14 +149,67 @@ export const run = guarded(async (argv, ctx) => {
   if (emptyTranscript && !values.session?.length) {
     return { exitCode: EXIT.OK, output: { ok: true, recorded: false, skipped: 'empty-transcript', bucketed: false, call: null, cost: null, warnings: notes } };
   }
+  // One id per `P cost` run, kept in the booking: the way to find out whether a booking whose answer got lost reached the PR, and what a replay deduplicates by.
+  const id = randomUUID();
+  const data = { ...patch.cost, id };
+  const problem = costBookingProblem(data);
+  const sentence = patch.cost.entry
+    ? `Cost booked: ${patch.cost.entry.phase} / ${patch.cost.entry.role}${patch.cost.entry.round !== undefined ? `, round ${patch.cost.entry.round}` : ''}, ${patch.cost.transcript ? `transcript total so far $${patch.cost.entry.usd} (the PR's cost adds only what it gained since its last booking)` : `$${patch.cost.entry.usd}`}. Never edited: the PR's cost adds these comments up.`
+    : "Cost booking: a retry or a session. Never edited: the PR's cost adds these comments up.";
+  const recorded = !emptyTranscript;
+
   const gh = createGitHub({ cwd: root, env: ctx.env });
   return guardGh(() => {
-    const recorder = createRunRecorder({ gh, pr });
-    const record = recorder.update(patch);
-    const ok = record !== null;
-    return {
-      exitCode: ok ? EXIT.OK : EXIT.FAILED,
-      output: { ok, recorded: ok && !emptyTranscript, ...(emptyTranscript ? { skipped: 'empty-transcript' } : {}), bucketed: ok && bucketed, call: ok ? bookedCall(recorder.previous, record, patch.cost.entry) : null, cost: ok ? costReport(record.cost) : null, warnings: [...notes, ...recorder.warnings] },
-    };
+    const refused = (why) => ({ exitCode: EXIT.FAILED, output: { ok: false, recorded: false, bucketed: false, call: null, cost: null, warnings: [...notes, `not booked: ${why}`] } });
+    if (problem !== null) return refused(problem);
+    // Before the post: the PR must be one (createComment accepts a plain issue too), and the repo is looked up (the outbound scan needs it): a failure here means nothing was posted.
+    try {
+      gh.repo();
+      gh.prView(pr, [...VIEW_FIELDS]);
+    } catch (err) {
+      return refused(sayErr(err));
+    }
+    let postError = null;
+    try {
+      postEvent(gh, pr, 'cost-booking', id, sentence, data);
+    } catch (err) {
+      // An outbound-scan refusal (or any error that is not gh's) is thrown BEFORE anything is sent: definitely not booked. A gh error may be a lost answer to a POST that landed.
+      if (!(err instanceof GhError) || err instanceof OutboundScanBlocked) return refused(sayErr(err));
+      postError = err;
+    }
+    // One listing: the booking's own contribution and the new total come from the same replay.
+    let found = null;
+    let listError = null;
+    try {
+      const me = gh.viewer();
+      found = summaryFromComments(gh.listComments(pr), me, pr);
+    } catch (err) {
+      listError = err;
+    }
+    const visible = found?.costBookings.bookings.some((b) => b.id === id) === true;
+    if (postError !== null && !visible) {
+      return {
+        exitCode: EXIT.FAILED,
+        output: {
+          ok: false, recorded: false, outcome: 'unknown', id, bucketed: false, call: null, cost: null,
+          warnings: [...notes, `the booking may or may not exist (posting it failed: ${sayErr(postError)}${listError ? `; the PR's comments could not be read: ${sayErr(listError)}` : ''}): look for id ${id} on the PR before booking again`],
+        },
+      };
+    }
+    const base = { ok: true, recorded, ...(emptyTranscript ? { skipped: 'empty-transcript' } : {}), id, bucketed };
+    if (!visible) {
+      return {
+        exitCode: EXIT.OK,
+        output: { ...base, confirmed: false, call: null, cost: null, warnings: [...notes, `booked (id ${id}); total not confirmed${listError ? ` (the PR's comments could not be read: ${sayErr(listError)})` : ' (the booking is not in the PR comments yet)'}: do NOT book this call again`] },
+      };
+    }
+    const eff = found.effectiveCost;
+    const warnings = [...notes];
+    if (postError !== null) warnings.push(`posting the booking reported an error (${sayErr(postError)}), but it is on the PR (id ${id})`);
+    if (eff.unavailable !== undefined) {
+      warnings.push(`booked (id ${id}); cost unavailable: ${eff.unavailable}`);
+      return { exitCode: EXIT.OK, output: { ...base, confirmed: true, call: null, cost: null, warnings } };
+    }
+    return { exitCode: EXIT.OK, output: { ...base, confirmed: true, call: callOf(patch.cost.entry, eff.contributions.get(id)), cost: costReport(eff.cost), warnings } };
   });
 });

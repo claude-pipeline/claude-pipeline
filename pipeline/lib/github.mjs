@@ -354,7 +354,10 @@ export function createGitHub({ cwd, env, ghFn = gh, retry } = {}) {
 
     // Always a NEW comment, never an edit: for append-only evidence (run events) that no later writer may overwrite.
     createComment(n, body) {
-      const r = api('POST', `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`, { body });
+      const route = `repos/${self.repo().slug}/issues/${prNumber(n)}/comments`;
+      const r = api('POST', route, { body });
+      // An answer without the new comment's id (empty, null): the POST was sent, so the outcome is unknown, not "nothing was posted" (a GhError: P cost then looks the booking up).
+      if (r === null || typeof r !== 'object' || r.id === undefined) throw new GhError({ code: 0, stderr: 'the reply to the comment POST had no comment id', args: ['api', '-X', 'POST', route] });
       return { id: r.id, url: r.html_url };
     },
 
