@@ -254,16 +254,16 @@ test('ci-wait (real gh args): an absent required check on a CONFLICTING PR is ve
   assert.ok(fake.lines().includes('pr view 5 --json mergeable,mergeStateStatus'));
 });
 
-test('ci-wait: ci.merge_checks is waited on as well, and on a ci.e2e_label PR a still-running non-required check is reported as others (in-process)', async () => {
+test('ci-wait: ci.merge_checks is waited on as well, and a still-running non-required check is waited for, then reported as others at --timeout (in-process, no label needed)', async () => {
   const repo = createTmpRepo();
-  repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}  merge_checks: [Replay from zero]\n  e2e_label: run-e2e\n`);
+  repo.write('.claude/pipeline.yml', `${pipelineYml('github', ['ci'])}  merge_checks: [Replay from zero]\n`);
   repo.commit('init');
   let t = 0;
   const calls = [];
   const gh = {
     prView: (n, fields) => {
       calls.push(fields.join(','));
-      return fields.includes('labels') ? { labels: [{ name: 'run-e2e' }] } : pr();
+      return pr();
     },
     protection: () => ({ status: 200, json: { required_status_checks: { checks: [{ context: 'ci', app_id: 15368 }] } } }),
     branchRules: () => [],
@@ -276,13 +276,13 @@ test('ci-wait: ci.merge_checks is waited on as well, and on a ci.e2e_label PR a 
     statusesOf: () => [], timelineOf: () => [], workflowRunsOfSuite: () => [],
   };
   const clock = { now: () => t, sleep: async (ms) => { t += ms; } };
-  const r = await ciWait(['--pr', '5'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
+  const r = await ciWait(['--pr', '5', '--timeout', '60'], { cwd: repo.dir, env: process.env, ciWait: { gh, clock, onProgress: () => {} } });
   assert.equal(r.exitCode, 0, JSON.stringify(r.output));
   assert.equal(r.output.verdict, 'passed');
-  assert.equal(t, 30_000, 'held until the merge check passed');
+  assert.equal(t, 60_000, 'held until the merge check passed (30s), then for the running non-required suite up to --timeout');
   assert.deepEqual(r.output.checks.map((c) => [c.name, c.state, c.source]), [['ci', 'pass', undefined], ['Replay from zero', 'pass', 'merge_checks']]);
   assert.deepEqual(r.output.others, [{ name: 'Playwright suite', status: 'in_progress', url: 'https://github.example/runs/3' }]);
-  assert.ok(calls.includes('labels'));
+  assert.ok(!calls.includes('labels'), 'the label is no longer read');
 });
 
 test('ci-wait (R1-B2): a pipeline.yml that exists but is invalid is a config error (exit 2), never a silent pass without ci.merge_checks / ci.e2e_label; a missing file is still allowed', async () => {

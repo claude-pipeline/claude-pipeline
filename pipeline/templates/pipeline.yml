@@ -49,8 +49,8 @@ verify:
 
 ci:
   required_checks: ["Test integrity", "Hard-stop scan"]   # + your CI job names
-  e2e_label: null              # label that triggers CI E2E for high-risk PRs, if any; `pipeline ci-wait` also reports non-required checks
-  #                            # still running or red on a PR carrying it (`others`), so a green required set never hides the suite
+  e2e_label: null              # label that triggers CI E2E for high-risk PRs, if any (`pipeline ci-wait` reports non-required checks still
+  #                            # running or red as `others` on every PR and waits for running ones, label or not)
   # merge_checks: []           # check names your own merge command requires although branch protection does not; `pipeline ci-wait`
   #                            # judges one only when it reports (pending waits, a failure fails); one that never reports (a path-filtered
   #                            # workflow that did not run) is not owed: `notOwed` in the result, never `missing`

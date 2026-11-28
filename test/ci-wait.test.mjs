@@ -227,7 +227,8 @@ test('a draft-era failure also keeps waiting while a ready-era run is in progres
   });
   const r = await s.run();
   assert.equal(r.output.verdict, 'passed', JSON.stringify(r.output));
-  assert.equal(s.elapsed(), 405_000);
+  assert.equal(s.elapsed(), 510_000); // #743: the non-required Playwright run (finishes at 500s) is waited for too, to the next poll
+  assert.deepEqual(r.output.others, []);
 });
 
 // ---- a MISSING identity is held open by a run that started BEFORE ready (PR #196, 2026-11-09 plan B) ---------------------------
@@ -1537,7 +1538,7 @@ test('e2e label: `passed` lists a still-running non-required check as others [{n
   assert.equal(r.output.verdict, 'passed');
   assert.deepEqual(r.output.others, [{ name: 'Playwright suite', status: 'in_progress', url: 'https://github.example/runs/pw' }]);
   assert.match(r.output.message, /Playwright suite/);
-  assert.equal(s.reads.labels, 1);
+  assert.equal(s.reads.labels, 0, 'the label is no longer read (#743)');
 });
 
 test('e2e label: a failed non-required check (check run or commit status) is listed with its conclusion / state; the verdict stays passed', async () => {
@@ -1590,8 +1591,8 @@ test('e2e label (R1-F1): a newer skipped no-op run of the suite does not hide th
 });
 
 // A run-e2e PR whose required checks are green returned `passed` with the Playwright suite still running; the hand-off then needed the same ci-wait job re-run by hand every few minutes.
-// --wait-others keeps polling until no `others` entry is running; without it the verdict is unchanged.
-test('e2e label + waitOthers: a still-running non-required check is waited for; a red one ends the wait as passed with others; without the option the first read answers', async () => {
+// ci-wait keeps polling until no `others` entry is running (#743: the default, --wait-others is kept for compatibility).
+test('e2e label + waitOthers: a still-running non-required check is waited for; a red one ends the wait as passed with others; without the option it is waited for as well', async () => {
   const world = (suite) => ({ classic: present('A'), labels: ['run-e2e'], checkRuns: (t) => [cr('A', 'success', { id: 1 }), suite(t)] });
   const running = (t) => (t < 100 ? cr('Playwright suite', null, { id: 2 }) : cr('Playwright suite', 'success', { id: 2 }));
   const waited = sim(world(running), { ...E2E, waitOthers: true });
@@ -1601,8 +1602,8 @@ test('e2e label + waitOthers: a still-running non-required check is waited for; 
   assert.ok(waited.elapsed() >= 100_000, 'it polled until the suite finished');
   const plain = sim(world(running), E2E);
   const p = await plain.run();
-  assert.equal(p.output.others.length, 1);
-  assert.equal(plain.elapsed(), 0);
+  assert.deepEqual(p.output.others, []); // #743: waited for without the option too (was: the first read answered with 1 running entry, elapsed 0)
+  assert.ok(plain.elapsed() >= 100_000);
   const red = sim(world(() => cr('Playwright suite', 'failure', { id: 2 })), { ...E2E, waitOthers: true });
   const r = await red.run();
   assert.equal(r.output.verdict, 'passed');
@@ -1613,30 +1614,61 @@ test('e2e label + waitOthers: a still-running non-required check is waited for; 
   assert.equal(s.output.others[0].status, 'in_progress', 'at the limit the running entry is still reported, never hidden');
 });
 
-test('e2e label: no label on the PR, or no ci.e2e_label configured, leaves the output unchanged (no `others`, no label read without the option)', async () => {
-  const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Playwright suite', null)] };
+test('others (#743): no label on the PR, or no ci.e2e_label configured, makes no difference: others is reported either way and no label is read', async () => {
+  const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Playwright suite', 'failure')] };
   const unlabelled = sim({ ...world, labels: ['bug'] }, E2E);
   const a = await unlabelled.run();
   assert.equal(a.output.verdict, 'passed');
-  assert.equal('others' in a.output, false);
+  assert.deepEqual(a.output.others.map((o) => o.name), ['Playwright suite']);
   const unconfigured = sim({ ...world, labels: ['run-e2e'] });
   const b = await unconfigured.run();
-  assert.equal('others' in b.output, false);
-  assert.equal(unconfigured.reads.labels, 0);
+  assert.deepEqual(b.output.others.map((o) => o.name), ['Playwright suite']);
+  assert.equal(unlabelled.reads.labels + unconfigured.reads.labels, 0);
 });
 
-test('e2e label (R1-F4): a failed label read is retried on the next poll like every other read (never a plain pass that looks unlabelled); it ends as github after MAX_READ_FAILURES', async () => {
-  const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Playwright suite', null)] };
-  const flaky = sim({ ...world, labels: (t, n) => { if (n === 1) throw new Error('HTTP 502'); return ['run-e2e']; } }, E2E);
-  const a = await flaky.run();
-  assert.equal(a.output.verdict, 'passed');
-  assert.deepEqual(a.output.others.map((o) => o.name), ['Playwright suite']);
-  assert.equal(flaky.reads.labels, 2);
-  assert.equal(flaky.elapsed(), 15_000, 'one interval for the retry');
+// The label read is gone (#743): a label reader that fails can no longer turn a pass into `github` or hide `others`.
+test('others (#743): a failing label reader is never called, so it cannot end the wait as github or hide others', async () => {
+  const world = { classic: present('A'), checkRuns: [cr('A', 'success'), cr('Playwright suite', 'failure')] };
   const broken = sim({ ...world, labels: () => { throw new Error('HTTP 502'); } }, E2E);
   const b = await broken.run();
-  assert.equal(b.output.verdict, 'github');
-  assert.equal(broken.reads.labels, MAX_READ_FAILURES);
+  assert.equal(b.output.verdict, 'passed');
+  assert.deepEqual(b.output.others.map((o) => o.name), ['Playwright suite']);
+  assert.equal(broken.reads.labels, 0);
+});
+
+// ---- non-required path-triggered checks, on every PR (#743): no e2e label needed ----------------------------------------------
+
+// Catches: the merge ask reaching the owner while the SQL test arms / Playwright suite (non-required, path-triggered) still run,
+// because ci-wait answered `passed` on an unlabelled PR as soon as the required checks were green.
+test('others (#743): an unlabelled PR with green required checks keeps waiting while a non-required check runs, then passes with others: []', async () => {
+  const s = sim({
+    classic: present('A'),
+    checkRuns: (t) => [cr('A', 'success', { id: 1 }), t < 100 ? cr('SQL arms', null, { id: 2 }) : cr('SQL arms', 'success', { id: 2 })],
+  });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.deepEqual(r.output.others, []);
+  assert.ok(s.elapsed() >= 100_000, 'it polled until the non-required check finished');
+});
+
+// Catches: a stuck optional check hanging the wait forever (the timeout still ends it, with the entry reported).
+test('others (#743): a non-required check still running at --timeout ends as passed with that entry in others and the do-not-hand-off message', async () => {
+  const s = sim({ classic: present('A'), checkRuns: [cr('A', 'success', { id: 1 }), cr('SQL arms', null, { id: 2, html_url: 'https://github.example/runs/sql' })] }, { timeoutMs: 60_000 });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.deepEqual(r.output.others, [{ name: 'SQL arms', status: 'in_progress', url: 'https://github.example/runs/sql' }]);
+  assert.match(r.output.message, /SQL arms=in_progress/);
+  assert.match(r.output.message, /do not hand off before they are/);
+  assert.ok(s.elapsed() >= 60_000);
+});
+
+// Catches: a red optional suite hidden from the hand-off on a PR without the e2e label.
+test('others (#743): an unlabelled PR with a red non-required check passes at once with it listed in others', async () => {
+  const s = sim({ classic: present('A'), checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', 'failure', { id: 2, html_url: 'https://github.example/runs/pw' })] });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.deepEqual(r.output.others, [{ name: 'Playwright suite', status: 'failure', url: 'https://github.example/runs/pw' }]);
+  assert.equal(s.elapsed(), 0);
 });
 
 // ---- a passing check that ran before the ready event is flagged, never second-guessed (#642) ---------------------------------

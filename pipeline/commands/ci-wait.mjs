@@ -13,7 +13,7 @@ import { readClassicRequired } from '../lib/protection.mjs';
 
 export const meta = {
   summary: 'wait until the required CI of a ready PR is really done (ignores a draft-era skipped run), then report the verdict',
-  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all] [--wait-others]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url, predatesReady? (true | null; true: a passing run or status dated before readyAt; null: the Actions run behind the status could not be read, unresolved; absent: not flagged; report only, the verdict is unchanged)}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, on a PR with ci.e2e_label: [{name, status, url}] non-required checks still running or red), notOwed? (passed, or failed under --wait-all: ci.merge_checks names with no producer at all, not owed)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
+  usage: 'pipeline ci-wait --pr N [--repo DIR] [--appear-timeout SEC=300] [--timeout SEC=3600] [--interval SEC=15] [--wait-all] [--wait-others (kept for compatibility: waiting for running non-required checks is the default)]   -> {ok, verdict, head, readyAt, requiredSource, checks:[{name, appId, state, url, predatesReady? (true | null; true: a passing run or status dated before readyAt; null: the Actions run behind the status could not be read, unresolved; absent: not flagged; report only, the verdict is unchanged)}], message?, failures?, statusEvidence?, heldBy?, configChecks?, mergeState? (conflicting), others? (passed, every PR: [{name, status, url}] non-required checks still running or red; a running one is waited for until --timeout, then reported: do not hand off), notOwed? (passed, or failed under --wait-all: ci.merge_checks names with no producer at all, not owed)}; checks entries of ci.merge_checks carry source merge_checks; verdict passed (exit 0) | failed | timeout | missing | stale-skipped | conflicting (the PR conflicts with its base: no workflow ran; mergeState {mergeable, state}) | unverified | no-required-checks | head-moved | base-changed | draft (exit 1; a draft at the start: exit 2) | github (exit 3, 5 GitHub reads in a row failed)',
 };
 
 export const DEFAULT_APPEAR_SECONDS = 300;
@@ -35,14 +35,13 @@ export const run = guarded(async (argv, ctx) => {
 
   // The check names the pipeline itself requires (config + the implicit guard / review contexts): diagnostics only, for a
   // verdict `unverified`. A missing pipeline.yml is allowed (nothing configured); one that exists but does not load is an error: the
-  // config decides what is waited on (ci.merge_checks, ci.e2e_label), so a typo must not silently switch those waits off.
+  // config decides what is waited on (ci.merge_checks), so a typo must not silently switch those waits off.
   const loaded = await loadConfig(root);
   if (!loaded.ok && existsSync(loaded.path)) throw new Fail(EXIT.USAGE, { ok: false, error: 'config', errors: loaded.errors, path: loaded.path });
   const configChecks = loaded.ok ? [...new Set([...requiredChecks(loaded.config.ci), ...loaded.config.ci.merge_checks])] : [];
   // ci.merge_checks: judged like required checks once they report; one with no producer is notOwed (not part of
-  // branch protection). ci.e2e_label: on a PR carrying it, non-required checks that are still running or red are reported as `others`.
+  // branch protection). Non-required checks that are still running or red are reported as `others` on every PR (#743), no label needed.
   const mergeChecks = loaded.ok ? loaded.config.ci.merge_checks : [];
-  const e2eLabel = loaded.ok ? loaded.config.ci.e2e_label : null;
 
   // `ctx.ciWait` is the test seam: a scripted gh and a simulated clock.
   const seam = ctx.ciWait ?? {};
@@ -53,7 +52,6 @@ export const run = guarded(async (argv, ctx) => {
       return { head: v.headRefOid, isDraft: v.isDraft === true, createdAt: v.createdAt, base: v.baseRefName };
     },
     mergeable: async () => gh.prView(pr, ['mergeable', 'mergeStateStatus']), // only read when a required check never appeared: a conflicting PR runs no workflow (#471)
-    labels: async () => (gh.prView(pr, ['labels']).labels ?? []).map((l) => l?.name), // only read at the end of a pass, when ci.e2e_label is configured
     classic: async (base) => readClassicRequired(gh, base),
     rules: async (base) => gh.branchRules(base),
     checkRuns: async (head) => gh.checkRunsOf(head),
@@ -66,7 +64,7 @@ export const run = guarded(async (argv, ctx) => {
   };
   const result = await waitForCi({
     readers,
-    options: { appearTimeoutMs: appear * 1000, timeoutMs: timeout * 1000, intervalMs: interval * 1000, waitAll: values['wait-all'] === true, waitOthers: values['wait-others'] === true, configChecks, mergeChecks, e2eLabel },
+    options: { appearTimeoutMs: appear * 1000, timeoutMs: timeout * 1000, intervalMs: interval * 1000, waitAll: values['wait-all'] === true, configChecks, mergeChecks },
     clock: seam.clock ?? realClock(),
     onProgress: seam.onProgress ?? ((line) => process.stderr.write(`ci-wait: ${line}\n`)),
   });
