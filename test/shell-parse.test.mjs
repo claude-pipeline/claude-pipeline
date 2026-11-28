@@ -1482,6 +1482,9 @@ test('#904: pathRuns names each path-run program the parser read by name, with t
   assert.deepEqual(files('./source x.sh'), ['./source']);
   assert.deepEqual(files('bin/npx foo'), ['bin/npx']);
   assert.deepEqual(files('echo hi | ./sh'), ['./sh']);
+  // a Windows path word (the parser keeps its backslashes) is a path too: `.\node.cmd --version` has no script operand, so only the mark names it
+  assert.deepEqual(files('.\\node.cmd --version'), ['.\\node.cmd']);
+  assert.deepEqual(files('.\\env foo'), ['.\\env']);
   // not marked: a system bin, a bare name, and a plain program run by path (its own record already names it)
   for (const line of ['/usr/bin/env x', 'env ./tool', 'env FOO=1 ls', './tool x', 'npx prettier .', '/bin/bash -c x']) assert.deepEqual(files(line), [], line);
   // chdir is where the word itself is looked up: before this wrapper's own -C applies, after an earlier wrapper's

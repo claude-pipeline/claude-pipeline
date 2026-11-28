@@ -1721,6 +1721,11 @@ test('#904: a program the line writes first is refused like the one on disk (`cp
   // the unknown directory: a node_modules program is allowed without a lookup; any other program is refused as `./tool` is
   for (const line of ['cd "$X" && ./node_modules/.bin/npx foo', 'cd "$X" && ./node_modules/.bin/node --version']) assert.equal(evaluate(line).decision, 'allow', line);
   assert.match(evaluate('cd "$X" && ./env foo').reason, /cannot tell which directory/);
+  // the bare spelling (no leading dot) is the same program; a `..` segment may leave node_modules, so it gets no spelling shortcut
+  assert.equal(evaluate('cd "$X" && node_modules/.bin/node --version').decision, 'allow', 'node_modules at the start of the word');
+  assert.match(evaluate('cd "$X" && ./node_modules/../env foo').reason, /cannot tell which directory/);
+  assert.match(evaluate('./node_modules/../env foo', withFiles({ env: HARMLESS_TEXT })).reason ?? '', namedLike('./node_modules/../env', 'env'), 'a known directory: looked up, the text file is refused');
+  assert.match(evaluate('.\\env foo', withFiles({ '.\\env': HARMLESS_TEXT })).reason ?? '', namedLike('.\\env', 'env'), 'a Windows path word is a path');
   assert.match(evaluate('cd "$X" && ./tool foo').reason, /cannot tell which directory/, 'the reference: a plain program');
   // accepted refusal (owner 11-28): a virtualenv interpreter after a cd the guard cannot follow
   assert.match(evaluate('cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m pytest').reason, /cannot tell which directory/);
@@ -1734,7 +1739,7 @@ test('#904: a binary, a node_modules program, a missing file, a directory and th
   ok('.venv/bin/python x.py', { '.venv/bin/python': BIN_FILE });
   ok('./node_modules/.bin/tsx x.ts', { 'node_modules/.bin/tsx': '#!/usr/bin/env node\nconsole.log(1)\n' });
   // an nvm-style bin/npx: a link whose target is under node_modules (npm's own npx-cli.js)
-  ok('bin/npx prettier .', { 'bin/npx': '#!/usr/bin/env node\nrequire("../lib/cli.js")()\n' }, { realpath: (p) => (p.endsWith('/bin/npx') ? '/home/u/.nvm/versions/node/v20/lib/node_modules/npm/bin/npx-cli.js' : p) });
+  ok('bin/npx prettier .', { 'bin/npx': '#!/usr/bin/env node\nrequire("../lib/cli.js")()\n' }, { realpath: (p) => (p === resolve('/work/repo', 'bin/npx') ? '/home/u/.nvm/versions/node/v20/lib/node_modules/npm/bin/npx-cli.js' : p) });
   ok('./env x'); // missing
   ok('./env x', { env: HARMLESS_TEXT }, { readDir: (p) => (p === resolve('/work/repo/env') ? [] : null) }); // a directory
   for (const line of ['/usr/bin/env node x.mjs', "/bin/bash -c 'echo hi'", '/opt/homebrew/bin/timeout 5 ls', 'env FOO=1 ls', 'npx prettier .']) ok(line);

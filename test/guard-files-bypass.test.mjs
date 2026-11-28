@@ -658,7 +658,8 @@ const F_TEXT = ['cp a ~', '.cl' + 'aude', 'sett' + 'ings.json'].join('/');
 const HARMLESS_TEXT = '#!/bin/sh\necho ok\n';
 const escRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const namedLike = (word, name) => new RegExp(`the program \`${escRe(word)}\` is run by its path but named like the \`${escRe(name)}\` command, so the guard reads it as \`${escRe(name)}\` and never reads the file`);
-const inProj = (files) => fsOf(Object.fromEntries(Object.entries(files).map(([k, v]) => [path.resolve(PROJ, k), v])));
+// (POSIX keys: the fixture is a Linux file system whatever the host)
+const inProj = (files) => fsOf(Object.fromEntries(Object.entries(files).map(([k, v]) => [path.posix.resolve(PROJ, k), v])));
 const INTERPS = ['node', 'nodejs', 'deno', 'bun', 'tsx', 'ts-node', 'python', 'python2.7', 'python3', 'python3.12', 'ruby', 'perl', 'php'];
 // (the argument shapes per name: as in test/guard-git.test.mjs)
 const ARGS_OF = { taskset: '5 foo', ssh: '5 foo', timeout: '5 foo', flock: '5 foo', script: '-c "echo hi"', su: '-c "echo hi"', npm: 'exec foo', pnpm: 'exec foo', yarn: 'exec foo' };
@@ -729,7 +730,7 @@ test('#904: a path the guard can resolve is judged like the literal (`$HOME/bin/
 test('#904: what counts as text: an empty file, a node shebang outside node_modules and a text file over the read cap are refused; the head decides', () => {
   assert.match(bash('./env foo', PROJ, inProj({ env: '' })).reason ?? '', /named like the `env` command/, 'an empty file');
   assert.match(bash('./npx foo', PROJ, inProj({ npx: '#!/usr/bin/env node\nconsole.log(1)\n' })).reason ?? '', /named like the `npx` command/, 'any text counts, whatever its shebang');
-  const big = { existsSync: (p) => p === path.resolve(PROJ, 'env'), readText: () => null, readHead: () => '#!/usr/bin/env node\n// a generated bundle' };
+  const big = { existsSync: (p) => p === path.posix.resolve(PROJ, 'env'), readText: () => null, readHead: () => '#!/usr/bin/env node\n// a generated bundle' };
   assert.match(bash('./env foo', PROJ, big).reason ?? '', /named like the `env` command/, 'over the cap');
 });
 
@@ -748,6 +749,9 @@ test('#904: at the nesting limit the same refusal test decides: a text ./env is 
   assert.match(deny.reason, /named like the `env` command/);
   assert.equal(bash('bash a0.sh', PROJ, chain('./node_modules/.bin/npx echo hi', { 'node_modules/.bin/npx': '#!/usr/bin/env node\n' })).decision, 'allow');
   assert.equal(bash('bash a0.sh', PROJ, chain('./env echo hi', { env: 'MZ\u0000\u0000' })).decision, 'allow', 'a binary at the limit');
+  const written = bash('bash a0.sh', PROJ, chain('cp helper.sh ./env && ./env echo ok', { 'helper.sh': HARMLESS_TEXT }));
+  assert.equal(written.decision, 'deny', 'a program the last script writes first');
+  assert.match(written.reason, /named like the `env` command/);
 });
 
 // ---- #904 (allow side and regression controls): what the refusal must not touch --------------------------------------------------------------------------------------
@@ -759,7 +763,7 @@ test('#904: a binary, a node_modules program, a missing file, a directory and th
   ok('./node_modules/.bin/tsx x.ts', { 'node_modules/.bin/tsx': '#!/usr/bin/env node\nconsole.log(1)\n' });
   ok('bin/npx prettier .', { 'bin/npx': '#!/usr/bin/env node\nrequire("../lib/cli.js")()\n' }, { realpath: (p) => (p.endsWith('/bin/npx') ? '/home/u/.nvm/versions/node/v20/lib/node_modules/npm/bin/npx-cli.js' : p) });
   ok('./env x'); // missing
-  ok('./env x', { env: HARMLESS_TEXT }, { readDir: (p) => (p === path.resolve(PROJ, 'env') ? [] : null) }); // a directory
+  ok('./env x', { env: HARMLESS_TEXT }, { readDir: (p) => (p === path.posix.resolve(PROJ, 'env') ? [] : null) }); // a directory
   for (const line of ['/usr/bin/env node x.mjs', "/bin/bash -c 'echo hi'", '/opt/homebrew/bin/timeout 5 ls', 'env FOO=1 ls', 'npx prettier .', 'cd "$X" && ./node_modules/.bin/npx foo']) ok(line);
   ok('./env GH_REPO=o/other x', { env: BIN_FILE });
   ok('BASH_ENV=evil.sh ./env x', { env: BIN_FILE });
