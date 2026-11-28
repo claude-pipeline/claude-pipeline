@@ -3342,7 +3342,7 @@ class Parser {
       if (isSpace(c)) this.i++;
       else if (c === '\n') { this.nlCheck(); this.i++; if (this.hd.length) this.readHeredocs(); this.lineStart = this.i; } // (#269 R24-B1)
       else if (c === '\\' && s[this.i + 1] === '\n') this.i += 2;
-      else if (c === '#') { while (this.i < n && s[this.i] !== '\n') this.i++; }
+      else if (c === '#') { const from = this.i; while (this.i < n && s[this.i] !== '\n') this.i++; if (this.comments) this.comments.push([from, this.i]); }
       else break;
     }
   }
