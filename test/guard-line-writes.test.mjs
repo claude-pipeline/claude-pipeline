@@ -2257,3 +2257,73 @@ test('#902: writtenTo places a wrapper log from the directory the command starts
   assert.equal(w.unknown, true, 'the wrapper may have put anything there');
   assert.ok(w.texts.includes('keep'), 'and the earlier text is still a possible content');
 });
+
+// #965: a program run through a variable DIRECTORY after any command the guard does not model (launchctl, disown, setsid, tmux, at, bg ...). Failure caught: the owner's install script
+// (`launchctl kickstart ...`, then `"$BIN/tool" version`) was refused, "tool refers to a protected pipeline file ...": the `$` in the command word made the home startup file (~/.zshenv of the
+// shell a script would start under) count as rewritable by the unmodelled command before it, so every name on the line became unknown. The literal path was allowed all along.
+// (files policy only: the git policy's refusals of the same script are another issue)
+test('#965: "$DIR/tool" after an unmodelled command is judged like the literal path; a protected DIR, a write to the startup file or to the program stay refused', () => {
+  // (HOME in the environment, as in the hook: the shell's startup file is then the real home's ~/.zshenv, the one an unmodelled command may be taken to rewrite)
+  const decide = (l) => files(typeof l === 'string' ? l : l(BAD_FILES), fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const before of ['launchctl list', 'disown', 'bg', 'at now', 'tmux ls', 'setsid', 'foocmd x']) {
+    for (const prog of ['"$BIN/tool" version', '"$BIN"/tool version', '"${BIN}/tool" version']) {
+      assert.equal(decide(`BIN=/tmp/bin; ${before}; ${prog}`), 'allow', `${before}; ${prog}`);
+    }
+  }
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; /tmp/bin/tool version'), 'allow'); // twin: the literal path
+  // a whole-variable program set once on the script to a path with a literal file name ("$NEW" version): the same
+  for (const set of ['NEW=/tmp/h/tool', 'P=/tmp/h; NEW="$P/x/tool"']) assert.equal(decide(`${set}; "$NEW" version; launchctl list; "$NEW" version`), 'allow', set);
+  // refused: the directory is a protected one
+  assert.equal(decide('BIN=/home/u/.claude/pipeline/bin; launchctl list; "$BIN/tool" version'), 'deny');
+  // refused: the line itself writes the shell startup file / the program before running it (a modelled write, judged on the text it puts there)
+  assert.equal(decide((bad) => `BIN=/tmp/bin; launchctl list; echo '${bad}' >> ~/.zshenv; "$BIN/tool" version`), 'deny');
+  assert.equal(decide((bad) => `BIN=/tmp/bin; launchctl list; echo '${bad}' > "$BIN/tool"; "$BIN/tool" version`), 'deny');
+  // refused: the program name itself is only known at run time (the variable is not just its directory)
+  assert.equal(decide('launchctl list; "$BIN/$TOOL" version'), 'deny');
+  assert.equal(decide('launchctl list; $PROG version'), 'deny');
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; $BIN/tool version'), 'deny'); // (unquoted: the value may split into words)
+  // refused: a whole-variable program that may be a code runner, or that something else may rebind
+  for (const l of ['N=node; launchctl list; "$N" -e 1', 'N=/usr/bin/node; launchctl list; "$N" -e 1', 'N=/tmp/h/tool; launchctl list; read N; "$N" -e 1', 'launchctl list; N=/tmp/h/tool; for N in node; do "$N" -e 1; done', 'launchctl list; "$N" -e 1']) assert.equal(decide(l), 'deny', l);
+});
+
+// #965 review round 1 (R1-B1): the assignment that makes `"$N"` plain must be one that surely ran before the use. Failure caught: `RUN=/opt/helper launchctl list; "$RUN" --version` (the assignment is the
+// environment of launchctl alone; RUN may be node when the line runs) or an assignment after the use, in a branch or a subshell was believed, and the line was allowed to rewrite the startup file.
+test('#965: a whole-variable program is plain only when an assignment-only command surely ran before it, at its level', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  assert.equal(decide('N=/tmp/h/tool; launchctl list; "$N" -e 1'), 'allow'); // (the allowed twin)
+  for (const l of ['RUN=/opt/helper launchctl list; "$RUN" --version', 'launchctl list; "$N" -e 1; N=/tmp/h/tool', 'launchctl list; if true; then N=/tmp/h/tool; fi; "$N" -e 1',
+    'launchctl list; (N=/tmp/h/tool); "$N" -e 1', 'N=/tmp/h/tool; launchctl list; echo ${N::=node}; "$N" -e 1']) assert.equal(decide(l), 'deny', l);
+});
+// R1-B2: the name the variable holds is judged as the command word written out. Failure caught: `AWK=/usr/bin/awk; launchctl list; "$AWK" 'BEGIN { print 1 > "report.txt" }'` (an inline program, which the literal awk is
+// refused for) was allowed because awk is no STEERABLE name, and so was a versioned runner (node22 -e).
+test('#965: a whole-variable program that names a code runner given an inline program stays refused', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['AWK=/usr/bin/awk; launchctl list; "$AWK" \'BEGIN { print 1 > "report.txt" }\'', 'N=/usr/bin/node22; launchctl list; "$N" -e 1']) assert.equal(decide(l), 'deny', l);
+  assert.equal(decide('AWK=/usr/bin/awk; launchctl list; "$AWK" -f prog.awk in.txt'), 'allow'); // twin: awk on a program file is no inline code
+});
+// R1-F1: the command word is found after the keywords a segment starts with, and the variable program is plain only where it is the parsed command word. Failure caught: the install script's call inside an if / loop
+// (`then "$BIN/tool" version`) stayed refused (the word taken was `then`); and a wrapper the parser unwraps (`"$D/setsid" $PROG x.js`) must not be certified by its first word.
+test('#965: "$DIR/tool" after then / do / if / ! is plain too; a wrapper in front of a run-time program is not', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['BIN=/tmp/bin; launchctl list; if [ -x "$BIN/tool" ]; then "$BIN/tool" version; fi', 'BIN=/tmp/bin; launchctl list; if "$BIN/tool" version; then :; fi',
+    'BIN=/tmp/bin; launchctl list; for i in 1 2; do "$BIN/tool" version; done', 'BIN=/tmp/bin; launchctl list; ! "$BIN/tool" version']) assert.equal(decide(l), 'allow', l);
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; "$BIN/setsid" $PROG x.js'), 'deny');
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; if true; then "$BIN/setsid" $PROG x.js; fi'), 'deny');
+});
+// R2-B1 / R2-F1 / R2-F2: the program a variable stands for is plain only by the CLASS of its name: not a wrapper, a shell, an interpreter or a steerable runner (the parser unwraps / reads those only by
+// the literal name), and not a name the shell binds by itself. Failure caught: `WRAP=/usr/bin/setsid; launchctl list; "$WRAP" node x.js`, `SH=/bin/bash; ...; "$SH" -c 'node x.js'` and
+// `_=/tmp/h/tool; ...; : node; "$_" -e 1` were certified as plain programs, so the unmodelled command before them was no longer taken to rewrite the startup file the program then runs.
+test('#965: a variable program that is a wrapper, a shell or an interpreter, or a name the shell binds by itself, is not plain', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['WRAP=/usr/bin/setsid; launchctl list; "$WRAP" node x.js', 'SH=/bin/bash; launchctl list; "$SH" -c \'node x.js\'', 'SH=/bin/bash; launchctl list; "$SH" setup.sh',
+    '_=/tmp/h/tool; launchctl list; : node; "$_" -e 1', 'REPLY=/tmp/h/tool; launchctl list; read <<< node; "$REPLY" -e 1']) assert.equal(decide(l), 'deny', l);
+  assert.equal(decide('N=/tmp/h/tool; launchctl list; "$N" version'), 'allow'); // twin: a plain program name
+});
+// R3-F1: a name the parser dispatches on (find -exec, tmux runners, a SQL client ...) is read only under its literal name too. Failure caught: `F=/usr/bin/find; launchctl list; "$F" . -exec node {} \;` and the
+// tmux / psql forms were certified as plain programs (no inner `node` / script is a command of the frame), so the line was allowed where the merge base refused the `$` command word.
+test('#965: a variable program that is find, tmux or a SQL client is not plain', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['F=/usr/bin/find; launchctl list; "$F" . -name \'*.js\' -exec node {} \\;', 'T=/opt/homebrew/bin/tmux; launchctl list; "$T" new-session -d \'node x.js\'',
+    'PSQL=/opt/homebrew/opt/libpq/bin/psql; launchctl list; "$PSQL" -c \'select 1\'']) assert.equal(decide(l), 'deny', l);
+  assert.equal(decide('N=/tmp/h/tool; launchctl list; "$N" version'), 'allow'); // twin
+});

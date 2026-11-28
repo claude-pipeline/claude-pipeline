@@ -57,7 +57,11 @@ const GO = `go migration ${NAME}`;
 test('parseGo: only the two shapes, case-insensitive on the two words, nothing else', () => {
   assert.deepEqual(parseGo('go migration abc_1'), { op: 'migration', arg: 'abc_1' });
   assert.deepEqual(parseGo('  GO Data 0123456789ab.'), { op: 'data', arg: '0123456789ab' });
-  for (const bad of ['go migration x?', 'go migration', 'go migration a b', 'please go data abc', 'go migrate x', 'go data ' + 'a'.repeat(121), '', 'go\nmigration x', null, 'go data x; rm']) assert.equal(parseGo(bad), null, String(bad));
+  // #681 (extend): the owner's prompt arrived as `"go migration\n  20270111100800_close_legacy_linker"`: one pair of quotes and a line wrap between the op and the name
+  assert.deepEqual(parseGo('"go migration\n  20270111100800_close_legacy_linker"'), { op: 'migration', arg: '20270111100800_close_legacy_linker' });
+  assert.deepEqual(parseGo('“go data 0123456789ab”'), { op: 'data', arg: '0123456789ab' });
+  assert.deepEqual(parseGo('`go migration abc_1`'), { op: 'migration', arg: 'abc_1' });
+  for (const bad of ['"go migration x', 'go migration x"', '“go migration x"', '""go migration x""', '"go migration x" please', '"go migration x y"', '"go migration\n\nx and y"', 'go migration x?', 'go migration', 'go migration a b', 'please go data abc', 'go migrate x', 'go data ' + 'a'.repeat(121), '', 'go\nmigration x', null, 'go data x; rm']) assert.equal(parseGo(bad), null, String(bad));
 });
 
 test('a presented migration block + the typed go records once, with every field; the hook cwd need not be a repo', async (t) => {

@@ -6,7 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1070,7 +1071,7 @@ function typedFor(t, w, ids, quote, variant = undefined) {
   const record = ownerRules(t, quote, rulingRequest(7, ids, w.slug, / · content ([0-9a-f]{12}) · /.exec(asked.json.line)[1]));
   if (variant !== undefined) {
     const file = join(ownerGoDir(), `${record.session}.jsonl`);
-    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: randomUUID(), toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
+    writeFileSync(file, `${JSON.stringify({ ...record, ask: { askId: `ask-${randomUUID().replace(/-/g, '').slice(0, 12)}`, toolUseId: 'toolu_x', clickId: randomUUID().slice(0, 16), variant } })}\n`);
   }
   return (id, decision) => w.cli(['triage', 'owner-ruling', '--round', '1', '--id', id, '--decision', decision, '--reason', 'owner confirmed', '--owner-quote', quote, '--pr', '7']);
 }
@@ -1587,6 +1588,40 @@ test('#944 drift: a recommended Reject click is refused when the PR head on GitH
   const split = await a.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
   assert.equal(split.exitCode, 1, JSON.stringify(split.output));
   assert.match(split.output.reason, /recorded different PR heads/);
+  // #977: an ask that does not carry the clean-checkout marker (issued by a build that did not check the working tree) has the same two equal heads as a good one, so it is refused too
+  const unmarked = e2eWorld(t);
+  const u = await clickedRuling(t, unmarked, { ids: ['R1-B1'], ...REJECT });
+  assert.equal(u.file.headClean, true, 'an ask issued from a clean checkout carries the marker');
+  const unmarkedFile = join(asksDir(u.home), `${u.ask.askId}.json`);
+  const rawUnmarked = JSON.parse(readFileSync(unmarkedFile, 'utf8'));
+  delete rawUnmarked.headClean;
+  writeFileSync(unmarkedFile, JSON.stringify(rawUnmarked));
+  assert.equal(readAsk(u.ask.askId, { home: u.home }).ok, true, 'the ask still reads');
+  const beforeUnmarked = unmarked.stateText();
+  const noMarker = await u.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(noMarker.exitCode, 1, JSON.stringify(noMarker.output));
+  assert.match(noMarker.output.reason, /did not check that the working tree was clean.*ask again/);
+  assert.equal(unmarked.stateText(), beforeUnmarked, 'the state is byte-identical');
+  // R1-B1: the ask file reads when the click is validated but not when the head is compared (an I/O error between the two reads): refused, not skipped. The fs binding is swapped (and synced to the named imports) to fail the LAST read of the ask file, counted on a control run.
+  const lstatOf = async (failAt, code = 'EIO') => {
+    const w = e2eWorld(t);
+    const c = await clickedRuling(t, w, { ids: ['R1-B1'], ...REJECT });
+    const real = fs.lstatSync;
+    let seen = 0;
+    fs.lstatSync = (p, ...rest) => { if (String(p).endsWith(`${c.ask.askId}.json`) && ++seen === failAt) throw Object.assign(new Error(code), { code }); return real(p, ...rest); };
+    syncBuiltinESMExports();
+    try { return { seen: () => seen, w, r: await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject') }; } finally { fs.lstatSync = real; syncBuiltinESMExports(); }
+  };
+  const control = await lstatOf(0);
+  assert.equal(control.r.exitCode, 0, JSON.stringify(control.r.output));
+  assert.ok(control.seen() >= 2, 'the ask file is read at least twice (the click check, then the head comparison)');
+  const flaky = await lstatOf(control.seen());
+  assert.equal(flaky.r.exitCode, 1, JSON.stringify(flaky.r.output));
+  assert.match(flaky.r.output.reason, /could not be read.*ask again/);
+  // R2-B1 (#977): the same read finding NO file (it vanished after the click was validated) is refused too, not skipped: the head comparison would be skipped with it
+  const vanished = await lstatOf(control.seen(), 'ENOENT');
+  assert.equal(vanished.r.exitCode, 1, JSON.stringify(vanished.r.output));
+  assert.match(vanished.r.output.reason, /could not be read.*ask again/);
 });
 
 test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {

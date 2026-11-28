@@ -1,6 +1,7 @@
 // #262 (live-database guard, Task 4): the decision for a Supabase MCP call on a live project, and the claim that spends the owner's go. Scratch home, real git, real transcripts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
 import { chmodSync, closeSync, existsSync, mkdirSync, mkdtempSync, openSync, readFileSync, readdirSync, rmSync, symlinkSync, utimesSync, writeFileSync, writeSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
@@ -1428,6 +1429,23 @@ test('after-deploy: the final registry check and the claim run under the registr
   assert.deepEqual(hist(plain), []);
   release(own.lock);
   assert.equal(apply(plain).decision, 'allow');
+});
+
+test('after-deploy: a registry lock whose reclaim keeps hitting a busy rename gives up at the call\'s own wait, not after the lock helper\'s whole retry budget, and denies as for a lock still held', async (t) => {
+  // Failure caught (#924): on Windows a stale registry lock whose rename stays busy cost the hook about 2 s of retries per filesystem call, past the host's hook timeout (which counts as an allow), before the hook's own time check ran.
+  const s = await deployScene(t);
+  s.ctx.io.registryLockWaitMs = 100;
+  const dead = spawnSync(process.execPath, ['-e', '0']).pid; // an exited child: a pid that is not running
+  assert.ok(tryAcquire('db-refs', { dir: join(STATE(s.home), 'locks'), pid: dead }).acquired);
+  let renames = 0;
+  t.mock.method(fs, 'renameSync', () => { renames++; throw Object.assign(new Error('EBUSY'), { code: 'EBUSY' }); });
+  const started = Date.now();
+  const denied = applyMarked(s);
+  const took = Date.now() - started;
+  assert.equal(denied.decision, 'deny');
+  assert.match(denied.reason, /db-refs command is changing the registry/);
+  assert.deepEqual(hist(s), [], 'nothing was claimed');
+  assert.ok(renames <= 12 && took < 1000, `gave up by the wait (${renames} renames, ${took} ms; the retry budget alone is 40 per rename, about 2 s)`);
 });
 
 test('after-deploy: denied before the deploy finished, the same call after GitHub shows success applies (no attempt was spent)', async (t) => {

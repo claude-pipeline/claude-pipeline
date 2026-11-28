@@ -132,12 +132,13 @@ function sleepSync(ms) {
   Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 }
 
-function retrying(fn) {
+// `deadline` (optional, an absolute Date.now() ms timestamp): no further wait is started that would end past it, so the busy error is thrown instead (#924). Without one, the whole retry budget is spent as before.
+function retrying(fn, deadline) {
   for (let i = 1; ; i++) {
     try {
       return fn();
     } catch (err) {
-      if (!BUSY_CODES.has(err.code) || i >= _tuning.attempts) throw err;
+      if (!BUSY_CODES.has(err.code) || i >= _tuning.attempts || (deadline !== undefined && Date.now() + _tuning.waitMs > deadline)) throw err;
       sleepSync(_tuning.waitMs);
     }
   }
@@ -196,10 +197,10 @@ function assess(lockPath, ctx) {
 }
 
 // Atomically take a directory out of the way by renaming it; null if it is already gone.
-function moveAside(p) {
+function moveAside(p, deadline) {
   const target = `${p}.stale-${randomBytes(6).toString('hex')}`;
   try {
-    retrying(() => fs.renameSync(p, target));
+    retrying(() => fs.renameSync(p, target), deadline);
     return target;
   } catch (err) {
     if (err.code === 'ENOENT') return null;
@@ -230,12 +231,12 @@ function tryMkdir(p) {
 // past the 60 s staleness window cannot overwrite the owner that reclaimed its directory. After publishing, owner.json
 // is re-read and must carry our runId. Returns { ok: true } or { ok: false, existing } (someone else owns it; their
 // file is never touched). Other failures clean up the tmp file and an ownerless directory, then throw.
-function publishOwner(dirPath, owner, hooks) {
+function publishOwner(dirPath, owner, hooks, deadline) {
   const ownerPath = path.join(dirPath, 'owner.json');
   const tmp = path.join(dirPath, `owner.json.${randomBytes(4).toString('hex')}.tmp`);
   const removeTmp = () => {
     try {
-      retrying(() => fs.unlinkSync(tmp));
+      retrying(() => fs.unlinkSync(tmp), deadline);
     } catch {
       /* never created, or already renamed into place */
     }
@@ -248,7 +249,7 @@ function publishOwner(dirPath, owner, hooks) {
       fs.linkSync(tmp, ownerPath);
     } catch (err) {
       if (err.code === 'EEXIST') lostRace = true;
-      else if (NO_LINK_CODES.has(err.code)) retrying(() => fs.renameSync(tmp, ownerPath));
+      else if (NO_LINK_CODES.has(err.code)) retrying(() => fs.renameSync(tmp, ownerPath), deadline);
       else throw err;
     }
   } catch (err) {
@@ -270,22 +271,22 @@ function publishOwner(dirPath, owner, hooks) {
 // Remove a directory (lock or guard) if, and only if, its owner.json carries `runId`. Rename-then-remove, so the
 // path is free the instant the rename lands. If the rename keeps failing (Windows: something holds the directory
 // open), free it by unlinking owner.json and removing the then-empty directory instead.
-function releaseDir(dirPath, runId) {
+function releaseDir(dirPath, runId, deadline) {
   const owner = readOwner(dirPath);
   if (!owner || owner.runId !== runId) return false;
   let moved;
   try {
-    moved = moveAside(dirPath);
+    moved = moveAside(dirPath, deadline);
   } catch (err) {
     if (!BUSY_CODES.has(err.code)) throw err;
     try {
-      retrying(() => fs.unlinkSync(path.join(dirPath, 'owner.json')));
+      retrying(() => fs.unlinkSync(path.join(dirPath, 'owner.json')), deadline);
     } catch (unlinkErr) {
       if (unlinkErr.code === 'ENOENT') return false;
       throw err;
     }
     try {
-      retrying(() => fs.rmdirSync(dirPath));
+      retrying(() => fs.rmdirSync(dirPath), deadline);
     } catch {
       /* an empty leftover directory is reclaimed as "never completed" */
     }
@@ -316,7 +317,7 @@ function breakGuard(guard, ctx) {
     return 'busy';
   }
   ctx.hooks.beforeBreakGuard?.(guard);
-  const moved = moveAside(guard);
+  const moved = moveAside(guard, ctx.deadline);
   if (moved === null) return 'retry';
   let sameDir = false;
   try {
@@ -327,7 +328,7 @@ function breakGuard(guard, ctx) {
   }
   if (!sameDir) {
     try {
-      retrying(() => fs.renameSync(moved, guard)); // best effort; EEXIST means someone re-created the guard
+      retrying(() => fs.renameSync(moved, guard), ctx.deadline); // best effort; EEXIST means someone re-created the guard
     } catch {
       /* theirs stays aside; they notice the loss before touching the lock */
     }
@@ -353,13 +354,13 @@ function reclaim(lockPath, ctx) {
   };
   let moved = null;
   try {
-    if (!publishOwner(guard, me, ctx.hooks).ok) return 'busy';
+    if (!publishOwner(guard, me, ctx.hooks, ctx.deadline).ok) return 'busy';
     if (assess(lockPath, ctx).state === 'stale') {
       ctx.hooks.insideGuard?.(guard, lockPath);
-      if (readOwner(guard)?.runId === me.runId) moved = moveAside(lockPath);
+      if (readOwner(guard)?.runId === me.runId) moved = moveAside(lockPath, ctx.deadline);
     }
   } finally {
-    releaseDir(guard, me.runId);
+    releaseDir(guard, me.runId, ctx.deadline);
   }
   if (moved) removeQuietly(moved);
   return 'retry';
@@ -369,6 +370,8 @@ function reclaim(lockPath, ctx) {
 // test interleave another actor at a precise point; production callers never pass them.
 // Returns { acquired: true, lock } or { acquired: false, owner[, error] }. `error` is set when we could not write
 // our owner file (the lock directory is cleaned up so it cannot block anyone).
+// `deadline` (optional, an absolute Date.now() ms timestamp, #924): a busy rename / unlink stops being retried once waiting again would end past it; the busy error then surfaces as it does when the whole retry budget is spent
+// (not acquired with `error`, or thrown from a reclaim). Without it the retry budget is unchanged.
 export function tryAcquire(
   name,
   {
@@ -380,11 +383,12 @@ export function tryAcquire(
     machineId: machine = machineId(),
     isAlive = isPidAlive,
     hooks = {},
+    deadline,
   } = {},
 ) {
   const lockPath = lockPathFor(dir, name);
   fs.mkdirSync(dir, { recursive: true });
-  const ctx = { now, host, machineId: machine, isAlive, hooks };
+  const ctx = { now, host, machineId: machine, isAlive, hooks, deadline };
   for (let attempt = 0; attempt < MAX_ATTEMPTS; attempt++) {
     if (tryMkdir(lockPath)) {
       const owner = {
@@ -397,7 +401,7 @@ export function tryAcquire(
       };
       let published;
       try {
-        published = publishOwner(lockPath, owner, hooks);
+        published = publishOwner(lockPath, owner, hooks, deadline);
       } catch (error) {
         if (error.code === 'ENOENT') continue; // our directory was taken away before we published: start over
         return { acquired: false, owner: null, error };
@@ -433,8 +437,9 @@ export async function acquire(name, { waitMs = 30 * 60e3, pollMs = 1000, onWait,
 }
 
 // true when this call released the lock; false when it is gone or now belongs to another run (left untouched).
-export function release(lock) {
-  return releaseDir(lockPathFor(lock.dir, lock.name), lock.runId);
+// `deadline` (optional, absolute Date.now() ms, #924): a busy rename / unlink is not retried past it; the busy error is thrown, as when the whole retry budget is spent.
+export function release(lock, { deadline } = {}) {
+  return releaseDir(lockPathFor(lock.dir, lock.name), lock.runId, deadline);
 }
 
 export async function withLock(name, fn, opts) {

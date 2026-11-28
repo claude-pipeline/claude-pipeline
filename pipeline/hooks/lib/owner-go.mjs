@@ -722,7 +722,10 @@ export function replyBeforeToolUse(transcriptPath, toolUseId, { tailBytes = REPL
     if (e?.type !== 'assistant') continue;
     const t = i === useAt ? textOf(e, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : textOf(e);
     if (showsText(t)) lastTextAt = i;
-    if (blocksOf(e).some((b) => b?.type === 'thinking' || b?.type === 'redacted_thinking')) progressNote = true;
+    // R1-B1 / R2-F1: a real progress note is a NON-EMPTY `thinking` block, before the target call, on an entry Claude Code marks staysIfReplyIsCut. (`thinkingDisplay: "updates"` is also on ordinary hidden
+    // reasoning, whose `thinking` is empty, so it proves nothing.) Hidden or redacted reasoning is not a note.
+    const before = i === useAt ? blocksOf(e).slice(0, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : blocksOf(e);
+    if (e.staysIfReplyIsCut === true && before.some((b) => b?.type === 'thinking' && typeof b.thinking === 'string' && b.thinking.trim() !== '')) progressNote = true;
     text += t;
   }
   for (let i = Math.max(lastTextAt, origin[useAt]) + 1; i < useAt; i++) {
@@ -732,7 +735,8 @@ export function replyBeforeToolUse(transcriptPath, toolUseId, { tailBytes = REPL
     const visible = origin[i] < 0 || !invisibleNote(entries, parent, origin[i], verdicts); // (an entry that chains to no prompt fails closed: it counts)
     if (visible && blocksOf(e).some(blockSurfaces)) return { reason: 'another turn showed a live-database block between the reply and the dialog' };
   }
-  if (!showsText(text)) return { reason: progressNote ? 'no reply text before the dialog (Claude Code recorded only a progress note)' : 'no reply text before the dialog' };
+  // (#983: `progressNote` lets the live-database claim accept the click on the dialog's own block when only a progress note was recorded before the call; every other caller treats it as a refusal)
+  if (!showsText(text)) return progressNote ? { reason: 'no reply text before the dialog (Claude Code recorded only a progress note)', progressNote: true } : { reason: 'no reply text before the dialog' };
   return { text };
 }
 
@@ -934,9 +938,14 @@ export function rulingNudge(input) {
 export const QUEUED_NUDGE = '[claude-pipeline owner-go] the owner\'s answer was typed while the agent was still working, so it was not recorded: re-run the dry run (`P merge --pr N --dry-run --owner-go`), `P triage round-request` or `P triage ruling-request`, show the FRESH closing lines, and ask the owner once more after the reply ends.';
 // #262: the owner's typed go for a live-database change: `go migration <name>` or `go data <sha12>` and nothing else. (Here, not in live-db-go.mjs, so queuedNudge can read it without an import cycle.)
 export const GO_PROMPT_MAX = 300;
+// #681 (extend): a prompt copied out of a terminal can arrive wrapped in ONE pair of double quotes (straight or curly) or backticks, and line-wrapped between the op and the name
+// ("go migration\n  <name>"). Both are read; the words, the charset and the length cap are unchanged, and nothing else may share the prompt. (A newline is read after the op, never between "go" and the op.)
+const GO_QUOTES = { '"': '"', '“': '”', '`': '`' };
 export function parseGo(prompt) {
   if (typeof prompt !== 'string' || prompt.length > GO_PROMPT_MAX) return null;
-  const m = /^\s*go (migration|data) ([A-Za-z0-9_.-]{0,119}[A-Za-z0-9_-])[.!]?\s*$/i.exec(prompt);
+  let t = prompt.trim();
+  if (t.length >= 2 && GO_QUOTES[t[0]] === t[t.length - 1]) t = t.slice(1, -1);
+  const m = /^\s*go[ \t]+(migration|data)\s+([A-Za-z0-9_.-]{0,119}[A-Za-z0-9_-])[.!]?\s*$/i.exec(t);
   return m ? { op: m[1].toLowerCase(), arg: m[2] } : null;
 }
 export function queuedNudge(input) {

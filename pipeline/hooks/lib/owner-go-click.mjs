@@ -173,7 +173,7 @@ export const RULING_WHY = Object.freeze({
 });
 // The dialogs whose recommendation rests on Claude's reading of the CODE (a recommended Reject or fix-separately): their ask file also records the heads it was issued at (`head`: the checkout's, `prHead`: the PR's on GitHub), so a click is not applied once either moved.
 export const RULING_HEAD_BOUND_VARIANTS = Object.freeze(['ruling-v2-follow-up-any', 'ruling-v2-reject']);
-const headOk = (a) => (!Object.hasOwn(a, 'head') && !Object.hasOwn(a, 'prHead')) || (a.kind === 'ruling' && RULING_HEAD_BOUND_VARIANTS.includes(a.variant) && ['head', 'prHead'].every((k) => !Object.hasOwn(a, k) || /^[0-9a-f]{40}$/.test(String(a[k]))));
+const headOk = (a) => (!Object.hasOwn(a, 'head') && !Object.hasOwn(a, 'prHead')) || (a.kind === 'ruling' && RULING_HEAD_BOUND_VARIANTS.includes(a.variant) && ['head', 'prHead'].every((k) => !Object.hasOwn(a, k) || /^[0-9a-f]{40}$/.test(String(a[k]))) && (!Object.hasOwn(a, 'headClean') || a.headClean === true));
 const RULING_DECISION_WORD = Object.freeze({ accept: 'Accept', 'follow-up': 'Follow-up', reject: 'Reject' });
 const RECOMMENDS = 'Claude recommends ';
 // The recommendation row of the dialog's question (one line, before the binding last line; it binds nothing). Null for a decision / code that is not in the table.
@@ -265,7 +265,7 @@ function installedParts(ask, home) {
     if (op === undefined) return null;
     const v = verifyBlock(block, { home });
     const f = v.fields;
-    if (!v.ok || f.op !== op || f.label !== label || f.ref !== ref || (op === 'migration' ? f.name : f.sqlSha256.slice(0, 12)) !== arg || repoKey(f.repo) !== ask.repo) return null;
+    if (!v.ok || v.leading !== 0 || f.op !== op || f.label !== label || f.ref !== ref || (op === 'migration' ? f.name : f.sqlSha256.slice(0, 12)) !== arg || repoKey(f.repo) !== ask.repo) return null;
     return liveDbAsk({ repo: ask.repo, pr, block, op, arg, label, ref });
   }
   const ready = /^🔀 Ready to merge (#\d{1,6}(?:, #\d{1,6}){1,3}) — say "merge"$/.exec(block.split('\n').at(-1));
@@ -367,12 +367,12 @@ function readSpent(askId, home) {
 // Writes `asks/<askId>.json` and returns { askId, questions: [dialog] } (the dialog the agent passes to AskUserQuestion VERBATIM), or { error } when the dialog could not bind or be written. The question
 // text is `<title> (<askId>)` + blank line + `block`; before writing, the SAME binding cores the recorder uses are run on it with every option's answer, so an ask whose closing lines would bind
 // nothing (or another PR / repository than `prs` / `repo`) is never issued. An older ask of the same kind, repository and PRs that is neither spent nor superseded is marked superseded.
-export function issueAsk({ kind, repo, prs, header, title, block, options, actions, variant, head, prHead, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
+export function issueAsk({ kind, repo, prs, header, title, block, options, actions, variant, head, prHead, headClean, multiSelect = kind === 'merge-many', hookLayersSha256 = null, home = accountHome(), now = Date.now } = {}) {
   try {
     const key = repoKey(repo);
     if (!KINDS.includes(kind) || key === null || !Array.isArray(prs) || (prs.length === 0 && kind !== 'live-db') || !prs.every(Number.isInteger) || typeof title !== 'string' || typeof block !== 'string' || !isObj(actions)) return { error: 'invalid' };
     if (variant !== undefined && !variantOfKind(kind, variant)) return { error: 'invalid' };
-    if ((head !== undefined || prHead !== undefined) && !headOk({ kind, variant, ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }) })) return { error: 'invalid' };
+    if ((head !== undefined || prHead !== undefined || headClean !== undefined) && !headOk({ kind, variant, ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }), ...(headClean === undefined ? {} : { headClean }) })) return { error: 'invalid' };
     // an action is a decline (null), the answer text a typed parser reads (a string) or a follow-up instruction (round asks only)
     if (!Object.values(actions).every((a) => a === null || typeof a === 'string' || (kind === 'round' && isInstruction(a)))) return { error: 'invalid-actions' };
     const labels = (options ?? []).map((o) => o?.label);
@@ -386,7 +386,7 @@ export function issueAsk({ kind, repo, prs, header, title, block, options, actio
     if (askId === null) return { error: 'no-id' };
     const dialog = canonicalDialog({ question: `${title} (${askId})\n\n${block}`, header: header ?? 'Merge', multiSelect, options });
     if (dialog === null) return { error: 'invalid-dialog' };
-    const ask = { v: variant === undefined ? 1 : 2, askId, kind, ...(variant === undefined ? {} : { variant }), ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }), repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
+    const ask = { v: variant === undefined ? 1 : 2, askId, kind, ...(variant === undefined ? {} : { variant }), ...(head === undefined ? {} : { head }), ...(prHead === undefined ? {} : { prHead }), ...(headClean === undefined ? {} : { headClean }), repo: key, prs: [...prs], dialog, dialogSha256: dialogSha256(dialog), actions, issuedAt: new Date(now()).toISOString(), hookLayersSha256 };
     // every approving answer must bind exactly this repository and these PRs, or the ask is useless (a typo in the block, a closing line of another PR)
     for (const label of labels) {
       if (actions[label] === null || isInstruction(actions[label])) continue; // (a decline and an instruction bind nothing: neither can reach a record)
@@ -464,7 +464,7 @@ function bindAnswer(ask, text, question, home = accountHome()) {
     const go = parseGo(text);
     const cut = question.indexOf('\n\n');
     const v = go !== null && cut >= 0 ? verifyBlock(question.slice(cut + 2), { home }) : null;
-    if (!v?.ok) return { error: 'nothing-bound' };
+    if (!v?.ok || v.leading !== 0) return { error: 'nothing-bound' }; // (R1-B2: the question's body IS the block, no prose or other SQL before it)
     const f = v.fields;
     if (go.op !== f.op || go.arg !== (f.op === 'migration' ? f.name : f.sqlSha256.slice(0, 12))) return { error: 'nothing-bound' };
     if (repoKey(f.repo) !== ask.repo) return { error: 'other-pr-or-repo' };
