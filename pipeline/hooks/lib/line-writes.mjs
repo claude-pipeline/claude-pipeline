@@ -1322,7 +1322,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   const opaque = lone > seps;
   const first = cmds.findIndex(startsBackground);
   // (#950: the first command that starts a job outliving the frame: from there on the order is unknown, before it nothing is. Unless the shell already runs a command of the frame in the background
-  // (the parser's `bg`: a backgrounded and-or list or group) or a process substitution does (no mark of its own), or the frame holds a function / trap (the parser lists ; its body runs when called, maybe by the job): that one counts from the start, as before)
+  // (the parser's `bg`: a backgrounded and-or list or group) or a process substitution does (no mark of its own), or the frame holds a function / trap (its body runs when called, maybe by the job): that one counts from the start, as before)
   const early = first < 0 ? -1 : cmds.findIndex((c) => c.bg === true);
   const procSub = first >= 0 && (/[<>]\(/.test(typeof text === 'string' ? text : '') || cmds.some((c) => /[<>]\(/.test(c.raw ?? '')));
   const bgFrom = first < 0 ? Infinity : (procSub || hasDeferred(cmds) || cmds.fns?.size > 0) ? 0 : early >= 0 ? Math.min(first, early) : first;
