@@ -1653,8 +1653,8 @@ test('#904: the spellings the name reading folds, behind other wrappers and in a
   const rows = [
     ['./env foo', 'env', './env', 'env'], ['bin/npx foo', 'bin/npx', 'bin/npx', 'npx'], ['/work/repo/bin/nohup foo', 'bin/nohup', '/work/repo/bin/nohup', 'nohup'],
     ['./timeout 5 foo', 'timeout', './timeout', 'timeout'], ['./sudo foo', 'sudo', './sudo', 'sudo'], ['./command foo', 'command', './command', 'command'], ['./builtin foo', 'builtin', './builtin', 'builtin'],
-    ['echo a | ./xargs foo', 'xargs', './xargs', 'xargs'], ['./npm exec foo', 'npm', './npm', 'npm'], ['./ENV foo', 'ENV', './ENV', 'ENV'], ['./env.exe foo', 'env.exe', './env.exe', 'env.exe'],
-    ['./Node x.mjs', 'Node', './Node', 'Node'], ['./node.cmd x.mjs', 'node.cmd', './node.cmd', 'node.cmd'], ['nohup ./env x', 'env', './env', 'env'], ['sudo ./time x', 'time', './time', 'time'],
+    ['echo a | ./xargs foo', 'xargs', './xargs', 'xargs'], ['./npm exec foo', 'npm', './npm', 'npm'], ['./ENV foo', 'ENV', './ENV', 'env'], ['./env.exe foo', 'env.exe', './env.exe', 'env'],
+    ['./Node x.mjs', 'Node', './Node', 'node'], ['./node.cmd x.mjs', 'node.cmd', './node.cmd', 'node'], ['nohup ./env x', 'env', './env', 'env'], ['sudo ./time x', 'time', './time', 'time'],
     ['env FOO=1 ./nohup x', 'nohup', './nohup', 'nohup'], ['echo hi | ./sh', 'sh', './sh', 'sh'], ['./bash -c "echo hi"', 'bash', './bash', 'bash'], ['./python3.12 x.py', 'python3.12', './python3.12', 'python3.12'],
   ];
   for (const [line, at, word, name] of rows) {
@@ -1719,7 +1719,7 @@ test('#904: a program the line writes first is refused like the one on disk (`cp
     assert.match(v.reason, namedLike('./env', 'env'), line);
   }
   // the unknown directory: a node_modules program is allowed without a lookup; any other program is refused as `./tool` is
-  for (const line of ['cd "$X" && ./node_modules/.bin/npx foo', 'cd "$X" && ./node_modules/.bin/tsx x.ts']) assert.equal(evaluate(line).decision, 'allow', line);
+  for (const line of ['cd "$X" && ./node_modules/.bin/npx foo', 'cd "$X" && ./node_modules/.bin/node --version']) assert.equal(evaluate(line).decision, 'allow', line);
   assert.match(evaluate('cd "$X" && ./env foo').reason, /cannot tell which directory/);
   assert.match(evaluate('cd "$X" && ./tool foo').reason, /cannot tell which directory/, 'the reference: a plain program');
   // accepted refusal (owner 11-28): a virtualenv interpreter after a cd the guard cannot follow
