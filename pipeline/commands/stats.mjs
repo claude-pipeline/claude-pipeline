@@ -18,7 +18,7 @@ export const meta = {
     '     read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had',
     '     to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | deferred = its accepts were all deferred past the cap | nothing-accepted), blockingLoopPrs, capDeferredPrs, capDeferredItems, capDeferReopened, capLowNotDeferred, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,',
     '     countedRounds, pastCapRounds, usd, blockingLoop, capDeferredItems, capDeferReopened, capLowNotDeferred, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), reviewKind, resolutionIneligible, acceptedBlocking, capDeferred? (on the row of the last allowed round), admission?, previous?, found?}]}]. The cap-low numbers (review.cap_low_accepts) count over EVERY round of the state, one per item id and not a cached copy: capDeferredItems = accepts `triage cap-defer` turned into follow-ups unapplied, capDeferReopened = of those, tightened back to ACCEPT by Claude (the floor was wrong), capLowNotDeferred = 1 when the last allowed round\'s accepts were all low by this stats rule, nothing was deferred and an automatic extra round followed. --pr N limits it to those PRs (merged or not listed by date).',
-    '     Without --json the same numbers print as a plain-text table. Only the viewer\'s own comments count (the pipeline\'s comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR, unreadable) is named in `warnings`; a run record of this PR that names another repository (the repo was renamed or moved) still counts, with a warning, when its branch is the live branch of the PR (one extra read of the PR); a pull request reached through two slugs counts once, with a warning. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
+    '     Without --json the same numbers print as a plain-text table. Only the viewer\'s own comments count (the pipeline\'s comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR, unreadable) is named in `warnings`; a run record of this PR that names another repository (the repo was renamed or moved) still counts, with a warning, when its branch is the live branch of the PR (one extra read of the PR); a pull request reached through two slugs counts once, with a warning. A PR whose identity or repository cannot be read when it is needed is left out of the totals, with a warning (rerun). A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
     '     Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.',
   ].join('\n'),
 };
@@ -67,9 +67,14 @@ async function rounds(rest, ctx) {
           let state = null;
           const slugLower = slug.toLowerCase();
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
-          // "This repository" is the canonical one, resolved ONCE per PR and used for every record, so neither the order of two aliases nor the order of the comments can change the record picked. Looked up when several slugs are asked, the listing carries it, or an own record names another slug than the one asked.
+          // "This repository" is the canonical one, resolved ONCE per PR and used for every record, so neither the order of two aliases nor the order of the comments can change the record picked. Looked up when several slugs are asked or an own record names another slug than the one asked.
           const ownSlugs = comments.filter((c) => c?.user?.login === me && typeof c.body === 'string' && c.body.startsWith(MARKERS.summary)).map((c) => decodeRecord(c.body)).filter((r) => r.status === 'ok').map((r) => String(r.record.repo ?? '').toLowerCase());
-          const home = repos.length > 1 || baseRepo !== undefined || ownSlugs.some((s) => s !== slugLower) ? canonical() : undefined;
+          const home = repos.length > 1 || ownSlugs.some((s) => s !== slugLower) ? canonical() : undefined;
+          // records naming different repositories cannot be told apart without the canonical one: no record is guessed, the PR is left out
+          if (home === undefined && new Set(ownSlugs).size > 1 && livePull() === null) {
+            warnings.push(`${slug}#${number}: left out: its run records name different repositories and the repository of the PR could not be read; rerun`);
+            continue;
+          }
           for (const c of comments) {
             if (typeof c?.body !== 'string') continue;
             const isState = c.body.startsWith(MARKERS.triage);

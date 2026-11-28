@@ -297,6 +297,25 @@ test('R3-B1 stats rounds: only the old slug asked, records of the old and the cu
   assert.equal(oldLast.json.totals.usd, 9, 'the old-slug record comes last: still the canonical repository\'s record');
 });
 
+// R4-W1: a listing that carries base.repo must not force the canonical lookup when every own record names the slug that was asked: such a record counts directly (no branch read).
+test('R4-W1 stats rounds: an old-slug listing whose records all name the asked slug counts them directly, with no pulls read', () => {
+  const listed = { match: '^api repos/old/widgets/pulls\\?state=closed', stdoutJson: [{ number: 7, node_id: 'PR_node_7', base: { repo: { full_name: 'acme/widgets' } }, merged_at: '2026-11-10T10:00:00Z', updated_at: '2026-11-10T10:00:00Z' }] };
+  const record = mine(1, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'old/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`);
+  const r = statsCli([listed, { match: '^api repos/old/widgets/issues/7/comments', stdoutJson: [record, mine(2, triageBody(state7))] }], ['--json', '--since', '2026-11-05', '--repo-slug', 'old/widgets']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.totals.prs, r.json.totals.usd, r.json.warnings], [1, 9, []]);
+  assert.equal(r.fake.lines().some((l) => /pulls\/7/.test(l)), false, 'no extra read of the PR');
+});
+
+// R4-W2: records naming different slugs need the canonical repository to pick one; when it cannot be read, no record is guessed and the PR is left out.
+test('R4-W2 stats rounds: one slug asked, records of two slugs, the canonical repository unreadable: the PR is left out with a rerun warning', () => {
+  const rec = (repo, usd) => mine(repo === 'old/widgets' ? 1 : 3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost: { ...cost7, total: { ...cost7.total, usd } } })}`);
+  const r = statsCli([{ match: '^api repos/old/widgets/issues/7/comments', stdoutJson: [rec('old/widgets', 2), mine(2, triageBody(state7)), rec('acme/widgets', 9)] }, { match: '^api repos/old/widgets/pulls/7$', code: 1, stderr: 'HTTP 502' }], ['--json', '--pr', '7', '--repo-slug', 'old/widgets']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.totals.prs, r.json.prs.length, r.json.withoutState, r.json.totals.usd], [0, 0, 0, 0]);
+  assert.match(noteOf(r), /old\/widgets#7: left out: its run records name different repositories and the repository of the PR could not be read; rerun/);
+});
+
 const noteOf = (r) => r.json.warnings.join('\n');
 const onlyComments = (extra) => [world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, summaryBody(cost7)), mine(2, triageBody(state7)), ...extra] }];
 
