@@ -731,7 +731,10 @@ export function currentBranch(o) {
   return ref === null ? 'HEAD' : ref.trim().replace(/^refs\/heads\//, '');
 }
 
-export const isClean = (o) => git(['status', '--porcelain=v1', '-uall'], o) === '';
+// With `ref`, the index and the working tree must also both equal that commit (a status check alone passes after a soft reset to
+// another commit and back, when the staged changes equal that commit's tree).
+export const isClean = (o, ref) => git(['status', '--porcelain=v1', '-uall'], o) === ''
+  && (ref === undefined || (gitOrNull(['diff', '--quiet', assertRef(ref, ['diff', '--quiet', ref]), '--'], 1, o) !== null && gitOrNull(['diff', '--cached', '--quiet', ref, '--'], 1, o) !== null));
 
 export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref, ['rev-parse', '--verify', ref])], o).trim();
 

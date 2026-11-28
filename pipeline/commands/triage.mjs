@@ -456,8 +456,8 @@ async function ownerRuling(rest, ctx) {
         // leaves this checkout's HEAD where it was), and one that cannot be read is refused; local commits not pushed yet do not matter, only a change since the ask.
         const issuedAt = RULING_HEAD_BOUND_VARIANTS.includes(r.ask.variant) ? readAsk(r.ask.askId, { home: ctx.home }) : null;
         let moved = null;
-        // R1-B1 (#977): a file that exists but no longer reads is refused, never skipped ('none' = no file at all stays unjudged: the click check above already needs the file, and fixtures record a variant with none)
-        if (issuedAt?.ok === false && issuedAt.reason !== 'none') moved = 'the ask file could not be read, so the code Claude checked cannot be told apart from the code now';
+        // R1-B1 (#977): a file that exists but no longer reads is refused, never skipped. R2-B1: so is one that vanished after a click validated it ('none' stays unjudged only for a record that is not a click: typed fixtures record a variant with no file)
+        if (issuedAt?.ok === false && (issuedAt.reason !== 'none' || r.via === 'ask')) moved = 'the ask file could not be read, so the code Claude checked cannot be told apart from the code now';
         else if (issuedAt?.ok === true) {
           const { head: askedHead, prHead: askedPrHead } = issuedAt.ask;
           if (typeof askedHead !== 'string' || typeof askedPrHead !== 'string') moved = 'the ask recorded no PR head to compare with, so the code Claude checked cannot be told apart from the code now';
@@ -1054,7 +1054,8 @@ async function rulingRequest(rest, ctx) {
       const head = headSha({ cwd: root });
       const prHead = gh.prView(pr, ['headRefOid']).headRefOid;
       // R5-B2: HEAD equal to the PR head says nothing about files edited since: a dirty working tree is code the PR does not hold
-      if (typeof prHead === 'string' && prHead === head && !isClean({ cwd: root })) headRefusal = 'the checkout has uncommitted changes, so the code Claude checked may not be the PR\'s code: commit and push, then recommend again';
+      // R2-B2: "clean" is judged against the saved HEAD (index and working tree both equal it), so a reset to another commit and back around the check cannot pass
+      if (typeof prHead === 'string' && prHead === head && !isClean({ cwd: root }, head)) headRefusal = 'the checkout has uncommitted changes, so the code Claude checked may not be the PR\'s code: commit and push, then recommend again';
       // R1-B2 (#977): the marker is set only when HEAD is still the one saved (another process may have committed during the lookup, so the clean tree would be a different commit's); the marker says the clean-checkout check passed when this ask was issued (apply refuses an ask without it)
       else if (typeof prHead === 'string' && prHead === head) {
         if (headSha({ cwd: root }) === head) heads = { head, prHead, headClean: true };

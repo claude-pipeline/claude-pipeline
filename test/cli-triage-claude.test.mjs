@@ -1603,12 +1603,12 @@ test('#944 drift: a recommended Reject click is refused when the PR head on GitH
   assert.match(noMarker.output.reason, /did not check that the working tree was clean.*ask again/);
   assert.equal(unmarked.stateText(), beforeUnmarked, 'the state is byte-identical');
   // R1-B1: the ask file reads when the click is validated but not when the head is compared (an I/O error between the two reads): refused, not skipped. The fs binding is swapped (and synced to the named imports) to fail the LAST read of the ask file, counted on a control run.
-  const lstatOf = async (failAt) => {
+  const lstatOf = async (failAt, code = 'EIO') => {
     const w = e2eWorld(t);
     const c = await clickedRuling(t, w, { ids: ['R1-B1'], ...REJECT });
     const real = fs.lstatSync;
     let seen = 0;
-    fs.lstatSync = (p, ...rest) => { if (String(p).endsWith(`${c.ask.askId}.json`) && ++seen === failAt) throw Object.assign(new Error('EIO'), { code: 'EIO' }); return real(p, ...rest); };
+    fs.lstatSync = (p, ...rest) => { if (String(p).endsWith(`${c.ask.askId}.json`) && ++seen === failAt) throw Object.assign(new Error(code), { code }); return real(p, ...rest); };
     syncBuiltinESMExports();
     try { return { seen: () => seen, w, r: await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject') }; } finally { fs.lstatSync = real; syncBuiltinESMExports(); }
   };
@@ -1618,6 +1618,10 @@ test('#944 drift: a recommended Reject click is refused when the PR head on GitH
   const flaky = await lstatOf(control.seen());
   assert.equal(flaky.r.exitCode, 1, JSON.stringify(flaky.r.output));
   assert.match(flaky.r.output.reason, /could not be read.*ask again/);
+  // R2-B1 (#977): the same read finding NO file (it vanished after the click was validated) is refused too, not skipped: the head comparison would be skipped with it
+  const vanished = await lstatOf(control.seen(), 'ENOENT');
+  assert.equal(vanished.r.exitCode, 1, JSON.stringify(vanished.r.output));
+  assert.match(vanished.r.output.reason, /could not be read.*ask again/);
 });
 
 test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {

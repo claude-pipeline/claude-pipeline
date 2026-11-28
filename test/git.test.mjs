@@ -486,6 +486,16 @@ test('mergeBase, headSha, revParse, isClean', () => {
   assert.equal(isClean(o), true);
   repo.write('y.txt', 'edited\n');
   assert.equal(isClean(o), false);
+  // R2-B2 (#977): with a ref, the tree must equal THAT commit: a checkout that is plain-clean at another commit (a soft reset away and back around the check) is not
+  git(['checkout', '--', 'y.txt'], o);
+  assert.equal(isClean(o, mainTip), true);
+  git(['reset', '--hard', tip], o);
+  assert.equal(isClean(o), true);
+  assert.equal(isClean(o, tip), true);
+  assert.equal(isClean(o, mainTip), false);
+  git(['reset', '--soft', mainTip], o); // HEAD is back at mainTip, the index still holds tip's tree
+  assert.equal(isClean(o), false);
+  assert.equal(isClean(o, mainTip), false);
 });
 
 test('mergeBase explains itself when there is no common ancestor', () => {
