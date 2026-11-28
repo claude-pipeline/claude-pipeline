@@ -1035,8 +1035,11 @@ async function rulingRequest(rest, ctx) {
     const notes = items.filter((i) => isDeferrableAccept(i) || isOwnerDeferral(i)).map((i) => deferNote(i));
     // May the recommendation be shown? Refused => the neutral legacy dialog and the reason, never a retry (exit 0).
     const refusedRaw = values.recommend === undefined ? null : recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: values.why });
-    // minor-later claims "the pipeline rates it low": when that is what refused it, name the code that makes no such claim.
-    const refused = refusedRaw !== null && values.why === 'minor-later' && / is not low severity \(/.test(refusedRaw) ? `${refusedRaw}; if Claude's own research rates it worth fixing but not in this PR, recommend follow-up with --why fix-separately` : refusedRaw;
+    // minor-later claims "the pipeline rates it low": when that is what refused it, name the code that makes no such claim, but only when fix-separately would itself be shown (#956: an open deferrable ACCEPT that is not low severity is refused it too, so the neutral dialog is the way).
+    const severityRefused = refusedRaw !== null && values.why === 'minor-later' && / is not low severity \(/.test(refusedRaw);
+    const refused = !severityRefused ? refusedRaw : items.some(isDeferrableAccept)
+      ? `${refusedRaw}; fix-separately is refused for an accepted fix that is not low severity too: run ruling-request with no --recommend (the owner can still click Follow-up all)`
+      : `${refusedRaw}; if Claude's own research rates it worth fixing but not in this PR, recommend follow-up with --why fix-separately`;
     const shown = values.recommend !== undefined && refused === null;
     const dialogVariant = shown ? rulingVariantFor(values.recommend, values.why) ?? RULING_VARIANT_LEGACY : RULING_VARIANT_LEGACY;
     const recommendFields = { recommend: shown ? values.recommend : null, why: shown ? values.why : null, dialogVariant, ...(refused === null ? {} : { recommendRefused: refused }) };

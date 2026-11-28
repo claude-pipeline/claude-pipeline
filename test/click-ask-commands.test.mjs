@@ -568,6 +568,10 @@ test('triage ruling-request --recommend reject|fix-separately: refused for an im
   const refusedAny = (await askRec(blocking, '--recommend', 'follow-up', '--why', 'fix-separately')).output;
   assert.deepEqual([refusedAny.recommend, refusedAny.dialogVariant], [null, 'ruling-v1']);
   assert.match(refusedAny.recommendRefused, /not low severity/);
+  // failure caught (#956 review): the minor-later refusal telling the controller to retry with fix-separately, which is refused for the same accepted fix
+  const minorBlocking = (await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused;
+  assert.doesNotMatch(minorBlocking, /recommend follow-up with --why fix-separately/);
+  assert.match(minorBlocking, /no --recommend/);
   assert.match((await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused, /not low severity/);
 });
 
