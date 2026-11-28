@@ -6,7 +6,8 @@ import { createHash, randomUUID } from 'node:crypto';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { syncBuiltinESMExports } from 'node:module';
+import fs, { existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -1601,6 +1602,22 @@ test('#944 drift: a recommended Reject click is refused when the PR head on GitH
   assert.equal(noMarker.exitCode, 1, JSON.stringify(noMarker.output));
   assert.match(noMarker.output.reason, /did not check that the working tree was clean.*ask again/);
   assert.equal(unmarked.stateText(), beforeUnmarked, 'the state is byte-identical');
+  // R1-B1: the ask file reads when the click is validated but not when the head is compared (an I/O error between the two reads): refused, not skipped. The fs binding is swapped (and synced to the named imports) to fail the LAST read of the ask file, counted on a control run.
+  const lstatOf = async (failAt) => {
+    const w = e2eWorld(t);
+    const c = await clickedRuling(t, w, { ids: ['R1-B1'], ...REJECT });
+    const real = fs.lstatSync;
+    let seen = 0;
+    fs.lstatSync = (p, ...rest) => { if (String(p).endsWith(`${c.ask.askId}.json`) && ++seen === failAt) throw Object.assign(new Error('EIO'), { code: 'EIO' }); return real(p, ...rest); };
+    syncBuiltinESMExports();
+    try { return { seen: () => seen, w, r: await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject') }; } finally { fs.lstatSync = real; syncBuiltinESMExports(); }
+  };
+  const control = await lstatOf(0);
+  assert.equal(control.r.exitCode, 0, JSON.stringify(control.r.output));
+  assert.ok(control.seen() >= 2, 'the ask file is read at least twice (the click check, then the head comparison)');
+  const flaky = await lstatOf(control.seen());
+  assert.equal(flaky.r.exitCode, 1, JSON.stringify(flaky.r.output));
+  assert.match(flaky.r.output.reason, /could not be read.*ask again/);
 });
 
 test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {

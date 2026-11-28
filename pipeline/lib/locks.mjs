@@ -328,7 +328,7 @@ function breakGuard(guard, ctx) {
   }
   if (!sameDir) {
     try {
-      retrying(() => fs.renameSync(moved, guard)); // best effort; EEXIST means someone re-created the guard
+      retrying(() => fs.renameSync(moved, guard), ctx.deadline); // best effort; EEXIST means someone re-created the guard
     } catch {
       /* theirs stays aside; they notice the loss before touching the lock */
     }
