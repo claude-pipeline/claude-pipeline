@@ -2469,6 +2469,8 @@ test('#902: a wrapper output exported from a nested script is placed where the w
 // R1-B4: util-linux `-c` takes the command; it is not the BSD log file
 test('#902: script -q -c ./x.sh /dev/null runs x.sh, it does not write it', () => {
   assert.equal(evaluate('script -q -c ./x.sh /dev/null', withFiles({ 'x.sh': HARMLESS_TEXT })).decision, 'allow');
+  // R2-B1: a long option is no short-option cluster (BSD script has none)
+  for (const l of ['script -q --command ./x.sh /dev/null', 'script --quiet -c ./x.sh /dev/null']) assert.equal(evaluate(l, withFiles({ 'x.sh': HARMLESS_TEXT })).decision, 'allow', l);
 });
 
 test('#902: nohup.out counts as written by a nohup whose stdout may be a terminal, and not by one whose stdout is redirected or piped', () => {

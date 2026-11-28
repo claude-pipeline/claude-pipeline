@@ -2641,7 +2641,9 @@ test('#902: a log is judged in the directories the whole line may be in, as a re
 // R3-5 / R4-3: nohup.out is written only when stdout is a terminal; a pty-giving wrapper (script, screen, unbuffer, ssh) before nohup keeps it
 test('#902: nohup.out is a write target in a protected directory unless the command\'s stdout is provably no terminal (redirected, or not the last stage of a pipe)', () => {
   w902([`cd ${W_P} && nohup ls > /dev/null`, `cd ${W_P} && nohup ls | cat`, `cd ${W_P} && nohup ls 2>&1 | wc -l`, `cd ${W_P} && nohup ls >> /tmp/l 2>&1 &`, 'nohup npm run dev &', 'nohup npm run dev > /tmp/dev.log 2>&1 &'], 'allow');
-  w902([`cd ${W_P} && script -q /dev/null nohup ls`, `cd ${W_P} && script -q /dev/null nohup ls > /dev/null`, `cd ${W_P} && nohup ls`, `cd ${W_P} && nohup ls &`, `cd ${W_P} && nohup ls || echo failed`], 'deny'); // (the last two: accepted new refusals, corpus 0 of 113 nohup commands)
+  w902([`cd ${W_P} && script -q /dev/null nohup ls`, `cd ${W_P} && script -q /dev/null nohup ls > /dev/null`, `cd ${W_P} && nohup ls`, `cd ${W_P} && nohup ls &`, `cd ${W_P} && nohup ls || echo failed`], 'deny');
+  // R2-B2: a terminal device or a run-time target is no proof that stdout is not a terminal
+  w902([`cd ${W_P} && script -q /dev/null nohup ls > /dev/tty`, `cd ${W_P} && script -q /dev/null nohup ls > $OUT`, `cd ${W_P} && nohup ls > /dev/tty`, `cd ${W_P} && nohup ls > /dev/stdout`, `cd ${W_P} && nohup ls > /dev/pts/3`, `cd ${W_P} && nohup ls > /dev/fd/1`, `cd ${W_P} && nohup ls > $(tty)`], 'deny'); // (the last two: accepted new refusals, corpus 0 of 113 nohup commands)
 });
 
 // R4-4 (class b): in the util-linux reading the words after `--` are the COMMAND, so a log option is a candidate whatever stands after it
@@ -2690,7 +2692,7 @@ test('#902: running a file a wrapper wrote earlier on the line is refused, with 
   assert.doesNotMatch(msg, /in one piece/);
   // an unrelated script, the pty trick, a /tmp log: unchanged
   const ok = withFiles746({ '/repo/ok.sh': '#!/bin/sh\necho ok\n' });
-  for (const line of ['script -q /tmp/x.log ls; bash ok.sh', 'time -o /tmp/t.txt ls; bash ok.sh', 'script -q /dev/null npm test; bash ok.sh', 'script -q x.log ls; bash ok.sh', 'flock -n job.sh ./job.sh', 'flock job.sh -c ./job.sh', 'flock n.sh true; bash n.sh', 'script -q -c ./ok.sh /dev/null']) assert.equal(verdictOf(line, ok).decision, 'allow', line);
+  for (const line of ['script -q /tmp/x.log ls; bash ok.sh', 'time -o /tmp/t.txt ls; bash ok.sh', 'script -q /dev/null npm test; bash ok.sh', 'script -q x.log ls; bash ok.sh', 'flock -n job.sh ./job.sh', 'flock job.sh -c ./job.sh', 'flock n.sh true; bash n.sh', 'script -q -c ./ok.sh /dev/null', 'script -q --command ./ok.sh /dev/null', 'script --quiet -c ./ok.sh /dev/null']) assert.equal(verdictOf(line, ok).decision, 'allow', line);
   // (a script after a writer the guard does not model, such as `make`, keeps its verdict)
   assert.equal(verdictOf('make; bash n.sh', withFiles746({ '/repo/n.sh': '#!/bin/sh\necho ok\n' })).decision, 'allow');
 });

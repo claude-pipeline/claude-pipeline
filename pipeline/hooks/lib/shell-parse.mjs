@@ -647,15 +647,18 @@ function scriptOutputs(argv) {
   const out = [];
   { // BSD / macOS: script [-adeFkpqr] [-t time] [-T fmt] [file [command ...]]: the first word that is no option is the file, every later word is the child's (its own -c or input file is never an output)
     let i = 1;
+    let longOpt = false;
     while (i < argv.length) {
       const t = argv[i];
       if (t === '--') { i++; break; }
       if (t.length < 2 || t[0] !== '-') break;
+      if (t[1] === '-') { longOpt = true; break; } // (BSD script has no long options: a line with one is util-linux's, read by the second block only)
       let step = 1;
       for (let k = 1; k < t.length; k++) if (t[k] === 't' || t[k] === 'T' || t[k] === 'c') { if (k === t.length - 1) step = 2; break; } // (-c: util-linux's command word, never the file)
       i += step;
     }
-    if (i >= argv.length) out.push('typescript');
+    if (longOpt) { /* no BSD reading */ }
+    else if (i >= argv.length) out.push('typescript');
     else { out.push(argv[i]); while (hasExpansion(argv[i]) && i + 1 < argv.length) { i++; out.push(argv[i]); } } // (a run-time word may expand to an option or to nothing: the word after it may be the file)
   }
   { // util-linux: its file options are outputs whatever stands around them; the operand (or the default name `typescript`) only when at most one is left (it refuses more: nothing is written)
@@ -752,12 +755,13 @@ export const MAX_WRAPPER_OUTS = 16;
 export const REFUSED_WRAPPER_OUTS = "the command's wrappers name more than 16 possible output files (logs, timing or lock files), too many to check; split the command up";
 // The wrapper outputs of a command that count as writes. nohup.out is written only when stdout is a terminal: it is dropped when the command's stdout is provably not one (a write redirect of stdout, or the command is
 // not the last stage of a pipe), unless a pty-giving wrapper (script, screen, unbuffer, ssh) stood before the nohup: the redirect is then that wrapper's own and nohup still sees the pty.
+const TERMINALISH = /^\/dev\/(?:tty|stdout|stderr|fd\/|pts\/|ttys)/;
 export function wrapperTargetsOf(c, next) {
   const outs = c?.wrapperOuts;
   if (!outs || !outs.length) return [];
   if (!outs.some((o) => o.tty && !o.pty)) return outs;
   const piped = next?.sep === '|' || next?.sep === '|&'; // (exactly: `||` is no pipe, stdout stays the terminal)
-  const redirected = (c.redirects ?? []).some((r) => ['>', '>>', '&>', '&>>', '>|', '>&'].includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && typeof r.target === 'string' && !/^&(?:\d+|-)$/.test(r.target));
+  const redirected = (c.redirects ?? []).some((r) => ['>', '>>', '&>', '&>>', '>|', '>&'].includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && typeof r.target === 'string' && !/^&(?:\d+|-)$/.test(r.target) && !TERMINALISH.test(r.target) && !hasExpansion(r.target)); // (a terminal device or a run-time target is no proof)
   return piped || redirected ? outs.filter((o) => !o.tty || o.pty) : outs;
 }
 export const WRAPPER_NAMES = Object.keys(WRAPPERS); // (the names the parser unwraps; the #904 tests walk them)
