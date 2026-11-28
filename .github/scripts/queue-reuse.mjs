@@ -4,7 +4,9 @@
 //
 // TRUST: this file runs from the BASE commit of the queue (ci.yml extracts .github/scripts + pipeline/lib of merge_group.base_sha
 // into $RUNNER_TEMP/base and runs that copy), never from the queue checkout, which contains the PR's own changes. The git commands
-// below still run in the queue checkout (cwd): its HEAD is the queue commit.
+// below still run in the queue checkout (cwd): its HEAD is the queue commit. They go through pipeline/lib/proc.mjs (the BASE copy,
+// next to this file), which on Windows looks `git` / `gh` up from the temp dir, never the checkout: a git.exe or gh.exe the PR
+// plants in its own tree is not run.
 //
 // Every check must hold:
 //   1. QUEUE_REF is a queue ref of the default branch for PR N on BASE_SHA, and `queueManifest` (pipeline/lib/queue-members.mjs,
@@ -23,8 +25,8 @@
 //      INSTALLER_STEP + INSTALLER_SHARD (both optional), GH_TOKEN (read by gh), GITHUB_OUTPUT (optional),
 //      WORKFLOW_FILE (default ci.yml), BASE_BRANCH (default main),
 //      TESTED_TREE_GH_ARGV (tests only: JSON array standing in for ["gh"], e.g. ["node","fake-gh.mjs"]).
-import { spawnSync } from 'node:child_process';
 import { appendFileSync } from 'node:fs';
+import { run as runCommand } from '../../pipeline/lib/proc.mjs';
 import { parseQueueRef, queueManifest } from '../../pipeline/lib/queue-members.mjs';
 
 const { REPO, SHA, BASE_SHA, QUEUE_REF, JOB_NAME, TEST_STEP, SHARD, INSTALLER_STEP, INSTALLER_SHARD, GITHUB_OUTPUT } = process.env;
@@ -43,9 +45,8 @@ class Run extends Error {}
 const mustRun = (why) => { throw new Run(why); };
 
 function capture(argv) {
-  const r = spawnSync(argv[0], argv.slice(1), { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
-  if (r.error) mustRun(`${argv.join(' ')}: ${r.error.message}`);
-  if (r.status !== 0) mustRun(`${argv.join(' ')} exited ${r.status}: ${(r.stderr || '').trim().slice(0, 200)}`);
+  const r = runCommand(argv[0], argv.slice(1), { maxBuffer: 64 * 1024 * 1024 });
+  if (r.code !== 0) mustRun(`${argv.join(' ')} exited ${r.code}: ${r.stderr.trim().slice(0, 200)}`);
   return r.stdout.trim();
 }
 
@@ -119,14 +120,16 @@ function decide() {
   const all = listing.workflow_runs;
   if (!Array.isArray(all)) mustRun('no workflow_runs list');
   if (Number.isInteger(listing.total_count) && listing.total_count > all.length) mustRun(`the run listing is incomplete (${all.length} of ${listing.total_count})`);
-  const candidates = all.filter((r) => r?.head_sha === headSha && r.event === 'pull_request' && r.head_repository?.full_name === REPO
-    && Array.isArray(r.pull_requests) && r.pull_requests.some((p) => p?.number === prNumber));
-  if (candidates.length === 0) mustRun(`no ${WORKFLOW_FILE} pull_request run of PR #${prNumber} on ${headSha} from ${REPO}`);
+  // The newest run on the head is picked FIRST; only then must that run be bound to PR N and this repository (a newer run whose
+  // pull_requests is empty is the newest, never skipped over for an older bound one).
+  const candidates = all.filter((r) => r?.head_sha === headSha && r.event === 'pull_request');
+  if (candidates.length === 0) mustRun(`no ${WORKFLOW_FILE} pull_request run of PR #${prNumber} on ${headSha}`);
   if (candidates.some((r) => !Number.isInteger(r.id) || !Number.isInteger(r.run_number) || !Number.isInteger(r.run_attempt) || r.run_attempt < 1)) mustRun('a listed run lacks id, run_number or run_attempt');
   const top = Math.max(...candidates.map((r) => r.run_number));
   const tops = candidates.filter((r) => r.run_number === top);
   if (tops.length !== 1) mustRun(`runs ${tops.map((r) => r.id).join(' and ')} share run number ${top}`);
   const [newest] = tops;
+  if (!newest.pull_requests?.some?.((p) => p?.number === prNumber) || newest.head_repository?.full_name !== REPO) mustRun(`the newest run ${newest.id} (#${newest.run_number}) is not bound to PR #${prNumber} from ${REPO}`);
   if (newest.status !== 'completed' || newest.conclusion !== 'success') mustRun(`the newest run ${newest.id} (#${newest.run_number}) is ${newest.status === 'completed' ? newest.conclusion : newest.status}, not a green completed run`);
   const attempt = api(`repos/${REPO}/actions/runs/${newest.id}/attempts/${newest.run_attempt}`);
   if (attempt.id !== newest.id || attempt.run_attempt !== newest.run_attempt || attempt.head_sha !== headSha || attempt.event !== 'pull_request') mustRun(`attempt ${newest.run_attempt} of run ${newest.id} is not that run's attempt on ${headSha}`);
