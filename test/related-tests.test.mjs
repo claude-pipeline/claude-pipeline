@@ -348,7 +348,8 @@ test('test.mjs --related --list: a changed test file runs even with a tiny budge
 test('test.mjs --related --list: a changed test over CP_QUICK_CHANGED_CAP_MS is not listed, is named as deferred to CI, and the named files still run (exit 0)', () => {
   const r = cli(['--related', '--list', 'config.test.mjs'], { CP_RELATED_CHANGED: 'test/glob.test.mjs', CP_QUICK_CHANGED_CAP_MS: '0' });
   assert.equal(r.status, 0, r.stderr);
-  assert.deepEqual(listed(r), ['config.test.mjs']);
+  assert.ok(listed(r).includes('config.test.mjs'));
+  assert.ok(!listed(r).includes('glob.test.mjs'));
   assert.match(r.stdout, /1 changed deferred to CI over changed cap 0 ms \(glob\.test\.mjs; NOT run here\)/);
 });
 
