@@ -2181,3 +2181,22 @@ test('#950: a backgrounder (launchctl, setsid, tmux) leaves the commands BEFORE 
   denyBoth('bash bg3.sh; cp f.sh n.sh', { ...SPEC, 'bg3.sh': 'sleep 1; setsid -f bash n.sh' }); // a script that starts one: the outer later write is still seen
   allowBoth('bash n.sh; cp f.sh n.sh'); // twin: no backgrounder
 });
+
+// R1-B1 / R1-B2 (#950): a command the shell itself runs in the background (a backgrounded and-or list or group, a process substitution) before a backgrounder line still sees every later write.
+// Failure caught: `bash n.sh && echo done & cp f.sh n.sh` + a launchctl line was allowed (the copy may land before bash opens n.sh), though main refused it.
+test('#950: a command run in the background by the shell, placed BEFORE a backgrounder line, still sees later writes', () => {
+  for (const bg of ['launchctl kickstart -k "gui/$(id -u)/x"', 'disown', 'setsid sleep 1']) {
+    denyBoth(`bash n.sh && echo done & cp f.sh n.sh\n${bg}`);
+    denyBoth(`( bash n.sh; echo ok ) &\ncp f.sh n.sh\n${bg}`);
+    denyBoth(`echo hi > >(bash n.sh)\ncp f.sh n.sh\n${bg}`);
+    denyBoth(`bash n.sh < <(echo x)\ncp f.sh n.sh\n${bg}`);
+  }
+});
+
+// R1-B3 / R1-B4 (#950): the same position rule across a call into a script. Failure caught: (B3) `setsid -f bash wrap.sh; cp f.sh n.sh` with wrap.sh running n.sh was allowed (the copy may land first);
+// (B4) `bash setup.sh; cp f.sh n.sh`, with setup.sh running n.sh and only THEN restarting a service, was refused: the caller waits for setup.sh, and the copy comes after n.sh ran.
+test('#950: a detached call site makes the later writes visible to the script it starts; a restart AFTER a foreground run inside a called script does not', () => {
+  const spec = { ...SPEC, 'wrap.sh': 'bash n.sh', 'wrap2.sh': 'echo hi\nbash n.sh', 'setup.sh': 'bash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"', 'setup2.sh': 'echo hi\nsetsid -f bash n.sh', 'setup3.sh': 'bash n.sh\nsetsid sleep 1\nbash n.sh' };
+  for (const l of ['setsid -f bash wrap.sh; cp f.sh n.sh', 'echo a; tmux new -d "bash wrap2.sh"; cp f.sh n.sh', 'launchctl kickstart -k x; bash wrap.sh; cp f.sh n.sh', 'bash setup2.sh; cp f.sh n.sh', 'bash setup3.sh; cp f.sh n.sh']) denyBoth(l, spec);
+  for (const l of ['bash setup.sh; cp f.sh n.sh', 'bash wrap.sh; cp f.sh n.sh']) allowBoth(l, spec);
+});

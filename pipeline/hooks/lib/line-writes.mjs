@@ -1272,7 +1272,7 @@ function visible(frame, at, idx, late = false) {
 // (`{ ...; } &`, a trailing `&`) sees all of its own later records.
 function seen(frames, fi, at, idx) {
   const f = frames[fi];
-  const late = fi === frames.length - 1 ? lateIn(f, at) : frames.slice(fi + 1).some((x) => x.bgWork);
+  const late = lateIn(f, at) || (fi < frames.length - 1 && frames.slice(fi + 1).some((x) => x.bgWork || lateIn(x, x.i))); // (a call site that starts background work, or a script judged inside that has by now: #950, by position)
   return visible(f, at, idx, late);
 }
 // Does the command `at` of frame f see every later record of its own frame? When the frame is opaque, or `at` is the command that starts background work (launchctl, setsid, screen ...) or comes after it (#950:
@@ -1321,8 +1321,12 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   const lone = typeof text === 'string' ? (loneIn(text) > seps ? loneIn(syntaxText(text, cmds)) : 0) : 0;
   const opaque = lone > seps;
   const first = cmds.findIndex(startsBackground);
-  const bgFrom = first < 0 ? Infinity : first; // (#950: the first command that starts a job outliving it: from there on the order is unknown, before it nothing is)
-  const bgWork = seps > 0 || opaque || bgFrom !== Infinity || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
+  // (#950: the first command that starts a job outliving the frame: from there on the order is unknown, before it nothing is. Unless the shell already runs a command of the frame in the background
+  // (the parser's `bg`: a backgrounded and-or list or group) or a process substitution does (no mark of its own): that one counts from the start, as before)
+  const early = first < 0 ? -1 : cmds.findIndex((c) => c.bg === true);
+  const procSub = first >= 0 && (/[<>]\(/.test(typeof text === 'string' ? text : '') || cmds.some((c) => /[<>]\(/.test(c.raw ?? '')));
+  const bgFrom = first < 0 ? Infinity : procSub ? 0 : early >= 0 ? Math.min(first, early) : first;
+  const bgWork = seps > 0 || opaque || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
   return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgFrom, bgWork };
 }
 
