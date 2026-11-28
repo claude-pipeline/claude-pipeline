@@ -750,6 +750,27 @@ test('#904: at the nesting limit the same refusal test decides: a text ./env is 
   assert.equal(bash('bash a0.sh', PROJ, chain('./env echo hi', { env: 'MZ\u0000\u0000' })).decision, 'allow', 'a binary at the limit');
 });
 
+// ---- #904 (allow side and regression controls): what the refusal must not touch --------------------------------------------------------------------------------------
+const BIN_FILE = 'MZ\u0000\u0000';
+test('#904: a binary, a node_modules program, a missing file, a directory and the system spellings keep their verdicts (no new refusal of an everyday program)', () => {
+  const ok = (line, files = {}, o = {}) => assert.equal(bash(line, PROJ, { ...inProj(files), ...o }).decision, 'allow', line);
+  ok('./node x.mjs', { node: BIN_FILE });
+  ok('.venv/bin/python x.py', { '.venv/bin/python': BIN_FILE });
+  ok('./node_modules/.bin/tsx x.ts', { 'node_modules/.bin/tsx': '#!/usr/bin/env node\nconsole.log(1)\n' });
+  ok('bin/npx prettier .', { 'bin/npx': '#!/usr/bin/env node\nrequire("../lib/cli.js")()\n' }, { realpath: (p) => (p.endsWith('/bin/npx') ? '/home/u/.nvm/versions/node/v20/lib/node_modules/npm/bin/npx-cli.js' : p) });
+  ok('./env x'); // missing
+  ok('./env x', { env: HARMLESS_TEXT }, { readDir: (p) => (p === path.resolve(PROJ, 'env') ? [] : null) }); // a directory
+  for (const line of ['/usr/bin/env node x.mjs', "/bin/bash -c 'echo hi'", '/opt/homebrew/bin/timeout 5 ls', 'env FOO=1 ls', 'npx prettier .', 'cd "$X" && ./node_modules/.bin/npx foo']) ok(line);
+  ok('./env GH_REPO=o/other x', { env: BIN_FILE });
+  ok('BASH_ENV=evil.sh ./env x', { env: BIN_FILE });
+});
+
+test('#904: the by-name reading is kept in front of the refusal\'s reach: a protected-file write behind a binary wrapper is still read by name', () => {
+  const v = bash(`bin/env sh -c '${F_TEXT}'`, PROJ, inProj({ 'bin/env': BIN_FILE }));
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /the command copies a file onto/);
+});
+
 test('script files: the pipeline CLI and node_modules programs are not scanned', () => {
   const files = {
     '/home/u/.claude/pipeline/bin/pipeline.mjs': "writeFileSync(join(home, '.claude', 'settings.json'), x); process.env.PIPELINE_ADMIN = '1'",

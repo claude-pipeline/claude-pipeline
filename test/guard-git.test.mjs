@@ -1726,6 +1726,32 @@ test('#904: a program the line writes first is refused like the one on disk (`cp
   assert.match(evaluate('cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m pytest').reason, /cannot tell which directory/);
 });
 
+// ---- #904 (allow side and regression controls): what the refusal must not touch --------------------------------------------------------------------------------------
+const BIN_FILE = 'MZ\u0000\u0000';
+test('#904: a binary, a node_modules program, a missing file, a directory and the system spellings keep their verdicts (no new refusal of an everyday program)', () => {
+  const ok = (line, files = {}, o = {}) => assert.equal(evaluate(line, { ...withFiles(files), ...o }).decision, 'allow', line);
+  ok('./node x.mjs', { node: BIN_FILE });
+  ok('.venv/bin/python x.py', { '.venv/bin/python': BIN_FILE });
+  ok('./node_modules/.bin/tsx x.ts', { 'node_modules/.bin/tsx': '#!/usr/bin/env node\nconsole.log(1)\n' });
+  // an nvm-style bin/npx: a link whose target is under node_modules (npm's own npx-cli.js)
+  ok('bin/npx prettier .', { 'bin/npx': '#!/usr/bin/env node\nrequire("../lib/cli.js")()\n' }, { realpath: (p) => (p.endsWith('/bin/npx') ? '/home/u/.nvm/versions/node/v20/lib/node_modules/npm/bin/npx-cli.js' : p) });
+  ok('./env x'); // missing
+  ok('./env x', { env: HARMLESS_TEXT }, { readDir: (p) => (p === resolve('/work/repo/env') ? [] : null) }); // a directory
+  for (const line of ['/usr/bin/env node x.mjs', "/bin/bash -c 'echo hi'", '/opt/homebrew/bin/timeout 5 ls', 'env FOO=1 ls', 'npx prettier .']) ok(line);
+  // the environment and startup words around a binary ./env change nothing: the same verdict as without the mark
+  ok('./env GH_REPO=o/other x', { env: BIN_FILE });
+  ok('BASH_ENV=evil.sh ./env x', { env: BIN_FILE });
+});
+
+test('#904: the by-name reading is kept in front of the refusal\'s reach: a guarded string behind a binary wrapper or a node_modules npx is still read by name', () => {
+  const v = evaluate(`bin/env sh -c '${PUSH_G}'`, withFiles({ 'bin/env': BIN_FILE }));
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /sh was given a string that contains a guarded command/);
+  const w = evaluate(`./node_modules/.bin/npx -c '${PUSH_G}'`, withFiles({ 'node_modules/.bin/npx': HARMLESS_TEXT }));
+  assert.equal(w.decision, 'deny');
+  assert.match(w.reason, /was given a string that contains a guarded command/);
+});
+
 test('string-running wrappers are unwrapped or scanned', () => {
   const deny = [
     'unbuffer git push origin main',

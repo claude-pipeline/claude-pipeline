@@ -524,3 +524,37 @@ test('qualifier scan: an expired deadline mid-scan stops it and marks the parse 
   assert.ok(polls < 100, `${polls} polls`);
   assert.equal(simpleCommands(line, { expired: () => false }).truncated, false);
 });
+
+// ---- #904: the lookups of a program run by path stop at the deadline ------------------------------------------------------------------------------------------
+// Why: a line of many path-run wrappers makes the guard look up one file each (a lookup, then a head read). Without a deadline check per entry (and per candidate directory) the lookups would all run after
+// the clock was gone, and a hook that runs past its timeout is ALLOWED by Claude Code. The planted files are binaries, so nothing is refused for its content: only the clock can stop the line.
+const PATH_RUN_WRAPPERS = ['env', 'nohup', 'time', 'nice', 'command', 'exec', 'setsid', 'stdbuf', 'caffeinate', 'busybox', 'noglob', 'nocorrect', 'builtin', 'unbuffer', 'xargs', 'sudo', 'doas', 'ionice'];
+for (const [name] of both) {
+  const root = name === 'guard-git' ? GIT_ROOT : PROJ;
+  const mk = name === 'guard-git' ? gitFs : filesFs;
+  const run = name === 'guard-git' ? git : files;
+  const line = `${PATH_RUN_WRAPPERS.map((n) => `./${n}`).join(' ')} x`;
+  const planted = Object.fromEntries(PATH_RUN_WRAPPERS.map((n) => [n, 'MZ\u0000\u0000']));
+  // every file system call moves the injected clock on by `step` and is counted
+  const counted = (clock, step) => {
+    const inner = mk(planted);
+    const mine = (q) => PATH_RUN_WRAPPERS.some((n) => resolve(q) === resolve(root, n)); // (only the lookups of the planted programs count and move the clock: the guard's own configuration reads are not the subject)
+    const tick = (fn) => (...a) => { if (mine(a[0])) { clock.calls++; clock.t += step; } return fn(...a); };
+    return { ...inner, readText: tick(inner.readText), pathExists: tick(inner.pathExists), readDir: tick(inner.readDir), readHead: tick(() => 'MZ\u0000\u0000') };
+  };
+  test(`${name}: with the clock gone, a line of path-run wrappers makes no further file lookup (fails closed with "took too long"), and on a clock that stands still every entry is looked up`, () => {
+    const gone = { t: 0, calls: 0, atDeadline: null };
+    const step = EVAL_DEADLINE_MS / 4;
+    const fs = counted(gone, step);
+    const watch = (fn) => (...a) => { if (gone.atDeadline === null && gone.t > EVAL_DEADLINE_MS) gone.atDeadline = gone.calls; return fn(...a); };
+    const r = run(line, { ...fs, readText: watch(fs.readText), pathExists: watch(fs.pathExists), readDir: watch(fs.readDir), readHead: watch(fs.readHead) }, { now: () => gone.t, cpu: () => gone.t });
+    assert.equal(r.decision, 'deny');
+    assert.match(r.reason, /took too long|too busy/);
+    assert.ok(gone.atDeadline !== null, 'the clock did pass the deadline during the lookups');
+    assert.ok(gone.calls - gone.atDeadline <= 3, `${gone.calls - gone.atDeadline} lookups after the deadline`);
+    const still = { t: 5, calls: 0 };
+    const fine = run(line, counted(still, 0), { now: () => 5, cpu: () => 5 });
+    assert.equal(fine.decision, 'allow', `${fine.decision}: ${fine.reason}`);
+    assert.ok(still.calls >= PATH_RUN_WRAPPERS.length, `${still.calls} lookups for ${PATH_RUN_WRAPPERS.length} wrappers`);
+  });
+}
