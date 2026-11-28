@@ -1150,6 +1150,12 @@ test('fake-gh-comments: started while the state file is empty (another process m
   child.stdout.on('data', (d) => { stdout += d; });
   child.stderr.on('data', (d) => { stderr += d; });
   const exit = new Promise((resolve) => child.on('close', resolve));
+  // The fixture logs its call before its first state read: once it has, the child is running and about to see the empty file.
+  const deadline = Date.now() + 10000;
+  while (fake.calls().length < 1) {
+    assert.ok(Date.now() < deadline, 'the fake gh child never logged its call');
+    await new Promise((resolve) => setTimeout(resolve, 10));
+  }
   await new Promise((resolve) => setTimeout(resolve, 100));
   writeFileSync(stateFile, full);
   assert.equal(await exit, 0, stderr);

@@ -41,11 +41,16 @@ const writeState = (data) => {
   }
 };
 const state = readState();
+// Only the routes that change the state (POST, PATCH, failures included: writable() counts the attempt) save it, through `outSaved`; a read-only route
+// that saved its start-of-run snapshot could land after, and erase, a concurrent write's newer state.
 const out = (json, code = 0, stderr = '') => {
-  writeState(JSON.stringify(state));
   if (json !== undefined) process.stdout.write(typeof json === 'string' ? json : JSON.stringify(json));
   if (stderr) process.stderr.write(stderr);
   process.exitCode = code;
+};
+const outSaved = (...args) => {
+  writeState(JSON.stringify(state));
+  out(...args);
 };
 const stamp = () => new Date(Date.UTC(2026, 10, 5, 10, 0, 0) + (state.seq = (state.seq ?? 0) + 1) * 1000).toISOString().replace('.000Z', 'Z');
 const writable = () => {
@@ -60,21 +65,21 @@ if (/^api user/.test(joined)) {
   else out(state.comments);
 } else if (/^api -X POST repos\/[^/]+\/[^/]+\/issues\/\d+\/comments/.test(joined)) {
   if (!writable()) {
-    out(undefined, 1, 'gh: Server Error (HTTP 502)');
+    outSaved(undefined, 1, 'gh: Server Error (HTTP 502)');
   } else {
     const t = stamp();
     const id = 1000 + (state.comments.length + 1);
     state.comments.push({ id, body: JSON.parse(stdin).body, user: { login: state.me ?? 'me' }, created_at: t, updated_at: t, html_url: `https://github.com/x/y/pull/1#issuecomment-${id}` });
-    out({ id, html_url: `https://github.com/x/y/pull/1#issuecomment-${id}` });
+    outSaved({ id, html_url: `https://github.com/x/y/pull/1#issuecomment-${id}` });
   }
 } else if (/^api -X PATCH repos\/[^/]+\/[^/]+\/issues\/comments\/\d+/.test(joined)) {
   const c = state.comments.find((x) => String(x.id) === /comments\/(\d+)/.exec(joined)[1]);
   if (!c || !writable()) {
-    out(undefined, 1, 'gh: Server Error (HTTP 502)');
+    outSaved(undefined, 1, 'gh: Server Error (HTTP 502)');
   } else {
     c.body = JSON.parse(stdin).body;
     c.updated_at = stamp();
-    out({ id: c.id, html_url: c.html_url });
+    outSaved({ id: c.id, html_url: c.html_url });
   }
 } else {
   const hit = JSON.parse(readFileSync(process.env.PIPELINE_FAKE_GH_SCRIPT, 'utf8')).find((e) => new RegExp(e.match).test(joined));
