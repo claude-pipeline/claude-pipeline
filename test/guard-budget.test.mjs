@@ -8,7 +8,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolve, dirname, basename } from 'node:path';
-import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
+import { evaluateGitCommand, SETS_BY_NAME } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
 import { MAX_SCRIPT_JUDGMENTS, rememberExpansions, substitute, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, wallLeftMs, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
@@ -591,4 +591,87 @@ test('#951: a script of copy loops over long paths is allowed through evaluateGi
     ...Array.from({ length: 4 }, () => 'for f in a.js b.js c.js d.js e.js; do cp "$MOD/$f" "$B/$f.$SUF"; done')].join('\n') + '\n';
   assert.equal(git('bash inst.sh /x/wt', gitFs({ 'inst.sh': script(4400) })).decision, 'allow');
   assert.equal(files('bash inst.sh /x/wt', filesFs({ 'inst.sh': script(1020) })).decision, 'allow');
+});
+
+// #746 item 5: the owner's setup script (`FILES="a b"; for f in $FILES; do cp "$MOD/$f" "$B/$f.$SUF"; done`, run as `bash setup.sh /x/wt`) was refused from its first such loop. Failure caught:
+// (1) a loop over a variable that holds several words was "a loop word built from a variable whose value is not known here": nothing split the value, so a plain list kept in a variable could
+// not be written in a script; (2) a variable's value that merely CONTAINS the letters of a binder (`REM="$HOME/.local/share/x"`, `handoff-read.js`) made "IFS may be set" true for the whole script, so the
+// name of the loop was "assigned more than once". Only a script run by bash / sh / dash splits an unquoted value on blanks; at a top-level line (zsh does not split) or in `zsh f` the loop stays refused.
+const ITEM5_LOOP = 'for f in $FILES; do cp "m/$f" "b/$f.x"; done';
+const setup = (script, cmd = 'bash setup.sh /x/wt') => git(cmd, gitFs({ 'setup.sh': script.join('\n') + '\n', 'other.sh': 'echo hi\n' }));
+test('#746 item 5: a bash script loops over a variable holding a word list, and a path that only contains `.local` / `-read` is no binder', () => {
+  for (const script of [
+    ['FILES="a b"', ITEM5_LOOP],
+    ['FILES="composer.js finished.js handoff-read.js"', ITEM5_LOOP],
+    ['REM="$HOME/.local/share/x"', 'FILES=a', ITEM5_LOOP],
+    ['REM="$HOME/.declare"', 'FILES=a', ITEM5_LOOP],
+    ['H="$HOME/handoff-read.js"', 'FILES="a b"', ITEM5_LOOP],
+    ['S="agent/x agent/y"', 'for s in $S; do git push origin $s; done'],
+  ]) {
+    for (const cmd of ['bash setup.sh /x/wt', 'sh setup.sh /x/wt', '/bin/bash setup.sh /x/wt']) {
+      const v = setup(script, cmd);
+      assert.equal(v.decision, 'allow', `${cmd}: ${script.join(' / ')}: ${v.reason}`);
+    }
+  }
+});
+test('#746 item 5: the split list is judged word by word like the literal list (a push to main in the list is refused)', () => {
+  assert.equal(setup(['for s in agent/x main; do git push origin $s; done']).decision, 'deny');
+  const v = setup(['S="agent/x main"', 'for s in $S; do git push origin $s; done']);
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /pushing to main is blocked/);
+});
+test('#746 item 5: stays refused where the value may not split as the list says (top-level line, zsh, quotes, glob, `$`, IFS in any spelling, a list assigned twice, a source)', () => {
+  const ok = ['FILES="a b"', ITEM5_LOOP];
+  assert.equal(setup(ok).decision, 'allow'); // (the base of the cases below)
+  for (const script of [
+    ['FILES="a*  b"', ITEM5_LOOP],
+    ['FILES="a $HOME"', ITEM5_LOOP],
+    ['FILES="a b"', 'for f in "$FILES"; do cp "m/$f" "b/$f.x"; done'],
+    ['FILES="a b"', 'FILES="c d"', ITEM5_LOOP],
+    ['IFS=,', ...ok],
+    ['read IFS < /dev/null', ...ok],
+    ['g() { local IFS=,; }', ...ok],
+    ['declare IFS=,', ...ok],
+    ['FILES="a b"', 'source other.sh', ITEM5_LOOP],
+  ]) assert.equal(setup(script).decision, 'deny', script.join(' / '));
+  assert.equal(setup(ok, 'zsh setup.sh /x/wt').decision, 'deny');
+  assert.equal(git(ok.join('; '), gitFs({})).decision, 'deny'); // (a top-level line is zsh's: no split)
+});
+// #746 item 5 (a fourth cause the owner's script showed): `"$NEW" version | grep -q x` with NEW="$P/dir/tool" made every loop name AFTER it unreadable (the command word had to be plain text, and a value that holds
+// `$P` is not), so the first loop that used its variable in a command was refused as "assigned more than once". A quoted word whose one assignment holds a `/` is a program by path, never a builtin.
+test('#746 item 5: a command word `"$NEW"` whose value is a path built from another variable does not make the loops after it unreadable; any other value still does', () => {
+  const loop = 'for f in a b; do cp "m/$f" "b/$f.x"; done';
+  const base = ['P="$HOME/a/b"', 'NEW="$P/dir/tool"'];
+  assert.equal(setup([...base, '"$NEW" version | grep -q x', loop]).decision, 'allow');
+  assert.equal(setup([...base, '"${NEW}" version', loop]).decision, 'allow');
+  for (const script of [
+    [...base, '$NEW version', loop], // (unquoted: a $P with a blank splits it, and the first word may be a builtin)
+    ['P=read', 'NEW="$P"', '"$NEW" version', loop], // (no `/` in the value: it may name a builtin)
+    [...base, 'NEW="$P/other"', '"$NEW" version', loop], // (assigned twice)
+    [...base, 'if true; then NEW=read; fi', '"$NEW" version', loop],
+  ]) assert.equal(setup(script).decision, 'deny', script.join(' / '));
+});
+// #746 item 5, review round 1. R1-B3: a value the CALLER gave (`OP=eval bash setup.sh`) is no program path just because the word is quoted: eval is a builtin that binds names, and the loops after it were read as if it ran
+// nothing.
+test('#746 item 5: a quoted command word whose value the caller gave is a program path only when the value is a path', () => {
+  const loop = 'for f in a b; do cp "m/$f" "b/$f.x"; done';
+  assert.equal(setup(['"$OP" version', loop], 'OP=/usr/bin/tool bash setup.sh /x/wt').decision, 'allow'); // (the allowed twin: a path)
+  assert.equal(setup(['"$OP" \':\'', loop], 'OP=eval bash setup.sh /x/wt').decision, 'deny');
+});
+// R1-B4: bash splits a value only at space, tab and newline, so a U+00A0 at the end of a word is part of the file name, not blank: the guard must not judge `b` where bash runs `b<U+00A0>`.
+test('#746 item 5: a list word holding a character that is not a blank to bash is refused', () => {
+  assert.equal(setup(['FILES="a b\u00a0"', ITEM5_LOOP]).decision, 'deny', 'trailing U+00A0');
+  assert.equal(setup(['FILES="\u00a0a b"', ITEM5_LOOP]).decision, 'deny', 'leading U+00A0');
+});
+// R1-B5: a text judged clean for `bash f` (split words) is not clean for `zsh f` (no split) on the same line: the clean verdict was remembered without the shell's way of splitting, and a later run of the same text
+// by zsh was skipped as already judged.
+test('#746 item 5: a script written by the line and run by bash, then by zsh, is judged for each shell', () => {
+  const written = "echo 'FILES=\"a b\"; for f in $FILES; do cp \"m/$f\" \"b/$f.x\"; done' > w.sh";
+  assert.equal(git(`${written}; bash w.sh; sh w.sh`, gitFs({})).decision, 'allow', 'bash, sh'); // (the allowed twin)
+  assert.equal(git(`${written}; bash w.sh; sh w.sh; zsh w.sh`, gitFs({})).decision, 'deny', 'bash, sh, zsh');
+});
+test('#746 item 5: SETS_BY_NAME (shared by both guards) skips a binder word inside a path or file name and still counts a real binder', () => {
+  for (const t of ['X="/a/.local"', 'X="$HOME/.local/share/x"', 'X="$HOME/.declare"', 'cp m/handoff-read.js b', 'node ./x/read.js "a"', 'ls ~/export "a"']) assert.equal(SETS_BY_NAME.test(t), false, t);
+  // (a name spelled out, `local IFS=,`, is caught by the plain IFS test of the callers; these are the binders of a name written without the letters IFS in a row)
+  for (const t of ['read $N', 'read -r "$N" < f', 'g() { local "$N=,"; }', 'declare "I""FS=,"', 'declare -n r="$X"', 'eval "$X"', 'x; read $N', 'typeset -x "I""FS=,"', 'export "$N=1"', 'x=1;local "$N"=2']) assert.equal(SETS_BY_NAME.test(t), true, t);
 });
