@@ -25,7 +25,7 @@ import { evaluateSupabaseMcp, findLiveDbCli, serverSegment, supabaseMatch } from
 import { readDbRefs } from './db-refs.mjs';
 import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
-import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, WRAPPER_NAMES, SHELLS, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
+import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, WRAPPER_NAMES, SHELLS, NAME_DISPATCHED, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
 import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, rememberExpansions, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
@@ -5023,8 +5023,8 @@ const STEERABLE = /^(?:node|nodejs|deno|bun|bunx|tsx|ts-node|python\d*(?:\.\d+)*
 // runner) is named as plainly as the literal path is: the `$` there does not make the command a code runner (the install script's `"$BIN/helper" version` after a `launchctl` line was refused). Quoted,
 // so it cannot split into words. Any other `$` or backtick in the command word may be the program itself.
 const QUOTED_VAR_PROGRAM = /^"\$(?:\{(\w+)\}|(\w+))(?:"(\/[^\s"'$`\\*?[{]+)?|(\/[^\s"'$`\\*?[{]+)")$/;
-// (by CLASS of name: a program that starts other programs -- a wrapper the parser unwraps, a shell, an interpreter that is no inline runner (runsInlineCode judges those), a steerable runner -- is read by the parser only under its literal name, so a name held in a variable hides what it runs)
-const startsPrograms = (n) => STEERABLE.test(n) || WRAPPER_CMDS.has(n) || WRAPPER_NAMES.includes(n) || SHELL_NAMES.has(n) || SHELLS.has(n) || (INTERPRETERS.test(n) && !INLINE_RUNNERS.test(n));
+// (by CLASS of name: a program that starts other programs -- a wrapper the parser unwraps, a shell, a name interpretWords dispatches on (find, tmux, a SQL client ...), an interpreter that is no inline runner (runsInlineCode judges those), a steerable runner -- is read by the parser only under its literal name, so a name held in a variable hides what it runs)
+const startsPrograms = (n) => STEERABLE.test(n) || WRAPPER_CMDS.has(n) || WRAPPER_NAMES.includes(n) || SHELL_NAMES.has(n) || SHELLS.has(n) || NAME_DISPATCHED.has(n) || (INTERPRETERS.test(n) && !INLINE_RUNNERS.test(n));
 function plainVarProgram(word, c, cmds, ctx) {
   const m = QUOTED_VAR_PROGRAM.exec(word);
   if (!m) return false;

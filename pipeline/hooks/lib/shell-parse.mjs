@@ -51,6 +51,9 @@ const PS_ENV_RE = /^\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)([\s\S]*)$/i;
 const MAX_BRACE_WORK = 20_000; // brace-expansion results across one line; beyond it words stay unexpanded and the parse is flagged truncated
 const BRACE_CAP = 64; // results of one brace expression; beyond it we keep the first ones and set `truncated`
 export const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mksh', 'pdksh', 'yash', 'rbash', 'fish', 'csh', 'tcsh']);
+// The command names interpretWords reads what they start under (find -exec, tmux runners, watch, trap, eval, cmd / PowerShell launchers, the SQL clients ...), only under the LITERAL name: a name held in a variable hides it.
+// Keep in step with the name branches of interpretWords (the files policy refuses such a name as a variable command word).
+export const NAME_DISPATCHED = new Set(['find', 'tmux', 'watch', 'trap', 'eval', 'source', '.', 'cmd', 'pwsh', 'powershell', 'iex', 'invoke-expression', 'start', 'start-process', 'saps', ...SQL_CLIENT_NAMES]);
 const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split-window', 'splitw', 'respawn-pane', 'respawnp', 'respawn-window', 'respawnw', 'run-shell', 'run', 'pipe-pane', 'pipep', 'display-popup', 'popup', 'if-shell', 'if']);
 const TMUX_KEY_RE = /^(Enter|Space|Tab|Escape|BSpace|Up|Down|Left|Right|Home|End|PageUp|PageDown|[CMS]-.+|F[0-9]+|KP.+)$/;
 const PS_START_VALUED = ['workingdirectory', 'verb', 'windowstyle', 'redirectstandardinput', 'redirectstandardoutput', 'redirectstandarderror', 'credential', 'environment'];

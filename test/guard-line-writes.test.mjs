@@ -2295,3 +2295,11 @@ test('#965: a variable program that is a wrapper, a shell or an interpreter, or 
     '_=/tmp/h/tool; launchctl list; : node; "$_" -e 1', 'REPLY=/tmp/h/tool; launchctl list; read <<< node; "$REPLY" -e 1']) assert.equal(decide(l), 'deny', l);
   assert.equal(decide('N=/tmp/h/tool; launchctl list; "$N" version'), 'allow'); // twin: a plain program name
 });
+// R3-F1: a name the parser dispatches on (find -exec, tmux runners, a SQL client ...) is read only under its literal name too. Failure caught: `F=/usr/bin/find; launchctl list; "$F" . -exec node {} \;` and the
+// tmux / psql forms were certified as plain programs (no inner `node` / script is a command of the frame), so the line was allowed where the merge base refused the `$` command word.
+test('#965: a variable program that is find, tmux or a SQL client is not plain', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['F=/usr/bin/find; launchctl list; "$F" . -name \'*.js\' -exec node {} \\;', 'T=/opt/homebrew/bin/tmux; launchctl list; "$T" new-session -d \'node x.js\'',
+    'PSQL=/opt/homebrew/opt/libpq/bin/psql; launchctl list; "$PSQL" -c \'select 1\'']) assert.equal(decide(l), 'deny', l);
+  assert.equal(decide('N=/tmp/h/tool; launchctl list; "$N" version'), 'allow'); // twin
+});
