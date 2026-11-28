@@ -457,7 +457,7 @@ export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-ju
 // 'round-cap': an accepted fix taken out of the PR at the round limit and filed as a follow-up (applyRoundCapDefer). A judgement the owner can re-make, not a malfunction.
 export const ROUND_CAP_CAUSE = 'round-cap';
 // The reason of the needs-human final a contradicted "same on base" scope leaves when nothing else parked it (settle / arbiter apply); the contradiction itself is `final.scopeContradicted`.
-const SCOPE_CONTRADICTED_REASON = 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)';
+export const SCOPE_CONTRADICTED_REASON = 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)';
 const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security', ROUND_CAP_CAUSE];
 // The reason strings of states written before `cause` existed.
 const LEGACY_CAUSES = [
@@ -748,7 +748,7 @@ export function rulingRecommendationRefusal(items, decision, ctx = {}, code = un
       if (item.implemented === true) return `${item.id} is already implemented, so a recommendation to ${decision === 'REJECT' ? 'reject' : 'follow up'} (drop or move the built fix) would be wrong`;
       if (waits && MALFUNCTION_CAUSES.includes(needsHumanCause(item))) return `${item.id} waits because of a ${needsHumanCause(item)} malfunction: ${RERUN}`;
       if (item.secondReview?.decision === 'ACCEPT') return `${item.id}: the second review says ACCEPT, so Claude does not recommend dismissing it`;
-      if (code === 'fix-separately' && waits && item.final.scopeContradicted === true) return `${item.id} waits because the PR diff contradicted its "same on base" scope (the pipeline has evidence it is this PR's change), which a follow-up row would deny`;
+      if (code === 'fix-separately' && waits && (item.final.scopeContradicted === true || item.final.reason === SCOPE_CONTRADICTED_REASON)) return `${item.id} waits because the PR diff contradicted its "same on base" scope (the pipeline has evidence it is this PR's change), which a follow-up row would deny`;
     }
     return null;
   }

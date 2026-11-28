@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingRecommendationRefusal, rulingsBlock, rulingsDigest, rulingsInventory, sameOnBaseRows, validateRulings,
+  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingRecommendationRefusal, rulingsBlock, SCOPE_CONTRADICTED_REASON, rulingsDigest, rulingsInventory, sameOnBaseRows, validateRulings,
 } from '../pipeline/lib/triage.mjs';
 import { rulingsBlockDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 
@@ -250,4 +250,15 @@ test('R1-B1 applyRulings / fableFindingItems: a contradicted same-on-base scope 
   const plain = item();
   const [uncontradicted] = apply([plain], [rule(plain, { scope: undefined })]);
   assert.equal(rulingRecommendationRefusal([uncontradicted], 'FOLLOW-UP', {}, 'fix-separately'), null);
+});
+
+// Push security review (#954). Failure caught: a final written before the marker existed (installed old code, an in-flight PR) carries only the contradicted-scope reason text,
+// so the marker-only check failed open and a click could record "fix separately" for an item the pipeline had evidence was this PR's change.
+test('legacy final: the contradicted-scope reason with no scopeContradicted marker still refuses fix-separately', () => {
+  const plain = item();
+  const [uncontradicted] = apply([plain], [rule(plain, { scope: undefined })]);
+  const { scopeContradicted, ...rest } = uncontradicted.final;
+  const legacy = { ...uncontradicted, final: { ...rest, reason: SCOPE_CONTRADICTED_REASON } };
+  assert.equal(legacy.final.scopeContradicted, undefined);
+  assert.match(rulingRecommendationRefusal([legacy], 'FOLLOW-UP', {}, 'fix-separately') ?? '', /contradicted its "same on base" scope/);
 });
