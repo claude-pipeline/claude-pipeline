@@ -3,9 +3,8 @@
 // `review-package`: ~315 refusals in 21 days). Patterns are not commands, but whatever runs inside them (a substitution) or in an arm still is,
 // and a pattern the shells would reject is parsed as before (as commands: strict).
 import { test } from 'node:test';
-import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
-import { simpleCommands } from '../pipeline/hooks/lib/shell-parse.mjs';
+import { simpleCommands, MAX_WORK } from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const argvs = (s) => simpleCommands(s).map((c) => c.argv.join(' ')).filter(Boolean); // (assignment-only commands have no argv)
 
@@ -100,15 +99,11 @@ test('case: nested patterns that fail after a substitution cannot multiply the w
   for (const b of builds) for (const k of [25, 60]) {
     let t = 'true';
     for (let j = 0; j < k; j++) t = b(t);
-    // The cap is on CPU time, but a busy runner still inflates it (5288 ms once on ubuntu Node 20, which has no per-thread clock, so GC and helper threads count). Noise only ever adds
-    // time (see helpers/timing.mjs), so the cap must be met by the FASTEST of up to 3 runs: a real regression (uncharged retries: ~40 s at 25 levels) is slow on every run and still fails.
-    let best = Infinity;
-    for (let run = 0; run < 3 && best >= 5000; run++) {
-      const timed = cpuTimed(() => simpleCommands(t));
-      best = Math.min(best, timed.ms);
-      assert.equal(timed.r.truncated, true);
-    }
-    assert.ok(best < 5000, `finished in reasonable time (${k} levels): ${Math.round(best)} ms of CPU (best of up to 3)`);
+    // Counted, not timed: the parse reports the characters it lexed (`work`), and every retry is charged to it, so a retry nobody charges leaves the budget unspent (no truncation,
+    // seconds of real work) and fails here on any machine. The budget is crossed by at most one scan, hence a small slack over MAX_WORK.
+    const r = simpleCommands(t);
+    assert.equal(r.truncated, true, `the budget cut the parse short (${k} levels)`);
+    assert.ok(r.work > 0 && r.work <= MAX_WORK + 100_000, `work stays within the budget (${k} levels): ${r.work} of ${MAX_WORK}`);
   }
 });
 
