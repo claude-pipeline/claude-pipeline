@@ -391,7 +391,7 @@ test('P cost: while another booking holds the PR\'s cost lock, nothing is booked
   assert.deepEqual([free.json.recorded, free.json.call.usd, free.json.cost.total.usd], [true, 1, 1]);
 });
 
-// R3-B3 / R4-B1 (#939): withLock fails AFTER the callback returned when the lock was taken over meanwhile (LockLostError), and its release can also throw any other error (readOwner rethrows EACCES/EIO/EISDIR); the booking was already written,
+// R3-B3 / R4-B1 / R4-B2 (#939): withLock fails AFTER the callback returned when the lock was taken over meanwhile (LockLostError), and its release can also throw any other error (readOwner rethrows EACCES/EIO/EISDIR); the booking was already written,
 // so the command used to exit 2 with no result and a re-run of an explicit --usd booking booked twice.
 // The stand-in gh (a wrapper around the fake) damages the lock's owner record as the comment is written: removed = "taken over while held", a directory in its place = a release that cannot read it.
 const cleanupFailure = (damage) => {
@@ -419,11 +419,11 @@ const cleanupFailure = (damage) => {
   return { s, r };
 };
 for (const [damage, label] of [['removed', 'a lock lost'], ['dir', 'a lock release that throws a non-LockLost error']]) {
-  test(`P cost: ${label} after the booking was written still reports the booking (exit 0, recorded true, call and total, a warning) and books once`, () => {
+  test(`P cost: ${label} after the booking was written still reports the booking (exit 0, recorded true, call, no PR total, a warning) and books once`, () => {
     const { s, r } = cleanupFailure(damage);
     assertExit(r, 0);
-    assert.deepEqual([r.json.ok, r.json.recorded, r.json.call.usd, r.json.cost.total.usd], [true, true, 1, 1]);
-    assert.match(r.json.warnings.join('\n'), /booking was written but the cost lock cleanup failed; do not run the command again/);
+    assert.deepEqual([r.json.ok, r.json.recorded, r.json.call.usd, r.json.cost], [true, true, 1, null], 'the saved total may have been replaced by another booking: not reported');
+    assert.match(r.json.warnings.join('\n'), /written, but the cost lock was not held to the end, so another booking may have replaced it and the PR total is not confirmed: check `P summary` and book this call again only if it is missing/);
     assert.equal(written(s).cost.total.usd, 1, 'the booking is in the comment, once');
     assert.equal(s.fake.calls().filter((c) => c.argv.includes('-X')).length, 1, 'one write');
   });
