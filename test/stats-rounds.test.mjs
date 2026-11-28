@@ -420,6 +420,9 @@ test('stats rounds: PR 7 of two repositories is priced from its own cost booking
   const r = statsCli([
     { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), booking('w-1', 5)] },
     { match: '^api repos/acme/other/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), booking('o-1', 12)] },
+    // two different pull requests (two slugs ⇒ each PR's identity is read, so neither is mistaken for the other under a second name)
+    { match: '^api repos/acme/widgets/pulls/7$', stdoutJson: { number: 7, node_id: 'PR_node_w7', head: { ref: 'feat/w' }, base: { repo: { full_name: 'acme/widgets' } } } },
+    { match: '^api repos/acme/other/pulls/7$', stdoutJson: { number: 7, node_id: 'PR_node_o7', head: { ref: 'feat/o' }, base: { repo: { full_name: 'acme/other' } } } },
     ...script([]),
   ], ['--json', '--pr', '7', '--repo-slug', 'acme/widgets', '--repo-slug', 'acme/other']);
   assertExit(r, 0, r.stderr + r.stdout);

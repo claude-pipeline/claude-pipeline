@@ -574,11 +574,10 @@ test('P cost: a round\'s cost is added to, not replaced, by bookings made under 
     total = Math.round((total + add) * 100) / 100;
     assert.deepEqual([r.json.cost.byRound['11'].calls, r.json.cost.byRound['11'].usd, r.json.cost.total.usd], [calls, usd, total], `booking ${i + 1}: round and PR total grew by this call`);
     if (i === 3) assert.deepEqual([r.json.call.input, r.json.call.output], [0, 0], 'the pre-move transcript ledger survived the move: its 10 / 20 tokens are not booked again');
-    assert.equal(r.json.warnings.some((w) => /the repo moved/.test(w)), i === 0, i === 0 ? 'the move is reported once' : 'the record is already on the live slug');
-    withComment(s, existing(written(s)));
   }
+  // A booking is its own comment and never rewrites the run record (#958): the record keeps the pre-move slug until the next record write moves it (adoptRecord), and its cost still counts as the base.
   const final = written(s);
-  assert.equal(final.repo, 'acme/widgets');
+  assert.equal(final.record.repo, 'ianjamila/claude-pipeline');
   assert.deepEqual([final.cost.byRound['11'].calls, final.cost.byRound['11'].usd, final.cost.total.usd, final.cost.total.calls], [6, 5.64, 34.6, 7]);
   assert.deepEqual(Object.keys(final.cost.transcripts).sort().map((k) => k.slice(0, 9)), ['agent-new', 'agent-old'], 'the pre-move transcript key still matches under the new slug');
 });
@@ -630,7 +629,6 @@ test('P cost --role plan-codex --from-transcript: re-booking a grown transcript 
   const args = ['--phase', 'plan', '--role', 'plan-codex', '--from-transcript', '.review/pc.jsonl'];
   s.repo.write('.review/pc.jsonl', `${line('m1')}\n`);
   assertExit(costCli(s, args), 0);
-  withComment(s, existing(written(s)));
   s.repo.write('.review/pc.jsonl', `${line('m1')}\n${line('m2')}\n`);
   const r = costCli(s, args);
   assertExit(r, 0);
