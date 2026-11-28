@@ -396,3 +396,4 @@ full record.
 - 2026-11-28 · #984 · Dismissal clicks need a clean-checkout ask, lock waits respect the hook deadline, newer-request test (#977 #924 #962) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 964 runs (389 high)
 - 2026-11-28 · #981 · Cost bookings are append-only comments, so two saves at once can no longer erase one (#958) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · needs-human · Codex 7d: 967 runs (391 high)
 - 2026-11-28 · #981 · Cost bookings are append-only comments, so two saves at once can no longer erase one (#958) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · blocked · Codex 7d: 969 runs (391 high)
+- 2026-11-28 · #981 · Cost bookings are append-only comments, so two saves at once can no longer erase one (#958) · risk high · rounds 8 · arbiter 8 (fix-verify 4) · needs-human · Codex 7d: 977 runs (394 high)
