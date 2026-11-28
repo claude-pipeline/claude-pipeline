@@ -4,11 +4,12 @@
 // Every case below is a way a queue run could skip tests that were never run on this tree.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
+import { readFileSync, writeFileSync, existsSync, mkdirSync, statSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
-import { join, dirname } from 'node:path';
+import { join, dirname, posix } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { parseYaml } from '../pipeline/lib/yaml.mjs';
+import { importSpecs } from '../scripts/lib/related-tests.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { runNode, scratchDir } from './helpers/project.mjs';
 import { expandJob, stepRuns } from './helpers/ci-matrix.mjs';
@@ -234,10 +235,45 @@ test('the job itself failed, was cancelled, is missing or appears twice in that 
   }
 });
 
+// The static relative-import closure of an entry file (repo-relative posix paths). A specifier that names no file (one in a comment) is skipped.
+function importClosure(entry) {
+  const seen = new Set();
+  const visit = (rel) => {
+    if (seen.has(rel)) return;
+    seen.add(rel);
+    for (const spec of importSpecs(readFileSync(join(root, rel), 'utf8'))) {
+      const target = posix.join(posix.dirname(rel), spec);
+      if (existsSync(join(root, target)) && statSync(join(root, target)).isFile()) visit(target);
+    }
+  };
+  visit(entry);
+  return [...seen];
+}
+// PROOF_LOGIC is not exported (importing the script would run it): read its quoted entries, comments stripped.
+const proofLogic = (() => {
+  const block = /const PROOF_LOGIC = \{[\s\S]*?\n\};/.exec(readFileSync(script, 'utf8'))[0].replace(/\/\/.*$/gm, '');
+  const list = (key) => [...new RegExp(`${key}: \\[([^\\]]*)\\]`).exec(block)[1].matchAll(/'([^']+)'/g)].map((m) => m[1]);
+  return { prefixes: list('prefixes'), files: list('files') };
+})();
+const runnerClosure = importClosure('scripts/test.mjs');
+const deciderClosure = importClosure('.github/scripts/queue-reuse.mjs');
+const importedByTestRunner = [...new Set([...runnerClosure, ...deciderClosure])].filter((file) => !proofLogic.prefixes.some((p) => file.startsWith(p)));
+
+// Failure caught: scripts/test.mjs imports registry-snapshot.mjs -> pipeline/lib/paths.mjs + model-floor.mjs (and what those import) before it
+// launches the shard; a PR that changes a file that is imported later (not in PROOF_LOGIC) changes what the PR run's green proves, and the
+// queue reuses it unrun. The list is computed, so a new import that PROOF_LOGIC misses fails here.
+test('every file the test runner or the decider imports (transitively) is proof logic', () => {
+  assert.ok(runnerClosure.includes('pipeline/lib/model-floor.mjs') && deciderClosure.includes('pipeline/lib/proc.mjs'), 'the walker follows the known chains');
+  assert.deepEqual(importedByTestRunner.filter((file) => !proofLogic.files.includes(file)), [], 'imported by scripts/test.mjs or queue-reuse.mjs, yet not in PROOF_LOGIC.files');
+});
+
+// Failure caught: ci.yml extracts only .github/scripts and pipeline/lib of the base; an import outside them makes the base copy die with
+// ERR_MODULE_NOT_FOUND before it can answer, the step soft-fails and every queue job silently runs the full suite.
+test('the decider imports only files the step extracts from the base (.github/scripts, pipeline/lib)', () => {
+  assert.deepEqual(deciderClosure.filter((file) => !file.startsWith('.github/scripts/') && !file.startsWith('pipeline/lib/')), []);
+});
+
 // Failure caught: the PR changed the workflow, the test runner or the proof code: the PR run's evidence was produced by that very code.
-// Failure caught: scripts/test.mjs imports registry-snapshot.mjs -> pipeline/lib/paths.mjs + model-floor.mjs (and their imports) before it launches
-// the shard; a PR that changes one of them changes what the PR run's green proves, and the queue reused it unrun.
-const importedByTestRunner = ['pipeline/lib/queue-members.mjs', 'pipeline/lib/ci-proof.mjs', 'pipeline/lib/proc.mjs', 'pipeline/lib/shell-words.mjs', 'pipeline/lib/paths.mjs', 'pipeline/lib/model-floor.mjs', 'pipeline/lib/locks.mjs', 'pipeline/lib/seams.mjs', 'pipeline/hooks/lib/owner-go.mjs', 'pipeline/hooks/lib/repo-moves.mjs', 'pipeline/hooks/lib/owner-go-click.mjs', 'pipeline/hooks/lib/live-db-go.mjs', 'pipeline/hooks/lib/db-refs.mjs', 'pipeline/hooks/lib/sql-classify.mjs', 'pipeline/lib/git.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/glob.mjs', 'pipeline/lib/resolution.mjs', 'pipeline/lib/remote-url.mjs', 'pipeline/lib/owner-only.mjs', 'pipeline/lib/claude-ancestry.mjs'];
 test('the queue commit changes workflow, test runner or proof logic -> run (untouched files are fine)', async () => {
   for (const file of ['.github/workflows/ci.yml', '.github/scripts/queue-reuse.mjs', 'scripts/test.mjs', 'scripts/verify.mjs', 'scripts/lib/shard.mjs', 'package.json', 'package-lock.json', '.gitattributes', ...importedByTestRunner]) {
     await mustRun({ touch: file }, new RegExp(`RUN: the queue commit changes proof logic \\(${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));

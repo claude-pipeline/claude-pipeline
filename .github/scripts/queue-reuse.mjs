@@ -26,7 +26,7 @@
 //      WORKFLOW_FILE (default ci.yml), BASE_BRANCH (default main),
 //      TESTED_TREE_GH_ARGV (tests only: JSON array standing in for ["gh"], e.g. ["node","fake-gh.mjs"]).
 import { appendFileSync } from 'node:fs';
-import { run as runCommand } from '../../pipeline/lib/proc.mjs';
+import { createResolver, run as runCommand } from '../../pipeline/lib/proc.mjs';
 import { parseQueueRef, queueManifest } from '../../pipeline/lib/queue-members.mjs';
 
 const { REPO, SHA, BASE_SHA, QUEUE_REF, JOB_NAME, TEST_STEP, SHARD, INSTALLER_STEP, INSTALLER_SHARD, GITHUB_OUTPUT } = process.env;
@@ -70,8 +70,12 @@ const PROOF_LOGIC = {
 class Run extends Error {}
 const mustRun = (why) => { throw new Run(why); };
 
+// Windows: a bare `git` / `gh` that the temp-dir lookup cannot find must not fall back to a cwd search (proc.mjs would): no path, no run.
+const resolveExe = createResolver();
 function capture(argv) {
-  const r = runCommand(argv[0], argv.slice(1), { maxBuffer: 64 * 1024 * 1024 });
+  const exe = process.platform === 'win32' ? resolveExe(argv[0]) : argv[0];
+  if (!exe) mustRun(`${argv[0]} is not on PATH (it is never looked up in the checkout)`);
+  const r = runCommand(exe, argv.slice(1), { maxBuffer: 64 * 1024 * 1024 });
   if (r.code !== 0) mustRun(`${argv.join(' ')} exited ${r.code}: ${r.stderr.trim().slice(0, 200)}`);
   return r.stdout.trim();
 }
