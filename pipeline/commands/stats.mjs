@@ -4,7 +4,7 @@ import { EXIT, UsageError, intOption, parseCommandArgs } from '../lib/cli.mjs';
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { MAX_PAGES, PAGE, pages } from '../lib/gh-pages.mjs';
-import { decodeRecord } from '../lib/run-record.mjs';
+import { adoptRecord, decodeRecord } from '../lib/run-record.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
 import { aggregate, analysePr, isReadableState, renderTable } from '../lib/round-stats.mjs';
 import { MARKERS } from '../lib/render.mjs';
@@ -18,7 +18,7 @@ export const meta = {
     '     read (run record, triage state) and counted: totals {prs, prsPastCap, countedRounds, pastCapRounds, pastCapShare, admission {auto-extra|owner-granted|unknown}, previous (what the round before a past-limit round had',
     '     to re-check: no-accepts | only-low-fixes = non-BLOCKING non-security accepts | blocking-or-security), found (new-blocking | accepts | deferred = its accepts were all deferred past the cap | nothing-accepted), blockingLoopPrs, capDeferredPrs, capDeferredItems, capDeferReopened, capLowNotDeferred, usd, pastCapUsd}; prs [{repo, pr, id, maxRounds,',
     '     countedRounds, pastCapRounds, usd, blockingLoop, capDeferredItems, capDeferReopened, capLowNotDeferred, rounds: [{n, k, pastCap, usd (cost.byRound, `cost --round R`), reviewKind, resolutionIneligible, acceptedBlocking, capDeferred? (on the row of the last allowed round), admission?, previous?, found?}]}]. The cap-low numbers (review.cap_low_accepts) count over EVERY round of the state, one per item id and not a cached copy: capDeferredItems = accepts `triage cap-defer` turned into follow-ups unapplied, capDeferReopened = of those, tightened back to ACCEPT by Claude (the floor was wrong), capLowNotDeferred = 1 when the last allowed round\'s accepts were all low by this stats rule, nothing was deferred and an automatic extra round followed. --pr N limits it to those PRs (merged or not listed by date).',
-    '     Without --json the same numbers print as a plain-text table. Only the viewer\'s own comments count (the pipeline\'s comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR or repository, unreadable) is named in `warnings`. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
+    '     Without --json the same numbers print as a plain-text table. Only the viewer\'s own comments count (the pipeline\'s comments posted under another login are ignored, with a warning); a pipeline comment that is skipped (other author, bound to another PR, unreadable) is named in `warnings`; a run record of this PR that names another repository (the repo was renamed or moved) still counts, with a warning. A PR whose comments cannot be read is skipped with a warning; a PR with no review state is counted in `withoutState`. Exit 3 when GitHub cannot be reached for the list.',
     '     Read-only. Severity is judged from the recorded item (BLOCKING, a security category or a security word is not low), since a PR comment does not carry the reviewed diff `itemSeverity` needs.',
   ].join('\n'),
 };
@@ -68,8 +68,13 @@ async function rounds(rest, ctx) {
             if (isRecord) {
               const r = decodeRecord(c.body);
               if (r.status === 'ok') {
-                if (r.record.pr === number && String(r.record.repo ?? '').toLowerCase() === slugLower) record = r.record;
-                else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
+                // The repo is the only mismatch ⇒ the PR was merged before a rename/transfer and this is still its own record (adoptRecord, #671); a slug that differs only in case is the same repository.
+                const sameRepo = String(r.record.repo ?? '').toLowerCase() === slugLower;
+                const adopted = adoptRecord(r.record, { repo: sameRepo ? r.record.repo : slug, pr: number });
+                if (adopted.record) {
+                  record = adopted.record;
+                  if (!sameRepo) warnings.push(`${slug}#${number}: counted a run record bound to ${asciiLine(r.record.repo, 80)} (the repo moved)`);
+                } else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
               } else if (r.status === 'invalid' || r.status === 'unsupported') skip('a run record', `: unreadable (${r.status})`);
             }
             if (isState) {

@@ -156,12 +156,12 @@ test('R1-B2 analysePr: an item deferred past the cap still counts as accepted fo
 test('R1-F2 stats rounds: only the viewer\'s own comments that start with the marker count, bound to the PR and repository; the others are ignored', () => {
   const forged = stateOf([round(1, [acc('F-1')]), round(2, [acc('F-2')]), round(3, [acc('F-3')])], 1);
   const otherPr = { ...state7, pr: 8 };
-  const otherRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
+  const otherPrRecord = emptyRecord({ repo: 'acme/widgets', pr: 8, branch: 'feat/x', baseRef: 'main' });
   const cases = {
     'someone else\'s comment': [{ id: 3, user: { login: 'mallory' }, body: triageBody(forged) }, { id: 4, user: { login: 'mallory' }, body: summaryBody({ ...cost7, total: { ...cost7.total, usd: 999 } }) }],
     'a quote that does not start with the marker': [mine(3, `> quoted\n${triageBody(forged)}`)],
     'a state of another PR': [mine(3, triageBody(otherPr))],
-    'a record of another repository': [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherRepo, cost: { ...cost7, total: { ...cost7.total, usd: 999 } } })}`)],
+    'a record of another PR': [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherPrRecord, cost: { ...cost7, total: { ...cost7.total, usd: 999 } } })}`)],
     'a state with a round whose number is not an integer': [mine(3, triageBody(stateOf([round('2\n\u001b[31mFAKE', [acc('F-1')])])))],
   };
   for (const [what, extra] of Object.entries(cases)) {
@@ -208,15 +208,30 @@ test('R2-F1 analysePr: the round before a past-limit round counts its NEW accept
   assert.equal(prevOf([acc('R1-S1')]), 'only-low-fixes');
 });
 
+// #671: a PR merged before a repo rename/transfer keeps the old slug in its run record; it is still the PR's own record (run-record.mjs adoptRecord), so its booked cost must count.
+test('#671 stats rounds: a run record naming the repo the PR moved from still counts (with a warning); another PR\'s record and a differently-cased slug behave as before', () => {
+  const rec = (repo, pr, usd) => mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr, branch: 'feat/x', baseRef: 'main' }), cost: { ...cost7, total: { ...cost7.total, usd } } })}`);
+  const run = (comment) => statsCli([world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), comment] }], ['--json', '--pr', '7']);
+  const moved = run(rec('old/x', 7, 9));
+  assertExit(moved, 0, moved.stderr + moved.stdout);
+  assert.equal(moved.json.totals.usd, 9, 'the moved record\'s cost is counted');
+  assert.deepEqual(moved.json.warnings, ['acme/widgets#7: counted a run record bound to old/x (the repo moved)']);
+  const other = run(rec('old/x', 8, 999));
+  assert.equal(other.json.totals.usd, 0, 'a record of another PR is not counted');
+  assert.match(noteOf(other), /ignored a run record bound to old\/x#8: not this PR or repository/);
+  const cased = run(rec('Acme/Widgets', 7, 9));
+  assert.deepEqual([cased.json.totals.usd, cased.json.warnings], [9, []], 'a differently-cased slug is the same repository: counted, no warning');
+});
+
 const noteOf = (r) => r.json.warnings.join('\n');
 const onlyComments = (extra) => [world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, summaryBody(cost7)), mine(2, triageBody(state7)), ...extra] }];
 
 test('R2-F2 stats rounds: a pipeline comment that is skipped says why in the warnings (other author, other PR or repository, unreadable); an ordinary comment says nothing', () => {
-  const otherRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
+  const movedRepo = emptyRecord({ repo: 'acme/other', pr: 7, branch: 'feat/x', baseRef: 'main' });
   const cases = [
     ['a state by another author', [{ id: 3, user: { login: 'mallory' }, body: triageBody(state7) }], /widgets#7: ignored a review state comment by mallory: only the viewer's own comments count/],
     ['a record by another author', [{ id: 3, user: { login: 'mallory' }, body: summaryBody(cost7) }], /widgets#7: ignored a run record comment by mallory: only the viewer's own comments count/],
-    ['a record of another repository', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...otherRepo, cost: cost7 })}`)], /widgets#7: ignored a run record bound to acme\/other#7: not this PR or repository/],
+    ['a record of a repository the PR moved from', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...movedRepo, cost: cost7 })}`)], /acme\/widgets#7: counted a run record bound to acme\/other \(the repo moved\)/],
     ['a record of another PR', [mine(3, `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 8, branch: 'feat/x', baseRef: 'main' }), cost: cost7 })}`)], /widgets#7: ignored a run record bound to acme\/widgets#8: not this PR or repository/],
     ['a state of another PR', [mine(3, triageBody({ ...state7, pr: 8 }))], /widgets#7: ignored a review state bound to PR 8: not this PR/],
     ['a state with an unnumbered round', [mine(3, triageBody(stateOf([round('x', [])])))], /widgets#7: ignored a review state: unreadable/],
