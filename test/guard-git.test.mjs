@@ -1726,9 +1726,16 @@ test('#904: a program the line writes first is refused like the one on disk (`cp
   assert.match(evaluate('cd "$X" && ./node_modules/../env foo').reason, /cannot tell which directory/);
   assert.match(evaluate('./node_modules/../env foo', withFiles({ env: HARMLESS_TEXT })).reason ?? '', namedLike('./node_modules/../env', 'env'), 'a known directory: looked up, the text file is refused');
   assert.match(evaluate('.\\env foo', withFiles({ '.\\env': HARMLESS_TEXT })).reason ?? '', namedLike('.\\env', 'env'), 'a Windows path word is a path');
+  // the parent directory before node_modules is no traversal out of it; an escaped `..` (the shell may strip the escapes) gets no spelling shortcut
+  assert.equal(evaluate('cd "$X" && ../node_modules/.bin/node --version').decision, 'allow', 'a leading ..');
+  assert.match(evaluate('cd "$X" && ./node_modules/\\.\\./env foo').reason ?? '', /cannot tell which directory/, 'an escaped ..');
   assert.match(evaluate('cd "$X" && ./tool foo').reason, /cannot tell which directory/, 'the reference: a plain program');
   // accepted refusal (owner 11-28): a virtualenv interpreter after a cd the guard cannot follow
   assert.match(evaluate('cd "$(git rev-parse --show-toplevel)" && .venv/bin/python -m pytest').reason, /cannot tell which directory/);
+});
+
+test('#904: a plain Windows path program word keeps its verdict from before the change: not read as a script file, so a text file under it is no refusal (the failure: every Windows program word became a file the guard reads as a POSIX script)', () => {
+  assert.equal(evaluate('.\\build.cmd x', withFiles({ '.\\build.cmd': `#!/bin/sh\n${PUSH_G}\n` })).decision, 'allow');
 });
 
 // ---- #904 (allow side and regression controls): what the refusal must not touch --------------------------------------------------------------------------------------
