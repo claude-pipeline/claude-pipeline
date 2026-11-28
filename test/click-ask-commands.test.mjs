@@ -286,10 +286,10 @@ function triageWorld(yml = CHAT(), over = {}, { secondRound = false } = {}) {
   st = addRound(st, { n: 1, fromHead: 'a', toHead: s.head, contentHashAtToHead: s.hash, items: [item('R1-B1', 'Missing check'), item('R1-S3', 'Another\nmultiline   finding')] });
   if (secondRound) st = addRound(st, { n: 2, fromHead: s.head, toHead: s.head, contentHashAtToHead: s.hash, items: [item('R2-B1', 'Second missing check')] }); // a second reviewed round: with trip_wire_extra_rounds 1 (max_rounds 1 + 1) the trip-wire fires
   saveState(s.repo.dir, st);
-  s.fake.setScript([REPO]);
+  s.fake.setScript([REPO, { match: '^pr view 12 --json headRefOid', stdoutJson: { headRefOid: s.head } }]); // (a recommended Reject / fix-separately ask records the PR head on GitHub)
   return s;
 }
-const triage = (s, home, ...args) => triageRun(args, { cwd: s.repo.dir, env: baseEnv(s), home, managedPaths: [] });
+const triage =(s, home, ...args) => triageRun(args, { cwd: s.repo.dir, env: baseEnv(s), home, managedPaths: [] });
 
 test('triage round-request --ask: the question is the title and exactly the printed line; the ask binds the round request', async () => {
   const s = triageWorld();
