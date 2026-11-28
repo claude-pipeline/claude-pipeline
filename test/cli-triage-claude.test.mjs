@@ -1490,6 +1490,54 @@ test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling be
   assert.equal(seq.item('R1-S1').final.decision, 'REJECT');
 });
 
+test('#944 drift: an answer on a recommended Reject / fix-separately dialog is refused when the PR head moved since the dialog was issued; a click on another option and a typed answer still record', async (t) => {
+  // failure caught: Claude recommends Reject "already handled", a later commit removes that handling while the item still waits, and the old click still records REJECT on code Claude never checked
+  const moved = e2eWorld(t);
+  const c = await clickedRuling(t, moved, { ids: ['R1-B1'], recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' });
+  assert.match(c.file.head, /^[0-9a-f]{40}$/, 'the ask records the head it was issued at');
+  assert.equal(c.clicked.recorded?.prompt, 'R1-B1: reject');
+  moved.repo.commit('later change', { allowEmpty: true });
+  const before = moved.stateText();
+  const denied = await c.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(denied.exitCode, 1, JSON.stringify(denied.output));
+  assert.match(denied.output.reason, /recommended Reject all.*no longer holds.*head moved.*ask again/);
+  assert.equal(moved.stateText(), before, 'the state is byte-identical');
+  // the same for the any-severity follow-up dialog
+  const anyW = e2eWorld(t);
+  const any = await clickedRuling(t, anyW, { ids: ['R1-B1'], recommend: 'follow-up', why: 'fix-separately', label: 'Follow-up all (Recommended)' });
+  anyW.repo.commit('later change', { allowEmpty: true });
+  assert.equal((await any.ownerRuling('R1-B1', 'FOLLOW-UP', 'R1-B1: follow-up')).exitCode, 1);
+  // a click on the NON-recommended Accept says nothing about the code Claude checked
+  const other = e2eWorld(t);
+  const acc = await clickedRuling(t, other, { ids: ['R1-B1'], recommend: 'reject', why: 'already-handled', label: 'Accept all' });
+  other.repo.commit('later change', { allowEmpty: true });
+  assert.equal((await acc.ownerRuling('R1-B1', 'ACCEPT', 'R1-B1: accept')).exitCode, 0);
+  // the same words typed (no dialog) are the owner's own judgement
+  const typedW = e2eWorld(t);
+  const typed = typedFor(t, typedW, ['R1-B1'], 'R1-B1: reject');
+  typedW.repo.commit('later change', { allowEmpty: true });
+  assertExit(typed('R1-B1', 'REJECT'), 0);
+  // and the head unchanged: the click records (the control)
+  const fresh = e2eWorld(t);
+  const ok = await clickedRuling(t, fresh, { ids: ['R1-B1'], recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' });
+  assert.equal((await ok.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject')).exitCode, 0);
+});
+
+test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {
+  // failure caught: the batch recheck dropped a sibling that no longer waits, so the click recorded REJECT for the first id although the dialog's "Claude checked each item" no longer qualified the batch
+  const w = dWorld(t);
+  assertExit(w.codex(1, findingsOf([finding({ category: 'security' })], [sugg()])), 0);
+  waitingAccept(w, 'R1-B1');
+  w.wait('R1-S1');
+  const first = typedFor(t, w, ['R1-B1', 'R1-S1'], 'R1-B1: reject, R1-S1: reject', 'ruling-v2-reject');
+  w.edit((s) => { const i = s.rounds[0].items.find((x) => x.id === 'R1-S1'); i.final = { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'worth fixing' }; i.implemented = true; });
+  const before = w.stateText();
+  const denied = first('R1-B1', 'REJECT');
+  assertExit(denied, 1, denied.stdout);
+  assert.match(denied.json.reason, /no longer holds.*R1-S1/);
+  assert.equal(w.stateText(), before);
+});
+
 test('#944 drift: several answers on one item: a stale recommended record with a neutral click of the same words is recorded; stale records on two recommended dialogs are refused', async (t) => {
   // failure caught: the recheck refusing an answer a neutral dialog also carries (the owner's click on the plain dialog said nothing about a claim), or one stale record being enough to keep a ruling when every record claims
   const mixed = e2eWorld(t);

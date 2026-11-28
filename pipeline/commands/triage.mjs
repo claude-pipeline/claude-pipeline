@@ -26,7 +26,7 @@ import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
-import { RULING_VARIANT_LEGACY, clickNotes, followUpClickState, roundAsk, rulingAsk, rulingVariantFor, rulingWhyRow } from '../hooks/lib/owner-go-click.mjs';
+import { RULING_HEAD_BOUND_VARIANTS, RULING_VARIANT_LEGACY, clickNotes, followUpClickState, readAsk, roundAsk, rulingAsk, rulingVariantFor, rulingWhyRow } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRulingGap, ownerRulingRecords, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
   applyClaudeRuling, applyJudge, BUCKETS, CONFIDENCES, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
@@ -447,8 +447,13 @@ async function ownerRuling(rest, ctx) {
       // R3-B1/B2: each matching record is its own dialog: resolve its ids across ALL rounds (as the request and the digest do) and recheck it alone; the answer stands when one record's own batch still qualifies.
       const checks = answers.map((r) => {
         const claim = claimOf(r);
-        const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || (i.final?.by !== 'owner' && (i.final?.needsHuman === true || isDeferrableAccept(i) || isProtectedFinal(i))));
-        return { variant: r.ask.variant, waiting, stale: recommendationRefusal({ root, config, state, items: waiting, recommend: claim.recommend, code: claim.code }) };
+        // R1-B3 (#954): every asked sibling is rechecked except those this same answer already ruled; one in any other state (a built ACCEPT, a settled ruling) no longer qualifies the batch
+        const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || !(i.final?.by === 'owner' && i.final?.ownerQuote === ownerQuote));
+        // R1-B2 (#954): a recommended Reject / fix-separately was Claude's reading of the code at the head the ask was issued at; a click is stale once the head moved (an ask with no head, or one that cannot be read, is not judged here)
+        const issuedAt = RULING_HEAD_BOUND_VARIANTS.includes(r.ask.variant) ? readAsk(r.ask.askId, { home: ctx.home }) : null;
+        const nowHead = issuedAt?.ok === true && typeof issuedAt.ask.head === 'string' ? headSha({ cwd: root }) : null;
+        const moved = nowHead !== null && nowHead !== issuedAt.ask.head ? `the PR head moved from ${issuedAt.ask.head.slice(0, 12)} to ${nowHead.slice(0, 12)} since Claude recommended this, so the code it checked may have changed` : null;
+        return { variant: r.ask.variant, waiting, stale: moved ?? recommendationRefusal({ root, config, state, items: waiting, recommend: claim.recommend, code: claim.code }) };
       });
       if (checks.every((c) => c.stale !== null)) {
         const { variant, waiting, stale } = checks[0];
@@ -1017,7 +1022,9 @@ async function rulingRequest(rest, ctx) {
     if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields } };
     // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
     const block = [...items.map(summaryRow), ...(shown ? [rulingWhyRow(values.recommend, values.why)] : []), line].join('\n');
-    const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: dialogVariant });
+    const built = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: dialogVariant });
+    // a recommended Reject / fix-separately rests on Claude's reading of the code: the ask records the head it was issued at, and owner-ruling refuses the click once the head moved
+    const parts = built !== null && RULING_HEAD_BOUND_VARIANTS.includes(dialogVariant) ? { ...built, head: headSha({ cwd: root }) } : built;
     return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
   }, pr));
 }
