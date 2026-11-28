@@ -7,6 +7,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { createCommentsGh } from './helpers/fakegh-env.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import {
   PHASES, PRICE_TABLE_DATE, ROLES, addCostEntry, deductBookedTranscript, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
@@ -219,6 +220,36 @@ const written = (s) => {
   return decodeRecord(JSON.parse(w.at(-1).stdin).body).record;
 };
 const costCli = (s, args, env = {}) => cli(['cost', '--pr', String(PR), ...args], { dir: s.repo.dir, fake: s.fake, env: { ...s.env, ...env } });
+
+// A fake gh that REMEMBERS the PR's comments (what a post or an edit wrote is what the next listing shows), so two writers can be interleaved.
+const stateful = (s, comments = []) => {
+  s.fake = createCommentsGh(ghEntries({ prHead: s.head, extra: [{ match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }] }), { comments });
+  return s;
+};
+// The PR total as the comments hold it now.
+const liveCost = (s) => {
+  const mine = s.fake.comments().filter((c) => c.body.startsWith(MARKERS.summary));
+  return decodeRecord(mine.at(-1).body).record.cost;
+};
+
+// Issue #958: the run record is one editable comment and GitHub has no conditional edit, so a writer that read before another one wrote put its own total back and the other booking dropped out of the PR total.
+test('P cost: a booking survives a record write that read the PR before it (interleaved writers, #958)', () => {
+  const s = stateful(scenario());
+  const book = (usd) => costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '10', '--usd', String(usd)]);
+  const a = book(1);
+  assertExit(a, 0);
+  const stale = s.fake.comments();
+  const b = book(2);
+  assertExit(b, 0);
+  // a checkpoint (any run-record writer) whose read predates booking B
+  s.fake.freeze(stale);
+  assertExit(cli(['checkpoint', '--pr', String(PR), '--step', 'review'], { dir: s.repo.dir, fake: s.fake, env: s.env }), 0);
+  s.fake.unfreeze();
+  const c = book(4);
+  assertExit(c, 0);
+  assert.deepEqual([a.json.call.usd, b.json.call.usd, c.json.call.usd], [1, 2, 4], 'each call reports its own figure');
+  assert.deepEqual([liveCost(s).total.usd, liveCost(s).total.calls], [7, 3], 'all three bookings are in the total');
+});
 
 test('P cost: books an entry into a fresh record, then adds to it', () => {
   const s = scenario();

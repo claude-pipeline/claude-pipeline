@@ -1,6 +1,7 @@
 // A stand-in for `gh` that remembers the PR's comments, for the publication tests (test/review-publish.test.mjs, test/cli-triage-claude.test.mjs).
 // Same script format and call log as fake-gh.mjs (PIPELINE_FAKE_GH_SCRIPT, PIPELINE_FAKE_GH_LOG) plus a state file (PIPELINE_FAKE_GH_STATE):
-//   { me: "<login>", comments: [{id, body, user:{login}, created_at, updated_at}], seq, fail: { write?: true, list?: true, writeAfter?: <n comment writes allowed> } }
+//   { me: "<login>", comments: [{id, body, user:{login}, created_at, updated_at}], seq, fail: { write?: true, list?: true, writeAfter?: <n comment writes allowed> }, frozen?: [comments] }
+// `frozen`: the listing answers THIS list (a stale read) while writes still land on the live comments: a writer that read before another one wrote.
 // Routes: `api user` (the viewer), GET .../issues/N/comments --paginate, POST .../issues/N/comments, PATCH .../issues/comments/ID. Anything else is
 // answered by the script. A state file shared by two checkouts is how two worktrees of one PR see each other's publications.
 import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
@@ -28,7 +29,7 @@ if (/^api user/.test(joined)) {
   out(`${state.me ?? 'me'}\n`);
 } else if (/^api repos\/[^/]+\/[^/]+\/issues\/\d+\/comments --paginate/.test(joined)) {
   if (state.fail?.list) out(undefined, 1, 'gh: Server Error (HTTP 502)');
-  else out(state.comments);
+  else out(state.frozen ?? state.comments);
 } else if (/^api -X POST repos\/[^/]+\/[^/]+\/issues\/\d+\/comments/.test(joined)) {
   if (!writable()) {
     out(undefined, 1, 'gh: Server Error (HTTP 502)');
