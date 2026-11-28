@@ -321,7 +321,7 @@ test('changedFiles: a failing git (or a throwing one) is an { error }, never an 
 
 // ---- scripts/test.mjs --related --list ------------------------------------------------------------------------------
 const cli = (args, env = {}) => spawnSync(process.execPath, [join(root, 'scripts', 'test.mjs'), ...args], {
-  cwd: root, encoding: 'utf8', env: { ...process.env, CP_QUICK_RELATED_BUDGET_MS: '', ...env },
+  cwd: root, encoding: 'utf8', env: { ...process.env, CP_QUICK_RELATED_BUDGET_MS: '', CP_QUICK_CHANGED_CAP_MS: '', ...env },
 });
 const listed = (r) => r.stdout.split('\n').filter((l) => l.endsWith('.test.mjs'));
 
