@@ -50,7 +50,7 @@ const MAX_QUALIFIER_CHARS = 65_536; // characters of those code strings, togethe
 const PS_ENV_RE = /^\$env:([A-Za-z_][A-Za-z0-9_]*)(=?)([\s\S]*)$/i;
 const MAX_BRACE_WORK = 20_000; // brace-expansion results across one line; beyond it words stay unexpanded and the parse is flagged truncated
 const BRACE_CAP = 64; // results of one brace expression; beyond it we keep the first ones and set `truncated`
-const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mksh', 'pdksh', 'yash', 'rbash', 'fish', 'csh', 'tcsh']);
+export const SHELLS = new Set(['bash', 'sh', 'zsh', 'dash', 'ash', 'ksh', 'ksh93', 'mksh', 'pdksh', 'yash', 'rbash', 'fish', 'csh', 'tcsh']);
 const TMUX_RUNNERS = new Set(['new-session', 'new', 'new-window', 'neww', 'split-window', 'splitw', 'respawn-pane', 'respawnp', 'respawn-window', 'respawnw', 'run-shell', 'run', 'pipe-pane', 'pipep', 'display-popup', 'popup', 'if-shell', 'if']);
 const TMUX_KEY_RE = /^(Enter|Space|Tab|Escape|BSpace|Up|Down|Left|Right|Home|End|PageUp|PageDown|[CMS]-.+|F[0-9]+|KP.+)$/;
 const PS_START_VALUED = ['workingdirectory', 'verb', 'windowstyle', 'redirectstandardinput', 'redirectstandardoutput', 'redirectstandarderror', 'credential', 'environment'];
@@ -597,6 +597,7 @@ const WRAPPERS = {
   caffeinate: plain('tw'),
   busybox: plain(),
 };
+export const WRAPPER_NAMES = Object.keys(WRAPPERS); // (the names the parser unwraps; the #904 tests walk them)
 
 // #903 B: a bare npm runner (`npx`, `npm exec`: no command word, no -c text) starts npm's script shell, which reads its stdin as shell text. Is this argv one, and does it run once per workspace?
 // null: not a bare runner (a command word or a -c / --call text is there, an info flag makes npm exit first, `npm help`, another command). Else { workspace }.
@@ -721,7 +722,7 @@ function shellScan(argv, zshGlued) {
 
 // ---- script files -------------------------------------------------------------------------------
 
-const INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php)$/;
+export const INTERPRETER = /^(?:node|nodejs|deno|bun|tsx|ts-node|python\d*(?:\.\d+)*|ruby|perl|php)$/;
 export const SCRIPT_EXT = /\.(?:m?[jt]s|cjs|jsx|tsx|py|rb|pl|php|sh|bash|zsh)$/i;
 const SYSTEM_BIN = /^(?:\/usr)?(?:\/local)?\/(?:s?bin|libexec)\/|^\/opt\/homebrew\/s?bin\//;
 // Flags that make an interpreter run inline code, a module or a test runner instead of a file.
