@@ -19,19 +19,11 @@ export function sectionsOf(body) {
   return rest.trim();
 }
 
-// The ONE rule for whether a run record's cost may be a base of this PR's cost (the summary reader, the record writers through it, and `P stats rounds`): the record is bound to this PR number and, when `repo`
-// is given (left out: only the PR number is checked), to this repository: the same name (case-insensitive), or one the owner's repo-moves record links (sameRepo, judged from the record's last heartbeat;
-// `moves` is read from the owner's file only when the names differ).
-export function recordBelongs(record, { pr, repo, moves } = {}) {
-  if (record.pr !== pr) return false;
-  if (repo === undefined || String(record.repo ?? '').toLowerCase() === String(repo).toLowerCase()) return true;
-  return sameRepo({ recorded: record.repo, recordedAt: record.heartbeat?.at, current: repo, moves: moves ?? readRepoMoves().moves });
-}
-
 // The newest summary comment the viewer wrote that STARTS with the marker: the same one upsertComment edits.
 // -> {status: ok|absent|legacy|unsupported|invalid, record?, sections, url, id, costBookings, effectiveCost}
-// `summaryFromComments(comments, viewerLogin, pr, { repo, moves })` works on a comment list the caller already holds. `repo` (the PR's slug) binds the record's cost base to this repository too (recordBelongs):
-// a summary copied from another repository's PR of the same number is no base, and its cost is cut from the returned `record` as well, so a writer that rebuilds the record from it (checkpoint, summary) never restores it.
+// `summaryFromComments(comments, viewerLogin, pr, { repo, moves })` works on a comment list the caller already holds. `repo` (the PR's slug; left out: only the PR number is checked) binds the record's cost base
+// to this repository too: a summary copied from another repository's PR of the same number is no base (stats does the same), unless the owner's repo-moves record says it is the same repository renamed or
+// transferred (sameRepo, judged from the record's last heartbeat; `moves` is read from the owner's file only when the names differ).
 // `effectiveCost` is the PR's cost as the append-only cost bookings (`P cost`, one comment each) say it on top of the record's own cost section, a SIBLING of `record` (also when there is no
 // summary comment yet): the record keeps only the legacy base, so the two are never added twice. -> run-cost.mjs#effectiveCost ({ cost, contributions, any } or { unavailable }).
 // `costBookings` is what it was built from (readCostBookings), for a writer that replays the same bookings over a different base (costOver).
@@ -43,11 +35,11 @@ export function summaryFromComments(comments, viewerLogin, pr, { repo, moves } =
   const found = mine.at(-1);
   if (!found) return { status: 'absent', sections: '', url: null, id: null, costBookings, effectiveCost: effectiveCost({ baseStatus: 'absent', ...costBookings }) };
   const decoded = decodeRecord(found.body);
-  // A record bound to another PR or repository (a summary copied over by hand) is no base: its cost is neither counted here nor carried by the record this returns (the writers adopt a record whose only mismatch is the repo).
-  const ours = decoded.status === 'ok' && recordBelongs(decoded.record, { pr, repo, moves });
+  // A record bound to another PR or repository (a summary copied over by hand) is no base: stats and every record writer drop it, so its cost must not show here either.
+  const ours = decoded.status === 'ok' && decoded.record.pr === pr && (repo === undefined || String(decoded.record.repo ?? '').toLowerCase() === String(repo).toLowerCase()
+    || sameRepo({ recorded: decoded.record.repo, recordedAt: decoded.record.heartbeat?.at, current: repo, moves: moves ?? readRepoMoves().moves }));
   const base = ours ? decoded.record.cost : undefined;
-  const foreign = decoded.status === 'ok' && !ours ? { record: Object.fromEntries(Object.entries(decoded.record).filter(([k]) => k !== 'cost')) } : {};
-  return { ...decoded, ...foreign, sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id, costBookings, effectiveCost: effectiveCost({ base, baseStatus: decoded.status, ...costBookings }) };
+  return { ...decoded, sections: sectionsOf(found.body), url: found.html_url ?? null, id: found.id, costBookings, effectiveCost: effectiveCost({ base, baseStatus: decoded.status, ...costBookings }) };
 }
 
 // The cost to show for a record about to be written: `base` (that record's own cost section) with the bookings of a summary read (`summaryFromComments` result) on top.

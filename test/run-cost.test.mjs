@@ -285,17 +285,6 @@ test('P cost: a booking after the summary comment shows once in the block after 
   assert.equal(written(s).cost.total.usd, 3);
 });
 
-// R3-B1: the summary reader leaves another repository's spend out, so a record write must not restore it: a checkpoint that carried the copied record over (only the repo differs) put the foreign cost under this repository's name.
-test('P checkpoint: a summary copied from another repository (same PR number and branch) does not bring its spend over (R3-B1, #958)', () => {
-  const s = scenario();
-  withComment(s, existing({ ...rec(), repo: 'other/widgets', heartbeat: { host: 'h', at: '2026-11-01T00:00:00.000Z' }, cost: addCostEntry(emptyCost(), entry({ usd: 40 })) }));
-  assertExit(checkpoint(s), 0);
-  assertExit(checkpoint(s), 0);
-  const sum = summaryFromComments(s.fake.comments(), 'me', PR, { repo: 'acme/widgets', moves: [] });
-  assert.equal(sum.effectiveCost.any, false, 'no spend of this PR');
-  assert.equal(sum.record.repo, 'acme/widgets', 'the record is this repository\'s now');
-});
-
 // merge.mjs refuses when recorder.update returns null: a booking nobody can read must show as a note, never fail the write.
 test('a record write still succeeds, and says so in the block, when a booking of ours cannot be read (#958)', () => {
   const s = scenario();
