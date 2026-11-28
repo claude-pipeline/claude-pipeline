@@ -181,6 +181,7 @@ test('guard: `pipeline db-refs --help` / `-h` (also after set|remove) is allowed
     `${PIPE} db-refs set x -- --help`,
     `${PIPE} db-refs set x --helpme`,
     `${PIPE} db-refs set x --help-me`,
+    `set +B; ${PIPE} db-refs set --ref ${REF} --name {production,--help}`, // brace expansion puts --help in argv; the CLI gets one literal word
     `${PIPE} job start x -- ${PIPE} db-refs set x`,
     `${PIPE} db-refs set --ref ${REF} --name x --repo o/r; ${PIPE} db-refs --help`,
   ]) assert.equal(bash(cmd), 'deny', cmd);

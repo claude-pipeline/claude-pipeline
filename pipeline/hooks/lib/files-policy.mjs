@@ -2539,9 +2539,9 @@ const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s
 // program with no `$` and no backtick in it (so no expansion can run) a `((` is none. Only those two spellings are rewritten: `$((`, `$[`, a lone `_`, `((` / let in shell code, a program word with an
 // unquoted part and every other match of ARITH_CONTEXT are read as written.
 const INLINE_NODE_WORD = /(?<=^|[;&|(\n]\s*)node(?:js)?\s+(?:-e|-p|--eval|--print)\s+(?:'([^']*)'|"((?:[^"\\$`]|\\[^$`])*)")(?=\s|$|[;&|)])/g;
-// #685: `ls -lt DIR` is an option cluster of ls, not the test operator `-lt`: a run of option words right after an ls word at command position (the same lookbehind as the node word above) has any bare operator word in it
-// renamed (`-lt` -> `-Xlt`). `[`, `[[`, `test` and every other head keep the operator gate; a run that does not end at a blank, `;`, `&`, `|`, `)` or the end of the line matches nothing.
-const LS_OPTION_RUN = /(?<=^|[;&|(\n]\s*)ls(?:\s+-[A-Za-z]+)+(?=\s|$|[;&|)])/g;
+// #685: `ls -lt DIR` is an option cluster of ls, not the test operator `-lt`: a run of option words (short `-lt`, long `--color=auto`) right after an ls word at command position (the same lookbehind as the node word above) has any bare operator word in it
+// renamed (`-lt` -> `-Xlt`), unless the text before the ls word holds a quote, `#`, `$`, backslash, backtick, `[`, `<` or `>` (an ls inside `[[ ]]` or after a redirect is an operand, not a command). `[`, `[[`, `test` and every other head keep the operator gate; a run that does not end at a blank, `;`, `&`, `|`, `)` or the end of the line matches nothing.
+const LS_OPTION_RUN = /(?<=^|[;&|(\n]\s*)ls(?:\s+(?:-[A-Za-z]+|--[A-Za-z][\w-]*(?:=[^\s'"$`\\#\[<>;&|()]*)?))+(?=\s|$|[;&|)])/g;
 function arithView(raw) {
   return raw.replace(INLINE_NODE_WORD, (all, single, double, at) => {
     const before = raw.slice(0, at);
@@ -2550,7 +2550,7 @@ function arithView(raw) {
     if (single !== undefined) return `${head}'${single.replace(/\((?=\()/g, '( ').replace(/(?<!\w)let(?=\s)/g, 'lXt')}'`;
     if (double.includes('\\')) return all;
     return `${head}"${double.replace(/\((?=\()/g, '( ')}"`;
-  }).replace(LS_OPTION_RUN, (all, at, whole) => (/['"#$\\`]|<</.test(whole.slice(0, at)) ? all : all.replace(/(\s-)(?=(?:eq|ne|lt|gt|le|ge)(?:\s|$))/g, '$1X')));
+  }).replace(LS_OPTION_RUN, (all, at, whole) => (/['"#$\\`[<>]/.test(whole.slice(0, at)) ? all : all.replace(/(\s-)(?=(?:eq|ne|lt|gt|le|ge)(?:\s|$))/g, '$1X')));
 }
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
@@ -4080,8 +4080,8 @@ function findDbRefsWrite(cmds, raw) {
     if (i >= 0) {
       const rest = c.argv.slice(i + 1);
       const at = rest.indexOf('db-refs');
-      // (#649: pipeline.mjs prints usage and exits for a `--help` / `-h` word before any `--` when the command name comes first, before the command module runs)
-      const helpOnly = at === 0 && rest.slice(1, rest.includes('--') ? rest.indexOf('--') : undefined).some((a) => a === '--help' || a === '-h');
+      // (brace expansion can put a `--help` in argv that the CLI gets as one literal word: a `{` anywhere in the command's text gives no help exception) (#649: pipeline.mjs prints usage and exits for a `--help` / `-h` word before any `--` when the command name comes first, before the command module runs)
+      const helpOnly = at === 0 && !c.raw.includes('{') && rest.slice(1, rest.includes('--') ? rest.indexOf('--') : undefined).some((a) => a === '--help' || a === '-h');
       if (at >= 0 && rest[at + 1] !== 'show' && !helpOnly) return true;
     } else if (c.raw.includes('\\') && DB_REFS_RAW.test(toPosix(c.raw))) return true;
   }
