@@ -5,7 +5,7 @@ import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { MAX_PAGES, PAGE, pages } from '../lib/gh-pages.mjs';
 import { decodeRecord } from '../lib/run-record.mjs';
-import { heldBack } from '../lib/summary-comment.mjs';
+import { recordBelongs } from '../lib/summary-comment.mjs';
 import { effectiveCost } from '../lib/run-cost.mjs';
 import { readCostBookings } from '../lib/run-events.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
@@ -56,7 +56,6 @@ async function rounds(rest, ctx) {
           let cut = false;
           const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => { cut = true; warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record, state or cost bookings may be missing or old, so its cost is left out`); });
           let record = null;
-          let base;
           let state = null;
           let recordUnreadable = false;
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
@@ -73,8 +72,7 @@ async function rounds(rest, ctx) {
             if (isRecord) {
               const r = decodeRecord(c.body);
               if (r.status === 'ok') {
-                const held = heldBack(r, { pr: number, repo: slug, moves: ctx.moves }); // the record's cost as the summary reader resolves it (a held balance once its move is registered)
-                if (held.ours) { record = held.record ?? r.record; base = held.base; }
+                if (recordBelongs(r.record, { pr: number, repo: slug, moves: ctx.moves })) record = r.record;
                 else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
               } else if (r.status === 'invalid' || r.status === 'unsupported') {
                 recordUnreadable = true;
@@ -90,7 +88,7 @@ async function rounds(rest, ctx) {
           }
           // The cost is this PR's own record's cost section plus the cost bookings of THIS listing (this slug's comments of this PR: another repo's PR of the same number never mixes in). A record bound
           // to another PR was skipped above and brings no cost; an unreadable record, or an unreadable booking of ours, leaves the cost out (usd null).
-          const eff = effectiveCost({ base, baseStatus: record === null && recordUnreadable ? 'invalid' : 'ok', ...readCostBookings({ comments, viewer: me }) });
+          const eff = effectiveCost({ base: record?.cost, baseStatus: record === null && recordUnreadable ? 'invalid' : 'ok', ...readCostBookings({ comments, viewer: me }) });
           // A list cut by the page limit holds only some of the bookings: a partial total would be printed as the PR's cost, so the cost is left out (the cut is already a warning).
           if (eff.unavailable !== undefined) warnings.push(`${slug}#${number}: the booked cost is unavailable, so it is left out: ${asciiLine(eff.unavailable, 120)}`);
           const cost = cut || eff.unavailable !== undefined || !eff.any ? null : eff.cost;

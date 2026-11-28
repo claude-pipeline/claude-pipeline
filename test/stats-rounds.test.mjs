@@ -357,22 +357,3 @@ test('R3-B2 stats rounds: a record written under a name the repository has since
   assert.equal(await usdOf('old/widgets'), 9, 'renamed after the record was written: still this PR, its $9 counts');
   assert.equal(await usdOf('other/widgets'), null, 'another repository: no base, so no cost');
 });
-
-// R5-B2: a checkpoint under a renamed repository moves the cost into heldCost; once the move is registered the summary reader counts it again, and stats must price the same PR the same.
-test('R5-B2 stats rounds: a held cost whose move is registered counts, one whose move is not does not', async () => {
-  const held = `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), heldCost: { repo: 'old/widgets', at: '2026-11-01T00:00:00.000Z', cost: { ...cost7, total: { ...cost7.total, usd: 40 } } } })}`;
-  const usdOf = async (moves) => {
-    const repo = createTmpRepo();
-    repo.write('.claude/pipeline.yml', pipelineYml());
-    repo.commit('init');
-    const fake = createFakeGh(script([world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, held), mine(2, triageBody(state7))] }]));
-    const env = { ...process.env, ...fake.env };
-    delete env.PIPELINE_OFF;
-    let out = '';
-    const code = await main(['stats', 'rounds', '--json', '--pr', '7'], { cwd: repo.dir, env, moves, stdout: { write: (x) => { out += x; } } });
-    assert.equal(code, 0, out);
-    return JSON.parse(out).prs[0].usd;
-  };
-  assert.equal(await usdOf([{ from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 }]), 40, 'registered: the held $40 counts');
-  assert.equal(await usdOf([]), null, 'not registered: nothing counted');
-});

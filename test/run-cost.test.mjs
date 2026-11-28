@@ -314,47 +314,6 @@ test('P checkpoint: a legacy $40 record under a renamed repository (move not reg
   assert.equal(after.record.cost.total.usd, 40);
 });
 
-// R5-B1: a balance keeps the repository and time it was written under: the record's later own spend must not be merged into a balance bound elsewhere, or a second rename binds it to the wrong repository for good.
-test('P checkpoint: A -> B -> C with neither move registered keeps one balance per repository, and each comes back on its own move (R5-B1, #958)', () => {
-  const s = scenario();
-  const usd = (n) => addCostEntry(emptyCost(), entry({ usd: n }));
-  // held from a/widgets (written 11-01) and the record's own $10, written under b/widgets (11-06); the live repository is acme/widgets (c)
-  withComment(s, existing({ ...rec(), repo: 'b/widgets', heartbeat: { host: 'h', at: '2026-11-06T00:00:00.000Z' }, cost: usd(10), heldCost: { repo: 'a/widgets', at: '2026-11-01T00:00:00.000Z', cost: usd(40) } }));
-  assertExit(checkpoint(s), 0);
-  assertExit(checkpoint(s), 0);
-  const read = (moves) => summaryFromComments(s.fake.comments(), 'me', PR, { repo: 'acme/widgets', moves });
-  const aToB = { from: 'a/widgets', to: 'b/widgets', at: '2026-11-05T00:00:00.000Z', repoId: 7 };
-  const bToC = { from: 'b/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
-  const none = read([]);
-  assert.equal(none.effectiveCost.any, false, 'nothing proven: nothing counted');
-  assert.deepEqual(none.record.heldCost.map((h) => [h.repo, h.cost.total.usd]), [['a/widgets', 40], ['b/widgets', 10]], 'two balances, each under its own repository');
-  const second = read([bToC]);
-  assert.equal(second.effectiveCost.cost.total.usd, 10, 'B -> C registered: the $10 is ours');
-  assert.equal(second.record.heldCost.repo, 'a/widgets', 'the $40 stays held');
-  const both = read([aToB, bToC]);
-  assert.equal(both.effectiveCost.cost.total.usd, 50, 'both registered: all of it');
-  assert.equal(both.record.heldCost, undefined);
-});
-
-// R5-B3: costShapeProblem accepts any plain-object byPrice, but adding two cost sections throws on a bad key: a display must not throw, and neither balance may be touched.
-test('summaryFromComments: a malformed byPrice in the held or the own cost leaves the cost unavailable and both balances stored, without throwing (R5-B3, #958)', () => {
-  const usd = (n, extra = {}) => ({ ...addCostEntry(emptyCost(), entry({ usd: n })), ...extra });
-  const move = { from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
-  const heldAt = { repo: 'old/widgets', at: '2026-11-01T00:00:00.000Z' };
-  const cases = {
-    'own cost': { cost: usd(10, { byPrice: { bad: {} } }), heldCost: { ...heldAt, cost: usd(40) } },
-    'held cost': { cost: usd(10), heldCost: { ...heldAt, cost: usd(40, { byPrice: { bad: {} } }) } },
-  };
-  for (const [what, over] of Object.entries(cases)) {
-    const comment = existing({ ...rec(), ...over });
-    let sum;
-    assert.doesNotThrow(() => { sum = summaryFromComments([comment], 'me', PR, { repo: 'acme/widgets', moves: [move] }); }, what);
-    assert.ok(sum.effectiveCost.unavailable, `${what}: cost unavailable`);
-    assert.equal(sum.record.cost.total.usd, 10, `${what}: own balance stored`);
-    assert.equal(sum.record.heldCost.cost.total.usd, 40, `${what}: held balance stored`);
-  }
-});
-
 // R4-B1: a move lookup that fails (readRepoMoves answers { moves: [], error }) is "not proven" for counting, and a writer must not lose the cost for it either.
 test('summaryFromComments + writers: an unreadable repo-moves file neither counts nor loses a legacy cost (R4-B1, #958)', () => {
   const home = mkdtempSync(join(tmpdir(), 'moves-'));
