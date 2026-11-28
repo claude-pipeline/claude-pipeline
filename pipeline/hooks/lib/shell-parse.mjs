@@ -1090,6 +1090,12 @@ const ZSH_ALTERNATION = /(?<![$<>=(])\([^\s]*\|[^\s]*\)/;
 
 // (the arguments of a program named by a variable, for the policies that judge the command line it expands to; not part of the record's shape)
 const withArgs = (sf, argv) => Object.defineProperty(sf, 'args', { value: argv.slice(1), enumerable: false });
+// (#904) a program run by path: the word holds a slash and is not a system bin. One predicate for the script-file record below and for the `pathRuns` mark, so the two never drift.
+export function pathRunRecord(argv) {
+  if (!argv.length || !/[/]/.test(argv[0]) || SYSTEM_BIN.test(argv[0])) return null;
+  // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
+  return hasExpansion(argv[0]) ? withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv) : { kind: 'exec', file: argv[0] };
+}
 function scriptFileOfArgv(argv) {
   if (!argv.length) return null;
   const name = base(argv[0]);
@@ -1131,10 +1137,7 @@ function scriptFileOfArgv(argv) {
     return STDIN_FILES.has(file) ? null : { kind: 'interp', file };
   }
   // (a backslash is an ordinary file name character off Windows, so a path holding one is judged like any other)
-  if (/[/]/.test(argv[0]) && !SYSTEM_BIN.test(argv[0])) {
-    // `./ev*.sh` / `$D/x.sh`: the shell runs whatever the word expands to, so it is a candidate list of one word
-    return hasExpansion(argv[0]) ? withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv) : { kind: 'exec', file: argv[0] };
-  }
+  { const pr = pathRunRecord(argv); if (pr) return pr; }
   // `=tool`: zsh runs the file `tool` resolves to on PATH (the candidates are its PATH directories, see script-candidates.mjs)
   // `X=./evil.sh; $X`: a program named by a variable has no `/` to show it is a path
   if (/[$`]/.test(argv[0]) || EQUALS_WORD.test(argv[0])) return withArgs({ kind: 'exec', file: argv[0], ambiguous: true, words: [argv[0]] }, argv);
@@ -3777,11 +3780,13 @@ class Parser {
     // extCd (T2): a `time`, `command` or `builtin` stood in front. Whether it ran the command as the shell's own builtin or as an external program differs by shell and spelling (dash has no `time` keyword, zsh's `command cd` runs /usr/bin/cd,
     // bash's `time` after an assignment is a program), so a `cd` behind it may or may not have moved THIS shell: git-policy leaves the directory unknown. Not `spawn` (bash really moves), not truncated (`\time make` is everyday).
     let extCd = false;
+    const pathRuns = []; // (#904) every path-run program this command was read through BY NAME ({ rec, chdir }): the by-name reading drops the word before any record names the file
     for (let guard = 0; guard < 32 && a.length; guard++) {
       if (base(a[0]) === 'xargs' || base(a[0]) === 'parallel') fanRuns = true;
       if (runnerIn === null && !fan) runnerIn = bareRunner(a); // (not behind an xargs / parallel: the pipe is that program's stdin, not the runner's)
       const un = unwrap(a, this.ctx.runnerPlain);
       if (!un) break;
+      { const pr = pathRunRecord(a); if (pr) pathRuns.push({ rec: pr, chdir }); } // (#904: chdir as it is BEFORE this wrapper's own -C applies: where the wrapper itself is looked up)
       wrapped = true;
       if (base(a[0]) === 'time' || base(a[0]) === 'command' || base(a[0]) === 'builtin') extCd = true; // (`builtin`: dash has none, "not found": the cd never runs and the line goes on in the old directory)
       if (PACKAGE_RUNNERS.has(base(a[0]))) {
@@ -3813,6 +3818,11 @@ class Parser {
     }
     // Why: bash sets $BASH to its own path (zsh leaves it unset), so `"${BASH:-bash}" f.sh` runs f.sh with bash: read as bash, unless the text (or the environment) can bind
     // the name. Every other spelling (`$BASH f.sh` vanishes under zsh and runs f.sh itself) keeps its run-time head AND adds the bash / sh readings, so it is judged as strictly as either
+    if (a.length) { // (#904: the final program, when a by-name branch of scriptFileOfArgv takes it before the path branch: a shell, an interpreter, `source`)
+      const pr = pathRunRecord(a);
+      const sf = pr ? scriptFileOfArgv(a) : null;
+      if (pr && !(sf && sf.kind === 'exec' && sf.file === a[0])) pathRuns.push({ rec: pr, chdir });
+    }
     let bashAlso = null;
     if (a.length && BASH_WORD.test(a[0])) {
       if (this.ctx.bashPlain && BASH_DEFAULT.test(a[0])) { a = ['bash', ...a.slice(1)]; if (this.ctx.bashState) this.ctx.bashState.rewrote = true; }
@@ -3825,6 +3835,7 @@ class Parser {
     // typed: the words the command was typed with (a quoted string, a substitution and a heredoc body stay one word; comments are not words; leading NAME=value words are not in it), wrappers included. Not enumerable
     if (cmd && seg.typed) Object.defineProperty(cmd, 'typed', { value: seg.typed, enumerable: false });
     if (cmd && chdir !== undefined) Object.defineProperty(cmd, 'chdir', { value: chdir, enumerable: false });
+    if (cmd && pathRuns.length) Object.defineProperty(cmd, 'pathRuns', { value: pathRuns, enumerable: false });
     if (cmd && spawn) Object.defineProperty(cmd, 'spawn', { value: true, enumerable: false });
     if (cmd && wrapped) Object.defineProperty(cmd, 'wrapped', { value: true, enumerable: false });
     if (cmd && extCd) Object.defineProperty(cmd, 'extCd', { value: true, enumerable: false });
