@@ -2,7 +2,7 @@
 // began, the incident it opened, and that a run was taken over from an earlier session: `run-resumed`, which the merge gate reads beside the run record). Each event is its OWN PR comment, created once and never edited, so no later writer
 // can erase it. Only comments the viewer wrote that START with an event marker count; a quoted marker is not an event.
 import { line } from './render.mjs';
-import { applyCostPatch, emptyCost } from './run-cost.mjs';
+import { applyCostPatch, costShapeProblem, emptyCost } from './run-cost.mjs';
 import { packJson, unpackJson } from './run-record.mjs';
 
 export const EVENT_KINDS = Object.freeze(['prod-before', 'rollback-intent', 'rollback-result', 'recovery-reported', 'ci-proof-used', 'hold-lifted', 'hold-lift-deleted', 'hold-lift-aborted', 'run-resumed', 'cost-booking']);
@@ -50,8 +50,10 @@ export function costBookingProblem(data, id) {
   if (typeof data.id !== 'string' || !EVENT_ID.test(data.id)) return 'the payload has no usable id';
   if (id !== undefined && data.id !== id) return 'the payload id is not the comment id';
   if ('hold' in data) return 'the payload carries a hold';
+  if (data.entry !== undefined && (data.entry === null || typeof data.entry !== 'object' || Array.isArray(data.entry))) return 'the entry is not an object';
   try {
-    applyCostPatch(emptyCost(), data, { evict: false });
+    const bad = costShapeProblem(applyCostPatch(emptyCost(), data, { evict: false }));
+    if (bad) return `the booking makes a cost section nothing can read (${bad})`;
   } catch (err) {
     return String(err?.message ?? err).slice(0, 120);
   }

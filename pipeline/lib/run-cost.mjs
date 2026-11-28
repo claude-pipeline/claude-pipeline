@@ -192,6 +192,10 @@ export function effectiveCost({ base, baseStatus = 'ok', bookings = [], corrupt 
       const d = (k) => (Number(cost.total[k]) || 0) - (Number(was?.[k]) || 0);
       contributions.set(id, { usd: Math.round(d('usd') * 1e6) / 1e6, input: d('input'), output: d('output'), cacheRead: d('cacheRead'), cacheWrite: d('cacheWrite') });
     }
+    // The sessions the record holds were put there by a summary AFTER the bookings it saw: the cap keeps the newest 20, so they go in last (older bookings replayed over them would push them out).
+    if (Array.isArray(base?.sessions)) cost = addSessions(cost, base.sessions);
+    const bad = costShapeProblem(cost);
+    if (bad) return { unavailable: `the cost bookings could not be added up (${bad})` };
     return { cost, contributions, any: isPlainObject(base) || bookings.length > 0 };
   } catch (err) {
     return { unavailable: `the cost bookings could not be added up (${String(err?.message ?? err).slice(0, 120)})` };
