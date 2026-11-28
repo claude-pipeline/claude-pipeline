@@ -329,6 +329,8 @@ const unplacedTurnProvenance = (e) => unplacedProvenance(e) && !bangStdout(e);
 // (a hidden headless run is the case it would let through), and no machine here runs such a client. The readers do not exempt such a file; the owner is asked again after upgrading
 // (promptProvenance's legacy branch for a stored record predates this and is unchanged). Pinned by test/owner-go-visible-turns.test.mjs (#253).
 const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedTurnProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
+// #905: a non-owner PLAIN boundary: a prompt entry of unknown source that is neither an unplaced note nor an invisible turn (a half-flagged compaction summary, the #189 boundary).
+const plainBoundary = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedTurnProvenance(e) && !unplacedNote(e);
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
   const source = entrySource(e);
@@ -353,8 +355,8 @@ const invisibleTurn = (e) => {
 // or a plain boundary: the memo keeps { hidden, bare } (bare: the verdict is visible, but the walk did not end at an owner prompt), and every entry of a walk from the stdout entry down to it is hidden when its end is bare. The bare note itself (an ancestor) keeps its verdict.
 // #905: a NON-owner plain boundary (a prompt entry of unknown source that is no unplaced note: e.g. a half-flagged compaction summary, the #189 boundary) is no known turn either, so it no longer ends the walk visible
 // on its own fields: it walks its parentUuid chain like an unplaced note. A string parentUuid that resolves continues to the parent; no string parentUuid, a parent outside the window / unresolved, or a cycle is
-// hidden (fail closed). Only the owner's own prompt (entrySource 'owner') ends the walk as a known turn, so a request under a parentless half-flagged summary binds nothing; the #189 rule that such a summary stays a
-// boundary (a request ABOVE it never survives it) is unchanged.
+// hidden (fail closed), and so is a parent that does not precede the entry (R1-B3). Only the owner's own prompt (entrySource 'owner') ends the walk as a known turn, so a request under a parentless half-flagged summary binds nothing; the #189 rule that such a summary stays a
+// boundary (a request ABOVE it never survives it) is unchanged: replyOf keeps such a boundary a reply slot in every mode, blank when hidden (nothing under it binds), and a walk that ends bare cuts it like a `!` stdout entry (it is no known turn).
 function invisibleNote(entries, parent, first, memo = new Map()) {
   const path = [];
   const seen = new Set();
@@ -368,11 +370,11 @@ function invisibleNote(entries, parent, first, memo = new Map()) {
     if (invisibleTurn(e)) verdict = true;
     else if (entrySource(e) === 'owner') verdict = false; // the owner's own prompt: the one known turn (R3-B1)
     else if (typeof e.parentUuid !== 'string') { if (unplacedNote(e) || visibleSynthetic(e)) { verdict = false; bare = true; } else verdict = true; } // no chain: only an unplaced note / visibleSynthetic turn keeps the legacy parentless rule; a plain boundary fails closed (#905)
-    else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
+    else if (parent[i] < 0 || parent[i] >= i || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, one that does not PRECEDE the entry (R1-B3: the owner's later answer is no ancestor), or a cycle
     else i = parent[i];
   }
   let cut = -1; // the deepest `!` stdout entry on the path: it and everything chained through it is hidden when the walk ended bare
-  if (bare) path.forEach((i, k) => { if (bangStdout(entries[i])) cut = k; });
+  if (bare) path.forEach((i, k) => { if (bangStdout(entries[i]) || plainBoundary(entries[i])) cut = k; });
   path.forEach((i, k) => memo.set(i, k <= cut ? { hidden: true, bare: false } : { hidden: verdict, bare }));
   return cut >= 0 ? true : verdict;
 }
@@ -583,8 +585,10 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
     if (e?.type === 'user' && isHiddenSummary(e)) return;
     if (e?.type === 'user' && isPromptEntry(e)) {
       // skip (ruling reader): a turn whose prompt the owner did not type; mute (every other reader): an invisible turn, a boundary whose text is never added (#191 A2); slot: everything else
-      const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || hidden(i) ? 'skip' : 'slot') : hidden(i) ? 'mute' : 'slot';
-      const t = { pos: i, e, kind, content: [], lastPos: i, textPos: -1, shownPos: -1 };
+      // #905: a hidden plain boundary stays a slot (it ends the slot before it, as on the base) but a blank one: nothing printed under it is a request
+      const blank = plainBoundary(e) && hidden(i);
+      const kind = plainBoundary(e) ? 'slot' : skipSynthetic ? (entrySource(e) === 'synthetic' || hidden(i) ? 'skip' : 'slot') : hidden(i) ? 'mute' : 'slot';
+      const t = { pos: i, e, kind, blank, content: [], lastPos: i, textPos: -1, shownPos: -1 };
       turns.push(t);
       turnAt.set(i, t);
     } else if ((e?.type === 'user' || e?.type === 'assistant') && Array.isArray(content)) {
@@ -607,7 +611,7 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
     if (t.kind === 'mute') { mutes.push(t.pos); continue; }
     if (t.kind === 'slot') {
       let text = '';
-      for (const e of t.content) if (e.type === 'assistant') for (const b of e.message.content) if (b?.type === 'text' && typeof b.text === 'string') text += `${b.text}\n`;
+      if (!t.blank) for (const e of t.content) if (e.type === 'assistant') for (const b of e.message.content) if (b?.type === 'text' && typeof b.text === 'string') text += `${b.text}\n`;
       slots.push({ turn: t, lastPos: t.lastPos, text, promoted: false, voided: false });
       continue;
     }

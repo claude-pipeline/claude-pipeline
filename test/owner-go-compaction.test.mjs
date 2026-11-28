@@ -126,6 +126,48 @@ test('#905 a request chained under a parentless or unresolved half-flagged summa
   }
 });
 
+// #905 round 1 (R1-B1 / R1-F1): a hidden half-flagged summary still ENDS the reply slot before it, in every mode, so a request above it never survives it (the #189 finding-3 rule). Failure caught: the summary
+// becoming a 'skip' / 'mute' turn that opens no slot, so an older request binds a bare "merge" / "extra round" / ruling answer; R1-F1: a tool-only entry chained to the owner's prompt after the summary hid it too.
+test('#905 a request ABOVE a parentless or unresolved half-flagged summary never survives it (merge, extra round, ruling)', () => {
+  for (const [name, parentUuid] of [['no parentUuid at all', undefined], ['parentUuid outside the window', 'u-nowhere']]) {
+    const half = summary(SUMMARY_TEXT, { isCompactSummary: false, parentUuid });
+    const go = { ...promptEntry('go'), uuid: 'u-owner-go' };
+    const later = { ...toolsOnly, parentUuid: 'u-owner-go' }; // R1-F1: an entry of the owner's turn that lands after the summary
+    for (const [shape, tail] of [['summary last', []], ['tool-only entry of the owner turn after it', [later]], ['tool result of the owner turn after it', [later, { ...result('a.txt'), parentUuid: 'u-owner-go' }]]]) {
+      for (const present of [true, false]) {
+        const at = `${name}, ${shape} (present ${present})`;
+        assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [go, said(REQUEST), half, ...tail], { present }), { home: tmp(), now })), `merge: ${at}`);
+        assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [go, said(RASK), half, ...tail], { present }), { home: tmp(), now }), null, `extra round: ${at}`);
+        assert.equal(rule(tmp(), [go, said(ASK_REPLY), half, ...tail], 'R1-F1: accept', { present }), null, `ruling: ${at}`);
+      }
+    }
+  }
+});
+
+// #905 round 1 (R1-B2): a half-flagged summary chained to a parentless unplaced note (which ends visible but bare) is no more known than a parentless one. Failure caught: the bare end vouching for the summary,
+// so a request under it binds. The note's own legacy verdict is unchanged: a request chained to the note itself still binds.
+test('#905 a request under a half-flagged summary chained to a parentless unplaced note binds nothing; the note\'s own request still does', () => {
+  const note = { ...promptEntry('harness note', {}), uuid: 'u-note', parentUuid: null };
+  const half = summary(SUMMARY_TEXT, { isCompactSummary: false, parentUuid: 'u-note' });
+  for (const present of [true, false]) {
+    assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [promptEntry('go'), note, half, said(REQUEST)], { present }), { home: tmp(), now })), `merge (present ${present})`);
+    assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [promptEntry('go'), note, half, said(RASK)], { present }), { home: tmp(), now }), null, `extra round (present ${present})`);
+    assert.equal(rule(tmp(), [promptEntry('go'), note, half, said(ASK_REPLY)], 'R1-F1: accept', { present }), null, `ruling (present ${present})`);
+    const own = recordApproval(hookInput(tmp(), 'merge', [promptEntry('go'), note, said(REQUEST)], { present }), { home: tmp(), now });
+    assert.deepEqual(own?.requests.map((q) => q.pr), [58], `the note's own request is base behaviour (present ${present})`);
+  }
+});
+
+// #905 round 1 (R1-B3): the uuid map spans the whole window, so a half-flagged summary could name the owner's own LATER answer as its parent and turn visible once that answer is written. Failure caught: the answer
+// being the ancestor of the request it approves (a real transcript never links forward). Hook runs after the transcript holds the answer, the case that bound.
+test('#905 a request under a half-flagged summary whose parentUuid is the owner\'s own later answer binds nothing (merge, extra round, ruling)', () => {
+  const answer = { ...OWNER_ENTRY, uuid: 'u-answer' };
+  const half = summary(SUMMARY_TEXT, { isCompactSummary: false, parentUuid: 'u-answer' });
+  assert.ok(approvedNothing(recordApproval(hookInput(tmp(), 'merge', [promptEntry('go'), half, said(REQUEST)], { meta: answer }), { home: tmp(), now })), 'merge');
+  assert.equal(recordRoundGrant(hookInput(tmp(), 'extra round', [promptEntry('go'), half, said(RASK)], { meta: answer }), { home: tmp(), now }), null, 'extra round');
+  assert.equal(rule(tmp(), [promptEntry('go'), half, said(ASK_REPLY)], 'R1-F1: accept', { meta: answer }), null, 'ruling');
+});
+
 // #905 allow side: the walk still binds when it reaches a known turn. Failure caught: the fix failing closed on every non-owner boundary, so a request after a real compaction or under a summary chained to the owner's prompt stops binding.
 test('#905 a request after a real compaction and the owner\'s next typed prompt binds; so does one under a half-flagged summary chained to the owner\'s prompt', () => {
   for (const present of [true, false]) {
