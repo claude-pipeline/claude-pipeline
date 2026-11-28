@@ -329,6 +329,9 @@ const unplacedTurnProvenance = (e) => unplacedProvenance(e) && !bangStdout(e);
 // (a hidden headless run is the case it would let through), and no machine here runs such a client. The readers do not exempt such a file; the owner is asked again after upgrading
 // (promptProvenance's legacy branch for a stored record predates this and is unchanged). Pinned by test/owner-go-visible-turns.test.mjs (#253).
 const unplacedNote = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && !unplacedTurnProvenance(e) && e.isCompactSummary === undefined && e.isVisibleInTranscriptOnly === undefined;
+// #905: a non-owner PLAIN boundary: a prompt entry of unknown source that is neither an unplaced note nor an invisible turn (a half-flagged compaction summary, the #189 boundary). R2-F1: whatever its
+// provenance fields (a set but unknown promptSource / turnOrigin does not make a flagged summary an invisible turn, the invisibleTurn exemption needs both flags undefined).
+const plainBoundary = (e) => isPromptEntry(e) && entrySource(e) === 'unknown' && (e.isCompactSummary !== undefined || e.isVisibleInTranscriptOnly !== undefined);
 const invisibleTurn = (e) => {
   if (!isPromptEntry(e) || visibleSynthetic(e)) return false;
   const source = entrySource(e);
@@ -351,6 +354,10 @@ const invisibleTurn = (e) => {
 // verdict, shared across the calls of one lastReply), so n chained notes cost O(n), not O(n^2).
 // R2-B1 / R3-B1 (#898): a chain that passes through a `!` stdout entry (bangStdout: it carries turnOrigin) must end at a known turn (the owner's typed prompt: entrySource 'owner'), never at the parentless fallback
 // or a plain boundary: the memo keeps { hidden, bare } (bare: the verdict is visible, but the walk did not end at an owner prompt), and every entry of a walk from the stdout entry down to it is hidden when its end is bare. The bare note itself (an ancestor) keeps its verdict.
+// #905: a NON-owner plain boundary (a prompt entry of unknown source that is no unplaced note: e.g. a half-flagged compaction summary, the #189 boundary) is no known turn either, so it no longer ends the walk visible
+// on its own fields: it walks its parentUuid chain like an unplaced note. A string parentUuid that resolves continues to the parent; no string parentUuid, a parent outside the window / unresolved, or a cycle is
+// hidden (fail closed), and so is a parent that does not precede the entry (R1-B3). Only the owner's own prompt (entrySource 'owner') ends the walk as a known turn, so a request under a parentless half-flagged summary binds nothing; the #189 rule that such a summary stays a
+// boundary (a request ABOVE it never survives it) is unchanged: replyOf keeps such a boundary a reply slot in every mode, blank when hidden (nothing under it binds), and a walk that ends bare cuts it like a `!` stdout entry (it is no known turn).
 function invisibleNote(entries, parent, first, memo = new Map()) {
   const path = [];
   const seen = new Set();
@@ -362,13 +369,13 @@ function invisibleNote(entries, parent, first, memo = new Map()) {
     path.push(i);
     seen.add(i);
     if (invisibleTurn(e)) verdict = true;
-    else if (!unplacedNote(e) && !visibleSynthetic(e)) { verdict = false; bare = entrySource(e) !== 'owner'; } // the owner's prompt, or a plain boundary of its own: its own fields said so (R3-B1: only the owner's is a known turn)
-    else if (typeof e.parentUuid !== 'string') { verdict = false; bare = true; }
-    else if (parent[i] < 0 || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, or a cycle
+    else if (entrySource(e) === 'owner') verdict = false; // the owner's own prompt: the one known turn (R3-B1)
+    else if (typeof e.parentUuid !== 'string') { if (unplacedNote(e) || visibleSynthetic(e)) { verdict = false; bare = true; } else verdict = true; } // no chain: only an unplaced note / visibleSynthetic turn keeps the legacy parentless rule; a plain boundary fails closed (#905)
+    else if (parent[i] < 0 || parent[i] >= i || seen.has(parent[i])) verdict = true; // a parent outside the window / unresolved, one that does not PRECEDE the entry (R1-B3: the owner's later answer is no ancestor), or a cycle
     else i = parent[i];
   }
   let cut = -1; // the deepest `!` stdout entry on the path: it and everything chained through it is hidden when the walk ended bare
-  if (bare) path.forEach((i, k) => { if (bangStdout(entries[i])) cut = k; });
+  if (bare) path.forEach((i, k) => { if (bangStdout(entries[i]) || plainBoundary(entries[i])) cut = k; });
   path.forEach((i, k) => memo.set(i, k <= cut ? { hidden: true, bare: false } : { hidden: verdict, bare }));
   return cut >= 0 ? true : verdict;
 }
@@ -526,29 +533,37 @@ function currentPromptEntry(transcriptPath, prompt) {
 // Residual: a process that chains its entries to the owner's prompt on purpose would still be attributed to it; that takes writing the transcript file itself (guard-files refuses a tool write).
 function originsOf(entries) {
   const origin = new Array(entries.length).fill(-1); // entry index -> index of its originating prompt entry (-1: none)
+  const forward = new Array(entries.length).fill(false); // R3-B1: entry index -> its chain was rejected by the order rule (a forward link): unbindable, but what it shows still counts as shown
   const parent = new Array(entries.length).fill(-1); // prompt entry index -> index of the prompt its parentUuid chain resolves to (-1: none; R5-F1)
   const isPrompt = (e) => isPromptEntry(e) && !isHiddenSummary(e);
   if (!entries.some((e) => typeof e?.uuid === 'string')) {
     let latest = -1;
     entries.forEach((e, i) => { if (isPrompt(e)) latest = i; origin[i] = latest; });
-    return { origin, parent };
+    return { origin, parent, forward };
   }
   const at = new Map(); // uuid -> entry index
   const twice = new Set(); // a uuid two entries claim: any chain through it is ambiguous
   entries.forEach((e, i) => { if (typeof e?.uuid === 'string') { if (at.has(e.uuid)) twice.add(e.uuid); else at.set(e.uuid, i); } });
-  const memo = new Map(); // uuid -> origin found from there (-1: none)
-  const resolve = (first) => {
+  const memo = new Map(); // uuid -> origin found from there (-1: none, FORWARD: rejected by the order rule)
+  const FORWARD = -2;
+  // R2-B2: the order rule holds at every hop: a parent must PRECEDE the entry that names it (a transcript never links forward), through non-prompt entries too; a forward link fails closed (-1).
+  // R3-B1: it denies ANCESTRY only: the walk reports FORWARD (-2) for that class (memoised along the path, so an entry chained through a forward-linked one is in it too), which the caller keeps unbindable (-1)
+  // and flags in `forward`; the other unplaceable kinds (no parent, outside the window, a cycle, a duplicate uuid) stay -1 and flagged nowhere.
+  const resolve = (first, child) => {
     const path = [];
     const seen = new Set();
     let id = first;
     let found = -1;
+    let from = child;
     while (typeof id === 'string') {
+      if (at.has(id) && at.get(id) >= from) { if (at.get(id) > from) found = FORWARD; break; } // (an entry naming itself is a cycle, not a forward link)
       if (memo.has(id)) { found = memo.get(id); break; }
       if (seen.has(id) || twice.has(id) || !at.has(id)) break;
       seen.add(id);
       path.push(id);
       const j = at.get(id);
       const n = entries[j];
+      from = j;
       if (isPrompt(n)) { found = j; break; }
       const compaction = isHiddenSummary(n) || (n?.type === 'system' && n.subtype === 'compact_boundary');
       id = typeof n?.parentUuid === 'string' ? n.parentUuid : compaction && typeof n?.logicalParentUuid === 'string' ? n.logicalParentUuid : null;
@@ -557,9 +572,11 @@ function originsOf(entries) {
     return found;
   };
   entries.forEach((e, i) => {
-    if (isPrompt(e)) { origin[i] = i; parent[i] = resolve(e?.parentUuid); } else origin[i] = resolve(e?.parentUuid);
+    const found = resolve(e?.parentUuid, i);
+    const placed = found === FORWARD ? -1 : found;
+    if (isPrompt(e)) { origin[i] = i; parent[i] = placed; } else { origin[i] = placed; forward[i] = found === FORWARD; }
   });
-  return { origin, parent };
+  return { origin, parent, forward };
 }
 
 // #741 (B1b) `liveDb` (the live-database readers only; the ruling reader and every other caller are unchanged): a tool input or result of any OTHER visible turn that shows a live-database block, its binding or apply
@@ -568,23 +585,27 @@ export function lastReply(transcriptPath, { tailBytes = TRANSCRIPT_TAIL_BYTES, p
   return replyOf(tailEntries(transcriptPath, tailBytes).entries, { prompt, skipSynthetic, liveDb });
 }
 function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}) {
-  const { origin, parent } = originsOf(entries);
+  const { origin, parent, forward } = originsOf(entries);
   const verdicts = new Map(); // memoised hidden(i), shared by every chain walk (#246)
   const hidden = (i) => invisibleNote(entries, parent, i, verdicts);
   // The turns, one per prompt entry (a hidden compaction summary is none), each with the entries attributed to it, in transcript order. pos / lastPos: the entry index of its prompt / of its last entry.
   const turns = [];
   const turnAt = new Map(); // prompt entry index -> turn
+  const strays = []; // R3-B1: positions of forward-linked entries (order rule) that show text or an ask: never bound to a turn, but shown to the owner
   entries.forEach((e, i) => {
     const content = e?.message?.content;
     if (e?.type === 'user' && isHiddenSummary(e)) return;
     if (e?.type === 'user' && isPromptEntry(e)) {
       // skip (ruling reader): a turn whose prompt the owner did not type; mute (every other reader): an invisible turn, a boundary whose text is never added (#191 A2); slot: everything else
-      const kind = skipSynthetic ? (entrySource(e) === 'synthetic' || hidden(i) ? 'skip' : 'slot') : hidden(i) ? 'mute' : 'slot';
-      const t = { pos: i, e, kind, content: [], lastPos: i, textPos: -1, shownPos: -1 };
+      // #905: a hidden plain boundary stays a slot (it ends the slot before it, as on the base) but a blank one: nothing printed under it is a request
+      const blank = plainBoundary(e) && hidden(i);
+      const kind = plainBoundary(e) ? 'slot' : skipSynthetic ? (entrySource(e) === 'synthetic' || hidden(i) ? 'skip' : 'slot') : hidden(i) ? 'mute' : 'slot';
+      const t = { pos: i, e, kind, blank, content: [], lastPos: i, textPos: -1, shownPos: -1 };
       turns.push(t);
       turnAt.set(i, t);
     } else if ((e?.type === 'user' || e?.type === 'assistant') && Array.isArray(content)) {
       const t = turnAt.get(origin[i]);
+      if (!t && forward[i] && content.some((b) => (e.type === 'assistant' && b?.type === 'text' && typeof b.text === 'string' && showsText(b.text)) || (b?.type === 'tool_use' && inputSurfacesAsk(b.input)) || (b?.type === 'tool_result' && surfacesAsk(toolResultText(b.content))) || (liveDb && blockSurfaces(b)))) strays.push(i);
       if (t) { // (no turn: an unresolved chain, or text before the window's first prompt: dropped)
         t.content.push(e);
         t.lastPos = i;
@@ -603,7 +624,7 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
     if (t.kind === 'mute') { mutes.push(t.pos); continue; }
     if (t.kind === 'slot') {
       let text = '';
-      for (const e of t.content) if (e.type === 'assistant') for (const b of e.message.content) if (b?.type === 'text' && typeof b.text === 'string') text += `${b.text}\n`;
+      if (!t.blank) for (const e of t.content) if (e.type === 'assistant') for (const b of e.message.content) if (b?.type === 'text' && typeof b.text === 'string') text += `${b.text}\n`;
       slots.push({ turn: t, lastPos: t.lastPos, text, promoted: false, voided: false });
       continue;
     }
@@ -634,13 +655,14 @@ function replyOf(entries, { prompt, skipSynthetic = false, liveDb = false } = {}
   // Only the reply slot right before the owner's prompt: when the newest prompt IS that prompt (and nothing answered it yet), its own (empty) slot is skipped, and that is the ONLY slot that
   // may be. A later prompt plus a text-less assistant turn (tool calls only) leaves the old request stale, and an older request is never revived by a later "merge": the agent shows it again.
   const newest = [...turns].reverse().find((t) => t.kind !== 'skip');
-  const current = newest?.kind === 'slot' && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
+  // R2-B1: a flagged summary (plainBoundary) is never the current submission, whatever its text: a hidden one whose text equals the answer must not hide the request above it. (A legacy typed prompt of unknown source still is one.)
+  const current = newest?.kind === 'slot' && !plainBoundary(newest.e) && newest.content.length === 0 && (prompt === undefined || plain(prompt) === promptTextOf(newest.e));
   const candidates = current ? slots.filter((x) => x.turn !== newest) : slots;
   const last = candidates[candidates.length - 1]; // (none: only text before the window's first prompt, which has no known origin, A3)
   // R2-B1: assistant text of ANY other visible slot after the selected slot's last SHOWN entry was the last thing the owner was shown: the selected request is stale, exactly like a mute.
   // R3-B1: the selected slot's last shown entry is its last assistant text (textPos), not lastPos: a tool-only entry or a tool result of the selected slot shows nothing and must not hide
   // a later request of another slot. #241: a tool block of another visible slot that surfaces an ask (shownPos) counts as shown too, not the selected slot's own. R3-F1: so does a visibleSynthetic skip turn's.
-  const shownAfter = !last || candidates.some((x) => x !== last && x.turn.shownPos > last.turn.textPos) || shownSkips.some((pos) => pos > last.turn.textPos);
+  const shownAfter = !last || candidates.some((x) => x !== last && x.turn.shownPos > last.turn.textPos) || shownSkips.some((pos) => pos > last.turn.textPos) || strays.some((pos) => pos > last.turn.textPos);
   if (!last || last.voided || shownAfter || mutes.some((pos) => pos > last.lastPos)) return { text: '', promoted: false };
   return { text: last.text, promoted: last.promoted };
 }
