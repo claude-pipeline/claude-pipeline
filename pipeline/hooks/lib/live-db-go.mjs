@@ -276,7 +276,8 @@ export function verifyBlock(replyText, { home = accountHome(), io = {} } = {}) {
   for (let i = 0; i < built.length; i++) {
     if (right(got[i]) !== right(built[i])) return fail(`block line ${i + 1} is not what the pipeline builds ("${right(got[i]).slice(0, 80)}")`);
   }
-  return { ok: true, fields: { op, ref, label, name, sqlSha256: sha, head, file, repo, dir, summary, sql } };
+  // `leading`: the lines before the block (a reply may open with prose); `blockLines`: the block's own line count. A caller that needs the text to BE the block (a dialog's question body) requires leading 0.
+  return { ok: true, leading: open - 3, blockLines: got.length, fields: { op, ref, label, name, sqlSha256: sha, head, file, repo, dir, summary, sql } };
 }
 
 // ---- the recorder -------------------------------------------------------------------------------------------------------------------
