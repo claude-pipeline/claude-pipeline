@@ -379,3 +379,4 @@ full record.
 - 2026-11-28 · #933 · A lowered review round limit no longer blocks a PR reviewed under the old one (#923) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 832 runs (335 high)
 - 2026-11-28 · #939 · P cost shows this call's cost next to the PR total (#734) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · blocked · Codex 7d: 839 runs (339 high)
 - 2026-11-28 · #939 · P cost shows this call's cost next to the PR total (#734) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 842 runs (339 high)
+- 2026-11-28 · #953 · Guard: an & in a comment or quoted text no longer makes a script's order unknown (#919) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 847 runs (340 high)
