@@ -376,3 +376,4 @@ full record.
 - 2026-11-28 · #941 · Guard refusal says when the session's working folder is inside the pipeline folder (#874) · risk high · rounds 3 · arbiter 3 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 809 runs (327 high)
 - 2026-11-28 · #949 · Flaky job test waits for its job before cleanup (#183) · risk low · rounds 1 · arbiter 0 · awaiting-owner-merge · Codex 7d: 829 runs (333 high)
 - 2026-11-28 · #940 · CI: the merge queue reuses a passed PR run when the tree is provably identical (CI speed-up PR 3) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 831 runs (334 high)
+- 2026-11-28 · #933 · A lowered review round limit no longer blocks a PR reviewed under the old one (#923) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 832 runs (335 high)
