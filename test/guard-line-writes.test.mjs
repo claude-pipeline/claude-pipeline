@@ -2261,3 +2261,28 @@ test('#965: "$DIR/tool" after an unmodelled command is judged like the literal p
   // refused: a whole-variable program that may be a code runner, or that something else may rebind
   for (const l of ['N=node; launchctl list; "$N" -e 1', 'N=/usr/bin/node; launchctl list; "$N" -e 1', 'N=/tmp/h/tool; launchctl list; read N; "$N" -e 1', 'launchctl list; N=/tmp/h/tool; for N in node; do "$N" -e 1; done', 'launchctl list; "$N" -e 1']) assert.equal(decide(l), 'deny', l);
 });
+
+// #965 review round 1 (R1-B1): the assignment that makes `"$N"` plain must be one that surely ran before the use. Failure caught: `RUN=/opt/helper launchctl list; "$RUN" --version` (the assignment is the
+// environment of launchctl alone; RUN may be node when the line runs) or an assignment after the use, in a branch or a subshell was believed, and the line was allowed to rewrite the startup file.
+test('#965: a whole-variable program is plain only when an assignment-only command surely ran before it, at its level', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  assert.equal(decide('N=/tmp/h/tool; launchctl list; "$N" -e 1'), 'allow'); // (the allowed twin)
+  for (const l of ['RUN=/opt/helper launchctl list; "$RUN" --version', 'launchctl list; "$N" -e 1; N=/tmp/h/tool', 'launchctl list; if true; then N=/tmp/h/tool; fi; "$N" -e 1',
+    'launchctl list; (N=/tmp/h/tool); "$N" -e 1', 'N=/tmp/h/tool; launchctl list; echo ${N::=node}; "$N" -e 1']) assert.equal(decide(l), 'deny', l);
+});
+// R1-B2: the name the variable holds is judged as the command word written out. Failure caught: `AWK=/usr/bin/awk; launchctl list; "$AWK" 'BEGIN { print 1 > "report.txt" }'` (an inline program, which the literal awk is
+// refused for) was allowed because awk is no STEERABLE name, and so was a versioned runner (node22 -e).
+test('#965: a whole-variable program that names a code runner given an inline program stays refused', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['AWK=/usr/bin/awk; launchctl list; "$AWK" \'BEGIN { print 1 > "report.txt" }\'', 'N=/usr/bin/node22; launchctl list; "$N" -e 1']) assert.equal(decide(l), 'deny', l);
+  assert.equal(decide('AWK=/usr/bin/awk; launchctl list; "$AWK" -f prog.awk in.txt'), 'allow'); // twin: awk on a program file is no inline code
+});
+// R1-F1: the command word is found after the keywords a segment starts with, and the variable program is plain only where it is the parsed command word. Failure caught: the install script's call inside an if / loop
+// (`then "$BIN/tool" version`) stayed refused (the word taken was `then`); and a wrapper the parser unwraps (`"$D/setsid" $PROG x.js`) must not be certified by its first word.
+test('#965: "$DIR/tool" after then / do / if / ! is plain too; a wrapper in front of a run-time program is not', () => {
+  const decide = (l) => files(l, fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const l of ['BIN=/tmp/bin; launchctl list; if [ -x "$BIN/tool" ]; then "$BIN/tool" version; fi', 'BIN=/tmp/bin; launchctl list; if "$BIN/tool" version; then :; fi',
+    'BIN=/tmp/bin; launchctl list; for i in 1 2; do "$BIN/tool" version; done', 'BIN=/tmp/bin; launchctl list; ! "$BIN/tool" version']) assert.equal(decide(l), 'allow', l);
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; "$BIN/setsid" $PROG x.js'), 'deny');
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; if true; then "$BIN/setsid" $PROG x.js; fi'), 'deny');
+});
