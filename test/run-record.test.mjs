@@ -99,6 +99,19 @@ test('shape validation: pr, step, outcome, lists', () => {
   }
 });
 
+// #1002: a forged repo/branch that is not text was trusted as ok, and the first reader that printed it (String(record.repo), a template literal) threw.
+test('shape validation: a repo or branch that is present but not a string makes the record invalid; absent ones stay ok', () => {
+  for (const bad of [{ repo: { toString: null } }, { branch: 42 }, { repo: 7 }, { branch: ['x'] }]) {
+    const rec = { ...emptyRecord(ID), ...bad };
+    assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker(rec)}`).status, 'invalid', JSON.stringify(bad));
+  }
+  const old = emptyRecord(ID);
+  delete old.repo;
+  delete old.branch;
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker(old)}`).status, 'ok');
+  assert.equal(decodeRecord(`${MARKERS.summary}\n${rawMarker({ ...old, repo: null, branch: null })}`).status, 'ok');
+});
+
 test('shape validation: a bad task or history entry makes the record invalid, never a throw downstream', () => {
   const ok = { id: 'T1', title: 't', spec: 's', done: false };
   for (const bad of [

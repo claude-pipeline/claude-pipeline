@@ -121,6 +121,9 @@ function shapeProblem(r) {
   if (!isPlainObject(r)) return 'not an object';
   if (!Number.isInteger(r.v) || r.v < 1) return 'bad version';
   if (!Number.isInteger(r.pr) || r.pr <= 0) return 'bad pr';
+  // repo / branch are optional (an old record), but a present one must be text: readers print them.
+  if (r.repo != null && !isStr(r.repo)) return 'bad repo';
+  if (r.branch != null && !isStr(r.branch)) return 'bad branch';
   if (!STEPS.includes(r.step)) return 'unknown step';
   if (r.outcome !== null && !OUTCOMES.includes(r.outcome)) return 'unknown outcome';
   if (!Array.isArray(r.tasks) || !Array.isArray(r.history)) return 'tasks/history are not lists';
