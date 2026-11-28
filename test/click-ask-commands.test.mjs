@@ -535,7 +535,7 @@ test('triage ruling-request --recommend: Reject of an open deferrable ACCEPT is 
   assert.deepEqual(asks(home), []);
 });
 
-test('triage ruling-request --recommend reject|fix-separately: refused for an implemented item, a settled Claude ACCEPT, a round-cap deferral, a second review that says ACCEPT, a malfunction wait; reject allowed (fix-separately refused) for a contradicted scope; the allowed twins', async () => {
+test('triage ruling-request --recommend reject|fix-separately: refused for an implemented item, a settled Claude ACCEPT, a round-cap deferral, a second review that says ACCEPT, a malfunction wait; reject allowed (fix-separately refused) for a contradicted scope; the allowed twins; a serious open deferrable ACCEPT refused fix-separately', async () => {
   // failure caught: Claude's own rating shown as a recommendation for something it must not dismiss (a built fix, a settled ACCEPT, a contrary second review, a malfunction a re-run would clear, a scope the pipeline's evidence contradicts), or refused for what it may
   const waiting = (cause, reason = 'arbiter low confidence') => ({ decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause, reason });
   const CONTRADICTED = 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)';
@@ -560,11 +560,14 @@ test('triage ruling-request --recommend reject|fix-separately: refused for an im
       assert.match(r.output.recommendRefused, re, `${what} / ${why}`);
     }
   }
-  // allowed twins: an open deferrable ACCEPT may get fix-separately AND minor-later (low severity); a BLOCKING one fix-separately (the owner-raised deferral); never reject
+  // allowed twins: an open LOW-severity deferrable ACCEPT may get fix-separately AND minor-later; a BLOCKING one gets neither (#956: the neutral dialog, the owner can still click Follow-up all); never reject
+  // failure caught (#956): Claude putting "Follow-up all (Recommended)" first on a serious (BLOCKING / security) accepted fix, so one click moves it out of the PR
   const low = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'docs', final: DEFERRABLE });
   for (const why of ['fix-separately', 'minor-later']) assert.equal((await askRec(low, '--recommend', 'follow-up', '--why', why)).output.dialogVariant, why === 'minor-later' ? 'ruling-v2-follow-up' : 'ruling-v2-follow-up-any', why);
   const blocking = triageWorld(CHAT(), { final: DEFERRABLE });
-  assert.equal((await askRec(blocking, '--recommend', 'follow-up', '--why', 'fix-separately')).output.dialogVariant, 'ruling-v2-follow-up-any');
+  const refusedAny = (await askRec(blocking, '--recommend', 'follow-up', '--why', 'fix-separately')).output;
+  assert.deepEqual([refusedAny.recommend, refusedAny.dialogVariant], [null, 'ruling-v1']);
+  assert.match(refusedAny.recommendRefused, /not low severity/);
   assert.match((await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused, /not low severity/);
 });
 

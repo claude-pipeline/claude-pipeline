@@ -724,7 +724,7 @@ export function ownerRulingRefusal(item, id, round, decision) {
 //  3. FOLLOW-UP 'minor-later' (the row says the pipeline rates it low): only when EVERY item is low severity (itemSeverity fails closed on BLOCKING, non-allowlisted categories, sensitive paths, same-file
 //     serious items, an unknown diff or config) AND is either an open deferrable ACCEPT or waits for a human with the plain 'low-confidence' cause (never a malfunction, security-dismissal, test-security or unknown one);
 //  4. FOLLOW-UP 'fix-separately' and REJECT (Claude's own rating, no severity claim): only items that wait for a human (any final decision) or, for 'fix-separately', an open deferrable ACCEPT (the owner's
-//     deferral); never an implemented one, one waiting on a malfunction, one a second review says ACCEPT for, a round-cap deferral, or ('fix-separately') one whose same-on-base scope the PR diff contradicted;
+//     deferral) that is LOW severity (#956: the 'minor-later' bar; a serious accepted fix gets the neutral dialog, the owner can still click Follow-up all); never an implemented one, one waiting on a malfunction, one a second review says ACCEPT for, a round-cap deferral, or ('fix-separately') one whose same-on-base scope the PR diff contradicted;
 //  5. anything else (an unknown decision, or a FOLLOW-UP code that is not one of those two) is refused.
 const FOLLOW_UP_CODES = ['minor-later', 'fix-separately'];
 export function rulingRecommendationRefusal(items, decision, ctx = {}, code = undefined) {
@@ -744,6 +744,15 @@ export function rulingRecommendationRefusal(items, decision, ctx = {}, code = un
         return `${item.id} is not waiting for a human decision${decision === 'REJECT' ? '' : ' (and is not an accepted fix the owner raised the deferral of)'}, so Claude's own rating of it is not asked for`;
       }
       if (item.implemented === true) return `${item.id} is already implemented, so a recommendation to ${decision === 'REJECT' ? 'reject' : 'follow up'} (drop or move the built fix) would be wrong`;
+      if (code === 'fix-separately' && !waits) {
+        let severity;
+        try {
+          severity = itemSeverity(item, ctx);
+        } catch (err) {
+          return `severity could not be judged (${asciiLine(err?.message, 120)})`;
+        }
+        if (severity.level !== 'low') return `${item.id} is not low severity (${severity.reasons.map((r) => asciiLine(r, 160)).join('; ')})`;
+      }
       if (waits && MALFUNCTION_CAUSES.includes(needsHumanCause(item))) return `${item.id} waits because of a ${needsHumanCause(item)} malfunction: ${RERUN}`;
       if (item.secondReview?.decision === 'ACCEPT') return `${item.id}: the second review says ACCEPT, so Claude does not recommend dismissing it`;
       // R2-B4 (#954): the writer before the marker stored only the generic security reason when BOTH the blocking-security and the contradicted-scope conditions held, so an arbiter security-dismissal final
