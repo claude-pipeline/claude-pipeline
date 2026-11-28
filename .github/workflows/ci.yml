@@ -23,8 +23,8 @@
 # concurrency group is its own queue ref, which no other run shares, and only pull_request runs ever cancel.
 # The suite runs in full on the queue commit unless a job PROVES it already passed: each matrix job's "Already tested on the PR run?"
 # step (.github/scripts/queue-reuse.mjs, run from the BASE commit's copy, never the PR's own) answers run=false only when the queue
-# holds exactly this one PR, the diff over the base touches no workflow, test runner or proof code (.github/**, scripts/test.mjs,
-# scripts/verify.mjs, scripts/lib/**, package files, .gitattributes, queue-members.mjs, ci-proof.mjs), the newest pull_request run of
+# holds exactly this one PR, the diff over the base touches no workflow, test runner or proof code (PROOF_LOGIC in
+# queue-reuse.mjs: .github/**, the test runner and every pipeline module it or the decider imports, package files, .gitattributes), the newest pull_request run of
 # this workflow on the PR head (latest attempt, green) tested a merge commit (referenced_workflows: refs/pull/N/merge) whose tree
 # equals the queue commit's tree, and that attempt's same-named job and its test step (and the installer round trip on its
 # designated shard) succeeded. The job then still starts and reports success with its test steps skipped, so the aggregates are
