@@ -4,7 +4,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingsBlock, rulingsDigest, rulingsInventory, sameOnBaseRows, validateRulings,
+  applyRulings, fableFindingItems, reviewEligibilityProblems, roundOutcome, rulingRecommendationRefusal, rulingsBlock, rulingsDigest, rulingsInventory, sameOnBaseRows, validateRulings,
 } from '../pipeline/lib/triage.mjs';
 import { rulingsBlockDigest } from '../pipeline/hooks/lib/owner-go.mjs';
 
@@ -231,4 +231,23 @@ test('roundOutcome is untouched by the filing: reachedMax / extraRound / newAcce
   const it = item({ bucket: 'SUGGESTION', category: 'design' });
   const [marked] = apply([it], [rule(it, { scope: undefined })]);
   assert.deepEqual(roundOutcome(stateOf([marked])), roundOutcome(stateOf([{ ...marked, followupIssue: 'https://github.com/a/b/issues/9' }])));
+});
+
+// R1-B1 (#954). Failure caught: a BLOCKING security finding on a line the PR adds, ruled "same on base", stores the generic blocking-security reason, so the dialog could recommend
+// "fix separately" (it was there before) against the pipeline's own evidence, at issue and when the click is applied. The contradiction is its own marker on the final, whatever the reason says.
+test('R1-B1 applyRulings / fableFindingItems: a contradicted same-on-base scope on a BLOCKING security item (both conditions true) refuses fix-separately, though not reject', () => {
+  const added = { globs: GLOBS, files: [entry('pipeline/hooks/a.mjs', { added: [{ line: 4, text: 'x' }] })] };
+  const it = item();
+  const [viaRuling] = apply([it], [rule(it)], { regression: added });
+  const [viaFinding] = findingItems([finding({ line: 4 })], { regression: added });
+  for (const [what, built] of [['applyRulings', viaRuling], ['fableFindingItems', viaFinding]]) {
+    assert.equal(built.final.reason.startsWith('would '), true, `${what}: the generic blocking-security reason is what the owner reads`);
+    const items = [built];
+    assert.match(rulingRecommendationRefusal(items, 'FOLLOW-UP', {}, 'fix-separately') ?? '', /contradicted its "same on base" scope/, `${what}: fix-separately refused`);
+    assert.equal(rulingRecommendationRefusal(items, 'REJECT', {}, undefined), null, `${what}: reject has no scope rule`);
+  }
+  // the control: an item that waits for the same security reason with the scope never contradicted may be recommended fix-separately
+  const plain = item();
+  const [uncontradicted] = apply([plain], [rule(plain, { scope: undefined })]);
+  assert.equal(rulingRecommendationRefusal([uncontradicted], 'FOLLOW-UP', {}, 'fix-separately'), null);
 });

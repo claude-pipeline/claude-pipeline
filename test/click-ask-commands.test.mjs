@@ -544,7 +544,7 @@ test('triage ruling-request --recommend reject|fix-separately: refused for an im
     ['a round-cap deferral', { final: { decision: 'FOLLOW-UP', by: 'claude', needsHuman: false, reason: 'deferred', claude: { ruledAt: 'a', cause: 'round-cap', critical: false } }, roundCapDeferral: { fixHead: 'a', reviewedHead: 'b', at: 'c' } }, /deferred past the round limit/, true],
     ['a second review that says ACCEPT', { final: waiting('low-confidence'), secondReview: { decision: 'ACCEPT', confidence: 'high' } }, /second review says ACCEPT/, true],
     ['a malfunction wait', { final: waiting('model-proof', 'model-proof failed: ruling not provably from Fable') }, /model-proof malfunction/, true],
-    ['a contradicted same-on-base scope (fix-separately only)', { final: waiting('security-dismissal', CONTRADICTED) }, /contradicted its "same on base" scope/, false],
+    ['a contradicted same-on-base scope (fix-separately only)', { final: { ...waiting('security-dismissal', CONTRADICTED), scopeContradicted: true } }, /contradicted its "same on base" scope/, false],
   ];
   for (const [what, over, re, bothCodes] of refusedCases) {
     const s = triageWorld(CHAT(), over);
