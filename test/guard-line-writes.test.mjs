@@ -2233,3 +2233,31 @@ test('#950: a shell option (shopt / setopt / hash / enable) in a called script s
   for (const s of ['setup.sh', 'setup4.sh', 'setup5.sh']) assert.equal(run(`bash ${s}; cp f.sh n.sh`, opt).files.r.decision, 'allow', s);
   assert.equal(run('bash tr.sh; cp f.sh n.sh', { ...SPEC, 'n.sh': 'ok', 'tr.sh': "shopt -s expand_aliases\ntrap 'bash n.sh' EXIT\nlaunchctl kickstart -k x" }).files.r.decision, 'deny'); // twin: a trap still defers
 });
+
+// #965: a program run through a variable DIRECTORY after any command the guard does not model (launchctl, disown, setsid, tmux, at, bg ...). Failure caught: the owner's install script
+// (`launchctl kickstart ...`, then `"$BIN/tool" version`) was refused, "tool refers to a protected pipeline file ...": the `$` in the command word made the home startup file (~/.zshenv of the
+// shell a script would start under) count as rewritable by the unmodelled command before it, so every name on the line became unknown. The literal path was allowed all along.
+// (files policy only: the git policy's refusals of the same script are another issue)
+test('#965: "$DIR/tool" after an unmodelled command is judged like the literal path; a protected DIR, a write to the startup file or to the program stay refused', () => {
+  // (HOME in the environment, as in the hook: the shell's startup file is then the real home's ~/.zshenv, the one an unmodelled command may be taken to rewrite)
+  const decide = (l) => files(typeof l === 'string' ? l : l(BAD_FILES), fakeFs(PROJ, SPEC), { env: { HOME: '/home/u' } }).decision;
+  for (const before of ['launchctl list', 'disown', 'bg', 'at now', 'tmux ls', 'setsid', 'foocmd x']) {
+    for (const prog of ['"$BIN/tool" version', '"$BIN"/tool version', '"${BIN}/tool" version']) {
+      assert.equal(decide(`BIN=/tmp/bin; ${before}; ${prog}`), 'allow', `${before}; ${prog}`);
+    }
+  }
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; /tmp/bin/tool version'), 'allow'); // twin: the literal path
+  // a whole-variable program set once on the script to a path with a literal file name ("$NEW" version): the same
+  for (const set of ['NEW=/tmp/h/tool', 'P=/tmp/h; NEW="$P/x/tool"']) assert.equal(decide(`${set}; "$NEW" version; launchctl list; "$NEW" version`), 'allow', set);
+  // refused: the directory is a protected one
+  assert.equal(decide('BIN=/home/u/.claude/pipeline/bin; launchctl list; "$BIN/tool" version'), 'deny');
+  // refused: the line itself writes the shell startup file / the program before running it (a modelled write, judged on the text it puts there)
+  assert.equal(decide((bad) => `BIN=/tmp/bin; launchctl list; echo '${bad}' >> ~/.zshenv; "$BIN/tool" version`), 'deny');
+  assert.equal(decide((bad) => `BIN=/tmp/bin; launchctl list; echo '${bad}' > "$BIN/tool"; "$BIN/tool" version`), 'deny');
+  // refused: the program name itself is only known at run time (the variable is not just its directory)
+  assert.equal(decide('launchctl list; "$BIN/$TOOL" version'), 'deny');
+  assert.equal(decide('launchctl list; $PROG version'), 'deny');
+  assert.equal(decide('BIN=/tmp/bin; launchctl list; $BIN/tool version'), 'deny'); // (unquoted: the value may split into words)
+  // refused: a whole-variable program that may be a code runner, or that something else may rebind
+  for (const l of ['N=node; launchctl list; "$N" -e 1', 'N=/usr/bin/node; launchctl list; "$N" -e 1', 'N=/tmp/h/tool; launchctl list; read N; "$N" -e 1', 'launchctl list; N=/tmp/h/tool; for N in node; do "$N" -e 1; done', 'launchctl list; "$N" -e 1']) assert.equal(decide(l), 'deny', l);
+});
