@@ -66,8 +66,8 @@ const pastRemedy = (n, pr) => `approve it now: \`P triage round-request --pr ${p
  *  - the PUBLISHED state holds the very same round (n, toHead, contentHashAtToHead) and a LATER counted round (a forward grant turned into a fake
  *    round is always the newest one, so the newest round never qualifies; a round that ran under a higher cap is the exception: it carries no grant, and
  *    it is usually the newest one, which would otherwise leave it with no remedy);
- *  - and EITHER it carries no `ownerGrant` and no `admission` (it ran before grants were recorded; for a state that ran under a higher cap H also one admitted
- *    'normal' with k <= H, or 'auto-extra' with max + 1 < k <= H + 1: it was within the cap it ran under; a round the owner already approved afterwards
+ *  - and EITHER it carries no `ownerGrant` and no `admission` (it ran before grants were recorded; for a state that ran under a higher cap H also one with no admission and k <= H + 1 (its old
+ *    automatic extra), or admitted 'normal' with k <= H, or 'auto-extra' with max + 1 < k <= H + 1: it was within the cap it ran under; a round the owner already approved afterwards
  *    (`ownerGrant.past`) is looked at again the same way, its grant may be gone), OR its `ownerGrant` no longer verifies because the
  *    owner's record is gone or no longer the owner's (`no-record` / `provenance`: the transcripts are cleaned up), which the owner can approve again.
  * Not qualifying, so their refusals keep their text: (a state that never ran under a higher cap) k = max + 1 admitted `normal`, a round recorded `admission: 'owner'` without a grant, any other admission.
@@ -90,7 +90,7 @@ export function pastRoundsNeedingApproval(state, published, { maxRounds, repo, p
       const migrated = r.ownerGrant?.past === true && r.admission === 'owner';
       const underHigher = higher !== null && k > maxRounds && (migrated
         ? k <= higher + 1
-        : r.ownerGrant === undefined && ((r.admission === undefined || r.admission === 'normal') ? k <= higher : r.admission === 'auto-extra' && k > maxRounds + 1 && k <= higher + 1));
+        : r.ownerGrant === undefined && (r.admission === undefined ? k <= higher + 1 : r.admission === 'normal' ? k <= higher : r.admission === 'auto-extra' && k > maxRounds + 1 && k <= higher + 1));
       if ((k <= maxRounds + 1 && !underHigher) || !FULL_SHA.test(String(r.toHead))) continue;
       const p = theirs.find((x) => x?.n === r.n);
       if (p === undefined || p.toHead !== r.toHead || p.contentHashAtToHead !== r.contentHashAtToHead) continue;
@@ -124,6 +124,13 @@ export function verifyOwnerGrants(state, { repo, pr, maxRounds, published, ...op
   const problems = [];
   if (configured && !(Number.isInteger(stateMax) && stateMax >= 1)) {
     problems.push(`the review state records maxRounds ${JSON.stringify(stateMax ?? null)}, not within the configured review.max_rounds (${maxRounds}): the cap cannot be trusted`);
+  }
+  // Both stored caps are read as the higher cap the rounds ran under (higherCapOf bounds them to 1..5): one outside that range is a corrupt or tampered state, not a cap.
+  if (configured && Number.isInteger(stateMax) && stateMax > 5) {
+    problems.push(`the review state records maxRounds ${stateMax}, above the highest review.max_rounds (5): the cap cannot be trusted`);
+  }
+  if (configured && state?.capLoweredFrom !== undefined && !(Number.isInteger(state.capLoweredFrom) && state.capLoweredFrom >= 1 && state.capLoweredFrom <= 5)) {
+    problems.push(`the review state records capLoweredFrom ${JSON.stringify(state.capLoweredFrom)}, not an integer within 1..5: the cap cannot be trusted`);
   }
   const higher = configured && ranUnderHigherCap(state, maxRounds); // the rounds ran under a higher cap than the configured one (#923)
   const granted = [];

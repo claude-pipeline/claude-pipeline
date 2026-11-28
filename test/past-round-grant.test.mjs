@@ -103,6 +103,31 @@ test('pastRoundsNeedingApproval: a state that ran under a higher cap qualifies o
   assert.deepEqual(pastRoundsNeedingApproval(never, never, ctx), []);
 });
 
+test('pastRoundsNeedingApproval: a legacy state (no admission fields) that ran under cap 3 offers its newest round 4, the old automatic extra, for approval (R3-B1)', () => {
+  // failure caught: cap 3 lowered to 2, four rounds without admission; round 4 (the old automatic extra, the newest) is required to carry a grant but is never offered, so the gate refuses it with no remedy
+  const s = { ...build('acme/widgets', [1, 2, 3, 4].map((n) => ({ n }))), maxRounds: 2, capLoweredFrom: 3 };
+  assert.deepEqual(pastRoundsNeedingApproval(s, s, { maxRounds: 2, repo: 'acme/widgets', pr: 7 }).map((x) => x.n), [3, 4]);
+  // control: admitted 'normal' stays bounded by the old cap itself
+  const normal = { ...build('acme/widgets', [1, 2, 3, 4].map((n) => ({ n, admission: 'normal' }))), maxRounds: 2, capLoweredFrom: 3 };
+  assert.deepEqual(pastRoundsNeedingApproval(normal, normal, { maxRounds: 2, repo: 'acme/widgets', pr: 7 }).map((x) => x.n), [3]);
+});
+
+test('verifyOwnerGrants: a stored maxRounds above 5 or a capLoweredFrom outside 1..5 is refused as an untrusted cap (R3-B2)', () => {
+  // failure caught: a tampered state (maxRounds 99, or capLoweredFrom 99) is ignored by higherCapOf, so its rounds are judged against the lowered cap as if nothing were wrong and the cap is silently believed
+  const ctx = { repo: 'acme/widgets', pr: 7, maxRounds: 2 };
+  const base = build('acme/widgets', [1, 2].map((n) => ({ n, admission: n === 1 ? 'normal' : 'auto-extra' })));
+  assert.equal(verifyOwnerGrants({ ...base, maxRounds: 2 }, ctx).ok, true, 'control: an untouched state passes');
+  assert.equal(verifyOwnerGrants({ ...base, maxRounds: 2, capLoweredFrom: 3 }, ctx).ok, true, 'control: a valid capLoweredFrom passes');
+  const high = verifyOwnerGrants({ ...base, maxRounds: 99 }, ctx);
+  assert.equal(high.ok, false);
+  assert.match(high.problems.join('|'), /records maxRounds 99.*the cap cannot be trusted/);
+  for (const bogus of [99, 0, 2.5, '3', null]) {
+    const r = verifyOwnerGrants({ ...base, maxRounds: 2, capLoweredFrom: bogus }, ctx);
+    assert.equal(r.ok, false, `capLoweredFrom ${JSON.stringify(bogus)}`);
+    assert.match(r.problems.join('|'), /capLoweredFrom.*the cap cannot be trusted/);
+  }
+});
+
 test('verifyOwnerGrants: the refusal for a qualifying round names the remedy; others keep their text; never throws', () => {
   const s = build('acme/widgets');
   const r = verifyOwnerGrants(s, { repo: 'acme/widgets', pr: 7, maxRounds: 1 });
