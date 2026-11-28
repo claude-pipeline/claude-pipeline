@@ -1975,7 +1975,7 @@ function arithBodies(s, g, cmds) {
   return out;
 }
 // (Defence in depth for expansionText, which blanks a quoted body for the scans that read it: this one covers the zsh bare-subscript scan and the no-cmds fallback of the [[ scan)
-const quotedBodiesBlank = (s, cmds) => {
+export const quotedBodiesBlank = (s, cmds) => {
   if (!/<</.test(s)) return s;
   const spans = cmds?.heredocSpans;
   if (!Array.isArray(spans)) return s;
@@ -1988,7 +1988,7 @@ const quotedBodiesBlank = (s, cmds) => {
 };
 // The text the subscript, substring and append scans read: what the shell expands. Single-quoted strings, comments and (in double quotes) every word that is no expansion are blanked, so a
 // program text (`node -e "…a[i]=…; s+=…"`) is no assignment; a heredoc body is cut to its expansions (${…}, $[ ], $(( ))). Null from the scanner (`$'…'`, an open quote): the text as written.
-function expandedOnly(s) {
+export function expandedOnly(s) {
   let out = '';
   const blank = (x) => x.replace(/[^\n]/g, ' ');
   const closer = (i, open, close) => { // the end (after the closer) of a balanced `open … close` that starts at i, or the end of the text

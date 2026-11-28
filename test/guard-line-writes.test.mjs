@@ -2126,3 +2126,21 @@ test('#529: a command with `&>` may run in the background: the writes after it m
   allowBoth('bash fg3.sh; cp f.sh n.sh', spec); // nested twin: BASE allow -> CANDIDATE allow
   allowBoth("echo '&>' ; bash fg3.sh; cp f.sh n.sh", spec); // quoted data: BASE allow -> CANDIDATE allow (no frame becomes opaque from text)
 });
+
+// #919: a lone `&` that is text (a comment, single or double quotes, a quoted heredoc body) is no background job. Failure caught: `# a & b` anywhere in a script made its whole
+// frame "opaque", so a LATER write counted for every earlier command (`bash n.sh; cp f.sh n.sh` read as if the copy ran first) and a harmless script was refused.
+test('#919: a `&` in a comment, quotes or a quoted heredoc body does not make the frame opaque; a `&` the shell reads still does', () => {
+  // text only: the script runs before the copy, as written
+  for (const t of ['# a & b\n', "echo 'a & b'\n", 'echo "a & b"\n', "cat <<'X'\na & b\nX\n"]) allowBoth(`${t}bash n.sh; cp f.sh n.sh`);
+  // the real thing keeps the order unknown
+  denyBoth('bash n.sh; cp f.sh n.sh &');
+  denyBoth('bash n.sh; cp f.sh n.sh; (sleep 1) &');
+  denyBoth('bash n.sh; cp f.sh n.sh; { sleep 1; } &');
+  // a `&` inside a substitution stays opaque, also inside double quotes, in backticks, and in an UNQUOTED heredoc
+  denyBoth('echo "$(sleep 1 &)"\nbash n.sh; cp f.sh n.sh');
+  denyBoth('echo "a & $(sleep 1 &)"\nbash n.sh; cp f.sh n.sh');
+  denyBoth('echo `sleep 1 &`\nbash n.sh; cp f.sh n.sh');
+  denyBoth('cat <<X\n$(sleep 1 &)\nX\nbash n.sh; cp f.sh n.sh');
+  // an apostrophe in an unquoted heredoc body must not pair with a later quote and blank the real `&` between them
+  denyBoth("cat <<X\ndon't\nX\nbash n.sh; cp f.sh n.sh; (sleep 1) & echo 'x' &");
+});

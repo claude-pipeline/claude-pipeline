@@ -10,7 +10,7 @@
 // - A write counts for a command when it comes before it on the line (strictly: even a conditional or background one), runs in the same
 //   pipeline, races with a background job, or may repeat before it (a loop).
 // Pure: the policies supply how to expand a word and where a command runs (see newWriteFrame).
-import { commandName } from './shell-parse.mjs';
+import { commandName, withoutLiteralText, quotedBodiesBlank, expandedOnly } from './shell-parse.mjs';
 import { applySed, sedReadings, dynamic } from './sed-emulate.mjs';
 
 // ---- control flow -------------------------------------------------------------------------------------------
@@ -1312,11 +1312,26 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
   } : null;
   const w = writesOf(cmds, { readProgram });
   // Why: a `&` the commands do not show (a trailing one, `( ... ) &`, `{ ...; } &`) makes the whole frame's order unknown (opaque); bgWork: this frame starts something that may outlive it
-  const lone = typeof text === 'string' ? (text.match(/(?<![&|<>])&(?![&>])/g) ?? []).length : 0;
+  const lone = typeof text === 'string' ? (syntaxText(text, cmds).match(/(?<![&|<>])&(?![&>])/g) ?? []).length : 0;
   const seps = cmds.filter((c) => c.sep === '&').length;
   const opaque = lone > seps || cmds.some(startsBackground);
   const bgWork = seps > 0 || opaque || cmds.some((c) => c.maybeBg === true); // (#529: a `&>` span the parser recognised, never the raw text: quoted `&>` data makes no frame opaque)
   return { cmds, recs: w.recs, unmodelled: w.unmodelled, from: flowStart(cmds), i: -1, expand, locate, isAbs, p, ci, driveRel, real, stamp, tick, deferred: hasDeferred(cmds), opaque, bgWork };
+}
+
+// The text the shell reads as command syntax, for the lone-`&` count (#919: a `&` in a comment, quotes or a quoted heredoc body is text, no background job).
+// Fails closed to the text as written: any UNQUOTED heredoc (its body expands, and an apostrophe in it would shift the quote scan), heredoc spans that cannot be placed,
+// or a text the scanner gives up on (`$'…'`, an open quote). Double-quoted text is blanked only when no substitution (`$(`, a backtick) is in the text: inside one, a nested quote could end it early.
+function syntaxText(text, cmds) {
+  let t = text;
+  if (/<</.test(t)) {
+    const spans = cmds.heredocSpans;
+    if (!Array.isArray(spans) || spans.some(([a, b, quoted]) => quoted !== true || !(a >= 0 && a <= b && b <= t.length))) return text;
+    t = quotedBodiesBlank(t, cmds);
+  }
+  const lit = withoutLiteralText(t);
+  if (lit === null) return text;
+  return /\$\(|`/.test(lit) ? lit : expandedOnly(lit);
 }
 
 // commands that start a job which outlives them (a `&` is read from the text)
