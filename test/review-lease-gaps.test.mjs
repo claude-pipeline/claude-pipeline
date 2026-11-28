@@ -155,9 +155,17 @@ test('while a manual install is mid-swap (it holds the install lock, not admissi
   const child = spawn(process.execPath, installArgs(w), { env: childEnv(w, { PIPELINE_INSTALL_SWAP_GATE: w.gate }), stdio: ['ignore', 'pipe', 'pipe'] });
   t.after(() => child.kill());
   let out = '';
+  let err = '';
+  let closed = false;
   child.stdout.on('data', (d) => { out += d; });
-  const exited = new Promise((resolve) => child.on('close', (status) => resolve(status)));
-  await until(() => existsSync(join(w.gate, 'reached')), 'the swap gate');
+  child.stderr.on('data', (d) => { err += d; });
+  const exited = new Promise((resolve) => child.on('close', (status) => { closed = status ?? 'signal'; resolve(status); }));
+  // 60 s, like the installer's own wait for `go`: a slow Windows runner took 29 s for the full install in the sibling test (#914). An installer that exits before the gate fails at once, with what it said.
+  await until(() => {
+    if (existsSync(join(w.gate, 'reached'))) return true;
+    if (closed !== false) assert.fail(`the installer exited (status ${closed}) before reaching the swap gate\nstdout: ${out}\nstderr: ${err}`);
+    return false;
+  }, 'the swap gate', 60_000);
   const started = Date.now();
   const first = await open(w, { waitMs: 5_000 });
   const again = await open(w, { waitMs: 5_000 });

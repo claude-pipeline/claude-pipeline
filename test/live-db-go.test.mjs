@@ -291,6 +291,9 @@ test('a block shown only in a turn a task notice started is no reply: the typed 
   await setup(w);
   const { out, transcript } = goAfter(w, t, goData(dataSql), [notice(), textOf(dataBlock(w).join('\n'))]);
   assert.equal(out?.record, undefined);
+  // Failure caught: the refusal said only "the reply does not end with a block", so Claude re-presented the block in the same kind of turn and was refused again.
+  assert.match(out?.reason ?? '', /only a block in Claude's reply to the owner's own message is read/);
+  assert.match(out.reason, /task notification|background notice|hand-back/i);
   assert.deepEqual(lastReply(transcript, { prompt: goData(dataSql), skipSynthetic: true }), { text: '', promoted: false });
 });
 
