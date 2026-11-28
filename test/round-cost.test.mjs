@@ -9,7 +9,6 @@ import { askSummary, costFrom } from '../pipeline/lib/round-ask.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
 import { decodeRecord, emptyRecord, encodeRecord } from '../pipeline/lib/run-record.mjs';
 import { roundWorld } from './helpers/round-world.mjs';
-import { uniqueSlug } from './helpers/cli-review-world.mjs';
 import { createCommentsGh } from './helpers/fakegh-env.mjs';
 import { renderEvent } from '../pipeline/lib/run-events.mjs';
 
@@ -117,9 +116,8 @@ test('P cost --round: a bad round, or a round with nothing to book, is a usage e
 
 test('round-request: with per-round bookings the summary names the last round\'s cost; the closing line is unchanged', (t) => {
   const cost = { total: totals(23.4, 40), byPhase: { review: totals(18.1, 20) }, byRole: { arbiter: totals(6.2, 5) }, byRound: { '1': totals(8), '2': totals(9.5) }, retries: 0, guardBlocks: null, sessions: [] };
-  const slug = uniqueSlug();
-  const body = `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: slug, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost })}`;
-  const w = roundWorld(t, { slug, comments: [{ id: 77, user: { login: 'me' }, body }] });
+  const body = `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), cost })}`;
+  const w = roundWorld(t, { comments: [{ id: 77, user: { login: 'me' }, body }] });
   const { h2 } = w.atCap();
   const r = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(r, 0, r.stderr + r.stdout);
@@ -131,15 +129,14 @@ test('round-request: with per-round bookings the summary names the last round\'s
 // The ask shows what the run cost: the record's own cost section (an older CLI's bookings) plus the booking comments of `P cost`, replayed, through the command entry.
 test('round-request: the booked cost is the record\'s legacy cost plus the cost-booking comments, and an unreadable booking says so instead of a wrong figure', (t) => {
   const cost = { total: totals(23.4, 40), byPhase: { review: totals(18.1, 20) }, byRole: { arbiter: totals(6.2, 5) }, byRound: { '1': totals(8), '2': totals(9.5) }, retries: 0, guardBlocks: null, sessions: [] };
-  const slug = uniqueSlug();
-  const body = `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: slug, pr: 7, branch: 'feat/x', baseRef: 'main' }), cost })}`;
+  const body = `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo: 'acme/widgets', pr: 7, branch: 'feat/x', baseRef: 'main' }), cost })}`;
   const booking = { id: 78, user: { login: 'me' }, body: renderEvent('cost-booking', 'b-1', 'Cost booked.', { id: 'b-1', entry: { phase: 'review', role: 'judge', input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0.5, round: 2 } }) };
-  const w = roundWorld(t, { slug, comments: [{ id: 77, user: { login: 'me' }, body }, booking] });
+  const w = roundWorld(t, { comments: [{ id: 77, user: { login: 'me' }, body }, booking] });
   w.atCap();
   const r = w.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual([r.json.cost.bookedUsd, r.json.cost.lastRound, r.json.cost.lastRoundUsd], [23.9, 2, 10]);
-  const broken = roundWorld(t, { slug, comments: [{ id: 77, user: { login: 'me' }, body }, { id: 78, user: { login: 'me' }, body: '<!-- claude-pipeline:event:cost-booking:x -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->' }] });
+  const broken = roundWorld(t, { comments: [{ id: 77, user: { login: 'me' }, body }, { id: 78, user: { login: 'me' }, body: '<!-- claude-pipeline:event:cost-booking:x -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->' }] });
   broken.atCap();
   const r2 = broken.cli(['triage', 'round-request', '--pr', '7']);
   assertExit(r2, 0, r2.stderr + r2.stdout);
