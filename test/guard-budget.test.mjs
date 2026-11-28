@@ -549,3 +549,13 @@ test('#951: the same word asked again while the variables stand is charged to th
   const many = rememberExpansions(() => vars, expander(newEvalBudget(), vars));
   assert.throws(() => { for (let i = 0; i < 20; i++) many(`$B/w${i}`); }, GuardLimit);
 });
+
+// R1-S1 (#951): the test above calls rememberExpansions directly, so it stays green when a policy stops wrapping its expander. Failure caught: git-policy or files-policy asking for the same
+// words again and again (four copy loops over a long $HOME-based path) and refusing the script with "variables expand to more text than can be checked". The sizes are the ones where the
+// unmemoised expander runs out of budget and the memoised one does not (found by dropping the wrapper in that policy; the two policies spend the budget differently, hence two sizes).
+test('#951: a script of copy loops over long paths is allowed through evaluateGitCommand and evaluateBashForFiles (each policy wraps its expander)', () => {
+  const script = (n) => ['set -eu', `D="$HOME/${'d'.repeat(n)}"`, 'B="$D/backups"', 'MOD="$D/mods"', 'SUF=before',
+    ...Array.from({ length: 4 }, () => 'for f in a.js b.js c.js d.js e.js; do cp "$MOD/$f" "$B/$f.$SUF"; done')].join('\n') + '\n';
+  assert.equal(git('bash inst.sh /x/wt', gitFs({ 'inst.sh': script(4400) })).decision, 'allow');
+  assert.equal(files('bash inst.sh /x/wt', filesFs({ 'inst.sh': script(1020) })).decision, 'allow');
+});
