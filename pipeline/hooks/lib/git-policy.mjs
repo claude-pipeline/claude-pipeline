@@ -1603,8 +1603,11 @@ function pathRunRefusal(rec, dir, ctx) {
   if (/^\$\{?HOME\}?(?=\/|$)/.test(word)) word = ctx.home + word.replace(/^\$\{?HOME\}?/, '');
   if (DYNAMIC.test(word)) return null; // still only known at run time: as a plain `$X/tool`
   const home = word === '~' || word.startsWith('~/') ? ctx.home + word.slice(1) : word;
-  // (by its spelling: no lookup needed, so an unknown directory does not matter. The spelling is read lexically normalised, so `../node_modules/.bin/x` and `node_modules/.bin/x` count and `./node_modules/../env` does not; a word holding a backslash gets no shortcut, the shell may strip escapes (`\.\.`) and its spelling cannot be trusted)
-  if (!home.includes('\\') && isNodeModulesOrPipelineHome('/' + path.posix.normalize(home))) return null;
+  // (by its spelling: no lookup needed, so an unknown directory does not matter. The word is read lexically normalised, so `../node_modules/.bin/x` and `node_modules/.bin/x` count and `./node_modules/../env` does not.
+  // A word with backslashes has two readings: a Windows path (backslashes as separators, quoted) and the shell's (escapes stripped, `\.\.` is `..`). The first must name the directory; the second must not lose it to a `..`)
+  const spelled = (r) => isNodeModulesOrPipelineHome('/' + path.posix.normalize(r));
+  const asPath = home.replace(/\\/g, '/'), asShell = home.replace(/\\(.)/g, '$1');
+  if (spelled(asPath) && (!isNodeModulesOrPipelineHome('/' + asShell) || spelled(asShell))) return null;
   if (dir === null && !path.isAbsolute(home)) return deny(`cannot tell which directory this runs in, so which ${word0} runs cannot be verified. Use an absolute path, or chain the cd with &&. (A virtualenv or other program after a cd the guard cannot follow: run it from a known directory or by its full path.)`);
   const abs = path.resolve(dir ?? ctx.cwd, home);
   checkDeadline(ctx.budget);
