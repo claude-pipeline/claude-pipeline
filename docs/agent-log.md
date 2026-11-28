@@ -373,3 +373,4 @@ full record.
 - 2026-11-27 · #921 · chore(pipeline): review round limit back to 4 → 3 · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 742 runs (293 high)
 - 2026-11-27 · #925 · Guard: an npm runner's shell text from a setting or from stdin is judged (#903) · risk high · rounds 1 · arbiter 1 · awaiting-owner-merge · Codex 7d: 753 runs (299 high)
 2026-11-28 · #934 · Windows lease test waits long enough; a live-DB go refusal says where to show the block (#914, #916) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 772 runs (308 high)
+- 2026-11-28 · #941 · Guard refusal says when the session's working folder is inside the pipeline folder (#874) · risk high · rounds 3 · arbiter 3 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 809 runs (327 high)
