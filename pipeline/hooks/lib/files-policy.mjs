@@ -4090,8 +4090,8 @@ function findDbRefsWrite(cmds, raw) {
     if (i >= 0) {
       const rest = c.argv.slice(i + 1);
       const at = rest.indexOf('db-refs');
-      // (brace expansion can put a `--help` in argv that the CLI gets as one literal word: a `{` anywhere in the command's text gives no help exception) (#649: pipeline.mjs prints usage and exits for a `--help` / `-h` word before any `--` when the command name comes first, before the command module runs)
-      const helpOnly = at === 0 && !c.raw.includes('{') && rest.slice(1, rest.includes('--') ? rest.indexOf('--') : undefined).some((a) => a === '--help' || a === '-h');
+      // (brace expansion can put a `--help` in argv that the CLI gets as one literal word: a `{` anywhere in the WHOLE line gives no help exception: an eval / watch / tmux text is sub-parsed with its braces already expanded) (#649: pipeline.mjs prints usage and exits for a `--help` / `-h` word before any `--` when the command name comes first, before the command module runs)
+      const helpOnly = at === 0 && !raw.includes('{') && rest.slice(1, rest.includes('--') ? rest.indexOf('--') : undefined).some((a) => a === '--help' || a === '-h');
       if (at >= 0 && rest[at + 1] !== 'show' && !helpOnly) return true;
     } else if (c.raw.includes('\\') && DB_REFS_RAW.test(toPosix(c.raw))) return true;
   }

@@ -182,6 +182,7 @@ test('guard: `pipeline db-refs --help` / `-h` (also after set|remove) is allowed
     `${PIPE} db-refs set x --helpme`,
     `${PIPE} db-refs set x --help-me`,
     `set +B; ${PIPE} db-refs set --ref ${REF} --name {production,--help}`, // brace expansion puts --help in argv; the CLI gets one literal word
+    `set +B; eval "pipeline db-refs set --ref ${REF} --name" {production,--help}`, // eval's joined text is sub-parsed with the braces already expanded: the help exception looks at the whole line (R2-F1)
     `${PIPE} job start x -- ${PIPE} db-refs set x`,
     `${PIPE} db-refs set --ref ${REF} --name x --repo o/r; ${PIPE} db-refs --help`,
   ]) assert.equal(bash(cmd), 'deny', cmd);
