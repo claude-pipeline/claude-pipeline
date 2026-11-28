@@ -192,6 +192,15 @@ test('a queue merge is not re-run: a green merge_group run on the pushed sha ski
   assert.doesNotMatch(r.stdout, /RUN: /);
 });
 
+// Chain PR -> queue -> push (queue-reuse.mjs): a queue job that reused the PR run's proof concludes success with its test steps skipped.
+// Failure caught: path A starts demanding a green test step, so every push after a reused queue run re-runs the whole suite.
+test('a queue job that concluded success with its test steps skipped (a proven reuse) still lets the push skip', async () => {
+  const reused = { name: JOB, conclusion: 'success', steps: [{ name: 'Tests (Node 24, shard 1/2)', conclusion: 'skipped' }, { name: 'Installer round trip (Node 24)', conclusion: 'skipped' }] };
+  const r = await decide({ over: { ...mgRuns(mgRun()), mgJobs: { stdoutJson: { jobs: [reused] } } }, headTree: NO_PR_EVIDENCE });
+  assert.equal(r.output, 'run=false', r.stdout);
+  assert.match(r.stdout, /SKIP: this exact commit already passed this job in the merge queue/);
+});
+
 // Failure caught: the jobs listing is read as one page of 100. A run with many attempts (14 jobs each) lists the later attempts on page 2,
 // the passed job is not found there, and every push to main re-runs the whole suite instead of skipping it.
 test('a passed job that only appears on page 2 of a run jobs listing is found (PR evidence and merge_group evidence)', async () => {
@@ -291,8 +300,10 @@ test('the test jobs open with the skip step, push only, naming their own job (ea
     // Only checkout (and the windows autocrlf setting) may come before it; everything after is gated.
     for (const before of steps.slice(0, at)) assert.match(before, /actions\/checkout@|core\.autocrlf/);
     assert.ok(steps.slice(0, at).some((s) => s.includes('actions/checkout@')), 'the script comes from the checkout');
-    const gated = "github.event_name != 'push' || steps.tested.outputs.run != 'false'";
+    // push skips on the tested-tree answer, merge_group on the queue-reuse answer (ci-workflow.test.mjs pins that half per row)
+    const gated = "(github.event_name != 'push' || steps.tested.outputs.run != 'false') && (github.event_name != 'merge_group' || steps.reused.outputs.run != 'false')";
     for (const after of steps.slice(at + 1)) {
+      if (after.includes('id: reused')) continue; // the merge-queue reuse decider: its own gate (merge_group only)
       // The one exception: the installer round trip runs on one shard row only (which row is pinned against the expanded matrix in
       // ci-workflow.test.mjs), and keeps the skip gate too.
       const installerShard = after.includes('installer-round-trip.sh') && /^ {8}if: matrix\.shard == \d+ && /m.exec(after)?.[0];
@@ -315,7 +326,7 @@ test('each matrix job: JOB_NAME is its own name, its shard row is in the name, a
     assert.match(block, /run: node scripts\/test\.mjs --shard \$\{\{ matrix\.shard \}\}\/\d+$/m);
     const installer = stepsOf(block).filter((st) => st.includes('installer-round-trip.sh'));
     assert.equal(installer.length, 1);
-    assert.match(installer[0], /if: matrix\.shard == \d+ && \(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\)/);
+    assert.match(installer[0], /if: matrix\.shard == \d+ && \(\(github\.event_name != 'push' \|\| steps\.tested\.outputs\.run != 'false'\) && \(github\.event_name != 'merge_group' \|\| steps\.reused\.outputs\.run != 'false'\)\)/);
   }
 });
 
