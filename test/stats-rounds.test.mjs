@@ -317,3 +317,21 @@ test('stats rounds: PR 7 of two repositories is priced from its own cost booking
   assertExit(r, 0, r.stderr + r.stdout);
   assert.deepEqual(r.json.prs.map((p) => [p.repo, p.usd]).sort(), [['acme/other', 12], ['acme/widgets', 5]]);
 });
+
+const bookingOf = (n, id, usd) => mine(n, renderEvent('cost-booking', id, 'Cost booked.', { id, entry: { phase: 'review', role: 'judge', input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd, round: 2 } }));
+
+test('R1-B7 stats rounds: a PR whose bookings cannot be read has no cost and says why (#958)', () => {
+  const broken = mine(5, '<!-- claude-pipeline:event:cost-booking:broken -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->');
+  const r = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(2, triageBody(state7)), bookingOf(3, 'w-1', 5), broken] }], ['--json', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.prs[0].usd, null);
+  assert.match(r.json.warnings.join('\n'), /widgets#7: .*cost.*could not be read/);
+});
+
+test('R1-B6 stats rounds: a comment list cut by the page limit leaves the PR cost out instead of printing a partial total (#958)', () => {
+  const page1 = Array.from({ length: 100 }, (_, i) => mine(i + 1, i === 0 ? triageBody(state7) : i === 1 ? bookingOf(2, 'w-1', 2).body : 'noise'));
+  const r = statsCli([...world.slice(0, 1), { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: page1 }], ['--json', '--pr', '7']);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.prs[0].usd, null, 'the $2 seen is not the PR total');
+  assert.match(r.json.warnings.join('\n'), /widgets#7: the comments were cut after 30 pages/);
+});

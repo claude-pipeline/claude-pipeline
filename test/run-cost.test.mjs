@@ -9,6 +9,7 @@ import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createCommentsGh } from './helpers/fakegh-env.mjs';
 import { MARKERS } from '../pipeline/lib/render.mjs';
+import { renderEvent } from '../pipeline/lib/run-events.mjs';
 import {
   PHASES, effectiveCost, PRICE_TABLE_DATE, ROLES, addCostEntry, deductBookedTranscript, costShapeProblem, listPriceUsd, priceMessage, modelFamily, addRetries, addSessions, costLines, costReport, emptyCost, readGuardLog, setGuardBlocks, usageFromTranscript,
 } from '../pipeline/lib/run-cost.mjs';
@@ -223,7 +224,7 @@ function existing(record, sections = '') {
 // The PR already holds this summary comment (and nothing else): a fresh stateful gh.
 const withComment = (s, comment) => stateful(s, comment ? [comment] : []);
 // What the PR's comments say now: the summary read the way every reader reads it (the record's cost section plus the bookings, replayed) and the record itself.
-const summaryNow = (s) => summaryFromComments(s.fake.comments(), 'me');
+const summaryNow = (s) => summaryFromComments(s.fake.comments(), 'me', PR);
 const written = (s) => {
   const sum = summaryNow(s);
   assert.equal(sum.effectiveCost.unavailable, undefined, 'the cost replays');
@@ -310,6 +311,34 @@ test('P cost: when the answer to the booking is not confirmed, the call is not b
   const neither = scenario();
   stateful(neither).fake.setFail({ write: true, list: true });
   assert.equal(book1(neither).json.outcome, 'unknown');
+});
+
+// gh exits 0 with an empty answer to a POST that landed: the unusable answer is an unknown outcome (looked up by id), not "not booked" (a retry would book a hand-entered amount twice).
+test('R1-B1 P cost: a POST whose answer is empty is looked up by its id, not reported as not booked (#958)', () => {
+  const s = scenario();
+  stateful(s).fake.setFail({ emptyAnswer: true });
+  const r = book1(s);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.deepEqual([r.json.recorded, r.json.confirmed, r.json.cost.total.usd], [true, true, 2]);
+  assert.equal(bookingComments(s).length, 1, 'booked once');
+});
+
+// A summary the viewer wrote on another PR (copied by hand) brings no cost: a record write rejects it, so the total shown before and after must agree.
+test('R1-B2 summaryFromComments: a record bound to another PR is no cost base (#958)', () => {
+  const other = existing({ ...rec(), pr: PR - 1, cost: addCostEntry(emptyCost(), entry({ usd: 40 })) });
+  const booking = { id: 9, user: { login: 'me' }, body: renderEvent('cost-booking', 'b-1', 'Cost booked.', { id: 'b-1', entry: entry({ usd: 2 }) }) };
+  const sum = summaryFromComments([other, booking], 'me', PR);
+  assert.equal(sum.effectiveCost.cost.total.usd, 2, 'only the booking, not the other PR\'s $40');
+  assert.equal(summaryFromComments([existing({ ...rec(), cost: addCostEntry(emptyCost(), entry({ usd: 40 })) }), booking], 'me', PR).effectiveCost.cost.total.usd, 42, 'a record of this PR still counts');
+});
+
+// The summary puts a new session into the record's cost section; 20+ older sessions booked by P cost replay after it and must not push it out.
+test('R1-B8 effectiveCost: a session the record holds survives 20 older sessions booked after it (#958)', () => {
+  const base = addSessions(emptyCost(), ['new']);
+  const bookings = Array.from({ length: 20 }, (_, i) => ({ id: `b-${i}`, data: { id: `b-${i}`, sessions: [`old-${i}`] } }));
+  const eff = effectiveCost({ base, bookings });
+  assert.ok(eff.cost.sessions.includes('new'), eff.cost.sessions.join(','));
+  assert.equal(eff.cost.sessions.length, 20);
 });
 
 test('P cost --pr <an issue, not a PR>: refused before anything is posted (#958)', () => {
@@ -655,6 +684,16 @@ test('P summary: the per-session guard denies are recorded and reported', () => 
   const absent = scenario();
   withComment(absent, existing(withCost({ entry: entry(), sessions: ['s1'] })));
   assert.equal(summary(absent, [], { PIPELINE_GUARD_LOG_FILE: join(tmp(), 'nope.jsonl') }).json.cost.guardBySession, null);
+});
+
+test('R1-F2 P summary: an unreadable cost booking is a warning, not a silent cost: null (#958)', () => {
+  const s = scenario();
+  withComment(s, existing(withCost({ entry: entry(), sessions: ['s1'] })));
+  s.fake.addComment({ body: '<!-- claude-pipeline:event:cost-booking:broken -->\n\nx\n\n<!-- claude-pipeline:event-data:AAAA -->' });
+  const r = summary(s, [], { PIPELINE_GUARD_LOG_FILE: join(tmp(), 'nope.jsonl') });
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.cost, null);
+  assert.match(r.json.warnings.join('\n'), /the booked cost is unavailable: a cost booking could not be read/);
 });
 
 // ---- per-version prices (fable floor + prices, A5) -----------------------------------------------------------------

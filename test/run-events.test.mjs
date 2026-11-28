@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { createGitHub } from '../pipeline/lib/github.mjs';
-import { EVENT_KINDS, parseEvent, postEvent, readCostBookings, readResumedEvidence, renderEvent } from '../pipeline/lib/run-events.mjs';
+import { EVENT_KINDS, costBookingProblem, parseEvent, postEvent, readCostBookings, readResumedEvidence, renderEvent } from '../pipeline/lib/run-events.mjs';
 import { createFakeGh, REPO_VIEW } from './helpers/fakegh-env.mjs';
 
 const REPO = { match: '^repo view', stdoutJson: REPO_VIEW };
@@ -112,4 +112,14 @@ test('readCostBookings: another author\'s booking and a quoted marker are ignore
   assert.equal(corrupt.length, 2);
   assert.match(corrupt.join('\n'), /comment 6: the payload is invalid/);
   assert.match(corrupt.join('\n'), /comment 7: .*session id/);
+});
+
+// The validator promises a payload that passes can never fail in a replay: a round the cost readers reject (ten digits) or an entry that is no object (counted as a zero-dollar call) must not pass.
+test('R1-B4 costBookingProblem: a round no reader accepts and an entry that is not an object are refused (#958)', () => {
+  const entry = { phase: 'build', role: 'judge', input: 1, output: 0, cacheRead: 0, cacheWrite: 0, usd: 1 };
+  assert.equal(costBookingProblem({ id: 'b-1', entry }), null);
+  assert.equal(costBookingProblem({ id: 'b-1', entry: { ...entry, round: 999_999_999 } }), null);
+  assert.notEqual(costBookingProblem({ id: 'b-1', entry: { ...entry, round: 1_000_000_000 } }), null);
+  assert.notEqual(costBookingProblem({ id: 'b-1', entry: null }), null);
+  assert.notEqual(costBookingProblem({ id: 'b-1', entry: 'x' }), null);
 });
