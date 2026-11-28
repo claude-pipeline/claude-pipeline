@@ -2155,6 +2155,7 @@ test('#919: a `&` in a comment, quotes or a quoted heredoc body does not make th
   // R1-F1: quoted text fed to a shell through an output process substitution (`>(sh)`, zsh `=(…)`) can run, like a pipe
   denyBoth("echo 'sleep 1 &' > >(sh)\nbash n.sh; cp f.sh n.sh");
   denyBoth("echo 'sleep 1 &' > =(sh)\nbash n.sh; cp f.sh n.sh");
+  allowBoth("files=(a b)\necho 'a & b'\nbash n.sh; cp f.sh n.sh"); // an array assignment is no process substitution
   // R1-B1: a `#` inside a word (`Issue\\ #42`, a continued line, `${x/ #/}`) is no comment: the real trailing `&` after it still counts
   denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh Issue\\ #42 &");
   denyBoth("echo 'x'\nbash n.sh; cp f.sh n.sh; bash r.sh a\\\n#b &");

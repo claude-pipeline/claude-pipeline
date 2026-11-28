@@ -1328,7 +1328,7 @@ export function newWriteFrame(cmds, { expand, locate, isAbs, p, ci = false, driv
 const DATA_CMDS = new Set(['echo', 'printf', 'cat', 'true', 'false', ':']); // (print their words; they run nothing)
 // Can no command run the quoted text? Not when it is piped or captured (`echo 'x &' | sh`, `$(…)`), given to a command that may run its words or its heredoc (`bash -c`, `eval`, `for c in 'x &'`), or defined in a function.
 function quotedIsData(text, cmds) {
-  if (/<<<|[<>=]\(|\$\(|`/.test(text) || (cmds.fns instanceof Set && cmds.fns.size > 0) || cmds.some((c) => c.sep === '|')) return false;
+  if (/<<<|[<>]\(|(?:^|[\s<>|;&(])=\(|\$\(|`/.test(text) || (cmds.fns instanceof Set && cmds.fns.size > 0) || cmds.some((c) => c.sep === '|')) return false;
   return cmds.every((c) => DATA_CMDS.has(commandName(c.argv[0] ?? '')) || !(/<</.test(c.raw ?? '') || [...c.argv.slice(1), ...Object.values(c.env ?? {})].some((w) => String(w).includes('&'))));
 }
 function syntaxText(text, cmds) {
