@@ -306,7 +306,7 @@ test('P checkpoint: a legacy $40 record under a renamed repository (move not reg
   assertExit(checkpoint(s), 0);
   const none = summaryFromComments(s.fake.comments(), 'me', PR, { repo: 'acme/widgets', moves: [] });
   assert.equal(none.effectiveCost.any, false, 'not proven this repository\'s: not counted');
-  assert.equal(none.record.heldCost[0].cost.total.usd, 40, 'but still stored in the written record');
+  assert.equal(none.record.heldCost.cost.total.usd, 40, 'but still stored in the written record');
   const move = { from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
   const after = summaryFromComments(s.fake.comments(), 'me', PR, { repo: 'acme/widgets', moves: [move] });
   assert.equal(after.effectiveCost.cost.total.usd, 40, 'the move is registered: counted again');
@@ -330,7 +330,7 @@ test('P checkpoint: A -> B -> C with neither move registered keeps one balance p
   assert.deepEqual(none.record.heldCost.map((h) => [h.repo, h.cost.total.usd]), [['a/widgets', 40], ['b/widgets', 10]], 'two balances, each under its own repository');
   const second = read([bToC]);
   assert.equal(second.effectiveCost.cost.total.usd, 10, 'B -> C registered: the $10 is ours');
-  assert.deepEqual(second.record.heldCost.map((h) => h.repo), ['a/widgets'], 'the $40 stays held');
+  assert.equal(second.record.heldCost.repo, 'a/widgets', 'the $40 stays held');
   const both = read([aToB, bToC]);
   assert.equal(both.effectiveCost.cost.total.usd, 50, 'both registered: all of it');
   assert.equal(both.record.heldCost, undefined);
@@ -351,7 +351,7 @@ test('summaryFromComments: a malformed byPrice in the held or the own cost leave
     assert.doesNotThrow(() => { sum = summaryFromComments([comment], 'me', PR, { repo: 'acme/widgets', moves: [move] }); }, what);
     assert.ok(sum.effectiveCost.unavailable, `${what}: cost unavailable`);
     assert.equal(sum.record.cost.total.usd, 10, `${what}: own balance stored`);
-    assert.equal(sum.record.heldCost.cost.total.usd, 40, `${what}: held balance stored (a record read back as written)`);
+    assert.equal(sum.record.heldCost.cost.total.usd, 40, `${what}: held balance stored`);
   }
 });
 

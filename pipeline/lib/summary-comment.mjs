@@ -31,8 +31,9 @@ export function recordBelongs(record, { pr, repo, moves } = {}) {
 // What the record's cost is bound to: a record not provably this PR's (another repository, a rename not registered, an unreadable moves file) COUNTS for nothing, and the record this returns does not carry that cost as `cost` (the writers
 // adopt a record whose only mismatch is the repo and would then count it under the live name) but in `heldCost`, a LIST of balances { repo, at, cost }, each bound to the repository and the heartbeat time it was written under (never merged
 // with another: a balance keeps the binding it can be proven by), written back untouched and never counted. A balance provably ours later (the move registered, the file readable again) is merged back into `cost`, each on its own proof.
-// A legacy single `heldCost` object is read as a list of one; it is always written as a list. A cost section that cannot be added up (a malformed byPrice) leaves every balance as stored and the cost unavailable (`base: false` reads as an unreadable cost section): never a throw.
+// The older single-object `heldCost` is read as a list of one. A cost section that cannot be added up (a malformed byPrice) leaves every balance as stored and the cost unavailable (`base: false` reads as an unreadable cost section): never a throw.
 // -> { record?: the record to return in place of the decoded one, ours, base: the cost to count }
+const pack = (list) => (list.length === 1 ? list[0] : list); // one balance is stored as the plain { repo, at, cost } object, several as a list
 export function heldBack(decoded, { pr, repo, moves }) {
   if (decoded.status !== 'ok') return { ours: false };
   const r = decoded.record;
@@ -45,14 +46,14 @@ export function heldBack(decoded, { pr, repo, moves }) {
       const { heldCost, ...rest } = r;
       const cost = [...back.map((h) => h.cost), ...(r.cost ? [r.cost] : [])].reduce((sum, c) => mergeCost(sum, c), emptyCost()); // every cost goes in on the added side: that is where a bad key throws
       const kept = held.filter((h) => !back.includes(h));
-      return { record: { ...rest, cost, ...(kept.length ? { heldCost: kept } : {}) }, ours, base: cost };
+      return { record: { ...rest, cost, ...(kept.length ? { heldCost: pack(kept) } : {}) }, ours, base: cost };
     } catch {
       return { ours, base: false };
     }
   }
   if (ours || !r.cost) return { ours, base: ours ? r.cost : undefined };
   const { cost, ...rest } = r;
-  return { record: { ...rest, heldCost: [...held, { repo: r.repo, at: r.heartbeat?.at, cost }] }, ours };
+  return { record: { ...rest, heldCost: pack([...held, { repo: r.repo, at: r.heartbeat?.at, cost }]) }, ours };
 }
 
 // The newest summary comment the viewer wrote that STARTS with the marker: the same one upsertComment edits.
