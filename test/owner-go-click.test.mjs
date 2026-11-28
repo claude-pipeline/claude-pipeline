@@ -588,8 +588,14 @@ test('clickProvenance: a record whose kind differs from the clicked ask is not t
 const RULING_IDS = ['R1-B1', 'R2-S3'];
 const ROW_ACCEPT = rulingWhyRow('accept', 'real-problem');
 const ROW_FOLLOW = rulingWhyRow('follow-up', 'minor-later');
-const rulingV2 = (variant, row = variant === 'ruling-v2-accept' ? ROW_ACCEPT : ROW_FOLLOW) => rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line: rulingRequestWithRow(row, 58, RULING_IDS, REPO, 'c0ffee000000'), variant });
-const V2_LABELS = { 'ruling-v2-accept': ['Accept all (Recommended)', 'Follow-up all', 'Reject all'], 'ruling-v2-follow-up': ['Follow-up all (Recommended)', 'Accept all', 'Reject all'] };
+const ROW_ANY = rulingWhyRow('follow-up', 'fix-separately');
+const ROW_REJECT = rulingWhyRow('reject', 'not-a-bug');
+const DEFAULT_ROW = { 'ruling-v2-accept': ROW_ACCEPT, 'ruling-v2-follow-up': ROW_FOLLOW, 'ruling-v2-follow-up-any': ROW_ANY, 'ruling-v2-reject': ROW_REJECT };
+const rulingV2 = (variant, row = DEFAULT_ROW[variant]) => rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line: rulingRequestWithRow(row, 58, RULING_IDS, REPO, 'c0ffee000000'), variant });
+const V2_LABELS = {
+  'ruling-v2-accept': ['Accept all (Recommended)', 'Follow-up all', 'Reject all'], 'ruling-v2-follow-up': ['Follow-up all (Recommended)', 'Accept all', 'Reject all'],
+  'ruling-v2-follow-up-any': ['Follow-up all (Recommended)', 'Accept all', 'Reject all'], 'ruling-v2-reject': ['Reject all (Recommended)', 'Accept all', 'Follow-up all'],
+};
 const legacyLabel = (l) => l.replace(' (Recommended)', '');
 
 test('a click on each deciding label of a v2 ruling ask records the same ruling as the same choice in a v1 ask (the v2 record only adds ask.variant); Not now declines', async (t) => {
@@ -629,6 +635,14 @@ test('a forged v2 ruling ask is refused: a tampered action map, another variant\
   assert.equal(invalid(acc, { v: 2, variant: 'ruling-v2-follow-up' }).ok, false, 'accept dialog under the follow-up id');
   assert.equal(invalid(rulingV2('ruling-v2-follow-up'), { v: 2, variant: 'ruling-v2-accept' }).ok, false, 'follow-up dialog under the accept id');
   assert.equal(invalid(acc, { v: 1 }).ok, false, 'a v2 dialog as a legacy ask');
+  const rej = rulingV2('ruling-v2-reject');
+  assert.equal(invalid(rej, { v: 2, variant: 'ruling-v2-reject' }).ok, true, 'the recommended-Reject ask reads');
+  assert.equal(invalid(rej, { v: 2, variant: 'ruling-v2-accept' }).ok, false, 'a reject dialog under the accept id');
+  assert.equal(invalid(rej, { v: 2, variant: 'ruling-v2-follow-up-any' }).ok, false, 'a reject dialog under the any-severity follow-up id');
+  assert.equal(invalid(acc, { v: 2, variant: 'ruling-v2-reject' }).ok, false, 'an accept dialog under the reject id');
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up-any'), { v: 2, variant: 'ruling-v2-follow-up-any' }).ok, true, 'the any-severity follow-up ask reads');
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up-any'), { v: 2, variant: 'ruling-v2-follow-up' }).ok, false, 'a fix-separately dialog under the low-severity follow-up id');
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up'), { v: 2, variant: 'ruling-v2-follow-up-any' }).ok, false, 'a minor-later dialog under the any-severity follow-up id');
   assert.equal(invalid(rulingParts(), { v: 2, variant: 'ruling-v2-accept' }).ok, false, 'the legacy dialog under a v2 id');
   assert.equal(invalid(rulingParts(), { v: 1, variant: 'ruling-v2-accept' }).ok, false, 'v 1 carries no variant key');
   assert.equal(invalid(rulingParts(), { v: 2, variant: 'ruling-v1' }).ok, false, 'the legacy id is never written');
@@ -654,4 +668,16 @@ test('a v2 ruling ask whose recommendation row is not installed text is invalid;
   assert.equal(invalid(rulingV2('ruling-v2-accept', 'R1-B1 · SUGGESTION · a note'), 'ruling-v2-accept'), false, 'a v2 ask with no row');
   const v1 = rulingAsk({ repo: REPO, pr: 58, ids: RULING_IDS, line: rulingRequestWithRow(ROW_ACCEPT, 58, RULING_IDS, REPO, 'c0ffee000000') });
   assert.equal(invalid(v1), false, 'a v1 ask carrying a row');
+  // cp #944: the row is checked per VARIANT. A claim made under another variant's id is an unknown dialog (the owner-ruling recheck keys on the id, so a row under the wrong id would dodge it)
+  assert.equal(invalid(rulingV2('ruling-v2-reject'), 'ruling-v2-reject'), true);
+  for (const code of ['already-handled', 'no-user-impact']) assert.equal(invalid(rulingV2('ruling-v2-reject', rulingWhyRow('reject', code)), 'ruling-v2-reject'), true, `any installed reject code reads: ${code}`);
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up-any'), 'ruling-v2-follow-up-any'), true);
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up-any', ROW_FOLLOW), 'ruling-v2-follow-up-any'), false, 'a minor-later row (the pipeline rates it low) under the any-severity id');
+  assert.equal(invalid(rulingV2('ruling-v2-follow-up', ROW_ANY), 'ruling-v2-follow-up'), false, 'a fix-separately row under the low-severity follow-up id');
+  assert.equal(invalid(rulingV2('ruling-v2-reject', ROW_ACCEPT), 'ruling-v2-reject'), false, 'an accept row under the reject id');
+  assert.equal(invalid(rulingV2('ruling-v2-reject', ROW_ANY), 'ruling-v2-reject'), false, 'a follow-up row under the reject id');
+  assert.equal(invalid(rulingV2('ruling-v2-reject', ROW_FOLLOW), 'ruling-v2-reject'), false, 'a minor-later row under the reject id');
+  assert.equal(invalid(rulingV2('ruling-v2-accept', ROW_REJECT), 'ruling-v2-accept'), false, 'a reject row under the accept id');
+  assert.equal(invalid(rulingV2('ruling-v2-reject', 'Claude recommends Reject all (when asked): trust me.'), 'ruling-v2-reject'), false, 'free prose under the reject id');
+  assert.equal(invalid(rulingV2('ruling-v2-reject', `${ROW_REJECT}!`), 'ruling-v2-reject'), false, 'an edited reject row');
 });

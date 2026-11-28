@@ -29,15 +29,21 @@ export function forgeAsk({ kind, repo, prs, header, title, block, options, actio
 
 // A world: a temp home, an issued ask and a transcript holding the fixture's entries rewritten to the ask's dialog and `answer` (default: the approving label). `tamper(dialog)` returns the dialog the
 // transcript shows instead of the issued one; `mutate({ prompt, use, result })` edits the entries (a metadata case); `fixture` picks the spike transcript; `write: false` leaves the transcript with
-// the prompt and the tool_use only (poll tests append the result themselves).
-export function world(t, { parts = mergeParts(), answer = null, fixture = 'genuine-click', build = OLDEST, tamper = null, mutate = null, hookLayersSha256 = null, issueBeforeUseMs = 10000, write = true, forge = false } = {}) {
-  const home = mkdtempSync(join(tmpdir(), 'owner-go-click-'));
+// the prompt and the tool_use only (poll tests append the result themselves). `issuedAsk` ({ home, askId, questions }, cp #944): the ask a command already issued (e.g. `ruling-request --ask`) in that home;
+// `parts` is then only the dialog's label -> answer map, nothing is issued here, and the transcript's entries are moved to just after the ask's own issue time.
+export function world(t, { parts = mergeParts(), answer = null, fixture = 'genuine-click', build = OLDEST, tamper = null, mutate = null, hookLayersSha256 = null, issueBeforeUseMs = 10000, write = true, forge = false, issuedAsk = null } = {}) {
+  const home = issuedAsk === null ? mkdtempSync(join(tmpdir(), 'owner-go-click-')) : issuedAsk.home;
   const entries = loadFixture(fixture, build);
   const [prompt, use, result] = entries;
+  if (issuedAsk !== null) {
+    const issuedMs = Date.parse(JSON.parse(readFileSync(join(asksDir(home), `${issuedAsk.askId}.json`), 'utf8')).issuedAt);
+    const shift = issuedMs + issueBeforeUseMs - Date.parse(use.timestamp);
+    for (const e of entries) e.timestamp = new Date(Date.parse(e.timestamp) + shift).toISOString();
+  }
   // a recording the script made by keys or a hook was answered in under 2 s: move the answer to 30 s so that the 2 s floor is never what a case proves (mutate may still set its own time)
   if (Date.parse(result.timestamp) - Date.parse(use.timestamp) < MIN_ANSWER_MS) result.timestamp = new Date(Date.parse(use.timestamp) + 30000).toISOString();
   const issuedAt = Date.parse(use.timestamp) - issueBeforeUseMs;
-  const issued = forge ? forgeAsk({ ...parts, ...(forge === true ? {} : forge), hookLayersSha256, home, issuedAt }) : issueAsk({ ...parts, hookLayersSha256, home, now: () => issuedAt });
+  const issued = issuedAsk !== null ? { askId: issuedAsk.askId, questions: issuedAsk.questions } : forge ? forgeAsk({ ...parts, ...(forge === true ? {} : forge), hookLayersSha256, home, issuedAt }) : issueAsk({ ...parts, hookLayersSha256, home, now: () => issuedAt });
   assert.ok(issued.askId, `issue failed: ${JSON.stringify(issued)}`);
   const dialog = tamper ? tamper(structuredClone(issued.questions[0])) : issued.questions[0];
   const chosen = answer ?? Object.keys(parts.actions).find((l) => parts.actions[l] !== null);
