@@ -171,6 +171,21 @@ test('guard: an agent line running `pipeline db-refs set|remove|server` is refus
   for (const cmd of [`${PIPE} db-refs show`, `${PIPE} preflight`, 'git commit -m "pipeline db-refs set"']) assert.equal(bash(cmd), 'allow', cmd);
 });
 
+// #649: pipeline.mjs answers `--help` / `-h` anywhere before a `--` with the usage text and exits before the command module runs, so `db-refs --help` changes nothing. Failure caught: the owner and the agent
+// cannot read the db-refs usage ("changes which databases count as live"). Only a help word the CLI itself would see counts: the command name must come first, the word must be exactly --help / -h, and not after `--`.
+test('guard: `pipeline db-refs --help` / `-h` (also after set|remove) is allowed; the same commands without it, or with it after `--` or misspelt, stay refused', () => {
+  for (const cmd of [`${PIPE} db-refs --help`, `${PIPE} db-refs -h`, `${PIPE} db-refs set x --help`, `${PIPE} db-refs remove --ref ${REF} -h`]) assert.equal(bash(cmd), 'allow', cmd);
+  for (const cmd of [
+    `${PIPE} db-refs set x`,
+    `${PIPE} db-refs remove x`,
+    `${PIPE} db-refs set x -- --help`,
+    `${PIPE} db-refs set x --helpme`,
+    `${PIPE} db-refs set x --help-me`,
+    `${PIPE} job start x -- ${PIPE} db-refs set x`,
+    `${PIPE} db-refs set --ref ${REF} --name x --repo o/r; ${PIPE} db-refs --help`,
+  ]) assert.equal(bash(cmd), 'deny', cmd);
+});
+
 // #683: the registry writer library gets the recorders' run / import protection. Catches: an agent running `node -e "import('…/db-refs.mjs')…writeDbRefs(…)"` and
 // rewriting which databases count as live, while the same shapes for live-db-go.mjs are already refused.
 const WLIB = '/home/u/.claude/pipeline/hooks/lib/db-refs.mjs';

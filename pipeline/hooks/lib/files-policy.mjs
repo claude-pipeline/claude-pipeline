@@ -4080,7 +4080,9 @@ function findDbRefsWrite(cmds, raw) {
     if (i >= 0) {
       const rest = c.argv.slice(i + 1);
       const at = rest.indexOf('db-refs');
-      if (at >= 0 && rest[at + 1] !== 'show') return true;
+      // (#649: pipeline.mjs prints usage and exits for a `--help` / `-h` word before any `--` when the command name comes first, before the command module runs)
+      const helpOnly = at === 0 && rest.slice(1, rest.includes('--') ? rest.indexOf('--') : undefined).some((a) => a === '--help' || a === '-h');
+      if (at >= 0 && rest[at + 1] !== 'show' && !helpOnly) return true;
     } else if (c.raw.includes('\\') && DB_REFS_RAW.test(toPosix(c.raw))) return true;
   }
   return !!cmds.truncated && DB_REFS_RAW.test(toPosix(raw));
