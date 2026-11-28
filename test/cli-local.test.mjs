@@ -575,6 +575,10 @@ test('job: GH_REPO in the runner\'s environment names the target of a merge star
   // GH_REPO does not stop a command that is no merge
   const started = cli(repo.dir, ['job', 'start', 'ok', '--', 'node', '-e', '0'], { ...ENV, GH_REPO: 'o/chat' });
   assertExit(started, 0, started.stdout);
+  // wait for the detached runner, or it is still writing .review/jobs/ok when cleanup removes the repo (ENOTEMPTY / EPERM)
+  const waited = cli(repo.dir, ['job', 'wait', 'ok', '--timeout', '30']);
+  assertExit(waited, 0, waited.stdout);
+  assert.equal(waited.json.state, 'done');
 });
 
 test('job: a command the git guard denies is refused and no job directory is created', (t) => {
