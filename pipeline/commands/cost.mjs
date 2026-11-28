@@ -9,6 +9,8 @@ import { EXIT, UsageError, intOption, parseCommandArgs, requireOption } from '..
 import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { createRunRecorder } from '../lib/run-progress.mjs';
+import { LockTimeoutError, withLock } from '../lib/locks.mjs';
+import { repoLockKey } from '../lib/review-context.mjs';
 import { PRICE_TABLE_DATE, costReport, modelFamily, normalisePhase, normaliseRole, priceMessage, usageFromTranscript } from '../lib/run-cost.mjs';
 
 export const meta = {
@@ -16,7 +18,7 @@ export const meta = {
   usage: [
     'pipeline cost --pr N --phase plan|build|verify|pr|review|gate|merge|... --role implementer|judge|arbiter|substitute-opus|substitute-fable|plan-review|plan-codex|verifier|controller|other',
     '              [--input N] [--output N] [--cache-read N] [--cache-write N] [--usd X | --model M] [--from-transcript FILE] [--round R] [--retry] [--session ID]... [--repo DIR]',
-    '  -> {ok, recorded, skipped?, call, cost, warnings}; `call` = what THIS call added to the record ({usd, input, output, cacheRead, cacheWrite, phase, role, round?}, after the transcript dedupe: a transcript booked before books only what it gained since, unless --usd is given: then every call books the full tokens and USD); null when nothing was booked (an empty-transcript skip, a retry/session-only call, a failed record). `cost` = the PR total so far (every call booked for the PR), never one call: read a call\'s own figure from `call`. Exit 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
+    '  -> {ok, recorded, skipped?, call, cost, warnings}; `call` = what THIS call added to the record ({usd, input, output, cacheRead, cacheWrite, phase, role, round?}, after the transcript dedupe: a transcript booked before books only what it gained since, unless --usd is given: then every call books the full tokens and USD); null when nothing was booked (an empty-transcript skip, a retry/session-only call, a failed record). `cost` = the PR total so far (every call booked for the PR), never one call: read a call\'s own figure from `call`. Exit 1 when nothing was booked (the record could not be written, or another booking holds the cost lock of this PR for 30 s: run the same command again), 2 usage (a negative or non-numeric amount, a --round that is not a whole number >= 1 or comes without an amount), 3 GitHub unavailable',
     '  An unknown --role is booked as `other`, an unknown --phase as `other`. --from-transcript FILE: sum the message.usage of a Claude transcript (JSONL, at most 50 MB; a file that is not there yet is looked for 5 times over ~2 s, and a half-written last line is skipped; a transcript with no usable messages gives a warning, and when no --input/--output/--cache-*/--usd came with it NOTHING is booked for that call (no entry, no retry; `recorded` false, `skipped: "empty-transcript"`; `--session` is still recorded): run the same command again in a few seconds);',
     '  explicit --input/--output/--cache-* then add to it. --retry alone (no amounts) only counts a retry.',
     '  --phase plan books a plan review (before the PR exists, like build calls): --role plan-review (a Fable/Opus/Sonnet plan reviewer, priced from its transcript) or plan-codex (a hand-run Codex plan review: tokens only, no USD unless --usd); `P summary` shows plan ahead of build.',
@@ -64,6 +66,11 @@ export function bookedCall(before, after, entry) {
     phase: entry.phase, role: entry.role, ...(entry.round !== undefined ? { round: entry.round } : {}),
   };
 }
+
+// One lock per repository and PR around the booking's read -> PATCH: GitHub has no conditional edit, so two bookings on one machine that both read before either wrote
+// would build on the same base and the later PATCH would erase the earlier one. Same-host only: a Mac and a PC booking one PR at once are not covered.
+const COST_LOCK_WAIT_MS = 30 * 1000;
+export const costLockName = (root, pr) => `cost-${createHash('sha256').update(repoLockKey(root)).digest('hex').slice(0, 12)}-pr${pr}`;
 
 export const run = guarded(async (argv, ctx) => {
   const { values } = parseCommandArgs(argv, {
@@ -146,9 +153,19 @@ export const run = guarded(async (argv, ctx) => {
     return { exitCode: EXIT.OK, output: { ok: true, recorded: false, skipped: 'empty-transcript', bucketed: false, call: null, cost: null, warnings: notes } };
   }
   const gh = createGitHub({ cwd: root, env: ctx.env });
-  return guardGh(() => {
+  return guardGh(async () => {
     const recorder = createRunRecorder({ gh, pr });
-    const record = recorder.update(patch);
+    const env = ctx.env ?? process.env;
+    const wait = Number(env.PIPELINE_LOCK_WAIT_MS);
+    const waitMs = wait > 0 ? wait : COST_LOCK_WAIT_MS;
+    let record;
+    try {
+      record = await withLock(costLockName(root, pr), () => recorder.update(patch), { dir: env.PIPELINE_LOCK_DIR || undefined, waitMs });
+    } catch (err) {
+      if (!(err instanceof LockTimeoutError)) throw err;
+      // never book without the lock: nothing was written, so re-running the same command is safe
+      return { exitCode: EXIT.FAILED, output: { ok: false, recorded: false, bucketed: false, call: null, cost: null, warnings: [...notes, `another booking for this PR holds the cost lock (waited ${waitMs} ms); nothing was booked: run this same command again`] } };
+    }
     const ok = record !== null;
     return {
       exitCode: ok ? EXIT.OK : EXIT.FAILED,
