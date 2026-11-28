@@ -6,7 +6,7 @@
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { git, GitError, NETWORK_TIMEOUT_MS } from './git.mjs';
+import { git, GitError, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { pipelineStateDir } from './repo.mjs';
 import { withLock } from './locks.mjs';
 import { agentLogLine } from './render.mjs';
@@ -175,7 +175,9 @@ const isRaceFailure = (err) => err instanceof GitError && /rejected|non-fast-for
 // (`agent-log publish` exit 3 on a one-second blip left the run's line queued and the summary step stalled). A remote that is not a repository, a rejected push or a hook refusal are not blips.
 const NET_RETRIES = 2;
 const NET_BACKOFF_MS = [1000, 3000];
-const isNetworkBlip = (err) => err instanceof GitError && !/does not appear to be a git repository|permission denied|authentication failed|rejected|non-fast-forward/i.test(err.stderr ?? '')
+// Only a call that talks to the remote can blip: a local call that timed out (a stuck child, #964) is not retried, or the queue lock would be held for three timeouts.
+const REMOTE_VERBS = new Set(['ls-remote', 'fetch', 'push']);
+const isNetworkBlip = (err) => err instanceof GitError && REMOTE_VERBS.has(err.args?.[0]) && !/does not appear to be a git repository|permission denied|authentication failed|rejected|non-fast-forward/i.test(err.stderr ?? '')
   && /could not resolve host|temporary failure in name resolution|network is unreachable|connection (?:timed out|reset|refused|closed)|operation timed out|timed out|early eof|remote end hung up|rpc failed|unable to access|ssl|tls|returned error: 5\d\d/i.test(err.stderr ?? '');
 const sleepSync = (ms) => { try { Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms); } catch { /* no wait available: the retry still happens */ } };
 const REMOTE_LOG_REF = `refs/remotes/${REMOTE}/${AGENT_LOG_BRANCH}`;
@@ -253,7 +255,10 @@ function commitFile({ root, g, rel, text, parent, message, anonymous = false }) 
       if (anonymous) throw new Error('fixed identity'); // a public (scan-listed) repository never gets the configured name and email
       g(['var', 'GIT_AUTHOR_IDENT'], root);
       g(['var', 'GIT_COMMITTER_IDENT'], root);
-    } catch { ident = FALLBACK_IDENT; } // no user.name / user.email configured (a CI box), or `anonymous`
+    } catch (err) {
+      if (err instanceof GitError && err.abnormal) throw err; // a timed-out lookup says nothing about the identity: never publish under the fallback for it
+      ident = FALLBACK_IDENT; // no user.name / user.email configured (a CI box), or `anonymous`
+    }
     return gitIn(g, root, ['-c', 'commit.gpgsign=false', 'commit-tree', tree, ...(parent ? ['-p', parent] : []), '-m', message], { env: ident }).trim();
   } finally {
     rmSync(dir, { recursive: true, force: true, maxRetries: 3 });
@@ -273,7 +278,8 @@ function gitIn(g, cwd, args, { env, input } = {}) {
  * -> { commit, pushed, lines } (`lines`: the ones actually appended). Throws on a git failure; the caller keeps its lines queued.
  */
 export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, sleepFn = sleepSync, anonymous = false }) {
-  const g = (args, cwd = root, timeoutMs, extra = {}) => gitFn(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}), ...extra });
+  // Every call is bounded (a local one by LOCAL_TIMEOUT_MS): this runs under the queue lock, which a hung child would hold forever (#964).
+  const g = (args, cwd = root, timeoutMs = LOCAL_TIMEOUT_MS, extra = {}) => gitFn(args, { cwd, timeoutMs, ...extra });
   const clean = lines.map(assertSingleLine);
   let lastErr;
   let blips = 0;
@@ -314,8 +320,8 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, 
 // itself failed (no network), the cached log branch is stale evidence: it is read only with `trustCachedBranch` (a closer reasoning
 // over what it can see), never to drop queued lines.
 export function originLogLines(root, { logFile, defaultBranch, fetch = false, trustCachedBranch = true }) {
-  const o = { cwd: root };
-  const g = (args, cwd = root, timeoutMs) => git(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}) });
+  const o = { cwd: root, timeoutMs: LOCAL_TIMEOUT_MS }; // `close` calls this under the queue lock: bounded like publishLines (#964)
+  const g = (args, cwd = root, timeoutMs = LOCAL_TIMEOUT_MS) => git(args, { cwd, timeoutMs });
   let refreshed = false;
   let branchRefreshed = true;
   let branchExists = true;

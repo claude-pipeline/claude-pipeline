@@ -377,7 +377,8 @@ test('I: a helper named from the script\'s own directory (or by names the line s
 test('J: an unknown psql line is refused only with protected text around, also when a startup file cannot be followed', () => {
   const env = { env: { HOME: '/home/u', ZDOTDIR: '/home/u' } };
   const spec = { '/home/u/.zshenv': 'source "$(echo x)"\n' }; // (a sourced file that cannot be followed: every name is unknown)
-  const run = (cmd) => files(cmd, fakeFs(PROJ, spec, DIRS), env);
+  // a clock that stands still (as in guard-budget.test.mjs): a busy machine must not trip the 10 s wall cap and turn an allow into a deny (#952); the allowance asserted below is counted work
+  const run = (cmd) => files(cmd, fakeFs(PROJ, spec, DIRS), { ...env, now: () => 5 });
   for (const sql of ["select ':x'", 'select \'{"a":null}\'::jsonb', "insert into t values ('{\"k\":\"v\"}')"]) {
     assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}"`).decision, 'allow', sql);
     assert.equal(run(`psql -c "${sql.replaceAll('"', '\\"')}; select '/home/u/.claude/settings.json'"`).decision, 'deny', `${sql} + protected`);

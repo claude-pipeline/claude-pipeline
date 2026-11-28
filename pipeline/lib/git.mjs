@@ -17,6 +17,8 @@ import { MAX_BLOCKS, SearchCap, checkSelection, committedBlock, isMarkerLine, ma
 
 // Upper bound for a git call that talks to a remote (fetch, push, ls-remote): a hung one inside a lock cannot be reclaimed.
 export const NETWORK_TIMEOUT_MS = 120_000;
+// Upper bound for a local plumbing call that runs while a lock is held (hash-object, write-tree, rev-parse, ...): a stuck child must not hold the lock forever (#964).
+export const LOCAL_TIMEOUT_MS = 30_000;
 
 // `abnormal: true` = the child did not finish on its own (timed out, killed by a signal, or its output went past the buffer limit): its
 // `code` is not git's answer (a SIGKILLed git reports 1, git's own "no match"), so a catch that maps a code to an answer must test it.
