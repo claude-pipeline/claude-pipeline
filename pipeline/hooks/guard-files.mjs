@@ -68,7 +68,7 @@ async function main() {
       : evaluateFileTool({ ...input, cwd }, opts);
     if (verdict?.decision === 'deny') {
       deny(verdict.reason);
-      if (isShell) await recordDeny(input, verdict.reason);
+      if (isShell) await recordDeny(input, verdict.logReason ?? verdict.reason); // the unhinted text: a working-folder name must not recode the logged reason (#874)
     }
     else if (verdict?.decision !== 'allow') throw new TypeError('the policy returned no decision');
   } catch (err) {

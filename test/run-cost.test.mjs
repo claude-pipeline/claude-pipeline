@@ -233,6 +233,9 @@ test('P cost: books an entry into a fresh record, then adds to it', () => {
   assertExit(r2, 0);
   assert.deepEqual([r2.json.cost.total.input, r2.json.cost.total.usd, r2.json.cost.retries], [101, 0.5, 1]);
   assert.ok(r2.json.cost.byRole.other, 'unknown role -> other');
+  // `cost` is the PR total, `call` only this call: a reader of the second booking must not take 0.5 for its cost
+  assert.deepEqual(r.json.call, { usd: 0.4, input: 100, output: 50, cacheRead: 7, cacheWrite: 3, phase: 'build', role: 'implementer' });
+  assert.deepEqual(r2.json.call, { usd: 0.1, input: 1, output: 0, cacheRead: 0, cacheWrite: 0, phase: 'review', role: 'other' });
   assert.equal(written(s).cost.byPhase.review.input, 1);
 });
 
@@ -297,6 +300,7 @@ test('P cost --from-transcript: an empty transcript with no hand amounts books n
   assert.equal(first.json.ok, true);
   assert.equal(first.json.recorded, false);
   assert.equal(first.json.skipped, 'empty-transcript');
+  assert.equal(first.json.call, null, 'nothing booked: no call figure');
   assert.match(first.json.warnings.join('\n'), /nothing was booked; run this same command again in a few seconds/);
   assert.equal(s.fake.calls().length, before, 'no GitHub read or write when there is nothing to book');
   s.repo.write('.review/t.jsonl', `${JSON.stringify({ message: { id: 'm', usage: { input_tokens: 10, output_tokens: 20 } } })}\n`);
@@ -304,6 +308,7 @@ test('P cost --from-transcript: an empty transcript with no hand amounts books n
   assertExit(second, 0);
   assert.equal(second.json.recorded, true);
   assert.equal(second.json.skipped, undefined);
+  assert.deepEqual([second.json.call.input, second.json.call.output, second.json.call.round], [10, 20, 1]);
   assert.deepEqual([second.json.cost.total.calls, second.json.cost.retries, second.json.cost.byRound['1'].calls], [1, 1, 1]);
   assert.ok(written(s).cost.transcripts, 'the transcript key is booked only by the real booking');
 });
@@ -337,6 +342,9 @@ test('P cost --from-transcript: booking a continued agent\'s transcript again bo
   s.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5));
   const second = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl', '--output', '1']);
   assertExit(second, 0);
+  assert.deepEqual([first.json.call.input, first.json.call.output], [10, 20]);
+  assert.deepEqual([second.json.call.input, second.json.call.output, second.json.call.cacheRead, second.json.call.cacheWrite], [5, 11, 15, 20], 'call = what the transcript gained since (plus the hand output), not the whole transcript');
+  assert.ok(second.json.call.usd > 0 && second.json.call.usd < second.json.cost.total.usd, 'call usd is the gained part, the PR total is larger');
   const t = second.json.cost.total;
   assert.deepEqual([t.input, t.output, t.cacheRead, t.cacheWrite, t.calls], [15, 31, 45, 60, 2], 'the whole transcript once, plus the hand output');
   assert.equal(t.usd, (() => { const sc = scenario(); sc.repo.write('.review/agent-a1.jsonl', msg('m1', 10) + msg('m2', 5)); return costCli(sc, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']).json.cost.total.usd; })(), 'USD too');
@@ -344,6 +352,42 @@ test('P cost --from-transcript: booking a continued agent\'s transcript again bo
   withComment(s, existing(written(s)));
   const third = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-a1.jsonl']);
   assert.deepEqual([third.json.cost.total.input, third.json.cost.total.output], [15, 31]);
+});
+
+// R1-B1 / R2-B1 (#939): a booking that lands between this call's first look at the record and its write used to be erased by the write (A $2 under B $3 left $2) while the report said the total was right.
+// The record is now built on the writer's fresh read, so the total keeps both and `call` is this call's own amount. Two DIFFERENT amounts: identical ones hide an overwrite.
+test('P cost: a booking that landed before this call\'s write stays in the total, and call is this call\'s own amount', () => {
+  const s = scenario();
+  const other = costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '20', '--usd', '2']); // the booking the other run made
+  assertExit(other, 0);
+  const booked = existing(written(s));
+  // The fake counts matching calls over the whole log (the run above included), so the listing sequence is padded past them.
+  const earlier = s.fake.calls().filter((c) => /issues\/12\/comments --paginate/.test(c.argv.join(' '))).length;
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [PATCH_77, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }, { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [...Array(earlier).fill([]), [booked]] }] }));
+  const mine = costCli(s, ['--phase', 'review', '--role', 'judge', '--input', '30', '--usd', '3']);
+  assertExit(mine, 0);
+  assert.equal(mine.json.recorded, true);
+  assert.deepEqual([mine.json.cost.total.usd, mine.json.cost.total.input, mine.json.cost.total.calls], [5, 50, 2], 'the PR total keeps both bookings');
+  assert.deepEqual([mine.json.call.usd, mine.json.call.input], [3, 30], 'call is this call\'s own amount, not the total');
+  assert.deepEqual([written(s).cost.total.usd, written(s).cost.total.calls], [5, 2], 'and so does the written comment');
+  assert.deepEqual(mine.json.warnings, []);
+});
+
+// R2-B1: the transcript dedupe runs on the base the patch is applied to, so a transcript the other booking already took books nothing again.
+test('P cost: a transcript another booking took in the meantime books nothing again (call is zero, total is the transcript once)', () => {
+  const s = scenario();
+  s.repo.write('.review/agent-r1.jsonl', `${JSON.stringify({ message: { id: 'm1', model: 'claude-sonnet-4-5', usage: { input_tokens: 10, output_tokens: 20, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 } } })}\n`);
+  const args = ['--phase', 'build', '--role', 'implementer', '--from-transcript', '.review/agent-r1.jsonl'];
+  const first = costCli(s, args);
+  assertExit(first, 0);
+  const booked = existing(written(s));
+  const earlier = s.fake.calls().filter((c) => /issues\/12\/comments --paginate/.test(c.argv.join(' '))).length;
+  s.fake.setScript(ghEntries({ prHead: s.head, extra: [PATCH_77, { match: '^pr view 12 --json title', stdoutJson: { title: 'T' } }, { match: 'repos/acme/widgets/issues/12/comments --paginate', stdoutJsonSeq: [...Array(earlier).fill([]), [booked]] }] }));
+  const again = costCli(s, args);
+  assertExit(again, 0);
+  assert.equal(first.json.call.input, 10);
+  assert.deepEqual([again.json.call.input, again.json.call.usd], [0, 0]);
+  assert.equal(again.json.cost.total.input, 10, 'the PR total is the transcript once');
 });
 
 // R4-B1: two overlapping bookings of one growing transcript: the one that read the smaller snapshot finished last and lowered the ledger, so the next booking of the larger transcript re-booked the difference.

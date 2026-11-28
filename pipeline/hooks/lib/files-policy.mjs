@@ -27,7 +27,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, rememberExpansions, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
 
 const posix = path.posix;
@@ -5126,8 +5126,23 @@ let evalNesting = 0;
 export const evaluateBashForFiles = (command, opts = {}) => {
   const nested = evalNesting > 0;
   evalNesting++;
-  try { return evaluateBashForFilesChecked(command, nested && opts.shell !== 'bash' ? { ...opts, shell: 'bash' } : opts); } finally { evalNesting--; }
+  let verdict;
+  try { verdict = evaluateBashForFilesChecked(command, nested && opts.shell !== 'bash' ? { ...opts, shell: 'bash' } : opts); } finally { evalNesting--; }
+  return nested ? verdict : withCwdHint(verdict, opts);
 };
+// #874: wording only. When the session's own working folder (the hook's cwd, not a `cd` target and not merely a folder above a protected one) is inside a protected
+// pipeline folder, a refusal of a line may be caused by that (a relative or bare command resolves under it), and the reason alone ("<name> refers to a protected pipeline file ...")
+// does not say so. The one place that sees every verdict of the outermost call adds the possible cause and the fix; the decision and the original reason are untouched. The hint
+// cannot tell which refusals depend on the folder, so it says that a command naming a protected file itself stays refused from any folder. `logReason` keeps the unhinted text: the
+// guard log classifies on it, so a folder name holding "plugin" or "force" cannot recode the denial.
+function withCwdHint(verdict, opts) {
+  if (verdict?.decision !== 'deny') return verdict;
+  try {
+    const ctx = makeCtx(opts);
+    if (!ctx.hit(ctx.cwd)) return verdict;
+    return { ...verdict, logReason: verdict.reason, reason: `${verdict.reason} (This session's working folder (${ctx.cwd}) is itself inside the protected pipeline folder, so many commands there are refused: if this refusal comes from the folder, run a Bash call that is only \`cd <your worktree>\` first, then retry. A command that itself names a protected file stays refused from any folder.)` };
+  } catch { return verdict; }
+}
 // The same text judged again with other options (a cwd assumed, writes only): what the tool's shell reads is unchanged, so `opts.shell` stays as the caller has it (the outermost call's tool shell, or
 // 'bash' already inside a nested one). Every nested call this makes still goes through evaluateBashForFiles and is forced to Bash.
 function evaluateSameText(command, opts) {
@@ -5331,11 +5346,11 @@ function evaluateBashForFilesFrame(command, opts) {
   const startUnknownAll = ctx.unknownAll === true;
   const frame = newWriteFrame(cmds, {
     text: raw,
-    expand: (w) => {
+    expand: rememberExpansions(() => ctx.vars, (w) => {
       if (/^~[^/\\]/.test(w)) return null; // Why: ~+ / ~- / ~user are not the home directory (expandRefs would read `~+/n.sh` as /home/u+/n.sh): the place is only known at run time
       const e = expandRefs(w, ctx);
       return /[$`*?[{]/.test(e) || (e.startsWith('~') && !isAbs(e)) ? null : e;
-    },
+    }),
     locate: (e, idx) => (isAbs(e) ? [pathsFor().normalize(e)] : dirs.map((d) => pathsFor().join(d, e))),
     isAbs, p: pathsFor(), ci: ctx.ci, driveRel: drivePaths,
     real: (q) => realResolve(q, ctx.api),

@@ -18,7 +18,7 @@ const FD_NAME_WORD = /^\{([A-Za-z_]\w*)(?:\[.*\])?\}$/s; // (s: a subscript may 
 // continuations are removed, as the shell removes them before it reads the word (`{a\<newline>['0']}>f`, R24-F1))
 const FD_SUB_RAW = /^\{[A-Za-z_]\w*\[.*\]\}$/s;
 const MAX_NEST = 200; // in-place nesting of $( ), ( ), <( ) before we give up on the line
-const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
+export const MAX_WORK = 8_000_000; // total characters lexed across all recursive parses
 const HARD_MAX_DEPTH = 50;
 const ASSIGN_RE = /^([A-Za-z_][A-Za-z0-9_]*)\+?=/;
 // the counter (ctx.ctl) each construct kind of ctlOpen raises: in a loop, a function body, an if / case branch
@@ -1979,7 +1979,7 @@ function arithBodies(s, g, cmds) {
   return out;
 }
 // (Defence in depth for expansionText, which blanks a quoted body for the scans that read it: this one covers the zsh bare-subscript scan and the no-cmds fallback of the [[ scan)
-const quotedBodiesBlank = (s, cmds) => {
+export const quotedBodiesBlank = (s, cmds) => {
   if (!/<</.test(s)) return s;
   const spans = cmds?.heredocSpans;
   if (!Array.isArray(spans)) return s;
@@ -1992,7 +1992,7 @@ const quotedBodiesBlank = (s, cmds) => {
 };
 // The text the subscript, substring and append scans read: what the shell expands. Single-quoted strings, comments and (in double quotes) every word that is no expansion are blanked, so a
 // program text (`node -e "…a[i]=…; s+=…"`) is no assignment; a heredoc body is cut to its expansions (${…}, $[ ], $(( ))). Null from the scanner (`$'…'`, an open quote): the text as written.
-function expandedOnly(s) {
+export function expandedOnly(s) {
   let out = '';
   const blank = (x) => x.replace(/[^\n]/g, ' ');
   const closer = (i, open, close) => { // the end (after the closer) of a balanced `open … close` that starts at i, or the end of the text
@@ -3346,7 +3346,7 @@ class Parser {
       if (isSpace(c)) this.i++;
       else if (c === '\n') { this.nlCheck(); this.i++; if (this.hd.length) this.readHeredocs(); this.lineStart = this.i; } // (#269 R24-B1)
       else if (c === '\\' && s[this.i + 1] === '\n') this.i += 2;
-      else if (c === '#') { while (this.i < n && s[this.i] !== '\n') this.i++; }
+      else if (c === '#') { const from = this.i; while (this.i < n && s[this.i] !== '\n') this.i++; if (this.comments) this.comments.push([from, this.i]); }
       else break;
     }
   }
@@ -4197,7 +4197,7 @@ function newCtx(maxDepth, expired, bashState) {
 
 // The text with every comment the lexer skips blanked out (newlines kept), from a lexing pass that interprets nothing (muted); null when that pass did not
 // read the whole text (a limit, an error): the caller keeps the text as it is.
-function withoutComments(src, maxDepth, expired) {
+export function withoutComments(src, maxDepth, expired) {
   const ctx = newCtx(Math.min(Math.max(maxDepth, 0), HARD_MAX_DEPTH), expired, null);
   ctx.muted = 1;
   const p = new Parser(ctx, src);
@@ -4236,6 +4236,8 @@ export function simpleCommands(str, opts) {
     try { parser?.drain(true); } catch { /* best effort */ }
   }
   Object.defineProperty(ctx.out, 'truncated', { value: ctx.truncated, enumerable: false });
+  // work: the characters this parse lexed in all (the budget MAX_WORK caps); a test reads it to prove a retry is charged without timing the run
+  Object.defineProperty(ctx.out, 'work', { value: ctx.work, enumerable: false });
   // refused: with `truncated`, the form the parser refuses to read (a ${ cmd; } or similar; #269 R17-F3), so the guard can name it; null otherwise
   Object.defineProperty(ctx.out, 'refused', { value: ctx.refused, enumerable: false });
   // undecidable: a heredoc whose end the shells read differently (see readHeredocs); truncated is set with it, so a caller that refuses a cut-short parse refuses this one too, and one that wants the cause can ask

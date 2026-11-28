@@ -6,6 +6,7 @@ import { tmpdir } from 'node:os';
 import { basename, dirname, join } from 'node:path';
 import { createHash, randomUUID } from 'node:crypto';
 import { git as realGit } from '../pipeline/lib/git.mjs';
+import { release, tryAcquire } from '../pipeline/lib/locks.mjs';
 import { execFileSync, spawn, spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
@@ -13,6 +14,7 @@ import { OWNER_ENTRY, linesOf } from './helpers/owner-go.mjs';
 import { runOwnerCli, seedRegistry } from './helpers/db-refs-owner.mjs';
 import { buildBlock, liveDbGoOutcome, sha256Of } from '../pipeline/hooks/lib/live-db-go.mjs';
 import { LIVE_DB_CONSUMED_REL, claimLiveDbGo, evaluateSupabaseMcp, isSupabaseTool } from '../pipeline/hooks/lib/live-db-guard.mjs';
+import { readDbRefs } from '../pipeline/hooks/lib/db-refs.mjs';
 import { buildCatalogQuery } from '../pipeline/hooks/lib/live-db-catalog.mjs';
 import { evaluateBashForFiles, evaluateFileTool } from '../pipeline/hooks/lib/files-policy.mjs';
 import { HOOK_CLOCK } from '../pipeline/hooks/lib/script-candidates.mjs';
@@ -724,17 +726,17 @@ const isoAt = (ms) => new Date(ms).toISOString();
 const fileList = (nodes, next = null) => ({ pageInfo: { hasNextPage: next !== null, endCursor: next }, nodes });
 const prNode = (over = {}) => ({ number: 42, merged: true, baseRefName: 'main', baseRepository: { nameWithOwner: 'acme/widgets' }, mergeCommit: { oid: COMMIT }, files: fileList([{ path: FILE, changeType: 'ADDED' }]), ...over });
 // GitHub's answer for an eligible file: on main, identical text, one history node (PR 42's merge commit, an hour old), the PR ADDED the file
-const ghBase = ({ name = NAME, text = SQL } = {}) => ({ data: { repository: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main', target: { oid: HEAD_SHA, file: { object: { text, isBinary: false, isTruncated: false } }, history: { nodes: [{ oid: COMMIT, committedDate: isoAt(NOW - 3_600_000), associatedPullRequests: { nodes: [prNode({ files: fileList([{ path: `supabase/migrations/${name}.sql`, changeType: 'ADDED' }]) })] } }] } } } } } });
+const ghBase = ({ name = NAME, text = SQL, head = HEAD_SHA } = {}) => ({ data: { repository: { nameWithOwner: 'acme/widgets', defaultBranchRef: { name: 'main', target: { oid: head, file: { object: { text, isBinary: false, isTruncated: false } }, history: { nodes: [{ oid: COMMIT, committedDate: isoAt(NOW - 3_600_000), associatedPullRequests: { nodes: [prNode({ files: fileList([{ path: `supabase/migrations/${name}.sql`, changeType: 'ADDED' }]) })] } }] } } } } } });
 const tip = (a) => a.data.repository.defaultBranchRef.target;
 const firstCommit = (a) => tip(a).history.nodes[0];
 const firstPr = (a) => firstCommit(a).associatedPullRequests.nodes[0];
 const GH_OK = { code: 0, stdout: '', stderr: '', timedOut: false, overBuffer: false };
 
 // No go anywhere: a scratch home with the registry (REF flagged unless `flag` is false), the history folder, and a fake gh that records its calls and answers from `s.answer()` (or `s.respond(args, opts)`: a partial gh result)
-async function autoScene(t, { flag = true, since = '2026-11-01T00:00:00Z', refs = [] } = {}) {
+async function autoScene(t, { flag = true, since = '2026-11-01T00:00:00Z', refs = [], deploy = null } = {}) {
   const home = mkdtempSync(join(tmpdir(), 'cp-live-db-auto-'));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', ...(flag ? { autoMigrations: true, autoSince: since } : {}) }, ...refs] });
+  seedRegistry(home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', ...(flag ? { autoMigrations: true, autoSince: since, ...(deploy ?? {}) } : {}) }, ...refs] });
   mkdirSync(attempts({ home }), { recursive: true });
   const s = { home, calls: [], answer: () => ghBase(), respond: null };
   s.tweak = (fn, over) => { s.answer = () => { const a = ghBase(over); fn(a); return a; }; };
@@ -1160,6 +1162,300 @@ test('through the real hook entry: GitHub that never answers, even with 5,000 pe
   assert.equal(many.decision, 'deny', many.reason);
   assert.ok(many.ms < 14_000, `${many.ms} ms`);
   assert.deepEqual(hist(s), []);
+});
+
+// ---- auto-apply after the deploy (#882): a file marked apply-after-deploy applies once GitHub shows its production deploy succeeded ---------------------------------------------------------------
+
+const MARKED = `-- pipeline: apply-after-deploy\n${SQL}`;
+const OTHER_SHA = 'c'.repeat(40);
+const DEPLOY_REG = { deployEnv: 'Production', deployBot: 'vercel' };
+// the cutoff-era shapes of unreleased #907 commits (N3): 7ac5c1d3 (deployClock 'pending') and 39e28449 (the finished two-phase registration with its staging key)
+const LEGACY_REGS = {
+  'deployClock pending': { ...DEPLOY_REG, deploySince: isoAt(NOW - 7_200_000), deployClock: 'pending' },
+  'two-phase proof with deployPending': { ...DEPLOY_REG, deploySince: isoAt(NOW - 7_200_000), deployClock: 'github', deployProof: 'two-phase', deployPending: { env: 'Production', bot: 'vercel', since: isoAt(NOW - 7_200_000) } },
+};
+const bot = (login = 'vercel') => ({ __typename: 'Bot', login });
+const dnode = (over = {}) => ({ commitOid: COMMIT, createdAt: isoAt(NOW - 3_100_000), environment: 'Production', originalEnvironment: 'Production', latestEnvironment: 'Production', state: 'ACTIVE', creator: bot(), latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot() }, ...over });
+const withStatus = (over) => dnode({ latestStatus: { state: 'SUCCESS', createdAt: isoAt(NOW - 3_000_000), creator: bot(), ...over } });
+// GitHub's answer to the deploy query
+const deployAnswer = ({ live = dnode(), newest = dnode(), envName = 'Production', repoName = 'acme/widgets', pr = {}, head = COMMIT, branchName = 'main' } = {}) => ({ data: { repository: { nameWithOwner: repoName, environment: envName === null ? null : { name: envName, latestCompletedDeployment: live }, deployments: { nodes: newest === null ? [] : [newest] }, defaultBranchRef: head === null ? null : { name: branchName, target: { oid: head } }, pullRequest: { number: 42, merged: true, mergedAt: isoAt(NOW - 3_500_000), mergeCommit: { oid: COMMIT }, ...pr } } } });
+const argOf = (args, key) => args.find((a) => a.startsWith(`${key}=`))?.slice(key.length + 1);
+const queryOf = (call) => argOf(call.args, 'query');
+
+// autoScene whose registry carries the after-deploy registration; its gh stub answers the file query, the file-list pages and the deploy query, each by what was asked: the deploy answer is the stub's `s.deploy()` only when the call asks for env=Production and pr 42
+async function deployScene(t, { registration = DEPLOY_REG, ...opts } = {}) {
+  const s = await autoScene(t, { deploy: registration, ...opts });
+  s.deploy = () => deployAnswer();
+  s.answer = () => ghBase({ text: MARKED, head: COMMIT });
+  s.respond = (args) => {
+    const q = queryOf({ args });
+    if (q.includes('latestCompletedDeployment')) return { stdout: JSON.stringify(argOf(args, 'env') === 'Production' && argOf(args, 'num') === '42' ? s.deploy() : deployAnswer({ envName: null, newest: null })) };
+    if (q.includes('after:$after')) return { stdout: JSON.stringify(s.page()) };
+    return { stdout: JSON.stringify(s.answer()) };
+  };
+  return s;
+}
+const applyMarked = (s) => apply(s, { query: MARKED });
+const { readAttemptLog } = await import('../pipeline/hooks/lib/live-db-auto.mjs');
+
+test('after-deploy: a marked file whose newest and latest completed Production deployments are its merge commit, ACTIVE, SUCCESS by the registered bot applies with no go; the history and the log say it waited for a deploy', async (t) => {
+  // Failure caught: the feature not working (a marked file still waiting for a click after a successful deploy), or an apply that leaves no trace of the deploy that allowed it.
+  const s = await deployScene(t);
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.equal(s.calls.length, 2, 'the file query and the deploy query');
+  const n = body(gfile(s, 'name', 1, { sql: MARKED }));
+  assert.deepEqual([n.via, n.afterDeploy, n.deployEnv, n.deployedAt, n.commit, n.pr], ['auto', true, 'Production', isoAt(NOW - 3_000_000), COMMIT, 42]);
+  const [ev] = readAttemptLog({ home: s.home }).events;
+  assert.deepEqual([ev.via, ev.afterDeploy, ev.deployEnv, ev.deployedAt], ['auto', true, 'Production', isoAt(NOW - 3_000_000)]);
+  // an unmarked apply on the same registry carries no deploy fields, and an attempt-log row without them (older install) reads null
+  const plain = await deployScene(t);
+  plain.answer = () => ghBase();
+  assert.equal(apply(plain).decision, 'allow');
+  assert.equal(plain.calls.length, 1, 'no deploy query for an unmarked file');
+  const [old] = readAttemptLog({ home: plain.home }).events;
+  assert.deepEqual([old.afterDeploy, old.deployEnv, old.deployedAt], [null, null, null]);
+  assert.equal('afterDeploy' in body(gfile(plain, 'name', 1)), false);
+});
+
+test('after-deploy N3: an entry with cutoff-era keys keeps the registry valid and another ref readable, claims nothing, stays unregistered after a label set and a server add, and a fresh after-deploy on registers only that ref', async (t) => {
+  // Failure caught: an unreleased #907 registration invalidating the registry, still letting a marked file apply (with no cutoff to compare), or an unrelated owner write turning it into a live registration.
+  const other = { ref: 'zyxwvutsrq9876543210', name: 'Other', repo: 'acme/other', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' };
+  for (const [shape, keys] of Object.entries(LEGACY_REGS)) {
+    const s = await deployScene(t, { registration: keys, refs: [other] });
+    const read = readDbRefs(s.home);
+    assert.equal(read.ok, true, shape);
+    assert.deepEqual([read.refs.find((e) => e.ref === other.ref).name, read.refs[0].deployEnv, read.refs[0].deployLegacy], ['Other', null, true], shape);
+    const r = applyMarked(s);
+    assert.equal(r.decision, 'deny', shape);
+    assert.match(r.reason, /after-deploy on/, shape);
+    assert.equal(s.calls.length, 0, `${shape}: GitHub asked nothing`);
+    assert.deepEqual(hist(s), [], shape);
+    // a label-only set and a server add rewrite the registry: the legacy keys go, nothing becomes registered
+    assert.equal(runOwnerCli(s.home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'acme/widgets']).exitCode, 0, shape);
+    assert.equal(runOwnerCli(s.home, ['server', 'add', 'mine']).exitCode, 0, shape);
+    assert.equal(applyMarked(s).decision, 'deny', `${shape}: still not registered after unrelated writes`);
+    assert.equal(s.calls.length, 0, shape);
+    assert.deepEqual(hist(s), [], shape);
+    // only the fresh registration writes a pair, and only for the ref given
+    assert.equal(runOwnerCli(s.home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']).exitCode, 0, shape);
+    assert.deepEqual(Object.fromEntries(readDbRefs(s.home).refs.map((e) => [e.ref, e.deployEnv])), { [REF]: 'Production', [other.ref]: null }, shape);
+    assert.equal(applyMarked(s).decision, 'allow', `${shape}: the fresh registration works`);
+  }
+});
+
+test('after-deploy D1: a marked file whose merge is live when the owner switches after-deploy on (real owner CLI) applies with no click: the check is made at apply time', async (t) => {
+  // Failure caught: eligibility frozen at switch-on (a time cutoff or a snapshot) refusing the merge that is live at that moment, or one still deploying then.
+  const s = await deployScene(t, { registration: null });
+  assert.equal(applyMarked(s).decision, 'deny', 'before the registration the click stays');
+  assert.equal(runOwnerCli(s.home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']).exitCode, 0);
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.ok(existsSync(gfile(s, 'name', 1, { sql: MARKED })));
+});
+
+test('after-deploy N1: a later commit on the default branch gives the file the click, with its own final wording and no deploy query, even when the deploy proof would pass', async (t) => {
+  // Failure caught: a redeploy or rollback of an older merge, or a merge made after the file's own, still qualifying; and the refusal telling the caller to call again when waiting cannot help.
+  const s = await deployScene(t);
+  s.answer = () => ghBase({ text: MARKED, head: HEAD_SHA });
+  s.deploy = () => deployAnswer({ head: HEAD_SHA });
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /a later commit is on the default branch: this file takes the owner's go/);
+  assert.doesNotMatch(r.reason, /call again/);
+  assert.equal(s.calls.length, 1, 'the deploy query is never made');
+  assert.deepEqual(hist(s), []);
+  assert.equal(markers(s).length, 0);
+});
+
+test('after-deploy N2: a PR merged before auto-apply was switched on keeps the click even when the commit that added the file is dated after it', async (t) => {
+  // Failure caught: a merge older than the switch (its commit re-dated, e.g. by a rebase merge) applying with no go because only the commit date was compared with autoSince.
+  const s = await deployScene(t);
+  s.deploy = () => deployAnswer({ pr: { mergedAt: '2026-10-30T00:00:00Z' } });
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /merged before auto-apply was switched on/);
+  assert.equal(s.calls.length, 2);
+  assert.deepEqual(hist(s), []);
+  const ok = await deployScene(t);
+  ok.deploy = () => deployAnswer({ pr: { mergedAt: '2026-11-01T00:00:00Z' } });
+  assert.equal(applyMarked(ok).decision, 'allow', 'merged at the switch time is not before it');
+});
+
+test('after-deploy: a marked file of an entry without the registration is refused with GitHub asked nothing (the owner\'s click stays)', async (t) => {
+  // Failure caught: a marked file applying before its code is deployed on a project whose owner never registered the deploy.
+  const s = await deployScene(t, { registration: null });
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /after-deploy on/);
+  assert.equal(s.calls.length, 0);
+  assert.deepEqual(hist(s), []);
+});
+
+test('after-deploy: anything GitHub shows other than the one trusted, successful deploy of the merge commit is refused with a plain reason, nothing claimed, no go burnt', async (t) => {
+  // Failure caught: a forged, stale, rolled-back or half-finished deploy counting as live (a marked migration applied before the code that needs it, or after it was rolled back).
+  const other = { commitOid: OTHER_SHA };
+  const cases = [
+    ['no deployment at all', { live: null, newest: null }, /no deployment in "Production" yet/],
+    ['no such environment', { envName: null }, /no deployment environment named "Production"/],
+    ['another environment name', { envName: 'Staging' }, /no deployment environment named "Production"/],
+    ['the latest completed one is another commit (stub-level: a rollback GitHub recorded)', { live: dnode(other) }, /the deployment GitHub shows as live is commit c+, not the merge commit/],
+    ['the newest one is another commit, the live one is trusted', { newest: dnode(other) }, /the newest deployment is commit c+/],
+    ['the newest one is by an untrusted creator ahead of a trusted live one', { newest: dnode({ creator: { __typename: 'User', login: 'vercel' } }) }, /not made by vercel\[bot\]/],
+    ['the deployment is not ACTIVE', { newest: dnode({ state: 'INACTIVE' }) }, /not active/],
+    ['status FAILURE', { newest: withStatus({ state: 'FAILURE' }), live: withStatus({ state: 'FAILURE' }) }, /has not succeeded/],
+    ['status IN_PROGRESS', { newest: withStatus({ state: 'IN_PROGRESS' }) }, /has not succeeded/],
+    ['status INACTIVE', { newest: withStatus({ state: 'INACTIVE' }) }, /has not succeeded/],
+    ['creator a User named vercel', { live: dnode({ creator: { __typename: 'User', login: 'vercel' } }) }, /not made by vercel\[bot\]/],
+    ['status set by another bot', { newest: withStatus({ creator: bot('github-actions') }) }, /status of the newest deployment was not set by vercel\[bot\]/],
+    ['a Preview deployment an agent moved into Production by a status', { newest: dnode({ originalEnvironment: 'Preview' }) }, /another environment/],
+    ['a deployment of another environment', { live: dnode({ environment: 'Preview', latestEnvironment: 'Preview' }) }, /another environment/],
+    ['status time before the commit', { newest: withStatus({ createdAt: isoAt(NOW - 7_200_000) }) }, /not credible/],
+    ['status time without a zone', { newest: withStatus({ createdAt: '2026-11-17T11:10:00' }) }, /not credible/],
+    ['status time in the future', { newest: withStatus({ createdAt: isoAt(NOW + 3_600_000) }) }, /not credible/],
+    ['another repository answered', { repoName: 'evil/widgets' }, /evil\/widgets instead of acme\/widgets/],
+    ['another pull request', { pr: { number: 43 } }, /does not show the pull request as merged/],
+    ['merged at another commit', { pr: { mergeCommit: { oid: OTHER_SHA } } }, /does not show the pull request as merged/],
+    ['the default branch moved since the file was read', { head: OTHER_SHA }, /default branch moved during the check/],
+    ['no default branch in the answer', { head: null }, /default branch moved during the check/],
+    ['another branch made the default at the same commit (the PR\'s base no longer matches)', { branchName: 'release' }, /default branch moved during the check/],
+  ];
+  for (const [what, over, reason] of cases) {
+    const s = await deployScene(t);
+    s.deploy = () => deployAnswer(over);
+    const r = applyMarked(s);
+    assert.equal(r.decision, 'deny', what);
+    assert.match(r.reason, reason, what);
+    assert.match(r.reason, /wait for the deploy to finish and call again, or ask for the owner's go/, what);
+    assert.equal(s.calls.length, 2, what);
+    assert.equal(markers(s).length, 0, what);
+    assert.deepEqual(hist(s), [], `${what}: nothing claimed`);
+  }
+  // a hand-written registry with the bot github-actions is invalid: every Supabase write is refused, GitHub is asked nothing
+  const forged = await deployScene(t, { registration: { ...DEPLOY_REG, deployBot: 'github-actions' } });
+  assert.equal(applyMarked(forged).decision, 'deny');
+  assert.equal(forged.calls.length, 0);
+});
+
+test('after-deploy: the deploy query is the last GitHub read, after a second page of the PR\'s files', async (t) => {
+  // Failure caught: the proof read before the file pages, so a rollback GitHub shows while the pages are read goes unseen.
+  const s = await deployScene(t);
+  s.answer = () => { const a = ghBase({ text: MARKED, head: COMMIT }); firstPr(a).files = fileList([{ path: 'README.md', changeType: 'MODIFIED' }], 'cursor-1'); return a; };
+  s.page = () => ({ data: { repository: { pullRequest: { files: fileList([{ path: FILE, changeType: 'ADDED' }]) } } } });
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.deepEqual(s.calls.map((c) => (queryOf(c).includes('latestCompletedDeployment') ? 'deploy' : queryOf(c).includes('after:$after') ? 'page' : 'file')), ['file', 'page', 'deploy']);
+});
+
+test('after-deploy: a registration the owner switches off while GitHub is asked claims nothing', async (t) => {
+  // Failure caught: the owner running `after-deploy off` (a rollback) while the deploy query is out, and the hook still applying the migration on the registration it read before.
+  const s = await deployScene(t);
+  s.deploy = () => {
+    seedRegistry(s.home, { refs: [{ ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' }] });
+    return deployAnswer();
+  };
+  const r = applyMarked(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /changed the after-deploy registration during the check/);
+  assert.deepEqual(hist(s), [], 'nothing claimed');
+  assert.equal(markers(s).length, 0);
+});
+
+test('after-deploy: an MCP server the owner removes while GitHub is asked claims nothing; one that stays listed applies', async (t) => {
+  // Failure caught: `db-refs server remove` finishing during the GitHub reads, and the migration still being applied through the server the owner just revoked.
+  const entry = { ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z', ...DEPLOY_REG };
+  const via = (s) => evaluateSupabaseMcp('mcp__mine__apply_migration', { project_id: REF, name: NAME, query: MARKED }, s.ctx);
+  const s = await deployScene(t);
+  seedRegistry(s.home, { refs: [entry], servers: ['mine'] });
+  s.deploy = () => { seedRegistry(s.home, { refs: [entry], servers: [] }); return deployAnswer(); };
+  const r = via(s);
+  assert.equal(r.decision, 'deny');
+  assert.match(r.reason, /removed the MCP server/);
+  assert.deepEqual(hist(s), [], 'nothing claimed');
+  assert.equal(markers(s).length, 0);
+  const kept = await deployScene(t);
+  seedRegistry(kept.home, { refs: [entry], servers: ['mine'] });
+  assert.equal(via(kept).decision, 'allow');
+});
+
+test('auto-apply of an unmarked file: a server removed, or auto-migrations switched off, while GitHub is asked claims nothing', async (t) => {
+  // Failure caught: the owner's `db-refs server remove` or `auto-migrations off` finishing during the GitHub read, and the unmarked migration still being applied with no go (the final registry check ran only for marked files).
+  const entry = { ref: REF, name: 'EagleWatch prod', repo: 'acme/widgets', kind: 'live', autoMigrations: true, autoSince: '2026-11-01T00:00:00Z' };
+  const via = (s) => evaluateSupabaseMcp('mcp__mine__apply_migration', { project_id: REF, name: NAME, query: SQL }, s.ctx);
+  const cases = [
+    ['server remove', { refs: [entry], servers: [] }, /removed the MCP server/],
+    ['auto-migrations off', { refs: [{ ...entry, autoMigrations: undefined, autoSince: undefined }], servers: ['mine'] }, /changed the auto-apply settings/],
+    ['off then on (a later autoSince)', { refs: [{ ...entry, autoSince: '2026-11-20T00:00:00Z' }], servers: ['mine'] }, /changed the auto-apply settings/],
+  ];
+  for (const [what, after, reason] of cases) {
+    const s = await autoScene(t);
+    seedRegistry(s.home, { refs: [entry], servers: ['mine'] });
+    s.answer = () => { seedRegistry(s.home, after); return ghBase(); };
+    const r = via(s);
+    assert.equal(r.decision, 'deny', what);
+    assert.match(r.reason, reason, what);
+    assert.deepEqual(hist(s), [], `${what}: nothing claimed`);
+    assert.equal(markers(s).length, 0, what);
+  }
+  const kept = await autoScene(t);
+  seedRegistry(kept.home, { refs: [entry], servers: ['mine'] });
+  assert.equal(via(kept).decision, 'allow', 'nothing changed: applies');
+});
+
+test('after-deploy: the final registry check and the claim run under the registry lock the owner\'s db-refs writes take, released after; a lock the owner holds past the wait claims nothing', async (t) => {
+  // Failure caught: the owner's `after-deploy off` finishing between the hook's last registry read and its claim, and the migration still being allowed.
+  const s = await deployScene(t);
+  const lockDir = join(STATE(s.home), 'locks', 'db-refs.lock');
+  const heldAtCreate = [];
+  s.ctx.io.openSync = (file, ...rest) => { if (String(file).includes('live-db-attempts')) heldAtCreate.push(existsSync(lockDir)); return openSync(file, ...rest); };
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.ok(heldAtCreate.length >= 2 && heldAtCreate.every(Boolean), 'both attempt records were created while the registry lock was held');
+  assert.equal(existsSync(lockDir), false, 'released after the claim');
+  // the owner's command holds the lock (an `off` mid-write): the hook waits a moment, then claims nothing and spends no attempt; once it is free the same call applies
+  const busy = await deployScene(t);
+  busy.ctx.io.registryLockWaitMs = 100;
+  const owner = tryAcquire('db-refs', { dir: join(STATE(busy.home), 'locks') });
+  assert.ok(owner.acquired);
+  const denied = applyMarked(busy);
+  assert.equal(denied.decision, 'deny');
+  assert.match(denied.reason, /db-refs command is changing the registry/);
+  assert.deepEqual(hist(busy), []);
+  release(owner.lock);
+  assert.equal(applyMarked(busy).decision, 'allow');
+  // an unmarked file takes the same lock (every auto-apply claim re-reads the registry under it)
+  const plain = await deployScene(t);
+  plain.answer = () => ghBase();
+  plain.ctx.io.registryLockWaitMs = 100;
+  const own = tryAcquire('db-refs', { dir: join(STATE(plain.home), 'locks') });
+  assert.equal(apply(plain).decision, 'deny');
+  assert.deepEqual(hist(plain), []);
+  release(own.lock);
+  assert.equal(apply(plain).decision, 'allow');
+});
+
+test('after-deploy: denied before the deploy finished, the same call after GitHub shows success applies (no attempt was spent)', async (t) => {
+  // Failure caught: an early call spending the attempt, so the owner needs a go for a migration whose deploy was only seconds late.
+  const s = await deployScene(t);
+  s.deploy = () => deployAnswer({ newest: withStatus({ state: 'PENDING' }) });
+  assert.equal(applyMarked(s).decision, 'deny');
+  assert.deepEqual(hist(s), []);
+  s.deploy = () => deployAnswer();
+  assert.equal(applyMarked(s).decision, 'allow');
+  assert.ok(existsSync(gfile(s, 'name', 1, { sql: MARKED })));
+});
+
+test('after-deploy: the unmarked file sends the same file query as before and nothing more; the deploy query asks for this environment, this PR and every field the proof reads', async (t) => {
+  // Failure caught: the unmarked path changing (an extra call or a different query), and a deploy query that does not ask what the proof reads (the stub answers success only for env=Production and pr 42).
+  const plain = await deployScene(t);
+  plain.answer = () => ghBase();
+  assert.equal(apply(plain).decision, 'allow');
+  assert.equal(plain.calls.length, 1);
+  const q = queryOf(plain.calls[0]);
+  assert.ok(!/deployments|environment\(|latestCompletedDeployment/.test(q), 'the file query is unchanged');
+  assert.deepEqual(plain.calls[0].args.filter((a, i) => plain.calls[0].args[i - 1] === '-f').map((a) => a.split('=')[0]), ['query', 'o', 'n', 'p']);
+  const s = await deployScene(t);
+  assert.equal(applyMarked(s).decision, 'allow');
+  const call = s.calls[1];
+  const dq = queryOf(call);
+  assert.deepEqual([argOf(call.args, 'env'), argOf(call.args, 'num'), argOf(call.args, 'o'), argOf(call.args, 'n')], ['Production', '42', 'acme', 'widgets']);
+  for (const piece of ['latestCompletedDeployment', 'first:1', 'direction:DESC', 'field:CREATED_AT', 'environments:[$env]', 'creator { __typename login }', 'latestStatus { state createdAt creator { __typename login } }', 'commitOid', 'originalEnvironment', 'latestEnvironment', 'state', 'mergedAt', 'mergeCommit { oid }', 'nameWithOwner', 'defaultBranchRef { name target { oid } }']) assert.ok(dq.includes(piece), piece);
 });
 
 // ---- #741 (B2): a refusal that names the bytes ------------------------------------------------------------------------------------------------------------------------

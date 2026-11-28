@@ -569,6 +569,22 @@ export function substitute(budget, text, re, lookup) {
   });
 }
 
+// #951: the same word asked again while the variables stand as they were expands to the same text. Every script and path the line's writes are tried against asks again, so a
+// word with a long variable (`"$B/$f.$SUF"`, in two short copy loops) was charged to the budget hundreds of times and the whole script was refused as "expands to more text".
+// The result is remembered until any variable changes (a changed value starts afresh: nothing stale is returned), so the text a word adds is counted once; a first expansion
+// that is too big still throws, and is not remembered.
+export function rememberExpansions(getVars, expand) {
+  let snap = null;
+  let memo = new Map();
+  return (w) => {
+    const vars = getVars();
+    const same = snap !== null && Object.keys(vars).length === Object.keys(snap).length && Object.keys(vars).every((k) => Object.hasOwn(snap, k) && snap[k] === vars[k]);
+    if (!same) { snap = { ...vars }; memo = new Map(); }
+    if (!memo.has(w)) memo.set(w, expand(w));
+    return memo.get(w);
+  };
+}
+
 const MAX_GLOB_WORK = 5000; // directory entries looked at across one command
 const MAX_GLOB_STEPS = 200_000; // matcher steps across one command (a name against a segment backtracks)
 const MAX_SEGMENT = 256; // a longer glob segment is refused

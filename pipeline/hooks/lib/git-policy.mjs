@@ -22,7 +22,7 @@ import { PM_RUN_ALIASES, PM_WRAPPERS, pmScriptOf, pmCannotRunScript, pmCall, pmM
 import { catchAllReason, guardedCommandText, dataLessArgs } from './guarded-text.mjs';
 import { REVIEW_MARKER_TEXT } from '../../lib/review-marker.mjs';
 import { flattenProgram, newWriteFrame, writesUnderGit, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, flowStart, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, spliceLines, execLinesOf, assigningDefaults, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, rememberExpansions, GuardLimit } from './script-candidates.mjs';
 
 // (what proves the shell left on a `|| exit`: shell-parse's plainExit, which also refuses a wrapped / spawned exit)
 const PROTECTED_BRANCHES = ['main', 'master'];
@@ -3499,11 +3499,11 @@ function evalString(str, startDir, ctx, level, child = false) {
   const cdDirs = cdTargets(cmds, startDir, ctx);
   const frame = newWriteFrame(cmds, {
     text: str,
-    expand: (w) => {
+    expand: rememberExpansions(() => ctx.vars, (w) => {
       let e = expandVars(w, ctx).replace(/^\$\{?HOME\}?(?=\/|$)/, ctx.home);
       if (e === '~' || e.startsWith('~/')) e = ctx.home + e.slice(1);
       return /[$`*?[{]/.test(e) || e.startsWith('~') ? null : e; // ({a,b}: zsh writes both for a redirect, and the parser leaves the word of one unexpanded)
-    },
+    }),
     // (a command that has not run yet could be in any directory the line cds to: every one of them, and the bare word)
     locate: (e, idx) => {
       if (path.isAbsolute(e)) return [path.resolve(e)];

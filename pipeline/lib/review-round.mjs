@@ -27,9 +27,10 @@ import { assertPublishedHistory } from './review-publish.mjs';
 import { GhError } from './proc.mjs';
 import { isSensitivePath, prBaseBranch, rateBranch, regressionOnlyFor, threatModelsFor, trustedBase } from './risk.mjs';
 import { DEFAULTS, EFFORTS, EFFORT_LANES, baseConfigAt } from './config.mjs';
-import { addRound, emptyState, higherRisk, loadState, maxRiskOf, saveState } from './state.mjs';
+import { addRound, emptyState, higherRisk, loadState, lowerCapTo, maxRiskOf, saveState } from './state.mjs';
 import { baseEffort, codexSpend, decideRoute, protectedKindsFor, wholePrOwed } from './review-route.mjs';
 import { readWeeklyUsage } from './codex-usage.mjs';
+import { pastApprovalFirst } from './owner-grants.mjs';
 import { linkDeferredFollowups, reuseRuled, reviewedRoundCount, roundAdmission, roundOutcome, ruledCacheFrom } from './triage.mjs';
 import { clickNotes } from '../hooks/lib/owner-go-click.mjs';
 import { claimGrantMarkers, grantIdOf, ownerGrantConfigDirHint, ownerGrantedRounds, ownerGrantGap } from '../hooks/lib/owner-go.mjs';
@@ -130,7 +131,7 @@ const ownerRecords = (c, k) => {
 };
 const reviewedAdmission = ({ baseOnly, resolutionOnly }) => (baseOnly || resolutionOnly ? 'uncounted' : 'normal');
 const admit = (c, st, flags) => (st
-  ? roundAdmission(st, c.round, { ...flags, head: c.head, grants: (k) => ownerRecords(c, k) })
+  ? roundAdmission(lowerCapTo(st, c.config.review.max_rounds), c.round, { ...flags, head: c.head, grants: (k) => ownerRecords(c, k) })
   : { admission: reviewedAdmission(flags), problem: null });
 // Why (#472): the round-cap refusal also says what became of an owner click on the extra-round dialog (waiting for its transcript entry, refused, or recorded for a round already used), so the agent
 // neither asks again for a click that is only waiting nor reads "no grant" over it. '' when there is nothing to say; never throws.
@@ -158,6 +159,11 @@ const unconfirmedGrant = (c, st) => {
 // Returns the admission ('normal' | 'uncounted' | 'extraRound' | 'owner'); a refused round is exit 2 round-cap.
 export const checkCap = (c, st, flags, { already = false } = {}) => {
   const { admission, problem } = admit(c, st, flags);
+  // An owner's extra round is not admitted (and its grant not consumed) while an earlier round that ran under a higher cap still needs the owner's approval: that history would keep failing the gate (#923).
+  if (st && c.config.owner_approval === 'chat' && (problem || admission === 'owner')) {
+    const first = pastApprovalFirst(st, { maxRounds: c.config.review.max_rounds, repo: c.ghRepo?.slug, pr: c.pr, round: c.round });
+    if (first !== null) throw new Fail(EXIT.USAGE, { ok: false, error: 'round-cap', message: first });
+  }
   // resolutionIneligible: why the free (resolution-only) round was refused, when one was tried (it is computed before the cap).
   if (problem) {
     throw new Fail(EXIT.USAGE, {
@@ -598,7 +604,7 @@ export async function recordRound({ adm, findings, roundFields = {}, gate, after
         }
       };
     }
-    const base0 = fresh ?? emptyState({ repo: adm.slug, pr, branch: adm.view.headRefName ?? 'HEAD', risk: adm.level, lightLane: adm.lightLane, maxRounds: config.review.max_rounds });
+    const base0 = fresh ? lowerCapTo(fresh, config.review.max_rounds) : emptyState({ repo: adm.slug, pr, branch: adm.view.headRefName ?? 'HEAD', risk: adm.level, lightLane: adm.lightLane, maxRounds: config.review.max_rounds });
     const ruled = linkDeferredFollowups(reuseRuled(assignIds(findings, round, excerptFor, { contentHash: adm.hashAtHead }), ruledCacheFrom(allItems(base0)), { round }), allItems(base0));
     const reviewer = adm.fable || fresh?.reviewer === 'fable' ? 'fable' : 'judge';
     const reasons = adm.lane.reasons.length > 0 ? adm.lane.reasons : ['reviewed by Fable in an earlier round'];

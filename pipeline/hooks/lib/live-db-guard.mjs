@@ -248,7 +248,7 @@ function decide(tool, ti, ctx) {
     if (op === 'migration' && c.status !== 'error' && c.status !== 'no-time') {
       const auto = autoEntry(target.ref, state);
       if (auto.entry) {
-        const a = autoApply({ home, entry: auto.entry, name: migName, query, session: ctx.sessionId, now: ctx.now ?? Date.now, leftMs: ctx.leftMs, env: ctx.env, io: ctx.io });
+        const a = autoApply({ home, entry: auto.entry, server: seg, name: migName, query, session: ctx.sessionId, now: ctx.now ?? Date.now, leftMs: ctx.leftMs, env: ctx.env, io: ctx.io });
         if (a.status === 'claimed') return allow();
         autoNote = ` Auto-apply did not apply: ${a.reason}.`;
       }

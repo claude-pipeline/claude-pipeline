@@ -37,8 +37,10 @@ const STRAY_TMP_MAX_AGE_MS = 60 * 60 * 1000;
 // Version 10: a final carries `postMax.rule === 'cap-low'` (an unbuilt low-severity ACCEPT deferred at the round cap, the owner-approval route): a pipeline of version 9 reads it as an ordinary post-limit follow-up and would merge it
 // with no owner "merge" and no Rulings block shown.
 // Version 11: a round's `reviewBaseKind` is 'conflict' (#423): its Fable / Codex input depends on the conflict records and the sides file, which a pipeline of version 10 does not write, so an older reader would diff the cached marker tree and certify the round with a kept modify/delete or binary choice unseen.
+// Version 12: the state carries `capLoweredFrom` (review.max_rounds was lowered after the state was created, #923): a pipeline of version 11 reads the lowered `maxRounds` as the cap the rounds ran under and
+// would accept a legacy round (no admission field) at max + 1 as the automatic extra round, although it ran as an ordinary round under the higher cap.
 // A writer picks the HIGHEST version any feature of the state needs (requiredStateVersion).
-export const SUPPORTED_STATE_VERSION = 11;
+export const SUPPORTED_STATE_VERSION = 12;
 export const STATE_VERSION_CLAUDE = 2;
 export const STATE_VERSION_DEFERRAL = 3;
 export const STATE_VERSION_SUBSTITUTE = 4;
@@ -48,6 +50,9 @@ export const STATE_VERSION_OWNER_DEFERRAL = 7;
 export const STATE_VERSION_SAME_ON_BASE = 9;
 export const STATE_VERSION_CAP_LOW = 10;
 export const STATE_VERSION_CONFLICT = 11;
+export const STATE_VERSION_CAP_LOWERED = 12;
+// Did review.max_rounds get lowered under this state (lowerCapTo recorded the higher cap it ran under)? Then the writer lifts the state to STATE_VERSION_CAP_LOWERED (and only then).
+export const stateNeedsCapLoweredVersion = (state) => state?.capLoweredFrom !== undefined;
 // Does any round of the state hold a 'conflict' review base? Then the writer lifts the state to STATE_VERSION_CONFLICT (and only then).
 export const stateNeedsConflictVersion = (state) => (Array.isArray(state?.rounds) ? state.rounds : []).some((r) => r?.reviewBaseKind === 'conflict');
 // Does any final of the state carry the cap-low rule on its post-max marker (a cached copy too)? Then the writer lifts the state to STATE_VERSION_CAP_LOW (and only then). The rule's name is triage.mjs CAP_LOW_RULE (not imported: that module imports this one).
@@ -75,9 +80,10 @@ export const isSubstituteRound = (round) => round?.firstReviewer === 'substitute
 // Who gave a second review: 'codex' (no `by`, the first kind), or the pinned Claude substitute that did (R5-5). Anything else that starts with `substitute` reads as plain `substitute`.
 export const secondReviewerOf = (sr) => (typeof sr?.by !== 'string' || !sr.by.startsWith('substitute') ? 'codex' : sr.by === 'substitute-opus' || sr.by === 'substitute-fable' ? sr.by : 'substitute');
 const isSubstituteSecondReview = (item) => typeof item?.secondReview?.by === 'string' && item.secondReview.by.startsWith('substitute');
-// The lowest version that may hold this state, the HIGHEST any feature in it needs: 11 when a round's review base is 'conflict' (stateNeedsConflictVersion), 10 when a final carries the cap-low rule (stateNeedsCapLowVersion), 9 when a final carries the same-on-base mark, 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
+// The lowest version that may hold this state, the HIGHEST any feature in it needs: 12 when the cap was lowered after the state was created (stateNeedsCapLoweredVersion), 11 when a round's review base is 'conflict' (stateNeedsConflictVersion), 10 when a final carries the cap-low rule (stateNeedsCapLowVersion), 9 when a final carries the same-on-base mark, 8 when a round's owner grant carries the click-dialog variant (stateNeedsClickDialogVersion), 7 when a final carries the owner-deferral mark, 6 when a final carries the post-max marker, 5 when a final carries the out-of-model marker (stateNeedsOutOfModelVersion), else
 // 4 when it holds a substitute round / second review or a governor / budget decision, else 1.
 export function requiredStateVersion(state) {
+  if (stateNeedsCapLoweredVersion(state)) return STATE_VERSION_CAP_LOWERED;
   if (stateNeedsConflictVersion(state)) return STATE_VERSION_CONFLICT;
   if (stateNeedsCapLowVersion(state)) return STATE_VERSION_CAP_LOW;
   if (stateNeedsSameOnBaseVersion(state)) return STATE_VERSION_SAME_ON_BASE;
@@ -105,6 +111,19 @@ export function maxRiskOf(state) {
   return known.length === 0 ? 'high' : known.reduce(higherRisk);
 }
 const sleepSync = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// The review.max_rounds in the config may be LOWERED after a state was created (the state copies it once, at creation): a stored cap above
+// the configured one is lowered to it, so admission and outcome use the new limit. Never raised; anything else is returned unchanged (#923).
+// The cap the rounds ran under is kept as `capLoweredFrom` (the highest one seen, never removed): once the lowered cap is saved, the stored cap alone no longer says an old round ran under a higher one.
+export function lowerCapTo(state, configuredMax) {
+  const stored = state?.maxRounds;
+  if (!Number.isInteger(configuredMax) || configuredMax < 1) return state;
+  if (!Number.isInteger(stored) || stored <= configuredMax) return state;
+  const from = state.capLoweredFrom;
+  // A recorded capLoweredFrom that is present but not an integer in 1..5 is corrupt: it stays as it is, so verifyOwnerGrants refuses it instead of it being replaced by a valid-looking value.
+  if (from !== undefined && !(Number.isInteger(from) && from >= 1 && from <= 5)) return { ...state, maxRounds: configuredMax };
+  return { ...state, maxRounds: configuredMax, capLoweredFrom: Math.max(stored, from ?? 0) };
+}
 
 export function emptyState({ repo, pr, branch, risk, lightLane = false, maxRounds = 3 }) {
   return {

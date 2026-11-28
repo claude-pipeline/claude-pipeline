@@ -22,8 +22,9 @@ export function expandJob(job) {
   }));
 }
 
-// Evaluates a step's `if:` for one row: only matrix.<key>, github.event_name and steps.tested.outputs.run (the push-skip answer) are allowed.
-export function stepRuns(cond, combo, { event = 'pull_request', tested = '' } = {}) {
+// Evaluates a step's `if:` for one row: only matrix.<key>, github.event_name, steps.tested.outputs.run (the push-skip answer) and
+// steps.reused.outputs.run (the merge-queue reuse answer) are allowed.
+export function stepRuns(cond, combo, { event = 'pull_request', tested = '', reused = '' } = {}) {
   if (cond === undefined) return true;
   const expr = cond
     .replace(/matrix\.(\w+)/g, (whole, key) => {
@@ -31,8 +32,9 @@ export function stepRuns(cond, combo, { event = 'pull_request', tested = '' } = 
       return JSON.stringify(combo[key]);
     })
     .replaceAll('github.event_name', JSON.stringify(event))
-    .replaceAll('steps.tested.outputs.run', JSON.stringify(tested));
+    .replaceAll('steps.tested.outputs.run', JSON.stringify(tested))
+    .replaceAll('steps.reused.outputs.run', JSON.stringify(reused));
   assert.match(expr, /^[\w"'.()!=&| ]+$/, cond);
   // eslint-disable-next-line no-new-func
-  return Boolean(new Function(`return (${expr});`)());
+  return Boolean(new Function('always', `return (${expr});`)(() => true)); // always() is true here: only the event and step outputs are modelled
 }

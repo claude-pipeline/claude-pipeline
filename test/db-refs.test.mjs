@@ -162,6 +162,8 @@ test('guard: an agent line running `pipeline db-refs set|remove|server` is refus
     `${PIPE} db-refs server add evil`,
     `${PIPE} db-refs auto-migrations on --ref ${REF}`,
     `${PIPE} db-refs auto-migrations off --ref ${REF}`,
+    `${PIPE} db-refs after-deploy on --ref ${REF} --env Production --bot vercel`,
+    `${PIPE} db-refs after-deploy off --ref ${REF}`,
     'pipeline db-refs set --ref x',
     `${PIPE} db-refs`,
     `cd /tmp && ${PIPE} db-refs set --ref ${REF} --name x --repo o/r`,
@@ -298,15 +300,24 @@ test('preflight: an invalid registry file is reported when the repo has supabase
 // ---- auto-apply (Task 1): the registry's autoMigrations flag -------------------------------------------------------------------------------------------------------------
 
 const ON = { autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' };
+const DEPLOY = { deployEnv: 'Production', deployBot: 'vercel' };
+const NO_DEPLOY = { deployEnv: null, deployBot: null };
+// the keys the unreleased cutoff-era commits of #907 wrote (N3): 7ac5c1d3's staged clock, 39e28449's finished two-phase registration with its staging key, and a staging key alone
+const LEGACY_PENDING = { env: 'Production', bot: 'vercel', since: '2026-11-28T01:00:00Z' };
+const LEGACY_SHAPES = {
+  'deployClock pending (7ac5c1d3)': { ...DEPLOY, deploySince: '2026-11-28T01:00:00Z', deployClock: 'pending' },
+  'two-phase proof with a staged registration (39e28449)': { ...DEPLOY, deploySince: '2026-11-28T01:00:00Z', deployClock: 'github', deployProof: 'two-phase', deployPending: LEGACY_PENDING },
+  'a staged registration alone': { deployPending: LEGACY_PENDING },
+};
 const LIVE = (over = {}) => ({ ref: REF, name: 'EagleWatch live', repo: 'acme/widgets', kind: 'live', ...over });
 
 test('readDbRefs: autoMigrations absent reads false; a non-boolean, or true on a dev entry, one without repo or one without a valid autoSince, is invalid', (t) => {
   // Failure caught: a hand-edited or half-written registry that the guard still believes, turning auto-apply on for a project it should not cover.
   const home = scratchHome(t);
   seedRegistry(home, { refs: [LIVE()] });
-  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: false, autoSince: null });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: false, autoSince: null, ...NO_DEPLOY });
   seedRegistry(home, { refs: [LIVE(ON)] });
-  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: true, autoSince: '2026-11-27T01:00:00Z' });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), autoMigrations: true, autoSince: '2026-11-27T01:00:00Z', ...NO_DEPLOY });
   seedRegistry(home, { refs: [LIVE({ autoMigrations: false })] });
   assert.equal(readDbRefs(home).refs[0].autoMigrations, false);
   for (const bad of [LIVE({ autoMigrations: 'true' }), LIVE({ autoMigrations: 1 }), LIVE({ autoMigrations: null }), LIVE({ ...ON, kind: 'dev' }), LIVE({ ...ON, repo: null }), LIVE({ autoMigrations: true }), LIVE({ autoMigrations: true, autoSince: '2026-11-27' }), LIVE({ autoMigrations: true, autoSince: 'yesterday' }), LIVE({ autoMigrations: true, autoSince: '2026-11-27T01:00:00' })]) {
@@ -489,4 +500,131 @@ test('a registry writer holding the db-refs lock makes every other writer refuse
   const ok = runOwnerCli(home, ['auto-migrations', 'off', '--ref', REF2]);
   assert.equal(ok.exitCode, 0, JSON.stringify(ok.output));
   assert.equal(existsSync(join(dirname(dbRefsFile(home)), 'locks', 'db-refs.lock')), false, 'the lock is released after a write');
+});
+
+// ---- after-deploy (#882): the registration of the GitHub deployment that lets a marked migration apply ---------------------------------------------------------------------
+
+test('readDbRefs: the after-deploy pair is both-or-none, only with auto-apply on, never the bot github-actions; a registry without it reads null', (t) => {
+  // Failure caught: a half registration (an environment without a bot, or a bot of any creator) or a github-actions bot letting a marked file through without a creator check an agent cannot forge; and an older registry failing to read.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE(ON)] });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...NO_DEPLOY }, 'a registry without the keys reads as before');
+  seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY })] });
+  assert.deepEqual(readDbRefs(home).refs[0], { ...LIVE(), ...ON, ...DEPLOY });
+  seedRegistry(home, { refs: [LIVE({ ...ON, ...DEPLOY, deployEnv: 'Production – eaglewatch' })] });
+  assert.equal(readDbRefs(home).refs[0].deployEnv, 'Production – eaglewatch', 'an en dash is a valid environment character');
+  const { deployEnv, deployBot } = DEPLOY;
+  for (const bad of [
+    LIVE({ ...ON, deployEnv }), LIVE({ ...ON, deployBot }),
+    LIVE({ ...DEPLOY }), LIVE({ autoMigrations: false, ...DEPLOY }),
+    LIVE({ ...ON, ...DEPLOY, deployBot: 'github-actions' }), LIVE({ ...ON, ...DEPLOY, deployBot: 'Vercel' }), LIVE({ ...ON, ...DEPLOY, deployBot: 'vercel[bot]' }), LIVE({ ...ON, ...DEPLOY, deployBot: '' }),
+    LIVE({ ...ON, ...DEPLOY, deployEnv: '' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'x'.repeat(101) }), LIVE({ ...ON, ...DEPLOY, deployEnv: 'Prod\nuction' }), LIVE({ ...ON, ...DEPLOY, deployEnv: 7 }), LIVE({ ...ON, ...DEPLOY, deployEnv: null }),
+    // a cutoff-era key that is malformed is still invalid, and none of them is valid without the auto switch
+    LIVE({ ...ON, ...DEPLOY, deployClock: 'x' }), LIVE({ ...ON, ...DEPLOY, deployProof: 'x' }), LIVE({ ...ON, deployPending: { ...LEGACY_PENDING, bot: 'github-actions' } }), LIVE({ autoMigrations: false, deployPending: LEGACY_PENDING }), LIVE({ ...ON, deployPending: 'x' }),
+    LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28' }), LIVE({ ...ON, ...DEPLOY, deploySince: '2026-11-28T01:00:00' }), LIVE({ ...DEPLOY, deploySince: '2026-11-28T01:00:00Z' }),
+  ]) {
+    seedRegistry(home, { refs: [bad] });
+    assert.deepEqual(readDbRefs(home), { ok: false, reason: 'invalid' }, JSON.stringify(bad));
+  }
+});
+
+// a fake `gh` for the child process (PIPELINE_GH, honoured in a checkout only): every call is counted in the returned file and fails, so a command that must stay offline shows it
+const ghTrap = (t) => {
+  const dir = scratchHome(t);
+  const script = join(dir, 'fake-gh.mjs');
+  const calls = join(dir, 'calls');
+  writeFileSync(script, `import { appendFileSync } from 'node:fs';
+appendFileSync(${JSON.stringify(calls)}, 'call\\n');
+process.stderr.write('gh: must not be called\\n');
+process.exit(4);\n`);
+  return { env: { PIPELINE_GH: `node "${script}"` }, calls };
+};
+
+test('after-deploy on|off: refused inside Claude Code, with auto-apply off, for github-actions[bot] and a malformed env; [bot] is stripped; on writes the pair only and makes no GitHub call; off, auto-migrations off, a repo change and --dev clear it, a label-only set keeps it', async (t) => {
+  // Failure caught: an agent registering a deployer for itself, a workflow-created deployment counting as production, a registration that needs GitHub (or any time) to switch on, or the trust surviving a change of repo.
+  const home = scratchHome(t);
+  seedRegistry(home, { refs: [LIVE(ON), LIVE({ ref: REF2, repo: 'acme/other' })] });
+  const before = readFileSync(dbRefsFile(home), 'utf8');
+  const on = ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel'];
+  const inside = await run(on, ownerCtx(home, { env: { CLAUDECODE: '1' } }));
+  assert.equal(inside.exitCode, 2);
+  assert.equal(inside.output.error, 'refused');
+  assert.equal((await run(['after-deploy', 'off', '--ref', REF], ownerCtx(home, { env: { CLAUDECODE: '1' } }))).exitCode, 2);
+  for (const bad of [
+    ['after-deploy'], ['after-deploy', 'maybe', '--ref', REF], ['after-deploy', 'on', '--ref', 'bad', '--env', 'Production', '--bot', 'vercel'], ['after-deploy', 'on', '--ref', REF, '--bot', 'vercel'], ['after-deploy', 'on', '--ref', REF, '--env', 'Production'],
+    ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'github-actions'], ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'GitHub-Actions[bot]'], ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'not a login'],
+    ['after-deploy', 'on', '--ref', REF, '--env', 'Prod\nuction', '--bot', 'vercel'], ['after-deploy', 'on', '--ref', REF, '--env', 'x'.repeat(101), '--bot', 'vercel'], ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel', '--name', 'x'],
+    ['after-deploy', 'off', '--ref', REF, '--env', 'Production'], ['after-deploy', 'on', '--ref', REF2, '--env', 'Production', '--bot', 'vercel'], ['after-deploy', 'on', '--ref', 'qqqqqqqqqqqqqqqqqqqq', '--env', 'Production', '--bot', 'vercel'],
+    ['set', '--ref', REF, '--name', 'x', '--repo', 'acme/widgets', '--bot', 'vercel'],
+  ]) await assert.rejects(() => run(bad, ownerCtx(home)), UsageError, bad.join(' '));
+  assert.equal(readFileSync(dbRefsFile(home), 'utf8'), before, 'nothing written');
+
+  const trap = ghTrap(t);
+  const r = runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'Vercel[bot]'], trap.env);
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.match(r.output.note, /Production/);
+  assert.match(r.output.note, /vercel\[bot\]/);
+  assert.match(r.output.note, /dashboard/);
+  assert.match(r.output.note, /after-deploy off/);
+  assert.match(r.output.note, /auto-migrations on/, 'the note names the lever that keeps the click for earlier merges');
+  assert.equal(existsSync(trap.calls), false, 'after-deploy on makes no GitHub call');
+  const entry = readDbRefs(home).refs[0];
+  assert.deepEqual([entry.deployEnv, entry.deployBot, entry.autoMigrations], ['Production', 'vercel', true]);
+  assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deploySince|deployClock|deployProof|deployPending/, 'no time or proof key is written');
+  const shown = (await run(['show'], ownerCtx(home))).output.refs[0];
+  assert.deepEqual([shown.deployEnv, shown.deployBot], ['Production', 'vercel']);
+  // a second on replaces both
+  runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Staging', '--bot', 'netlify'], trap.env);
+  const again = readDbRefs(home).refs[0];
+  assert.deepEqual([again.deployEnv, again.deployBot], ['Staging', 'netlify']);
+
+  const absent = () => assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deployEnv|deployBot/);
+  const kept = LIVE({ ...ON, ...DEPLOY });
+  seedRegistry(home, { refs: [kept] });
+  runOwnerCli(home, ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'ACME/widgets']);
+  assert.deepEqual(readDbRefs(home).refs[0], { ...kept, name: 'Renamed', repo: 'ACME/widgets' }, 'a label-only set keeps the registration');
+  for (const args of [['after-deploy', 'off', '--ref', REF], ['auto-migrations', 'off', '--ref', REF], ['set', '--ref', REF, '--name', 'x', '--repo', 'other/x'], ['set', '--ref', REF, '--name', 'x', '--repo', 'acme/widgets', '--dev']]) {
+    seedRegistry(home, { refs: [kept] });
+    const done = runOwnerCli(home, args);
+    assert.equal(done.exitCode, 0, args.join(' '));
+    absent();
+    assert.deepEqual([readDbRefs(home).refs[0].deployEnv, readDbRefs(home).refs[0].deployBot], [null, null], args.join(' '));
+  }
+  assert.equal(readDbRefs(home).refs[0].kind, 'dev', 'the last case was the --dev one');
+});
+
+test('legacy cutoff-era keys (N3): the registry stays valid, the entry reads as not registered, every write drops all deploy keys, only a fresh after-deploy on writes a pair', async (t) => {
+  // Failure caught: an unreleased #907 registration invalidating the registry (every Supabase write refused), or an unrelated owner write (a label, a server) quietly turning a half-trusted legacy entry into a live registration.
+  const home = scratchHome(t);
+  const other = LIVE({ ref: REF2, name: 'Other', repo: 'acme/other', ...ON });
+  const writes = [
+    ['a label-only set', ['set', '--ref', REF, '--name', 'Renamed', '--repo', 'acme/widgets']],
+    ['a server add', ['server', 'add', 'my-supabase']],
+    ['auto-migrations on again', ['auto-migrations', 'on', '--ref', REF]],
+    ['after-deploy off', ['after-deploy', 'off', '--ref', REF]],
+  ];
+  for (const [shape, keys] of Object.entries(LEGACY_SHAPES)) {
+    seedRegistry(home, { refs: [LIVE({ ...ON, ...keys }), other] });
+    const r = readDbRefs(home);
+    assert.equal(r.ok, true, shape);
+    assert.deepEqual(r.refs[0], { ...LIVE(), ...ON, ...NO_DEPLOY, deployLegacy: true }, `${shape}: read as not registered, flagged`);
+    assert.deepEqual(r.refs[1], { ...other, repo: 'acme/other', ...NO_DEPLOY }, `${shape}: another ref reads normally`);
+    const shownRefs = (await run(['show'], ownerCtx(home))).output.refs;
+    assert.equal(shownRefs[0].deployEnv, undefined, `${shape}: show prints no registration`);
+    assert.equal(shownRefs[0].deployLegacy, true, shape);
+    for (const [what, args] of writes) {
+      seedRegistry(home, { refs: [LIVE({ ...ON, ...keys }), other] });
+      assert.equal(runOwnerCli(home, args).exitCode, 0, `${shape} / ${what}`);
+      assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deployEnv|deployBot|deploySince|deployClock|deployProof|deployPending/, `${shape} / ${what}: every deploy key is gone`);
+      assert.equal(readDbRefs(home).refs.find((e) => e.ref === REF).deployLegacy, undefined, `${shape} / ${what}`);
+    }
+    seedRegistry(home, { refs: [LIVE({ ...ON, ...keys }), other] });
+    const on = runOwnerCli(home, ['after-deploy', 'on', '--ref', REF, '--env', 'Production', '--bot', 'vercel']);
+    assert.equal(on.exitCode, 0, shape);
+    // Failure caught: the response still telling the owner the entry is legacy after the write that cleared it
+    assert.deepEqual([on.output.refs[0].deployEnv, on.output.refs[0].deployLegacy], ['Production', undefined], `${shape}: the response prints what was written`);
+    const after = readDbRefs(home).refs;
+    assert.deepEqual([after[0].deployEnv, after[0].deployBot, after[0].deployLegacy, after[1].deployEnv], ['Production', 'vercel', undefined, null], `${shape}: only the ref given is registered`);
+    assert.doesNotMatch(readFileSync(dbRefsFile(home), 'utf8'), /deploySince|deployClock|deployProof|deployPending/, shape);
+  }
 });
