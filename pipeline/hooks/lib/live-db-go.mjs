@@ -210,7 +210,7 @@ export function blobAt(dir, head, file, io = {}) {
 
 const NO_BLOCK_REASON = 'the reply does not end with a live-database block';
 // What the typed go's reader says when it found no block (#916): the reply it reads is Claude's reply to the owner's OWN message; a block shown in a turn a background notice started is skipped.
-const NO_BLOCK_GO_REASON = `${NO_BLOCK_REASON}: only a block in Claude's reply to the owner's own message is read, and a block shown in a turn started by a background notice, a task notification or a subagent hand-back does not count, so present it again in the reply to the owner's next message`;
+const NO_BLOCK_GO_REASON = `${NO_BLOCK_REASON}: only a block in Claude's reply to the owner's own message is read, and a block shown in a turn started by a background notice, a task notification or a subagent hand-back does not count, so present it again at the end of this reply (the reply to the owner's go)`;
 
 // Reads the block at the END of a reply and rebuilds it. { ok:true, fields } | { ok:false, reason }. `fields`: op, ref, label, name, sqlSha256, head, file, repo, dir, summary, sql.
 // `home` is where the registry lives. `io.git` is a test seam.
