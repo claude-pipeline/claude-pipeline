@@ -63,7 +63,7 @@ test('#874: a refusal from a working folder inside the protected pipeline folder
 });
 
 test('#874: a refusal from a normal worktree gets no working-folder hint (it would send the owner after a cause that is not there)', () => {
-  const r = runIn(`node scratch.mjs ${S}`, '/home/u/proj');
+  const r = runIn(`node scratch.mjs ${TR}`, '/home/u/proj');
   assert.equal(r.decision, 'deny');
   assert.match(r.reason, /node refers to a protected pipeline file .* is not a read-only command/);
   assert.doesNotMatch(r.reason, /working folder/);
