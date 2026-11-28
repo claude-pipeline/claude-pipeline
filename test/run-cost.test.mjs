@@ -391,6 +391,32 @@ test('P cost: while another booking holds the PR\'s cost lock, nothing is booked
   assert.deepEqual([free.json.recorded, free.json.call.usd, free.json.cost.total.usd], [true, 1, 1]);
 });
 
+// R3-B3 (#939): withLock throws LockLostError AFTER the callback returned when the lock was taken over meanwhile; the booking was already written, so the command used to exit 2 with no result and a re-run of an explicit --usd booking booked twice.
+// The stand-in gh (a wrapper around the fake) removes the lock's owner record as the comment is written, which is exactly "taken over while held".
+test('P cost: a lock lost after the booking was written still reports the booking (exit 0, recorded true, call and total, a warning) and books once', () => {
+  const s = scenario();
+  const dir = mkdtempSync(join(tmpdir(), 'cost-lost-'));
+  const wrapper = join(dir, 'gh-wrapper.mjs');
+  writeFileSync(wrapper, [
+    "import { spawnSync } from 'node:child_process';",
+    "import { readdirSync, readFileSync, rmSync } from 'node:fs';",
+    "import { join } from 'node:path';",
+    'const argv = process.argv.slice(2);',
+    'let input = \'\';',
+    'try { input = readFileSync(0, \'utf8\'); } catch { /* no stdin */ }',
+    "const r = spawnSync(process.execPath, [process.env.WRAPPED_FAKE_GH, ...argv], { input, encoding: 'utf8', env: process.env });",
+    "if (argv.includes('-X')) for (const d of readdirSync(process.env.WRAPPED_LOCK_DIR)) rmSync(join(process.env.WRAPPED_LOCK_DIR, d, 'owner.json'), { force: true });",
+    'process.stdout.write(r.stdout); process.stderr.write(r.stderr); process.exitCode = r.status ?? 1;',
+  ].join('\n'));
+  const fakeGh = join(import.meta.dirname, 'fixtures', 'fake-gh.mjs');
+  const lockDir = mkdtempSync(join(tmpdir(), 'cost-lost-locks-'));
+  const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '10', '--usd', '1'], { PIPELINE_GH: `node "${wrapper}"`, WRAPPED_FAKE_GH: fakeGh, WRAPPED_LOCK_DIR: lockDir, PIPELINE_LOCK_DIR: lockDir });
+  assertExit(r, 0);
+  assert.deepEqual([r.json.ok, r.json.recorded, r.json.call.usd, r.json.cost.total.usd], [true, true, 1, 1]);
+  assert.match(r.json.warnings.join('\n'), /lock was lost after this booking was written/);
+  assert.equal(written(s).cost.total.usd, 1, 'the booking is in the comment, once');
+});
+
 // R2-B1: the transcript dedupe runs on the base the patch is applied to, so a transcript the other booking already took books nothing again.
 test('P cost: a transcript another booking took in the meantime books nothing again (call is zero, total is the transcript once)', () => {
   const s = scenario();
