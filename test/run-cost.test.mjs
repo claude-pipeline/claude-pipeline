@@ -2,9 +2,10 @@
 // cost / guard-block lines of `P summary`. The CLI tests run the real CLI against the scripted gh fake (gate-env).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, writeFileSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import { readRepoMoves } from '../pipeline/hooks/lib/repo-moves.mjs';
 import { cli, scenario, ghEntries, PR } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { createCommentsGh } from './helpers/fakegh-env.mjs';
@@ -19,6 +20,7 @@ import {
 import { summaryFromComments, writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { transcriptUsage } from '../pipeline/commands/cost.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
+import { baseRecordFor } from '../pipeline/lib/run-progress.mjs';
 
 const NOW = Date.parse('2026-10-14T10:00:00Z');
 const rec = () => emptyRecord({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main' });
@@ -294,6 +296,46 @@ test('P checkpoint: a summary copied from another repository (same PR number and
   const sum = summaryFromComments(s.fake.comments(), 'me', PR, { repo: 'acme/widgets', moves: [] });
   assert.equal(sum.effectiveCost.any, false, 'no spend of this PR');
   assert.equal(sum.record.repo, 'acme/widgets', 'the record is this repository\'s now');
+});
+
+// R4-F1: a record that is not provably this repository's counts for nothing, but a writer that adopts it (checkpoint: the repo is the only mismatch) must not destroy its spend: registering the move later brings it back.
+test('P checkpoint: a legacy $40 record under a renamed repository (move not registered) is not counted, stays stored, and counts once the move is registered (R4-F1, #958)', () => {
+  const s = scenario();
+  withComment(s, existing({ ...rec(), repo: 'old/widgets', heartbeat: { host: 'h', at: '2026-11-01T00:00:00.000Z' }, cost: addCostEntry(emptyCost(), entry({ usd: 40 })) }));
+  assertExit(checkpoint(s), 0);
+  assertExit(checkpoint(s), 0);
+  const none = summaryFromComments(s.fake.comments(), 'me', PR, { repo: 'acme/widgets', moves: [] });
+  assert.equal(none.effectiveCost.any, false, 'not proven this repository\'s: not counted');
+  assert.equal(none.record.heldCost.cost.total.usd, 40, 'but still stored in the written record');
+  const move = { from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
+  const after = summaryFromComments(s.fake.comments(), 'me', PR, { repo: 'acme/widgets', moves: [move] });
+  assert.equal(after.effectiveCost.cost.total.usd, 40, 'the move is registered: counted again');
+  assert.equal(after.record.heldCost, undefined, 'and carried as the record\'s own cost');
+  assert.equal(after.record.cost.total.usd, 40);
+});
+
+// R4-B1: a move lookup that fails (readRepoMoves answers { moves: [], error }) is "not proven" for counting, and a writer must not lose the cost for it either.
+test('summaryFromComments + writers: an unreadable repo-moves file neither counts nor loses a legacy cost (R4-B1, #958)', () => {
+  const home = mkdtempSync(join(tmpdir(), 'moves-'));
+  const dir = join(home, '.claude', 'pipeline-state', 'owner-go');
+  mkdirSync(dir, { recursive: true });
+  writeFileSync(join(dir, 'repo-moves.json'), 'not json');
+  const broken = readRepoMoves({ home });
+  assert.ok(broken.error, 'the lookup failed');
+  const legacy = existing({ ...rec(), repo: 'old/widgets', heartbeat: { host: 'h', at: '2026-11-01T00:00:00.000Z' }, cost: addCostEntry(emptyCost(), entry({ usd: 40 })) });
+  const live = { repo: 'acme/widgets', pr: PR, branch: 'agent/feature' };
+  let comments = [legacy];
+  const gh = { viewer: () => 'me', listComments: () => comments, updateComment: (id, m, b) => { comments = [{ ...legacy, body: b }]; return { id, url: 'u', action: 'updated' }; } };
+  const checkpointNow = (moves) => {
+    const current = summaryFromComments(comments, 'me', PR, { repo: live.repo, moves });
+    const base = baseRecordFor(current, { ...live, host: 'h', now: NOW });
+    writeSummaryComment(gh, PR, { record: applyCheckpoint(base.record, { step: 'review' }, { host: 'h', now: NOW }), existing: current });
+    return summaryFromComments(comments, 'me', PR, { repo: live.repo, moves });
+  };
+  const failed = checkpointNow(broken.moves);
+  assert.equal(failed.effectiveCost.any, false, 'not counted while the lookup fails');
+  const move = { from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
+  assert.equal(summaryFromComments(comments, 'me', PR, { repo: live.repo, moves: [move] }).effectiveCost.cost.total.usd, 40, 'the file fixed afterwards: the \$40 is back');
 });
 
 // merge.mjs refuses when recorder.update returns null: a booking nobody can read must show as a note, never fail the write.
