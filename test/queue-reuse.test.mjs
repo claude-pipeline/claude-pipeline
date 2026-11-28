@@ -235,8 +235,11 @@ test('the job itself failed, was cancelled, is missing or appears twice in that 
 });
 
 // Failure caught: the PR changed the workflow, the test runner or the proof code: the PR run's evidence was produced by that very code.
+// Failure caught: scripts/test.mjs imports registry-snapshot.mjs -> pipeline/lib/paths.mjs + model-floor.mjs (and their imports) before it launches
+// the shard; a PR that changes one of them changes what the PR run's green proves, and the queue reused it unrun.
+const importedByTestRunner = ['pipeline/lib/queue-members.mjs', 'pipeline/lib/ci-proof.mjs', 'pipeline/lib/proc.mjs', 'pipeline/lib/shell-words.mjs', 'pipeline/lib/paths.mjs', 'pipeline/lib/model-floor.mjs', 'pipeline/lib/locks.mjs', 'pipeline/lib/seams.mjs', 'pipeline/hooks/lib/owner-go.mjs', 'pipeline/hooks/lib/repo-moves.mjs', 'pipeline/hooks/lib/owner-go-click.mjs', 'pipeline/hooks/lib/live-db-go.mjs', 'pipeline/hooks/lib/db-refs.mjs', 'pipeline/hooks/lib/sql-classify.mjs', 'pipeline/lib/git.mjs', 'pipeline/lib/diff.mjs', 'pipeline/lib/glob.mjs', 'pipeline/lib/resolution.mjs', 'pipeline/lib/remote-url.mjs', 'pipeline/lib/owner-only.mjs', 'pipeline/lib/claude-ancestry.mjs'];
 test('the queue commit changes workflow, test runner or proof logic -> run (untouched files are fine)', async () => {
-  for (const file of ['.github/workflows/ci.yml', '.github/scripts/queue-reuse.mjs', 'scripts/test.mjs', 'scripts/verify.mjs', 'scripts/lib/shard.mjs', 'package.json', 'package-lock.json', '.gitattributes', 'pipeline/lib/queue-members.mjs', 'pipeline/lib/ci-proof.mjs']) {
+  for (const file of ['.github/workflows/ci.yml', '.github/scripts/queue-reuse.mjs', 'scripts/test.mjs', 'scripts/verify.mjs', 'scripts/lib/shard.mjs', 'package.json', 'package-lock.json', '.gitattributes', ...importedByTestRunner]) {
     await mustRun({ touch: file }, new RegExp(`RUN: the queue commit changes proof logic \\(${file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}`));
   }
   const unrelated = await decide({ touch: 'pipeline/lib/other.mjs' });

@@ -38,7 +38,33 @@ const SHA40 = /^[0-9a-f]{40}$/;
 // What the PR run's evidence depends on besides the tree: any change here and the queue run must produce its own evidence.
 const PROOF_LOGIC = {
   prefixes: ['.github/', 'scripts/lib/'],
-  files: ['scripts/test.mjs', 'scripts/verify.mjs', 'package.json', 'package-lock.json', '.gitattributes', 'pipeline/lib/queue-members.mjs', 'pipeline/lib/ci-proof.mjs'],
+  // Plus the static import closure of scripts/test.mjs outside scripts/lib/ (traced: test.mjs -> scripts/lib/registry-snapshot.mjs ->
+  // pipeline/lib/paths.mjs + model-floor.mjs -> ...): code that runs before the shard launches, so a change there changes what a
+  // green PR run proves. Each entry says who imports it.
+  files: [
+    'scripts/test.mjs', 'scripts/verify.mjs', 'package.json', 'package-lock.json', '.gitattributes',
+    'pipeline/lib/queue-members.mjs', // the queue-entry reader this decider itself imports
+    'pipeline/lib/ci-proof.mjs', // the proof checks the PR run is judged by
+    'pipeline/lib/proc.mjs', // this decider imports it (git / gh launcher), and git.mjs below imports it
+    'pipeline/lib/shell-words.mjs', // imported by proc.mjs
+    'pipeline/lib/paths.mjs', // scripts/lib/registry-snapshot.mjs imports it, and scripts/test.mjs imports that before it launches the shard
+    'pipeline/lib/model-floor.mjs', // scripts/lib/registry-snapshot.mjs imports it (same chain as paths.mjs)
+    'pipeline/lib/locks.mjs', // imported by model-floor.mjs
+    'pipeline/lib/seams.mjs', // imported by model-floor.mjs and proc.mjs
+    'pipeline/hooks/lib/owner-go.mjs', // imported by model-floor.mjs
+    'pipeline/hooks/lib/repo-moves.mjs', // imported by owner-go.mjs
+    'pipeline/hooks/lib/owner-go-click.mjs', // imported by owner-go.mjs
+    'pipeline/hooks/lib/live-db-go.mjs', // imported by owner-go-click.mjs
+    'pipeline/hooks/lib/db-refs.mjs', // imported by live-db-go.mjs
+    'pipeline/hooks/lib/sql-classify.mjs', // imported by live-db-go.mjs
+    'pipeline/lib/git.mjs', // imported by live-db-go.mjs
+    'pipeline/lib/diff.mjs', // imported by git.mjs
+    'pipeline/lib/glob.mjs', // imported by diff.mjs
+    'pipeline/lib/resolution.mjs', // imported by git.mjs
+    'pipeline/lib/remote-url.mjs', // imported by live-db-go.mjs
+    'pipeline/lib/owner-only.mjs', // imported by db-refs.mjs
+    'pipeline/lib/claude-ancestry.mjs', // imported by owner-only.mjs
+  ],
 };
 
 class Run extends Error {}
