@@ -87,6 +87,7 @@ export const run = guarded(async (argv, ctx) => {
   const fromFile = values['from-transcript'] ? transcriptUsage(values['from-transcript'], root, values.model) : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, usd: 0, unpricedMessages: 0, byPrice: {} };
   const num = (flag) => {
     if (values[flag] === undefined) return 0;
+    if (values[flag].trim() === '') throw new UsageError(`--${flag} is empty (an unset shell variable?): pass a number`);
     const n = Number(values[flag]);
     if (!Number.isFinite(n) || n < 0) throw new UsageError(`--${flag} must be a non-negative number`);
     return n;

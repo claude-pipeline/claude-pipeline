@@ -246,6 +246,9 @@ test('P cost: refuses nothing-to-record and bad amounts with exit 2 and writes n
   assertExit(costCli(s, ['--phase', 'build', '--role', 'judge']), 2);
   assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', '--input', '-5']), 2);
   assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', '--usd', 'abc']), 2);
+  // an unset shell variable (#821 through the amount flags): an empty or blank amount is not 0
+  for (const flag of ['--usd', '--input', '--output', '--cache-read', '--cache-write']) for (const blank of ['', '  ']) assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', flag, blank]), 2);
+  assertExit(costCli(s, ['--phase', 'build', '--role', 'judge', '--input', '5', '--usd', '']), 2);
   assert.equal(s.fake.calls().length, before);
 });
 
@@ -425,6 +428,7 @@ test('P cost: a round\'s cost is added to, not replaced, by bookings made under 
     usd = Math.round((usd + add) * 100) / 100;
     total = Math.round((total + add) * 100) / 100;
     assert.deepEqual([r.json.cost.byRound['11'].calls, r.json.cost.byRound['11'].usd, r.json.cost.total.usd], [calls, usd, total], `booking ${i + 1}: round and PR total grew by this call`);
+    if (i === 3) assert.deepEqual([r.json.call.input, r.json.call.output], [0, 0], 'the pre-move transcript ledger survived the move: its 10 / 20 tokens are not booked again');
     assert.equal(r.json.warnings.some((w) => /the repo moved/.test(w)), i === 0, i === 0 ? 'the move is reported once' : 'the record is already on the live slug');
     withComment(s, existing(written(s)));
   }
