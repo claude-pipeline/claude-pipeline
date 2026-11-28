@@ -110,7 +110,8 @@ export function deductBookedTranscript(cost, entry, booking) {
   const out = { ...entry };
   if (before) {
     for (const k of ['input', 'output', 'cacheRead', 'cacheWrite']) out[k] = grow(usage[k], before[k], entry[k]);
-    out.usd = Math.round(grow(usage.usd, before.usd, entry.usd) * 1e6) / 1e6;
+    // capped at the entry's own USD: plan-codex books tokens only (entry.usd 0) while its transcript is still priced, and that price must not be charged on a re-booking.
+    out.usd = Math.round(Math.min(Number(entry.usd) || 0, grow(usage.usd, before.usd, entry.usd)) * 1e6) / 1e6;
     if (isPlainObject(entry.byPrice)) {
       out.byPrice = {};
       for (const [price, b] of Object.entries(entry.byPrice)) {

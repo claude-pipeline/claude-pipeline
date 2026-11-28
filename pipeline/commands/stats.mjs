@@ -53,6 +53,7 @@ async function rounds(rest, ctx) {
           const comments = pages(gh, `repos/${slug}/issues/${number}/comments`, undefined, () => warnings.push(`${slug}#${number}: the comments were cut after ${MAX_PAGES} pages (${MAX_PAGES * PAGE} comments): the record or state may be missing or old`));
           let record = null;
           let state = null;
+          let movedFrom = null;
           const slugLower = slug.toLowerCase();
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
           for (const c of comments) {
@@ -73,7 +74,7 @@ async function rounds(rest, ctx) {
                 const adopted = adoptRecord(r.record, { repo: sameRepo ? r.record.repo : slug, pr: number });
                 if (adopted.record) {
                   record = adopted.record;
-                  if (!sameRepo) warnings.push(`${slug}#${number}: counted a run record bound to ${asciiLine(r.record.repo, 80)} (the repo moved)`);
+                  movedFrom = sameRepo ? null : r.record.repo;
                 } else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
               } else if (r.status === 'invalid' || r.status === 'unsupported') skip('a run record', `: unreadable (${r.status})`);
             }
@@ -86,7 +87,11 @@ async function rounds(rest, ctx) {
           }
           const p = analysePr({ repo: slug, pr: number, state, record });
           if (p === null) withoutState += 1;
-          else analysed.push(p);
+          else {
+            analysed.push(p);
+            // only for the record finally selected, and only when the PR counts
+            if (movedFrom !== null) warnings.push(`${slug}#${number}: counted a run record bound to ${asciiLine(movedFrom, 80)} (the repo moved)`);
+          }
         } catch (err) {
           warnings.push(`${slug}#${number}: comments could not be read (${asciiLine(err?.message, 120)}): skipped`);
         }

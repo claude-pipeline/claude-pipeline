@@ -481,6 +481,20 @@ test('deductBookedTranscript: a hand amount booked with an already-booked transc
   assert.deepEqual([grown.entry.input, grown.entry.usd, grown.entry.byPrice.p1.input], [50, 0.5, 50], 'a re-booking with no hand amount books only the growth');
 });
 
+// #980 R1-B1: plan-codex is tokens only (entry.usd 0) but its priced transcript is still the booking usage, so the growth formula charged the transcript's USD growth on a re-booking.
+test('P cost --role plan-codex --from-transcript: re-booking a grown transcript without --usd books the new tokens and still $0', () => {
+  const s = scenario();
+  const line = (id) => JSON.stringify({ message: { id, model: 'claude-sonnet-5-5', usage: { input_tokens: 1000000, output_tokens: 0 } } });
+  const args = ['--phase', 'plan', '--role', 'plan-codex', '--from-transcript', '.review/pc.jsonl'];
+  s.repo.write('.review/pc.jsonl', `${line('m1')}\n`);
+  assertExit(costCli(s, args), 0);
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/pc.jsonl', `${line('m1')}\n${line('m2')}\n`);
+  const r = costCli(s, args);
+  assertExit(r, 0);
+  assert.deepEqual([r.json.cost.byRole['plan-codex'].input, r.json.cost.byRole['plan-codex'].usd, r.json.cost.total.usd], [2000000, 0, 0]);
+});
+
 // R1-B1 / R1-F2: the ledger key was the bare file name, so two different transcripts both called transcript.jsonl shared one entry (the second under-booked), and a name with a space or bracket made the booking fail.
 test('P cost --from-transcript: same-named transcripts from different folders both book; an odd file name still books', () => {
   const s = scenario();
