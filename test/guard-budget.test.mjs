@@ -11,7 +11,7 @@ import { resolve, dirname, basename } from 'node:path';
 import { evaluateGitCommand } from '../pipeline/hooks/lib/git-policy.mjs';
 import { evaluateBashForFiles } from '../pipeline/hooks/lib/files-policy.mjs';
 import { runHook } from '../pipeline/hooks/lib/hook-io.mjs';
-import { MAX_SCRIPT_JUDGMENTS, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, wallLeftMs, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
+import { MAX_SCRIPT_JUDGMENTS, rememberExpansions, substitute, EVAL_DEADLINE_MS, EVAL_WALL_CAP_MS, HOOK_CLOCK, newEvalBudget, wallLeftMs, checkDeadline, budgetExpired, GuardLimit } from '../pipeline/hooks/lib/script-candidates.mjs';
 import { HOOK_TIMEOUT_S } from '../pipeline/lib/installer.mjs';
 import { readFileSync, mkdtempSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -523,4 +523,29 @@ test('qualifier scan: an expired deadline mid-scan stops it and marks the parse 
   assert.equal(r.truncated, true);
   assert.ok(polls < 100, `${polls} polls`);
   assert.equal(simpleCommands(line, { expired: () => false }).truncated, false);
+});
+
+// #951: two short copy loops (`for f in $FILES; do cp "$MOD/$f" "$B/$f.$SUF"; done`) were refused as "variables expand to more text than can be checked". Failure caught: every script
+// and path the line's writes are tried against asked for the same words again, and each ask was charged to the budget as new text (the owner's install script: 21,000 asks of ~100
+// characters). The same word asked again with the variables unchanged is now charged once; a changed variable, or an expansion that is too big, behaves as before.
+const VAR_RE = /\$(\w+)/g;
+const expander = (budget, vars) => (w) => substitute(budget, w, VAR_RE, (m, n) => vars[n] ?? m);
+test('#951: the same word asked again while the variables stand is charged to the budget once; a changed variable re-expands; an oversized one still refuses', () => {
+  const vars = { B: 'b'.repeat(100) };
+  const raw = expander(newEvalBudget(), vars);
+  assert.throws(() => { for (let i = 0; i < 20_000; i++) raw('$B/x.$B'); }, GuardLimit); // asked 20,000 times and charged each time: refused
+  const budget = newEvalBudget();
+  const ask = rememberExpansions(() => vars, expander(budget, vars));
+  for (let i = 0; i < 20_000; i++) assert.equal(ask('$B/x.$B'), `${vars.B}/x.${vars.B}`);
+  assert.equal(budget.grown, 196); // (charged once: 2 refs x 98 added characters)
+  vars.B = 'c'.repeat(100); // a variable changed: nothing stale is returned
+  assert.equal(ask('$B/x.$B'), `${vars.B}/x.${vars.B}`);
+  assert.equal(budget.grown, 392);
+  vars.B = 'd'.repeat(150_000); // a first expansion that is too big is refused (and not remembered)
+  const big = rememberExpansions(() => vars, expander(newEvalBudget(), vars));
+  assert.throws(() => big('$B$B'), GuardLimit);
+  assert.throws(() => big('$B$B'), GuardLimit);
+  // distinct words are each counted: many different words with a big value still run out
+  const many = rememberExpansions(() => vars, expander(newEvalBudget(), vars));
+  assert.throws(() => { for (let i = 0; i < 20; i++) many(`$B/w${i}`); }, GuardLimit);
 });

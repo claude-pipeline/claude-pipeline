@@ -27,7 +27,7 @@ import path from 'node:path';
 import { toPosix, expandHome, isInside, sameSpelling, sameFileStrict, insideStrict, drivePosix, transcriptRes, configDirOf, HOME_CONFIG_DIR_RE } from '../../lib/paths.mjs';
 import { UNDECIDABLE_HEREDOC, REDEF_CMDS, exitFollows, shapeAt, simpleCommands, commandName, scriptFileOf, scriptFeedsOf, startupFilesOf, startupVarsOf, pathValuesOf, isEqualsWord, shebangShell, declAttrs, applyTransform, sqlShellEscapes, sourcePathSearch, splicesOptions, spliceText, implicitBindsOf, MATCH_NAMES, ZSH_NAME_BINDERS, indirectExpansionOnLine, arithAssignedNames, refusalAdvice, withoutLiteralText } from './shell-parse.mjs';
 import { flattenProgram, newWriteFrame, exportRecords, writtenTo, writtenCandidates, joinedReadings, writtenNamesIn, writeSignature, unmodelledBefore, sedArgsUnsafe, sedWriteTargets, sedInPlaceArg, awkArgsPure, sortArgsPure, flowStart, inFlow, mayNotRun } from './line-writes.mjs';
-import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
+import { ZSH_MODIFIED, zshModifiedNames, scriptCandidates, execLineOf, defaultReadDir, defaultReadHead, isShellHead, newEvalBudget, checkDeadline, budgetExpired, wallLeftMs, countScript, countReading, substitute, rememberExpansions, GuardLimit, execLinesOf, paramReadings, readingsOf, UNKNOWN_WORD, assigningDefaults, spliceLines } from './script-candidates.mjs';
 import { SETS_BY_NAME } from './git-policy.mjs';
 
 const posix = path.posix;
@@ -5312,11 +5312,11 @@ function evaluateBashForFilesFrame(command, opts) {
   const startUnknownAll = ctx.unknownAll === true;
   const frame = newWriteFrame(cmds, {
     text: raw,
-    expand: (w) => {
+    expand: rememberExpansions(() => ctx.vars, (w) => {
       if (/^~[^/\\]/.test(w)) return null; // Why: ~+ / ~- / ~user are not the home directory (expandRefs would read `~+/n.sh` as /home/u+/n.sh): the place is only known at run time
       const e = expandRefs(w, ctx);
       return /[$`*?[{]/.test(e) || (e.startsWith('~') && !isAbs(e)) ? null : e;
-    },
+    }),
     locate: (e, idx) => (isAbs(e) ? [pathsFor().normalize(e)] : dirs.map((d) => pathsFor().join(d, e))),
     isAbs, p: pathsFor(), ci: ctx.ci, driveRel: drivePaths,
     real: (q) => realResolve(q, ctx.api),
