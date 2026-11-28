@@ -381,3 +381,4 @@ full record.
 - 2026-11-28 · #939 · P cost shows this call's cost next to the PR total (#734) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · needs-human · Codex 7d: 842 runs (339 high)
 - 2026-11-28 · #953 · Guard: an & in a comment or quoted text no longer makes a script's order unknown (#919) · risk high · rounds 2 · arbiter 2 · awaiting-owner-merge · Codex 7d: 847 runs (340 high)
 2026-11-28 · #939 · P cost shows this call's cost next to the PR total (#734) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · blocked — process-review · Codex 7d: 850 runs (342 high)
+- 2026-11-28 · #945 · owner-go: a reply under a parentless half-flagged summary no longer counts as shown to the owner (#905) · risk high · rounds 4 · arbiter 4 (fix-verify 1) · awaiting-owner-merge · Codex 7d: 861 runs (347 high)
