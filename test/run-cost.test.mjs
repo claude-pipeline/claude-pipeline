@@ -467,6 +467,34 @@ test('deductBookedTranscript: a stale smaller snapshot does not lower the ledger
   assert.equal(again.entry.byPrice.p1, undefined, 'price buckets add nothing either');
 });
 
+// #980: the ledger was deducted from the COMBINED entry (transcript + hand amounts), so a hand amount smaller than the ledger's lead over the snapshot was swallowed.
+test('deductBookedTranscript: a hand amount booked with an already-booked transcript still books; a plain re-booking books only the growth', () => {
+  const snap = (n) => ({ input: n, output: 0, cacheRead: 0, cacheWrite: 0, usd: n / 100, byPrice: { p1: { input: n, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 1 } } });
+  const first = deductBookedTranscript(emptyCost(), snap(150), { key: 'agent-a1.jsonl', usage: snap(150) });
+  // a later booking: transcript snapshot 100 (behind the ledger's 150), plus --input 10 hand tokens priced into the same bucket
+  const hand = { ...snap(100), input: 110, usd: 1.1, byPrice: { p1: { input: 110, output: 0, cacheRead: 0, cacheWrite5m: 0, cacheWrite1h: 0, messages: 2 } } };
+  const r = deductBookedTranscript(first.cost, hand, { key: 'agent-a1.jsonl', usage: snap(100) });
+  assert.equal(r.entry.input, 10, 'the hand tokens are booked, not swallowed by the ledger');
+  assert.equal(r.entry.usd, 0.1, 'the hand USD is booked');
+  assert.deepEqual([r.entry.byPrice.p1.input, r.entry.byPrice.p1.messages], [10, 1], 'the hand bucket share is booked');
+  const grown = deductBookedTranscript(first.cost, snap(200), { key: 'agent-a1.jsonl', usage: snap(200) });
+  assert.deepEqual([grown.entry.input, grown.entry.usd, grown.entry.byPrice.p1.input], [50, 0.5, 50], 'a re-booking with no hand amount books only the growth');
+});
+
+// #980 R1-B1: plan-codex is tokens only (entry.usd 0) but its priced transcript is still the booking usage, so the growth formula charged the transcript's USD growth on a re-booking.
+test('P cost --role plan-codex --from-transcript: re-booking a grown transcript without --usd books the new tokens and still $0', () => {
+  const s = scenario();
+  const line = (id) => JSON.stringify({ message: { id, model: 'claude-sonnet-5-5', usage: { input_tokens: 1000000, output_tokens: 0 } } });
+  const args = ['--phase', 'plan', '--role', 'plan-codex', '--from-transcript', '.review/pc.jsonl'];
+  s.repo.write('.review/pc.jsonl', `${line('m1')}\n`);
+  assertExit(costCli(s, args), 0);
+  withComment(s, existing(written(s)));
+  s.repo.write('.review/pc.jsonl', `${line('m1')}\n${line('m2')}\n`);
+  const r = costCli(s, args);
+  assertExit(r, 0);
+  assert.deepEqual([r.json.cost.byRole['plan-codex'].input, r.json.cost.byRole['plan-codex'].usd, r.json.cost.total.usd], [2000000, 0, 0]);
+});
+
 // R1-B1 / R1-F2: the ledger key was the bare file name, so two different transcripts both called transcript.jsonl shared one entry (the second under-booked), and a name with a space or bracket made the booking fail.
 test('P cost --from-transcript: same-named transcripts from different folders both book; an odd file name still books', () => {
   const s = scenario();
