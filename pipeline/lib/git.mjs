@@ -738,7 +738,9 @@ export function isClean(o, ref) {
   if (ref === undefined) return git(['status', '--porcelain=v1', '-uall'], o) === '';
   assertRef(ref, ['status', '--porcelain=v2', '--branch', ref]);
   const lines = git(['status', '--porcelain=v2', '--branch', '-uall'], o).split('\n').filter((l) => l !== '');
-  return lines.some((l) => l === `# branch.oid ${ref}`) && lines.every((l) => l.startsWith('# '));
+  if (!(lines.some((l) => l === `# branch.oid ${ref}`) && lines.every((l) => l.startsWith('# ')))) return false;
+  // R4-B1: one status call resolves HEAD twice, so a branch that moved during its scan can show `ref` with no entries for another tree: the index and the working tree are also compared with the fixed commit (exit 1 = differs; anything else throws)
+  return gitOrNull(['diff', '--quiet', ref, '--'], 1, o) !== null && gitOrNull(['diff', '--cached', '--quiet', ref, '--'], 1, o) !== null;
 }
 
 export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref, ['rev-parse', '--verify', ref])], o).trim();
