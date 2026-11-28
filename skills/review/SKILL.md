@@ -21,7 +21,7 @@ number, `R` a review round, `<slug>` 2–5 lowercase words from the request.
 2. No cross-model review, no merge. Codex unavailable (`exitCode: 3`) with `substitute.eligible` ⇒ the substitute path (2.1), not a stop. `reason: model` (Codex refused `review.codex_model`) WITHOUT `substitute.eligible` ⇒ not `awaiting-review` (Codex will not answer until the default branch is fixed and the fork point moves): park `needs-human`, tell the owner the CLI `message`. Otherwise ⇒ `gh pr edit N --add-label awaiting-review`,
    `P comment --pr N --kind awaiting-review --reason "<reason from the JSON>"`, tell the owner, stop (outcome `awaiting-review`). A failed Codex run is never "no findings".
 3. Never pass a `model` parameter to `judge`, `arbiter`, `arbiter-fix`, `implementer`, `substitute-opus` or `substitute-fable`: their agent files pin the model (Sonnet, Fable, Fable, Sonnet, Opus, Fable).
-4. Keep your context lean: work from `P` JSON, subagent summaries and file paths; hand paths, not logs or diffs, to subagents.
+4. Keep your context lean: work from `P` JSON, subagent summaries and paths; give subagents paths, not logs or diffs.
 5. Anything over 2 minutes is a background wait: `P round codex` (2.1) is started with Bash `run_in_background: true` and wakes you once; any other long command runs as `P job start <name> -- <command>`, then `P job wait <name> --run-id <runId> --until-done` in the background (or in the foreground `--timeout 540`, repeated until `state` is `done`; `replaced`/`lost` ⇒ start it again once). Read `exitCode` and the JSON in `tail` (`job read --full` has the whole stdout). The by-hand flow stays valid: `reference/special-rounds.md`.
 6. The whole suite is CI's job: locally you run only `verify.quick`, on the changed area. Never run `verify.full` here.
 7. **Stop ritual.** Every stop below names its outcome. Once the PR exists, run `P summary --pr N --outcome <outcome> --built "<one line: what was built>"`
@@ -41,11 +41,11 @@ Picking up an existing `awaiting-review` PR (Codex was unavailable): `P state sh
 Details of steps 2–5: `reference/build.md`.
 
 1. `git fetch origin <default_branch>` and `git worktree add --no-track -b agent/<slug> <worktree_dir>/agent-<slug> origin/<default_branch>`
-   (`--no-track`: a branch tracking `origin/main` can make a bare push target main). All work happens there; give subagents its absolute path.
-2. ONE `implementer` dispatch builds the whole change (tasks in order, tests first, `verify.quick`, the commit trailer, "return immediately when done"); more only for a big change; continue THE SAME agent before a fresh dispatch.
+   (`--no-track`: a branch tracking `origin/main` can make a bare push target main). Work there; give subagents its absolute path.
+2. ONE `implementer` dispatch builds the whole change (tasks in order, tests first, `verify.quick`, the commit trailer, "return immediately when done"); more only if big; continue THE SAME agent before a fresh dispatch (fix round: fresh past ~60 calls); empty leg = `stalled`.
 3. `verify.quick` after each dispatch and before every push; red ⇒ implementer, max 3 fix cycles, then stop (outcome `blocked`).
 4. Draft PR: `git push -u origin agent/<slug>`, `gh pr create --draft`; body opens with `## In plain English`; one keyword per issue (`Closes #170. Closes #171.`). Then book every call made before the PR existed, e.g. the build implementer (`reference/cost-booking.md`).
-5. `mkdir -p .review`, then `P risk`, `P hardstops` (`> .review/hardstops.json`) and `P integrity`, each with `--base origin/<default_branch> --head HEAD`, on the real diff; note any `blocking` / `ownerMerge` item or integrity violation (3.3 depends on it). The review runs either way.
+5. `mkdir -p .review`, then `P risk`, `P hardstops` (`> .review/hardstops.json`) and `P integrity`, each with `--base origin/<default_branch> --head HEAD`; note any `blocking` / `ownerMerge` item or integrity violation (3.3 depends on it). Review runs either way.
 
 ## 2. Review rounds (max `review.max_rounds`, plus the one extra round `P state outcome` calls `extraRound`, plus one per owner `extra round`)
 

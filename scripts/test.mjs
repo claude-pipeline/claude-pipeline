@@ -6,8 +6,9 @@
 // --related ADDS the test files related to what the branch changed (scripts/lib/related-tests.mjs: changed test files, tests that
 // import or mention a changed file, directly or through the modules they use) to the named ones, best first (changed, then
 // strong relations by distance, then name-only mentions of a root file such as README.md, which have a 15000 ms cap of their
-// own), while their estimated time fits CP_QUICK_RELATED_BUDGET_MS (default 90000; 0 = none; `all` = no cap; changed test
-// files always run).
+// own), while their estimated time fits CP_QUICK_RELATED_BUDGET_MS (default 90000; 0 = none; `all` = no cap). Changed test
+// files go first, lightest first, within their own cap CP_QUICK_CHANGED_CAP_MS (default 600000; `all` = no cap): one over the cap
+// is NOT run here, the summary says "deferred to CI" and names it (#686), and CI's full suite runs it.
 // Names stay strict (exact .test.mjs, exit 2 when missing); related files are never "missing". It prints one summary line
 // first (kept in .verify/logs/tests.log) and falls back to just the named files, saying why, when git cannot tell.
 // CP_RELATED_CHANGED (test-only): a newline-separated list of repo-relative paths used INSTEAD OF git's changed files.
@@ -26,7 +27,7 @@ import { join, dirname } from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath, pathToFileURL } from 'node:url';
 import { MAX_SHARDS, parseShard, shardFiles, weigh } from './lib/shard.mjs';
-import { changedFiles, describeSelection, describeSelectionDetail, parseBudget, relatedTests } from './lib/related-tests.mjs';
+import { changedFiles, describeSelection, describeSelectionDetail, parseBudget, parseChangedCap, relatedTests } from './lib/related-tests.mjs';
 import { selectTestFiles } from './lib/select-tests.mjs';
 import { buildManifest, collectFileTimes } from './lib/file-times.mjs';
 import { realRegistryFile, registryChange, snapshotRegistry } from './lib/registry-snapshot.mjs';
@@ -58,6 +59,8 @@ function loadWeights() {
 function addRelated(named, allTests) {
   const { budgetMs, error: budgetError } = parseBudget(process.env.CP_QUICK_RELATED_BUDGET_MS);
   if (budgetError) console.log(budgetError);
+  const { changedCapMs, error: capError } = parseChangedCap(process.env.CP_QUICK_CHANGED_CAP_MS);
+  if (capError) console.log(capError);
   if (budgetMs === 0) {
     console.log('related tests: off (CP_QUICK_RELATED_BUDGET_MS=0); running only the named files');
     return named;
@@ -80,10 +83,10 @@ function addRelated(named, allTests) {
     const read = (p) => { try { return readFileSync(join(root, p), 'utf8'); } catch { return null; } };
     const result = relatedTests({
       tests: allTests, testDir: 'test', changed: changed.files, files: listed.stdout.split('\0').filter(Boolean), read,
-      weights: weigh(sizes, loadWeights()), budgetMs, exclude: named,
+      weights: weigh(sizes, loadWeights()), budgetMs, changedCapMs, exclude: named,
     });
-    console.log(describeSelection({ ...result, changedCount: changed.files.length, basis: changed.basis, budgetMs }));
-    for (const l of describeSelectionDetail(result)) console.log(l);
+    console.log(describeSelection({ ...result, changedCount: changed.files.length, basis: changed.basis, budgetMs, changedCapMs }));
+    for (const l of describeSelectionDetail({ ...result, changedCapMs })) console.log(l);
     const extra = new Set(result.selected.map((s) => s.name));
     return allTests.filter((f) => named.includes(f) || extra.has(f));
   } catch (e) {

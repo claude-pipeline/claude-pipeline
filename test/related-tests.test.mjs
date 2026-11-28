@@ -5,7 +5,7 @@ import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
 import { dirname, join } from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { DEFAULT_BUDGET_MS, DEFAULT_WEAK_BUDGET_MS, changedFiles, describeSelection, describeSelectionDetail, importSpecs, mentionsPath, parseBudget, relatedTests, toPosix } from '../scripts/lib/related-tests.mjs';
+import { DEFAULT_BUDGET_MS, DEFAULT_CHANGED_CAP_MS, DEFAULT_WEAK_BUDGET_MS, changedFiles, describeSelection, describeSelectionDetail, importSpecs, mentionsPath, parseBudget, parseChangedCap, relatedTests, toPosix } from '../scripts/lib/related-tests.mjs';
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..');
 
@@ -85,6 +85,36 @@ test('relatedTests: a changed test file is tier 0 and runs whatever the budget',
   const r = run(['test/unrelated.test.mjs'], { budgetMs: 1 });
   assert.deepEqual(names(r), ['unrelated.test.mjs']);
   assert.equal(tierOf(r, 'unrelated.test.mjs'), 0);
+});
+
+// #686: a heavy changed test file (cli-review.test.mjs, hundreds of seconds) made quick run past its step limit with no failing test.
+test('relatedTests: a changed test over the changed-file cap is deferred to CI (not selected) and named in both description lines', () => {
+  const weights = new Map(tests.map((t) => [t, 100]));
+  weights.set('unrelated.test.mjs', 700_000);
+  const r = run(['test/unrelated.test.mjs', 'lib/leaf.mjs'], { weights, budgetMs: 90_000 });
+  assert.ok(!names(r).includes('unrelated.test.mjs'));
+  assert.deepEqual(r.deferred.map((d) => d.name), ['unrelated.test.mjs']);
+  assert.ok(!r.skipped.some((s) => s.name === 'unrelated.test.mjs'), 'deferred is not "skipped over budget"');
+  assert.ok(r.estimatedMs <= 90_000, 'a deferred file adds no time');
+  const base = { ...r, changedCount: 2, basis: 'b', budgetMs: 90_000 };
+  assert.match(describeSelection(base), new RegExp(`1 changed deferred to CI over changed cap ${DEFAULT_CHANGED_CAP_MS} ms \\(unrelated\\.test\\.mjs; NOT run here\\)`));
+  const detail = describeSelectionDetail(base);
+  assert.ok(detail.some((l) => /^related changed deferred to CI, NOT run here, over changed cap 600000 ms \(1\): unrelated\.test\.mjs \[est\. 700000 ms\] \(end\)$/.test(l)), detail.join('\n'));
+  assert.ok(detail.every((l) => !l.endsWith('.test.mjs')));
+});
+
+test('relatedTests: changedCapMs Infinity (CP_QUICK_CHANGED_CAP_MS=all) keeps the old behaviour: every changed test runs whatever its weight', () => {
+  const r = run(['test/unrelated.test.mjs'], { weights: new Map([['unrelated.test.mjs', 5_000_000]]), budgetMs: 1, changedCapMs: Infinity });
+  assert.deepEqual(names(r), ['unrelated.test.mjs']);
+  assert.deepEqual(r.deferred, []);
+});
+
+test('relatedTests: of two changed test files the lightest is selected and the heaviest deferred', () => {
+  const weights = new Map([['unrelated.test.mjs', 500_000], ['direct.test.mjs', 200_000]]);
+  const r = run(['test/unrelated.test.mjs', 'test/direct.test.mjs'], { weights, budgetMs: 90_000 });
+  assert.deepEqual(names(r), ['direct.test.mjs']);
+  assert.deepEqual(r.deferred.map((d) => d.name), ['unrelated.test.mjs']);
+  assert.equal(r.estimatedMs, 200_000, 'the changed file still counts against the related budget');
 });
 
 test('relatedTests: a path mention (whole path or join segments) makes a test related; a changed bin entry reaches its tests', () => {
@@ -211,6 +241,15 @@ test('parseBudget: unset is the default, "all" lifts the cap, 0 turns related te
   assert.match(bad.error, /not a number of ms/);
 });
 
+test('parseChangedCap: unset is 10 minutes, "all" lifts the cap, junk reports an error naming the variable', () => {
+  assert.deepEqual(parseChangedCap(undefined), { changedCapMs: DEFAULT_CHANGED_CAP_MS });
+  assert.deepEqual(parseChangedCap('all'), { changedCapMs: Infinity });
+  assert.deepEqual(parseChangedCap('1500'), { changedCapMs: 1500 });
+  const bad = parseChangedCap('lots');
+  assert.equal(bad.changedCapMs, DEFAULT_CHANGED_CAP_MS);
+  assert.match(bad.error, /CP_QUICK_CHANGED_CAP_MS/);
+});
+
 test('describeSelection: counts, the skipped names (truncated) and the changed-file count on one line', () => {
   const sel = (name, tier) => ({ name, tier, distance: tier, ms: 1 });
   const line = describeSelection({
@@ -282,7 +321,7 @@ test('changedFiles: a failing git (or a throwing one) is an { error }, never an 
 
 // ---- scripts/test.mjs --related --list ------------------------------------------------------------------------------
 const cli = (args, env = {}) => spawnSync(process.execPath, [join(root, 'scripts', 'test.mjs'), ...args], {
-  cwd: root, encoding: 'utf8', env: { ...process.env, CP_QUICK_RELATED_BUDGET_MS: '', ...env },
+  cwd: root, encoding: 'utf8', env: { ...process.env, CP_QUICK_RELATED_BUDGET_MS: '', CP_QUICK_CHANGED_CAP_MS: '', ...env },
 });
 const listed = (r) => r.stdout.split('\n').filter((l) => l.endsWith('.test.mjs'));
 
@@ -304,6 +343,14 @@ test('test.mjs --related --list: a changed test file runs even with a tiny budge
   assert.ok(out.includes('config.test.mjs'));
   assert.ok(out.length <= 3, out.join(' '));
   assert.match(r.stdout, /skipped over budget/);
+});
+
+test('test.mjs --related --list: a changed test over CP_QUICK_CHANGED_CAP_MS is not listed, is named as deferred to CI, and the named files still run (exit 0)', () => {
+  const r = cli(['--related', '--list', 'config.test.mjs'], { CP_RELATED_CHANGED: 'test/glob.test.mjs', CP_QUICK_CHANGED_CAP_MS: '0' });
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(listed(r).includes('config.test.mjs'));
+  assert.ok(!listed(r).includes('glob.test.mjs'));
+  assert.match(r.stdout, /1 changed deferred to CI over changed cap 0 ms \(glob\.test\.mjs; NOT run here\)/);
 });
 
 test('test.mjs --related --list: CP_QUICK_RELATED_BUDGET_MS=0 runs only the named files; "all" lifts the cap', () => {
