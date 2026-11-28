@@ -338,7 +338,19 @@ test('R1-B8 effectiveCost: a session the record holds survives 20 older sessions
   const bookings = Array.from({ length: 20 }, (_, i) => ({ id: `b-${i}`, data: { id: `b-${i}`, sessions: [`old-${i}`] } }));
   const eff = effectiveCost({ base, bookings });
   assert.ok(eff.cost.sessions.includes('new'), eff.cost.sessions.join(','));
-  assert.equal(eff.cost.sessions.length, 20);
+  assert.equal(eff.cost.sessions.length, 21, 'the replay caps nothing');
+});
+
+// The replay is never written back, so it caps no session: whichever side (record or bookings) holds more than 20, every session stays and the guard-deny read sees them all.
+test('R2-B1 effectiveCost: 20 older record sessions and 20 newer booked ones are all kept, in either order (#958)', () => {
+  const ids = (p) => Array.from({ length: 20 }, (_, i) => `${p}-${i}`);
+  const booked = (p) => ids(p).map((id, i) => ({ id: `b-${i}`, data: { id: `b-${i}`, sessions: [id] } }));
+  const fromRecordFirst = effectiveCost({ base: addSessions(emptyCost(), ids('old')), bookings: booked('new') });
+  assert.deepEqual([...fromRecordFirst.cost.sessions].sort(), [...ids('old'), ...ids('new')].sort(), 'record sessions + booked ones');
+  const base = emptyCost();
+  base.sessions = ids('rec');
+  const mirror = effectiveCost({ base, bookings: booked('bk') });
+  assert.deepEqual([...mirror.cost.sessions].sort(), [...ids('rec'), ...ids('bk')].sort());
 });
 
 test('P cost --pr <an issue, not a PR>: refused before anything is posted (#958)', () => {

@@ -139,13 +139,13 @@ export function deductBookedTranscript(cost, entry, booking, { evict = true } = 
   return { cost: next, entry: out };
 }
 
-export function addSessions(cost, ids) {
+export function addSessions(cost, ids, { evict = true } = {}) {
   const next = structuredClone(isPlainObject(cost) ? { ...emptyCost(), ...cost } : emptyCost());
   for (const id of ids ?? []) {
     if (!SESSION_RE.test(String(id))) throw new Error(`session id ${JSON.stringify(String(id).slice(0, 20))}… is not a plain id`);
     if (!next.sessions.includes(String(id))) next.sessions.push(String(id));
   }
-  next.sessions = next.sessions.slice(-MAX_SESSIONS);
+  if (evict) next.sessions = next.sessions.slice(-MAX_SESSIONS);
   return next;
 }
 
@@ -167,7 +167,7 @@ export function applyCostPatch(cost, patchCost, { evict = true } = {}) {
     next = addCostEntry(next, entry);
   }
   if (patchCost.retries !== undefined) next = addRetries(next, patchCost.retries);
-  if (patchCost.sessions !== undefined) next = addSessions(next, patchCost.sessions);
+  if (patchCost.sessions !== undefined) next = addSessions(next, patchCost.sessions, { evict });
   return next;
 }
 
@@ -175,7 +175,7 @@ export function applyCostPatch(cost, patchCost, { evict = true } = {}) {
 
 // What the PR's cost is NOW: the legacy base (the cost section of the run record, written by an older CLI or by the summary / checkpoint writers; absent => nothing) with every
 // booking (`bookings`: [{ id, data }] in GitHub comment-id order, `data` a cost patch) applied on top through applyCostPatch, the arithmetic the record path uses, so a replay
-// equals what the old read-modify-write would have totalled when nothing raced. `evict: false`: the replay is never written back, so no transcript may fall out of its ledger.
+// equals what the old read-modify-write would have totalled when nothing raced. `evict: false`: the replay is never written back, so no transcript may fall out of its ledger and no session out of the list.
 // -> { cost, contributions: Map<id, {usd, input, output, cacheRead, cacheWrite}> (what each booking added to the total), any (a base cost or at least one booking exists) }
 //    or { unavailable: <reason> } when the record is unreadable (`baseStatus` invalid | unsupported), a booking of the viewer's is corrupt (`corrupt`: the reasons) or the replay fails.
 // Never throws: a display must not be able to stop a command.
@@ -192,8 +192,8 @@ export function effectiveCost({ base, baseStatus = 'ok', bookings = [], corrupt 
       const d = (k) => (Number(cost.total[k]) || 0) - (Number(was?.[k]) || 0);
       contributions.set(id, { usd: Math.round(d('usd') * 1e6) / 1e6, input: d('input'), output: d('output'), cacheRead: d('cacheRead'), cacheWrite: d('cacheWrite') });
     }
-    // The sessions the record holds were put there by a summary AFTER the bookings it saw: the cap keeps the newest 20, so they go in last (older bookings replayed over them would push them out).
-    if (Array.isArray(base?.sessions)) cost = addSessions(cost, base.sessions);
+    // The record's sessions and the booked ones carry no order against each other, so the replay (never written back) caps none of them: all stay, as `evict: false` keeps every transcript.
+    if (Array.isArray(base?.sessions)) cost = addSessions(cost, base.sessions, { evict: false });
     const bad = costShapeProblem(cost);
     if (bad) return { unavailable: `the cost bookings could not be added up (${bad})` };
     return { cost, contributions, any: isPlainObject(base) || bookings.length > 0 };
