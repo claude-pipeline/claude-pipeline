@@ -3,7 +3,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cli, ghEntries, PR, REPO, scenario, ymlFor } from './helpers/gate-env.mjs';
@@ -621,4 +621,16 @@ test('triage ruling-request --ask --recommend reject: shown only when the PR hea
       assert.equal(typeof r.output.ask?.askId, 'string', 'the neutral dialog is still issued');
     }
   }
+});
+
+test('triage ruling-request --ask --recommend reject: a checkout with uncommitted changes gets the neutral dialog even when its HEAD is the PR head', async () => {
+  // failure caught (R5-B2): the head comparison passes on HEAD alone, so a fix sitting uncommitted in the working tree (code Claude read but the PR does not hold) still earned a head-bound Reject that the later click records as already-handled
+  const s = triageWorld(CHAT(), { final: WAITING_ACCEPT }); // (the PR head on GitHub is this checkout's HEAD)
+  appendFileSync(join(s.repo.dir, 'src/app.js'), '// uncommitted fix\n');
+  const r = await askRec(s, '--recommend', 'reject', '--why', 'already-handled');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.dialogVariant, 'ruling-v1');
+  assert.equal(r.output.recommend, null);
+  assert.match(r.output.recommendRefused, /uncommitted changes/);
+  assert.equal(typeof r.output.ask?.askId, 'string', 'the neutral dialog is still issued');
 });

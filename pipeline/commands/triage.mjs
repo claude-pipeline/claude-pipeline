@@ -459,6 +459,8 @@ async function ownerRuling(rest, ctx) {
         if (issuedAt?.ok === true) {
           const { head: askedHead, prHead: askedPrHead } = issuedAt.ask;
           if (typeof askedHead !== 'string' || typeof askedPrHead !== 'string') moved = 'the ask recorded no PR head to compare with, so the code Claude checked cannot be told apart from the code now';
+          // R5-B1: an ask issued by an earlier build that accepted an ancestor PR head recorded two heads that differ from each other; both can be unchanged since, yet the code Claude checked was never the PR's
+          else if (askedHead !== askedPrHead) moved = 'the ask recorded different PR heads (this checkout and GitHub), so the code Claude checked was not the PR\'s code';
           else {
             const nowHead = headSha({ cwd: root });
             let nowPrHead = null;
@@ -1047,7 +1049,9 @@ async function rulingRequest(rest, ctx) {
     if (shown && gate.ok && RULING_HEAD_BOUND_VARIANTS.includes(dialogVariant)) {
       const head = headSha({ cwd: root });
       const prHead = gh.prView(pr, ['headRefOid']).headRefOid;
-      if (typeof prHead === 'string' && prHead === head) heads = { head, prHead };
+      // R5-B2: HEAD equal to the PR head says nothing about files edited since: a dirty working tree is code the PR does not hold
+      if (typeof prHead === 'string' && prHead === head && !isClean({ cwd: root })) headRefusal = 'the checkout has uncommitted changes, so the code Claude checked may not be the PR\'s code: commit and push, then recommend again';
+      else if (typeof prHead === 'string' && prHead === head) heads = { head, prHead };
       else headRefusal = `the PR head on GitHub (${String(prHead).slice(0, 12)}) is not this checkout's HEAD (${head.slice(0, 12)}), so the code Claude checked may not be the PR's code: push or pull, then recommend again`;
     }
     const recommended = shown && headRefusal === null;

@@ -1539,7 +1539,7 @@ test('#944 drift: an answer on a recommended Reject / fix-separately dialog is r
 });
 
 test('#944 drift: a recommended Reject click is refused when the PR head on GitHub moved or cannot be read, or the ask recorded no head to compare; unpushed local commits do not matter', async (t) => {
-  // failure caught (R2-B1): a push from another checkout leaves this checkout's HEAD where it was, so the old Reject click was recorded for code Claude never read; (R2-B2): an ask with no recorded head skipped the comparison and recorded it too
+  // failure caught (R5-B1): a pending ask recorded with head and prHead apart passed both unchanged-since comparisons; (R2-B1): a push from another checkout leaves this checkout's HEAD where it was, so the old Reject click was recorded for code Claude never read; (R2-B2): an ask with no recorded head skipped the comparison and recorded it too
   const REJECT = { recommend: 'reject', why: 'already-handled', label: 'Reject all (Recommended)' };
   const ghScript = (w) => { const file = w.fake.env.PIPELINE_FAKE_GH_SCRIPT; return { read: () => JSON.parse(readFileSync(file, 'utf8')), write: (entries) => writeFileSync(file, JSON.stringify(entries)) }; };
   const setPrView = (w, over) => { const g = ghScript(w); g.write(g.read().map((e) => (e.match === '^pr view 7' ? { ...e, ...over } : e))); };
@@ -1577,6 +1577,16 @@ test('#944 drift: a recommended Reject click is refused when the PR head on GitH
     assert.equal(denied.exitCode, 1, JSON.stringify(denied.output));
     assert.match(denied.output.reason, /recorded no PR head to compare with/);
   }
+  // R5-B1: an ask whose two heads differ (issued by an earlier build that accepted an ancestor PR head) is refused even when both are unchanged since
+  const apart = e2eWorld(t);
+  const a = await clickedRuling(t, apart, { ids: ['R1-B1'], ...REJECT });
+  const other = 'e'.repeat(40);
+  const askFile = join(asksDir(a.home), `${a.ask.askId}.json`);
+  writeFileSync(askFile, JSON.stringify({ ...JSON.parse(readFileSync(askFile, 'utf8')), prHead: other }));
+  setPrView(apart, { stdoutJson: { title: 'Add compute', body: 'Adds compute()', headRefName: 'feat/x', baseRefName: 'main', headRefOid: other } });
+  const split = await a.ownerRuling('R1-B1', 'REJECT', 'R1-B1: reject');
+  assert.equal(split.exitCode, 1, JSON.stringify(split.output));
+  assert.match(split.output.reason, /recorded different PR heads/);
 });
 
 test('#944 drift: a two-id ruling-v2-reject click is refused when the sibling is an arbiter ACCEPT whose fix is built (not waiting, not deferrable, not protected)', async (t) => {
