@@ -112,7 +112,15 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
       if (clickProvenance(r, { home }) !== 'owner') { skip('unverified', 'the owner\'s click on the live-database dialog cannot be verified from the transcript: ask the owner to type the go instead'); continue; }
       if (r.transcript_path !== transcriptPath) { skip('unverified', 'the recorded click is from another transcript than this call\'s'); continue; }
       // R6-F1: as for the typed go, the owner must have been shown the whole block in the reply: the text right before the AskUserQuestion call ends with the block the dialog carries.
-      const shown = replyBeforeToolUse(transcriptPath, r.ask.toolUseId);
+      let shown = replyBeforeToolUse(transcriptPath, r.ask.toolUseId);
+      // #983: Claude Code sometimes records no text before the call, only a progress note (a `thinking` block). The owner then read the block in the dialog's own question (clickProvenance above proved the
+      // transcript's question is the ask file's), so that question's block, rebuilt by the same verifyBlock, stands in for the reply. Only this case: any other refusal reason stays.
+      if (shown.text === undefined && shown.progressNote === true) {
+        const asked = readAsk(r.ask.askId, { home });
+        const q = asked.ok ? String(asked.ask?.dialog?.question ?? '') : '';
+        const cut = q.indexOf('\n\n');
+        if (cut >= 0) shown = { text: q.slice(cut + 2) };
+      }
       const sv = shown.text === undefined ? null : verifyBlock(shown.text, { home, io });
       const sf = sv?.fields;
       if (!sv?.ok || sf.op !== r.op || sf.ref !== r.projectRef || sf.sqlSha256 !== r.sqlSha256 || sf.head !== r.head || sf.file !== r.file || sf.repo !== r.repo || sf.name !== r.name) {
