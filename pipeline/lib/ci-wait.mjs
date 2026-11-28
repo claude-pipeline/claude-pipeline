@@ -657,10 +657,16 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (unverified) return unverifiedResult();
     const others = await otherChecks(obs, identities);
     // A `needs:`-gated job has no check run until its predecessor finishes: an unfinished workflow run of the head still counts as a running other (R1-B2; the same headRuns read as findHolder).
+    let anyActiveRun = false;
     if (readers.headRuns) {
       for (const w of await readers.headRuns(head)) {
-        if (w && ACTIVE_WORKFLOW_RUN.has(w.status)) others.push({ name: w.name ?? `workflow run ${w.id ?? '?'}`, status: w.status, url: w.html_url ?? null });
+        if (w && ACTIVE_WORKFLOW_RUN.has(w.status)) {
+          anyActiveRun = true;
+          others.push({ name: w.name ?? `workflow run ${w.id ?? '?'}`, status: w.status, url: w.html_url ?? null });
+        }
       }
+      // The check runs were read before the workflow runs: a gated job created and finished in between is in neither list. With no run active any more, read the check runs once more (R2-B1; never a third pass).
+      if (!anyActiveRun && !confirmed) return decide(await reread(), true);
     }
     const owedNote = notOwed.length > 0 ? { notOwed } : {};
     // The required checks are green but a non-required check of the head is still running: keep waiting for it until --timeout (a red or finished one ends the wait as `passed` with `others`).
@@ -675,8 +681,8 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if (others.length > 0) {
       const list = (xs) => xs.map((o) => `${o.name}=${o.status}`).join(', ');
       const red = others.filter((o) => !RUNNING_OTHER.has(o.status));
-      // Only a running entry is waited for; a finished red one never turns green: it is named to the owner in the hand-off.
-      const advice = [...(running.length > 0 ? [`do not hand off before the running one(s) finish: ${list(running)}`] : []), ...(red.length > 0 ? [`report the red one(s) to the owner in the hand-off: ${list(red)}`] : [])].join('; ');
+      // Only a running entry is waited for (restarts are capped by the hand-off guide); a finished red one never turns green: the guide's rule is stated for it (a red e2e suite is fixed first, any other is named to the owner).
+      const advice = [...(running.length > 0 ? [`still running: ${list(running)}: start ci-wait again (up to the restart cap in the hand-off guide), then name the still-running check to the owner and hand off`] : []), ...(red.length > 0 ? [`red: ${list(red)}: a red e2e suite is fixed before the hand-off (treat it as failed); any other red check is named to the owner in the hand-off`] : [])].join('; ');
       return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this PR are not green: ${list(others)}: ${advice}` });
     }
     return result(EXIT.OK, 'passed', { ...owedNote, others });

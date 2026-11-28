@@ -1658,18 +1658,18 @@ test('others (#743): a non-required check still running at --timeout ends as pas
   assert.equal(r.output.verdict, 'passed');
   assert.deepEqual(r.output.others, [{ name: 'SQL arms', status: 'in_progress', url: 'https://github.example/runs/sql' }]);
   assert.match(r.output.message, /SQL arms=in_progress/);
-  assert.match(r.output.message, /do not hand off before the running one\(s\) finish: SQL arms=in_progress/);
+  assert.match(r.output.message, /still running: SQL arms=in_progress: start ci-wait again \(up to the restart cap in the hand-off guide\), then name the still-running check to the owner and hand off/);
   assert.ok(s.elapsed() >= 60_000);
 });
 
 // Catches (R1-B5): a red non-required check telling the session "do not hand off" although it never turns green: the hand-off would never happen.
 test('others (#743): a red non-required check is to be reported to the owner in the hand-off, never waited for ("do not hand off" is for running entries only)', async () => {
   const red = await sim({ classic: present('A'), checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', 'failure', { id: 2 })] }).run();
-  assert.doesNotMatch(red.output.message, /do not hand off/);
-  assert.match(red.output.message, /report the red one\(s\) to the owner in the hand-off: Playwright suite=failure/);
+  assert.doesNotMatch(red.output.message, /do not hand off|start ci-wait again/);
+  assert.match(red.output.message, /red: Playwright suite=failure: a red e2e suite is fixed before the hand-off \(treat it as failed\); any other red check is named to the owner in the hand-off/);
   const mixed = await sim({ classic: present('A'), checkRuns: [cr('A', 'success', { id: 1 }), cr('Playwright suite', 'failure', { id: 2 }), cr('SQL arms', null, { id: 3 })] }, { timeoutMs: 30_000 }).run();
-  assert.match(mixed.output.message, /do not hand off before the running one\(s\) finish: SQL arms=in_progress/);
-  assert.match(mixed.output.message, /report the red one\(s\) to the owner in the hand-off: Playwright suite=failure/);
+  assert.match(mixed.output.message, /still running: SQL arms=in_progress: start ci-wait again/);
+  assert.match(mixed.output.message, /red: Playwright suite=failure: a red e2e suite is fixed before the hand-off/);
 });
 
 // Catches (R1-B2): a `needs:`-gated non-required job (EW "SQL arms pass lookup" -> "SQL arms (shard n/3)") has no check run until its predecessor finishes; a poll
@@ -1684,6 +1684,16 @@ test('others (#743): an unfinished workflow run of the head with no check run ye
   assert.ok(s.elapsed() >= 100_000, 'it waited for the workflow run to finish');
   const stuck = await sim(world([wf]), { timeoutMs: 60_000 }).run();
   assert.deepEqual(stuck.output.others, [{ name: 'Migration replay', status: 'in_progress', url: 'https://github.example/actions/9' }]);
+});
+
+// Catches (R2-B1): the check runs are read before the head's workflow runs; a `needs:`-gated job created and failed in between left `passed, others: []` (the head run is already completed).
+test('others (#743): a non-required job that appears and fails between the check-run read and the workflow-run read is found by one more check-run read', async () => {
+  const done = { id: 9, name: 'Migration replay', status: 'completed', created_at: '2026-01-01T12:00:05Z' };
+  const s = sim({ classic: present('A'), headRuns: [done], checkRuns: (t, n) => [cr('A', 'success', { id: 1 }), ...(n >= 2 ? [cr('SQL arms (shard 1/3)', 'failure', { id: 2 })] : [])] });
+  const r = await s.run();
+  assert.equal(r.output.verdict, 'passed');
+  assert.deepEqual(r.output.others.map((o) => [o.name, o.status]), [['SQL arms (shard 1/3)', 'failure']]);
+  assert.equal(s.reads.checkRuns, 2, 'one more read, never a third');
 });
 
 // Catches (R1-F1): the default wait for a running non-required check printing nothing for up to an hour (the last line stayed "no check is waiting").
