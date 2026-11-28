@@ -18,7 +18,7 @@ import { readReviewGate } from '../lib/model-floor.mjs';
 import { wholePrOwed } from '../lib/review-route.mjs';
 import { roundStats } from '../lib/round-stats.mjs';
 import { hashBranch, prBaseBranch, trustedDefaultBranch } from '../lib/risk.mjs';
-import { addRound, loadState, saveState, updateItems } from '../lib/state.mjs';
+import { addRound, loadState, lowerCapTo, saveState, updateItems } from '../lib/state.mjs';
 import { DEFERRABLE_ACCEPT_BY, arbiterFailures, capLowItems, countsTowardCap, finalIsReopenable, isDeferrableAccept, isOwnerDeferral, isOwnerRuled, isPostMaxFinal, isProtectedFinal, reviewedRoundCount, roundOutcome, staleFableRounds, staleSubstituteFableRounds } from '../lib/triage.mjs';
 import { newerFormatText, pastRoundHistoryProblem, publishTriage, readBaseline, readPublished, reviewContentHash, writeBaseline } from '../lib/review-publish.mjs';
 import {
@@ -503,7 +503,7 @@ async function outcome(rest, ctx) {
   const { values } = parseCommandArgs(rest, { repo: { type: 'string' } }, { allowPositionals: false });
   const root = resolveRepo(values, ctx);
   const { config } = await requireConfig(root);
-  const state = requireState(root);
+  const state = lowerCapTo(requireState(root), config.review?.max_rounds); // one cap for the decision and the report (#923)
   // Best effort: a stale origin/<trusted default branch> (after update-branch + a plain pull) only makes coverage look invalid; offline keeps the cached ref.
   refreshBaseRef(root, config);
   const hash = currentContentHash(root, config);

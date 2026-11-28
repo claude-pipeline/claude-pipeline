@@ -199,6 +199,39 @@ test('round-request: all the existing refusals stay (label mode, wrong PR, a rou
   assert.equal(allowed.json.summary, undefined);
 });
 
+test('round-request: a state stored under cap 4 after review.max_rounds was lowered to 3 asks for round 4 (the same cap codex-review admits with); state outcome reports the lowered cap (#923)', (t) => {
+  const w = roundWorld(t, { max: 3 });
+  const h1 = w.reviewAndFix(1, w.base, w.head, [low({ title: 'Issue 1' })]);
+  const h2 = w.reviewAndFix(2, w.head, h1, [low({ title: 'Issue 2' })]);
+  const clean = w.codex(3, findingsOf([], []), { from: h1, to: h2 });
+  assertExit(clean, 0, clean.stderr + clean.stdout);
+  w.repo.write('src/more.js', 'export const more = 1;\n');
+  const h3 = w.repo.commit('after the clean round');
+  w.edit((s) => { s.maxRounds = 4; }); // the state was created when review.max_rounds was 4; the config has since been lowered to 3
+  const r = ask(w);
+  assertExit(r, 0, r.stderr + r.stdout);
+  assert.equal(r.json.line, `🔁 Extra review round needed #7: round 4 · head ${h3.slice(0, 12)} · repo ${w.slug}`);
+  const o = w.cli(['state', 'outcome']);
+  assert.equal(o.json.maxRounds, 3, 'the reported cap is the one the decision used');
+  assert.equal(o.json.effectiveMaxRounds, 3);
+});
+
+test('round-request: while a round that ran under the old higher cap still needs the owner\'s approval it prints no extra-round line and points to --past (#923)', (t) => {
+  // failure caught: the owner is asked for round 4 first, then codex-review refuses it until round 3 is approved
+  const w = roundWorld(t, { max: 2 });
+  const h1 = w.reviewAndFix(1, w.base, w.head, [low({ title: 'Issue 1' })]);
+  const h2 = w.reviewAndFix(2, w.head, h1, [low({ title: 'Issue 2' })]);
+  const third = w.codex(3, findingsOf([], []), { from: h1, to: h2 });
+  assertExit(third, 0, third.stderr + third.stdout);
+  w.edit((s) => { s.maxRounds = 3; s.rounds[2].admission = 'normal'; }); // round 3 ran as an ordinary round under cap 3; the config has since been lowered to 2
+  w.repo.write('src/more.js', 'export const more = 1;\n');
+  w.repo.commit('after round 3');
+  const r = ask(w);
+  assertExit(r, 1);
+  assert.match(r.json.reason, /round 3 ran past review\.max_rounds \(2\) under a higher limit.*round-request --pr 7 --past/);
+  assert.equal(r.json.line, undefined);
+});
+
 // ---- the round trip-wire (#374 PR B): a prompt, not a gate ----------------------------------------------------------------------------------------------------------
 
 // maxRounds 1, rounds 1 and 2 accepted one fix each: the count did not fall, and 2 rounds are reviewed (limit 1).

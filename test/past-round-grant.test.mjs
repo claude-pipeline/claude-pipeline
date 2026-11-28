@@ -8,7 +8,7 @@ import { join } from 'node:path';
 import { assertExit } from './helpers/assert-exit.mjs';
 import { roundWorld } from './helpers/round-world.mjs';
 import { cleanupAtExit, ownerApprovesPast, ownerGrants, pastRoundRequest, roundRequest } from './helpers/owner-go.mjs';
-import { addRound, decodeFromComment, emptyState, saveState } from '../pipeline/lib/state.mjs';
+import { addRound, decodeFromComment, emptyState, lowerCapTo, saveState } from '../pipeline/lib/state.mjs';
 import { triageComment } from '../pipeline/lib/render.mjs';
 import { roundOutcome } from '../pipeline/lib/triage.mjs';
 import { readBaseline, reviewContentHash, writeBaseline } from '../pipeline/lib/review-publish.mjs';
@@ -79,6 +79,53 @@ test('pastRoundsNeedingApproval: the plan\'s rules, n != k, exclusions, last rou
   assert.deepEqual(pastRoundsNeedingApproval(g, g, ctx).map((x) => x.n), [3, 5]);
   const bad = build('acme/widgets', SPEC.map((r) => (r.n === 3 ? { ...r, ownerGrant: { ...gone, grantId: 'zz' } } : r)));
   assert.deepEqual(pastRoundsNeedingApproval(bad, bad, ctx).map((x) => x.n), [5]);
+});
+
+test('pastRoundsNeedingApproval: a state that ran under a higher cap qualifies only the rounds that cap could hold, and a migrated round whose record is gone qualifies again (#923)', () => {
+  // failure caught: a grant-less round 5 of a cap-3 state (round 5 needed an owner grant under both caps) approved through the migration exception while it is the newest round
+  const ran = (ns, max = 2, from = 3, extra = {}) => ({ ...build('acme/widgets', ns.map((n) => ({ n, admission: 'normal', ...(extra[n] ?? {}) }))), maxRounds: max, capLoweredFrom: from });
+  const ctx = { maxRounds: 2, repo: 'acme/widgets', pr: 7 };
+  const five = ran([1, 2, 3, 4, 5]);
+  assert.deepEqual(pastRoundsNeedingApproval(five, five, ctx).map((x) => x.n), [3], 'normal only up to the old cap (3)');
+  const auto = ran([1, 2, 3, 4, 5], 2, 3, { 4: { admission: 'auto-extra' } });
+  assert.deepEqual(pastRoundsNeedingApproval(auto, auto, ctx).map((x) => x.n), [3, 4], 'auto-extra up to the old cap + 1');
+  // the recorded higher cap must exceed the configured one and stay in the config range
+  for (const bogus of [3, 99, null, '3']) {
+    const s = ran([1, 2, 3], 2, bogus);
+    assert.deepEqual(pastRoundsNeedingApproval(s, s, bogus === 3 ? { ...ctx, maxRounds: 3 } : ctx).map((x) => x.n), [], `capLoweredFrom ${JSON.stringify(bogus)}`);
+  }
+  // R2-B2: the owner approved round 3 after it ran (admission owner, a past grant); its record is gone: offered again, even as the newest round
+  const gone = { grantId: 'a'.repeat(16), k: 3, quote: 'approve round', ownerTs: '2026-11-01T00:00:00.000Z', past: true };
+  const migrated = ran([1, 2, 3], 2, 3, { 3: { admission: 'owner', ownerGrant: gone } });
+  assert.deepEqual(pastRoundsNeedingApproval(migrated, migrated, ctx).map((x) => x.n), [3]);
+  // control: the same round in a state that never ran under a higher cap is skipped as before (k = max + 1, no later round)
+  const never = { ...migrated, capLoweredFrom: undefined };
+  assert.deepEqual(pastRoundsNeedingApproval(never, never, ctx), []);
+});
+
+test('pastRoundsNeedingApproval: a legacy state (no admission fields) that ran under cap 3 offers its newest round 4, the old automatic extra, for approval (R3-B1)', () => {
+  // failure caught: cap 3 lowered to 2, four rounds without admission; round 4 (the old automatic extra, the newest) is required to carry a grant but is never offered, so the gate refuses it with no remedy
+  const s = { ...build('acme/widgets', [1, 2, 3, 4].map((n) => ({ n }))), maxRounds: 2, capLoweredFrom: 3 };
+  assert.deepEqual(pastRoundsNeedingApproval(s, s, { maxRounds: 2, repo: 'acme/widgets', pr: 7 }).map((x) => x.n), [3, 4]);
+  // control: admitted 'normal' stays bounded by the old cap itself
+  const normal = { ...build('acme/widgets', [1, 2, 3, 4].map((n) => ({ n, admission: 'normal' }))), maxRounds: 2, capLoweredFrom: 3 };
+  assert.deepEqual(pastRoundsNeedingApproval(normal, normal, { maxRounds: 2, repo: 'acme/widgets', pr: 7 }).map((x) => x.n), [3]);
+});
+
+test('verifyOwnerGrants: a stored maxRounds above 5 or a capLoweredFrom outside 1..5 is refused as an untrusted cap (R3-B2)', () => {
+  // failure caught: a tampered state (maxRounds 99, or capLoweredFrom 99) is ignored by higherCapOf, so its rounds are judged against the lowered cap as if nothing were wrong and the cap is silently believed
+  const ctx = { repo: 'acme/widgets', pr: 7, maxRounds: 2 };
+  const base = build('acme/widgets', [1, 2].map((n) => ({ n, admission: n === 1 ? 'normal' : 'auto-extra' })));
+  assert.equal(verifyOwnerGrants({ ...base, maxRounds: 2 }, ctx).ok, true, 'control: an untouched state passes');
+  assert.equal(verifyOwnerGrants({ ...base, maxRounds: 2, capLoweredFrom: 3 }, ctx).ok, true, 'control: a valid capLoweredFrom passes');
+  const high = verifyOwnerGrants({ ...base, maxRounds: 99 }, ctx);
+  assert.equal(high.ok, false);
+  assert.match(high.problems.join('|'), /records maxRounds 99.*the cap cannot be trusted/);
+  for (const bogus of [99, 0, 2.5, '3', null]) {
+    const r = verifyOwnerGrants({ ...base, maxRounds: 2, capLoweredFrom: bogus }, ctx);
+    assert.equal(r.ok, false, `capLoweredFrom ${JSON.stringify(bogus)}`);
+    assert.match(r.problems.join('|'), /capLoweredFrom.*the cap cannot be trusted/);
+  }
 });
 
 test('verifyOwnerGrants: the refusal for a qualifying round names the remedy; others keep their text; never throws', () => {
@@ -424,4 +471,23 @@ test('state show: a copy AHEAD of the PR only in a round-level proof, while the 
   assertExit(pub, 0, pub.stderr + pub.stdout);
   const out = w.published();
   assert.deepEqual([out.rounds.find((r) => r.n === 2).modelProof, out.rounds.find((r) => r.n === 3).ownerGrant], [proof, grant], 'the PR holds the proof and the grant');
+});
+
+test('lowerCapTo: a present but malformed capLoweredFrom is kept as it is, so the verifier still refuses it; a valid one is kept (R4-B1)', () => {
+  // failure caught: lowering the cap again replaced a corrupt capLoweredFrom (null) with the stored cap, so verifyOwnerGrants passed a state whose recorded history was corrupt
+  const ctx = { repo: 'acme/widgets', pr: 7, maxRounds: 2 };
+  const base = build('acme/widgets', [1, 2].map((n) => ({ n, admission: n === 1 ? 'normal' : 'auto-extra' })));
+  for (const bogus of [null, '3', 0, 99]) {
+    const lowered = lowerCapTo({ ...base, maxRounds: 3, capLoweredFrom: bogus }, 2);
+    assert.equal(lowered.maxRounds, 2, `the cap is still lowered (${JSON.stringify(bogus)})`);
+    assert.equal(lowered.capLoweredFrom, bogus, `capLoweredFrom ${JSON.stringify(bogus)} stays as it was`);
+    const r = verifyOwnerGrants(lowered, ctx);
+    assert.equal(r.ok, false, `capLoweredFrom ${JSON.stringify(bogus)}`);
+    assert.match(r.problems.join('|'), /capLoweredFrom.*the cap cannot be trusted/);
+  }
+  // control: a valid recorded cap is kept (the highest one), a missing one is created, and the verifier passes
+  assert.equal(lowerCapTo({ ...base, maxRounds: 3, capLoweredFrom: 4 }, 2).capLoweredFrom, 4);
+  const fresh = lowerCapTo({ ...base, maxRounds: 3 }, 2);
+  assert.equal(fresh.capLoweredFrom, 3);
+  assert.equal(verifyOwnerGrants(fresh, ctx).ok, true);
 });
