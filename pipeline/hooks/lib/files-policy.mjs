@@ -5023,8 +5023,8 @@ const STEERABLE = /^(?:node|nodejs|deno|bun|bunx|tsx|ts-node|python\d*(?:\.\d+)*
 // runner) is named as plainly as the literal path is: the `$` there does not make the command a code runner (the install script's `"$BIN/helper" version` after a `launchctl` line was refused). Quoted,
 // so it cannot split into words. Any other `$` or backtick in the command word may be the program itself.
 const QUOTED_VAR_PROGRAM = /^"\$(?:\{(\w+)\}|(\w+))(?:"(\/[^\s"'$`\\*?[{]+)?|(\/[^\s"'$`\\*?[{]+)")$/;
-// (by CLASS of name: a program that starts other programs -- a wrapper the parser unwraps, a shell, an interpreter, a steerable runner -- is read by the parser only under its literal name, so a name held in a variable hides what it runs)
-const startsPrograms = (n) => STEERABLE.test(n) || WRAPPER_CMDS.has(n) || WRAPPER_NAMES.includes(n) || SHELL_NAMES.has(n) || SHELLS.has(n) || INTERPRETERS.test(n) || INLINE_RUNNERS.test(n);
+// (by CLASS of name: a program that starts other programs -- a wrapper the parser unwraps, a shell, an interpreter that is no inline runner (runsInlineCode judges those), a steerable runner -- is read by the parser only under its literal name, so a name held in a variable hides what it runs)
+const startsPrograms = (n) => STEERABLE.test(n) || WRAPPER_CMDS.has(n) || WRAPPER_NAMES.includes(n) || SHELL_NAMES.has(n) || SHELLS.has(n) || (INTERPRETERS.test(n) && !INLINE_RUNNERS.test(n));
 function plainVarProgram(word, c, cmds, ctx) {
   const m = QUOTED_VAR_PROGRAM.exec(word);
   if (!m) return false;
