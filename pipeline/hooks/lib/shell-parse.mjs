@@ -481,7 +481,8 @@ function unwrapTaskset(argv) {
 // (#990) util-linux also reads `script [options] [file] -- command...`: the words after the `--` are the command, where the BSD reading above takes the first of them for the typescript file
 // (`script -- git push origin main` judged a command named `push`). Both readings are judged: the util-linux one is an `alts` child (see unwrapEnv), the only one when the BSD one has no command left.
 function unwrapScript(argv) {
-  for (let i = 1; i < argv.length; i++) {
+  const dash = scriptUtilLinux(argv).dash; // (a -c / --command after script's own `--` is the child's: `script -- git -c k=v push`)
+  for (let i = 1; i < (dash >= 0 ? dash : argv.length); i++) {
     const t = argv[i];
     if (t === '--command') return argv[i + 1] === undefined ? null : shellCmd(argv[i + 1]);
     if (t.startsWith('--command=')) return shellCmd(t.slice('--command='.length));
@@ -651,7 +652,7 @@ function scriptOutputs(argv) {
       if (t === '--') { i++; break; }
       if (t.length < 2 || t[0] !== '-') break;
       let step = 1;
-      for (let k = 1; k < t.length; k++) if (t[k] === 't' || t[k] === 'T') { if (k === t.length - 1) step = 2; break; }
+      for (let k = 1; k < t.length; k++) if (t[k] === 't' || t[k] === 'T' || t[k] === 'c') { if (k === t.length - 1) step = 2; break; } // (-c: util-linux's command word, never the file)
       i += step;
     }
     if (i >= argv.length) out.push('typescript');
@@ -755,7 +756,7 @@ export function wrapperTargetsOf(c, next) {
   const outs = c?.wrapperOuts;
   if (!outs || !outs.length) return [];
   if (!outs.some((o) => o.tty && !o.pty)) return outs;
-  const piped = typeof next?.sep === 'string' && next.sep.startsWith('|');
+  const piped = next?.sep === '|' || next?.sep === '|&'; // (exactly: `||` is no pipe, stdout stays the terminal)
   const redirected = (c.redirects ?? []).some((r) => ['>', '>>', '&>', '&>>', '>|', '>&'].includes(r.op) && (r.fd === null || r.fd === undefined || r.fd === 1) && typeof r.target === 'string' && !/^&(?:\d+|-)$/.test(r.target));
   return piped || redirected ? outs.filter((o) => !o.tty || o.pty) : outs;
 }

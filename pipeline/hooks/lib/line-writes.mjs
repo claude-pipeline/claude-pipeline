@@ -428,10 +428,11 @@ function stdoutItems(cmd) {
 const FD_DUP = /^&(?:\d+|-)$/; // (>&2, >&-: the only duplications)
 function redirectRecords(cmd, idx, next) {
   const out = [];
-  // (#902) a wrapper's own output file (script log, time -o, screen log, flock lock, nohup.out): the name is certain, the content is not. It appends, so it is never a certain replacement of what the line wrote before.
+  // (#902) a wrapper's own output file (script log, time -o, screen log, nohup.out): the name is certain, the content is not. It appends, so it is never a certain replacement of what the line wrote before.
   // `wrapper` names the writer for the refusal's wording; `wchdir` is where its wrapper had moved to BEFORE it started (see locateDest).
+  // flock only opens its lock file (empty when it creates it), it never writes content: no record (the files guard still refuses a protected lock file, from wrapperOuts)
   for (const o of wrapperTargetsOf(cmd, next)) {
-    if (typeof o.target !== 'string' || !o.target || o.target === '/dev/null') continue;
+    if (typeof o.target !== 'string' || !o.target || o.target === '/dev/null' || o.wrapper === 'flock') continue;
     out.push({ idx, dest: o.target, items: UNKNOWN, append: true, wrapper: o.wrapper, ...(o.chdir !== undefined ? { wchdir: o.chdir } : {}) });
   }
   for (const r of cmd.redirects ?? []) {
@@ -1996,7 +1997,14 @@ export function exportRecords(f, idx, existing = []) {
       const more = key === 'file' && rec.link === 'sym' && d && !f.isAbs(expandWord(f, it.file) ?? '/') ? [f.p.resolve(f.p.dirname(d), expandWord(f, it.file))] : []; // a symlink's relative source is read from the link's directory
       return [...paths, ...more].map((p) => ({ [key]: p }));
     });
-    const dests = rec.dest === null ? [null] : (absOf(rec.dest, rec.idx) ?? [null]);
+    // (#902) a wrapper's dest is placed from the directory its command started in (locateDest); null (it cannot be told) leaves dest null: any file
+    const destOf = () => {
+      if (rec.wrapper === undefined) return absOf(rec.dest, rec.idx) ?? [null];
+      const e = expandWord(f, rec.dest);
+      if (e === null) return [null];
+      return (locateDest(f, e, rec) ?? [null]).filter((x) => x === null || f.isAbs(x));
+    };
+    const dests = rec.dest === null ? [null] : destOf();
     for (const d of dests.length ? dests : [null]) {
       const items = convert(rec.items, d);
       out.push({ ...rec, idx, bg: place.bg, opt: place.opt, dest: d, items, parts: rec.parts?.map((part) => convert(part, d)), ...(rec.generic ? { generic: rec.generic.flatMap((w) => { const ps = absOf(w, rec.idx); return ps && ps.length ? ps : [w]; }) } : {}) });
