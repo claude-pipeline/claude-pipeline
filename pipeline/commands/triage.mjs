@@ -451,14 +451,18 @@ async function ownerRuling(rest, ctx) {
         // R2-B3: "this same answer" is judged as the owner-go record lookup judges it (white space collapsed, case ignored): an equivalent spelling of the answer, stored by an earlier call, is the same answer
         const same = (q) => String(q ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
         const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || !(i.final?.by === 'owner' && same(i.final?.ownerQuote) === same(ownerQuote)));
-        // R1-B2 (#954): a recommended Reject / fix-separately was Claude's reading of the code at the head the ask was issued at; a click is stale once the head moved (an ask file that cannot be read is not judged here).
+        // R1-B2 (#954): a recommended Reject / fix-separately was Claude's reading of the code at the head the ask was issued at; a click is stale once the head moved (R1-B1, #977: an ask file that exists but cannot be read now is refused too; one that is absent is not judged here).
         // R2-B2: a readable head-bound ask that recorded no head, or no PR head on GitHub, cannot be compared at all: refused, not skipped. R2-B1: the PR head on GitHub is compared too (a push from another checkout
         // leaves this checkout's HEAD where it was), and one that cannot be read is refused; local commits not pushed yet do not matter, only a change since the ask.
         const issuedAt = RULING_HEAD_BOUND_VARIANTS.includes(r.ask.variant) ? readAsk(r.ask.askId, { home: ctx.home }) : null;
         let moved = null;
-        if (issuedAt?.ok === true) {
+        // R1-B1 (#977): a file that exists but no longer reads is refused, never skipped. R2-B1: so is one that vanished after a click validated it ('none' stays unjudged only for a record that is not a click: typed fixtures record a variant with no file)
+        if (issuedAt?.ok === false && (issuedAt.reason !== 'none' || r.via === 'ask')) moved = 'the ask file could not be read, so the code Claude checked cannot be told apart from the code now';
+        else if (issuedAt?.ok === true) {
           const { head: askedHead, prHead: askedPrHead } = issuedAt.ask;
           if (typeof askedHead !== 'string' || typeof askedPrHead !== 'string') moved = 'the ask recorded no PR head to compare with, so the code Claude checked cannot be told apart from the code now';
+          // #977: the heads alone cannot tell an ask issued from a dirty checkout (an earlier build did not check) from a good one; only the marker the clean-checkout check writes can
+          else if (issuedAt.ask.headClean !== true) moved = 'the ask was issued by a build that did not check that the working tree was clean, so the code Claude checked may not be the PR\'s code';
           // R5-B1: an ask issued by an earlier build that accepted an ancestor PR head recorded two heads that differ from each other; both can be unchanged since, yet the code Claude checked was never the PR's
           else if (askedHead !== askedPrHead) moved = 'the ask recorded different PR heads (this checkout and GitHub), so the code Claude checked was not the PR\'s code';
           else {
@@ -1050,8 +1054,13 @@ async function rulingRequest(rest, ctx) {
       const head = headSha({ cwd: root });
       const prHead = gh.prView(pr, ['headRefOid']).headRefOid;
       // R5-B2: HEAD equal to the PR head says nothing about files edited since: a dirty working tree is code the PR does not hold
-      if (typeof prHead === 'string' && prHead === head && !isClean({ cwd: root })) headRefusal = 'the checkout has uncommitted changes, so the code Claude checked may not be the PR\'s code: commit and push, then recommend again';
-      else if (typeof prHead === 'string' && prHead === head) heads = { head, prHead };
+      // R2-B2: "clean" is judged against the saved HEAD (index and working tree both equal it), so a reset to another commit and back around the check cannot pass
+      if (typeof prHead === 'string' && prHead === head && !isClean({ cwd: root }, head)) headRefusal = 'the checkout has uncommitted changes, so the code Claude checked may not be the PR\'s code: commit and push, then recommend again';
+      // R1-B2 (#977): the marker is set only when HEAD is still the one saved (another process may have committed during the lookup, so the clean tree would be a different commit's); the marker says the clean-checkout check passed when this ask was issued (apply refuses an ask without it)
+      else if (typeof prHead === 'string' && prHead === head) {
+        if (headSha({ cwd: root }) === head) heads = { head, prHead, headClean: true };
+        else headRefusal = `this checkout's HEAD moved while the PR head was read (it was ${head.slice(0, 12)}), so the code Claude checked may not be the PR's code: recommend again`;
+      }
       else headRefusal = `the PR head on GitHub (${String(prHead).slice(0, 12)}) is not this checkout's HEAD (${head.slice(0, 12)}), so the code Claude checked may not be the PR's code: push or pull, then recommend again`;
     }
     const recommended = shown && headRefusal === null;
