@@ -2165,3 +2165,71 @@ test('#919: a `&` in a comment, quotes or a quoted heredoc body does not make th
   allowBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh");
   denyBoth("case \"$m\" in\n# read & don't report\ncheck) echo \"$(date)\" ;;\nesac\nbash n.sh; cp f.sh n.sh &");
 });
+
+// #950: a launchctl / setsid / tmux line starts a job that outlives the script. Failure caught: ONE such line anywhere made the whole script's order unknown, so a LATER write
+// (`cp f.sh n.sh`) counted for every EARLIER command (`bash n.sh` read as if the copy had run first) and the owner's harmless install script was refused. The order is unknown only
+// from the line that starts the job: a command before it cannot be reached by a job not yet started; the line itself and every command after it still see every later write.
+test('#950: a backgrounder (launchctl, setsid, tmux) leaves the commands BEFORE it in order; the line itself and the commands after it still see later writes', () => {
+  for (const bg of ['launchctl kickstart -k "gui/$(id -u)/x"', 'setsid sleep 1', "tmux new -d 'sleep 1'", 'screen -dm sleep 1']) {
+    allowBoth(`bash n.sh; ${bg}; cp f.sh n.sh`); // the script ran before the job was started and the copy came later
+    allowBoth(`bash n.sh\n${bg}\ncp f.sh n.sh\necho done`);
+    denyBoth(`${bg}; bash n.sh; cp f.sh n.sh`); // a job already running may be what runs it when the copy lands
+    denyBoth(`bash n.sh; ${bg}; bash n.sh; cp f.sh n.sh`);
+    denyBoth(`bash n.sh; ${bg}\nbash n.sh\necho x\ncp f.sh n.sh`);
+  }
+  denyBoth('bash n.sh; setsid -f bash n.sh; cp f.sh n.sh'); // the job's own command
+  denyBoth('bash bg3.sh; cp f.sh n.sh', { ...SPEC, 'bg3.sh': 'sleep 1; setsid -f bash n.sh' }); // a script that starts one: the outer later write is still seen
+  allowBoth('bash n.sh; cp f.sh n.sh'); // twin: no backgrounder
+});
+
+// R1-B1 / R1-B2 (#950): a command the shell itself runs in the background (a backgrounded and-or list or group, a process substitution) before a backgrounder line still sees every later write.
+// Failure caught: `bash n.sh && echo done & cp f.sh n.sh` + a launchctl line was allowed (the copy may land before bash opens n.sh), though main refused it.
+test('#950: a command run in the background by the shell, placed BEFORE a backgrounder line, still sees later writes', () => {
+  for (const bg of ['launchctl kickstart -k "gui/$(id -u)/x"', 'disown', 'setsid sleep 1']) {
+    denyBoth(`bash n.sh && echo done & cp f.sh n.sh\n${bg}`);
+    denyBoth(`( bash n.sh; echo ok ) &\ncp f.sh n.sh\n${bg}`);
+    denyBoth(`echo hi > >(bash n.sh)\ncp f.sh n.sh\n${bg}`);
+    denyBoth(`bash n.sh < <(echo x)\ncp f.sh n.sh\n${bg}`);
+  }
+});
+
+// R1-B3 / R1-B4 (#950): the same position rule across a call into a script. Failure caught: (B3) `setsid -f bash wrap.sh; cp f.sh n.sh` with wrap.sh running n.sh was allowed (the copy may land first);
+// (B4) `bash setup.sh; cp f.sh n.sh`, with setup.sh running n.sh and only THEN restarting a service, was refused: the caller waits for setup.sh, and the copy comes after n.sh ran.
+test('#950: a detached call site makes the later writes visible to the script it starts; a restart AFTER a foreground run inside a called script does not', () => {
+  const spec = { ...SPEC, 'wrap.sh': 'bash n.sh', 'wrap2.sh': 'echo hi\nbash n.sh', 'setup.sh': 'bash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"', 'setup2.sh': 'echo hi\nsetsid -f bash n.sh', 'setup3.sh': 'bash n.sh\nsetsid sleep 1\nbash n.sh' };
+  for (const l of ['setsid -f bash wrap.sh; cp f.sh n.sh', 'echo a; tmux new -d "bash wrap2.sh"; cp f.sh n.sh', 'launchctl kickstart -k x; bash wrap.sh; cp f.sh n.sh', 'bash setup2.sh; cp f.sh n.sh', 'bash setup3.sh; cp f.sh n.sh']) denyBoth(l, spec);
+  for (const l of ['bash setup.sh; cp f.sh n.sh', 'bash wrap.sh; cp f.sh n.sh']) allowBoth(l, spec);
+});
+
+// R2-F1 (#950): a function body or a trap action runs when it is called, not where it is written. Failure caught: `bash co.sh; cp f.sh n.sh` with co.sh = `run() { bash n.sh; }` then `coproc run`
+// was allowed (the body was judged before the backgrounder, so the caller's later copy was not seen) though main refused it: the child outlives co.sh and may open n.sh after the copy.
+test('#950: a function or trap in a called script that a backgrounder runs still sees the caller\'s later writes', () => {
+  const spec = {
+    ...SPEC,
+    'co.sh': 'run() { bash n.sh; }\ncoproc run',
+    'co2.sh': 'run() { bash n.sh; }\nexport -f run; setsid -f bash -c run',
+    'co3.sh': "trap 'bash n.sh' EXIT\nlaunchctl kickstart -k x",
+  };
+  for (const s of ['co.sh', 'co2.sh', 'co3.sh']) denyBoth(`bash ${s}; cp f.sh n.sh`, spec);
+  allowBoth('bash setup.sh; cp f.sh n.sh', { ...SPEC, 'setup.sh': 'bash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"' }); // twin: no function, a foreground run first
+});
+
+// R3-F1 (#950): the same hole one `source` away. Failure caught: `bash co4.sh; cp f.sh n.sh` with co4.sh = `. lib.sh\ncoproc run` and lib.sh = `run() { bash n.sh; }` was allowed (the function sits in the sourced
+// file's frame, the backgrounder in co4.sh's) though main refused it. R3-B1: a shell option schedules no work. Failure caught: `bash setup.sh; cp f.sh n.sh` was refused when setup.sh ran n.sh in the
+// foreground, then held a `shopt` line and a restart.
+test('#950: a function in a sourced file that a backgrounder runs still sees the caller\'s later writes', () => {
+  const spec = {
+    ...SPEC,
+    'co4.sh': '. lib.sh\ncoproc run',
+    'co5.sh': 'source lib2.sh\nexport -f run; setsid -f bash -c run',
+    'lib.sh': 'run() { bash n.sh; }',
+    'lib2.sh': 'run() { bash n.sh; }',
+  };
+  for (const s of ['co4.sh', 'co5.sh']) denyBoth(`bash ${s}; cp f.sh n.sh`, spec);
+});
+// (checked on the files policy only: the git policy refuses a shopt / setopt / hash / enable in a called script for another reason, it no longer knows the directory)
+test('#950: a shell option (shopt / setopt / hash / enable) in a called script schedules no work; a trap still does', () => {
+  const opt = { ...SPEC, 'n.sh': 'ok', 'setup.sh': 'shopt -s expand_aliases\nbash n.sh\nlaunchctl kickstart -k "gui/$(id -u)/x"', 'setup4.sh': 'setopt nullglob\nbash n.sh\nlaunchctl kickstart -k x', 'setup5.sh': 'hash -r\nenable -n kill\nbash n.sh\nlaunchctl kickstart -k x' };
+  for (const s of ['setup.sh', 'setup4.sh', 'setup5.sh']) assert.equal(run(`bash ${s}; cp f.sh n.sh`, opt).files.r.decision, 'allow', s);
+  assert.equal(run('bash tr.sh; cp f.sh n.sh', { ...SPEC, 'n.sh': 'ok', 'tr.sh': "shopt -s expand_aliases\ntrap 'bash n.sh' EXIT\nlaunchctl kickstart -k x" }).files.r.decision, 'deny'); // twin: a trap still defers
+});
