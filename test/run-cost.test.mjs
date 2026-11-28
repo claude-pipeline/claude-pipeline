@@ -332,6 +332,19 @@ test('P cost --from-transcript: an empty transcript with --session still records
   assert.ok(r.json.warnings.some((w) => /no messages with usage found/.test(w)));
 });
 
+// Issue #821: an unset shell variable (--from-transcript "") counted as spent (!== undefined) but read no file (falsy), so a zero entry was booked with ok:true and exit 0.
+test('P cost --from-transcript: an empty or blank value is refused with exit 2 and nothing is booked (#821)', () => {
+  const s = scenario();
+  const before = s.fake.calls().length;
+  for (const blank of ['', '   ']) {
+    const r = costCli(s, ['--phase', 'build', '--role', 'implementer', '--from-transcript', blank]);
+    assertExit(r, 2);
+    assert.match(r.stderr + JSON.stringify(r.json ?? {}), /--from-transcript is empty/);
+  }
+  assertExit(costCli(s, ['--phase', 'build', '--role', 'implementer', '--input', '5', '--from-transcript', '']), 2); // a hand amount does not make the empty path acceptable
+  assert.equal(s.fake.calls().length, before, 'no GitHub read or write');
+});
+
 // A continued implementer (SendMessage) is booked after its first leg and again after its last: the second booking re-counted leg 1 (about $0.92 on EagleWatch #2366).
 test('P cost --from-transcript: booking a continued agent\'s transcript again books only the new usage (total = the whole transcript once)', () => {
   const s = scenario();
