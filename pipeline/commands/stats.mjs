@@ -67,6 +67,9 @@ async function rounds(rest, ctx) {
           let state = null;
           const slugLower = slug.toLowerCase();
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
+          // "This repository" is the canonical one, resolved ONCE per PR and used for every record, so neither the order of two aliases nor the order of the comments can change the record picked. Looked up when several slugs are asked, the listing carries it, or an own record names another slug than the one asked.
+          const ownSlugs = comments.filter((c) => c?.user?.login === me && typeof c.body === 'string' && c.body.startsWith(MARKERS.summary)).map((c) => decodeRecord(c.body)).filter((r) => r.status === 'ok').map((r) => String(r.record.repo ?? '').toLowerCase());
+          const home = repos.length > 1 || baseRepo !== undefined || ownSlugs.some((s) => s !== slugLower) ? canonical() : undefined;
           for (const c of comments) {
             if (typeof c?.body !== 'string') continue;
             const isState = c.body.startsWith(MARKERS.triage);
@@ -81,9 +84,7 @@ async function rounds(rest, ctx) {
               const r = decodeRecord(c.body);
               if (r.status === 'ok') {
                 // The repo is the only mismatch ⇒ the PR was merged before a rename/transfer and this is still its own record (adoptRecord, #671); a slug that differs only in case is the same repository.
-                // "This repository" is the canonical one, not the slug asked first, so the order of two aliases cannot change the record picked.
                 const recSlug = String(r.record.repo ?? '').toLowerCase();
-                const home = repos.length > 1 || recSlug !== slugLower ? canonical() : undefined;
                 const sameRepo = recSlug === (home ?? slug).toLowerCase();
                 // a record naming another repository is adopted only when its branch is the PR's live one (else a copied record of another PR with the same number would be taken)
                 const branch = sameRepo ? undefined : livePull()?.head?.ref;
@@ -110,7 +111,11 @@ async function rounds(rest, ctx) {
             continue;
           }
           if (typeof identity === 'string') seen.set(identity, `${slug}#${number}`);
-          else if (repos.length > 1) warnings.push(`${slug}#${number}: could not tell whether this pull request is also counted under another repository name (it could not be read): counted`);
+          else if (repos.length > 1) {
+            // an unreadable identity cannot be told apart from the same PR under another slug: neither alias goes into the totals (never a silent double count)
+            warnings.push(`${slug}#${number}: left out: it could not be told apart from the same pull request under another repository name (it could not be read); rerun`);
+            continue;
+          }
           const movedFrom = record === null && adopted !== null ? adopted.from : null;
           const p = analysePr({ repo: slug, pr: number, state, record: record ?? adopted?.record ?? null });
           if (p === null) withoutState += 1;
