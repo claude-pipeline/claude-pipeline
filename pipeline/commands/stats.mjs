@@ -5,6 +5,7 @@ import { guarded, resolveRepo } from '../lib/cmd-common.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { MAX_PAGES, PAGE, pages } from '../lib/gh-pages.mjs';
 import { decodeRecord } from '../lib/run-record.mjs';
+import { recordBelongs } from '../lib/summary-comment.mjs';
 import { effectiveCost } from '../lib/run-cost.mjs';
 import { readCostBookings } from '../lib/run-events.mjs';
 import { decodeFromComment } from '../lib/state.mjs';
@@ -57,7 +58,6 @@ async function rounds(rest, ctx) {
           let record = null;
           let state = null;
           let recordUnreadable = false;
-          const slugLower = slug.toLowerCase();
           const skip = (what, why) => warnings.push(`${slug}#${number}: ignored ${what}${why}`);
           for (const c of comments) {
             if (typeof c?.body !== 'string') continue;
@@ -72,7 +72,7 @@ async function rounds(rest, ctx) {
             if (isRecord) {
               const r = decodeRecord(c.body);
               if (r.status === 'ok') {
-                if (r.record.pr === number && String(r.record.repo ?? '').toLowerCase() === slugLower) record = r.record;
+                if (recordBelongs(r.record, { pr: number, repo: slug, moves: ctx.moves })) record = r.record;
                 else skip(`a run record bound to ${asciiLine(r.record.repo, 80)}#${asciiLine(r.record.pr, 20)}`, ': not this PR or repository');
               } else if (r.status === 'invalid' || r.status === 'unsupported') {
                 recordUnreadable = true;

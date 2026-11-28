@@ -12,6 +12,7 @@ import { encodeForComment } from '../pipeline/lib/state.mjs';
 import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
+import { main } from '../pipeline/bin/pipeline.mjs';
 
 const acc = (id, bucket = 'SUGGESTION', over = {}) => ({ id, bucket, category: 'maintainability', title: 'Rename helper', file: 'src/a.js', final: { decision: 'ACCEPT', by: 'judge' }, ...over });
 const rej = (id, bucket = 'SUGGESTION') => ({ id, bucket, category: 'maintainability', title: 'Nit', final: { decision: 'REJECT', by: 'judge' } });
@@ -334,4 +335,25 @@ test('R1-B6 stats rounds: a comment list cut by the page limit leaves the PR cos
   assertExit(r, 0, r.stderr + r.stdout);
   assert.equal(r.json.prs[0].usd, null, 'the $2 seen is not the PR total');
   assert.match(r.json.warnings.join('\n'), /widgets#7: the comments were cut after 30 pages/);
+});
+
+// R3-B2: the summary reader counts a record of a repository the owner recorded as moved (same PR number), so stats must price the same PR the same: it judged the repo by exact name and left that spend out.
+// `ctx.moves` is the in-process seam for the owner's repo-moves record (the command reads the owner's file when it is left out).
+test('R3-B2 stats rounds: a record written under a name the repository has since moved from counts, one under an unrelated name does not', async () => {
+  const oldRecord = (repo) => `${MARKERS.summary}\n\n${encodeRecord({ ...emptyRecord({ repo, pr: 7, branch: 'feat/x', baseRef: 'main' }), heartbeat: { host: 'h', at: '2026-11-01T00:00:00.000Z' }, cost: cost7 })}`;
+  const moves = [{ from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 }];
+  const usdOf = async (recordRepo) => {
+    const repo = createTmpRepo();
+    repo.write('.claude/pipeline.yml', pipelineYml());
+    repo.commit('init');
+    const fake = createFakeGh(script([world[0], { match: '^api repos/acme/widgets/issues/7/comments', stdoutJson: [mine(1, oldRecord(recordRepo)), mine(2, triageBody(state7))] }]));
+    const env = { ...process.env, ...fake.env };
+    delete env.PIPELINE_OFF;
+    let out = '';
+    const code = await main(['stats', 'rounds', '--json', '--pr', '7'], { cwd: repo.dir, env, moves, stdout: { write: (s) => { out += s; } } });
+    assert.equal(code, 0, out);
+    return JSON.parse(out).prs[0].usd;
+  };
+  assert.equal(await usdOf('old/widgets'), 9, 'renamed after the record was written: still this PR, its $9 counts');
+  assert.equal(await usdOf('other/widgets'), null, 'another repository: no base, so no cost');
 });
