@@ -6,7 +6,7 @@
 import { appendFileSync, mkdirSync, mkdtempSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { dirname, isAbsolute, join, relative, resolve } from 'node:path';
-import { git, GitError, NETWORK_TIMEOUT_MS } from './git.mjs';
+import { git, GitError, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from './git.mjs';
 import { pipelineStateDir } from './repo.mjs';
 import { withLock } from './locks.mjs';
 import { agentLogLine } from './render.mjs';
@@ -273,7 +273,8 @@ function gitIn(g, cwd, args, { env, input } = {}) {
  * -> { commit, pushed, lines } (`lines`: the ones actually appended). Throws on a git failure; the caller keeps its lines queued.
  */
 export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, sleepFn = sleepSync, anonymous = false }) {
-  const g = (args, cwd = root, timeoutMs, extra = {}) => gitFn(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}), ...extra });
+  // Every call is bounded (a local one by LOCAL_TIMEOUT_MS): this runs under the queue lock, which a hung child would hold forever (#964).
+  const g = (args, cwd = root, timeoutMs = LOCAL_TIMEOUT_MS, extra = {}) => gitFn(args, { cwd, timeoutMs, ...extra });
   const clean = lines.map(assertSingleLine);
   let lastErr;
   let blips = 0;
@@ -314,8 +315,8 @@ export function publishLines({ root, logRel, lines, defaultBranch, gitFn = git, 
 // itself failed (no network), the cached log branch is stale evidence: it is read only with `trustCachedBranch` (a closer reasoning
 // over what it can see), never to drop queued lines.
 export function originLogLines(root, { logFile, defaultBranch, fetch = false, trustCachedBranch = true }) {
-  const o = { cwd: root };
-  const g = (args, cwd = root, timeoutMs) => git(args, { cwd, ...(timeoutMs ? { timeoutMs } : {}) });
+  const o = { cwd: root, timeoutMs: LOCAL_TIMEOUT_MS }; // `close` calls this under the queue lock: bounded like publishLines (#964)
+  const g = (args, cwd = root, timeoutMs = LOCAL_TIMEOUT_MS) => git(args, { cwd, timeoutMs });
   let refreshed = false;
   let branchRefreshed = true;
   let branchExists = true;

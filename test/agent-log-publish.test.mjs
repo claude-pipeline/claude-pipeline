@@ -10,7 +10,7 @@ import { createTmpRepo } from './helpers/tmprepo.mjs';
 import { createFakeGh, pipelineYml, REPO_VIEW } from './helpers/fakegh-env.mjs';
 import { cli, AGENT_LOG } from './helpers/gate-env.mjs';
 import { assertExit } from './helpers/assert-exit.mjs';
-import { git as gitRun, GitError } from '../pipeline/lib/git.mjs';
+import { git as gitRun, GitError, LOCAL_TIMEOUT_MS, NETWORK_TIMEOUT_MS } from '../pipeline/lib/git.mjs';
 import { run as procRun } from '../pipeline/lib/proc.mjs';
 import { PLANTED, makeScanner, writeScanConfig } from './helpers/outbound-scan.mjs';
 import { AGENT_LOG_BRANCH, AGENT_LOG_HEADER, assertSafeLogTarget, logRelPath, publishLines } from '../pipeline/lib/agentlog.mjs';
@@ -437,6 +437,25 @@ test('the plumbing runs in a temp index: GIT_INDEX_FILE is set for the plumbing 
   for (const verb of ['checkout', 'add', 'commit', 'reset', 'worktree', 'branch', 'update-ref', 'merge', 'switch']) {
     assert.equal(seen.some((s) => s.args.includes(verb) && s.args[0] === verb), false, `no git ${verb}`);
   }
+});
+
+// #964: a git child that never returns (a stuck hash-object) held the agent-log queue lock for hours; every local call is now bounded.
+test('every git call a publish makes under the queue lock carries a timeout, and a hung local call surfaces as a GitError (lines stay queued)', () => {
+  const w = world();
+  const seen = [];
+  const gitFn = (args, o) => { seen.push({ verb: args.find((a) => /^[a-z-]+$/.test(a) && !a.startsWith('commit.')), timeoutMs: o.timeoutMs }); return gitRun(args, o); };
+  publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L1], defaultBranch: 'main', gitFn });
+  const untimed = seen.filter((s) => !(s.timeoutMs > 0)).map((s) => s.verb);
+  assert.deepEqual(untimed, [], 'a call without timeoutMs can hang forever inside the lock');
+  assert.ok(seen.some((s) => s.verb === 'hash-object' && s.timeoutMs === LOCAL_TIMEOUT_MS), 'local plumbing uses LOCAL_TIMEOUT_MS');
+  assert.ok(LOCAL_TIMEOUT_MS < NETWORK_TIMEOUT_MS);
+
+  // the timeout git.mjs raises for a killed child: publishLines throws it (the command maps a GitError to exit 3, lines kept queued)
+  const hung = (args, o) => {
+    if (args[0] === 'hash-object') throw new GitError({ args, code: 1, stderr: 'timed out', abnormal: true });
+    return gitRun(args, o);
+  };
+  assert.throws(() => publishLines({ root: w.repo.dir, logRel: AGENT_LOG, lines: [L2], defaultBranch: 'main', gitFn: hung, sleepFn: () => {} }), (e) => e instanceof GitError && e.abnormal === true);
 });
 
 test('close reads the log branch copy: a pending line that only lives on pipeline-agent-log is found', () => {
