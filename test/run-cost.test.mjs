@@ -17,10 +17,10 @@ import {
 import {
   STEPS, applyCheckpoint, decodeRecord, emptyRecord, encodeRecord, recordForOutcome, renderStatusBlock,
 } from '../pipeline/lib/run-record.mjs';
-import { summaryFromComments, writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
+import { readSummaryComment, summaryFromComments, writeSummaryComment } from '../pipeline/lib/summary-comment.mjs';
 import { transcriptUsage } from '../pipeline/commands/cost.mjs';
 import { UsageError } from '../pipeline/lib/cli.mjs';
-import { baseRecordFor } from '../pipeline/lib/run-progress.mjs';
+import { baseRecordFor, writeRunRecord } from '../pipeline/lib/run-progress.mjs';
 
 const NOW = Date.parse('2026-10-14T10:00:00Z');
 const rec = () => emptyRecord({ repo: 'acme/widgets', pr: PR, branch: 'agent/feature', baseRef: 'main' });
@@ -376,17 +376,17 @@ test('summaryFromComments: a null held element, or a proven but unreadable held 
   }
 });
 
-test('writeSummaryComment: a rewrite of a record whose cost read as unavailable keeps showing it unavailable (R6-B3, #958)', () => {
+test('writeRunRecord (P summary, P comment, P checkpoint): a record that reads cost-unavailable is written with the cost shown unavailable (R6-B3, #958)', () => {
   const usd = (n, extra = {}) => ({ ...addCostEntry(emptyCost(), entry({ usd: n })), ...extra });
-  const move = { from: 'old/widgets', to: 'acme/widgets', at: '2026-11-10T00:00:00.000Z', repoId: 7 };
-  const comment = existing({ ...rec(), cost: usd(10), heldCost: { repo: 'old/widgets', at: '2026-11-01T00:00:00.000Z', cost: usd(40, { byPrice: { bad: {} } }) } });
-  const current = summaryFromComments([comment], 'me', PR, { repo: 'acme/widgets', moves: [move] });
-  assert.ok(current.effectiveCost.unavailable, 'the read says unavailable');
+  // a held balance under this repository's own name is proven ours; its byPrice cannot be added up
+  const comment = existing({ ...rec(), cost: usd(10), heldCost: { repo: 'acme/widgets', at: '2026-11-01T00:00:00.000Z', cost: usd(40, { byPrice: { bad: {} } }) } });
   let body = '';
-  const gh = { updateComment: (id, m, b) => { body = b; return { id, url: 'u', action: 'updated' }; } };
-  const out = writeSummaryComment(gh, PR, { existing: current });
-  assert.ok(out.effectiveCost.unavailable, 'the rewrite reports it too');
-  assert.doesNotMatch(body.split('<!-- claude-pipeline:record')[0], /\$10/, 'and the status block does not show the own $10 as the total');
+  const gh = { viewer: () => 'me', repo: () => ({ slug: 'acme/widgets' }), listComments: () => [comment], updateComment: (id, m, b) => { body = b; return { id, url: 'u', action: 'updated' }; } };
+  const first = readSummaryComment(gh, PR);
+  assert.ok(first.effectiveCost.unavailable, 'the read says unavailable');
+  const out = writeRunRecord(gh, PR, { record: first.record, sections: first.sections, firstRead: first });
+  assert.ok(out.effectiveCost.unavailable, 'the write reports it too');
+  assert.doesNotMatch(body.split('<!-- claude-pipeline:record')[0], /\$10/, 'the status block does not show the own $10 as the total');
 });
 
 // R4-B1: a move lookup that fails (readRepoMoves answers { moves: [], error }) is "not proven" for counting, and a writer must not lose the cost for it either.
