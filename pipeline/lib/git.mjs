@@ -731,10 +731,15 @@ export function currentBranch(o) {
   return ref === null ? 'HEAD' : ref.trim().replace(/^refs\/heads\//, '');
 }
 
-// With `ref`, the index and the working tree must also both equal that commit (a status check alone passes after a soft reset to
-// another commit and back, when the staged changes equal that commit's tree).
-export const isClean = (o, ref) => git(['status', '--porcelain=v1', '-uall'], o) === ''
-  && (ref === undefined || (gitOrNull(['diff', '--quiet', assertRef(ref, ['diff', '--quiet', ref]), '--'], 1, o) !== null && gitOrNull(['diff', '--cached', '--quiet', ref, '--'], 1, o) !== null));
+// With `ref`, HEAD must also BE that commit: HEAD and the cleanliness are read in ONE status call (`# branch.oid` plus any change or untracked
+// entry), so a reset to another commit and back around the check cannot pass (a status check alone does, when the staged changes equal that
+// commit's tree; and a separate `git diff <ref>` never lists untracked files).
+export function isClean(o, ref) {
+  if (ref === undefined) return git(['status', '--porcelain=v1', '-uall'], o) === '';
+  assertRef(ref, ['status', '--porcelain=v2', '--branch', ref]);
+  const lines = git(['status', '--porcelain=v2', '--branch', '-uall'], o).split('\n').filter((l) => l !== '');
+  return lines.some((l) => l === `# branch.oid ${ref}`) && lines.every((l) => l.startsWith('# '));
+}
 
 export const revParse = (ref, o) => git(['rev-parse', '--verify', assertRef(ref, ['rev-parse', '--verify', ref])], o).trim();
 

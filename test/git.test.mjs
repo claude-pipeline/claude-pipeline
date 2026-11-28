@@ -493,6 +493,11 @@ test('mergeBase, headSha, revParse, isClean', () => {
   assert.equal(isClean(o), true);
   assert.equal(isClean(o, tip), true);
   assert.equal(isClean(o, mainTip), false);
+  // HEAD != ref is false even on a clean tree, and an untracked file is false even when HEAD is the ref
+  repo.write('u.txt', 'untracked\n');
+  assert.equal(isClean(o, tip), false);
+  repo.rm('u.txt');
+  assert.equal(isClean(o, tip), true);
   git(['reset', '--soft', mainTip], o); // HEAD is back at mainTip, the index still holds tip's tree
   assert.equal(isClean(o), false);
   assert.equal(isClean(o, mainTip), false);
