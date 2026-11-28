@@ -75,13 +75,27 @@ export function supabaseMatch(tool, state, ti, ctx) {
 export const isSupabaseTool = (tool, state, ti, ctx) => !!supabaseMatch(tool, state, ti, ctx);
 
 // The most screen rows of block the progress-note fallback accepts on the dialog alone: a dialog taller than a terminal screen may clip, and the owner must have read every line of the SQL (a longer block needs
-// the reply text or the typed go). Rows, not newlines: a line counts ceil(length / PROGRESS_NOTE_COLUMNS) rows (R2-B1: one 4000-character line is 50 rows in an 80-column terminal).
+// the reply text or the typed go). Rows, not newlines (R2-B1: one 4000-character line is 50 rows in an 80-column terminal). A deliberate UPPER bound, whichever way the dialog wraps: each line counts the larger of
+// its hard-wrap rows and its greedy word-wrap rows (R3-F1), and a character outside printable ASCII counts 2 columns (wide glyphs, R3-B1), a tab 8.
 const PROGRESS_NOTE_BLOCK_MAX_ROWS = 40;
 const PROGRESS_NOTE_COLUMNS = 80;
+const colsOf = (s) => { let n = 0; for (const ch of s) n += ch === '\t' ? 8 : ch >= ' ' && ch <= '~' ? 1 : 2; return n; };
+const rowsOfLine = (line) => {
+  const W = PROGRESS_NOTE_COLUMNS;
+  const hard = Math.ceil(Math.max(1, colsOf(line)) / W);
+  let rows = 1;
+  let col = 0;
+  for (const word of line.split(' ')) {
+    const w = colsOf(word);
+    if (col > 0 && col + 1 + w > W) { rows += 1; col = 0; } else if (col > 0) col += 1;
+    if (w > W) { rows += Math.ceil(w / W) - 1; col = ((w - 1) % W) + 1; } else col += w;
+  }
+  return Math.max(hard, rows);
+};
 const renderedRows = (text) => {
   const lines = String(text).replace(/\r\n/g, '\n').split('\n');
   while (lines.length && lines[lines.length - 1].trim() === '') lines.pop();
-  return lines.reduce((n, l) => n + Math.ceil(Math.max(1, [...l].length) / PROGRESS_NOTE_COLUMNS), 0);
+  return lines.reduce((n, l) => n + rowsOfLine(l), 0);
 };
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });
