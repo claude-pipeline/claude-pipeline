@@ -111,13 +111,12 @@ test('recorder: replacing an invalid record writes a record the merge gate still
   assert.deepEqual(after.record.resumed, { at: new Date(NOW).toISOString(), host: 'pc-1', head: HEAD });
 });
 
-// R1-F3 (#407): the recorder's first read is ok, another writer corrupts the comment, and the writer's own re-read stamps the record resumed: that is reported too.
-test('recorder: a record that turns unreadable between the recorder\'s read and the writer\'s re-read is reported in recorder.warnings, once', () => {
+// R1-F3 (#407): the record is built on the writer's own read (R2-B1), so a comment another writer corrupted before that read is stamped resumed there and reported once.
+test('recorder: a record that is unreadable when the writer reads it is reported in recorder.warnings, once', () => {
   const gh = memoryGh();
   seed(gh, plain());
   const real = gh.listComments;
-  let reads = 0;
-  gh.listComments = () => { reads += 1; return reads === 1 ? real() : real().map((c) => (c.body.startsWith(MARKERS.summary) ? { ...c, body: INVALID_BODY } : c)); };
+  gh.listComments = () => real().map((c) => (c.body.startsWith(MARKERS.summary) ? { ...c, body: INVALID_BODY } : c));
   const recorder = recorderFor(gh);
   assert.ok(recorder.update({ step: 'merge' }), 'the write itself still happens');
   const marked = recorder.warnings.filter((w) => /could not be read; started a new one, marked resumed/.test(w));
