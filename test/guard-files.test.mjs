@@ -2424,6 +2424,8 @@ test('#685: -lt as an ls option on a session-log path is no numeric test operato
     'ls -l -ge ~/.codex/sessions/',
     'ls --color=auto -lt ~/.codex/sessions/2026/11/20/',
     'ls --color -l --sort=time -lt ~/.codex/sessions/',
+    '[ -d ~/.codex/sessions ] && ls -lt ~/.codex/sessions/', // a CLOSED test before the ls is an earlier command (R2-B1)
+    'test -d ~/.codex/sessions && ls -lt ~/.codex/sessions/',
   ]) assert.equal(bash(cmd), 'allow', cmd);
   for (const cmd of [
     'ls -lt ~/.codex/sessions/2026/11/20/; [ "$x" -lt 3 ]',
@@ -2438,6 +2440,9 @@ test('#685: -lt as an ls option on a session-log path is no numeric test operato
     '[[ ( ls -lt 3 ) ]] && ls ~/.codex/sessions/',
     '[ x >| ls -lt 3 ]; cat ~/.codex/sessions/a',
     'test x >& ls -lt 3; cat ~/.codex/sessions/a',
+    '[ -d /tmp ] && [ ls -lt 3 ]; cat ~/.codex/sessions/a',
+    'echo ] ; [ x && ls -lt 3 ]; cat ~/.codex/sessions/a',
+    '[[ x ]] && [[ ls -lt 3 ]]; cat ~/.codex/sessions/a',
   ]) assert.equal(bash(cmd), 'deny', cmd);
 });
 

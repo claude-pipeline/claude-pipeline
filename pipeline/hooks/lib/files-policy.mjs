@@ -2540,8 +2540,18 @@ const ARITH_CONTEXT = /\(\(|\$\[|(?:^|[\s;&|(){`])(?:let|integer)(?=\s)|(?:^|[\s
 // unquoted part and every other match of ARITH_CONTEXT are read as written.
 const INLINE_NODE_WORD = /(?<=^|[;&|(\n]\s*)node(?:js)?\s+(?:-e|-p|--eval|--print)\s+(?:'([^']*)'|"((?:[^"\\$`]|\\[^$`])*)")(?=\s|$|[;&|)])/g;
 // #685: `ls -lt DIR` is an option cluster of ls, not the test operator `-lt`: a run of option words (short `-lt`, long `--color=auto`) right after an ls word at command position (the same lookbehind as the node word above) has any bare operator word in it
-// renamed (`-lt` -> `-Xlt`), unless the text before the ls word holds a quote, `#`, `$`, backslash, backtick, `[`, `<` or `>` (an ls inside `[[ ]]` or after a redirect is an operand, not a command). `[`, `[[`, `test` and every other head keep the operator gate; a run that does not end at a blank, `;`, `&`, `|`, `)` or the end of the line matches nothing.
+// renamed (`-lt` -> `-Xlt`), unless the text before the ls word holds a quote, `#`, `$`, backslash, backtick, `<` or `>`, or an unclosed `[` / `[[` (an ls inside `[[ ]]` or after a redirect is an operand, not a command; a closed test before it is not). `[`, `[[`, `test` and every other head keep the operator gate; a run that does not end at a blank, `;`, `&`, `|`, `)` or the end of the line matches nothing.
 const LS_OPTION_RUN = /(?<=^|[;&|(\n]\s*)ls(?:\s+(?:-[A-Za-z]+|--[A-Za-z][\w-]*(?:=[^\s'"$`\\#\[<>;&|()]*)?))+(?=\s|$|[;&|)])/g;
+// (an `ls` word is an operand, not a command, inside a test that is still open: a `[` / `[[` word with no `]` / `]]` word of its own kind after it, or a stray or glued bracket, fails closed; a CLOSED test before it is just an earlier command)
+const openTest = (before) => {
+  const stack = [];
+  for (const w of before.split(/\s+/)) {
+    if (w === '[' || w === '[[') stack.push(w);
+    else if (w === ']' || w === ']]') { if (stack.pop() !== (w === ']' ? '[' : '[[')) return true; }
+    else if (/[\[\]]/.test(w)) return true;
+  }
+  return stack.length > 0;
+};
 function arithView(raw) {
   return raw.replace(INLINE_NODE_WORD, (all, single, double, at) => {
     const before = raw.slice(0, at);
@@ -2550,7 +2560,7 @@ function arithView(raw) {
     if (single !== undefined) return `${head}'${single.replace(/\((?=\()/g, '( ').replace(/(?<!\w)let(?=\s)/g, 'lXt')}'`;
     if (double.includes('\\')) return all;
     return `${head}"${double.replace(/\((?=\()/g, '( ')}"`;
-  }).replace(LS_OPTION_RUN, (all, at, whole) => (/['"#$\\`[<>]/.test(whole.slice(0, at)) ? all : all.replace(/(\s-)(?=(?:eq|ne|lt|gt|le|ge)(?:\s|$))/g, '$1X')));
+  }).replace(LS_OPTION_RUN, (all, at, whole) => (/['"#$\\`<>]/.test(whole.slice(0, at)) || openTest(whole.slice(0, at)) ? all : all.replace(/(\s-)(?=(?:eq|ne|lt|gt|le|ge)(?:\s|$))/g, '$1X')));
 }
 const FD_DUP =/^&(?:\d+|-)$/; // (the only redirect targets that are descriptors)
 // xargs is unwrapped by the parser, so its name only survives in the raw text.
