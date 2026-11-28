@@ -44,10 +44,11 @@
 // still produce it, it is listed in `notOwed` (and left out of `checks`) instead of ending the wait `missing`, and a failed required check still ends
 // `failed` (a --wait-all `failed` carries `notOwed` too).
 // They never decide `unverified` / `no-required-checks`: those speak about the policy sources alone.
-// `options.e2eLabel` (config ci.e2e_label): on a PR carrying that label (`readers.labels()`, read once at the end) a `passed` result
-// also reports `others: [{name, status, url}]`, the head's NON-required check runs / statuses that are still running or red, so a
-// green required set never hides a pending or failed e2e suite. Report only: the verdict is not changed. A failed label read is
-// retried like every other read and ends `github` after repeated failures; it never leaves the plain result.
+// A `passed` result on EVERY PR also reports `others: [{name, status, url}]`, the head's NON-required check runs / statuses that
+// are still running or red (path-triggered suites such as EW's SQL arms / Playwright), so a green required set never hides a pending
+// or failed one (#743); an unfinished workflow run of the head (`readers.headRuns`) counts as a running entry too (a `needs:`-gated job has no check run yet). A running entry keeps the wait open until --timeout (then `passed` with the entry in `others`, do not hand
+// off); a red one does not change the verdict. `options.waitOthers` (--wait-others) is kept for compatibility: waiting is the default.
+// `options.e2eLabel` (config ci.e2e_label) is accepted and no longer read: no label is needed for any of this.
 // Freshness of a check run = its workflow run's created_at (else the run's own completed_at / started_at); of a status = its
 // created_at. Freshness that cannot be read counts as fresh (fail fast).
 // A needs:-gated aggregate (EW "Typecheck + Vitest") is only created when its shard jobs finish, ~8-12 min after ready, so a
@@ -135,7 +136,7 @@ function identitiesOf(sources) {
 const RUNNING_OTHER = new Set(['queued', 'in_progress', 'pending', 'waiting', 'requested']);
 
 export async function waitForCi({ readers, options, clock, onProgress = () => {} }) {
-  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, waitOthers = false, configChecks = [], mergeChecks = [], e2eLabel = null } = options;
+  const { appearTimeoutMs, timeoutMs, intervalMs, waitAll, configChecks = [], mergeChecks = [] } = options;
   const start = clock.now();
   const elapsed = () => clock.now() - start;
 
@@ -150,6 +151,7 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
   let readyAtMemo;
   let markerAtMemo; // ms of the newest review-complete marker of the head, or null; per poll, like readyAtMemo
   let runStartMemo = new Map(); // Actions run id -> ms the run started (number) | null (no readable start time, no reader, or not an Actions run) | undefined (the read threw: never normalise it to null); per poll, like markerAtMemo
+  let lastOthersSignature = null; // the running non-required checks last reported as progress
   let held = null; // the run that last kept an absent required check waiting past --appear-timeout
   let heldSignature = null;
   let mergeRetried = false; // the one extra read of a mergeability GitHub had not computed yet
@@ -420,15 +422,11 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     }
   };
 
-  // The head's checks that nobody requires (not an identity) and that are still running or red, on a PR carrying the e2e label; null
-  // when this does not apply (no label configured, no reader, the label absent). A failed label read throws into the poll loop, which
-  // retries it like every other read: it must never look like a PR without the label. A check run is judged by its latest NON-skipped
+  // The head's checks that nobody requires (not an identity) and that are still running or red, on every pass (#743). A check run is judged by its latest NON-skipped
   // run per app (every other `labeled` event on the head starts a no-op run whose jobs skip, with a higher id than the real suite's;
   // a name whose only runs are skipped is not listed); a status by its latest per context. Check runs and commit statuses are
   // separate producers, so a name seen on one side never hides the other.
   const otherChecks = async (obs, identities) => {
-    if (!e2eLabel || !readers.labels) return null;
-    if (!(await readers.labels()).includes(e2eLabel)) return null;
     const known = new Set(identities.map((i) => i.name));
     const out = [];
     const seenRuns = new Set();
@@ -658,14 +656,36 @@ export async function waitForCi({ readers, options, clock, onProgress = () => {}
     if ((again.base ?? null) !== base) return baseChanged(again.base);
     if (unverified) return unverifiedResult();
     const others = await otherChecks(obs, identities);
-    const owedNote = notOwed.length > 0 ? { notOwed } : {};
-    // --wait-others: the required checks are green but a non-required check of the run-e2e suite is still running: keep waiting for it (a red or finished one ends the wait as `passed` with `others`, as before).
-    if (waitOthers && others !== null && others.some((o) => RUNNING_OTHER.has(o.status)) && elapsed() < timeoutMs) return null;
-    await markStatusRuns(states, Date.parse(await getReadyAt(pr))); // a failed timeline read throws into the poll loop and is retried (like the label read below): the pass is dated against ready, never reported without readyAt / predatesReady
-    if (others !== null && others.length > 0) {
-      return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this run-e2e PR are not green: ${others.map((o) => `${o.name}=${o.status}`).join(', ')}: do not hand off before they are` });
+    // A `needs:`-gated job has no check run until its predecessor finishes: an unfinished workflow run of the head still counts as a running other (R1-B2; the same headRuns read as findHolder).
+    let anyActiveRun = false;
+    if (readers.headRuns) {
+      for (const w of await readers.headRuns(head)) {
+        if (w && ACTIVE_WORKFLOW_RUN.has(w.status)) {
+          anyActiveRun = true;
+          others.push({ name: w.name ?? `workflow run ${w.id ?? '?'}`, status: w.status, url: w.html_url ?? null });
+        }
+      }
     }
-    return result(EXIT.OK, 'passed', { ...owedNote, ...(others === null ? {} : { others }) });
+    const owedNote = notOwed.length > 0 ? { notOwed } : {};
+    // The required checks are green but a non-required check of the head is still running: keep waiting for it until --timeout (a red or finished one ends the wait as `passed` with `others`).
+    const running = others.filter((o) => RUNNING_OTHER.has(o.status));
+    const runningSignature = running.map((o) => `${o.name}=${o.status}`).join(', ');
+    if (runningSignature !== lastOthersSignature) {
+      lastOthersSignature = runningSignature;
+      if (running.length > 0) onProgress(`waiting for non-required: ${runningSignature}`);
+    }
+    if (running.length > 0 && elapsed() < timeoutMs) return null;
+    // The check runs were read before the workflow runs: a gated job created and finished in between is in neither list. With no run active any more and the verdict about to be given, read the check runs once more (R2-B1; never a third pass, and not on a poll that keeps waiting, R3-F1).
+    if (readers.headRuns && !anyActiveRun && !confirmed) return decide(await reread(), true);
+    await markStatusRuns(states, Date.parse(await getReadyAt(pr))); // a failed timeline read throws into the poll loop and is retried: the pass is dated against ready, never reported without readyAt / predatesReady
+    if (others.length > 0) {
+      const list = (xs) => xs.map((o) => `${o.name}=${o.status}`).join(', ');
+      const red = others.filter((o) => !RUNNING_OTHER.has(o.status));
+      // Only a running entry is waited for (restarts are capped by the hand-off guide); a finished red one never turns green: the guide's rule is stated for it (a red e2e suite is fixed first, any other is named to the owner).
+      const advice = [...(running.length > 0 ? [`still running: ${list(running)}: start ci-wait again (up to the restart cap in the hand-off guide), then name the still-running check to the owner and hand off`] : []), ...(red.length > 0 ? [`red: ${list(red)}: a red e2e suite is fixed before the hand-off (treat it as failed); any other red check is named to the owner in the hand-off`] : [])].join('; ');
+      return result(EXIT.OK, 'passed', { ...owedNote, others, message: `passed, but ${others.length} other check(s) on this PR are not green: ${list(others)}: ${advice}` });
+    }
+    return result(EXIT.OK, 'passed', { ...owedNote, others });
     };
     return decide({ checkRuns: await readers.checkRuns(pr.head), statuses: await readers.statuses(pr.head) }, false);
   };
