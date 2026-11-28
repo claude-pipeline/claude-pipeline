@@ -81,7 +81,7 @@ async function world(t, { op = 'migration', answer = null, flush = false, modelA
       ? { type: 'user', message: { role: 'user', content: [{ type: 'tool_result', tool_use_id: `toolu_fix${i}`, content: item.result }] }, uuid, parentUuid, timestamp, sessionId: use.sessionId }
       : item.prompt !== undefined
         ? { type: 'user', message: { role: 'user', content: item.prompt }, promptId: `pid-fix${i}`, uuid, parentUuid, timestamp, origin: { kind: 'human' }, promptSource: 'typed', entrypoint: 'cli', sessionId: use.sessionId }
-        : { ...structuredClone(use), uuid, parentUuid, timestamp, message: { role: 'assistant', content: item.blocks } };
+        : { ...structuredClone(use), uuid, parentUuid, timestamp, ...(item.extra ?? {}), message: { role: 'assistant', content: item.blocks } };
     if (item.own !== false) ownPrev = uuid;
     prev = uuid;
     return e;
@@ -365,31 +365,59 @@ test('through the real hook entry: a pending click of this session and a git tha
 // ---- #741 (B1b): the reply right before the dialog -------------------------------------------------------------------------------------------------------------------------
 
 const present = (b) => [{ blocks: [{ type: 'tool_use', id: 'toolu_present', name: 'Bash', input: { command: 'node pipeline.mjs live-db present --ask' } }] }, { result: JSON.stringify({ ok: true, block: b }) }];
-const progress = { blocks: [{ type: 'thinking', thinking: 'Showing the block now', signature: 'sig' }] };
+// Claude Code 2.1.332's progress note: the entry shape of the real transcript (a one-sentence `thinking` summary, no reply text).
+const progress = { blocks: [{ type: 'thinking', thinking: 'I am applying the migration the owner approved', signature: 'sig' }], extra: { thinkingDisplay: 'updates', staysIfReplyIsCut: true, apiBlockIndex: 1 } };
 
-test('B1b: a dialog whose message holds only a progress note is refused with that reason at the click and at the claim', async (t) => {
-  // Failure caught (transcripts 3ba22acc, 9f16c301): Claude Code recorded only a narration `thinking` block before AskUserQuestion; the click was refused later with "a different block" and the agent could not tell why.
+test('#983: a dialog whose message holds only a progress note is accepted when the dialog\'s own question carries the block: the click hook is silent and the guard allows the apply once', async (t) => {
+  // Failure caught (owner clicked "Yes, apply" twice on 2026-11-28): Claude Code recorded only a progress note before AskUserQuestion, the owner read the block in the dialog's question, and the claim refused the click as "no reply text".
   const w = await world(t, { flush: true, reply: [progress] });
   const line = await clickHookLine(w.input, { home: w.home, now: () => w.t, sleep: noSleep, pollMs: 0, check: OK });
-  assert.match(line, /will not be accepted: no reply text before the dialog \(Claude Code recorded only a progress note\)/);
+  assert.doesNotMatch(line ?? '', /will not be accepted|progress note/);
+  assert.equal(w.claim().status, 'claimed');
+  assert.equal(w.apply().decision, 'deny', 'the go is used by the claim above: a second apply is refused');
+  const w2 = await world(t, { flush: true, reply: [progress] });
+  assert.ok((await w2.hook()).recorded);
+  assert.equal(w2.apply().decision, 'allow');
+});
+
+test('#983: a progress note stands in for the reply only when the question carries the block: a question without it is not claimed; no progress note and no text is still refused', async (t) => {
+  // Failure caught: the progress-note exception accepting any click without checking the block, or widening to a turn with no text at all.
+  const w = await world(t, { flush: true, reply: [progress] });
+  assert.ok((await w.hook()).recorded);
+  const strip = (v) => (typeof v === 'string' ? v.split(w.block).join('(block removed)') : Array.isArray(v) ? v.map(strip) : v && typeof v === 'object' ? Object.fromEntries(Object.entries(v).map(([k, x]) => [strip(k), strip(x)])) : v);
+  writeFileSync(w.file, text(readFileSync(w.file, 'utf8').trim().split('\n').map((l) => strip(JSON.parse(l)))));
   const c = w.claim();
   assert.equal(c.status, 'unverified');
-  assert.match(c.reason, /no reply text before the dialog \(Claude Code recorded only a progress note\)/);
   assert.equal(w.apply().decision, 'deny');
+  const none = await world(t, { flush: true, reply: [] });
+  assert.ok((await none.hook()).recorded);
+  const nc = none.claim();
+  assert.equal(nc.status, 'unverified');
+  assert.match(nc.reason, /no reply text before the dialog/);
+  assert.doesNotMatch(nc.reason, /progress note/);
+});
+
+test('#983: a progress note followed by another turn\'s text before the dialog is still refused', async (t) => {
+  // Failure caught: the progress-note exception hiding that another visible turn printed text between the note and the dialog.
+  const w = await world(t, { flush: true, reply: [progress, { prompt: 'status?', own: false, uuid: 'u-p1' }, { blocks: [{ type: 'text', text: 'Still working on it.' }], own: false, uuid: 'u-tx', parent: 'u-p1' }] });
+  assert.ok((await w.hook()).recorded);
+  const c = w.claim();
+  assert.equal(c.status, 'unverified');
+  assert.match(c.reason, /another turn printed text between the reply and the dialog/);
 });
 
 test('R1-B7: a PENDING click (the label is not known yet) on a dialog with no reply text tells the agent to recover only if the owner chose to apply, and to stop otherwise', async (t) => {
   // Failure caught: the pending click line told the agent unconditionally to show the dialog again, so after the owner's "Not yet" the agent asked for the same approval at once.
-  const w = await world(t, { reply: [progress] });
+  const w = await world(t, { reply: [] });
   const line = await clickHookLine(w.input, { home: w.home, now: () => w.t, sleep: noSleep, pollMs: 0, check: OK });
-  assert.match(line, /no reply text before the dialog \(Claude Code recorded only a progress note\)/);
+  assert.match(line, /no reply text before the dialog/);
   assert.match(line, /If the owner chose to apply, run live-db present again/);
   assert.match(line, /if they chose not to, stop: nothing is applied/);
 });
 
-test('B1b: an older valid block, a tool result, then a progress-note-only dialog is refused; present, a tool result, then the block as text and the dialog is claimed', async (t) => {
+test('B1b: an older valid block, then a tool result, then no text before the dialog is refused; present, a tool result, then the block as text and the dialog is claimed', async (t) => {
   // Failure caught: the block printed earlier in the turn (before another tool call) counted as the reply right before the dialog, so a click bound to text the owner was no longer shown last.
-  const old = await world(t, { flush: true, reply: (b) => [b, ...present(b), progress] });
+  const old = await world(t, { flush: true, reply: (b) => [b, ...present(b)] });
   assert.ok((await old.hook()).recorded);
   const c = old.claim();
   assert.equal(c.status, 'unverified');
