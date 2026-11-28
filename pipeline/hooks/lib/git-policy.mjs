@@ -443,8 +443,10 @@ const CURRENT_BRANCH_WORD = new RegExp(`(^|:)${CURRENT_BRANCH_IDIOM.source.slice
 // `unset`), set in the environment, or a sourced script that may have set variables.
 // A name can be written without the letters IFS in a row (`eval "I""FS=,"`, `read $N`, `printf -v $N`, `declare I""FS=,`, `N=IFS; export $N`),
 // so the commands that assign a variable by a computed or split-up name count as well.
-const SETS_BY_NAME_HEAD = /\b(?:eval|read|mapfile|readarray|getopts|source)\b|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s/;
-const DECLARING_WORD = /\b(?:export|unset|declare|typeset|local|readonly)\b/;
+// #746 item 5: a binder word counts only as a command word: not when a path or file name holds it (`$HOME/.local/share/x`, `handoff-read.js`, `~/export`), i.e. it is not flanked by `.` `/` `~` `-`.
+// A real binder (`read IFS`, `local IFS=,`, `declare I""FS=,`, `x;read $N`) is never written that way: it follows a blank, `;`, `&`, `|`, `(`, `{`, `` ` `` or a quote.
+const SETS_BY_NAME_HEAD = /(?<![./~-])\b(?:eval|read|mapfile|readarray|getopts|source)\b(?![./~-])|\bprintf\s+-[A-Za-z]*v|(?:^|[\s;&|(])\.\s/;
+const DECLARING_WORD = /(?<![./~-])\b(?:export|unset|declare|typeset|local|readonly)\b(?![./~-])/;
 // (#288 R3-F3: the declaring words used to be one pattern, `\b(?:export|…)\b[^;&|\n]*[$`'"]`, which rescans the rest of the segment from EVERY declaring word: 27,000 `export` words took 7 s. A segment holds a name-setting
 // declaration when its FIRST declaring word is followed by a quote, `$` or backtick before the segment ends -- the same answer, one pass per segment.)
 const SETS_BY_NAME = {
@@ -2444,9 +2446,12 @@ function judgeScoped(text, dir, ctx, level, sf, child = false) {
   const scopes = (ctx.scopeTexts ??= []);
   ctx.judgedTexts = (ctx.judgedTexts ?? 0) + 1; // (#505: a text of a script was read and walked: what it did to the branches is recorded; see SOURCING in evalString)
   scopes.push(text);
+  const outerSplits = ctx.wordSplits;
+  ctx.wordSplits = sf.splits === true; // (#746 item 5: this text runs in bash / sh / dash; every other text is read as zsh, which does not split a variable)
   try {
     return judgeScopedIn(text, dir, ctx, level, sf, child);
   } finally {
+    ctx.wordSplits = outerSplits;
     scopes.pop();
   }
 }
@@ -3072,6 +3077,20 @@ function headResolves(c, cmds, ctx, out, text) {
     return nm !== '' && !BIND_HEADS.has(nm) && !bindsRunTimeName({ ...c, argv: [nm, ...c.argv.slice(1)] });
   });
 }
+// #746 item 5: the shells that split an unquoted variable on blanks (the command word is read by name, so `/bin/bash` counts too)
+const SPLITTING_SHELLS = new Set(['bash', 'sh', 'dash']);
+const SPLIT_WORD = /^[A-Za-z0-9_@%+=:,./-]+$/;
+// #746 item 5: for a loop word that is exactly `$NAME` / `${NAME}`: how many words NAME's value has, when ONE bare assignment gives NAME plain words with blanks between them (no `$`, backtick, quote or glob).
+// 0 for anything else (assigned elsewhere or twice, a one-word value, a prefix of a command): the loop word is then read as it was, not split.
+function splitCountOf(w, cmds) {
+  const m = /^\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))$/.exec(w);
+  const k = m?.[1] ?? m?.[2];
+  if (!k) return 0;
+  const at = cmds.filter((c) => Object.hasOwn(c.env ?? {}, k));
+  if (at.length !== 1 || at[0].argv.length) return 0;
+  const words = String(at[0].env[k]).trim().split(/[ \t\n]+/);
+  return words.length > 1 && words.every((x) => SPLIT_WORD.test(x)) ? words.length : 0;
+}
 function onceAssignedNames(cmds, ctx, str) {
   if (ctx.tainted.size || cmds.truncated || cmds.dynamicOther || definesFunction(str, cmds) || cmds.some(isStateHazard) || !subshellsTrusted(cmds) || indirectExpansionOnLine(str, cmds)) return [];
   const heads = []; // (#81 t8: the commands named by a variable; each is resolved below, once the readings are known, and judged as the command it names)
@@ -3148,7 +3167,12 @@ function onceAssignedNames(cmds, ctx, str) {
         if (!words.every((w) => computed(w) || LOOP_WORD_IN.test(w) || textual(w))) { bad = true; break; }
         const expand = words.some((w) => w.includes('$') && !computed(w));
         if (expand && (/['\\]/.test(String(lp.raw ?? "'")) || ifsMayBeSet(ctx) || words.some((w) => [...w.matchAll(/\$\{?(\w+)/g)].some((x) => x[1] === k)))) { bad = true; break; }
+        // #746 item 5: in a bash / sh / dash script `for f in $LIST` loops over the words of LIST's value: one reading per word, judged as `for f in a b` is. The header holds no quote or
+        // backslash and ifsMayBeSet is false (above); loopWordAt compares the value it finds with the count read here, so a value that differs is refused.
+        const splittable = ctx.wordSplits === true && !/["'\\]/.test(String(lp.raw ?? "'"));
         for (const w of words) {
+          const n = splittable && !computed(w) ? splitCountOf(w, cmds) : 0;
+          if (n > 0) { for (let i = 0; i < n; i++) seen.set(`s${i}/${n}:${w}`, { val: w, expand: true, split: { n, i } }); continue; }
           const m = w.includes('$') && !computed(w) ? { val: w, expand: true } : { val: w };
           seen.set((m.expand ? 'x' : 'v') + w, m);
         }
@@ -3255,7 +3279,15 @@ function loopsInSequence(text, k, count) {
 // A reading's loop word that holds `$NAME` gets its value where the `for` runs (every use of the loop name comes after it): the names it reads must be known
 // there and give literal text, else the reading is refused. Null when the value is set.
 function loopWordAt(k, ctx) {
-  const v = expandVars(ctx.pins.get(k).val, ctx);
+  const pin = ctx.pins.get(k);
+  const v = expandVars(pin.val, ctx);
+  if (pin.split) {
+    // #746 item 5: word i of the list's value; the value must be what the reading was made for (the same count, every word plain text)
+    const ws = v.includes('$') ? [] : v.trim().split(/[ \t\n]+/);
+    if (ws.length !== pin.split.n || !ws.every((x) => SPLIT_WORD.test(x))) return deny(`$${k} takes a loop word built from a variable whose value is not known here (or is not plain text), so its value at run time cannot be verified. Rewrite: write the loop words out.`);
+    ctx.vars[k] = ws[pin.split.i];
+    return null;
+  }
   if (v.includes('$') || !LOOP_WORD.test(v)) return deny(`$${k} takes a loop word built from a variable whose value is not known here (or is not plain text), so its value at run time cannot be verified. Rewrite: write the loop words out.`);
   ctx.vars[k] = v;
   return null;
@@ -3765,6 +3797,8 @@ function evalString(str, startDir, ctx, level, child = false) {
       }
       const withPath = (rec) => { if (sourcePathSearch(rec, c.argv, cmds)) { rec.ambiguous = true; rec.words ??= [rec.file]; rec.pathSearch = true; } if (rec.words?.some(isEqualsWord) || rec.pathSearch) rec.pathValues = pathValuesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n) }); return rec; }; // (zsh `=tool`: the PATH directories to look in)
       if (sf) withPath(sf);
+      // #746 item 5: bash, sh and dash split an unquoted variable on blanks (the guard otherwise reads the line as zsh, which does not): only for a script FILE they run, never a source, a candidate or a `-c` text
+      if (sf && sf.kind === 'shell' && !sf.sourced && !sf.candidate && !sf.ambiguous && SPLITTING_SHELLS.has(name)) sf.splits = true;
       // a shell runs its startup files (BASH_ENV, ENV, ZDOTDIR/.zshenv ...) BEFORE the script it was given, so they are judged first, in the
       // order the shell reads them, and what they change (a branch switch) is what the script and the feeds are then judged against
       const startupList = startupFilesOf(c, cmds, { env: ctx.env, inherited: (n) => knownValues(ctx, n), exec: sf?.kind === 'exec' });
