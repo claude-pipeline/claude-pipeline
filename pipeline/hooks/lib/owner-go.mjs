@@ -722,7 +722,9 @@ export function replyBeforeToolUse(transcriptPath, toolUseId, { tailBytes = REPL
     if (e?.type !== 'assistant') continue;
     const t = i === useAt ? textOf(e, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : textOf(e);
     if (showsText(t)) lastTextAt = i;
-    if (blocksOf(e).some((b) => b?.type === 'thinking' || b?.type === 'redacted_thinking')) progressNote = true;
+    // R1-B1: a real progress note is the `thinking` block of an entry Claude Code marks as shown to the owner (thinkingDisplay "updates" / staysIfReplyIsCut), before the target call; hidden or redacted reasoning is not
+    const before = i === useAt ? blocksOf(e).slice(0, blocksOf(e).findIndex((b) => b?.type === 'tool_use' && b.id === toolUseId)) : blocksOf(e);
+    if ((e.thinkingDisplay === 'updates' || e.staysIfReplyIsCut === true) && before.some((b) => b?.type === 'thinking')) progressNote = true;
     text += t;
   }
   for (let i = Math.max(lastTextAt, origin[useAt]) + 1; i < useAt; i++) {

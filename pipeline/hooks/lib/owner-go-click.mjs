@@ -265,7 +265,7 @@ function installedParts(ask, home) {
     if (op === undefined) return null;
     const v = verifyBlock(block, { home });
     const f = v.fields;
-    if (!v.ok || f.op !== op || f.label !== label || f.ref !== ref || (op === 'migration' ? f.name : f.sqlSha256.slice(0, 12)) !== arg || repoKey(f.repo) !== ask.repo) return null;
+    if (!v.ok || v.leading !== 0 || f.op !== op || f.label !== label || f.ref !== ref || (op === 'migration' ? f.name : f.sqlSha256.slice(0, 12)) !== arg || repoKey(f.repo) !== ask.repo) return null;
     return liveDbAsk({ repo: ask.repo, pr, block, op, arg, label, ref });
   }
   const ready = /^🔀 Ready to merge (#\d{1,6}(?:, #\d{1,6}){1,3}) — say "merge"$/.exec(block.split('\n').at(-1));
@@ -464,7 +464,7 @@ function bindAnswer(ask, text, question, home = accountHome()) {
     const go = parseGo(text);
     const cut = question.indexOf('\n\n');
     const v = go !== null && cut >= 0 ? verifyBlock(question.slice(cut + 2), { home }) : null;
-    if (!v?.ok) return { error: 'nothing-bound' };
+    if (!v?.ok || v.leading !== 0) return { error: 'nothing-bound' }; // (R1-B2: the question's body IS the block, no prose or other SQL before it)
     const f = v.fields;
     if (go.op !== f.op || go.arg !== (f.op === 'migration' ? f.name : f.sqlSha256.slice(0, 12))) return { error: 'nothing-bound' };
     if (repoKey(f.repo) !== ask.repo) return { error: 'other-pr-or-repo' };

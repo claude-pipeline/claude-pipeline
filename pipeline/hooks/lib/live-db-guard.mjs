@@ -74,6 +74,8 @@ export function supabaseMatch(tool, state, ti, ctx) {
 }
 export const isSupabaseTool = (tool, state, ti, ctx) => !!supabaseMatch(tool, state, ti, ctx);
 
+// The most lines of block the progress-note fallback accepts on the dialog alone: a dialog taller than a terminal screen may clip, and the owner must have read every line of the SQL (a longer block needs the reply text or the typed go).
+const PROGRESS_NOTE_BLOCK_MAX_LINES = 40;
 const deny = (reason) => ({ decision: 'deny', reason: `${PREFIX} ${reason}` });
 const allow = () => ({ decision: 'allow', reason: '' });
 const plain = (t) => String(t ?? '').replace(/\r\n/g, '\n').trim();
@@ -119,7 +121,12 @@ export function claimLiveDbGo({ home, sessionId, transcriptPath, op, projectRef,
         const asked = readAsk(r.ask.askId, { home });
         const q = asked.ok ? String(asked.ask?.dialog?.question ?? '') : '';
         const cut = q.indexOf('\n\n');
-        if (cut >= 0) shown = { text: q.slice(cut + 2) };
+        if (cut >= 0) {
+          const body = q.slice(cut + 2);
+          const dv = verifyBlock(body, { home, io });
+          // R1-B2: the body must BE the block (nothing before it); R1-F1: and short enough that the dialog shows it whole (longer ones need the reply text or the typed go)
+          shown = dv.ok && dv.leading === 0 && dv.blockLines <= PROGRESS_NOTE_BLOCK_MAX_LINES ? { text: body } : { reason: `${shown.reason}; the dialog's own question is not a block of at most ${PROGRESS_NOTE_BLOCK_MAX_LINES} lines and nothing else` };
+        }
       }
       const sv = shown.text === undefined ? null : verifyBlock(shown.text, { home, io });
       const sf = sv?.fields;

@@ -38,7 +38,7 @@ const text = (es) => `${es.map((e) => JSON.stringify(e)).join('\n')}\n`;
 // these content blocks), `{ result }` (a tool_result user entry) or `{ prompt }` (another owner prompt); `own: false` keeps it out of the dialog's own chain, `uuid` / `parent` set its place in the chain.
 // `promptOver`: fields written over the fixture's prompt entry (its provenance).
 const dir0 = (repo) => repo.dir;
-async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null, flag = false, rebase = false, promptOver = null } = {}) {
+async function world(t, { op = 'migration', answer = null, flush = false, modelAnswers = false, reply = null, flag = false, rebase = false, promptOver = null, dataText = 'update t set a = 1 where id = 7' } = {}) {
   const home = realpathSync(mkdtempSync(join(tmpdir(), 'cp-live-db-click-')));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   mkdirSync(join(home, '.claude'), { recursive: true });
@@ -47,7 +47,7 @@ async function world(t, { op = 'migration', answer = null, flush = false, modelA
   repo.git(['remote', 'add', 'origin', 'https://github.com/acme/widgets.git']);
   repo.write(FILE, SQL);
   const head = repo.commit('init');
-  const dataSql = 'update t set a = 1 where id = 7';
+  const dataSql = dataText;
   const block = (op === 'migration'
     ? buildBlock({ op, ref: REF, label: LABEL, name: NAME, file: FILE, head, repo: 'acme/widgets', dir: repo.dir, sql: SQL, summary: 'adds c' })
     : buildBlock({ op, ref: REF, label: LABEL, repo: 'acme/widgets', dir: repo.dir, sql: dataSql, summary: 'fix' })).join('\n');
@@ -395,6 +395,41 @@ test('#983: a progress note stands in for the reply only when the question carri
   assert.equal(nc.status, 'unverified');
   assert.match(nc.reason, /no reply text before the dialog/);
   assert.doesNotMatch(nc.reason, /progress note/);
+});
+
+test('R1-B1: hidden reasoning is not a progress note: redacted_thinking, or a thinking block on an entry Claude Code does not mark as shown, leaves the click refused', async (t) => {
+  // Failure caught: any thinking / redacted_thinking block letting a click through on the dialog's body alone, so a turn whose reasoning the owner never saw replaced the reply text.
+  for (const [what, note] of [['redacted_thinking', { blocks: [{ type: 'redacted_thinking', data: 'x' }] }], ['an unmarked thinking block', { blocks: progress.blocks }]]) {
+    const w = await world(t, { flush: true, reply: [note] });
+    assert.ok((await w.hook()).recorded, what);
+    const c = w.claim();
+    assert.equal(c.status, 'unverified', what);
+    assert.match(c.reason, /no reply text before the dialog/, what);
+    assert.equal(w.apply().decision, 'deny', what);
+  }
+});
+
+test('R1-B2: a dialog question with prose or other SQL before the block is never issued or bound, so no click path can carry it', async (t) => {
+  // Failure caught: verifyBlock reads the block as a suffix, so an ask whose question opened with a second description or another SQL block passed as the block the owner approved.
+  const w = await world(t);
+  const forged = liveDbAsk({ repo: 'acme/widgets', pr: 7, block: `This only adds a harmless column.\n\n${w.block}`, op: 'migration', arg: NAME, label: LABEL, ref: REF });
+  const issued = issueAsk({ ...forged, home: w.home, now: () => w.answeredAt - 20000 });
+  assert.equal(issued.askId, undefined, JSON.stringify(issued));
+  assert.ok(issued.error);
+});
+
+test('R1-F1: a block longer than the fallback bound is not claimed on a progress note; the same block shown as reply text still is', async (t) => {
+  // Failure caught: a long block (up to the line cap) approved on a dialog that may clip a tall question, so the owner never read all of the SQL.
+  const dataText = Array.from({ length: 45 }, (_, i) => `update t set a = ${i} where id = 7;`).join('\n');
+  const long = await world(t, { op: 'data', flush: true, reply: [progress], dataText });
+  assert.ok(long.block.split('\n').length > 40);
+  assert.ok((await long.hook()).recorded);
+  const c = long.claim();
+  assert.equal(c.status, 'unverified');
+  assert.match(c.reason, /at most 40 lines/);
+  const shown = await world(t, { op: 'data', flush: true, dataText });
+  assert.ok((await shown.hook()).recorded);
+  assert.equal(shown.claim().status, 'claimed');
 });
 
 test('#983: a progress note followed by another turn\'s text before the dialog is still refused', async (t) => {
