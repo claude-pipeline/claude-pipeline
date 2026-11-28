@@ -2402,3 +2402,84 @@ test('#746 C2 review R3-B1: a filter whose dollar sign starts no expansion is no
   }
   for (const line of ['C=bad.ts; npx playwright test --grep x -c "$C"', 'C=bad.ts; playwright test --grep $C -c ok.ts', 'C=bad.ts; playwright test --grep x* -c ${C}']) assert.equal(evaluate(line, o).decision, 'deny', line);
 });
+
+// ---- #902: a wrapper's own output file is a write the line makes, so a script it writes is not "missing, runs nothing" ---------------------------------------------------
+// The failure: `script -q n.sh echo <push to main>; bash n.sh` (and `time -o n.sh …`, `flock n.sh …`, `screen -Logfile n.sh …`) wrote n.sh through the wrapper, but the line-writes model only knew redirects and a fixed
+// list of writer commands, so n.sh counted as missing and `bash n.sh` as running nothing. The record keeps the name certain and the content unknown (append: the earlier content stays a possibility).
+// A script the wrapper wrote is refused whatever else the line mentions: nobody runs a script log or a timing report as a script.
+test('#902: a script the line wrote through a wrapper\'s own output option is refused when run, with n.sh missing or present', () => {
+  const rows = [
+    `script -q n.sh echo ${PUSH_G}; bash n.sh`, `script n.sh echo hi; bash n.sh`, 'time -o n.sh echo hi; bash n.sh', 'time -a -o n.sh echo hi; ./n.sh', 'time --output=n.sh echo hi; source n.sh', 'time -o n.sh echo hi && node n.sh',
+    `echo ${PUSH_G} > n.sh; script -q -a n.sh true; bash n.sh`, `echo ${PUSH_G} > n.sh; time -a -o n.sh true; bash n.sh`, 'flock n.sh true; bash n.sh', 'screen -L -Logfile n.sh ls; bash n.sh',
+    'command time -o n.sh ls; bash n.sh', 'env script -q n.sh ls; bash n.sh', 'script -q --log-out=n.sh -- env ls; bash n.sh',
+  ];
+  for (const present of [false, true]) {
+    for (const l of rows) {
+      const v = evaluate(l, withFiles(present ? { 'n.sh': HARMLESS_TEXT } : {}));
+      assert.equal(v.decision, 'deny', `${l} (n.sh ${present ? 'present' : 'missing'}): ${v.reason}`);
+    }
+  }
+  // the reason names the wrapper's file, not the "built from pieces" advice (write it out in one piece), which makes no sense for a log
+  const v = evaluate('time -o n.sh echo hi; bash n.sh', withFiles({}));
+  assert.match(v.reason, /written by `time`/);
+  assert.match(v.reason, /cannot follow its content/);
+  assert.doesNotMatch(v.reason, /in one piece/);
+});
+
+test('#902: a wrapper log that is not the script run later changes nothing (an unrelated existing script, the pty trick, a log in /tmp)', () => {
+  const ok = withFiles({ 'ok.sh': HARMLESS_TEXT });
+  for (const l of ['script -q /tmp/x.log ls; bash ok.sh', 'time -o /tmp/t.txt ls; bash ok.sh', 'script -q x.log ls; bash ok.sh', 'script -q /dev/null npm test; bash ok.sh', 'flock /tmp/x.lock ls; bash ok.sh', 'make; bash ok.sh']) {
+    const v = evaluate(l, ok);
+    assert.equal(v.decision, 'allow', `${l}: ${v.reason}`);
+  }
+  // everyday wrapper lines, no script run after them (the "stays allowed" table of the issue)
+  for (const l of ['script -q /tmp/x.log ls', 'script -q /dev/null git status', 'script -q x.log npm test', 'time -o /tmp/t.txt ls', '/usr/bin/time -l -o /tmp/t.txt npm test', 'time npm test', 'time -p ls', '\\time make', 'flock /tmp/x.lock ls',
+    'screen -dmS s npm run dev', 'screen -dmS x -L npm run dev', 'nohup npm test &', 'nohup npm run dev > /tmp/dev.log 2>&1 &', 'script -q /dev/null npm run build 2>&1 | tail -5']) {
+    const v = evaluate(l, ok);
+    assert.equal(v.decision, 'allow', `${l}: ${v.reason}`);
+  }
+});
+
+test('#902: the log lands where its wrapper starts: `env -C sub script -q n.sh` writes sub/n.sh, `script -q n.sh env -C sub` writes n.sh (both orders; an unresolved -C may be anywhere)', () => {
+  const both = withFiles({ 'n.sh': HARMLESS_TEXT, 'sub/n.sh': HARMLESS_TEXT, 'ok.sh': HARMLESS_TEXT });
+  const rows = [
+    ['env -C sub script -q n.sh echo hi; bash sub/n.sh', 'deny'], ['env -C sub script -q n.sh echo hi; bash n.sh', 'allow'], ['env -C sub script -q x.log ls; bash ok.sh', 'allow'],
+    ['script -q n.sh env -C sub echo hi; bash n.sh', 'deny'], ['script -q n.sh env -C sub echo hi; bash sub/n.sh', 'allow'], ['script -q x.log env -C sub ls; bash ok.sh', 'allow'],
+    ['env -C "$X" script -q n.sh echo hi; bash n.sh', 'deny'], ['env -C sub time -o n.sh ls; bash sub/n.sh', 'deny'], ['time -o n.sh env -C sub ls; bash n.sh', 'deny'],
+  ];
+  for (const [l, want] of rows) {
+    const v = evaluate(l, both);
+    assert.equal(v.decision, want, `${l}: ${v.reason}`);
+  }
+});
+
+// nohup writes nohup.out only when stdout is a terminal: under a pty a wrapper gives it (script, screen, unbuffer, ssh). Accepted refusal (corpus 0 of 113 nohup commands): `nohup ls; bash nohup.out`.
+test('#902: nohup.out counts as written by a nohup whose stdout may be a terminal, and not by one whose stdout is redirected or piped', () => {
+  assert.equal(evaluate('nohup ls; bash nohup.out', withFiles({ 'nohup.out': HARMLESS_TEXT })).decision, 'deny');
+  assert.equal(evaluate('script -q /dev/null nohup ls > /dev/null; bash nohup.out', withFiles({ 'nohup.out': HARMLESS_TEXT })).decision, 'deny');
+  for (const l of ['nohup ls > /dev/null; bash nohup.out', 'nohup ls | cat; bash nohup.out', 'nohup ls >> /tmp/l 2>&1 &\nbash nohup.out']) assert.equal(evaluate(l, withFiles({ 'nohup.out': HARMLESS_TEXT })).decision, 'allow', l);
+});
+
+test('#902: more than 16 distinct wrapper output files on one command is refused with its own reason; 16 and any number of repeats are not', () => {
+  const many = (n) => `time ${Array.from({ length: n }, (_, i) => `-o /tmp/t${i}`).join(' ')} ls`;
+  const v = evaluate(many(17));
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /the command's wrappers name more than 16 possible output files \(logs, timing or lock files\), too many to check; split the command up/);
+  assert.equal(evaluate(many(16)).decision, 'allow');
+  assert.equal(evaluate(`time ${Array.from({ length: 40 }, () => '-o /tmp/t').join(' ')} ls`).decision, 'allow');
+});
+
+// ---- #990: on Linux `script -- CMD` runs CMD; the child split read only the BSD form, where the first word after `--` is the log file --------------------------------------------------------
+// The failure: `script -- <push to main>` was judged as a command named `push` (its first word taken as the file), so the push ran with the git guard silent. The util-linux reading is a child too (both are judged).
+test('#990: a guarded push behind `script --` is refused, in each spelling that gives util-linux a command', () => {
+  for (const l of [`script -- ${PUSH_G}`, `script -q -- ${PUSH_G}`, `script -q --log-out=/tmp/x.log -- ${PUSH_G}`, `script -q -O /tmp/x.log -- ${PUSH_G}`, `script -qa -- ${PUSH_G}`,
+    // the two that were refused before (BSD reading) stay refused
+    `script -q /tmp/x.log -- ${PUSH_G}`, `script -q /dev/null ${PUSH_G}`]) {
+    assert.equal(evaluate(l).decision, 'deny', l);
+  }
+  // not over-refused: the same shapes with a harmless command, and a child's own `--` after its command
+  for (const l of ['script -- git status', 'script -q -- ls', 'script -q --log-out=/tmp/x.log -- git status', 'script -q /tmp/x.log ls', 'script -q /dev/null git status', 'script -q /dev/null git log -- README.md']) {
+    const v = evaluate(l);
+    assert.equal(v.decision, 'allow', `${l}: ${v.reason}`);
+  }
+});

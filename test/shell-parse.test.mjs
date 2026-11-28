@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import { cpuTimed } from './helpers/timing.mjs';
 import assert from 'node:assert/strict';
 import { splitArgs, simpleCommands, commandName, allRedirects, scriptFileOf, implicitBindsOf } from '../pipeline/hooks/lib/shell-parse.mjs';
+import * as SP from '../pipeline/hooks/lib/shell-parse.mjs';
 
 const argvs = (s, o) => simpleCommands(s, o).map((c) => c.argv.join(' '));
 const sorted = (a) => [...a].sort();
@@ -1492,4 +1493,102 @@ test('#904: pathRuns names each path-run program the parser read by name, with t
   assert.deepEqual(runs('env -C sub ./env x').map((e) => [e.rec.file, e.chdir]), [['./env', 'sub']]);
   // an expanding word is a candidate record, still marked (the policies decide what to do with it)
   assert.equal(runs('$D/env x')[0]?.rec.ambiguous, true);
+});
+
+// ---- #902: a wrapper's own output file (script log, time -o, screen log, flock lock, nohup.out) is recorded as a write target, never as a redirect -------------------------------
+// The mark `wrapperOuts` ([{ target, wrapper, chdir }], not enumerable) is on the emitted command, kept OUT of `redirects` (git-policy reads `redirects` in ~28 places that must keep their verdicts).
+// The failure it guards: the parser unwrapped `script -q <protected file> ls` to `ls` and dropped the wrapper's own words, so no guard ever judged the file the wrapper writes.
+// Platform facts the rows rest on (macOS, checked 11-28): `script -q F -- cmd` fails but still creates F; stock macOS `screen` has no -Logfile; `/usr/bin/time` has no --output / -f; `nohup` writes nohup.out only under a pty.
+const outsOf = (line) => simpleCommands(line).flatMap((c) => (c.wrapperOuts ?? []).map((o) => o.target));
+
+test('#902: script records its log file: the BSD file operand, the util-linux log options, the default name; a child\'s own -c or input file is no output', () => {
+  assert.deepEqual(outsOf('script -q /tmp/x.log ls'), ['/tmp/x.log']);
+  for (const opts of ['-a', '-qa', '-F', '-t 0', '-T fmt', '-Tfmt', '-k -r -d -e -p']) assert.deepEqual(outsOf(`script ${opts} /tmp/x.log ls`), ['/tmp/x.log'], opts);
+  assert.deepEqual(outsOf('script -q /dev/null grep -c x /tmp/in'), ['/dev/null'], 'a BSD child\'s own -c and input file are the child\'s');
+  assert.deepEqual(outsOf('script -q -- /tmp/x.log ls'), ['/tmp/x.log']);
+  // util-linux: the log options are outputs wherever they stand, and whatever stands after `--` (R4-4: the words after `--` are the command, not operands)
+  for (const line of ['script -q --log-out=/tmp/l -- env ls', 'script -q -O/tmp/l -- env ls', 'script -q -O /tmp/l -- env ls', 'script --log-in=/tmp/l -- time ls', 'script -B /tmp/l -- nice ls', 'script --log-o /tmp/l -c ls', 'script -c ls --log-timing=/tmp/l']) {
+    assert.ok(outsOf(line).includes('/tmp/l'), line);
+  }
+  assert.ok(outsOf('script -t/tmp/l -c ls').includes('/tmp/l'), 'an attached timing file');
+  assert.ok(outsOf('script --timing=/tmp/l -c ls').includes('/tmp/l'));
+  assert.ok(outsOf('script -q -c ls').includes('typescript'), 'no file operand: the default name');
+  assert.ok(outsOf('script -c ls /tmp/x.log').includes('/tmp/x.log'), 'util-linux operand');
+  // a run-time word as the file: the word after it may be the file as well (it can expand to an option or to nothing)
+  assert.deepEqual(outsOf('script -q $X /tmp/x.log ls'), ['$X', '/tmp/x.log']);
+  // a wrapper that does not unwrap (no command) gets no record: the line itself is refused by name
+  assert.deepEqual(outsOf('script -O /tmp/l'), []);
+});
+
+test('#902: time records its -o file in each spelling; -fo is a format, not an output; a word after the program is the program\'s', () => {
+  for (const line of ['time -o /tmp/t ls', 'time -o/tmp/t ls', 'time --output=/tmp/t ls', 'time --output /tmp/t ls', 'time --out=/tmp/t ls', 'time --o /tmp/t ls', 'time -ao /tmp/t ls', 'time -a -o /tmp/t ls', 'time -lo /tmp/t ls', 'time -f %e -o /tmp/t ls', '/usr/bin/time -l -o /tmp/t ls', 'command time -o /tmp/t ls', 'env time -o /tmp/t ls', 'sudo time -o /tmp/t ls', 'nohup time -o /tmp/t ls', 'time -o /tmp/t -- ls']) {
+    assert.ok(outsOf(line).includes('/tmp/t'), line);
+  }
+  for (const line of ['time -fo /tmp/t ls', 'time --format /tmp/t ls', 'time --format=/tmp/t ls', 'time -p ls', 'time ls -o /tmp/t', 'time -- ls -o /tmp/t', 'time npm test', '\\time make']) assert.ok(!outsOf(line).includes('/tmp/t'), line);
+  assert.deepEqual(outsOf('time -p ls'), []);
+  assert.deepEqual(outsOf('time -o /tmp/t'), [], 'no command: nothing unwrapped, no record');
+  // a run-time word among the options: the next word may be an option's value (R4-6: `time VAR=$X cmd arg` records `cmd`; harmless outside a protected directory)
+  assert.ok(outsOf('time VAR=$X cmd arg').includes('cmd'));
+});
+
+test('#902: flock records its lock file in both forms; screen its -Logfile, or the default screenlog.* with -L; nohup its nohup.out', () => {
+  for (const line of ['flock /tmp/k ls', 'flock -n /tmp/k ls', 'flock -w 5 /tmp/k ls', 'flock /tmp/k -c ls', 'flock -c ls /tmp/k', 'flock -n -c ls /tmp/k']) assert.deepEqual(outsOf(line), ['/tmp/k'], line);
+  assert.deepEqual(outsOf('screen -dmS x -L -Logfile /tmp/s.log ls'), ['/tmp/s.log']);
+  assert.deepEqual(outsOf('screen -L -logfile /tmp/s.log ls'), ['/tmp/s.log']);
+  assert.deepEqual(outsOf('screen -dmS x -L npm run dev'), ['screenlog.*'], 'a name only known at run time, in the command\'s directory');
+  assert.deepEqual(outsOf('screen -dmS s ls'), []);
+  assert.deepEqual(outsOf('nohup ls'), ['nohup.out']);
+  assert.deepEqual(outsOf('env ls'), []);
+  assert.deepEqual(outsOf('ls'), []);
+});
+
+test('#902: a wrapper output is not a redirect (the redirect readers keep their input), it is not enumerable, and repeats are recorded once', () => {
+  const [c] = simpleCommands('script -q /tmp/x.log ls');
+  assert.deepEqual(c.redirects ?? [], []);
+  assert.ok(!Object.keys(c).includes('wrapperOuts'));
+  assert.deepEqual(c.wrapperOuts.map((o) => o.wrapper), ['script']);
+  assert.deepEqual(outsOf('time -o /tmp/t -o /tmp/t -o /tmp/t ls'), ['/tmp/t']);
+  // behind each wrapper in the chain, the record names the wrapper that owns the file
+  assert.deepEqual(simpleCommands('env time -o /tmp/t flock /tmp/k ls')[0].wrapperOuts.map((o) => [o.wrapper, o.target]), [['time', '/tmp/t'], ['flock', '/tmp/k']]);
+});
+
+test('#902: each wrapper output keeps the directory change that came BEFORE its wrapper (a log lands where its wrapper starts)', () => {
+  const at = (line) => simpleCommands(line)[0].wrapperOuts.map((o) => [o.target, o.chdir]);
+  assert.deepEqual(at('env -C sub script -q x.log ls'), [['x.log', 'sub']]);
+  assert.deepEqual(at('script -q x.log env -C sub ls'), [['x.log', undefined]]);
+  assert.deepEqual(at('env -C a env -C b time -o x.log ls'), [['x.log', null]], 'two changes of directory: unknown');
+  assert.deepEqual(at('time -o x.log env -C sub ls'), [['x.log', undefined]]);
+});
+
+test('#902: more than 16 distinct output words on one command is refused (truncated, with its own reason); 16 and any number of repeats are not', () => {
+  const many = (n) => `time ${Array.from({ length: n }, (_, i) => `-o /tmp/t${i}`).join(' ')} ls`;
+  const over = simpleCommands(many(17));
+  assert.equal(over.truncated, true);
+  assert.match(over.refused ?? '', /more than 16 possible output files/);
+  assert.equal(simpleCommands(many(16)).truncated, false);
+  assert.equal(simpleCommands(`time ${Array.from({ length: 40 }, () => '-o /tmp/t').join(' ')} ls`).truncated, false);
+});
+
+// Failure caught: a wrapper added to the parser's WRAPPERS table later that writes a file of its own would be unwrapped and its file never judged, with nothing to say so. Every name needs an answer.
+test('#902: every wrapper the parser unwraps has an output disposition (a reader, none, or its text is sh -c)', () => {
+  assert.ok(SP.WRAPPER_NAMES.length >= 36, `${SP.WRAPPER_NAMES.length} wrappers`);
+  assert.equal(typeof SP.WRAPPER_OUTPUTS, 'object');
+  const missing = SP.WRAPPER_NAMES.filter((n) => !(SP.WRAPPER_OUTPUTS && Object.hasOwn(SP.WRAPPER_OUTPUTS, n)));
+  assert.deepEqual(missing, [], 'wrappers with no disposition');
+  for (const n of SP.WRAPPER_NAMES) assert.ok(typeof SP.WRAPPER_OUTPUTS[n] === 'function' || ['none', 'shell'].includes(SP.WRAPPER_OUTPUTS[n]), n);
+  for (const n of ['script', 'time', 'flock', 'screen']) assert.equal(typeof SP.WRAPPER_OUTPUTS[n], 'function', n);
+});
+
+// ---- #990: `script -- CMD` (util-linux) runs CMD; the child split read only the BSD form (the first word after `--` was taken as the log file) ------------------------------------
+// The failure: `script -- git push origin main` was read as a command named `push`, so the guard never saw the push. Both readings are children now.
+test('#990: the words after `script ... --` are a command too, when util-linux would run them (at most one operand before the `--`); the BSD reading stays', () => {
+  const G = ['git', 'pu' + 'sh', 'origin', 'ma' + 'in'].join(' ');
+  for (const line of [`script -- ${G}`, `script -q -- ${G}`, `script -q --log-out=/tmp/x.log -- ${G}`, `script -q /tmp/x.log -- ${G}`, `script -q -O /tmp/x.log -- ${G}`]) {
+    assert.ok(argvs(line).includes(G), line);
+  }
+  // main parity: the BSD reading (the first word after `--` is the file) is still a child
+  assert.ok(argvs(`script -q /dev/null ${G}`).includes(G));
+  // two operands before the `--` is no util-linux command (it refuses), and a child's own `--` is the child's: no extra command
+  assert.ok(!argvs('script -q /dev/null grep -- hooks').includes('hooks'));
+  assert.ok(!argvs('script -q /dev/null cat -- /tmp/x').includes('/tmp/x'));
 });

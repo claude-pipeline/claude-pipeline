@@ -2565,3 +2565,141 @@ test('#746 C: `npx playwright test -c / --config FILE` with a real config is all
     assert.equal(verdictOf(line, o).decision, 'deny', line);
   }
 });
+
+// ---- #902: a wrapper's own output file (script log, time -o, screen log, flock lock file, conditional nohup.out) is a write target, judged like a `>` redirect -------------------------------
+// The failure: the parser unwrapped `script -q <protected file> ls` to `ls` and dropped the wrapper's own words, so a protected file the wrapper creates or overwrites was never judged and the line was allowed.
+// Platform facts the rows rest on (macOS, checked 11-28): `script -q F -- cmd` fails on macOS but still creates F; stock macOS `screen` has no -Logfile; `/usr/bin/time` has no --output / -f; `nohup` writes nohup.out only under a pty.
+const W_S = '/home/u/.claude/settings.json';
+const W_P = '/home/u/.claude/pipeline';
+const W_OG = '/home/u/.claude/pipeline-state/owner-go';
+const W_RS = '.review/state.json'; // (relative to the repo, cwd /repo)
+const w902 = (rows, want) => {
+  for (const line of rows) {
+    const v = verdictOf(line);
+    assert.equal(v.decision, want, `${line} -> ${v.reason ?? ''}`);
+  }
+};
+
+test('#902: a protected file named as a wrapper\'s own output file is refused (the issue\'s "allowed on main" table, each spelling and behind each wrapper)', () => {
+  w902([
+    `script -q ${W_S} cat /tmp/payload`, `script ${W_S} cat /tmp/payload`, `script -a ${W_S} ls`, `script -qa ${W_S} ls`, `script -F ${W_S} ls`, `script -t 0 ${W_S} ls`,
+    `time -o ${W_S} ls`, `time -o${W_S} ls`, `time --output=${W_S} ls`, `time --output ${W_S} ls`, `time --out=${W_S} ls`, `time -ao ${W_S} ls`, `time -a -o ${W_S} ls`,
+    `command time -o ${W_S} ls`, `env time -o ${W_S} ls`, `sudo time -o ${W_S} ls`, `nohup time -o ${W_S} ls`, `/usr/bin/time -o ${W_S} ls`,
+    `screen -L -Logfile ${W_S} ls`, `screen -dmS x -L -Logfile ${W_S} ls`,
+    `flock ${W_OG}/abc ls`, `flock -n ${W_OG}/abc -c ls`, `script -q ${W_RS} ls`, `script -q /repo/${W_RS} ls`,
+    // a relative log inside a protected directory, and a wrapper that moves into one
+    `cd ${W_P} && script -q x.log ls`, `cd ${W_P} && time -o t.txt ls`, `env -C ${W_P} script -q x.log ls`, `sudo -D ${W_P} time -o t ls`,
+    // the name through a variable
+    `F=${W_S}; script -q $F ls`, `F=${W_S}; time -o $F ls`,
+  ], 'deny');
+  assert.match(verdictOf(`script -q ${W_P}/x.log ls`).reason, /`script` writes its log file to \/home\/u\/\.claude\/pipeline\/x\.log, which is a protected pipeline file/);
+  assert.match(verdictOf(`time -o ${W_P}/t ls`).reason, /`time` writes its output file to/);
+  assert.match(verdictOf(`flock ${W_OG}/abc ls`).reason, /`flock` writes its lock file to/);
+});
+
+test('#902: everyday wrapper lines stay allowed (a log in /tmp, the pty trick, timing, flock on a /tmp lock, screen, nohup in the background, reading a protected file)', () => {
+  w902([
+    'script -q /tmp/x.log ls', 'script -q /dev/null ls', 'script -q /dev/null git status', 'script -q x.log npm test', 'script -q /dev/null npm run build 2>&1 | tail -5', 'time -o /tmp/t.txt ls', '/usr/bin/time -l -o /tmp/t.txt npm test',
+    'time npm test', 'time -p ls', '\\time make', 'command time -p npm test', 'time ls | wc -l', 'time -o /dev/null ls', 'flock /tmp/x.lock ls', 'flock -n /tmp/x.lock npm test', 'screen -dmS s npm test', 'screen -dmS x -L npm run dev', 'nohup npm test &',
+    'nohup npm run dev > /tmp/dev.log 2>&1 &', 'time $X ls', 'time VAR=$X cmd arg',
+    `time cat ${W_S}`, `script -q /dev/null cat ${W_S}`, `time ls ${W_P}`, `cd ${W_P} && time ls`, `cd ${W_P} && time -p ls`, `cd ${W_P} && script -q /dev/null ls`, `cd ${W_P} && flock /tmp/x.lock ls`,
+    // a literal `&1` is a file name for a wrapper (no descriptor)
+    "script -q '&1' ls",
+  ], 'allow');
+  w902([`cd ${W_P} && script -q '&1' ls`], 'deny');
+});
+
+// R2-3 / R4-1: one shared view of write targets, so every question a redirect is asked is asked of a wrapper's file. Each `>` twin is denied on main (asserted too).
+test('#902: a wrapper log is judged with the questions a `>` redirect is asked: a name only known at run time, a hook-capable project file, `$_`, a relative name after an unknown cd', () => {
+  w902(['typeset -i F=3; ls > $F', 'typeset -i F=3; script -q $F ls', 'typeset -i F=3; time -o $F ls', 'typeset -i F=3; flock $F ls'], 'deny');
+  // a project file that can declare hooks
+  for (const t of ['.claude/settings.json', '.claude/settings.local.json']) {
+    w902([`ls > ${t}`, `script -q ${t} ls`, `time -o ${t} ls`, `screen -L -Logfile ${t} ls`], 'deny');
+  }
+  // `$_` on a line that names a protected file
+  w902([`echo ${W_S}; cat > $_`, `echo ${W_S}; script -q $_ ls`, `echo ${W_S}; time -o $_ ls`], 'deny');
+  // a relative name with a run-time part after a cd into an unknown place, and the climb out of an assumed one
+  w902(['cd "$X" && ls > "$Y.log"', 'cd "$X" && script -q "$Y.log" ls', 'cd "$X" && time -o "$Y.log" ls', 'cd "$X" && ls > x.log', 'cd "$X" && script -q x.log ls', 'cd "$(mktemp -d)" && ls > ../x.log', 'cd "$(mktemp -d)" && script -q ../x.log ls'], 'deny');
+});
+
+// R3-2: the three readers that scan EVERY redirect (the path fix, `$_` use, the assumed-directory climb) keep scanning input redirects as before and also read the wrapper targets: no input redirect becomes a write question.
+test('#902: an input redirect is judged as on main (the readers that scan every redirect still do); a variable that is no integer attribute is no new question', () => {
+  w902([`cat ${W_S}; wc -l < "$_"`, `echo ${W_S}; cat < $_`, 'cat < ${0:A:h}/x.txt', 'ls > ${0:A:h}/x.txt', 'script -q ${0:A:h}/x.log ls', 'cd "$(mktemp -d)" && ls < ../x', 'F=$(cat x); ls > $F'], 'allow');
+});
+
+// R4-2 (R3-3, files guard = redirect parity): a wrapper log is judged in every directory the line may be in, exactly as a `>` redirect is; a literal wrapper -C that comes first narrows it
+test('#902: a log is judged in the directories the whole line may be in, as a redirect is; `env -C` before the wrapper narrows it, a run-time -C cannot be told', () => {
+  // the redirect twins, denied on main
+  w902([`env -C ${W_P} ls > x.log`, `ls > x.log; env -C ${W_P} ls`], 'deny');
+  w902([`script -q x.log env -C ${W_P} ls`, `time -o x.log env -C ${W_P} ls`, `env -C ${W_P} script -q x.log ls`, `cd ${W_P} && script -q x.log env -C /tmp ls`, `env -C ${W_P} env -C pipeline script -q x.log ls`], 'deny');
+  w902([`cd ${W_P} && env -C /tmp script -q x.log ls`, `cd ${W_P} && env -C /tmp time -o x.log ls`, 'env -C /tmp script -q x.log ls'], 'allow');
+  // named over-denial: the directory cannot be told
+  w902(['sudo -D /tmp time -o t ls', 'env -C "$X" script -q x.log ls'], 'deny');
+  w902(['sudo -D /tmp time -o /tmp/t ls'], 'allow');
+});
+
+// R3-5 / R4-3: nohup.out is written only when stdout is a terminal; a pty-giving wrapper (script, screen, unbuffer, ssh) before nohup keeps it
+test('#902: nohup.out is a write target in a protected directory unless the command\'s stdout is provably no terminal (redirected, or not the last stage of a pipe)', () => {
+  w902([`cd ${W_P} && nohup ls > /dev/null`, `cd ${W_P} && nohup ls | cat`, `cd ${W_P} && nohup ls 2>&1 | wc -l`, `cd ${W_P} && nohup ls >> /tmp/l 2>&1 &`, 'nohup npm run dev &', 'nohup npm run dev > /tmp/dev.log 2>&1 &'], 'allow');
+  w902([`cd ${W_P} && script -q /dev/null nohup ls`, `cd ${W_P} && script -q /dev/null nohup ls > /dev/null`, `cd ${W_P} && nohup ls`, `cd ${W_P} && nohup ls &`], 'deny'); // (the last two: accepted new refusals, corpus 0 of 113 nohup commands)
+});
+
+// R4-4 (class b): in the util-linux reading the words after `--` are the COMMAND, so a log option is a candidate whatever stands after it
+test('#902: a util-linux log option is judged even when a command (`env`, `time`, `nice`) follows the `--`', () => {
+  w902([`script -q --log-out=${W_S} -- env ls`, `script -q -O${W_S} -- env ls`, `script -q -O ${W_S} -- env ls`, `script --log-in=${W_S} -- time ls`, `script --log-out=${W_S} -- nice ls`, `script -q --log-io=${W_S} -- command ls`,
+    `script -c ls ${W_S}`, `script -q -O ${W_S} /dev/null ls`, `script --timing=${W_S} -c ls`, `script -t${W_S} -c ls`], 'deny');
+  // main parity: a BSD child's own -c and input file are the child's
+  w902([`script -q /dev/null grep -c x ${W_S}`, `script -q /dev/null cat ${W_S}`], 'allow');
+});
+
+// R2-7: the rows another rule already refused stay refused (pinned, so a change to that rule shows here)
+test('#902: wrappers whose option is covered by another rule stay refused: parallel --joblog, ssh -E', () => {
+  w902([`parallel --joblog ${W_S} echo ::: a`, `ssh -E ${W_S} host ls`], 'deny');
+});
+
+// R4-6: screen -L without -Logfile is screenlog.*, a name only known at run time, in the command's directory
+test('#902: `screen -L` with no -Logfile is a run-time name in the command\'s directory (refused in a protected one only)', () => {
+  w902([`cd ${W_P} && screen -L ls`, `cd ${W_P} && screen -dmS x -L npm run dev`], 'deny');
+  w902(['screen -L ls', 'screen -dmS x -L npm run dev'], 'allow');
+});
+
+// R4-8: redirect parity for script, time and screen logs in the hooks-mention rule; flock's lock file and the conditional nohup.out are left out
+test('#902: a wrapper log makes a hooks-mentioning line a hook-file write for script / time / screen (as a redirect does), not for flock or nohup', () => {
+  w902(['grep hooks .claude/settings.json > /tmp/x.log', 'script -q /tmp/x.log grep hooks .claude/settings.json', 'time -o /tmp/t.txt jq .hooks .claude/settings.json', 'screen -L -Logfile /tmp/x.log grep hooks .claude/settings.json'], 'deny');
+  w902(['flock /tmp/x.lock grep hooks .claude/settings.json', 'nohup grep hooks .claude/settings.json', 'script -q /dev/null grep hooks .claude/settings.json', 'time grep hooks .claude/settings.json', 'time -p grep hooks .claude/settings.json'], 'allow');
+  assert.match(verdictOf('script -q /tmp/x.log grep hooks .claude/settings.json').reason, /writes a file that can declare hooks and mentions hooks/);
+});
+
+// R3-1 / R4-5: a script a wrapper wrote is refused when run (its contents are not known); the files guard refuses a log name it can place, with a sentence about the wrapper
+test('#902: running a file a wrapper wrote earlier on the line is refused, with n.sh missing or present; an unrelated script is not; a name the guard cannot place is allowed as after any unmodelled writer', () => {
+  const GUARDED = `echo x > ${W_S}`;
+  for (const present of [false, true]) {
+    const o = present ? withFiles746({ '/repo/n.sh': '#!/bin/sh\necho ok\n' }) : {};
+    for (const line of [
+      'time -o n.sh echo hi; bash n.sh', `script -q n.sh ${GUARDED}; bash n.sh`, `echo ${GUARDED} > n.sh; script -q -a n.sh true; bash n.sh`, `echo ${GUARDED} > n.sh; time -a -o n.sh true; bash n.sh`,
+      'flock n.sh true; bash n.sh', 'flock job.sh -c ./job.sh', 'screen -L -Logfile n.sh ls; bash n.sh', 'time -o n.sh echo hi; ./n.sh', 'time -o n.sh echo hi; source n.sh', 'time -o n.sh echo hi && node n.sh',
+      `time -o n.sh echo hi; cat ${W_S}; bash n.sh`,
+    ]) {
+      const v = verdictOf(line, o);
+      assert.equal(v.decision, 'deny', `${line} (n.sh ${present ? 'present' : 'missing'}) -> ${v.reason ?? ''}`);
+    }
+  }
+  const msg = verdictOf('time -o n.sh echo hi; bash n.sh').reason;
+  assert.match(msg, /written by `time`/);
+  assert.match(msg, /cannot follow its content/);
+  assert.doesNotMatch(msg, /in one piece/);
+  // an unrelated script, the pty trick, a /tmp log: unchanged
+  const ok = withFiles746({ '/repo/ok.sh': '#!/bin/sh\necho ok\n' });
+  for (const line of ['script -q /tmp/x.log ls; bash ok.sh', 'time -o /tmp/t.txt ls; bash ok.sh', 'script -q /dev/null npm test; bash ok.sh', 'script -q x.log ls; bash ok.sh', 'flock -n job.sh ./job.sh']) assert.equal(verdictOf(line, ok).decision, 'allow', line);
+  // the files guard refuses only a log name it can place: `$PWD/n.sh` is not one (as after any unmodelled writer such as `make`)
+  assert.equal(verdictOf(`script -q "$PWD/n.sh" ${GUARDED}; bash n.sh`, withFiles746({})).decision, 'allow');
+  assert.equal(verdictOf('make; bash n.sh', withFiles746({ '/repo/n.sh': '#!/bin/sh\necho ok\n' })).decision, 'allow');
+});
+
+test('#902: more than 16 distinct wrapper output files on one command is refused with its own reason; 16 and any number of repeats are not', () => {
+  const many = (n) => `time ${Array.from({ length: n }, (_, i) => `-o /tmp/t${i}`).join(' ')} ls`;
+  const v = verdictOf(many(17));
+  assert.equal(v.decision, 'deny');
+  assert.match(v.reason, /the command's wrappers name more than 16 possible output files \(logs, timing or lock files\), too many to check; split the command up/);
+  w902([many(16), `time ${Array.from({ length: 40 }, () => '-o /tmp/t').join(' ')} ls`], 'allow');
+});
