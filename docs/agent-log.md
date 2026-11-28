@@ -395,3 +395,4 @@ full record.
 - 2026-11-28 · #986 · Guard: the owner's install script runs again: a loop over a word-list variable, and a program run through a folder variable after launchctl (#965, #746 item 5) · risk high · rounds 4 · arbiter 4 · awaiting-owner-merge · Codex 7d: 964 runs (389 high)
 - 2026-11-28 · #984 · Dismissal clicks need a clean-checkout ask, lock waits respect the hook deadline, newer-request test (#977 #924 #962) · risk high · rounds 5 · arbiter 5 (fix-verify 2) · awaiting-owner-merge · Codex 7d: 964 runs (389 high)
 - 2026-11-28 · #981 · Cost bookings are append-only comments, so two saves at once can no longer erase one (#958) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · needs-human · Codex 7d: 967 runs (391 high)
+- 2026-11-28 · #981 · Cost bookings are append-only comments, so two saves at once can no longer erase one (#958) · risk high · rounds 6 · arbiter 6 (fix-verify 3) · blocked · Codex 7d: 969 runs (391 high)
