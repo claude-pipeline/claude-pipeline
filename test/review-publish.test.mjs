@@ -1136,3 +1136,22 @@ test('state show (R1-B1): an owner deferral plus the follow-up issue filed befor
   assert.equal(kept.kept.rounds[0].items[0].followupIssue, 'https://github.com/acme/widgets/issues/9', 'the issue link is kept');
   assert.equal(show({ ...deferral, decision: 'REJECT' }).source, 'quarantined', 'no other combination');
 });
+
+// #998: two fake-gh processes share the state file, and a reader that starts while the other is rewriting it saw an empty or partial file (Windows CI:
+// "Unexpected end of JSON input" at the fixture's first read). The fixture must wait the write out, not crash.
+test('fake-gh-comments: started while the state file is empty (another process mid-write), it waits for the state instead of crashing', async () => {
+  const fake = createCommentsGh([]);
+  const stateFile = fake.env.PIPELINE_FAKE_GH_STATE;
+  const full = readFileSync(stateFile, 'utf8');
+  writeFileSync(stateFile, '');
+  const child = spawn(process.execPath, [join(here, 'fixtures', 'fake-gh-comments.mjs'), 'api', 'user'], { env: { ...process.env, ...fake.env }, stdio: ['ignore', 'pipe', 'pipe'] });
+  let stdout = '';
+  let stderr = '';
+  child.stdout.on('data', (d) => { stdout += d; });
+  child.stderr.on('data', (d) => { stderr += d; });
+  const exit = new Promise((resolve) => child.on('close', resolve));
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  writeFileSync(stateFile, full);
+  assert.equal(await exit, 0, stderr);
+  assert.equal(stdout.trim(), 'me');
+});

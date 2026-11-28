@@ -3,7 +3,9 @@
 //   { me: "<login>", comments: [{id, body, user:{login}, created_at, updated_at}], seq, fail: { write?: true, list?: true, writeAfter?: <n comment writes allowed> } }
 // Routes: `api user` (the viewer), GET .../issues/N/comments --paginate, POST .../issues/N/comments, PATCH .../issues/comments/ID. Anything else is
 // answered by the script. A state file shared by two checkouts is how two worktrees of one PR see each other's publications.
-import { appendFileSync, readFileSync, writeFileSync } from 'node:fs';
+// The state is written atomically (temp file + rename, retried on Windows' transient EPERM/EACCES/EBUSY) and read with a bounded retry, so a process that
+// starts while another is mid-write never sees an empty or partial file (#998).
+import { appendFileSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs';
 
 const argv = process.argv.slice(2);
 const joined = argv.join(' ');
@@ -11,9 +13,36 @@ const stdin = argv.includes('--input') ? (() => { try { return readFileSync(0, '
 if (process.env.PIPELINE_FAKE_GH_LOG) appendFileSync(process.env.PIPELINE_FAKE_GH_LOG, `${JSON.stringify({ argv, cwd: process.cwd(), stdin })}\n`);
 
 const file = process.env.PIPELINE_FAKE_GH_STATE;
-const state = JSON.parse(readFileSync(file, 'utf8'));
+const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+const readState = () => {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      return JSON.parse(readFileSync(file, 'utf8'));
+    } catch (e) {
+      if (attempt >= 40) throw e; // ~2 s in all, then the original error
+      sleep(50);
+    }
+  }
+};
+const writeState = (data) => {
+  const tmp = `${file}.${process.pid}.${Date.now()}.tmp`;
+  writeFileSync(tmp, data);
+  for (let attempt = 0; ; attempt++) {
+    try {
+      renameSync(tmp, file);
+      return;
+    } catch (e) {
+      if (attempt >= 20 || !['EPERM', 'EACCES', 'EBUSY'].includes(e.code)) {
+        rmSync(tmp, { force: true });
+        throw e;
+      }
+      sleep(25);
+    }
+  }
+};
+const state = readState();
 const out = (json, code = 0, stderr = '') => {
-  writeFileSync(file, JSON.stringify(state));
+  writeState(JSON.stringify(state));
   if (json !== undefined) process.stdout.write(typeof json === 'string' ? json : JSON.stringify(json));
   if (stderr) process.stderr.write(stderr);
   process.exitCode = code;
