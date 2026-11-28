@@ -12,7 +12,7 @@ import { createHash } from 'node:crypto';
 import path from 'node:path';
 import { EXIT, UnavailableError, UsageError, intOption, parseCommandArgs, requireOption } from '../lib/cli.mjs';
 import { Fail, guarded, requireConfig, resolveRepo, untrustedAnchorRefusal } from '../lib/cmd-common.mjs';
-import { SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
+import { CATEGORIES, SECOND_REVIEW_SCHEMA_PATH, buildCodexArgs, buildSecondReviewPrompt } from '../lib/codex.mjs';
 import { execCodex, readCodexAnswer } from '../lib/codex-exec.mjs';
 import { GitError, diffFiles, git, headSha, isAncestor, isClean, mergeBase, revParse, reviewContentHash, showFile } from '../lib/git.mjs';
 import { hashBranch, regressionOnlyFor } from '../lib/risk.mjs';
@@ -26,11 +26,11 @@ import { baseConfigAt } from '../lib/config.mjs';
 import { gatherRoundStatus, predictNextRound, reviewedDiff, trustedBaseConfig } from '../lib/round-status.mjs';
 import { createGitHub, guardGh } from '../lib/github.mjs';
 import { askFields, clickGate } from '../lib/click-ask.mjs';
-import { RULING_VARIANT_LEGACY, clickNotes, followUpClickState, roundAsk, rulingAsk, rulingWhyRow } from '../hooks/lib/owner-go-click.mjs';
+import { RULING_HEAD_BOUND_VARIANTS, RULING_VARIANT_LEGACY, clickNotes, followUpClickState, readAsk, roundAsk, rulingAsk, rulingVariantFor, rulingWhyRow } from '../hooks/lib/owner-go-click.mjs';
 import { grantIdOf, ownerGrantLookups, ownerGrantedRounds, ownerRulingGap, ownerRulingRecords, rulingConfigDirHint } from '../hooks/lib/owner-go.mjs';
 import {
-  applyClaudeRuling, applyJudge, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
-  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, ownerRulingRefusal, RULING_WHY, rulingRecommendationRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
+  applyClaudeRuling, applyJudge, BUCKETS, CONFIDENCES, capDeferItemsInState, capLowDeferral, capLowItems, capLowPolicy, applyOwnerRuling, applyTestResult, asciiLine, claudeRulingRefusal, DECISIONS, deferEligibility, deferItemsInState, finalizeWithoutArbiter, isOwnerRuled,
+  countsTowardCap, isDeferrableAccept, isOwnerDeferral, isProtectedFinal, markLightLane, needsHumanCause, ownerRulingRefusal, RULING_WHY, rulingRecommendationRefusal, reviewedRoundCount, roundAdmission, roundOutcome, roundTripWire, rulingContentDigest, secondReviewRefusal, settleSecondReview, substituteAgentFor, validateSecondReview, validateTriage,
 } from '../lib/triage.mjs';
 import {
   currentContentHash, ensureRoundDir, findItem, findRound, readFileOrFail, refreshBaseRef, refreshTrustedDefault, requireState, reviewBaseRef, roundDir, sha256, withRouteLock, withStateLock, writeFileAtomic, writeJson,
@@ -57,10 +57,10 @@ export const meta = {
     '  -> only for a disputed bug with a possible settle test and no test result yet; exit 1 for an item that needs a human, was ruled by the arbiter or is implemented, or (error settle-head-moved, next `arbiter needed --pr N --round R --force`) when the tree differs from the round\'s reviewed head in a file that is not a test file, or a tracked file that is not a test file has uncommitted changes',
     '  -> a bug-disproved result on a security/auth/permissions/data item is still needsHuman',
     'pipeline triage light-lane --round R [--repo DIR]',
-    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--recommend accept|follow-up --why CODE] [--repo DIR]',
+    'pipeline triage ruling-request --pr N --ids ID[,ID…] [--ask] [--recommend accept|follow-up|reject --why CODE] [--repo DIR]',
     '  -> {ok, line}: the LAST line of the reply that asks the owner to rule, `⚖️ Owner ruling needed #N: ID, ID · content <digest12> · repo owner/name`; the digest covers the text of exactly those items in the current review state (exit 1 for an unknown id, a --pr that is not the review state\'s, or a repository off github.com)',
     '  -> --ask (click-to-approve #261, owner_approval: chat): also {ask: {askId, questions}}: a choice question (Not now | Accept all | Follow-up all | Reject all; with an accepted --recommend the recommended one is first and labelled "(Recommended)", see below) whose text is the item summaries and then exactly that line, written as an ask file (one-time use, expires after 24 h, superseded by a newer ask for the same PR); the review skill passes it to AskUserQuestion verbatim and the owner-go hook records a human click as the same ruling a typed `ID: accept|follow-up|reject` per asked id records; otherwise ask: null and askSkipped (owner_approval is not chat | owner_go.click is off | Claude Code build unknown or not allowlisted for clicks | dialog hooks not approved: the owner runs `pipeline owner-go approve-dialog-hooks` once | the ask could not be issued)',
-    '  -> --recommend accept|follow-up --why CODE (only together; cp #771): the controller\'s recommendation for ALL the asked ids, as researched. CODE is one of accept: real-problem | unclear-safe; follow-up: minor-later (a code of the other decision is a usage error; there is no reject: every REJECT is a critical dismissal). The CLI decides only whether it may be SHOWN (triage.mjs#rulingRecommendationRefusal): every id must be one `owner-ruling` could record for that decision, and a follow-up only when every item is low severity (itemSeverity, as round-request / defer-fixes judge it) and waits for a human on low confidence or is an open deferrable ACCEPT. Accepted: the dialog is ruling-v2-accept / ruling-v2-follow-up (v 2 ask), the recommended option first as `Accept all (Recommended)` / `Follow-up all (Recommended)`, and the question gains one row `Claude recommends <Accept|Follow-up> all (when asked): <the fixed text of CODE>` just before the closing line. Refused (or no --recommend): exit 0 with the legacy ruling-v1 dialog, recommend null and recommendRefused (the reason): say in the reply that no bulk ruling can be recommended and per-item typed answers may be needed. Output adds {recommend, why, dialogVariant, recommendRefused?} with and without --ask. A recommendation records nothing: only the owner\'s click or typed answer does',
+    '  -> --recommend accept|follow-up|reject --why CODE (only together; cp #771, #944): the controller\'s recommendation for ALL the asked ids, as researched. CODE is one of accept: real-problem | unclear-safe; follow-up: minor-later | fix-separately; reject: not-a-bug | already-handled | no-user-impact (a code of another decision is a usage error; the code\'s text is fixed, never free prose). The CLI decides only whether it may be SHOWN (triage.mjs#rulingRecommendationRefusal): every id must be one `owner-ruling` could record for that decision; minor-later (the row says the pipeline rates it low) only when every item is low severity (itemSeverity, as round-request / defer-fixes judge it) and waits for a human on low confidence or is an open deferrable ACCEPT; fix-separately and reject (Claude\'s own rating, no severity claim, BLOCKING included) only for items waiting for a human (fix-separately also an open deferrable ACCEPT the owner raised the deferral of), never an implemented one, a malfunction wait, an item whose second review says ACCEPT, a round-cap deferral, or (fix-separately) one whose same-on-base scope the PR diff contradicted. Accepted: the dialog is ruling-v2-accept / ruling-v2-follow-up (minor-later) / ruling-v2-follow-up-any (fix-separately) / ruling-v2-reject (v 2 ask), the recommended option first as `Accept all (Recommended)` / `Follow-up all (Recommended)` / `Reject all (Recommended)`, and the question gains one row `Claude recommends <Accept|Follow-up|Reject> all (when asked): <the fixed text of CODE>` just before the closing line; each item row shows its category, why it waits and any second review. Probe first without --ask (recommendRefused reports a refusal and issues nothing), issue once with --ask, and pass ask.questions to AskUserQuestion unchanged: an edited dialog is refused and the owner has to type. When the items need different rulings, ask one id per dialog in sequence. Refused (or no --recommend): exit 0 with the legacy ruling-v1 dialog, recommend null and recommendRefused (the reason): say in the reply that no bulk ruling can be recommended and per-item typed answers may be needed. Output adds {recommend, why, dialogVariant, recommendRefused?} with and without --ask. A recommendation records nothing: only the owner\'s click or typed answer does',
     'pipeline triage round-request --pr N [--ask] [--past] [--after-process-review] [--repo DIR]',
     '  -> the TRIP-WIRE (a prompt, not a gate; ON by default, review.trip_wire_extra_rounds / review.trip_wire_not_falling, the smaller of the working-tree and fork-point values): when the PR has reviewed max_rounds + extra counted rounds, or at least not_falling past-limit rounds',
     '     accepted (more than 0 and) at least as many new items as the round before, the ask does not print a line: exit 1 {ok:false, error:"trip-wire", tripWire: {tripped, reviewed, max, acceptsByRound, reasons}, processReview: {headline, summary}[, longReview][, nextRound], warnings}. Park the PR with the headline',
@@ -383,6 +383,12 @@ function lightLaneLocked(n, root) {
 // What the owner said is recorded as said (trimmed only), with a cap so a pasted wall of text cannot bloat the published state.
 const OWNER_TEXT_MAX = 1000;
 
+// The dialogs that recommended a dismissal, by variant: the decision a click on the recommended option records, and the recommendation the click-time recheck asks again (rule 4 does not depend on which reject code).
+const CLAIMS = Object.freeze({
+  'ruling-v2-follow-up': { decision: 'FOLLOW-UP', recommend: 'follow-up', code: 'minor-later' },
+  'ruling-v2-follow-up-any': { decision: 'FOLLOW-UP', recommend: 'follow-up', code: 'fix-separately' },
+  'ruling-v2-reject': { decision: 'REJECT', recommend: 'reject', code: 'not-a-bug' },
+});
 async function ownerRuling(rest, ctx) {
   const { values } = parseCommandArgs(rest, {
     round: { type: 'string' }, id: { type: 'string' }, decision: { type: 'string' }, reason: { type: 'string' },
@@ -421,7 +427,7 @@ async function ownerRuling(rest, ctx) {
     const { slug, host } = gh.repo();
     const prNum = state.pr ?? pr;
     if (host !== 'github.com') return refuse(`gh resolves this repository on ${host ?? 'an unknown host'}, not github.com, and the owner's recorded ruling names a repository on github.com`);
-    const asked = { repo: slug, pr: prNum, id, quote: ownerQuote, decision };
+    const asked = { repo: slug, pr: prNum, id, quote: ownerQuote, decision, ...(ctx.home ? { home: ctx.home } : {}) }; // (ctx.home: the test seam the other triage commands have)
     const answers = ownerRulingRecords({ ...asked, contentOf: contentOfState(state) });
     if (answers.length === 0) {
       const again = `ask again: end the reply with the line \`pipeline triage ruling-request --pr ${prNum} --ids ${id}\` prints (Owner rules in chat, review-loop.md), wait for the owner's answer, and pass all of it as --owner-quote`;
@@ -432,18 +438,48 @@ async function ownerRuling(rest, ctx) {
       if (gap === 'changed') return refuse(`the finding text of ${id} (or of another item asked in the same request, or an item is gone) changed since the owner was asked, so the recorded ruling no longer applies; ${again}`);
       return refuse(`no owner ruling is recorded for ${slug} #${prNum} ${id} whose whole answer is --owner-quote and says ${decision.toLowerCase()} (an answer naming several decisions must also name ${id}): ${again}${clickNotesText(slug, prNum)}`);
     }
-    // R1-B1/B2 (cp #771): any answer on the dialog that recommended "Follow-up all" (the click or "Other") rested on the pipeline's claim that the item is low severity, checked only when the dialog was issued. Check it
-    // again now (the item, a sensitive path or the severity config may have changed since); a typed answer or an answer on any other dialog said no such thing.
-    if (decision === 'FOLLOW-UP' && answers.every((r) => r.ask?.variant === 'ruling-v2-follow-up')) {
-      // R2-B1: the dialog's claim covered the WHOLE batch it was asked for, so recheck every sibling still waiting (not just this id): else this id's FOLLOW-UP is saved on a batch claim that no longer holds.
+    // R1-B1/B2 (cp #771, #944): an answer on a dialog that recommended a DISMISSAL (the click or "Other" with the recommended decision) rested on a claim checked only when the dialog was issued: the pipeline rates it low
+    // (ruling-v2-follow-up), or the item is one only Claude's own rating dismisses (ruling-v2-follow-up-any, ruling-v2-reject). Check it again now (the item, a sensitive path or the severity config may have changed since).
+    // A typed answer, an answer on a neutral dialog, and an answer choosing another option than the recommended one (the non-recommended Accept, other words typed into "Other") said no such thing and are never rechecked.
+    const claimOf = (r) => CLAIMS[r.ask?.variant]?.decision === decision ? CLAIMS[r.ask.variant] : null;
+    if (answers.every((r) => claimOf(r) !== null)) {
+      // R2-B1: the dialog's claim covered the WHOLE batch it was asked for, so recheck every sibling still waiting (not just this id): else this id's ruling is saved on a batch claim that no longer holds.
       // R3-B1/B2: each matching record is its own dialog: resolve its ids across ALL rounds (as the request and the digest do) and recheck it alone; the answer stands when one record's own batch still qualifies.
       const checks = answers.map((r) => {
-        const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || (i.final?.by !== 'owner' && (i.final?.needsHuman === true || isDeferrableAccept(i) || isProtectedFinal(i))));
-        return { waiting, stale: recommendationRefusal({ root, config, state, items: waiting, recommend: 'follow-up' }) };
+        const claim = claimOf(r);
+        // R1-B3 (#954): every asked sibling is rechecked except those this same answer already ruled; one in any other state (a built ACCEPT, a settled ruling) no longer qualifies the batch
+        // R2-B3: "this same answer" is judged as the owner-go record lookup judges it (white space collapsed, case ignored): an equivalent spelling of the answer, stored by an earlier call, is the same answer
+        const same = (q) => String(q ?? '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const waiting = itemsFor(state, r.ids).filter((i) => i.id === id || !(i.final?.by === 'owner' && same(i.final?.ownerQuote) === same(ownerQuote)));
+        // R1-B2 (#954): a recommended Reject / fix-separately was Claude's reading of the code at the head the ask was issued at; a click is stale once the head moved (an ask file that cannot be read is not judged here).
+        // R2-B2: a readable head-bound ask that recorded no head, or no PR head on GitHub, cannot be compared at all: refused, not skipped. R2-B1: the PR head on GitHub is compared too (a push from another checkout
+        // leaves this checkout's HEAD where it was), and one that cannot be read is refused; local commits not pushed yet do not matter, only a change since the ask.
+        const issuedAt = RULING_HEAD_BOUND_VARIANTS.includes(r.ask.variant) ? readAsk(r.ask.askId, { home: ctx.home }) : null;
+        let moved = null;
+        if (issuedAt?.ok === true) {
+          const { head: askedHead, prHead: askedPrHead } = issuedAt.ask;
+          if (typeof askedHead !== 'string' || typeof askedPrHead !== 'string') moved = 'the ask recorded no PR head to compare with, so the code Claude checked cannot be told apart from the code now';
+          // R5-B1: an ask issued by an earlier build that accepted an ancestor PR head recorded two heads that differ from each other; both can be unchanged since, yet the code Claude checked was never the PR's
+          else if (askedHead !== askedPrHead) moved = 'the ask recorded different PR heads (this checkout and GitHub), so the code Claude checked was not the PR\'s code';
+          else {
+            const nowHead = headSha({ cwd: root });
+            let nowPrHead = null;
+            try { nowPrHead = gh.prView(prNum, ['headRefOid']).headRefOid; } catch { /* unreadable: refused below */ }
+            if (nowHead !== askedHead) moved = `the PR head moved from ${askedHead.slice(0, 12)} to ${nowHead.slice(0, 12)} since Claude recommended this, so the code it checked may have changed`;
+            else if (typeof nowPrHead !== 'string') moved = 'the PR head on GitHub could not be read, so it cannot be confirmed that the code Claude checked is still the PR';
+            else if (nowPrHead !== askedPrHead) moved = `the PR head on GitHub moved from ${askedPrHead.slice(0, 12)} to ${nowPrHead.slice(0, 12)} since Claude recommended this, so the code it checked may have changed`;
+          }
+        }
+        return { variant: r.ask.variant, waiting, stale: moved ?? recommendationRefusal({ root, config, state, items: waiting, recommend: claim.recommend, code: claim.code }) };
       });
       if (checks.every((c) => c.stale !== null)) {
-        const { waiting, stale } = checks[0];
-        return refuse(`the owner answered on the dialog that recommended Follow-up all, which said the pipeline rates ${waiting.map((i) => i.id).join(', ')} low severity, but that no longer holds (${stale}), so the answer approves nothing; ask again on the neutral dialog: \`pipeline triage ruling-request --pr ${prNum} --ids ${waiting.map((i) => i.id).join(',')} --ask\` with no --recommend`);
+        const { variant, waiting, stale } = checks[0];
+        const names = waiting.map((i) => i.id).join(', ');
+        // R2-F1: only the items an owner ruling could still record are offered again (the id being ruled always); the full list stays in the explanation above
+        const askable = waiting.filter((i) => i.id === id || ownerRulingRefusal(i, i.id, n, decision) === null).map((i) => i.id);
+        const again = `ask again on the neutral dialog: \`pipeline triage ruling-request --pr ${prNum} --ids ${askable.join(',')} --ask\` with no --recommend`;
+        if (variant === 'ruling-v2-follow-up') return refuse(`the owner answered on the dialog that recommended Follow-up all, which said the pipeline rates ${names} low severity, but that no longer holds (${stale}), so the answer approves nothing; ${again}`);
+        return refuse(`the owner answered on the dialog that recommended ${variant === 'ruling-v2-reject' ? 'Reject all' : 'Follow-up all'} for ${names}, which rested on Claude's check of those items, but that no longer holds (${stale}), so the answer approves nothing; ${again}`);
       }
     }
     seedBaseline({ ctx, root, pr: prNum, state }); // the `comment --kind triage` that publishes this ruling needs the baseline too
@@ -942,19 +978,28 @@ const contentOfState = (state) => (ids) => {
   return items ? rulingContentDigest(items) : null;
 };
 
+// One item's row in the ruling question (unverified text: the hook reads only the last line and the one recommendation row). The waiting cause is fixed text (needsHumanCause is one of a fixed list), never
+// final.reason (a test-security wait carries test output, which could pose as a second-review verdict in a dialog that may recommend Reject); bucket, category and a second review's verdict show only a known value.
+// The rest goes through oneLine: a newline in a stored field would break the question's line structure.
+const known = (list, x, fallback) => (list.includes(x) ? x : fallback);
+function summaryRow(i) {
+  const waits = i.final?.needsHuman === true ? ` · waits: ${needsHumanCause(i)}` : '';
+  const second = i.secondReview !== null && typeof i.secondReview === 'object' ? ` · second review: ${known(DECISIONS, i.secondReview.decision, 'unknown')} (${known(CONFIDENCES, i.secondReview.confidence, 'unknown')})` : '';
+  return `${i.id} · ${known(BUCKETS, i.bucket, 'other')} · ${known(CATEGORIES, i.category, 'other')} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}${waits}${second}`;
+}
 const oneLine = (x) => String(x ?? '').replace(/\s+/g, ' ').trim().slice(0, 120);
 const deferNote = (item, { id = true } = {}) => `${id ? `${item.id}: ` : ''}ACCEPTED by ${item.final?.ownerDeferral?.accepted ?? item.final?.by}, NOT fixed; follow-up = defer the fix to an issue; only when it is not a regression vs the default branch`;
 
-// Why the controller's recommendation may not be shown, or null (cp #771). The severity inputs are the ones round-request / defer-fixes give itemSeverity: the reviewed diff and the trusted base config
-// (a PR must not shrink its own sensitive-path list); a diff or config that cannot be read refuses a follow-up (it is a judgement of low severity). An accept needs neither.
-function recommendationRefusal({ root, config, state, items, recommend }) {
-  const decision = recommend === 'accept' ? 'ACCEPT' : 'FOLLOW-UP';
-  if (decision === 'ACCEPT') return rulingRecommendationRefusal(items, decision);
+// Why the controller's recommendation may not be shown, or null (cp #771, #944). `code` is the RULING_WHY code. Only minor-later judges severity, so only it reads the reviewed diff and the trusted base config
+// (a PR must not shrink its own sensitive-path list; a diff or config that cannot be read refuses it): an unreadable diff never refuses an accept, a reject or fix-separately.
+function recommendationRefusal({ root, config, state, items, recommend, code }) {
+  const decision = recommend === 'accept' ? 'ACCEPT' : recommend === 'reject' ? 'REJECT' : 'FOLLOW-UP';
+  if (decision !== 'FOLLOW-UP' || code !== 'minor-later') return rulingRecommendationRefusal(items, decision, {}, code);
   const diff = reviewedDiff(root, config, state);
   if (diff.files === null) return `the reviewed diff could not be read (${diff.problem}), so no item can be judged low severity`;
   const trusted = trustedBaseConfig(root, config);
   if (trusted.problem) return `severity could not be judged: the trusted base config is unreadable (${asciiLine(trusted.problem, 160)})`;
-  return rulingRecommendationRefusal(items, decision, { state, config, files: diff.files, baseConfig: trusted.config });
+  return rulingRecommendationRefusal(items, decision, { state, config, files: diff.files, baseConfig: trusted.config }, code);
 }
 
 // The line that ends the reply asking the owner to rule: the CLI writes it, so the agent cannot state a digest of its own choosing.
@@ -963,10 +1008,10 @@ async function rulingRequest(rest, ctx) {
   const pr = intOption(values, 'pr', { required: true, min: 1 });
   const ids = [...new Set(requireOption(values, 'ids').split(/[\s,]+/).filter(Boolean).map((id) => id.toUpperCase()))]; // (R1-B1 and r1-b1 are one item)
   if (ids.length === 0) throw new UsageError('--ids must name at least one item');
-  // cp #771: the controller's recommendation. Both flags or neither; the code must be one the table has for THAT decision (its text is worded by installed code, never the controller's prose).
+  // cp #771, #944: the controller's recommendation. Both flags or neither; the code must be one the table has for THAT decision (its text is worded by installed code, never the controller's prose).
   if ((values.recommend === undefined) !== (values.why === undefined)) throw new UsageError('--recommend and --why go together');
   if (values.recommend !== undefined) {
-    if (!Object.hasOwn(RULING_WHY, values.recommend)) throw new UsageError(`--recommend must be ${Object.keys(RULING_WHY).join('|')} (a REJECT is never recommended)`);
+    if (!Object.hasOwn(RULING_WHY, values.recommend)) throw new UsageError(`--recommend must be ${Object.keys(RULING_WHY).join('|')}`);
     if (!Object.hasOwn(RULING_WHY[values.recommend], values.why)) throw new UsageError(`--why for --recommend ${values.recommend} must be ${Object.keys(RULING_WHY[values.recommend]).join('|')}`);
   }
   const root = resolveRepo(values, ctx);
@@ -987,15 +1032,36 @@ async function rulingRequest(rest, ctx) {
     // F1: an item that is an ACCEPT (not fixed) is said so, in the CLI's own words, so the owner knows "follow-up" defers an accepted fix (the closing line keeps its fixed shape: the owner-go hook parses it).
     const notes = items.filter((i) => isDeferrableAccept(i) || isOwnerDeferral(i)).map((i) => deferNote(i));
     // May the recommendation be shown? Refused => the neutral legacy dialog and the reason, never a retry (exit 0).
-    const refused = values.recommend === undefined ? null : recommendationRefusal({ root, config, state, items, recommend: values.recommend });
+    const refusedRaw = values.recommend === undefined ? null : recommendationRefusal({ root, config, state, items, recommend: values.recommend, code: values.why });
+    // minor-later claims "the pipeline rates it low": when that is what refused it, name the code that makes no such claim.
+    const refused = refusedRaw !== null && values.why === 'minor-later' && / is not low severity \(/.test(refusedRaw) ? `${refusedRaw}; if Claude's own research rates it worth fixing but not in this PR, recommend follow-up with --why fix-separately` : refusedRaw;
     const shown = values.recommend !== undefined && refused === null;
-    const dialogVariant = shown ? `ruling-v2-${values.recommend}` : RULING_VARIANT_LEGACY;
+    const dialogVariant = shown ? rulingVariantFor(values.recommend, values.why) ?? RULING_VARIANT_LEGACY : RULING_VARIANT_LEGACY;
     const recommendFields = { recommend: shown ? values.recommend : null, why: shown ? values.why : null, dialogVariant, ...(refused === null ? {} : { recommendRefused: refused }) };
     if (values.ask !== true) return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields } };
+    // R3-B2: the click gate first: with clicks off (or an unlisted build) no dialog is issued, so no head is needed and a failing PR lookup must not turn the typed line into an error.
+    const gate = clickGate({ config, root, ctx });
+    // A recommended Reject / fix-separately rests on Claude's reading of the code: the ask records the head it was issued at (this checkout's HEAD and the PR's head on GitHub), and owner-ruling refuses the click once
+    // either moved or cannot be compared. R4-B1: it is shown only when the PR head on GitHub IS this checkout's HEAD; a checkout that is ahead (unpushed commits, or a PR rewound
+    // to an ancestor), behind or diverged (a push from another checkout, an update-branch) was not what the PR holds, so the neutral dialog is issued instead.
+    let heads = null;
+    let headRefusal = null;
+    if (shown && gate.ok && RULING_HEAD_BOUND_VARIANTS.includes(dialogVariant)) {
+      const head = headSha({ cwd: root });
+      const prHead = gh.prView(pr, ['headRefOid']).headRefOid;
+      // R5-B2: HEAD equal to the PR head says nothing about files edited since: a dirty working tree is code the PR does not hold
+      if (typeof prHead === 'string' && prHead === head && !isClean({ cwd: root })) headRefusal = 'the checkout has uncommitted changes, so the code Claude checked may not be the PR\'s code: commit and push, then recommend again';
+      else if (typeof prHead === 'string' && prHead === head) heads = { head, prHead };
+      else headRefusal = `the PR head on GitHub (${String(prHead).slice(0, 12)}) is not this checkout's HEAD (${head.slice(0, 12)}), so the code Claude checked may not be the PR's code: push or pull, then recommend again`;
+    }
+    const recommended = shown && headRefusal === null;
+    const variantNow = recommended ? dialogVariant : RULING_VARIANT_LEGACY;
+    const fieldsNow = headRefusal === null ? recommendFields : { recommend: null, why: null, dialogVariant: RULING_VARIANT_LEGACY, recommendRefused: headRefusal };
     // The question: one summary row per item, then exactly the printed line (presentedRuling reads the LAST line, so the rows bind nothing and the owner sees what is asked).
-    const block = [...items.map((i) => `${i.id} · ${i.bucket} · ${oneLine(i.title)}${i.file ? ` · ${oneLine(i.file)}${i.line ? `:${i.line}` : ''}` : ''}${isDeferrableAccept(i) || isOwnerDeferral(i) ? ` · ${deferNote(i, { id: false })}` : ''}`), ...(shown ? [rulingWhyRow(values.recommend, values.why)] : []), line].join('\n');
-    const parts = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: dialogVariant });
-    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...recommendFields, ...askFields({ gate: clickGate({ config, root, ctx }), parts, ctx }) } };
+    const block = [...items.map(summaryRow), ...(recommended ? [rulingWhyRow(values.recommend, values.why)] : []), line].join('\n');
+    const built = rulingAsk({ repo: slug, pr, ids: items.map((i) => i.id), line: block, variant: variantNow });
+    const parts = built !== null && heads !== null ? { ...built, ...heads } : built;
+    return { exitCode: EXIT.OK, output: { ok: true, line, ...(notes.length > 0 ? { notes } : {}), ...fieldsNow, ...askFields({ gate, parts, ctx }) } };
   }, pr));
 }
 

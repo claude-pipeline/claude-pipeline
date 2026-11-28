@@ -187,14 +187,15 @@ export function fableFindingItems(findings, round, { transcript = null, fingerpr
   return findings.map((f, i) => {
     const defersBlockingSecurity = f.bucket === 'BLOCKING' && SECURITY_CATEGORIES.includes(f.category) && f.ruling === 'FOLLOW-UP';
     let final = { decision: f.ruling, by: 'arbiter', needsHuman: false, reason: f.reasoning };
-    if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
+    const sob = f.ruling === 'FOLLOW-UP' ? sameOnBaseOf(f, regression ?? {}) : null;
+    // a same-on-base claim the whole-PR diff disproves (sob.waive false) waits for a human whatever the bucket or category (the arbiter files its own findings as SUGGESTION), and never stores the scope;
+    // the contradiction is kept as its own marker (final.scopeContradicted), whatever reason the final shows
+    const contradicted = f.scope === SAME_ON_BASE && sob !== null && sob.waive !== true;
+    if (f.confidence === 'low') final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence', scopeContradicted: contradicted };
     else {
       const oom = f.scope === OUT_OF_MODEL && f.ruling === 'FOLLOW-UP' ? outOfModelOf(f, { models, files: diffFiles }) : null;
-      const sob = f.ruling === 'FOLLOW-UP' ? sameOnBaseOf(f, regression ?? {}) : null;
       const waived = oom?.waive === true || (sob?.waive === true && f.scope === SAME_ON_BASE);
-      // a same-on-base claim the whole-PR diff disproves (sob.waive false) waits for a human whatever the bucket or category (the arbiter files its own findings as SUGGESTION), and never stores the scope
-      const contradicted = f.scope === SAME_ON_BASE && sob !== null && sob.waive !== true;
-      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)', cause: 'security-dismissal' };
+      if ((defersBlockingSecurity && !waived) || contradicted) final = { decision: f.ruling, by: 'arbiter', needsHuman: true, reason: defersBlockingSecurity ? 'would defer a blocking security/data finding' : SCOPE_CONTRADICTED_REASON, cause: 'security-dismissal', scopeContradicted: contradicted };
       else final = { ...final, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(f.scope === SAME_ON_BASE ? { scope: SAME_ON_BASE } : {}) }) };
     }
     const item = {
@@ -407,6 +408,9 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
       item.bucket === 'BLOCKING' &&
       SECURITY_CATEGORIES.includes(item.category) &&
       (r.ruling === 'REJECT' || r.ruling === 'FOLLOW-UP');
+    // see fableFindingItems: a same-on-base claim the diff disproves parks for a human whatever the bucket or category, and is marked as such on the final
+    const sob = r.ruling === 'FOLLOW-UP' || r.ruling === 'REJECT' ? sameOnBaseOf(item, regression ?? {}) : null;
+    const contradicted = r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' && sob !== null && sob.waive !== true;
     if (!proofOk) {
       // The ruling is not provably from Fable, so it must not steer the decision: fall back to the
       // judge's (a human decides anyway). With no judge on record the ruling is all there is.
@@ -427,15 +431,12 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
         cause: 'invalid-arbiter',
       };
     } else if (r.confidence === 'low') {
-      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence' };
+      next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: 'arbiter low confidence', cause: 'low-confidence', scopeContradicted: contradicted };
     } else {
       const oom = r.scope === OUT_OF_MODEL && r.ruling === 'FOLLOW-UP' ? outOfModelOf(item, { models, files: diffFiles }) : null;
-      const sob = r.ruling === 'FOLLOW-UP' || r.ruling === 'REJECT' ? sameOnBaseOf(item, regression ?? {}) : null;
       const waived = oom?.waive === true || (sob?.waive === true && r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP');
-      // see fableFindingItems: a same-on-base claim the diff disproves parks for a human whatever the bucket or category
-      const contradicted = r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' && sob !== null && sob.waive !== true;
       if ((dismissesBlockingSecurity && !waived) || contradicted) {
-        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)', cause: 'security-dismissal' };
+        next.final = { decision: r.ruling, by: 'arbiter', needsHuman: true, reason: dismissesBlockingSecurity ? 'would dismiss a blocking security/data item' : SCOPE_CONTRADICTED_REASON, cause: 'security-dismissal', scopeContradicted: contradicted };
       } else {
         next.final = { decision: r.ruling, by: 'arbiter', needsHuman: false, reason: r.reasoning, ...(oom === null ? {} : { outOfModel: oom.name }), ...(sob === null ? {} : { sameOnBase: sob.name, ...(r.scope === SAME_ON_BASE && r.ruling === 'FOLLOW-UP' ? { scope: SAME_ON_BASE } : {}) }) };
       }
@@ -453,6 +454,8 @@ export function applyRulings(items, rulings, { proofOk, transcript, proofCause, 
 export const MALFUNCTION_CAUSES = ['model-proof', 'invalid-arbiter', 'invalid-judge', 'stale-model', 'stale-terminal'];
 // 'round-cap': an accepted fix taken out of the PR at the round limit and filed as a follow-up (applyRoundCapDefer). A judgement the owner can re-make, not a malfunction.
 export const ROUND_CAP_CAUSE = 'round-cap';
+// The reason of the needs-human final a contradicted "same on base" scope leaves when nothing else parked it (settle / arbiter apply); the contradiction itself is `final.scopeContradicted`.
+export const SCOPE_CONTRADICTED_REASON = 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)';
 const NEEDS_HUMAN_CAUSES = [...MALFUNCTION_CAUSES, 'low-confidence', 'security-dismissal', 'test-security', ROUND_CAP_CAUSE];
 // The reason strings of states written before `cause` existed.
 const LEGACY_CAUSES = [
@@ -713,21 +716,44 @@ export function ownerRulingRefusal(item, id, round, decision) {
   return null;
 }
 
-// May the ruling dialog show "Claude recommends <decision> all" for these items (cp #771)? The controller researches the items and picks the decision; this decides only whether that recommendation
-// may be SHOWN. -> a reason string (refused) or null. `decision` is 'ACCEPT' | 'FOLLOW-UP' (REJECT is never recommended: every REJECT is a critical dismissal the pipeline accepts only after a second
-// review, which a controller's research is not). `ctx` = the inputs round-request / defer-fixes give itemSeverity (state, config, the reviewed diff's files, the trusted baseConfig).
+// May the ruling dialog show "Claude recommends <decision> all" for these items (cp #771, #944)? The controller researches the items and picks the decision; this decides only whether that recommendation
+// may be SHOWN. -> a reason string (refused) or null. `decision` is 'ACCEPT' | 'FOLLOW-UP' | 'REJECT'; `code` is the RULING_WHY code and is REQUIRED for FOLLOW-UP (a missing one is a refusal, so a caller that
+// predates it cannot silently skip the severity rules). `ctx` = the inputs round-request / defer-fixes give itemSeverity (state, config, the reviewed diff's files, the trusted baseConfig).
 //  1. every id passes the SAME check `owner-ruling` applies (so the click could record it);
 //  2. ACCEPT is never a dismissal: rule 1 only;
-//  3. FOLLOW-UP only when EVERY item is low severity (itemSeverity fails closed on BLOCKING, non-allowlisted categories, sensitive paths, same-file serious items, an unknown diff or config) AND is
-//     either an open deferrable ACCEPT or waits for a human with the plain 'low-confidence' cause (never a malfunction, security-dismissal, test-security or unknown one).
-export function rulingRecommendationRefusal(items, decision, ctx = {}) {
-  if (decision !== 'ACCEPT' && decision !== 'FOLLOW-UP') return 'only "accept" and "follow-up" may be recommended: every REJECT is a critical dismissal that needs a second review';
+//  3. FOLLOW-UP 'minor-later' (the row says the pipeline rates it low): only when EVERY item is low severity (itemSeverity fails closed on BLOCKING, non-allowlisted categories, sensitive paths, same-file
+//     serious items, an unknown diff or config) AND is either an open deferrable ACCEPT or waits for a human with the plain 'low-confidence' cause (never a malfunction, security-dismissal, test-security or unknown one);
+//  4. FOLLOW-UP 'fix-separately' and REJECT (Claude's own rating, no severity claim): only items that wait for a human (any final decision) or, for 'fix-separately', an open deferrable ACCEPT (the owner's
+//     deferral); never an implemented one, one waiting on a malfunction, one a second review says ACCEPT for, a round-cap deferral, or ('fix-separately') one whose same-on-base scope the PR diff contradicted;
+//  5. anything else (an unknown decision, or a FOLLOW-UP code that is not one of those two) is refused.
+const FOLLOW_UP_CODES = ['minor-later', 'fix-separately'];
+export function rulingRecommendationRefusal(items, decision, ctx = {}, code = undefined) {
+  if (decision !== 'ACCEPT' && decision !== 'FOLLOW-UP' && decision !== 'REJECT') return 'only "accept", "follow-up" and "reject" may be recommended';
+  if (decision === 'FOLLOW-UP' && !FOLLOW_UP_CODES.includes(code)) return `a recommendation to follow up needs one of the codes ${FOLLOW_UP_CODES.join(' | ')}`;
   if (!Array.isArray(items) || items.length === 0) return 'no item to recommend a ruling for';
   for (const item of items) {
     const why = ownerRulingRefusal(item, item?.id, null, decision);
     if (why !== null) return why;
   }
   if (decision === 'ACCEPT') return null;
+  if (decision === 'REJECT' || code === 'fix-separately') {
+    for (const item of items) {
+      const waits = item.final?.needsHuman === true;
+      if (isRoundCapDeferral(item)) return `${item.id} was deferred past the round limit, which only the owner's typed ruling can reopen`;
+      if (!waits && !(code === 'fix-separately' && isDeferrableAccept(item))) {
+        return `${item.id} is not waiting for a human decision${decision === 'REJECT' ? '' : ' (and is not an accepted fix the owner raised the deferral of)'}, so Claude's own rating of it is not asked for`;
+      }
+      if (item.implemented === true) return `${item.id} is already implemented, so a recommendation to ${decision === 'REJECT' ? 'reject' : 'follow up'} (drop or move the built fix) would be wrong`;
+      if (waits && MALFUNCTION_CAUSES.includes(needsHumanCause(item))) return `${item.id} waits because of a ${needsHumanCause(item)} malfunction: ${RERUN}`;
+      if (item.secondReview?.decision === 'ACCEPT') return `${item.id}: the second review says ACCEPT, so Claude does not recommend dismissing it`;
+      // R2-B4 (#954): the writer before the marker stored only the generic security reason when BOTH the blocking-security and the contradicted-scope conditions held, so an arbiter security-dismissal final
+      // without a boolean marker cannot be told apart from a contradicted one: fail closed (every current writer stores the boolean, true or false)
+      const unmarked = waits && item.final.by === 'arbiter' && ['security-dismissal', 'low-confidence'].includes(needsHumanCause(item)) && typeof item.final.scopeContradicted !== 'boolean'; // (R3-F1: the released writer checked confidence first, so a contradicted scope left no trace on a low-confidence final either)
+      if (code === 'fix-separately' && waits && (item.final.scopeContradicted === true || item.final.reason === SCOPE_CONTRADICTED_REASON)) return `${item.id} waits because the PR diff contradicted its "same on base" scope (the pipeline has evidence it is this PR's change), which a follow-up row would deny`;
+      if (code === 'fix-separately' && unmarked) return `${item.id} waits on an arbiter ruling written before the scope check was recorded on it, so whether the PR diff contradicted its "same on base" scope is unknown, which a follow-up row would deny`;
+    }
+    return null;
+  }
   for (const item of items) {
     // R1-B3: an ACCEPT whose fix is already in the PR (a low-confidence one still waiting for a human) is not "fix it later"; FOLLOW-UP would also drop the built fix from the fix review.
     if (item.implemented === true) return `${item.id} is already implemented, so a recommendation to follow up (fix it later) would be wrong`;

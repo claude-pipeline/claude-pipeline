@@ -2,7 +2,8 @@
 // (run(argv, ctx)) with a temp account home (ctx.home, the same seam `pipeline owner-go` has) so the asks, the dialog-hook list and the owner-go folder are never the developer's real ones.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
+import { spawnSync } from 'node:child_process';
+import { appendFileSync, existsSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, realpathSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { cli, ghEntries, PR, REPO, scenario, ymlFor } from './helpers/gate-env.mjs';
@@ -286,10 +287,10 @@ function triageWorld(yml = CHAT(), over = {}, { secondRound = false } = {}) {
   st = addRound(st, { n: 1, fromHead: 'a', toHead: s.head, contentHashAtToHead: s.hash, items: [item('R1-B1', 'Missing check'), item('R1-S3', 'Another\nmultiline   finding')] });
   if (secondRound) st = addRound(st, { n: 2, fromHead: s.head, toHead: s.head, contentHashAtToHead: s.hash, items: [item('R2-B1', 'Second missing check')] }); // a second reviewed round: with trip_wire_extra_rounds 1 (max_rounds 1 + 1) the trip-wire fires
   saveState(s.repo.dir, st);
-  s.fake.setScript([REPO]);
+  s.fake.setScript([REPO, { match: '^pr view 12 --json headRefOid', stdoutJson: { headRefOid: s.head } }]); // (a recommended Reject / fix-separately ask records the PR head on GitHub)
   return s;
 }
-const triage = (s, home, ...args) => triageRun(args, { cwd: s.repo.dir, env: baseEnv(s), home, managedPaths: [] });
+const triage =(s, home, ...args) => triageRun(args, { cwd: s.repo.dir, env: baseEnv(s), home, managedPaths: [] });
 
 test('triage round-request --ask: the question is the title and exactly the printed line; the ask binds the round request', async () => {
   const s = triageWorld();
@@ -396,7 +397,7 @@ test('triage ruling-request --ask: item summaries above, then exactly the printe
   assert.equal(r.exitCode, 0);
   assert.equal(r.output.line, plain.output.line);
   const q = r.output.ask.questions[0];
-  assert.equal(q.question, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · BLOCKING · Missing check · src/app.js:1\nR1-S3 · BLOCKING · Another multiline finding · src/app.js:1\n${r.output.line}`);
+  assert.equal(q.question, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · BLOCKING · security · Missing check · src/app.js:1\nR1-S3 · BLOCKING · security · Another multiline finding · src/app.js:1\n${r.output.line}`);
   assert.deepEqual(q.options.map((o) => o.label), ['Not now', 'Accept all', 'Follow-up all', 'Reject all']);
   assert.deepEqual(presentedRuling(q.question), { pr: PR, repo: 'acme/widgets', ids: ['R1-B1', 'R1-S3'], content: /content ([0-9a-f]{12})/.exec(r.output.line)[1] });
   const file = readAsk(r.output.ask.askId, { home }).ask;
@@ -423,7 +424,7 @@ test('triage ruling-request --ask --recommend: an accepted recommendation puts t
   const q = r.output.ask.questions[0];
   assert.deepEqual(q.options.map((o) => o.label), ['Accept all (Recommended)', 'Follow-up all', 'Reject all', 'Not now']);
   const row = 'Claude recommends Accept all (when asked): Claude checked the code: the finding looks real in this PR, so fixing it now is the safe choice.';
-  assert.equal(q.question, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · BLOCKING · Missing check · src/app.js:1\nR1-S3 · BLOCKING · Another multiline finding · src/app.js:1\n${row}\n${r.output.line}`);
+  assert.equal(q.question, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · BLOCKING · security · Missing check · src/app.js:1 · waits: low-confidence\nR1-S3 · BLOCKING · security · Another multiline finding · src/app.js:1 · waits: low-confidence\n${row}\n${r.output.line}`);
   assert.deepEqual(presentedRuling(q.question), { pr: PR, repo: 'acme/widgets', ids: ['R1-B1', 'R1-S3'], content: /content ([0-9a-f]{12})/.exec(r.output.line)[1] }, 'the row binds nothing: the closing line still does');
   const raw = JSON.parse(readFileSync(join(asksDir(home), `${r.output.ask.askId}.json`), 'utf8'));
   assert.deepEqual([raw.v, raw.variant, raw.actions['Accept all (Recommended)']], [2, 'ruling-v2-accept', 'R1-B1: accept, R1-S3: accept']);
@@ -479,4 +480,157 @@ test('triage ruling-request --ask: label mode -> ask null (the typed line stays)
   const bad = await triage(s, newHome(), 'ruling-request', '--pr', String(PR), '--ids', 'R9-B9', '--ask');
   assert.equal(bad.exitCode, 1);
   assert.equal('ask' in bad.output, false);
+});
+
+// ---- cp #944: a recommended Reject / a recommended follow-up that makes no severity claim ----------------------------------------------------------------------------------------------
+const WAITING_ACCEPT = { decision: 'ACCEPT', by: 'arbiter', needsHuman: true, cause: 'low-confidence', reason: 'arbiter low confidence', scopeContradicted: false }; // (the #2720 shape: an ACCEPT waiting for a human)
+const DEFERRABLE = { decision: 'ACCEPT', by: 'arbiter', needsHuman: false, reason: 'arbiter accepted it' };
+const askRec = (s, ...more) => triage(s, newHome(), 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--ask', ...more);
+const labelsOf = (r) => r.output.ask?.questions[0].options.map((o) => o.label);
+
+test('triage ruling-request --ask --recommend reject: a BLOCKING waiting item gets ruling-v2-reject, Reject all (Recommended) first, the row before the closing line and the typed action', async () => {
+  // failure caught (#944): no way to issue a recommended Reject (Claude edited a neutral dialog by hand and the owner's click was refused), or a row the verifier would not read
+  for (const final of [WAITING_ACCEPT, { ...WAITING_ACCEPT, cause: 'security-dismissal', reason: 'would dismiss a blocking security/data item' }]) {
+    const s = triageWorld(CHAT(), { final });
+    const home = newHome();
+    const r = await triage(s, home, 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--ask', '--recommend', 'reject', '--why', 'not-a-bug');
+    assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+    assert.deepEqual([r.output.recommend, r.output.why, r.output.dialogVariant, 'recommendRefused' in r.output], ['reject', 'not-a-bug', 'ruling-v2-reject', false], JSON.stringify(r.output.recommendRefused));
+    assert.deepEqual(labelsOf(r), ['Reject all (Recommended)', 'Accept all', 'Follow-up all', 'Not now']);
+    const row = 'Claude recommends Reject all (when asked): Claude checked the code for each item: what it describes does not happen, so there is nothing to fix.';
+    assert.match(r.output.ask.questions[0].question, new RegExp(`\\n${row.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\n⚖️ Owner ruling needed`));
+    const raw = readAsk(r.output.ask.askId, { home });
+    assert.equal(raw.ok, true, 'the installed verifier reads what the command issued');
+    assert.deepEqual([raw.ask.variant, raw.ask.actions['Reject all (Recommended)']], ['ruling-v2-reject', 'R1-B1: reject']);
+  }
+});
+
+test('triage ruling-request --ask --recommend follow-up --why fix-separately: a BLOCKING waiting item gets ruling-v2-follow-up-any; minor-later on it is still refused and the refusal names fix-separately', async () => {
+  // failure caught (#944): the only follow-up row was minor-later, refused for a BLOCKING item, so the controller had no recommended dialog for a follow-up it had researched
+  const s = triageWorld(CHAT(), { final: WAITING_ACCEPT });
+  const r = await askRec(s, '--recommend', 'follow-up', '--why', 'fix-separately');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual([r.output.recommend, r.output.dialogVariant, 'recommendRefused' in r.output], ['follow-up', 'ruling-v2-follow-up-any', false], JSON.stringify(r.output.recommendRefused));
+  assert.deepEqual(labelsOf(r), ['Follow-up all (Recommended)', 'Accept all', 'Reject all', 'Not now']);
+  assert.match(r.output.ask.questions[0].question, /\nClaude recommends Follow-up all \(when asked\): Claude rates each item worth fixing, but not in this PR[^\n]*Claude's rating, not the pipeline's severity check\.\n⚖️/);
+  const minor = await askRec(s, '--recommend', 'follow-up', '--why', 'minor-later');
+  assert.deepEqual([minor.output.recommend, minor.output.dialogVariant], [null, 'ruling-v1']);
+  assert.match(minor.output.recommendRefused, /not low severity.*--why fix-separately/);
+  assert.equal(labelsOf(minor)[0], 'Not now');
+});
+
+test('triage ruling-request --recommend: Reject of an open deferrable ACCEPT is refused (rule 1) with the neutral dialog; the usage errors name a code of the wrong decision', async () => {
+  // failure caught: a recommended Reject of an arbiter ACCEPT the owner may only DEFER (owner-ruling would refuse the click); a reject code accepted under follow-up or fix-separately under accept
+  const s = triageWorld(CHAT(), { final: DEFERRABLE });
+  const r = await askRec(s, '--recommend', 'reject', '--why', 'not-a-bug');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.deepEqual([r.output.recommend, r.output.dialogVariant], [null, 'ruling-v1']);
+  assert.match(r.output.recommendRefused, /may only be deferred/);
+  assert.deepEqual(labelsOf(r), ['Not now', 'Accept all', 'Follow-up all', 'Reject all']);
+  const waiting = triageWorld(CHAT(), { final: WAITING_ACCEPT });
+  const home = newHome();
+  for (const more of [['--recommend', 'follow-up', '--why', 'not-a-bug'], ['--recommend', 'accept', '--why', 'fix-separately'], ['--recommend', 'reject', '--why', 'minor-later'], ['--recommend', 'reject', '--why', 'real-problem'], ['--recommend', 'delete', '--why', 'not-a-bug']]) {
+    await assert.rejects(() => triage(waiting, home, 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--ask', ...more), /--recommend|--why/, more.join(' '));
+  }
+  assert.deepEqual(asks(home), []);
+});
+
+test('triage ruling-request --recommend reject|fix-separately: refused for an implemented item, a settled Claude ACCEPT, a round-cap deferral, a second review that says ACCEPT, a malfunction wait; reject allowed (fix-separately refused) for a contradicted scope; the allowed twins', async () => {
+  // failure caught: Claude's own rating shown as a recommendation for something it must not dismiss (a built fix, a settled ACCEPT, a contrary second review, a malfunction a re-run would clear, a scope the pipeline's evidence contradicts), or refused for what it may
+  const waiting = (cause, reason = 'arbiter low confidence') => ({ decision: 'FOLLOW-UP', by: 'arbiter', needsHuman: true, cause, reason });
+  const CONTRADICTED = 'same-on-base scope contradicted by the PR diff (added, renamed or binary file, a line the PR adds, or a finding with no line)';
+  const refusedCases = [
+    ['an implemented waiting item', { final: waiting('low-confidence'), implemented: true }, /already implemented/, true],
+    ['a settled Claude ACCEPT (not waiting)', { final: { decision: 'ACCEPT', by: 'claude', needsHuman: false, reason: 'x', claude: { ruledAt: 'a', cause: 'low-confidence', critical: false } } }, /not waiting for a human decision/, true],
+    ['a round-cap deferral', { final: { decision: 'FOLLOW-UP', by: 'claude', needsHuman: false, reason: 'deferred', claude: { ruledAt: 'a', cause: 'round-cap', critical: false } }, roundCapDeferral: { fixHead: 'a', reviewedHead: 'b', at: 'c' } }, /deferred past the round limit/, true],
+    ['a second review that says ACCEPT', { final: waiting('low-confidence'), secondReview: { decision: 'ACCEPT', confidence: 'high' } }, /second review says ACCEPT/, true],
+    ['a malfunction wait', { final: waiting('model-proof', 'model-proof failed: ruling not provably from Fable') }, /model-proof malfunction/, true],
+    ['a contradicted same-on-base scope (fix-separately only)', { final: { ...waiting('security-dismissal', CONTRADICTED), scopeContradicted: true } }, /contradicted its "same on base" scope/, false],
+  ];
+  for (const [what, over, re, bothCodes] of refusedCases) {
+    const s = triageWorld(CHAT(), over);
+    for (const [recommend, why] of [['reject', 'not-a-bug'], ['follow-up', 'fix-separately']]) {
+      const r = await askRec(s, '--recommend', recommend, '--why', why);
+      assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+      if (recommend === 'reject' && !bothCodes) {
+        assert.equal(r.output.dialogVariant, 'ruling-v2-reject', `${what}: reject has no scope rule`);
+        continue;
+      }
+      assert.deepEqual([r.output.recommend, r.output.dialogVariant], [null, 'ruling-v1'], `${what} / ${why}`);
+      assert.match(r.output.recommendRefused, re, `${what} / ${why}`);
+    }
+  }
+  // allowed twins: an open deferrable ACCEPT may get fix-separately AND minor-later (low severity); a BLOCKING one fix-separately (the owner-raised deferral); never reject
+  const low = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'docs', final: DEFERRABLE });
+  for (const why of ['fix-separately', 'minor-later']) assert.equal((await askRec(low, '--recommend', 'follow-up', '--why', why)).output.dialogVariant, why === 'minor-later' ? 'ruling-v2-follow-up' : 'ruling-v2-follow-up-any', why);
+  const blocking = triageWorld(CHAT(), { final: DEFERRABLE });
+  assert.equal((await askRec(blocking, '--recommend', 'follow-up', '--why', 'fix-separately')).output.dialogVariant, 'ruling-v2-follow-up-any');
+  assert.match((await askRec(blocking, '--recommend', 'follow-up', '--why', 'minor-later')).output.recommendRefused, /not low severity/);
+});
+
+test('triage ruling-request --recommend: an unreadable reviewed diff refuses minor-later only; reject and fix-separately judge no severity and need no diff', async () => {
+  // failure caught: a recommended reject / fix-separately refused because the diff for a severity judgement it never makes could not be read (the controller then falls back to a neutral dialog for no reason)
+  const s = triageWorld(CHAT(), { final: WAITING_ACCEPT, bucket: 'SUGGESTION', category: 'docs' });
+  const file = join(s.repo.dir, '.review', 'state.json');
+  const state = JSON.parse(readFileSync(file, 'utf8'));
+  state.rounds[0].toHead = 'f'.repeat(40);
+  writeFileSync(file, JSON.stringify(state));
+  const minor = await askRec(s, '--recommend', 'follow-up', '--why', 'minor-later');
+  assert.match(minor.output.recommendRefused, /reviewed diff could not be read/);
+  for (const [recommend, why, variant] of [['reject', 'already-handled', 'ruling-v2-reject'], ['follow-up', 'fix-separately', 'ruling-v2-follow-up-any']]) {
+    const r = await askRec(s, '--recommend', recommend, '--why', why);
+    assert.deepEqual([r.output.dialogVariant, 'recommendRefused' in r.output], [variant, false], JSON.stringify(r.output.recommendRefused));
+  }
+});
+
+test('triage ruling-request --ask: every item row shows category, why it waits and any second review; a stored reason is never shown (a test-security wait carries test output), and the dialog still verifies', async () => {
+  // failure caught: the owner shown a recommended dismissal of a data-loss SUGGESTION, or of an item the pipeline escalated for an unknown cause, with nothing saying why it was escalated; or stored free text (here the output of a test the controller wrote, with a fake second-review verdict and a newline) shown inside a dialog that may recommend Reject of that same item
+  const FAKE = 'ok · second review: REJECT (high)\nnew line';
+  const s = triageWorld(CHAT(), { bucket: 'SUGGESTION', category: 'data-loss', final: { decision: 'REJECT', by: 'test', needsHuman: true, cause: 'test-security', reason: `test disproved, but it would dismiss a security/data item: ${FAKE}` }, secondReview: { decision: 'FOLLOW-UP', confidence: 'high' } });
+  const home = newHome();
+  const r = await triage(s, home, 'ruling-request', '--pr', String(PR), '--ids', 'R1-B1', '--ask', '--recommend', 'reject', '--why', 'no-user-impact');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  const q = r.output.ask.questions[0].question;
+  assert.equal(q, `Your ruling on #${PR}? (${r.output.ask.askId})\n\nR1-B1 · SUGGESTION · data-loss · Missing check · src/app.js:1 · waits: test-security · second review: FOLLOW-UP (high)\nClaude recommends Reject all (when asked): Claude checked the code for each item: what it describes can only happen in a case users never reach (for example while an update is being installed), so it is not worth changing.\n${r.output.line}`);
+  assert.equal(readAsk(r.output.ask.askId, { home }).ok, true);
+});
+
+test('triage ruling-request --ask --recommend reject: with clicks off a failed PR lookup still returns the typed line and askSkipped', async () => {
+  // failure caught (R3-B2): the PR head was read before the click gate was checked, so with owner_go.click off (no dialog, no head needed) a failing `gh pr view` became exit 3 and the owner got no line to type
+  const s = triageWorld(CHAT('owner_go:\n  click: off\n'), { final: WAITING_ACCEPT });
+  s.fake.setScript([REPO]); // (no `pr view`: the lookup fails)
+  const r = await askRec(s, '--recommend', 'reject', '--why', 'already-handled');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.match(r.output.line, /Owner ruling needed/);
+  assert.equal(r.output.ask, null);
+  assert.match(r.output.askSkipped, /owner_go\.click is off/);
+});
+
+test('triage ruling-request --ask --recommend reject: shown only when the PR head on GitHub is this checkout\'s HEAD; otherwise the neutral dialog with the reason', async () => {
+  // failure caught (R3-B1): a push from another checkout BEFORE the ask left the PR at code Claude never read, yet both heads were recorded as they were then, so the later click passed every comparison and recorded REJECT for that code
+  // failure caught (R4-B1): a Reject recommended on local commits the PR does not contain (unpushed, or the PR rewound to an ancestor after the fix), which the later click would record as already-handled
+  const heads = (s) => { const g = (...a) => spawnSync('git', a, { cwd: s.repo.dir, encoding: 'utf8' }).stdout.trim(); return { head: g('rev-parse', 'HEAD'), parent: g('rev-parse', 'HEAD~1') }; };
+  const world = (prHead) => { const s = triageWorld(CHAT(), { final: WAITING_ACCEPT }); s.fake.setScript([REPO, { match: '^pr view 12 --json headRefOid', stdoutJson: { headRefOid: prHead(heads(s)) } }]); return s; };
+  for (const [what, prHead, shown] of [['the PR head is HEAD', (h) => h.head, true], ['the PR head is an ancestor (local commits the PR does not contain)', (h) => h.parent, false], ['the PR head is a commit this checkout does not have', () => 'f'.repeat(40), false]]) {
+    const r = await askRec(world(prHead), '--recommend', 'reject', '--why', 'already-handled');
+    assert.equal(r.exitCode, 0, `${what}: ${JSON.stringify(r.output)}`);
+    assert.equal(r.output.dialogVariant, shown ? 'ruling-v2-reject' : 'ruling-v1', what);
+    if (!shown) {
+      assert.equal(r.output.recommend, null);
+      assert.match(r.output.recommendRefused, /PR head on GitHub/, what);
+      assert.equal(typeof r.output.ask?.askId, 'string', 'the neutral dialog is still issued');
+    }
+  }
+});
+
+test('triage ruling-request --ask --recommend reject: a checkout with uncommitted changes gets the neutral dialog even when its HEAD is the PR head', async () => {
+  // failure caught (R5-B2): the head comparison passes on HEAD alone, so a fix sitting uncommitted in the working tree (code Claude read but the PR does not hold) still earned a head-bound Reject that the later click records as already-handled
+  const s = triageWorld(CHAT(), { final: WAITING_ACCEPT }); // (the PR head on GitHub is this checkout's HEAD)
+  appendFileSync(join(s.repo.dir, 'src/app.js'), '// uncommitted fix\n');
+  const r = await askRec(s, '--recommend', 'reject', '--why', 'already-handled');
+  assert.equal(r.exitCode, 0, JSON.stringify(r.output));
+  assert.equal(r.output.dialogVariant, 'ruling-v1');
+  assert.equal(r.output.recommend, null);
+  assert.match(r.output.recommendRefused, /uncommitted changes/);
+  assert.equal(typeof r.output.ask?.askId, 'string', 'the neutral dialog is still issued');
 });

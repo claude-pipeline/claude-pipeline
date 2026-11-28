@@ -638,23 +638,38 @@ test('the legacy ruling dialog is byte-identical to the one shipped before the v
   assert.equal(normal, LEGACY_RULING_ASK_FILE);
 });
 
-const RULING_ROW = { 'ruling-v2-accept': rulingWhyRow('accept', 'real-problem'), 'ruling-v2-follow-up': rulingWhyRow('follow-up', 'minor-later') };
+const RULING_ROW = {
+  'ruling-v2-accept': rulingWhyRow('accept', 'real-problem'), 'ruling-v2-follow-up': rulingWhyRow('follow-up', 'minor-later'),
+  'ruling-v2-follow-up-any': rulingWhyRow('follow-up', 'fix-separately'), 'ruling-v2-reject': rulingWhyRow('reject', 'not-a-bug'),
+};
 const rulingLine = (variant) => (variant === 'ruling-v1' ? RULING_LINE : rulingRequestWithRow(RULING_ROW[variant], 58, RULING_IDS, REPO, 'c0ffee000000'));
 const rulingPartsOf = (variant) => rulingParts(variant === 'ruling-v1' ? undefined : variant, rulingLine(variant));
 const RULING_PINNED = {
   'ruling-v1': 'b4e2d35737d8c4a2742751ffae7b555db8b4a73877dc7ec29c6b43f39c39d116',
   'ruling-v2-accept': 'a3aaf7a1585f55fe1b439881a04e25ca56029c3ed28b31272c37bc3afc6dd162',
   'ruling-v2-follow-up': 'bf87969a573aaad2d15613144f195a725144a0a875f124dfaab884f2763c3f76',
+  'ruling-v2-follow-up-any': 'bf87969a573aaad2d15613144f195a725144a0a875f124dfaab884f2763c3f76', // (same buttons and answers as ruling-v2-follow-up ON PURPOSE: only the row, and so the claim a click carries, differs)
+  'ruling-v2-reject': '7f3847a6ed2e881c64c1689baaa39b378f880ff985171a3df2a11c1e0ec83a26',
 };
-const RULING_WHY_PINNED = '0f9554f4100d61cdc9c24b6fb7ed8067eafa986847d7c293954bd8f3b9fd312f';
+// sha256 of each recommendation text, per decision and code (cp #944 replaced the whole-table pin: a new code adds a line here, an old text is never edited).
+const RULING_WHY_PINNED = {
+  accept: { 'real-problem': 'bedbb087555c67825bd714cd9ef9bfaa3dbd4655e5056c94f5e20607341da843', 'unclear-safe': '063b76e939c71fa71bae04a9c2e79ffff41531d6cd6f5903e4c270bdbf6357b1' },
+  'follow-up': { 'minor-later': 'ace2983540416429b2b5a589b2b7c6cfbe0a872a7a9eff3984a5481c746fb606', 'fix-separately': 'dc222ff96117061973ef29a229a8f5f441e219a8973b3eb6e5585f78bee33c35' },
+  reject: { 'not-a-bug': '3feeaca6df8cc8090578cdbd6839fc223eeb52732e2892cdb1aecb0ca2628957', 'already-handled': '8d36980a858d392f729afbd436bd5c6301c07dc6065139effd98be2ecf5c6a83', 'no-user-impact': '84a9b11ad18095acc729d059bdbec1eae38242f7214a1b009d976b87b5f10976' },
+};
+// The whole table as it was before #944 (accept x2, follow-up minor-later): its three texts must still hash to it, so none was edited.
+const RULING_WHY_BEFORE_944 = '0f9554f4100d61cdc9c24b6fb7ed8067eafa986847d7c293954bd8f3b9fd312f';
 
-test('the ruling variants are immutable and shaped as the plan says: a pinned sha256 per id, the recommended option first, never Reject, Not now last and declining in every v2', () => {
-  // failure caught: a reworded label / description / answer under a ruling id that asks already carry, a recommended label that is not first, or a Reject that is recommended (every Reject is a critical dismissal)
-  assert.deepEqual(RULING_VARIANT_IDS, ['ruling-v1', 'ruling-v2-accept', 'ruling-v2-follow-up']);
+test('the ruling variants are immutable and shaped as the plan says: a pinned sha256 per id, the recommended option first, Not now last and declining in every v2', () => {
+  // failure caught: a reworded label / description / answer under a ruling id that asks already carry, a recommended label that is not first, or a recommended label that maps to another decision than its plain label
+  assert.deepEqual(RULING_VARIANT_IDS, ['ruling-v1', 'ruling-v2-accept', 'ruling-v2-follow-up', 'ruling-v2-follow-up-any', 'ruling-v2-reject']);
   const got = Object.fromEntries(RULING_VARIANT_IDS.map((id) => { const p = rulingPartsOf(id); return [id, sha(JSON.stringify({ header: p.header, options: p.options, actions: p.actions }))]; }));
   assert.deepEqual(got, RULING_PINNED);
-  assert.equal(sha(JSON.stringify(RULING_WHY)), RULING_WHY_PINNED, 'the shipped recommendation texts are never edited: a different text is a new code');
-  assert.equal(new Set(Object.values(got)).size, RULING_VARIANT_IDS.length);
+  const textHashes = Object.fromEntries(Object.entries(RULING_WHY).map(([d, codes]) => [d, Object.fromEntries(Object.entries(codes).map(([c, t]) => [c, sha(t)]))]));
+  assert.deepEqual(textHashes, RULING_WHY_PINNED, 'the shipped recommendation texts are never edited: a different text is a new code');
+  assert.equal(sha(JSON.stringify({ accept: RULING_WHY.accept, 'follow-up': { 'minor-later': RULING_WHY['follow-up']['minor-later'] } })), RULING_WHY_BEFORE_944, 'the texts that existed before #944 are byte for byte what shipped');
+  assert.equal(got['ruling-v2-follow-up-any'], got['ruling-v2-follow-up'], 'the any-severity follow-up dialog has the same buttons and answers as the low-severity one (only its row differs)');
+  assert.equal(new Set(Object.values(got)).size, RULING_VARIANT_IDS.length - 1, 'every other dialog is its own');
   const legacy = rulingPartsOf('ruling-v1');
   assert.equal(Object.hasOwn(legacy, 'variant'), false);
   assert.deepEqual(legacy.options.map((o) => o.label), ['Not now', 'Accept all', 'Follow-up all', 'Reject all']);
@@ -664,7 +679,7 @@ test('the ruling variants are immutable and shaped as the plan says: a pinned sh
     assert.equal(p.options.filter((o) => o.label.endsWith('(Recommended)')).length, 1);
     assert.match(p.options[0].label, / \(Recommended\)$/);
     assert.equal(p.options.at(-1).label, 'Not now');
-    assert.ok(!p.options.some((o) => /^Reject all.*Recommended/.test(o.label)));
+    assert.equal(p.options.some((o) => /^Reject all.*Recommended/.test(o.label)), id === 'ruling-v2-reject', 'Reject is recommended only by its own dialog');
     // every deciding label maps to exactly the typed answer the legacy label of the same decision maps to, for both ids; Not now declines
     const plain = (label) => label.replace(' (Recommended)', '');
     for (const o of p.options) assert.equal(p.actions[o.label], legacy.actions[plain(o.label)], o.label);
@@ -673,11 +688,14 @@ test('the ruling variants are immutable and shaped as the plan says: a pinned sh
   }
   assert.equal(rulingPartsOf('ruling-v2-accept').actions['Accept all (Recommended)'], 'R1-B1: accept, R1-B2: accept');
   assert.equal(rulingPartsOf('ruling-v2-follow-up').actions['Follow-up all (Recommended)'], 'R1-B1: follow-up, R1-B2: follow-up');
+  assert.equal(rulingPartsOf('ruling-v2-follow-up-any').actions['Follow-up all (Recommended)'], 'R1-B1: follow-up, R1-B2: follow-up');
+  assert.deepEqual(rulingPartsOf('ruling-v2-reject').options.map((o) => o.label), ['Reject all (Recommended)', 'Accept all', 'Follow-up all', 'Not now']);
+  assert.equal(rulingPartsOf('ruling-v2-reject').actions['Reject all (Recommended)'], 'R1-B1: reject, R1-B2: reject');
 });
 
 test('rulingAsk: an unknown variant id (or a non-string, or a round id) builds nothing', () => {
   // failure caught: an ask naming an id this install does not know being built as some default dialog
-  for (const bad of ['ruling-v3', 'RULING-V1', 'ruling-v2-reject', 'round-v1', '', null, 1, {}, '__proto__', 'constructor']) assert.equal(rulingParts(bad, RULING_LINE), null, String(bad));
+  for (const bad of ['ruling-v3', 'RULING-V1', 'ruling-v2-rejects', 'round-v1', '', null, 1, {}, '__proto__', 'constructor']) assert.equal(rulingParts(bad, RULING_LINE), null, String(bad));
 });
 
 test('a ruling ask issued by the code before the variants (the literal from 4bcf5647) still verifies as the owner would see it', () => {
